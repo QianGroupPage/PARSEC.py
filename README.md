@@ -1,8 +1,12 @@
 # PARSEC.py
 
 PARSEC.py contains native Python implementations of real-space density
-functional theory (DFT). The repository currently keeps two independent code
-paths:
+functional theory (DFT), and supports machine-learned charge densities as an
+alternative to the superposition of atomic densities (SAD) for initializing
+SCF iterations. It accompanies the article below, accepted in the *Journal of
+Computational Chemistry*. See [Citing PARSEC.py](#citing-parsecpy).
+
+The repository currently keeps two independent code paths:
 
 - `src/new_architecture`: the recommended, modular translation of PARSEC's
   isolated single-point workflow.
@@ -29,6 +33,7 @@ Fortran source is used as the algorithm specification and reference result.
 - [Old architecture](#old-architecture)
 - [UPF-to-PARSEC conversion tool](#upf-to-parsec-conversion-tool)
 - [Further documentation](#further-documentation)
+- [Citing PARSEC.py](#citing-parsecpy)
 
 ## Quick start: new architecture
 
@@ -154,7 +159,7 @@ parsec_python/
 │   │   ├── Tools/              Legacy timing/plot helpers
 │   │   ├── main.py             Original monolithic script
 │   │   └── main_new.py         Refactored legacy launcher
-│   └── tools/
+│   └── parsec_tools/           Architecture-independent conversion utilities
 │       └── upf_to_parsec.py    UPF v2 to Martins-new POTRE converter
 ├── samples/                    Inputs/results for the older workflow
 ├── pyproject.toml              Pure-Python packaging for `parsec-py`
@@ -452,15 +457,18 @@ legacy-specific details.
 
 ## UPF-to-PARSEC conversion tool
 
-`src/tools/upf_to_parsec.py` converts a conservative subset of norm-conserving
+`parsec_tools.upf_to_parsec` converts a conservative subset of norm-conserving
 semilocal UPF v2 pseudopotentials to PARSEC Martins-new format. The input must
 use `pseudo_type="SL"`, provide one scalar semilocal potential and one
 `PP_CHI` reference function for every consecutive angular channel, and use a
 pure-exponential source mesh:
 
 ```bash
-python src/tools/upf_to_parsec.py input.UPF X_POTRE.DAT
+upf-to-parsec input.UPF X_POTRE.DAT
 ```
+
+Without installing, run it as a script with
+`python src/parsec_tools/upf_to_parsec.py input.UPF X_POTRE.DAT`.
 
 Useful options include `--xc-code`, `--grid-refinement {1,2}`,
 `--allow-ionized-reference`, and `--force`. The converter resamples onto
@@ -482,6 +490,22 @@ non-pure-exponential UPF meshes. Pair both the reported `Local_Component` and
   Python implementation map and detailed component examples.
 - [`src/new_architecture/provenance/source_map.json`](src/new_architecture/provenance/source_map.json):
   machine-readable Fortran-to-Python implementation status.
+
+## Citing PARSEC.py
+
+Zeyi Zhang, Carlos Mora Perez, Patrick Kwon, Martin Head-Gordon, and Jin Qian.
+"PARSEC.py: A Python-based Real-space Kohn-Sham Density Functional Theory Code
+Accelerated by Machine Learned Charge Density."
+*Journal of Computational Chemistry* (accepted).
+
+> **Placeholder.** The journal DOI has not been assigned yet. Until it is, cite
+> the preprint at
+> <https://chemrxiv.org/doi/full/10.26434/chemrxiv.15005599/v1>, and update both
+> this section and [`CITATION.cff`](CITATION.cff) once the DOI is available.
+
+[`CITATION.cff`](CITATION.cff) carries the same metadata in machine-readable
+form, so GitHub's "Cite this repository" control produces BibTeX and APA
+entries directly.
 
 ## License
 

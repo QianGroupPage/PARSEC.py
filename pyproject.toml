@@ -21,10 +21,11 @@ legacy = ["pandas", "matplotlib"]
 
 [project.scripts]
 parsec-py = "new_architecture.cli:main"
+upf-to-parsec = "parsec_tools.upf_to_parsec:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["new_architecture*", "old_architecture*"]
+include = ["new_architecture*", "old_architecture*", "parsec_tools*"]
 # The test suite asserts on repository layout (ARCHITECTURE.md, benchmarks/)
 # and so only runs from a source checkout. Keep it out of the wheel rather
 # than shipping benchmark pseudopotentials to every installed user.

@@ -12,7 +12,8 @@ python src/old_architecture/main_new.py
 python src/old_architecture/main_new.py --cpu path/to/input.in
 ```
 
-It can also be imported as a package when `src` is on `PYTHONPATH`:
+It can also be imported as a package once the project is installed with
+`pip install -e .` from the repository root:
 
 ```python
 from old_architecture.main_new import main

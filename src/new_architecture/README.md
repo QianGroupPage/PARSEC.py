@@ -17,12 +17,14 @@ CA-LDA, or run the complete SCF calculation independently.
 
 ## Run a PARSEC input file
 
-Install the two runtime dependencies into the active environment:
+Install the package and its two runtime dependencies from the repository root:
 
 ```bash
-cd src/new_architecture
-python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
+
+`requirements.txt` in this folder lists the same two dependencies for anyone
+who prefers to install them without the package.
 
 Put `parsec.in` and each Martins-new pseudopotential beside one another. The
 pseudopotential filename must be `<Atom_Type>_POTRE.DAT`:
@@ -47,8 +49,9 @@ Then run the single point:
 python main.py H2/parsec.in
 ```
 
-No `PYTHONPATH` setting is needed for this folder-local command. By default the
-launcher writes these files beside `parsec.in`:
+This folder-local command works without installing the package; after
+`pip install -e .` the equivalent command is `parsec-py H2/parsec.in`. By
+default the launcher writes these files beside `parsec.in`:
 
 - `parsec.out`: PARSEC-style input/grid sections, per-iteration state
   tables, energy decomposition, SRE lines, convergence, and timing
@@ -141,7 +144,6 @@ result = run_single_point(problem)      # complete CA-LDA single point
 Run the focused test suite from the repository root:
 
 ```bash
-export PYTHONPATH=src                # Windows PowerShell: $env:PYTHONPATH = "src"
 python -m unittest discover -s src/new_architecture/tests -v
 ```
 

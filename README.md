@@ -38,14 +38,19 @@ Python 3.10 or newer is required. From the repository root:
 python3 -m venv .venv
 source .venv/bin/activate            # Windows PowerShell: .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r src/new_architecture/requirements.txt
+python -m pip install -e .
 ```
+
+This is a pure-Python install; no compiler is required. It pulls in NumPy and
+SciPy, puts `new_architecture` and `old_architecture` on the import path, and
+provides the `parsec-py` command. Add the legacy plotting dependencies with
+`python -m pip install -e ".[legacy]"`.
 
 Every later command uses `python` and forward-slash paths, which work in bash,
 zsh, PowerShell, and `cmd` once the environment is active.
 
-The native single-point path requires NumPy and SciPy. Put `parsec.in` and one
-pseudopotential per atom type in the same calculation directory:
+Put `parsec.in` and one pseudopotential per atom type in the same calculation
+directory:
 
 ```text
 H2/
@@ -59,13 +64,13 @@ The filename must match the corresponding `Atom_Type`; for example, atom type
 Validate the input and POTRE files without constructing the real-space grid:
 
 ```bash
-python src/new_architecture/main.py path/to/parsec.in --dry-run
+parsec-py path/to/parsec.in --dry-run
 ```
 
 Run the physical calculation:
 
 ```bash
-python src/new_architecture/main.py path/to/parsec.in
+parsec-py path/to/parsec.in
 ```
 
 For a small physical example, run the canonical H2 case from its benchmark
@@ -73,8 +78,11 @@ directory:
 
 ```bash
 cd src/new_architecture/benchmarks/h2_canonical_nodg
-python ../../main.py parsec.in --no-archive
+parsec-py parsec.in --no-archive
 ```
+
+It converges to `-2.13713415 Ry`. Without installing, the equivalent
+folder-local launcher is `python src/new_architecture/main.py path/to/parsec.in`.
 
 The default outputs are written beside `parsec.in`:
 
@@ -100,10 +108,9 @@ A converged calculation returns exit code 0. Other runtime failures return 1,
 input errors return 2, and interruption returns 130. A valid calculation that
 reaches `Max_Iter` without converging writes its final state and returns 3.
 
-Package execution is also supported when `src` is importable:
+Package execution is also supported:
 
 ```bash
-export PYTHONPATH=src                # Windows PowerShell: $env:PYTHONPATH = "src"
 python -m new_architecture path/to/parsec.in
 ```
 
@@ -141,7 +148,8 @@ parsec_python/
 │   │   ├── Splines/            Legacy spline utilities
 │   │   ├── V_ion/              Legacy pseudopotential implementations
 │   │   ├── V_xc/               Legacy CA-LDA CPU/GPU routines
-│   │   ├── native/             C++/OpenMP ionic setup kernels
+│   │   ├── native/             C++/OpenMP ionic setup kernels (separate
+│   │   │                       optional `rsdft-native` distribution)
 │   │   ├── GUI/                Legacy input generator
 │   │   ├── Tools/              Legacy timing/plot helpers
 │   │   ├── main.py             Original monolithic script
@@ -149,7 +157,7 @@ parsec_python/
 │   └── tools/
 │       └── upf_to_parsec.py    UPF v2 to Martins-new POTRE converter
 ├── samples/                    Inputs/results for the older workflow
-├── pyproject.toml              Build configuration for `rsdft_native`
+├── pyproject.toml              Pure-Python packaging for `parsec-py`
 └── README.md
 ```
 
@@ -268,12 +276,7 @@ All physical arrays use PARSEC conventions:
 ## Modular Python API
 
 Parse a real PARSEC input, inspect all static terms, and then decide whether to
-run SCF. When running these examples from the repository root, first make the
-source packages importable:
-
-```bash
-export PYTHONPATH=src                # Windows PowerShell: $env:PYTHONPATH = "src"
-```
+run SCF:
 
 ```python
 from new_architecture import (
@@ -356,9 +359,9 @@ The tracked cases under `src/new_architecture/benchmarks` include:
 Example commands from the repository root:
 
 ```bash
-python src/new_architecture/main.py src/new_architecture/benchmarks/h2_full_nonlocal/parsec.in --no-archive
-python src/new_architecture/main.py src/new_architecture/benchmarks/0d_benzene/parsec.in --no-archive
-python src/new_architecture/main.py src/new_architecture/benchmarks/0d_naphthalene/parsec.in --no-archive
+parsec-py src/new_architecture/benchmarks/h2_full_nonlocal/parsec.in --no-archive
+parsec-py src/new_architecture/benchmarks/0d_benzene/parsec.in --no-archive
+parsec-py src/new_architecture/benchmarks/0d_naphthalene/parsec.in --no-archive
 ```
 
 See the README or `COMPARISON.md` inside each completed comparison directory
@@ -366,10 +369,10 @@ before interpreting small numerical differences.
 
 ## Testing the new architecture
 
-From the repository root:
+The suite runs from a source checkout, since several tests assert on the
+repository layout. From the repository root:
 
 ```bash
-export PYTHONPATH=src                # Windows PowerShell: $env:PYTHONPATH = "src"
 python -m unittest discover -s src/new_architecture/tests -p "test_*.py" -v
 ```
 
@@ -409,7 +412,7 @@ With no input path, it starts the manual input flow. Major modules are:
 The core legacy path additionally uses pandas and Matplotlib:
 
 ```bash
-python -m pip install pandas matplotlib
+python -m pip install -e ".[legacy]"
 ```
 
 GPU execution requires a CuPy build compatible with the installed CUDA
@@ -417,14 +420,13 @@ runtime. The GUI also requires a Python installation with Tk/Tkinter support.
 
 ### Legacy native extension
 
-`pyproject.toml` builds only the `rsdft_native` C++/OpenMP extension; it does
-not install either Python architecture as a wheel. A native build requires
-CMake 3.24 or newer, Ninja, and a C++17 compiler with OpenMP support (for
-example, the appropriate MSVC Build Tools on Windows). Build it from the
-repository root with:
+The `rsdft_native` C++/OpenMP extension is a separate, optional distribution
+under `src/old_architecture/native`, so the main install stays pure Python.
+Building it requires CMake 3.24 or newer, Ninja, and a C++17 compiler with
+OpenMP support (for example, the appropriate MSVC Build Tools on Windows):
 
 ```bash
-python -m pip install -v .
+python -m pip install -v ./src/old_architecture/native
 ```
 
 Set the OpenMP thread count with `OMP_NUM_THREADS`. The environment variables

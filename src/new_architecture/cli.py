@@ -146,7 +146,9 @@ def save_result_archive(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="main.py",
+        # No explicit prog: argparse derives it from argv[0], which gives
+        # "main.py" for the folder-local launcher and "parsec-py" for the
+        # installed console script.
         description=(
             "Run the modular isolated CA-LDA solver from a supported PARSEC "
             "parsec.in and adjacent *_POTRE.DAT files."

@@ -32,14 +32,17 @@ Fortran source is used as the algorithm specification and reference result.
 
 ## Quick start: new architecture
 
-Python 3.10 or newer is required. From the repository root in PowerShell:
+Python 3.10 or newer is required. From the repository root:
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```bash
+python3 -m venv .venv
+source .venv/bin/activate            # Windows PowerShell: .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r src\new_architecture\requirements.txt
+python -m pip install -r src/new_architecture/requirements.txt
 ```
+
+Every later command uses `python` and forward-slash paths, which work in bash,
+zsh, PowerShell, and `cmd` once the environment is active.
 
 The native single-point path requires NumPy and SciPy. Put `parsec.in` and one
 pseudopotential per atom type in the same calculation directory:
@@ -55,22 +58,22 @@ The filename must match the corresponding `Atom_Type`; for example, atom type
 
 Validate the input and POTRE files without constructing the real-space grid:
 
-```powershell
-python src\new_architecture\main.py path\to\parsec.in --dry-run
+```bash
+python src/new_architecture/main.py path/to/parsec.in --dry-run
 ```
 
 Run the physical calculation:
 
-```powershell
-python src\new_architecture\main.py path\to\parsec.in
+```bash
+python src/new_architecture/main.py path/to/parsec.in
 ```
 
 For a small physical example, run the canonical H2 case from its benchmark
 directory:
 
-```powershell
-cd src\new_architecture\benchmarks\h2_canonical_nodg
-python ..\..\main.py parsec.in --no-archive
+```bash
+cd src/new_architecture/benchmarks/h2_canonical_nodg
+python ../../main.py parsec.in --no-archive
 ```
 
 The default outputs are written beside `parsec.in`:
@@ -99,9 +102,9 @@ reaches `Max_Iter` without converging writes its final state and returns 3.
 
 Package execution is also supported when `src` is importable:
 
-```powershell
-$env:PYTHONPATH = "src"
-python -m new_architecture path\to\parsec.in
+```bash
+export PYTHONPATH=src                # Windows PowerShell: $env:PYTHONPATH = "src"
+python -m new_architecture path/to/parsec.in
 ```
 
 ## Repository structure
@@ -268,8 +271,8 @@ Parse a real PARSEC input, inspect all static terms, and then decide whether to
 run SCF. When running these examples from the repository root, first make the
 source packages importable:
 
-```powershell
-$env:PYTHONPATH = "src"
+```bash
+export PYTHONPATH=src                # Windows PowerShell: $env:PYTHONPATH = "src"
 ```
 
 ```python
@@ -352,10 +355,10 @@ The tracked cases under `src/new_architecture/benchmarks` include:
 
 Example commands from the repository root:
 
-```powershell
-python src\new_architecture\main.py src\new_architecture\benchmarks\h2_full_nonlocal\parsec.in --no-archive
-python src\new_architecture\main.py src\new_architecture\benchmarks\0d_benzene\parsec.in --no-archive
-python src\new_architecture\main.py src\new_architecture\benchmarks\0d_naphthalene\parsec.in --no-archive
+```bash
+python src/new_architecture/main.py src/new_architecture/benchmarks/h2_full_nonlocal/parsec.in --no-archive
+python src/new_architecture/main.py src/new_architecture/benchmarks/0d_benzene/parsec.in --no-archive
+python src/new_architecture/main.py src/new_architecture/benchmarks/0d_naphthalene/parsec.in --no-archive
 ```
 
 See the README or `COMPARISON.md` inside each completed comparison directory
@@ -365,9 +368,9 @@ before interpreting small numerical differences.
 
 From the repository root:
 
-```powershell
-$env:PYTHONPATH = "src"
-python -m unittest discover -s src\new_architecture\tests -p "test_*.py" -v
+```bash
+export PYTHONPATH=src                # Windows PowerShell: $env:PYTHONPATH = "src"
+python -m unittest discover -s src/new_architecture/tests -p "test_*.py" -v
 ```
 
 The suite covers input translation, architecture boundaries, grid and
@@ -381,8 +384,8 @@ output, and complete small SCF paths.
 The older implementation remains usable and is intentionally isolated under
 `src/old_architecture`. Its recommended refactored entry point is:
 
-```powershell
-python src\old_architecture\main_new.py --cpu path\to\input.in
+```bash
+python src/old_architecture/main_new.py --cpu path/to/input.in
 ```
 
 With no input path, it starts the manual input flow. Major modules are:
@@ -405,7 +408,7 @@ With no input path, it starts the manual input flow. Major modules are:
 
 The core legacy path additionally uses pandas and Matplotlib:
 
-```powershell
+```bash
 python -m pip install pandas matplotlib
 ```
 
@@ -420,7 +423,7 @@ CMake 3.24 or newer, Ninja, and a C++17 compiler with OpenMP support (for
 example, the appropriate MSVC Build Tools on Windows). Build it from the
 repository root with:
 
-```powershell
+```bash
 python -m pip install -v .
 ```
 
@@ -433,10 +436,10 @@ when these variables are unset. Therefore, either build `rsdft_native` before
 running `main_new.py`, or explicitly set both variables to `0` to use the
 older pure-Python ionic routines:
 
-```powershell
-$env:PARSEC_NATIVE_PSEUDODIAG = "0"
-$env:PARSEC_NATIVE_PSEUDONL = "0"
-python src\old_architecture\main_new.py --cpu path\to\input.in
+```bash
+export PARSEC_NATIVE_PSEUDODIAG=0    # Windows PowerShell: $env:PARSEC_NATIVE_PSEUDODIAG = "0"
+export PARSEC_NATIVE_PSEUDONL=0      # Windows PowerShell: $env:PARSEC_NATIVE_PSEUDONL = "0"
+python src/old_architecture/main_new.py --cpu path/to/input.in
 ```
 
 `--cpu` selects the CPU numerical backend; it does not by itself disable the
@@ -453,8 +456,8 @@ use `pseudo_type="SL"`, provide one scalar semilocal potential and one
 `PP_CHI` reference function for every consecutive angular channel, and use a
 pure-exponential source mesh:
 
-```powershell
-python src\tools\upf_to_parsec.py input.UPF X_POTRE.DAT
+```bash
+python src/tools/upf_to_parsec.py input.UPF X_POTRE.DAT
 ```
 
 Useful options include `--xc-code`, `--grid-refinement {1,2}`,

@@ -7,9 +7,9 @@ isolated single-point calculation.
 
 From the repository root, run the refactored legacy driver with:
 
-```powershell
-python src\old_architecture\main_new.py
-python src\old_architecture\main_new.py --cpu path\to\input.in
+```bash
+python src/old_architecture/main_new.py
+python src/old_architecture/main_new.py --cpu path/to/input.in
 ```
 
 It can also be imported as a package when `src` is on `PYTHONPATH`:

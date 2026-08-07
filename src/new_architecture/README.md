@@ -19,8 +19,8 @@ CA-LDA, or run the complete SCF calculation independently.
 
 Install the two runtime dependencies into the active environment:
 
-```powershell
-cd src\new_architecture
+```bash
+cd src/new_architecture
 python -m pip install -r requirements.txt
 ```
 
@@ -33,18 +33,18 @@ H2/
 └── H_POTRE.DAT
 ```
 
-From `src\new_architecture`, validate the input without starting the large
+From `src/new_architecture`, validate the input without starting the large
 grid calculation:
 
-```powershell
-cd src\new_architecture
-python main.py H2\parsec.in --dry-run
+```bash
+cd src/new_architecture
+python main.py H2/parsec.in --dry-run
 ```
 
 Then run the single point:
 
-```powershell
-python main.py H2\parsec.in
+```bash
+python main.py H2/parsec.in
 ```
 
 No `PYTHONPATH` setting is needed for this folder-local command. By default the
@@ -81,8 +81,8 @@ The requested calculation with PARSEC's canonical 863-point H potential and
 the currently supported no-double-grid path is under
 `benchmarks/h2_canonical_nodg`:
 
-```powershell
-python main.py benchmarks\h2_canonical_nodg\parsec.in --no-archive
+```bash
+python main.py benchmarks/h2_canonical_nodg/parsec.in --no-archive
 ```
 
 It converges to `-2.13713415 Ry` and writes the PARSEC-style report to
@@ -95,9 +95,9 @@ The completed full-pseudopotential H2 comparison is under
 `benchmarks/h2_full_nonlocal`. It uses an 861-point POTRE file and six
 nonlocal projector columns, not the synthetic test fixture:
 
-```powershell
-python main.py benchmarks\h2_full_nonlocal\parsec.in --dry-run
-python main.py benchmarks\h2_full_nonlocal\parsec.in --no-archive
+```bash
+python main.py benchmarks/h2_full_nonlocal/parsec.in --dry-run
+python main.py benchmarks/h2_full_nonlocal/parsec.in --no-archive
 ```
 
 For this matched case, PARSEC gives `-2.29319728 Ry` and Python gives
@@ -107,8 +107,8 @@ convergence values, timing, and limitations.
 
 The larger 12-atom benzene comparison is under `benchmarks/0d_benzene`:
 
-```powershell
-python main.py benchmarks\0d_benzene\parsec.in --no-archive
+```bash
+python main.py benchmarks/0d_benzene/parsec.in --no-archive
 ```
 
 Using the unchanged PARSEC example input and pseudopotentials, the native
@@ -140,9 +140,9 @@ result = run_single_point(problem)      # complete CA-LDA single point
 
 Run the focused test suite from the repository root:
 
-```powershell
-$env:PYTHONPATH = "src"
-python -m unittest discover -s src\new_architecture\tests -v
+```bash
+export PYTHONPATH=src                # Windows PowerShell: $env:PYTHONPATH = "src"
+python -m unittest discover -s src/new_architecture/tests -v
 ```
 
 Current scope: isolated sphere/box domains, full active grid without point-group

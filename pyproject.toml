@@ -1,0 +1,18 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "pybind11>=2.12",
+    "ninja>=1.11",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "rsdft-native"
+version = "0.1.0"
+description = "C++/OpenMP ionic setup kernels for the legacy PARSEC.py workflow"
+requires-python = ">=3.10"
+
+[tool.scikit-build]
+cmake.source-dir = "src/old_architecture/native"
+wheel.packages = []
+cmake.args = ["-G", "Ninja"]

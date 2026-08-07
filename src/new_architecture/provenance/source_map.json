@@ -1,0 +1,247 @@
+{
+  "schema_version": 2,
+  "scope": "Nonperiodic, unpolarized, CA-LDA PARSEC single-point calculations",
+  "implementation_language": "Python",
+  "calls_parsec_fortran": false,
+  "native_port_policy": "No PARSEC executable, object, shared library, subprocess, WSL callback, or language binding is used by the calculation.",
+  "verification_policy": "A final-energy match alone does not establish literal algorithmic parity. Source control flow, defaults, intermediate quantities, convergence behavior, and focused tests are required.",
+  "components": [
+    {
+      "component": "input",
+      "python_package": "Input",
+      "python_modules": [
+        "Input/parsec_input.py"
+      ],
+      "parsec_sources": [
+        "usrinputfile.F90",
+        "initial.f90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "A working restricted ESDF translation exists in Input/parsec_input.py; it is not claimed here as a complete PARSEC input-system port.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "grid",
+      "python_package": "Grid",
+      "python_modules": [
+        "Grid/cluster.py"
+      ],
+      "parsec_sources": [
+        "init_var.F90",
+        "grid_partition.f90",
+        "setup.F90",
+        "symmetries.f90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "Grid/cluster.py constructs the supported full isolated grid; symmetry reduction and a literal source-level audit are incomplete.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "laplacian",
+      "python_package": "Laplacian",
+      "python_modules": [
+        "Laplacian/finite_difference.py"
+      ],
+      "parsec_sources": [
+        "fornberg.f90",
+        "init_var.F90",
+        "setup.F90",
+        "matvecB.f90z"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "Centered finite-difference coefficients and a sparse operator exist; literal boundary/indexing parity is not yet certified.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "pseudopotential",
+      "python_package": "Pseudopotential",
+      "python_modules": [
+        "Pseudopotential/potre.py"
+      ],
+      "parsec_sources": [
+        "pseudo.f90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "A native POTRE reader exists and is used by benchmarks; complete format and reconstruction parity is not yet certified.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "ionic potential",
+      "python_package": "V_ion",
+      "python_modules": [
+        "V_ion/ionic_potential.py"
+      ],
+      "parsec_sources": [
+        "ionpot.f90",
+        "nonloc.F90",
+        "forceion.f90",
+        "initchrg.f90",
+        "corecd.f90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "V_ion/ionic_potential.py owns the local, nonlocal, atomic-density, and ion-ion routines; they still require routine-level verification.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "hartree",
+      "python_package": "Hartree",
+      "python_modules": [
+        "Hartree/poisson.py"
+      ],
+      "parsec_sources": [
+        "rho_hart.F90",
+        "hartset.F90",
+        "hpotcg.F90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "An isolated-boundary Poisson implementation exists; its full boundary construction and iteration trajectory have not been certified against PARSEC.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "exchange correlation",
+      "python_package": "V_xc",
+      "python_modules": [
+        "V_xc/ca_lda.py"
+      ],
+      "parsec_sources": [
+        "exc_nspn.f90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "A CA/PZ LDA implementation exists; it remains classified as unverified until branch, cutoff, unit, and NLCC behavior are checked component by component.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "hamiltonian",
+      "python_package": "Hamiltonian",
+      "python_modules": [
+        "Hamiltonian/operator.py"
+      ],
+      "parsec_sources": [
+        "matvecB.f90z"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "A Python linear operator exists, but exact PARSEC block-matvec semantics and state layout are not yet certified.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "eigensolvers",
+      "python_package": "Eigensolvers",
+      "python_modules": [
+        "Eigensolvers/eigval.py",
+        "Eigensolvers/chebff.py",
+        "Eigensolvers/chebdav.py",
+        "Eigensolvers/subspace.py",
+        "Eigensolvers/chebyshev.py",
+        "Eigensolvers/spectral_bounds.py",
+        "Eigensolvers/orthogonalize.py",
+        "Eigensolvers/rayleigh_ritz.py",
+        "Eigensolvers/lapack_random.py"
+      ],
+      "parsec_sources": [
+        "eigval.F90",
+        "chebff.f90z",
+        "chebdav.f90z",
+        "subspace.f90z",
+        "matvecB.f90z"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "The native selected-CHEBFF-or-CHEBDAV-first/SUBSPACE-later path implements the audited real non-BETA control flow without ARPACK fallback. Symmetry-representation dispatch, MPI reduction order, and compiler RANDOM_NUMBER identity are not yet ported or certified.",
+      "literal_parsec_status": "partially_verified",
+      "verification_evidence": [
+        "tests/unit/test_strict_eigensolver_primitives.py",
+        "tests/unit/test_strict_eigval_policy.py",
+        "tests/unit/test_chebdav_dispatch.py",
+        "tests/unit/test_strict_scf_eigensolver.py",
+        "benchmarks/h2_canonical_nodg/parsec_python.out"
+      ]
+    },
+    {
+      "component": "occupations and density",
+      "python_package": "Occupations",
+      "python_modules": [
+        "Occupations/fermi_dirac.py"
+      ],
+      "parsec_sources": [
+        "flevel.f90",
+        "newrho.F90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "Occupations/fermi_dirac.py implements finite-temperature occupations and density construction; edge cases and iteration behavior are not yet certified.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "mixing and convergence",
+      "python_package": "Mixer",
+      "python_modules": [
+        "Mixer/anderson.py"
+      ],
+      "parsec_sources": [
+        "anderson.f90",
+        "getsre.f90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "Anderson-style potential mixing and SRE metrics exist; history order, restart behavior, and all failure branches require a literal audit.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "energy",
+      "python_package": "Energy",
+      "python_modules": [
+        "Energy/total_energy.py"
+      ],
+      "parsec_sources": [
+        "totnrg.f90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "Energy components reproduce current benchmarks closely, but that agreement does not establish a literal routine port.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "scf",
+      "python_package": "SCF",
+      "python_modules": [
+        "SCF/single_point.py",
+        "driver.py"
+      ],
+      "parsec_sources": [
+        "parsec.F90",
+        "eigval.F90",
+        "rho_hart.F90",
+        "newrho.F90",
+        "totnrg.f90",
+        "getsre.f90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "The runnable SCF loop now uses the selected strict CHEBFF/CHEBDAV first solve followed by SUBSPACE, but unsupported symmetry reduction, double-grid integration, forces, and dipoles prevent a complete literal PARSEC workflow claim.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
+      "component": "output",
+      "python_package": "Output",
+      "python_modules": [
+        "Output/parsec_output.py"
+      ],
+      "parsec_sources": [
+        "parsec.F90",
+        "eigval.F90",
+        "totnrg.f90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "A PARSEC-shaped text report exists and explicitly identifies PARSEC-PYTHON; full formatting and unavailable sections are not claimed as identical.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    }
+  ]
+}

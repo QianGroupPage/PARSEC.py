@@ -1,0 +1,57 @@
+# PARSEC single-point input for H2 using the Python-source H pseudopotential.
+# H_POTRE.DAT is a Martins-new reconstruction of
+# src/old_architecture/V_ion/splineData.mat:dataH.
+# Geometry source:
+#   parsec_python/tests/tests/covalent/H2/tol_2e-4/diagmeth3/hart_tol_1e-6/sad/H2_sadwithml_diagmeth3_7A_0p2A.in
+# Source coordinates were translated by (-7.0, -7.0, -7.0) ang
+# so the source sphere center is the PARSEC origin.
+
+Restart_Run: .false.
+Relax_Restart: .false.
+
+Boundary_Conditions: cluster
+Cluster_Domain_Shape: sphere
+Boundary_Sphere_Radius: 7.0 ang
+Grid_Spacing: 0.20 ang
+Coordinate_Unit: Cartesian_Ang
+
+# Match parsec_python fd_order=8.
+Expansion_Order: 8
+
+States_Num: 16
+Net_Charges: 0
+Fermi_Temp: 500.0
+Spin_Polarization: .false.
+Max_Iter: 50
+Convergence_Criterion: 2.0e-4
+Diag_Tolerance: 1.0e-4
+
+# Closest PARSEC analogue of parsec_python diagmeth=3:
+# first filtering followed by Chebyshev subspace filtering.
+Eigensolver: chebff
+Chebdav_Degree: 10
+Chebyshev_Degree: 10
+Chebyshev_Degree_Delta: 0
+
+Mixing_Method: Anderson
+Mixing_Param: 0.15
+
+Atom_Types_Num: 1
+
+#------------ new atom type ----------------
+Atom_Type: H
+Pseudopotential_Format: martins_new
+Local_Component: s
+Read_VCD: .true.
+
+begin Atom_Coord
+   0.000000   0.000000  -0.375000
+   0.000000   0.000000   0.375000
+end Atom_Coord
+#------------ end of atom type -------------
+
+Correlation_Type: ca
+Electric_Field: 0.0
+
+Output_All_States: .true.
+Output_Level: 4

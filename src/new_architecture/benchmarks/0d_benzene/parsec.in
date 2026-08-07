@@ -1,0 +1,45 @@
+#
+# Ab-initio calculation by the finite-difference method
+#Restart_run: .true. 
+ 
+Boundary_Sphere_Radius:  16.00
+Grid_Spacing:  0.40
+ 
+States_Num:  20
+Eigensolver: chebff  #arpack
+ 
+Atom_Types_Num:  2
+ 
+#------------ new atom type ---------------- 
+Atom_Type: C
+Local_Component: p
+ 
+begin Atom_Coord
+  2.60782206   0.00000000   0.00000
+  1.30391103   2.25844016   0.00000
+ -1.30391103   2.25844016   0.00000
+ -2.60782206   0.00000000   0.00000
+ -1.30391103  -2.25844016   0.00000
+  1.30391103  -2.25844016   0.00000
+end Atom_Coord
+ 
+#------------ end of atom type ------------- 
+ 
+ 
+#------------ new atom type ---------------- 
+Atom_Type: H
+Local_Component: s
+ 
+begin Atom_Coord
+  4.66762355   0.00000000   0.00000
+  2.33381177   4.04228057   0.00000
+ -2.33381177   4.04228057   0.00000
+ -4.66762355   0.00000000   0.00000
+ -2.33381177  -4.04228057   0.00000
+  2.33381177  -4.04228057   0.00000
+end Atom_Coord
+ 
+#------------ end of atom type ------------- 
+ 
+#output_all_states .true.
+ 

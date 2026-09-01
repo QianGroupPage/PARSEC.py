@@ -495,21 +495,6 @@ non-pure-exponential UPF meshes. Pair both the reported `Local_Component` and
 
 Z. Zhang, C. M. Perez, P. Kwon, M. Head-Gordon, and J. Qian, “ PARSEC.py: A Python-Based Real-Space Kohn–Sham Density Functional Theory Code Accelerated by Machine Learned Charge Density,” Journal of Computational Chemistry 47, no. 23 (2026): e70482, https://doi.org/10.1002/jcc.70482.
 
-@article{https://doi.org/10.1002/jcc.70482,
-author = {Zhang, Zeyi and Perez, Carlos Mora and Kwon, Patrick and Head-Gordon, Martin and Qian, Jin},
-title = {PARSEC.py: A Python-Based Real-Space Kohn–Sham Density Functional Theory Code Accelerated by Machine Learned Charge Density},
-journal = {Journal of Computational Chemistry},
-volume = {47},
-number = {23},
-pages = {e70482},
-keywords = {electronic structure theory, high performance computing, machine learning charge density, real-space KS-DFT},
-doi = {https://doi.org/10.1002/jcc.70482},
-url = {https://onlinelibrary.wiley.com/doi/abs/10.1002/jcc.70482},
-eprint = {https://onlinelibrary.wiley.com/doi/pdf/10.1002/jcc.70482},
-abstract = {ABSTRACT PARSEC.py is a Python-based real-space Kohn–Sham density functional theory (real-space KS-DFT) framework designed to provide a user- and developer-friendly platform for first-principles electronic-structure simulations. Discretization on real-space grids eliminates basis-set approximations, while enabling systematic control of numerical accuracy and large-scale parallelization. Building upon the theoretical foundations of the original PARSEC code, the framework leverages the Python scientific ecosystem to support modular development and integration with modern machine learning (ML) tools. PARSEC.py incorporates ML-predicted density as an alternative initial guess for the superposition of atomic density (SAD) in self-consistent field (SCF) iterations. This capability provides a framework for integrating ML models into electronic-structure calculations and offers a pathway for accelerating SCF convergence. We present the theoretical framework, key algorithms, and performance characteristics of PARSEC.py using both SAD and ML initializations.},
-year = {2026}
-}
-
 ## License
 
 See [`LICENSE`](LICENSE).

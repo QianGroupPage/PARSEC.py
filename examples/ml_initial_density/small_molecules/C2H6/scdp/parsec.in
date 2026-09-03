@@ -1,0 +1,72 @@
+Boundary_Conditions: cluster
+Cluster_Domain_Shape: sphere
+Boundary_Sphere_Radius: 7.0 ang
+Grid_Spacing: 0.2 ang
+Expansion_Order: 8
+Coordinate_Unit: Cartesian_Ang
+Ignore_Symmetry: false
+
+Atom_Types_Num: 2
+Total_Atom_Num: 8
+
+Atom_Type: H
+Element_Symbol: H
+Pseudopotential_Format: martins_new
+Local_Component: s
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  7.4434360000  6.0795810000  5.8404340000
+  7.5753950000  7.8442160000  5.8404190000
+  5.9813140000  7.0761870000  5.8402250000
+  8.0186860000  6.9238130000  8.1597750000
+  6.5565640000  7.9204190000  8.1595660000
+  6.4246050000  6.1557840000  8.1595810000
+end Atom_Coord
+
+Atom_Type: C
+Element_Symbol: C
+Pseudopotential_Format: martins_new
+Local_Component: p
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  7.0000480000  6.9999880000  6.2469320000
+  6.9999520000  7.0000120000  7.7530680000
+end Atom_Coord
+
+Correlation_Type: pbe
+Spin_Polarization: false
+States_Num: 16
+Net_Charges: 0 e
+Fermi_Temp: 500 K
+Max_Iter: 50
+Convergence_Criterion: 2e-4 Ry
+
+Eigensolver: chebdav
+Chebdav_Degree: 15
+FF_MaxIter: 2
+Matvec_Blocksize: 6
+Chebyshev_Degree: 10
+Chebyshev_Degree_Delta: 3
+Subspace_Buffer_Size: 6
+Diag_Tolerance: 1e-4
+
+Mixing_Method: Anderson
+Mixing_Param: 0.30
+Memory_Param: 4
+Restart_Mixing: 20
+Solver_Lpole: 9
+Full_Hartree: false
+
+Initial_Density: scdp
+ML_Density_File: ../densities/scdp.npz
+ML_Density_Units: auto
+ML_Density_Interpolation: linear
+ML_Density_Negative_Policy: clip
+ML_Density_Model: fast
+Normalize_Initial_Density: true
+
+Skip_Force: true
+Output_Level: 1
+Output_All_States: false

@@ -72,7 +72,15 @@ class ParsecTextReporter:
             "",
             " =================================================================",
             "",
-            " Initial Run - starting from atomic potentials",
+            (
+                " Initial Run - starting from atomic potentials"
+                if self.problem.initial_density_settings.method == "sad"
+                else " Initial Run - starting from an imported/ML density"
+            ),
+            (
+                " Initial density method = "
+                f"{self.problem.initial_density_settings.method}"
+            ),
             (
                 " ignoresym= T"
                 if getattr(self.translation, "ignore_symmetry", False)

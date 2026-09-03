@@ -14,11 +14,13 @@ from ..models import (
     EigensolverSettings,
     GridSettings,
     HartreeSettings,
+    InitialDensitySettings,
     MixingSettings,
     SCFSettings,
     SinglePointInput,
     SpeciesPotential,
 )
+from ..MLDensity.field import normalize_density_units
 
 
 # PARSEC's ESDF table uses 1 bohr = 0.529177 angstrom exactly.
@@ -389,6 +391,24 @@ def _parse_parsec_input(
         "max_step",
         "min_step",
         "dynamic_diag_tol",
+        # PARSEC.py extension: a modular initial-density source.  These
+        # labels do not alter the DFT grid or any post-initialization physics.
+        "initial_density",
+        "density_method",
+        "ml_density_file",
+        "ml_file_path",
+        "ml_density_units",
+        "ml_density_negative_policy",
+        "ml_density_interpolation",
+        "ml_density_repository",
+        "ml_density_checkpoint",
+        "ml_density_python",
+        "ml_density_model",
+        "ml_density_device",
+        "ml_density_cache",
+        "ml_density_regenerate",
+        "ml_density_chunk_size",
+        "normalize_initial_density",
     }
     unknown_scalars = sorted(set(scalar).difference(species_keys | accepted_global))
     unknown_blocks = sorted(set(blocks).difference(block_keys))
@@ -415,6 +435,23 @@ def _parse_parsec_input(
         if key not in scalar:
             return default
         return _boolean(one(key), label=key)
+
+    def input_relative_path(key: str) -> Path | None:
+        """Resolve an optional quoted path relative to the input file."""
+
+        if key not in scalar:
+            return None
+        raw = one(key).strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1]
+        if not raw:
+            raise ParsecInputError(f"{key} cannot be empty")
+        candidate = Path(raw).expanduser()
+        return (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (source.parent / candidate).resolve()
+        )
 
     if optional_bool("restart_run") or optional_bool("relax_restart"):
         raise UnsupportedParsecOptionError("restart calculations are not supported")
@@ -763,7 +800,60 @@ def _parse_parsec_input(
             one("net_charges", "0"), label="Net_Charges"
         ),
         use_plain_residual=optional_bool("use_plain_sre"),
+        normalize_initial_density=optional_bool(
+            "normalize_initial_density", True
+        ),
         xc_functional=xc_functional,
+    )
+
+    initial_labels = []
+    for key in ("initial_density", "density_method"):
+        if key in scalar:
+            initial_labels.append((key, _normalize_label(one(key))))
+    if len(initial_labels) == 2 and initial_labels[0][1] != initial_labels[1][1]:
+        raise ParsecInputError(
+            "Initial_Density and legacy Density_Method specify different methods"
+        )
+    initial_method = initial_labels[0][1] if initial_labels else "sad"
+    if initial_method == "ml":
+        initial_method = "file"
+    if initial_method == "sad_ml_grid":
+        raise UnsupportedParsecOptionError(
+            "Density_Method=sad_ml_grid changed the DFT grid in the old architecture. "
+            "The modular implementation keeps Grid_Spacing/domain authoritative; "
+            "use Initial_Density=sad, file, charge3net, or scdp."
+        )
+    file_keys = [key for key in ("ml_density_file", "ml_file_path") if key in scalar]
+    if len(file_keys) > 1:
+        raise ParsecInputError(
+            "provide only one of ML_Density_File and legacy ML_File_Path"
+        )
+    density_file = input_relative_path(file_keys[0]) if file_keys else None
+    default_model = "fast" if initial_method == "scdp" else "qm9"
+    density_cache = input_relative_path("ml_density_cache")
+    if density_cache is None and initial_method in {"charge3net", "scdp"}:
+        density_cache = source.parent / ".parsec_ml_density_cache"
+    initial_density_settings = InitialDensitySettings(
+        method=initial_method,
+        file=density_file,
+        units=normalize_density_units(one("ml_density_units", "auto")),
+        negative_policy=_normalize_label(
+            one("ml_density_negative_policy", "clip")
+        ),
+        interpolation=_normalize_label(
+            one("ml_density_interpolation", "linear")
+        ),
+        repository=input_relative_path("ml_density_repository"),
+        checkpoint=input_relative_path("ml_density_checkpoint"),
+        python_executable=input_relative_path("ml_density_python"),
+        model=one("ml_density_model", default_model).strip().lower(),
+        device=_normalize_label(one("ml_density_device", "auto")),
+        cache_directory=density_cache,
+        regenerate=optional_bool("ml_density_regenerate"),
+        prediction_chunk_size=_integer(
+            one("ml_density_chunk_size", "50000"),
+            label="ML_Density_Chunk_Size",
+        ),
     )
 
     minimization = _normalize_label(one("minimization", "none"))
@@ -819,6 +909,7 @@ def _parse_parsec_input(
         hartree=hartree,
         eigensolver=eigensolver,
         mixing=mixing,
+        initial_density_settings=initial_density_settings,
         recenter_geometry=recenter,
     )
     return ParsecInputTranslation(
@@ -888,6 +979,11 @@ def summarize_translation(translation: ParsecInputTranslation) -> str:
         (
             f"Mixing: Anderson alpha={problem.mixing.parameter:.6g}, "
             f"memory={problem.mixing.memory}, restart={problem.mixing.restart}"
+        ),
+        (
+            "Initial density: "
+            f"{problem.initial_density_settings.method}, "
+            f"normalize={problem.scf.normalize_initial_density}"
         ),
         (
             f"Output: level={translation.output_level}, "

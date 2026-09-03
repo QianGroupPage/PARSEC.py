@@ -1,0 +1,85 @@
+Boundary_Conditions: cluster
+Cluster_Domain_Shape: sphere
+Boundary_Sphere_Radius: 9.0 ang
+Grid_Spacing: 0.2 ang
+Expansion_Order: 8
+Coordinate_Unit: Cartesian_Ang
+Ignore_Symmetry: false
+
+Atom_Types_Num: 3
+Total_Atom_Num: 12
+
+Atom_Type: H
+Element_Symbol: H
+Pseudopotential_Format: martins_new
+Local_Component: s
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  9.8897930000  9.6834860000  7.0036100000
+  9.0000000000  8.2673690000  6.3879170000
+  8.1102070000  9.6834860000  7.0036100000
+  9.8912630000  7.8153950000  8.6777090000
+  8.1087370000  7.8153950000  8.6777090000
+  9.8964890000  8.3796040000  10.9704330000
+  8.1035110000  8.3796040000  10.9704330000
+  9.0000000000  9.8572240000  11.4596990000
+end Atom_Coord
+
+Atom_Type: C
+Element_Symbol: C
+Pseudopotential_Format: martins_new
+Local_Component: p
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  9.0000000000  9.0562180000  7.1527080000
+  9.0000000000  8.4625720000  8.5221750000
+  9.0000000000  9.0022190000  10.7715590000
+end Atom_Coord
+
+Atom_Type: O
+Element_Symbol: O
+Pseudopotential_Format: martins_new
+Local_Component: p
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  9.0000000000  9.4930360000  9.4690320000
+end Atom_Coord
+
+Correlation_Type: pbe
+Spin_Polarization: false
+States_Num: 19
+Net_Charges: 0 e
+Fermi_Temp: 500 K
+Max_Iter: 50
+Convergence_Criterion: 2e-4 Ry
+
+Eigensolver: chebdav
+Chebdav_Degree: 15
+FF_MaxIter: 2
+Matvec_Blocksize: 6
+Chebyshev_Degree: 10
+Chebyshev_Degree_Delta: 3
+Subspace_Buffer_Size: 6
+Diag_Tolerance: 1e-4
+
+Mixing_Method: Anderson
+Mixing_Param: 0.30
+Memory_Param: 4
+Restart_Mixing: 20
+Solver_Lpole: 9
+Full_Hartree: false
+
+Initial_Density: charge3net
+ML_Density_File: ../densities/charge3net.npz
+ML_Density_Units: auto
+ML_Density_Interpolation: linear
+ML_Density_Negative_Policy: clip
+ML_Density_Model: qm9
+Normalize_Initial_Density: true
+
+Skip_Force: true
+Output_Level: 1
+Output_All_States: false

@@ -61,6 +61,7 @@ python src\parsec_python\main.py examples\0d_Si28H36\parsec.in --dry-run
 | `0d_naphthalene` | Eighteen-atom naphthalene benchmark used for GPU/C++ and symmetry optimization. | `python src\parsec_python\main.py examples\0d_naphthalene\parsec.in --no-archive` |
 | `0d_Si28H36` | Larger hydrogen-passivated silicon cluster; use this after validating the environment on a smaller case. | `python src\parsec_python\main.py examples\0d_Si28H36\parsec.in --no-archive` |
 | `0_CH4_CF4` | ARES comparison, FHI98PP-generated ordinary/core-hole potentials, and four spin-unpolarized PBE delta-SCF inputs. | See the core-hole commands below. |
+| `ml_initial_density` | Fourteen-molecule SAD/SCDP/ChargE3Net suite with portable predicted densities and CHEBFF/CHEBDAV reference outputs. | See [`ml_initial_density/README.md`](ml_initial_density/README.md). |
 
 `0d_naphthalene/gpu_cpp` is a retained self-contained historical run folder.
 For new calculations, prefer `0d_naphthalene/parsec.in`; the canonical
@@ -109,11 +110,24 @@ python src\parsec_python\main.py examples\0d_naphthalene\parsec.in `
 ```
 
 Selected `parsec_reference.out`, `parsec_python.out`, and comparison documents
-are retained as validation evidence. Ordinary new outputs, NumPy archives,
-CUDA caches, and `.parsec_cache` directories are intentionally ignored by
-Git. The older readable-Python naphthalene run is preserved locally under
-`0d_naphthalene/reference_readable`; the current optimized input remains at
-the case root.
+are retained as validation evidence. The reference coverage is:
+
+| Case | Python reference | Independent reference |
+|---|---|---|
+| `h2_canonical_nodg` | `parsec_python.out` | Canonical PP/input regression |
+| `h2_full_nonlocal` | `parsec_python.out` | `parsec_reference.out` from Fortran PARSEC |
+| `0d_benzene` | `parsec_python.out` | `parsec_reference.out` from Fortran PARSEC |
+| `0d_naphthalene` | `parsec_python.out` | `parsec_reference.out` and `parsec_reference_time.txt` from the 28-rank Fortran run |
+| `0d_Si28H36` | `parsec_python.out` | `parsec_reference.out` and `parsec_reference_time.txt` from the 30-rank Fortran run |
+| `0_CH4_CF4/python_pbe` | One `parsec_python.out` in each IS/FS directory | Corresponding ARES PBE `ares.log` files and the comparison in its README |
+| `ml_initial_density` | CHEBDAV `parsec.out` and retained CHEBFF `parsec_chebff.out` | Paired SAD/SCDP/ChargE3Net regression data |
+
+Reference timings are hardware-specific; energies and convergence histories
+are the portable validation quantities. Ordinary new outputs, NumPy result
+archives, CUDA caches, and `.parsec_cache` directories are intentionally
+ignored by Git. The older readable-Python naphthalene run is preserved locally
+under `0d_naphthalene/reference_readable`; the current optimized input remains
+at the case root.
 
 ## Comparing execution modes
 

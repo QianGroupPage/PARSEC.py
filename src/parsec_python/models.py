@@ -18,6 +18,14 @@ DomainShape = Literal["sphere", "box"]
 EigensolverName = Literal["chebff", "chebdav", "arpack"]
 HartreeBoundaryMethod = Literal["auto", "multipole", "direct"]
 XCFunctional = Literal["ca", "pbe"]
+InitialDensityMethod = Literal["sad", "file", "charge3net", "scdp"]
+DensityUnits = Literal[
+    "auto",
+    "e_per_bohr3",
+    "e_per_angstrom3",
+    "electrons_per_voxel",
+]
+DensityNegativePolicy = Literal["clip", "error", "allow"]
 
 
 @dataclass(frozen=True)
@@ -323,6 +331,93 @@ class SCFSettings:
 
 
 @dataclass(frozen=True)
+class InitialDensitySettings:
+    """Select and configure the valence-density SCF initial guess.
+
+    ``sad`` is the PARSEC-compatible superposition of atomic densities and is
+    the unchanged default.  ``file`` imports a portable ``.npz`` field or a
+    legacy three-dimensional ``.npy`` field.  ``charge3net`` and ``scdp`` run
+    an isolated model environment through the optional :mod:`MLDensity`
+    adapters and cache their prediction as the same portable ``.npz`` format.
+    Supplying ``file`` with either named provider imports an earlier prediction
+    from that provider without launching its environment.
+
+    The DFT grid always remains authoritative.  A model prediction is either
+    evaluated at those exact active grid points or interpolated onto them; it
+    is never allowed to silently change ``GridSettings``.
+    """
+
+    method: InitialDensityMethod = "sad"
+    file: str | Path | None = None
+    units: DensityUnits = "auto"
+    negative_policy: DensityNegativePolicy = "clip"
+    interpolation: Literal["linear", "nearest"] = "linear"
+    repository: str | Path | None = None
+    checkpoint: str | Path | None = None
+    python_executable: str | Path | None = None
+    model: str = "qm9"
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    cache_directory: str | Path | None = None
+    regenerate: bool = False
+    prediction_chunk_size: int = 50000
+
+    def __post_init__(self) -> None:
+        method = str(self.method).strip().lower()
+        if method == "ml":
+            method = "file"
+        if method not in {"sad", "file", "charge3net", "scdp"}:
+            raise ValueError(
+                "initial density method must be sad, file, charge3net, or scdp"
+            )
+        if self.units not in {
+            "auto",
+            "e_per_bohr3",
+            "e_per_angstrom3",
+            "electrons_per_voxel",
+        }:
+            raise ValueError("unsupported initial-density units")
+        if self.negative_policy not in {"clip", "error", "allow"}:
+            raise ValueError("negative_policy must be clip, error, or allow")
+        if self.interpolation not in {"linear", "nearest"}:
+            raise ValueError("initial-density interpolation must be linear or nearest")
+        if self.device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("ML density device must be auto, cpu, or cuda")
+        chunk_size = int(self.prediction_chunk_size)
+        if chunk_size != self.prediction_chunk_size or chunk_size < 1:
+            raise ValueError("prediction_chunk_size must be a positive integer")
+        if method == "file" and self.file is None:
+            raise ValueError("initial density method 'file' requires ML_Density_File")
+        if method == "sad" and self.file is not None:
+            raise ValueError("ML_Density_File cannot be combined with Initial_Density=sad")
+        model = str(self.model).strip().lower()
+        if not model:
+            raise ValueError("ML density model name cannot be empty")
+        if method == "charge3net" and model not in {"qm9", "mp", "nmc"}:
+            raise ValueError("ChargE3Net model must be qm9, mp, or nmc")
+        if method == "scdp" and model not in {
+            "qm9",
+            "fast",
+            "accurate",
+            "qm9-fast",
+            "qm9-accurate",
+        }:
+            raise ValueError("SCDP model must be fast or accurate")
+        object.__setattr__(self, "method", method)
+        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "prediction_chunk_size", chunk_size)
+        for name in (
+            "file",
+            "repository",
+            "checkpoint",
+            "python_executable",
+            "cache_directory",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, Path(value))
+
+
+@dataclass(frozen=True)
 class SinglePointInput:
     """Complete input to the modular isolated single-point calculator."""
 
@@ -333,6 +428,9 @@ class SinglePointInput:
     hartree: HartreeSettings = field(default_factory=HartreeSettings)
     eigensolver: EigensolverSettings = field(default_factory=EigensolverSettings)
     mixing: MixingSettings = field(default_factory=MixingSettings)
+    initial_density_settings: InitialDensitySettings = field(
+        default_factory=InitialDensitySettings
+    )
     recenter_geometry: bool = True
 
     def __post_init__(self) -> None:

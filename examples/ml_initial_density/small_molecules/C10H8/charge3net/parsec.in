@@ -1,0 +1,82 @@
+Boundary_Conditions: cluster
+Cluster_Domain_Shape: sphere
+Boundary_Sphere_Radius: 9.0 ang
+Grid_Spacing: 0.2 ang
+Expansion_Order: 8
+Coordinate_Unit: Cartesian_Ang
+Ignore_Symmetry: false
+
+Atom_Types_Num: 2
+Total_Atom_Num: 18
+
+Atom_Type: H
+Element_Symbol: H
+Pseudopotential_Format: martins_new
+Local_Component: s
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  9.0000000000  11.4813130000  10.2209270000
+  9.0000000000  10.2402470000  12.3559720000
+  9.0000000000  7.7597530000  12.3559720000
+  9.0000000000  6.5186870000  10.2209270000
+  9.0000000000  11.4813130000  7.7790730000
+  9.0000000000  6.5186870000  7.7790730000
+  9.0000000000  7.7597530000  5.6440280000
+  9.0000000000  10.2402470000  5.6440280000
+end Atom_Coord
+
+Atom_Type: C
+Element_Symbol: C
+Pseudopotential_Format: martins_new
+Local_Component: p
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  9.0000000000  10.3877570000  10.2288030000
+  9.0000000000  9.7000990000  11.4070840000
+  9.0000000000  8.2999010000  11.4070840000
+  9.0000000000  7.6122430000  10.2288030000
+  9.0000000000  8.2899150000  9.0000000000
+  9.0000000000  9.7100850000  9.0000000000
+  9.0000000000  10.3877570000  7.7711970000
+  9.0000000000  7.6122430000  7.7711970000
+  9.0000000000  8.2999010000  6.5929160000
+  9.0000000000  9.7000990000  6.5929160000
+end Atom_Coord
+
+Correlation_Type: pbe
+Spin_Polarization: false
+States_Num: 34
+Net_Charges: 0 e
+Fermi_Temp: 500 K
+Max_Iter: 50
+Convergence_Criterion: 2e-4 Ry
+
+Eigensolver: chebdav
+Chebdav_Degree: 15
+FF_MaxIter: 2
+Matvec_Blocksize: 6
+Chebyshev_Degree: 10
+Chebyshev_Degree_Delta: 3
+Subspace_Buffer_Size: 6
+Diag_Tolerance: 1e-4
+
+Mixing_Method: Anderson
+Mixing_Param: 0.30
+Memory_Param: 4
+Restart_Mixing: 20
+Solver_Lpole: 9
+Full_Hartree: false
+
+Initial_Density: charge3net
+ML_Density_File: ../densities/charge3net.npz
+ML_Density_Units: auto
+ML_Density_Interpolation: linear
+ML_Density_Negative_Policy: clip
+ML_Density_Model: qm9
+Normalize_Initial_Density: true
+
+Skip_Force: true
+Output_Level: 1
+Output_All_States: false

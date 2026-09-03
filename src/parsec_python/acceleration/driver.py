@@ -93,9 +93,39 @@ def _reference_cache_key(
         problem.hartree,
         problem.eigensolver,
         problem.mixing,
+        problem.initial_density_settings,
         problem.recenter_geometry,
     ):
         digest.update(repr(settings).encode("utf-8"))
+    initial_source = problem.initial_density_settings.file
+    if initial_source is not None:
+        source_path = Path(initial_source).resolve()
+        digest.update(str(source_path).encode("utf-8"))
+        if source_path.is_file():
+            with source_path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+    model_checkpoint = problem.initial_density_settings.checkpoint
+    if model_checkpoint is not None:
+        checkpoint_path = Path(model_checkpoint).resolve()
+        digest.update(str(checkpoint_path).encode("utf-8"))
+        if checkpoint_path.is_file():
+            checkpoint_stat = checkpoint_path.stat()
+            digest.update(
+                np.asarray(
+                    [checkpoint_stat.st_size, checkpoint_stat.st_mtime_ns],
+                    dtype=np.int64,
+                ).tobytes()
+            )
+    if (
+        problem.initial_density_settings.method in {"charge3net", "scdp"}
+        and problem.initial_density_settings.file is None
+    ):
+        from parsec_python.MLDensity.providers import provider_source_fingerprint
+
+        digest.update(
+            provider_source_fingerprint(problem.initial_density_settings)
+        )
     for atom in problem.atoms:
         digest.update(atom.symbol.encode("utf-8"))
         digest.update(
@@ -161,6 +191,12 @@ def _prepare_reference_physics(
     deferred_laplacian_cache_directory: os.PathLike[str] | str | None = None,
 ):
     cache_capacity = _resident_reference_cache_size()
+    # A forced fresh model prediction must not be bypassed by the warmed
+    # prepared-system cache.  The ordinary exact-key ML prediction cache still
+    # makes repeat calculations inexpensive when ``regenerate`` is false.
+    initial_settings = getattr(problem, "initial_density_settings", None)
+    if initial_settings is not None and initial_settings.regenerate:
+        cache_capacity = 0
     cache_started = perf_counter()
     cache_key = None
     if cache_capacity:

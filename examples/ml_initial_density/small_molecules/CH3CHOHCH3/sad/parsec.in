@@ -1,0 +1,80 @@
+Boundary_Conditions: cluster
+Cluster_Domain_Shape: sphere
+Boundary_Sphere_Radius: 9.0 ang
+Grid_Spacing: 0.2 ang
+Expansion_Order: 8
+Coordinate_Unit: Cartesian_Ang
+Ignore_Symmetry: false
+
+Atom_Types_Num: 3
+Total_Atom_Num: 12
+
+Atom_Type: H
+Element_Symbol: H
+Pseudopotential_Format: martins_new
+Local_Component: s
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  10.1041920000  7.8848240000  7.9288710000
+  8.7611940000  8.4712540000  6.9054100000
+  8.5000760000  7.1053560000  8.0084240000
+  9.1221890000  10.5985060000  7.9229590000
+  7.5306060000  9.1676750000  8.9751560000
+  10.1172560000  8.3484370000  10.3749160000
+  8.5221060000  7.5708860000  10.5806180000
+  8.7767320000  9.2535330000  11.1219750000
+end Atom_Coord
+
+Atom_Type: C
+Element_Symbol: C
+Pseudopotential_Format: martins_new
+Local_Component: p
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  9.0190060000  8.0688560000  7.8980650000
+  8.6320590000  9.0211760000  8.9938500000
+  9.0295830000  8.5171890000  10.3470550000
+end Atom_Coord
+
+Atom_Type: O
+Element_Symbol: O
+Pseudopotential_Format: martins_new
+Local_Component: p
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  9.2753720000  10.2723200000  8.8320510000
+end Atom_Coord
+
+Correlation_Type: pbe
+Spin_Polarization: false
+States_Num: 19
+Net_Charges: 0 e
+Fermi_Temp: 500 K
+Max_Iter: 50
+Convergence_Criterion: 2e-4 Ry
+
+Eigensolver: chebdav
+Chebdav_Degree: 15
+FF_MaxIter: 2
+Matvec_Blocksize: 6
+Chebyshev_Degree: 10
+Chebyshev_Degree_Delta: 3
+Subspace_Buffer_Size: 6
+Diag_Tolerance: 1e-4
+
+Mixing_Method: Anderson
+Mixing_Param: 0.30
+Memory_Param: 4
+Restart_Mixing: 20
+Solver_Lpole: 9
+Full_Hartree: false
+
+Initial_Density: sad
+Normalize_Initial_Density: true
+
+Skip_Force: true
+Output_Level: 1
+Output_All_States: false

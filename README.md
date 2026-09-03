@@ -105,6 +105,7 @@ src/
 │   ├── reference_main.py          explicit readable CLI launcher
 │   ├── models.py                  shared physical/settings/result data
 │   ├── Input/                     parsec.in translation and validation
+│   ├── MLDensity/                 optional SCDP/ChargE3Net initial guesses
 │   ├── Grid/                      isolated real-space domains
 │   ├── Laplacian/                 high-order finite differences
 │   ├── Pseudopotential/           PARSEC POTRE reader and radial splines
@@ -148,7 +149,8 @@ The isolated single-point workflow is:
    `-nabla^2`.
 5. Interpolate and superpose local ionic potentials; build separable
    Kleinman--Bylander nonlocal projector factors.
-6. Superpose atomic starting densities and normalize the electron count.
+6. Build the selected SAD, file, SCDP, or ChargE3Net starting density on the
+   exact DFT grid and normalize the electron count.
 7. Detect exact supported spatial symmetry and, when useful, construct
    representation-sector operators.
 8. For each SCF iteration, solve Poisson's equation for `V_H`, evaluate
@@ -221,6 +223,92 @@ See [the acceleration guide](src/parsec_python/acceleration/README.md) and
 [the optimization audit](src/parsec_python/acceleration/ACCELERATION_AUDIT.md)
 for implementation and parity details.
 
+## Optional ML initial densities
+
+PARSEC.py can use a density predicted by **ChargE3Net** or **SCDP** as the
+initial SCF guess. This changes only the starting density: the Hartree and XC
+potentials, Hamiltonian, eigensolver, mixing, convergence test, and final
+energy remain ordinary PARSEC.py calculations.
+
+For direct inference, install ChargE3Net or SCDP in its own environment. Their
+PyTorch/e3nn versions are independent of the PARSEC.py `.venv312` environment.
+A separate XYZ or POSCAR is not required: the interface reads the species and
+coordinates from `parsec.in` and evaluates the model at the exact active DFT
+grid points.
+
+The pretrained molecular checkpoints used by this interface were trained on
+QM9. They should be used for H/C/N/O/F molecules only unless a different,
+validated checkpoint is supplied.
+
+### Run directly with ChargE3Net
+
+After installing the official ChargE3Net repository and confirming that
+`models/charge3net_qm9.pt` is present, add this block to `parsec.in`:
+
+```text
+Initial_Density: charge3net
+ML_Density_Model: qm9
+ML_Density_Repository: C:\path\to\charge3net
+ML_Density_Python: C:\path\to\charge3net\.venv\Scripts\python.exe
+ML_Density_Device: auto
+Normalize_Initial_Density: true
+```
+
+### Run directly with SCDP
+
+Install the official SCDP repository in a separate environment and download
+one of its published QM9 checkpoints. For the fast checkpoint, use:
+
+```text
+Initial_Density: scdp
+ML_Density_Model: fast
+ML_Density_Repository: C:\path\to\scdp
+ML_Density_Python: C:\path\to\scdp\.venv\Scripts\python.exe
+ML_Density_Checkpoint: C:\path\to\scdp_fast.ckpt
+ML_Density_Device: auto
+Normalize_Initial_Density: true
+```
+
+Run either case with the normal command:
+
+```powershell
+python src\parsec_python\main.py path\to\calculation\parsec.in --no-archive
+```
+
+Before SCF, PARSEC.py launches the external environment, generates a portable
+exact-grid `density.npz`, validates its values and units, normalizes it to the
+pseudopotential valence-electron count, and caches it under
+`.parsec_ml_density_cache` beside `parsec.in`. An unchanged model, geometry,
+and grid reuse the exact cached prediction. Set `ML_Density_Regenerate: true`
+to force a new prediction.
+
+### Run from an existing `.npz` or `.npy`
+
+The generated `.npz` can be copied with the calculation and reused without
+installing ChargE3Net, SCDP, PyTorch, or the original checkpoint:
+
+```text
+Initial_Density: charge3net
+ML_Density_File: charge3net_qm9_density.npz
+ML_Density_Model: qm9
+ML_Density_Units: auto
+ML_Density_Interpolation: linear
+ML_Density_Negative_Policy: clip
+Normalize_Initial_Density: true
+```
+
+Use `Initial_Density: scdp` for a stored SCDP prediction, or
+`Initial_Density: file` for a provider-neutral density. `.npz` is preferred
+because it stores coordinates, units, and provenance. A legacy `.npy` must be
+a three-dimensional density on exactly the same underlying Cartesian grid;
+with automatic units it is interpreted as electrons per cubic angstrom.
+
+For installation commands, checkpoint details, cache discovery, file schemas,
+and a complete start-to-finish example, see the
+[ML-density interface guide](src/parsec_python/MLDensity/README.md). The
+[42-case regression suite](examples/ml_initial_density/README.md) contains
+runnable SAD, ChargE3Net, and SCDP comparisons with stored predictions.
+
 ## Optional native extension
 
 The C++/OpenMP extension is optional but recommended for fastest automatic
@@ -275,6 +363,7 @@ python src\tools\upf_to_parsec.py input.UPF output_POTRE.DAT
 - [Python implementation map](src/parsec_python/PYTHON_IMPLEMENTATION.md)
 - [Package architecture](src/parsec_python/ARCHITECTURE.md)
 - [Acceleration implementation](src/parsec_python/acceleration/README.md)
+- [ML initial-density interface](src/parsec_python/MLDensity/README.md)
 - [Pseudopotential generation](src/pp_generation/README.md)
 
 ## License

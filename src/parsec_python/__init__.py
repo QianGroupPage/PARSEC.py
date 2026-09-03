@@ -44,6 +44,12 @@ from .Laplacian import (
     second_derivative_coefficients,
 )
 from .Mixer import AndersonMixer, ResidualMetrics, potential_residual_metrics
+from .MLDensity import (
+    DensityLoadResult,
+    build_initial_density,
+    load_density_for_grid,
+    save_point_density,
+)
 from .Occupations import (
     BOLTZMANN_RYDBERG_PER_KELVIN,
     OccupationResult,
@@ -81,6 +87,7 @@ from .models import (
     EnergyBreakdown,
     GridSettings,
     HartreeSettings,
+    InitialDensitySettings,
     MixingSettings,
     PreparationTimings,
     RunTimings,
@@ -129,6 +136,7 @@ __all__ = [
     "ChebFFResult",
     "ChebFFSettings",
     "DirectCoulombBoundary",
+    "DensityLoadResult",
     "EigensolverSettings",
     "EigvalResult",
     "EigvalSettings",
@@ -137,6 +145,7 @@ __all__ = [
     "GridSettings",
     "HartreeResult",
     "HartreeSettings",
+    "InitialDensitySettings",
     "KohnShamHamiltonian",
     "MixingSettings",
     "MultipoleExpansion",
@@ -168,6 +177,7 @@ __all__ = [
     "XCFunctional",
     "apply_negative_laplacian_boundary",
     "build_cluster_grid",
+    "build_initial_density",
     "build_local_ionic_potential",
     "build_negative_laplacian",
     "build_nonlocal_projectors",
@@ -182,6 +192,7 @@ __all__ = [
     "format_flow_map",
     "ion_ion_energy",
     "load_pseudopotentials",
+    "load_density_for_grid",
     "normalize_density",
     "parse_parsec_input",
     "parsec_radial_integral",
@@ -195,6 +206,7 @@ __all__ = [
     "run_reference_single_point",
     "run_chebdav",
     "run_single_point",
+    "save_point_density",
     "second_derivative_coefficients",
     "solve_hartree",
     "solve_eigval",

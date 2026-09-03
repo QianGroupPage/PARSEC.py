@@ -220,20 +220,36 @@ def prepare_single_point(
     )
     nonlocal_ionic_seconds = time.perf_counter() - stage_start
 
-    # 4. Initial valence density and nonlinear core-correction density.  The
-    # valence SAD is normalized to N_e and later supplies occupations/Hartree;
-    # frozen rho_core is never normalized into N_e and enters only CA-LDA XC.
+    # 4. Initial valence density and nonlinear core-correction density.  SAD
+    # remains the PARSEC-compatible default.  A file/ML provider returns the
+    # same one-dimensional volume-density representation on this exact DFT
+    # grid, so no later SCF, Hartree, XC, or Hamiltonian code branches on how
+    # the initial guess was produced.  Frozen rho_core always comes from the
+    # PP atomic data and is never replaced by an ML valence prediction.
     stage_start = time.perf_counter()
     build_atomic_density = (
         superpose_atomic_density
         if atomic_density_builder is None
         else atomic_density_builder
     )
-    initial_density = build_atomic_density(
-        grid, atoms, pseudopotentials, problem.pseudopotentials
-    )
-    # PARSEC always performs this SAD normalization.  Disabling it is an
-    # explicit Python diagnostic option rather than a Fortran-compatible mode.
+    if problem.initial_density_settings.method == "sad":
+        initial_density = build_atomic_density(
+            grid, atoms, pseudopotentials, problem.pseudopotentials
+        )
+    else:
+        # Imported lazily: default SAD calculations do not import or initialize
+        # an ML framework.  The model itself runs in an isolated subprocess.
+        from ..MLDensity import build_initial_density
+
+        initial_density = build_initial_density(
+            problem.initial_density_settings,
+            grid,
+            atoms,
+            problem.pseudopotentials,
+        ).density
+    # PARSEC normalizes its atomic initial guess.  Applying the same operation
+    # to an ML prediction removes model/grid-integration charge drift and is
+    # the scientifically safe default.  Disabling it is diagnostic only.
     if problem.scf.normalize_initial_density:
         initial_density = normalize_density(initial_density, grid, electron_count)
     initial_density_seconds = time.perf_counter() - stage_start

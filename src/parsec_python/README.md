@@ -55,6 +55,7 @@ python src\parsec_python\reference_main.py calculation\parsec.in --no-archive
 | Location | Responsibility |
 |---|---|
 | `Input/` | Translate and validate PARSEC/ESDF input. |
+| `MLDensity/` | Load or predict optional SCDP/ChargE3Net initial densities on the exact DFT grid. |
 | `Grid/` | Build centered isolated sphere or box grids. |
 | `Laplacian/` | Generate high-order finite-difference coefficients and sparse `-nabla^2`. |
 | `Pseudopotential/` | Read Martins-new `POTRE.DAT`, integrate radial data, and reproduce PARSEC splines. |
@@ -139,6 +140,12 @@ Not currently supported as production physics:
 Unsupported requested input is rejected rather than silently approximated.
 Sphere Hartree boundaries use a multipole expansion; box boundaries use the
 exact, slower direct Coulomb construction.
+
+Machine-learned densities are optional initial guesses, not new functionals.
+They are converted/validated/normalized on the authoritative PARSEC grid and
+do not replace the PP core density or any converged DFT term. See
+[MLDensity/README.md](MLDensity/README.md) for direct SCDP/ChargE3Net setup,
+input labels, cache behavior, and training-domain limitations.
 
 ## Pseudopotentials
 

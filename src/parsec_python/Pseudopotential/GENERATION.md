@@ -18,10 +18,12 @@ ONCV/PAW/ultrasoft backends can be added without changing user input.
 Generate the validated PBE/Troullier--Martins Si 2p full-core-hole potential:
 
 ```bash
-cd /mnt/c/Users/zigze/Desktop/parsec_python
+git clone https://github.com/QianGroupPage/PARSEC.py.git
+cd PARSEC.py
+export PARSEC_FORTRAN_ROOT=/path/to/PARSEC
 PYTHONPATH=src python3 -m pp_generation Si \
   --backend fhi98pp \
-  --fhi-root /home/zeyizhang/PARSEC/fhi98pp/adka_v1_0/Dfhipp \
+  --fhi-root "$PARSEC_FORTRAN_ROOT/fhi98pp/adka_v1_0/Dfhipp" \
   --core-hole 2p --hole-charge 1 \
   --cutoff-radius 2.5 \
   --format fhi \
@@ -77,9 +79,10 @@ FHI-to-UPF/POTRE conversion requires the already built QE reader and the
 repository converter:
 
 ```bash
+export PARSEC_FORTRAN_ROOT=/path/to/PARSEC
 PYTHONPATH=src python3 -m pp_generation P \
-  --fhi-root /home/zeyizhang/PARSEC/fhi98pp/adka_v1_0/Dfhipp \
-  --qe-converter /home/zeyizhang/PARSEC/fhi98pp/adka_v1_0/Dfhipp/tools/fhi2upf_qe.x \
+  --fhi-root "$PARSEC_FORTRAN_ROOT/fhi98pp/adka_v1_0/Dfhipp" \
+  --qe-converter "$PARSEC_FORTRAN_ROOT/fhi98pp/adka_v1_0/Dfhipp/tools/fhi2upf_qe.x" \
   --potre-converter src/tools/upf_to_parsec.py \
   --core-hole 1s --cutoff-radius 1.95 \
   --format fhi --format upf --format parsec \
@@ -99,10 +102,11 @@ ATOM's local built-in writer produces CA-LDA defaults. PBE with ATOM requires
 a reviewed `atom.dat` (the online portal maintains a separate PBE library):
 
 ```bash
+export PARSEC_FORTRAN_ROOT=/path/to/PARSEC
 PYTHONPATH=src python3 -m pp_generation Si \
   --backend atom --xc ca \
-  --atom-executable /home/zeyizhang/PARSEC/pseudopotential/Src/atom_all_gfortran.exe \
-  --atom-kb-executable /home/zeyizhang/PARSEC/pseudopotential/Src/kb_conv_gfortran.exe \
+  --atom-executable "$PARSEC_FORTRAN_ROOT/pseudopotential/Src/atom_all_gfortran.exe" \
+  --atom-kb-executable "$PARSEC_FORTRAN_ROOT/pseudopotential/Src/kb_conv_gfortran.exe" \
   --format parsec --format upf --format psp8 --format siesta --format cpw2000 \
   --output-dir pp-output/si-atom-ca
 ```
@@ -117,7 +121,7 @@ core-hole reference is available.
 Run the standard-library suite (also discoverable by pytest):
 
 ```bash
-PARSEC_FORTRAN_ROOT=/home/zeyizhang/PARSEC \
+PARSEC_FORTRAN_ROOT=/path/to/PARSEC \
 PYTHONPATH=src python3 -m unittest -v pp_generation.tests.test_pp_generation
 ```
 

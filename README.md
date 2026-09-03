@@ -11,9 +11,9 @@ Readable scientific modules and optimized execution backends live in that
 package together. Normal calculations automatically select the fastest
 accuracy-preserving combination available on the machine.
 
-The former implementation is preserved in the GitHub branch
-[`old-architecture`](https://github.com/zeyizhang-berkeley/parsec_python/tree/old-architecture)
-and is intentionally absent from the default `main` branch.
+The former implementation is preserved in the Git branch
+`old_architecture` and is intentionally absent from the default `main`
+branch.
 
 ## Quick start
 
@@ -21,7 +21,9 @@ Python 3.12 and the repository's `.venv312` environment are recommended on
 Windows:
 
 ```powershell
-cd C:\Users\zigze\Desktop\parsec_python
+git clone https://github.com/QianGroupPage/PARSEC.py.git
+Set-Location PARSEC.py
+py -3.12 -m venv .venv312
 .\.venv312\Scripts\Activate.ps1
 python -m pip install -r src\parsec_python\requirements.txt
 ```

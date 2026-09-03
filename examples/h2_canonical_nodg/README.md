@@ -4,7 +4,7 @@ This directory preserves the full canonical hydrogen pseudopotential copied
 from:
 
 ```text
-/home/zeyizhang/PARSEC/tests/H2/H_POTRE.DAT
+<PARSEC_FORTRAN_ROOT>/tests/H2/H_POTRE.DAT
 ```
 
 That file contains 863 radial points. It is unrelated to the six-point

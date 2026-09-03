@@ -9,7 +9,7 @@ into all real one-dimensional representations. Exact orbit-stabilizer
 character selection covers both free and fixed-point actions; unsupported or
 trivial actions retain the full orbital domain in automatic mode.
 “Aligned” below means the Python control flow and formulas were checked
-against the named PARSEC routines inside `/home/zeyizhang/PARSEC/src`; it does
+against the named PARSEC routines inside `<PARSEC_FORTRAN_ROOT>/src`; it does
 not claim support for PARSEC features outside that scope.
 
 The acceleration rule is simple: preserve float64 operators and solver

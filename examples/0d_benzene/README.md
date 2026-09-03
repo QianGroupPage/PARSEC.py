@@ -4,7 +4,7 @@ This directory contains the unchanged benzene example input and
 pseudopotentials copied from:
 
 ```text
-/home/zeyizhang/PARSEC/examples/benchmarks/0d_benzene
+<PARSEC_FORTRAN_ROOT>/examples/benchmarks/0d_benzene
 ```
 
 The copied files are byte-for-byte identical to the WSL sources:

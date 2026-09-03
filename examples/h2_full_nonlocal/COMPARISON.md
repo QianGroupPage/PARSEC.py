@@ -57,7 +57,7 @@ does not validate PARSEC's Ono-Hirose double-grid algorithm.
 
 ## Canonical PARSEC H potential
 
-The stock `/home/zeyizhang/PARSEC/tests/H2` case uses PARSEC's canonical
+The stock `<PARSEC_FORTRAN_ROOT>/tests/H2` case uses PARSEC's canonical
 863-point, one-channel H potential and `Double_Grid_Order: 3`. Python currently
 rejects that double-grid setting. A trial order-one PARSEC input with that
 one-channel potential crashes in PARSEC's `nonloc` routine before SCF, so it

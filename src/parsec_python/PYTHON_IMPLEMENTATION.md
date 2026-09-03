@@ -136,10 +136,7 @@ problem = SinglePointInput(
     ],
     pseudopotentials={
         "H": SpeciesPotential(
-            path=(
-                r"\\wsl.localhost\Ubuntu-24.04\home\zeyizhang"
-                r"\PARSEC\tests\H2\python_pp\H_POTRE.DAT"
-            ),
+            path="path/to/H_POTRE.DAT",
             local_angular_momentum=0,  # s
             read_valence_density=True,
         )

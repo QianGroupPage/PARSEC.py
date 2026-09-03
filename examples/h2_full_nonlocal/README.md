@@ -5,7 +5,7 @@ input, full 861-point Martins-new pseudopotential, and PARSEC reference output
 come from:
 
 ```text
-/home/zeyizhang/PARSEC/tests/H2/python_pp/
+<PARSEC_FORTRAN_ROOT>/tests/H2/python_pp/
 ```
 
 The potential is a full PARSEC-format reconstruction of the original Python

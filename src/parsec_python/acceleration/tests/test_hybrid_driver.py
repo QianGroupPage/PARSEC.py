@@ -410,6 +410,31 @@ class RealHybridAccuracyTests(unittest.TestCase):
         )
         self.assertAlmostEqual(actual.energies.total, expected.energies.total, 7)
 
+    def test_explicit_cupy_symmetry_adapts_compact_scf_scalar_fields(self) -> None:
+        """Full-grid CuPy Poisson/XC APIs accept compact symmetry SCF state."""
+
+        problem = parse_parsec_input(SMOKE_INPUT).problem
+        expected = run_scf(prepare_single_point(problem, backend="scipy"))
+        system = prepare_single_point(problem, backend="cupy")
+        actual = run_scf(system)
+
+        details = dict(actual.backend.details)
+        self.assertEqual(details["hartree_backend"], "cupy")
+        self.assertGreater(int(details["symmetry_reduction_ratio"]), 1)
+        np.testing.assert_allclose(
+            actual.eigenvalues,
+            expected.eigenvalues,
+            rtol=2.0e-7,
+            atol=2.0e-7,
+        )
+        np.testing.assert_allclose(
+            actual.density,
+            expected.density,
+            rtol=2.0e-4,
+            atol=5.0e-7,
+        )
+        self.assertAlmostEqual(actual.energies.total, expected.energies.total, 7)
+
     def test_cuda_stream_scheduler_preserves_sector_results(self) -> None:
         problem = parse_parsec_input(SMOKE_INPUT).problem
         with patch.dict(

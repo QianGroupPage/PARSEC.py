@@ -810,15 +810,17 @@ def prepare_single_point(
                 scf_reducer,
             )
 
-    if scf_reducer is not None and xc_functional == "pbe":
-        # The readable PBE evaluator operates on the complete Cartesian
-        # cluster because its density gradient couples neighboring symmetry
-        # orbits.  Expand the invariant density for that operation, then
-        # retain one value per orbit again for the rest of accelerated SCF.
-        # This is an exact representation adapter, not a different functional.
+    if scf_reducer is not None and native_xc_evaluator is None:
+        # The readable XC evaluators accept complete Cartesian arrays.  PBE
+        # specifically needs that layout because its density gradient couples
+        # neighboring symmetry orbits; CA-LDA is pointwise but uses the same
+        # public array contract.  Expand the invariant density for this narrow
+        # operation, then retain one value per orbit again for the rest of the
+        # accelerated SCF.  This is an exact representation adapter, not a
+        # different functional or quadrature.
         from parsec_python.V_xc import XCResult
 
-        def symmetry_pbe_evaluator(density):
+        def symmetry_xc_evaluator(density):
             evaluated = reference.evaluate_xc(scf_reducer.to_full(density))
             return XCResult(
                 potential=scf_reducer.from_full(evaluated.potential),
@@ -829,7 +831,7 @@ def prepare_single_point(
                 total_energy=evaluated.total_energy,
             )
 
-        native_xc_evaluator = symmetry_pbe_evaluator
+        native_xc_evaluator = symmetry_xc_evaluator
 
     if selection.hartree_backend == "cupy":
         from .Hartree.cupy_poisson import CuPyPoissonSolver
@@ -840,12 +842,38 @@ def prepare_single_point(
         implementation.poisson_solver = poisson_solver
 
         def accelerated_hartree(density, initial_potential=None, **kwargs):
-            return poisson_solver.solve(
-                density,
+            # ``CuPyPoissonSolver`` owns the full-grid finite-difference
+            # operator and boundary builder.  The symmetry-aware nonlinear
+            # SCF path, however, keeps scalar fields as one physical value per
+            # orbit.  Expand only across this full-grid solver boundary, then
+            # immediately compact the returned invariant fields again.  This
+            # is an exact representation conversion; no density, boundary
+            # condition, or Poisson tolerance is changed.
+            full_density = (
+                density
+                if scf_reducer is None
+                else scf_reducer.to_full(density)
+            )
+            full_initial = (
+                initial_potential
+                if scf_reducer is None or initial_potential is None
+                else scf_reducer.to_full(initial_potential)
+            )
+            result = poisson_solver.solve(
+                full_density,
                 reference.grid,
                 reference.input.hartree,
-                initial_potential,
+                full_initial,
                 **kwargs,
+            )
+            if scf_reducer is None:
+                return result
+            return replace(
+                result,
+                potential=scf_reducer.from_full(result.potential),
+                right_hand_side=scf_reducer.from_full(
+                    result.right_hand_side
+                ),
             )
 
     elif selection.hartree_backend == "native":
@@ -982,6 +1010,18 @@ def prepare_single_point(
                     reference.input.hartree,
                 )
             else:
+                # The size-adaptive full-grid C++ multipole builder can be
+                # selected even when the nonlinear SCF stores an invariant
+                # scalar field on the wedge.  Expand physical point values at
+                # this narrow boundary only; the multipole/RHS equations and
+                # all later reduced-Poisson algebra are unchanged.
+                if scf_reducer is not None:
+                    from .SCF.symmetry_fields import SymmetryScalarField
+
+                    if isinstance(boundary_density, SymmetryScalarField):
+                        boundary_density = scf_reducer.to_full(
+                            boundary_density
+                        )
                 right_hand_side, boundary = native_boundary_builder.build(
                     boundary_density
                 )
@@ -1016,6 +1056,22 @@ def prepare_single_point(
                     reference.input.hartree,
                     **kwargs,
                 )
+                if scf_reducer is not None and hartree_reduction is not None:
+                    from dataclasses import replace as dataclass_replace
+                    from .SCF.symmetry_fields import SymmetryScalarField
+
+                    if not isinstance(
+                        native_result.potential, SymmetryScalarField
+                    ):
+                        native_result = dataclass_replace(
+                            native_result,
+                            potential=scf_reducer.from_full(
+                                native_result.potential
+                            ),
+                            right_hand_side=scf_reducer.from_full(
+                                native_result.right_hand_side
+                            ),
+                        )
             solve_seconds = perf_counter() - solve_started
             implementation.statistics.hartree_solve_calls += 1
             implementation.statistics.hartree_rhs_seconds += rhs_seconds
@@ -1415,8 +1471,9 @@ def prepare_single_point(
             ),
             (
                 "orbital_density_storage",
-                "normalized wedge orbitals; physical scalar orbit values "
-                "remain compact through SCF",
+                "representation-sector Ritz views; density accumulated "
+                "directly on physical scalar orbits without packed "
+                "wedge-by-state duplication",
             ),
             ("orbital_operator_cache", cache_info.status),
             ("orbital_operator_cache_key", cache_info.key),

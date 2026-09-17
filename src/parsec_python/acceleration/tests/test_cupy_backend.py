@@ -31,6 +31,8 @@ from parsec_python.acceleration.Eigensolvers import (
 from parsec_python.acceleration.Eigensolvers.orthogonalize import (
     _complete_subspace_policy,
     chebdav_block_orth_requested,
+    orthonormalize_complete_appended_subspace,
+    orthonormalize_complete_subspace,
     orthonormalize_appended_block,
 )
 from parsec_python.acceleration.Eigensolvers.chebyshev import (
@@ -111,6 +113,7 @@ class TestCuPyOptionalImport(unittest.TestCase):
             os.environ.pop("PARSEC_CUPY_SUBSPACE_QR_WORK_THRESHOLD", None)
             self.assertEqual(_complete_subspace_policy(20_000, 10), "mgs")
             self.assertEqual(_complete_subspace_policy(360_000, 80), "qr")
+            self.assertEqual(_complete_subspace_policy(700_000, 600), "tsqr")
             os.environ["PARSEC_CUPY_SUBSPACE_ORTHOGONALIZATION"] = "mgs"
             self.assertEqual(_complete_subspace_policy(360_000, 80), "mgs")
 
@@ -263,6 +266,76 @@ class TestCuPyComponentParity(unittest.TestCase):
             self.cp.asnumpy(generalized.residual_norms),
             self.cp.asnumpy(conventional.residual_norms),
             rtol=2e-9,
+            atol=2e-11,
+        )
+
+    def test_tsqr_is_orthonormal_and_preserves_the_input_span(self):
+        rng = np.random.default_rng(1207)
+        host = rng.standard_normal((4096, 32))
+        expected, _ = np.linalg.qr(host, mode="reduced")
+        with patch.dict(
+            os.environ,
+            {
+                "PARSEC_CUPY_SUBSPACE_ORTHOGONALIZATION": "tsqr",
+                "PARSEC_CUPY_TSQR_TILE_BYTES": str(256 * 1024),
+            },
+            clear=False,
+        ):
+            result = orthonormalize_complete_subspace(
+                self.cp.asarray(host, dtype=self.cp.float64)
+            )
+        actual = self.cp.asnumpy(result.basis)
+        self.assertEqual(result.algorithm, "householder_tsqr")
+        np.testing.assert_allclose(
+            actual.T @ actual, np.eye(32), rtol=2e-12, atol=2e-12
+        )
+        # Bases may differ by a dense orthogonal rotation.  Equality of the
+        # two projection operators is the sign/rotation-independent span test.
+        probe = rng.standard_normal((4096, 5))
+        np.testing.assert_allclose(
+            actual @ (actual.T @ probe),
+            expected @ (expected.T @ probe),
+            rtol=2e-11,
+            atol=2e-11,
+        )
+
+    def test_complete_appended_subspace_preserves_locked_prefix(self):
+        rng = np.random.default_rng(1211)
+        locked, _ = np.linalg.qr(rng.standard_normal((4096, 7)), mode="reduced")
+        appended = rng.standard_normal((4096, 32))
+        projected = appended - locked @ (locked.T @ appended)
+        expected, _ = np.linalg.qr(projected, mode="reduced")
+        device = self.cp.asarray(np.column_stack((locked, appended)))
+        with patch.dict(
+            os.environ,
+            {
+                "PARSEC_CUPY_SUBSPACE_ORTHOGONALIZATION": "tsqr",
+                "PARSEC_CUPY_TSQR_TILE_BYTES": str(256 * 1024),
+                "PARSEC_CUPY_PREFIX_PROJECTION_TILE_BYTES": str(256 * 1024),
+            },
+            clear=False,
+        ):
+            result = orthonormalize_complete_appended_subspace(
+                device,
+                existing_columns=7,
+                active_columns=39,
+            )
+        actual = self.cp.asnumpy(result.basis)
+        np.testing.assert_allclose(actual[:, :7], locked, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(
+            actual[:, 7:].T @ actual[:, 7:],
+            np.eye(32),
+            rtol=2e-12,
+            atol=2e-12,
+        )
+        np.testing.assert_allclose(
+            locked.T @ actual[:, 7:], 0.0, rtol=0.0, atol=2e-12
+        )
+        probe = rng.standard_normal((4096, 5))
+        np.testing.assert_allclose(
+            actual[:, 7:] @ (actual[:, 7:].T @ probe),
+            expected @ (expected.T @ probe),
+            rtol=2e-11,
             atol=2e-11,
         )
 

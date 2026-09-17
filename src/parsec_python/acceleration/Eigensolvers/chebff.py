@@ -11,7 +11,7 @@ from parsec_python.Eigensolvers.chebff import ChebFFCycle, ChebFFSettings
 from ..backends.cupy import require_cupy
 from .chebyshev import chebff_filter
 from .lapack_random import LapackRandom
-from .orthogonalize import orthonormalize
+from .orthogonalize import orthonormalize_complete_subspace
 from .rayleigh_ritz import DeviceRayleighRitzResult, rayleigh_ritz
 from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
 
@@ -117,7 +117,14 @@ def run_chebff(
             block_size=settings.block_size,
             reset_recurrence_per_block=settings.reset_recurrence_per_block,
         )
-        vectors = orthonormalize(vectors, rng=basis_generator).basis
+        # CHEBFF orthogonalizes the complete filtered trial space.  Route it
+        # through the same size-adaptive implementation as later SUBSPACE
+        # iterations: small problems retain PARSEC's selective MGS, moderate
+        # GPU problems use one blocked QR, and multi-gigabyte tall bases use
+        # memory-bounded TSQR.  All three construct the same FP64 column span.
+        vectors = orthonormalize_complete_subspace(
+            vectors, rng=basis_generator
+        ).basis
         # CHEBFF uses only eigenvalues and rotated vectors.  Forming
         # ``(H Q) C - (Q C) Lambda`` here is both absent from PARSEC's CHEBFF
         # control flow and an unnecessary grid-by-state GPU operation.

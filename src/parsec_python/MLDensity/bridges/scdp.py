@@ -8,10 +8,19 @@ coefficients is then chunked over the exact DFT grid points.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 
 import numpy as np
+
+
+# PyTorch 2.6 changed ``torch.load`` to weights-only mode by default.  Official
+# SCDP checkpoints (and e3nn 0.4's packaged constants) predate that change and
+# contain trusted framework objects, so retain the loader semantics under
+# which those public files were produced.  This must be set before importing
+# torch/e3nn below.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
 
 def _device(torch, requested: str):
@@ -79,6 +88,13 @@ def predict(args: argparse.Namespace) -> None:
         atom_cutoff=6.0,
         disable_pbc=True,
         vnode_method=vnode_method,
+        # SCDP defaults to a 24-entry top-k before removing self edges.  An
+        # isolated molecule with fewer than 24 atoms has fewer candidates than
+        # that fixed request, which makes torch.topk fail.  Cap the request at
+        # the available atom count; after the self edge is masked this retains
+        # every possible neighbour and is identical to the default for larger
+        # structures.
+        max_neighbors=min(24, int(numbers.size)),
         device=str(device),
     )
     batch = Batch.from_data_list([data]).to(device)

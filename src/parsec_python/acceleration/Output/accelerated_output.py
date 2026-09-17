@@ -10,6 +10,21 @@ from parsec_python.Output import ParsecTextReporter
 from ..models import AcceleratedSinglePointResult
 
 
+# Keep execution placement and precision visible even in the short report.
+# In particular, "Selected backend = cupy" alone does not distinguish the
+# default hybrid from a pure-CuPy run. Everything remains in backend_info;
+# this allowlist controls text presentation only.
+_SUMMARY_DETAIL_KEYS = frozenset({
+    "finite_difference_builder",
+    "hartree_backend",
+    "native_openmp_max_threads",
+    "gpu_later_subspace_filter_precision",
+    "orbital_sector_later_filter_precision",
+    "orbital_symmetry",
+    "hartree_symmetry",
+})
+
+
 class AcceleratedTextReporter:
     """Delegate physical reporting and append backend provenance/timings."""
 
@@ -29,6 +44,7 @@ class AcceleratedTextReporter:
             )
         )
         self.reference = ParsecTextReporter(write, report_translation)
+        self.output_level = report_translation.output_level
 
     def header(self) -> None:
         self.reference.header()
@@ -44,8 +60,10 @@ class AcceleratedTextReporter:
             f" Selected backend  = {info.selected}",
             f" Numeric dtype     = {info.dtype}",
             f" Device            = {info.device}",
-            f" Implementation    = {info.implementation}",
         ]
+        detailed = self.output_level >= 2
+        if detailed:
+            lines.append(f" Implementation    = {info.implementation}")
         if details.get("orbital_symmetry", "").startswith("CuPy real"):
             lines.insert(
                 0,
@@ -60,7 +78,10 @@ class AcceleratedTextReporter:
                 "Hartree uses the proven symmetry wedge reported below.\n",
             )
         for key, value in info.details:
-            lines.append(f" {key} = {value}")
+            if detailed or key in _SUMMARY_DETAIL_KEYS:
+                lines.append(f" {key} = {value}")
+        if not detailed:
+            lines.append(" Detailed backend settings: set Output_Level: 2")
         for reason in info.fallback_reasons:
             lines.append(f" Backend fallback  = {reason}")
         lines.append(

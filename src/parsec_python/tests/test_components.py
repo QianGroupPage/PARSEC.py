@@ -215,6 +215,41 @@ class PhysicsKernelTests(unittest.TestCase):
             expected_second,
         )
 
+    def test_anderson_safeguard_restarts_after_residual_growth(self) -> None:
+        settings = MixingSettings(
+            parameter=0.3,
+            safeguard=True,
+            growth_trigger=2.0,
+            backoff=0.5,
+        )
+        mixer = AndersonMixer(settings)
+        first_input = np.zeros(2)
+        first_mixed = mixer.mix(first_input, np.array([1.0, 0.0]), iteration=1)
+        np.testing.assert_allclose(first_mixed, np.array([0.3, 0.0]))
+
+        second_output = first_mixed + np.array([3.0, 0.0])
+        second_mixed = mixer.mix(first_mixed, second_output, iteration=2)
+        np.testing.assert_allclose(second_mixed, first_mixed + np.array([0.45, 0.0]))
+        self.assertEqual(mixer.safeguard_resets, 1)
+
+    def test_anderson_safeguard_limits_extrapolated_step(self) -> None:
+        settings = MixingSettings(
+            parameter=0.3,
+            safeguard=True,
+            step_limit=2.0,
+            growth_trigger=10.0,
+        )
+        mixer = AndersonMixer(settings)
+        current = mixer.mix(np.zeros(2), np.array([1.0, 0.0]), iteration=1)
+        residual = np.array([0.9, 0.001])
+        mixed = mixer.mix(current, current + residual, iteration=2)
+        self.assertLessEqual(
+            np.linalg.norm(mixed - current),
+            settings.step_limit * settings.parameter * np.linalg.norm(residual)
+            + 1.0e-14,
+        )
+        self.assertEqual(mixer.safeguard_clips, 1)
+
     def test_chebyshev_reuse_branch_on_diagonal_operator(self) -> None:
         size = 30
         kinetic = sp.diags(np.linspace(0.0, 10.0, size), format="csr")

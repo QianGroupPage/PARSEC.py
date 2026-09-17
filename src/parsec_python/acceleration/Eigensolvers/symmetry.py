@@ -75,25 +75,72 @@ class CuPySymmetryOrbitals:
     orbit; phases are needed only when materializing signed full-grid states.
     """
 
-    scaled_wedge_vectors: Any
+    scaled_wedge_vectors: Any | None
     representations: np.ndarray
     full_to_wedge: np.ndarray
     device_full_to_wedge: Any
     phases: Any
     full_size: int
+    representation_columns: np.ndarray | None = None
+    sector_vectors: tuple[Any, ...] | None = None
+    sector_orbits: tuple[np.ndarray, ...] | None = None
+    sector_scales: tuple[np.ndarray, ...] | None = None
+    wedge_size: int | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
-        return self.full_size, int(self.scaled_wedge_vectors.shape[1])
+        if self.scaled_wedge_vectors is not None:
+            count = int(self.scaled_wedge_vectors.shape[1])
+        else:
+            count = int(self.representations.size)
+        return self.full_size, count
 
     @property
     def ndim(self) -> int:
         return 2
 
+    def release_intermediate_storage(self) -> None:
+        """Drop the preceding iteration's sector references before its successor."""
+
+        if self.scaled_wedge_vectors is None:
+            object.__setattr__(self, "sector_vectors", None)
+
     def to_full_device(self):
         """Expand signed orbitals once, preserving global eigenvalue order."""
 
         cp, _ = require_cupy()
+        wedge = self.scaled_wedge_vectors
+        if wedge is None:
+            if (
+                self.representation_columns is None
+                or self.sector_vectors is None
+                or self.sector_orbits is None
+                or self.sector_scales is None
+                or self.wedge_size is None
+            ):
+                raise RuntimeError("lazy symmetry orbitals are incomplete")
+            wedge = cp.zeros(
+                (self.wedge_size, self.representations.size),
+                dtype=cp.float64,
+                order="F",
+            )
+            for representation, source in enumerate(self.sector_vectors):
+                output_columns = np.flatnonzero(
+                    self.representations == representation
+                )
+                if output_columns.size == 0:
+                    continue
+                source_columns = self.representation_columns[output_columns]
+                selected = cp.asfortranarray(source[:, source_columns])
+                selected *= cp.asarray(
+                    self.sector_scales[representation], dtype=cp.float64
+                )[:, None]
+                wedge[
+                    cp.asarray(
+                        self.sector_orbits[representation], dtype=cp.int64
+                    )[:, None],
+                    cp.asarray(output_columns, dtype=cp.int64)[None, :],
+                ] = selected
         full = cp.empty(self.shape, dtype=cp.float64, order="F")
         for representation in range(int(self.phases.shape[0])):
             output_columns = np.flatnonzero(
@@ -101,7 +148,7 @@ class CuPySymmetryOrbitals:
             )
             if output_columns.size == 0:
                 continue
-            expanded = self.scaled_wedge_vectors[
+            expanded = wedge[
                 :, output_columns
             ][self.device_full_to_wedge, :]
             expanded *= self.phases[representation, :, None]
@@ -136,6 +183,10 @@ class CuPySymmetrySCFEigensolver:
         self._sector_timing_stats: list[CuPyTimingStats] = []
         self.scheduler_batches = 0
         self.scheduler_wall_seconds = 0.0
+        self.memory_allocator_policy = "cupy default pool (not evaluated)"
+        self.sector_state_storage = "device"
+        self._previous_memory_allocator = None
+        self._memory_allocator_evaluated = False
 
         cp, _ = require_cupy()
         self._primary_device_id = int(cp.cuda.Device().id)
@@ -450,6 +501,110 @@ class CuPySymmetrySCFEigensolver:
         self._state = None
         self._sector_counts = None
 
+    def _configure_large_problem_allocator(self, counts: list[int]) -> None:
+        """Avoid retained CuPy pool fragments for memory-bound SCF sectors."""
+
+        if self._memory_allocator_evaluated:
+            return
+        self._memory_allocator_evaluated = True
+        policy = os.environ.get(
+            "PARSEC_CUPY_LARGE_PROBLEM_ALLOCATOR", "auto"
+        ).strip().lower()
+        if policy not in {"auto", "pool", "direct"}:
+            raise ValueError(
+                "PARSEC_CUPY_LARGE_PROBLEM_ALLOCATOR must be auto, pool, or direct"
+            )
+        threshold = float(
+            os.environ.get("PARSEC_CUPY_DIRECT_ALLOCATOR_FRACTION", "0.5")
+        )
+        if not 0.0 < threshold <= 1.0:
+            raise ValueError(
+                "PARSEC_CUPY_DIRECT_ALLOCATOR_FRACTION must be in (0, 1]"
+            )
+
+        cp, _ = require_cupy()
+        persistent_bytes: dict[int, int] = {
+            device_id: 0 for device_id in self.device_ids
+        }
+        for representation, count in enumerate(counts):
+            device_id = self._sector_device_ids[representation]
+            persistent_bytes[device_id] += (
+                self.decomposition.sector_size(representation)
+                * int(count)
+                * np.dtype(np.float64).itemsize
+            )
+        totals: dict[int, int] = {}
+        for device_id in self.device_ids:
+            with cp.cuda.Device(device_id):
+                _, total = cp.cuda.runtime.memGetInfo()
+                totals[device_id] = int(total)
+        use_direct = policy == "direct" or (
+            policy == "auto"
+            and any(
+                persistent_bytes[device_id] >= threshold * totals[device_id]
+                for device_id in self.device_ids
+            )
+        )
+        storage_policy = os.environ.get(
+            "PARSEC_CUPY_SECTOR_STATE_STORAGE", "auto"
+        ).strip().lower()
+        if storage_policy not in {"auto", "device", "host"}:
+            raise ValueError(
+                "PARSEC_CUPY_SECTOR_STATE_STORAGE must be auto, device, or host"
+            )
+        self._host_spill_sector_states = bool(
+            storage_policy == "host"
+            or (
+                storage_policy == "auto"
+                and any(
+                    persistent_bytes[device_id] >= threshold * totals[device_id]
+                    for device_id in self.device_ids
+                )
+            )
+        )
+        self.sector_state_storage = (
+            "exact FP64 host spill; one active representation on CUDA"
+            if self._host_spill_sector_states
+            else "persistent CUDA representation states"
+        )
+        if not use_direct:
+            self.memory_allocator_policy = (
+                "cupy default pool; estimated persistent sector orbitals "
+                + ",".join(
+                    f"cuda:{device_id}={persistent_bytes[device_id]}B"
+                    for device_id in self.device_ids
+                )
+            )
+            return
+
+        # Static Hamiltonian buffers allocated earlier remain valid.  Only
+        # subsequent allocations bypass the caching pool, so temporary
+        # ChebDav/SUBSPACE workspaces are returned to CUDA as soon as their
+        # owning arrays die instead of accumulating split blocks across SCF.
+        self._previous_memory_allocator = cp.cuda.get_allocator()
+        for device_id in self.device_ids:
+            with cp.cuda.Device(device_id):
+                cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+        cp.cuda.set_allocator(None)
+        self.memory_allocator_policy = (
+            "direct CUDA allocation for memory-bound sectors; estimated "
+            "persistent sector orbitals "
+            + ",".join(
+                f"cuda:{device_id}={persistent_bytes[device_id]}B"
+                for device_id in self.device_ids
+            )
+        )
+
+    def restore_memory_allocator(self) -> None:
+        """Restore the process allocator after this eigensolver is finished."""
+
+        if self._previous_memory_allocator is None:
+            return
+        cp, _ = require_cupy()
+        cp.cuda.set_allocator(self._previous_memory_allocator)
+        self._previous_memory_allocator = None
+
     def _initial_sector_count(
         self,
         representation: int,
@@ -575,11 +730,22 @@ class CuPySymmetrySCFEigensolver:
                 solver = self._solvers[representation]
                 if reset:
                     solver.reset()
-                return solver.solve(
+                elif getattr(self, "_host_spill_sector_states", False):
+                    solver.restore_state_to_device()
+                result = solver.solve(
                     count,
                     settings=settings,
                     spectral_bound=spectral_bound,
                 )
+                if getattr(self, "_host_spill_sector_states", False):
+                    host_state = solver.offload_state_to_host()
+                    assert host_state is not None
+                    result = replace(
+                        result,
+                        vectors=host_state.subspace.vectors,
+                        state=host_state,
+                    )
+                return result
 
     def _run_one_bound(
         self,
@@ -770,54 +936,18 @@ class CuPySymmetrySCFEigensolver:
         selected_representations: np.ndarray,
         selected_columns: np.ndarray,
     ) -> CuPySymmetryOrbitals:
-        """Pack globally sorted orbitals without repeated full-grid expansion."""
+        """Retain sector views instead of allocating a dense packed wedge.
 
-        cp, _ = require_cupy()
-        count = int(selected_representations.size)
-        with cp.cuda.Device(self._primary_device_id):
-            wedge = cp.zeros(
-                (self.decomposition.wedge_size, count),
-                dtype=cp.float64,
-                order="F",
-            )
-        for representation in range(self.representation_count):
-            output_columns = np.flatnonzero(
-                selected_representations == representation
-            )
-            if output_columns.size == 0:
-                continue
-            wedge_columns = selected_columns[output_columns]
-            source_device = self._sector_device_ids[representation]
-            with cp.cuda.Device(source_device):
-                source = results[representation].vectors[:, wedge_columns]
-                # Materialize the advanced-indexing result before changing
-                # device contexts.  Buffered sector subspaces never move.
-                source = cp.asfortranarray(source)
-            with cp.cuda.Device(self._primary_device_id):
-                if source_device == self._primary_device_id:
-                    primary_source = source
-                else:
-                    try:
-                        # CuPy uses CUDA peer access when the device pair
-                        # permits it.  Materialize a primary-device copy before
-                        # the stabilizer-aware scatter below.
-                        primary_source = cp.asarray(source)
-                    except Exception:
-                        # Exact host-staged fallback for devices without P2P.
-                        with cp.cuda.Device(source_device):
-                            host_source = source.get()
-                        with cp.cuda.Device(self._primary_device_id):
-                            primary_source = cp.asarray(host_source)
-                scaled = primary_source * self._device_sector_scales[
-                    representation
-                ][:, None]
-                sector_orbits = self._device_sector_orbits[representation]
-                wedge[
-                    sector_orbits[:, None],
-                    cp.asarray(output_columns, dtype=cp.int64)[None, :],
-                ] = scaled
+        The old representation packed every selected orbital into a
+        ``wedge_size x requested_states`` array.  That duplicated all sector
+        Ritz vectors solely to sum their squared magnitudes for the density.
+        Keeping the already resident sector arrays and their global-column
+        map removes that copy; :class:`CuPySymmetryDensityBuilder` performs
+        the identical representation-wise sum.
+        """
+
         return CuPySymmetryOrbitals(
-            scaled_wedge_vectors=wedge,
+            scaled_wedge_vectors=None,
             representations=np.ascontiguousarray(
                 selected_representations, dtype=np.int32
             ),
@@ -825,6 +955,25 @@ class CuPySymmetrySCFEigensolver:
             device_full_to_wedge=self._device_full_to_wedge,
             phases=self._device_phases,
             full_size=self.decomposition.full_size,
+            representation_columns=np.ascontiguousarray(
+                selected_columns, dtype=np.int32
+            ),
+            sector_vectors=tuple(result.vectors for result in results),
+            sector_orbits=tuple(
+                np.ascontiguousarray(values, dtype=np.int64)
+                for values in self._sector_orbits
+            ),
+            sector_scales=tuple(
+                np.ascontiguousarray(
+                    1.0
+                    / np.sqrt(
+                        self.decomposition.reduction.multiplicities[values]
+                    ),
+                    dtype=np.float64,
+                )
+                for values in self._sector_orbits
+            ),
+            wedge_size=self.decomposition.wedge_size,
         )
 
     def __call__(
@@ -857,6 +1006,7 @@ class CuPySymmetrySCFEigensolver:
                 for representation in range(self.representation_count)
             ]
         counts = self._sector_counts
+        self._configure_large_problem_allocator(counts)
 
         # CuPyHamiltonianBackend.bind has already retained this exact host
         # field on the full backend.  It is invariant by construction after
@@ -912,8 +1062,10 @@ class CuPySymmetrySCFEigensolver:
         self._state = CuPySymmetryEigvalState(
             requested_states=requested_states,
             sector_state_counts=tuple(counts),
-            sector_states=tuple(
-                solver.device_state for solver in self._solvers
+            sector_states=(
+                tuple(None for _ in self._solvers)
+                if getattr(self, "_host_spill_sector_states", False)
+                else tuple(solver.device_state for solver in self._solvers)
             ),
             solves_completed=solves_completed,
         )

@@ -311,6 +311,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 symmetry=symmetry_mode,
                 symmetry_cache_directory=symmetry_cache_directory,
             )
+            # Wavefunctions are much larger than all scalar observables and
+            # are absent from the default archive.  Keep symmetry-sector
+            # orbitals resident/lazy unless the user explicitly requests
+            # their public full-grid array.  This does not affect SCF density,
+            # energies, eigenvalues, or any normal text output.
+            system.materialize_final_wavefunctions = bool(
+                not arguments.no_archive
+                and (
+                    arguments.save_wavefunctions
+                    or translation.output_all_states
+                )
+            )
             reporter.setup(system)
             if arguments.profile_operator:
                 component_times = profile_hamiltonian_components(

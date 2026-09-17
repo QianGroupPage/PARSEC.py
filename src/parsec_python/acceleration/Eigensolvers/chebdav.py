@@ -35,6 +35,7 @@ from .orthogonalize import (
     chebdav_block_orth_requested,
     orthonormalize,
     orthonormalize_appended_block,
+    orthonormalize_complete_appended_subspace,
 )
 from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
 
@@ -328,13 +329,25 @@ def _final_approximate_subspace(
         block_size=block_size,
         reset_recurrence_per_block=False,
     )
-    _orthonormalize_appended(
-        operator,
-        basis,
-        locked_count,
-        active_count,
-        generator,
-    )
+    if active_count > max(4 * block_size, 32):
+        # The source cleanup may add the complete missing eigenspace in one
+        # operation.  Route that wide suffix through the large-subspace path;
+        # the ordinary Davidson loop continues to use its exact six-column
+        # PARSEC block orthogonalization above.
+        orthonormalize_complete_appended_subspace(
+            basis[:, :target_columns],
+            existing_columns=locked_count,
+            active_columns=target_columns,
+            rng=generator,
+        )
+    else:
+        _orthonormalize_appended(
+            operator,
+            basis,
+            locked_count,
+            active_count,
+            generator,
+        )
     active_values, active_vectors, active_residuals = _rayleigh_ritz_upper(
         operator,
         basis[:, locked_count:target_columns],

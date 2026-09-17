@@ -531,6 +531,16 @@ def run_scf(
         hamiltonian_binding_seconds = time.perf_counter() - binding_start
         hamiltonian_binding_total += hamiltonian_binding_seconds
         diagonalization_start = time.perf_counter()
+        # A memory-adaptive accelerated symmetry result may keep the preceding
+        # iteration's sector arrays only long enough to construct rho.  Once a
+        # successor solve begins those wrapper references are no longer
+        # physical state (the eigensolver owns its exact restart state), so
+        # release them before allocating the new filtered subspace.
+        release_previous_orbitals = getattr(
+            wavefunctions, "release_intermediate_storage", None
+        )
+        if callable(release_previous_orbitals):
+            release_previous_orbitals()
         eigensolution = solve_current_eigenproblem(
             hamiltonian_operator,
             number_of_states,

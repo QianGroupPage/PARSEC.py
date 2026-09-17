@@ -247,16 +247,18 @@ only portable `.npz` files. Neither ML stack is imported for an
 
 The explicit `ML_Density_Repository` and `ML_Density_Python` entries shown in
 the quick start are easiest to understand and reproduce. They may be omitted
-when the following recommended sibling layout is used:
+when the DFT checkout and a minimal ML workspace share the same parent
+directory:
 
 ```text
-parsec_ml_workspace/
-├── parsec_python/                   junction or checkout of this repository
-├── parsec_python_old_architecture/  optional old-architecture worktree
-├── charge3net/                      official clone + its .venv
-└── scdp/                            official clone + its .venv
+project-parent/
+├── parsec_python/             this repository and the canonical DFT source
+└── parsec_ml_workspace/
+    ├── charge3net/             official clone + its .venv
+    └── scdp/                   official clone + its .venv
 ```
 
+The ML workspace does not need another PARSEC checkout or a junction to one.
 This layout does not change any Git remote, branch, or GitHub pointer. Custom
 locations can also be supplied through `PARSEC_ML_WORKSPACE`,
 `CHARGE3NET_REPO`, `CHARGE3NET_PYTHON`, `SCDP_REPO`, and `SCDP_PYTHON`.

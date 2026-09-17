@@ -274,9 +274,22 @@ def _invoke_provider(
         "--chunk-size",
         str(settings.prediction_chunk_size),
     ]
+    # Isolated model environments often import matplotlib indirectly.  Give
+    # those subprocesses a cache directory next to the density request instead
+    # of assuming that the user's home directory is writable.  Newer PyTorch
+    # releases also default ``torch.load`` to weights-only mode; the published
+    # SCDP checkpoint and its e3nn constants contain trusted Python objects and
+    # require the historical full-loader behavior.
+    environment = os.environ.copy()
+    matplotlib_cache = request.parent / "matplotlib-cache"
+    matplotlib_cache.mkdir(parents=True, exist_ok=True)
+    environment.setdefault("MPLCONFIGDIR", str(matplotlib_cache))
+    if provider == "scdp":
+        environment.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
     completed = subprocess.run(
         command,
         cwd=repository,
+        env=environment,
         text=True,
         capture_output=True,
         check=False,

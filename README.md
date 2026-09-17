@@ -17,6 +17,9 @@ branch.
 
 ## Quick start
 
+Linux users: see [Linux installation](#linux-installation) below for Bash commands,
+CPU-only setup, and optional C++/OpenMP + NVIDIA GPU acceleration.
+
 Python 3.12 and the repository's `.venv312` environment are recommended on
 Windows:
 
@@ -87,6 +90,171 @@ Useful options include:
 | `--profile-operator` | Time individual Hamiltonian actions. |
 | `--resident` | Submit to a warmed local worker while creating fresh SCF state. |
 | `--debug` | Re-raise failures with a traceback. |
+
+## Linux installation
+
+These commands use Bash and a source checkout. Python 3.12 is recommended;
+the native extension requires Python 3.10 or newer. A GPU is optional. Neither
+the PARSEC Fortran executable nor MPI is needed for this Python solver.
+
+### 1. Create a Python environment (CPU-only is sufficient)
+
+On Ubuntu 24.04 / recent Debian-based systems, install the prerequisites:
+
+```bash
+sudo apt update
+sudo apt install git python3 python3-venv python3-dev build-essential
+```
+
+On other distributions, install the equivalent packages. On a university
+cluster without administrator access, use the site's Python/compiler modules
+or a user-managed environment instead of `sudo`. Use matching Python development
+headers when building the extension for a non-system Python.
+
+```bash
+git clone https://github.com/zeyizhang-berkeley/parsec_python.git PARSEC.py
+cd PARSEC.py
+python3 --version
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r src/parsec_python/requirements.txt
+```
+
+If you already have a checkout, skip cloning and enter its root directory.
+This installs NumPy and SciPy; CPU calculations are now available:
+
+```bash
+python src/parsec_python/main.py examples/h2_canonical_nodg/parsec.in \
+  --backend scipy --dry-run
+python src/parsec_python/main.py examples/h2_canonical_nodg/parsec.in \
+  --backend scipy --no-archive
+```
+
+`--dry-run` validates the input without running SCF. The second command writes
+`parsec.out` beside the input and replaces an existing log of that name; copy a
+case to a new calculation directory when preserving reference outputs.
+
+### 2. Add the C++/OpenMP CPU kernels (recommended)
+
+The extension needs a C++17 compiler with OpenMP and CMake 3.24 or newer.
+GCC/G++ on Linux is a suitable toolchain. From the activated environment and
+repository root:
+
+```bash
+python -m pip install --upgrade "cmake>=3.24" ninja
+python -m pip install -v ./src/parsec_python/acceleration/native
+python -c "import parsec_accelerated_native as n; print(n.build_info())"
+```
+
+Check that `openmp_enabled` is `True`. Rebuild the extension after updating its
+C++ sources. Windows `.pyd` files and Windows wheels cannot be reused on Linux.
+
+```bash
+python src/parsec_python/main.py examples/h2_canonical_nodg/parsec.in \
+  --backend native --no-archive
+```
+
+The repository-root `pyproject.toml` also builds this extension: `pip install .`
+is **not** an installation of the Python solver package. Use the launcher above,
+or make the source directory importable for module/API use:
+
+```bash
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+python -m parsec_python path/to/calculation/parsec.in --no-archive
+```
+
+### 3. Add NVIDIA GPU acceleration (optional)
+
+First ensure the NVIDIA driver works, then choose a compatible CuPy/CUDA build.
+For CUDA 12.x, with a suitable installed CUDA Toolkit:
+
+```bash
+nvidia-smi
+python -m pip install cupy-cuda12x
+```
+
+If you do not have a system CUDA Toolkit, current CuPy releases also offer
+`python -m pip install "cupy-cuda12x[ctk]"` to install CUDA component dependencies
+in the environment; a compatible NVIDIA driver is still required. Choose one
+installation route and do not install conflicting CuPy distributions together.
+The CUDA version displayed by `nvidia-smi` describes driver capability, not
+proof that a CUDA Toolkit is installed. See the
+[official CuPy installation guide](https://docs.cupy.dev/en/stable/install.html)
+for driver/runtime compatibility and other CUDA versions.
+
+Check device access and a small FP64 calculation:
+
+```bash
+python -c "import cupy as cp; print(cp.__version__); print('devices:', cp.cuda.runtime.getDeviceCount()); x = cp.arange(10, dtype=cp.float64); print('sum:', x.sum().item())"
+```
+
+With both CuPy and the native extension installed, use the default **hybrid**
+execution policy:
+
+```bash
+python src/parsec_python/main.py examples/h2_canonical_nodg/parsec.in \
+  --backend auto --no-archive
+```
+
+Inspect `Acceleration backend:` in `parsec.out`: a typical hybrid run reports
+`Selected backend = cupy` and `hartree_backend = native`. Explicit
+`--backend cupy` is a different comparison policy, not a synonym for hybrid.
+Set `Output_Level: 2` in `parsec.in` for full backend diagnostics; SCF output
+and final timing tables remain available at the default level `1`.
+
+AMD ROCm support in CuPy is experimental and does not establish support for
+this solver's custom GPU kernels. These GPU instructions target NVIDIA CUDA;
+an AMD CPU can still run the CPU/OpenMP path normally.
+
+### 4. Threads, new terminals and clusters
+
+In a new terminal, return to the checkout and activate the Linux environment:
+
+```bash
+cd /path/to/PARSEC.py
+source .venv/bin/activate
+```
+
+Linux uses `.venv/bin/activate`, not Windows `Scripts/Activate.ps1`; the launcher
+uses the active Linux interpreter. Do not share a Windows virtual environment
+with Linux/WSL.
+
+The native default is the processor count detected by OpenMP minus four, with
+a minimum of one thread; individual small kernels may use fewer workers. Override
+it explicitly when needed, especially in a scheduler allocation:
+
+```bash
+export OMP_NUM_THREADS=8  # Example: replace with your allocated CPU count.
+python src/parsec_python/main.py path/to/calculation/parsec.in --no-archive
+```
+
+On a cluster, request CPU/GPU resources with the site's scheduler before running
+jobs. Do not assume the machine-wide detected CPU count equals your allocation;
+respect the site's GPU visibility settings. Do not use `mpirun` to launch this
+single-process command: that would start independent calculations, potentially
+writing to the same files, rather than distribute one SCF calculation.
+
+For a new-system timing comparison, run without `--resident` and add
+`--no-symmetry-cache`. CuPy compilation/driver caches are separate, so this is
+not a guarantee of a completely cold GPU runtime.
+
+### Troubleshooting
+
+- **`No module named parsec_python`:** use `python src/parsec_python/main.py ...`
+  from the repository root, or set `PYTHONPATH` as above. Installing the native
+  extension alone does not install the Python package.
+- **Missing Python headers, compiler or OpenMP:** install the matching development
+  headers and a C++17/OpenMP toolchain; check the verbose build output. Avoid
+  `-ffast-math` when modifying build flags.
+- **CuPy import/NVRTC/CUDA library errors:** check the active environment, driver,
+  CuPy distribution and CUDA library paths. On clusters, load the appropriate
+  CUDA module; `nvidia-smi` succeeding is not a complete kernel test.
+- **Unexpected SciPy fallback:** examine the printed fallback reason and verify
+  the native and CuPy imports separately. `auto` can fall back; an explicit
+  `native` or `cupy` request fails if that backend is unavailable.
+- **Out of GPU memory:** try the CPU/native backend or a machine with more memory.
+  Do not silently coarsen the grid or loosen convergence to make a job fit.
 
 ## Source layout
 

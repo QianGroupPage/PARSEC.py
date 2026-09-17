@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import gc
+import os
 from time import perf_counter
 from typing import Any, Literal
 
@@ -142,6 +144,57 @@ class CuPyEigvalSolver:
         """Discard the reusable GPU eigensubspace."""
 
         self._state = None
+
+    def offload_state_to_host(self) -> CuPyEigvalDeviceState | None:
+        """Move the persistent Ritz state to exact FP64 host storage.
+
+        This is a memory-capacity policy used by the symmetry scheduler for
+        systems whose independent representation states do not all fit on one
+        device.  The Rayleigh--Ritz workspace is scratch and is deliberately
+        discarded; all mathematical state (vectors, eigenvalues, bounds, and
+        filter counters) is retained without conversion loss.
+        """
+
+        state = self._state
+        if state is None:
+            return None
+        cp, _ = require_cupy()
+        saved = state.subspace
+        if not isinstance(saved.vectors, cp.ndarray):
+            return state
+        host_subspace = replace(
+            saved,
+            eigenvalues=np.ascontiguousarray(
+                cp.asnumpy(saved.eigenvalues), dtype=np.float64
+            ),
+            vectors=np.asfortranarray(
+                cp.asnumpy(saved.vectors), dtype=np.float64
+            ),
+            ritz_workspace=None,
+        )
+        self._state = replace(state, subspace=host_subspace)
+        return self._state
+
+    def restore_state_to_device(self) -> CuPyEigvalDeviceState | None:
+        """Upload a previously host-spilled Ritz state to the active CUDA device."""
+
+        state = self._state
+        if state is None:
+            return None
+        cp, _ = require_cupy()
+        saved = state.subspace
+        if isinstance(saved.vectors, cp.ndarray):
+            return state
+        device_subspace = replace(
+            saved,
+            eigenvalues=cp.asarray(saved.eigenvalues, dtype=cp.float64),
+            vectors=cp.asarray(
+                saved.vectors, dtype=cp.float64, order="F"
+            ),
+            ritz_workspace=None,
+        )
+        self._state = replace(state, subspace=device_subspace)
+        return self._state
 
     def truncate_state(self, requested_states: int) -> CuPyEigvalDeviceState:
         """Reduce the active saved subspace without restarting the solver.
@@ -307,6 +360,7 @@ class CuPyEigvalSolver:
         previous_state = self._state
         reason = self._incompatibility(requested_states, working_states)
         restart = previous_state is not None and reason is not None
+        fallback_reason = None
 
         if previous_state is None or reason is not None:
             if self.settings.initial_method == "chebff":
@@ -318,19 +372,53 @@ class CuPyEigvalSolver:
             first_options = {"settings": first_settings}
             if spectral_bound is not None:
                 first_options["spectral_bound"] = spectral_bound
-            first, solve_seconds = synchronized_call(
-                first_solver,
-                self.operator,
-                working_states,
-                **first_options,
-            )
+            try:
+                first, solve_seconds = synchronized_call(
+                    first_solver,
+                    self.operator,
+                    working_states,
+                    **first_options,
+                )
+            except np.linalg.LinAlgError as error:
+                fallback = os.environ.get(
+                    "PARSEC_CUPY_CHEBDAV_FAILURE_FALLBACK", "off"
+                ).strip().lower()
+                if fallback not in {"off", "chebff"}:
+                    raise ValueError(
+                        "PARSEC_CUPY_CHEBDAV_FAILURE_FALLBACK must be off or chebff"
+                    ) from error
+                if self.settings.initial_method != "chebdav" or fallback != "chebff":
+                    raise
+                # This opt-in recovery changes only the eigensolver used for
+                # the first invariant subspace.  It retains the requested
+                # state count, Hamiltonian, precision, and all later PARSEC
+                # SUBSPACE iterations.  Drop failed Davidson temporaries
+                # before launching CHEBFF in the same CUDA context.
+                cp, _ = require_cupy()
+                gc.collect()
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+                first_options = {"settings": self.settings.chebff}
+                first, solve_seconds = synchronized_call(
+                    run_chebff,
+                    self.operator,
+                    working_states,
+                    **first_options,
+                )
+                first_solver = run_chebff
+                fallback_reason = (
+                    "chebdav orthogonalization failed; explicit chebff "
+                    f"fallback: {error}"
+                )
             resolve_device_stages(self.timing_stats)
             self._state = self._state_from_first(
                 first,
                 requested_states,
                 self.settings.initial_method,
             )
-            solver_path = self.settings.initial_method
+            solver_path = (
+                "chebff" if first_solver is run_chebff else "chebdav"
+            )
             residual_device = (
                 None
                 if solver_path == "chebff"
@@ -407,7 +495,7 @@ class CuPyEigvalSolver:
             state=self._state,
             solver_path=solver_path,
             restarted=restart,
-            restart_reason=reason,
+            restart_reason=(reason if reason is not None else fallback_reason),
             requested_states=requested_states,
             working_states=working_states,
             solve_seconds=float(solve_seconds),

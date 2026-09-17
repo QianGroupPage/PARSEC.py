@@ -272,6 +272,10 @@ class MixingSettings:
     memory: int = 4
     restart: int = 20
     regularization: float = 0.0
+    safeguard: bool = False
+    step_limit: float = 2.0
+    growth_trigger: float = 2.0
+    backoff: float = 0.5
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.parameter) or not 0 < self.parameter <= 1:
@@ -287,6 +291,12 @@ class MixingSettings:
             raise ValueError("mixing memory and restart must be positive")
         if not np.isfinite(self.regularization) or self.regularization < 0:
             raise ValueError("mixing regularization cannot be negative")
+        if not np.isfinite(self.step_limit) or self.step_limit <= 0:
+            raise ValueError("mixing safeguard step limit must be positive")
+        if not np.isfinite(self.growth_trigger) or self.growth_trigger <= 1:
+            raise ValueError("mixing safeguard growth trigger must exceed one")
+        if not np.isfinite(self.backoff) or not 0 < self.backoff <= 1:
+            raise ValueError("mixing safeguard backoff must be in (0, 1]")
         object.__setattr__(self, "memory", memory)
         object.__setattr__(self, "restart", restart)
 

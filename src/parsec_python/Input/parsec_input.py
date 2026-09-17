@@ -373,6 +373,10 @@ def _parse_parsec_input(
         "mixing_param",
         "memory_param",
         "restart_mixing",
+        "mixing_safeguard",
+        "mixing_step_limit",
+        "mixing_growth_trigger",
+        "mixing_backoff",
         "solver_lpole",
         "full_hartree",
         "atom_types_num",
@@ -781,6 +785,17 @@ def _parse_parsec_input(
         parameter=_strict_float(one("mixing_param", "0.30"), label="Mixing_Param"),
         memory=_integer(one("memory_param", "4"), label="Memory_Param"),
         restart=_integer(one("restart_mixing", "20"), label="Restart_Mixing"),
+        safeguard=optional_bool("mixing_safeguard"),
+        step_limit=_strict_float(
+            one("mixing_step_limit", "2.0"), label="Mixing_Step_Limit"
+        ),
+        growth_trigger=_strict_float(
+            one("mixing_growth_trigger", "2.0"),
+            label="Mixing_Growth_Trigger",
+        ),
+        backoff=_strict_float(
+            one("mixing_backoff", "0.5"), label="Mixing_Backoff"
+        ),
     )
     hartree = HartreeSettings(
         multipole_order=_integer(one("solver_lpole", "9"), label="Solver_Lpole"),
@@ -978,7 +993,8 @@ def summarize_translation(translation: ParsecInputTranslation) -> str:
         ),
         (
             f"Mixing: Anderson alpha={problem.mixing.parameter:.6g}, "
-            f"memory={problem.mixing.memory}, restart={problem.mixing.restart}"
+            f"memory={problem.mixing.memory}, restart={problem.mixing.restart}, "
+            f"safeguard={problem.mixing.safeguard}"
         ),
         (
             "Initial density: "

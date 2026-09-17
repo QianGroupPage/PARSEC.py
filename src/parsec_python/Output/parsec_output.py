@@ -172,6 +172,14 @@ class ParsecTextReporter:
                 f"  Mixing memory is {mixing.memory:2d}"
             ),
             f" Mixing restarted after {mixing.restart:12d} iterations",
+            (
+                " Anderson safeguard enabled: "
+                f"step_limit={mixing.step_limit:.3g}, "
+                f"growth_trigger={mixing.growth_trigger:.3g}, "
+                f"backoff={mixing.backoff:.3g}"
+                if mixing.safeguard
+                else " Anderson safeguard disabled (strict PARSEC path)"
+            ),
             "",
             " Correlation data:",
             " -----------------",

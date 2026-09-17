@@ -11,6 +11,10 @@ specification and numerical reference.
 
 ## Entry points
 
+For Linux environment creation, C++/OpenMP builds, optional NVIDIA/CuPy setup
+and Bash launch commands, see the repository's
+[Linux installation guide](../../README.md#linux-installation).
+
 From the repository root:
 
 ```powershell
@@ -42,6 +46,19 @@ Default output files beside `parsec.in` are:
   timing sections;
 - `parsec_python_results.npz`, containing structured arrays and metadata,
   unless `--no-archive` is supplied.
+
+Control the verbosity of the `Acceleration backend:` setup section in `parsec.in`:
+
+```text
+Output_Level: 1
+```
+
+The default level `1` prints a concise backend summary, including the device,
+hybrid component placement, thread count when available, precision and fallback
+warnings. Use `Output_Level: 2` (or higher) for all backend settings and diagnostic
+details. This controls only that setup section: output from `SCF iter # 1` onward,
+including per-iteration results, final energies and timing statistics, is unchanged.
+It does not enable extra profiling or change calculation settings.
 
 Use `reference_main.py` only when deliberately auditing the readable SciPy
 translation:
@@ -146,6 +163,22 @@ They are converted/validated/normalized on the authoritative PARSEC grid and
 do not replace the PP core density or any converged DFT term. See
 [MLDensity/README.md](MLDensity/README.md) for direct SCDP/ChargE3Net setup,
 input labels, cache behavior, and training-domain limitations.
+
+The default mixer remains the strict PARSEC Anderson formula.  Difficult
+large systems may opt into a fixed-point-preserving safeguard that limits
+exceptionally large Anderson extrapolations and resets stale history after a
+large residual increase:
+
+```text
+Mixing_Safeguard: true
+Mixing_Step_Limit: 2.0
+Mixing_Growth_Trigger: 2.0
+Mixing_Backoff: 0.5
+```
+
+These controls alter only the nonlinear convergence path.  They do not alter
+the Kohn--Sham equations, energy functional, or convergence criterion.  Leave
+`Mixing_Safeguard` absent or false for a line-by-line PARSEC mixer comparison.
 
 ## Pseudopotentials
 

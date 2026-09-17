@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from parsec_python.Mixer import ResidualMetrics
+from parsec_python.Mixer.anderson import safeguard_anderson_candidate
 from parsec_python.models import EnergyBreakdown, MixingSettings
 
 from ..Symmetry.axis_reflection import AxisReflectionReduction
@@ -236,6 +237,9 @@ class SymmetryAndersonMixer:
     _inputs: list[np.ndarray] = field(default_factory=list, init=False)
     _residuals: list[np.ndarray] = field(default_factory=list, init=False)
     _calls: int = field(default=0, init=False)
+    _previous_residual_norm: float | None = field(default=None, init=False)
+    safeguard_resets: int = field(default=0, init=False)
+    safeguard_clips: int = field(default=0, init=False)
 
     def _clear_history(self) -> None:
         self._inputs.clear()
@@ -244,6 +248,9 @@ class SymmetryAndersonMixer:
     def reset(self) -> None:
         self._clear_history()
         self._calls = 0
+        self._previous_residual_norm = None
+        self.safeguard_resets = 0
+        self.safeguard_clips = 0
 
     def mix(
         self,
@@ -294,6 +301,24 @@ class SymmetryAndersonMixer:
                 average_input += coefficient * (previous_input - input_wedge)
                 average_residual += coefficient * (previous_residual - residual)
             mixed = average_input + self.settings.parameter * average_residual
+
+        if self.settings.safeguard:
+            mixed, residual_norm, reset_history, clipped = (
+                safeguard_anderson_candidate(
+                    input_wedge,
+                    residual,
+                    mixed,
+                    self.settings,
+                    previous_residual_norm=self._previous_residual_norm,
+                    weights=self.reducer.reduction.multiplicities,
+                )
+            )
+            if reset_history:
+                self._clear_history()
+                self.safeguard_resets += 1
+            if clipped:
+                self.safeguard_clips += 1
+            self._previous_residual_norm = residual_norm
 
         self._inputs.append(input_wedge.copy())
         self._residuals.append(residual.copy())

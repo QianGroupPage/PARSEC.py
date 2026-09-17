@@ -35,6 +35,7 @@ class AcceleratedPreparedSinglePointSystem:
     residual_metrics_evaluator: Callable[..., object] | None = None
     total_energy_evaluator: Callable[..., object] | None = None
     scalar_field_adapter: object | None = None
+    materialize_final_wavefunctions: bool = True
 
     def __getattr__(self, name: str):
         return getattr(self.reference, name)
@@ -59,19 +60,33 @@ def run_scf(
     callback: Callable[[SCFIteration], None] | None = None,
 ) -> AcceleratedSinglePointResult:
     """Run the validated SCF algorithm through an accelerated H backend."""
-    result = run_reference_scf(
-        system,
-        callback=callback,
-        eigenproblem_solver=system.eigenproblem_solver,
-        orbital_density_builder=system.orbital_density_builder,
-        mixer_factory=system.mixer_factory,
-        residual_metrics_evaluator=system.residual_metrics_evaluator,
-        total_energy_evaluator=system.total_energy_evaluator,
-        scalar_field_adapter=system.scalar_field_adapter,
+    symmetry_eigensolver = getattr(
+        system.backend, "symmetry_eigensolver", None
     )
+    restore_allocator = getattr(
+        symmetry_eigensolver, "restore_memory_allocator", None
+    )
+    try:
+        result = run_reference_scf(
+            system,
+            callback=callback,
+            eigenproblem_solver=system.eigenproblem_solver,
+            orbital_density_builder=system.orbital_density_builder,
+            mixer_factory=system.mixer_factory,
+            residual_metrics_evaluator=system.residual_metrics_evaluator,
+            total_energy_evaluator=system.total_energy_evaluator,
+            scalar_field_adapter=system.scalar_field_adapter,
+        )
+    except Exception:
+        if callable(restore_allocator):
+            restore_allocator()
+        raise
     # The CuPy SCF downloads only density vectors during nonlinear iterations.
     # Materialize the requested orbitals once for the public final result.
-    if system.backend_info.selected == "cupy":
+    if (
+        system.backend_info.selected == "cupy"
+        and system.materialize_final_wavefunctions
+    ):
         from time import perf_counter
 
         import numpy as np
@@ -100,27 +115,38 @@ def run_scf(
     )
     if synchronize_statistics is not None:
         synchronize_statistics()
-    symmetry_eigensolver = getattr(
-        system.backend, "symmetry_eigensolver", None
-    )
     symmetry_state = getattr(symmetry_eigensolver, "state", None)
     if symmetry_state is not None:
-        key = "orbital_sector_final_state_counts"
+        keys = {
+            "orbital_sector_final_state_counts",
+            "orbital_memory_allocator",
+            "orbital_sector_state_storage",
+        }
         details = tuple(
-            item for item in system.backend_info.details if item[0] != key
+            item for item in system.backend_info.details if item[0] not in keys
         ) + (
             (
-                key,
+                "orbital_sector_final_state_counts",
                 " ".join(
                     str(value)
                     for value in symmetry_state.sector_state_counts
                 ),
+            ),
+            (
+                "orbital_memory_allocator",
+                str(symmetry_eigensolver.memory_allocator_policy),
+            ),
+            (
+                "orbital_sector_state_storage",
+                str(symmetry_eigensolver.sector_state_storage),
             ),
         )
         system.backend_info = replace(
             system.backend_info, details=details
         )
         system.backend.info = system.backend_info
+    if callable(restore_allocator):
+        restore_allocator()
     return AcceleratedSinglePointResult(
         result=result,
         backend=system.backend_info,

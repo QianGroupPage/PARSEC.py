@@ -128,6 +128,63 @@ class AxisReflectionReductionTests(unittest.TestCase):
         expected = density_builder(expanded, occupations, volume_element)
         np.testing.assert_allclose(actual, expected, rtol=0.0, atol=2.0e-15)
 
+    def test_sector_density_equals_packed_wedge_density(self) -> None:
+        decomposition = ReflectionRepresentationDecomposition.build(
+            self.grid, self.reduction
+        )
+        generator = np.random.default_rng(231)
+        representations = np.asarray((0, 2, 1, 3, 0, 2), dtype=np.int32)
+        occupations = generator.random(representations.size)
+        volume_element = self.grid.volume_element
+        sector_vectors = []
+        sector_orbits = []
+        sector_scales = []
+        representation_columns = np.empty(representations.size, dtype=np.int32)
+        packed = np.zeros((decomposition.wedge_size, representations.size))
+        for representation in range(decomposition.representation_count):
+            output_columns = np.flatnonzero(representations == representation)
+            orbits = decomposition.sector_orbit_indices(representation)
+            vectors = generator.standard_normal((orbits.size, output_columns.size))
+            scales = 1.0 / np.sqrt(
+                decomposition.reduction.multiplicities[orbits]
+            )
+            sector_vectors.append(vectors)
+            sector_orbits.append(orbits)
+            sector_scales.append(scales)
+            representation_columns[output_columns] = np.arange(output_columns.size)
+            packed[np.ix_(orbits, output_columns)] = vectors * scales[:, None]
+
+        def density_builder(vectors, weights, volume):
+            return (2.0 / volume) * np.sum(
+                vectors * vectors * weights[None, :], axis=1
+            )
+
+        packed_orbitals = CuPySymmetryOrbitals(
+            scaled_wedge_vectors=packed,
+            representations=representations,
+            full_to_wedge=decomposition.reduction.full_to_wedge,
+            device_full_to_wedge=decomposition.reduction.full_to_wedge,
+            phases=decomposition.phases,
+            full_size=decomposition.full_size,
+        )
+        sector_orbitals = CuPySymmetryOrbitals(
+            scaled_wedge_vectors=None,
+            representations=representations,
+            full_to_wedge=decomposition.reduction.full_to_wedge,
+            device_full_to_wedge=decomposition.reduction.full_to_wedge,
+            phases=decomposition.phases,
+            full_size=decomposition.full_size,
+            representation_columns=representation_columns,
+            sector_vectors=tuple(sector_vectors),
+            sector_orbits=tuple(sector_orbits),
+            sector_scales=tuple(sector_scales),
+            wedge_size=decomposition.wedge_size,
+        )
+        builder = CuPySymmetryDensityBuilder(density_builder)
+        expected = builder(packed_orbitals, occupations, volume_element)
+        actual = builder(sector_orbitals, occupations, volume_element)
+        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=2.0e-15)
+
     def test_only_atom_preserving_operations_are_retained(self) -> None:
         # Without the partner at -x, reflection in x and inversion are not
         # symmetries.  Reflections in y and z remain valid.
@@ -277,7 +334,12 @@ class AxisReflectionReductionTests(unittest.TestCase):
             atol=5.0e-15,
         )
 
-        settings = MixingSettings(parameter=0.37, memory=3, restart=6)
+        settings = MixingSettings(
+            parameter=0.37,
+            memory=3,
+            restart=6,
+            safeguard=True,
+        )
         full_mixer = AndersonMixer(settings)
         wedge_mixer = reducer.mixer(settings)
         current_full = input_potential

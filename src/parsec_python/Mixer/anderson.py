@@ -9,6 +9,49 @@ import numpy as np
 from ..models import MixingSettings
 
 
+def _weighted_norm(vector: np.ndarray, weights: np.ndarray | None = None) -> float:
+    """Return the norm used by the corresponding Anderson least-squares metric."""
+    if weights is None:
+        return float(np.linalg.norm(vector))
+    return float(np.sqrt(np.dot(vector, weights * vector)))
+
+
+def safeguard_anderson_candidate(
+    input_potential: np.ndarray,
+    residual: np.ndarray,
+    candidate: np.ndarray,
+    settings: MixingSettings,
+    *,
+    previous_residual_norm: float | None,
+    weights: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, bool, bool]:
+    """Apply a fixed-point-preserving trust region to an Anderson proposal.
+
+    A sudden residual growth discards stale history and takes one damped
+    linear-mixing step.  Otherwise, only an Anderson displacement much larger
+    than the matching linear step is clipped.  The operations change the path
+    to self-consistency, never the Kohn--Sham fixed point.
+    """
+    residual_norm = _weighted_norm(residual, weights)
+    reset_history = bool(
+        previous_residual_norm is not None
+        and residual_norm > settings.growth_trigger * previous_residual_norm
+    )
+    if reset_history:
+        candidate = (
+            input_potential
+            + settings.parameter * settings.backoff * residual
+        )
+
+    step = candidate - input_potential
+    maximum_step_norm = settings.step_limit * settings.parameter * residual_norm
+    step_norm = _weighted_norm(step, weights)
+    clipped = bool(step_norm > maximum_step_norm > 0.0)
+    if clipped:
+        candidate = input_potential + step * (maximum_step_norm / step_norm)
+    return candidate, residual_norm, reset_history, clipped
+
+
 @dataclass(frozen=True)
 class ResidualMetrics:
     weighted: float
@@ -51,6 +94,9 @@ class AndersonMixer:
     _inputs: list[np.ndarray] = field(default_factory=list, init=False)
     _residuals: list[np.ndarray] = field(default_factory=list, init=False)
     _calls: int = field(default=0, init=False)
+    _previous_residual_norm: float | None = field(default=None, init=False)
+    safeguard_resets: int = field(default=0, init=False)
+    safeguard_clips: int = field(default=0, init=False)
 
     def _clear_history(self) -> None:
         self._inputs.clear()
@@ -59,6 +105,9 @@ class AndersonMixer:
     def reset(self) -> None:
         self._clear_history()
         self._calls = 0
+        self._previous_residual_norm = None
+        self.safeguard_resets = 0
+        self.safeguard_clips = 0
 
     def mix(
         self,
@@ -112,6 +161,23 @@ class AndersonMixer:
                 average_residual += coefficient * (previous_residual - residual)
             mixed = average_input + self.settings.parameter * average_residual
 
+        if self.settings.safeguard:
+            mixed, residual_norm, reset_history, clipped = (
+                safeguard_anderson_candidate(
+                    input_potential,
+                    residual,
+                    mixed,
+                    self.settings,
+                    previous_residual_norm=self._previous_residual_norm,
+                )
+            )
+            if reset_history:
+                self._clear_history()
+                self.safeguard_resets += 1
+            if clipped:
+                self.safeguard_clips += 1
+            self._previous_residual_norm = residual_norm
+
         self._inputs.append(input_potential.copy())
         self._residuals.append(residual.copy())
         if len(self._inputs) > self.settings.memory:
@@ -121,4 +187,9 @@ class AndersonMixer:
         return mixed
 
 
-__all__ = ["AndersonMixer", "ResidualMetrics", "potential_residual_metrics"]
+__all__ = [
+    "AndersonMixer",
+    "ResidualMetrics",
+    "potential_residual_metrics",
+    "safeguard_anderson_candidate",
+]

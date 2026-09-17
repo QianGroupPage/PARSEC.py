@@ -17,6 +17,7 @@ _EPS_BIG = 2.221e-16
 _FIRST_REORTHOGONALIZATION_RATIO = 0.1
 _SECOND_REORTHOGONALIZATION_RATIO = 0.68
 _DEFAULT_QR_WORK_THRESHOLD = 100_000_000
+_DEFAULT_TSQR_STORAGE_THRESHOLD = 1_073_741_824
 
 
 @dataclass(frozen=True)
@@ -566,10 +567,10 @@ def _complete_subspace_policy(row_count: int, column_count: int) -> str:
             if legacy.strip().lower() not in {"0", "false", "no", "off"}
             else "mgs"
         )
-    if policy not in {"auto", "mgs", "qr", "cholqr2"}:
+    if policy not in {"auto", "mgs", "qr", "tsqr", "cholqr2"}:
         raise ValueError(
             "PARSEC_CUPY_SUBSPACE_ORTHOGONALIZATION must be auto, mgs, "
-            "qr, or cholqr2"
+            "qr, tsqr, or cholqr2"
         )
     if policy != "auto":
         return policy
@@ -589,7 +590,210 @@ def _complete_subspace_policy(row_count: int, column_count: int) -> str:
             "PARSEC_CUPY_SUBSPACE_QR_WORK_THRESHOLD cannot be negative"
         )
     work = int(row_count) * int(column_count) * int(column_count)
-    return "qr" if work >= threshold else "mgs"
+    if work < threshold:
+        return "mgs"
+
+    # A monolithic cuSOLVER QR temporarily needs another tall N-by-m array
+    # (and a device-dependent workspace).  That is inexpensive for the usual
+    # small molecular sectors but exhausts an 8 GiB GPU for the large
+    # nanodiamond representations.  TSQR has the same Householder-QR
+    # mathematics while bounding every temporary to one row tile.
+    raw_storage_threshold = os.environ.get(
+        "PARSEC_CUPY_SUBSPACE_TSQR_STORAGE_THRESHOLD",
+        str(_DEFAULT_TSQR_STORAGE_THRESHOLD),
+    ).strip()
+    try:
+        storage_threshold = int(raw_storage_threshold)
+    except ValueError as error:
+        raise ValueError(
+            "PARSEC_CUPY_SUBSPACE_TSQR_STORAGE_THRESHOLD must be an integer"
+        ) from error
+    if storage_threshold < 0:
+        raise ValueError(
+            "PARSEC_CUPY_SUBSPACE_TSQR_STORAGE_THRESHOLD cannot be negative"
+        )
+    storage_bytes = int(row_count) * int(column_count) * 8
+    return "tsqr" if storage_bytes >= storage_threshold else "qr"
+
+
+def _tsqr_in_place(matrix: Any) -> Any:
+    """Return an FP64 Householder TSQR basis using bounded device memory.
+
+    For row blocks ``A_i = Q_i R_i``, a second QR of the vertically stacked
+    triangular factors gives ``[R_i] = Q_R R``.  The global orthonormal basis
+    is then assembled in place as ``Q_i (Q_R)_i``.  This is a factorization of
+    exactly the same input column space as one tall Householder QR; row tiling
+    changes neither the Hamiltonian nor the requested eigenspace.
+
+    The input is consumed intentionally.  CHEBFF/SUBSPACE no longer needs the
+    unorthogonalized filtered vectors, and overwriting them avoids a second
+    multi-gigabyte N-by-state allocation on memory-constrained GPUs.
+    """
+
+    cp, _ = require_cupy()
+    rows, columns = map(int, matrix.shape)
+    if rows < columns:
+        raise ValueError("TSQR requires at least as many rows as columns")
+
+    raw_tile_bytes = os.environ.get(
+        "PARSEC_CUPY_TSQR_TILE_BYTES", str(96 * 1024 * 1024)
+    ).strip()
+    try:
+        tile_bytes = int(raw_tile_bytes)
+    except ValueError as error:
+        raise ValueError("PARSEC_CUPY_TSQR_TILE_BYTES must be an integer") from error
+    if tile_bytes <= 0:
+        raise ValueError("PARSEC_CUPY_TSQR_TILE_BYTES must be positive")
+
+    target_rows = max(columns, tile_bytes // max(8 * columns, 1))
+    block_count = max(1, (rows + target_rows - 1) // target_rows)
+    block_count = min(block_count, rows // columns)
+    # Equal-fraction boundaries ensure that the final block also has at least
+    # ``columns`` rows, so every local reduced QR has an m-by-m R factor.
+    bounds = [(index * rows) // block_count for index in range(block_count + 1)]
+
+    triangular_factors = []
+    for block in range(block_count):
+        start, stop = bounds[block], bounds[block + 1]
+        local_q, local_r = cp.linalg.qr(matrix[start:stop, :], mode="reduced")
+        matrix[start:stop, :] = local_q
+        triangular_factors.append(local_r)
+        del local_q
+
+    stacked = cp.concatenate(triangular_factors, axis=0)
+    del triangular_factors
+    top_q, _top_r = cp.linalg.qr(stacked, mode="reduced")
+    del stacked, _top_r
+
+    for block in range(block_count):
+        start, stop = bounds[block], bounds[block + 1]
+        rotation = top_q[block * columns : (block + 1) * columns, :]
+        updated = matrix[start:stop, :] @ rotation
+        matrix[start:stop, :] = updated
+        del updated
+    del top_q
+
+    gram = np.asarray(cp.asnumpy(matrix.T @ matrix), dtype=np.float64)
+    error = float(
+        np.max(
+            np.abs(gram - np.eye(columns, dtype=np.float64)), initial=0.0
+        )
+    )
+    # The tolerance matches the existing block/CholeskyQR2 audits.  A failed
+    # audit is a hard numerical error rather than permission to continue with
+    # a changed or rank-deficient eigenspace.
+    if not np.isfinite(error) or error > 5.0e-11:
+        raise np.linalg.LinAlgError(
+            f"TSQR orthogonality audit failed ({error:.3e})"
+        )
+    return matrix
+
+
+def orthonormalize_complete_appended_subspace(
+    vectors: Any,
+    *,
+    existing_columns: int,
+    active_columns: int | None = None,
+    rng: Any | None = None,
+) -> DeviceOrthonormalizationResult:
+    """Orthogonalize a large appended space while preserving a locked prefix.
+
+    CHEBDAV normally appends six columns, for which
+    :func:`orthonormalize_appended_block` is ideal.  Its final approximate
+    cleanup can instead append hundreds of columns at once.  Treating that
+    complete space as a six-column block maps to sequential MGS and may exceed
+    PARSEC's dependent-vector replacement limit.
+
+    Here ``Q`` is the already locked orthonormal prefix and ``X`` is the large
+    active suffix.  Two tiled block projections form
+
+    ``X <- X - Q (Q.T X)``
+
+    without allocating an N-by-active projection temporary, after which the
+    normal complete-subspace QR/TSQR policy orthonormalizes ``X``.  Locked
+    vectors are never rotated.  Both ``Q.T X`` and ``X.T X-I`` are audited in
+    FP64; one corrective projection/factorization is allowed before a hard
+    numerical error is reported.
+    """
+
+    cp, _ = require_cupy()
+    basis = cp.asarray(vectors, dtype=cp.float64)
+    if basis.ndim != 2:
+        raise ValueError("vectors must be a two-dimensional column matrix")
+    rows, workspace_columns = map(int, basis.shape)
+    columns = workspace_columns if active_columns is None else int(active_columns)
+    existing_columns = int(existing_columns)
+    if not 0 <= existing_columns < columns <= workspace_columns:
+        raise ValueError("existing_columns must precede the active suffix")
+
+    prefix = basis[:, :existing_columns]
+    active = basis[:, existing_columns:columns]
+    suffix_columns = int(active.shape[1])
+    raw_tile_bytes = os.environ.get(
+        "PARSEC_CUPY_PREFIX_PROJECTION_TILE_BYTES", str(96 * 1024 * 1024)
+    ).strip()
+    try:
+        tile_bytes = int(raw_tile_bytes)
+    except ValueError as error:
+        raise ValueError(
+            "PARSEC_CUPY_PREFIX_PROJECTION_TILE_BYTES must be an integer"
+        ) from error
+    if tile_bytes <= 0:
+        raise ValueError(
+            "PARSEC_CUPY_PREFIX_PROJECTION_TILE_BYTES must be positive"
+        )
+    tile_rows = max(1, tile_bytes // max(8 * suffix_columns, 1))
+
+    def project_locked_prefix() -> None:
+        if not existing_columns:
+            return
+        coefficients = prefix.T @ active
+        for start in range(0, rows, tile_rows):
+            stop = min(rows, start + tile_rows)
+            update = prefix[start:stop, :] @ coefficients
+            active[start:stop, :] -= update
+            del update
+        del coefficients
+
+    algorithm = "complete_appended_"
+    last_cross_error = 0.0
+    last_internal_error = np.inf
+    for correction in range(2):
+        project_locked_prefix()
+        project_locked_prefix()
+        complete = orthonormalize_complete_subspace(active, rng=rng)
+        active[:, :] = complete.basis
+        algorithm = "complete_appended_" + complete.algorithm
+
+        gram = np.asarray(cp.asnumpy(active.T @ active), dtype=np.float64)
+        last_internal_error = float(
+            np.max(
+                np.abs(gram - np.eye(suffix_columns, dtype=np.float64)),
+                initial=0.0,
+            )
+        )
+        if existing_columns:
+            cross = np.asarray(cp.asnumpy(prefix.T @ active), dtype=np.float64)
+            last_cross_error = float(np.max(np.abs(cross), initial=0.0))
+        else:
+            last_cross_error = 0.0
+        if (
+            np.isfinite(last_internal_error)
+            and np.isfinite(last_cross_error)
+            and last_internal_error <= 5.0e-11
+            and last_cross_error <= 5.0e-11
+        ):
+            return DeviceOrthonormalizationResult(
+                basis=basis,
+                random_replacements=0,
+                zero_replacements=0,
+                algorithm=algorithm,
+            )
+
+    raise np.linalg.LinAlgError(
+        "complete appended-subspace audit failed "
+        f"(internal={last_internal_error:.3e}, cross={last_cross_error:.3e})"
+    )
 
 
 def orthonormalize_complete_subspace(
@@ -616,6 +820,8 @@ def orthonormalize_complete_subspace(
         return orthonormalize(matrix, rng=rng)
     if policy == "qr":
         basis, _triangular = cp.linalg.qr(matrix, mode="reduced")
+    elif policy == "tsqr":
+        basis = _tsqr_in_place(matrix)
     else:
         # CholeskyQR2 reduces the many scalar synchronizations of selective
         # Gram--Schmidt to two small Gram transfers.  The second pass restores
@@ -650,6 +856,13 @@ def orthonormalize_complete_subspace(
         basis=basis,
         random_replacements=0,
         zero_replacements=0,
+        algorithm=(
+            "householder_tsqr"
+            if policy == "tsqr"
+            else "householder_qr"
+            if policy == "qr"
+            else "cholesky_qr2"
+        ),
     )
 
 
@@ -658,5 +871,6 @@ __all__ = [
     "chebdav_block_orth_requested",
     "orthonormalize",
     "orthonormalize_appended_block",
+    "orthonormalize_complete_appended_subspace",
     "orthonormalize_complete_subspace",
 ]

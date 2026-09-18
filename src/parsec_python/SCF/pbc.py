@@ -33,7 +33,7 @@ from ..V_ion import (
     superpose_atomic_density,
 )
 from ..V_xc import XCResult, ca_lda
-from .single_point import run_scf as _run_isolated_scf
+from .single_point import run_scf as _run_scf
 
 
 @dataclass(frozen=True)
@@ -242,23 +242,7 @@ def prepare_periodic_single_point(
     )
 
 
-def run_periodic_single_point(
-    problem: SinglePointInput,
-    *,
-    callback: Callable[[SCFIteration], None] | None = None,
-) -> SinglePointResult:
-    """Prepare and run one Gamma-point periodic single-point calculation.
-
-    ``run_scf`` itself is :func:`~.single_point.run_scf`, completely
-    unmodified -- see this module's docstring for what is and is not
-    modeled correctly in the periodic-specific preparation stage.
-    """
-    system = prepare_periodic_single_point(problem)
-    return _run_isolated_scf(system, callback=callback)
-
-
 __all__ = [
     "PeriodicPreparedSinglePointSystem",
     "prepare_periodic_single_point",
-    "run_periodic_single_point",
 ]

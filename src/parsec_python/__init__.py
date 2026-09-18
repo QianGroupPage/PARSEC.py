@@ -21,7 +21,12 @@ from .Eigensolvers import (
     solve_eigval,
 )
 from .Energy import total_energy
-from .Grid import RealSpaceGrid, build_cluster_grid
+from .Grid import (
+    PeriodicRealSpaceGrid,
+    RealSpaceGrid,
+    build_cluster_grid,
+    build_periodic_grid,
+)
 from .Hamiltonian import KohnShamHamiltonian
 from .Hartree import (
     DirectCoulombBoundary,
@@ -29,6 +34,9 @@ from .Hartree import (
     MultipoleExpansion,
     density_multipoles,
     solve_hartree,
+    PeriodicHartreeResult,
+    neutralize_density,
+    solve_periodic_hartree,
 )
 from .Input import (
     ANGSTROM_TO_BOHR,
@@ -72,6 +80,7 @@ from .V_ion import (
     load_pseudopotentials,
     normalize_density,
     superpose_atomic_density,
+    ewald_ion_ion_energy,
 )
 from .V_xc import (
     XCResult,
@@ -97,12 +106,17 @@ from .models import (
     SinglePointResult,
     SpeciesPotential,
     XCFunctional,
+    PeriodicCell,
+    PeriodicGridSettings,
 )
 from .driver import (
     PreparedSinglePointSystem,
     prepare_single_point as prepare_reference_single_point,
     run_scf as run_reference_scf,
     run_single_point as run_reference_single_point,
+    PeriodicPreparedSinglePointSystem,
+    prepare_periodic_single_point,
+#    run_periodic_single_point,
 )
 from .acceleration.driver import (
     AcceleratedPreparedSinglePointSystem,
@@ -213,4 +227,14 @@ __all__ = [
     "superpose_atomic_density",
     "summarize_translation",
     "total_energy",
+    "PeriodicCell",
+    "PeriodicGridSettings",
+    "PeriodicRealSpaceGrid",
+    "build_periodic_grid",
+    "ewald_ion_ion_energy",
+    "neutralize_density",
+    "solve_periodic_hartree",
+    "prepare_periodic_single_point",
+    "run_periodic_single_point",
+    "solve_periodic_hartree",
 ]

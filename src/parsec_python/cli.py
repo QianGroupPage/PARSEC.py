@@ -11,7 +11,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .driver import prepare_single_point, run_scf
+from .driver import prepare_single_point, prepare_periodic_single_point, run_scf
 from .Input import (
     ParsecInputError,
     parse_parsec_input,
@@ -331,6 +331,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
 
+    is_periodic = translation.problem.periodic_cell is not None
+    #if translation.problem.periodic_cell is not None:
+    #    print(
+    #        "Input error: this CLI's accelerated backend selection, symmetry "
+    #        "detection, and dry-run diagnostics are isolated-only. A periodic "
+    #        "(Boundary_Conditions=bulk) input parses successfully but must be "
+    #        "run through parsec_python.SCF.pbc.run_periodic_single_point() "
+    #        "(or driver.run_periodic_single_point()) directly for now.",
+    #        file=sys.stderr,
+    #    )
+    #    return 2
+
+    symmetry_mode = (
+        arguments.symmetry
+        if arguments.symmetry is not None
+        else ("off" if translation.ignore_symmetry else "auto")
+    )
+
     summary = summarize_translation(translation)
     if arguments.dry_run:
         try:
@@ -391,7 +409,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             for warning in translation.warnings:
                 log.write(f"WARNING: {warning}")
             log.write()
-            system = prepare_single_point(translation.problem)
+            if is_periodic:
+                system = prepare_periodic_single_point(translation.problem)
+            else:
+                system = prepare_single_point(translation.problem)
             reporter.setup(system)
 
             scf_start = time.perf_counter()

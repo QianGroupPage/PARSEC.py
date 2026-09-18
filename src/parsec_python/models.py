@@ -188,6 +188,9 @@ class PeriodicGridSettings:
 
     spacing: float
     expansion_order: int = 12
+    shift: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    domain_shape: DomainShape = "PBC_Orthorhombic"
+    box_lengths: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.spacing) or self.spacing <= 0:
@@ -202,6 +205,10 @@ class PeriodicGridSettings:
     @property
     def stencil_half_width(self) -> int:
         return self.expansion_order // 2
+    @property
+    def enclosing_radius(self) -> float:
+        """PARSEC ``rmax`` used only to size the underlying Cartesian box."""
+        return 0.5 * float(np.linalg.norm(np.asarray(self.box_lengths)))
 
 
 @dataclass(frozen=True)

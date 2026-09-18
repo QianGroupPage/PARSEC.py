@@ -19,6 +19,8 @@ from ..models import (
     SCFSettings,
     SinglePointInput,
     SpeciesPotential,
+    PeriodicCell,
+    PeriodicGridSettings,
 )
 from ..MLDensity.field import normalize_density_units
 
@@ -269,6 +271,56 @@ def _block_numbers(lines: tuple[str, ...], *, label: str) -> tuple[list[float], 
     return values, unit
 
 
+def _parse_cell_shape(
+    scalar: dict[str, list["_InputItem"]],
+    blocks: dict[str, list["_InputItem"]],
+) -> PeriodicCell:
+    """Parse a ``Cell_Shape`` block into a :class:`PeriodicCell`.
+
+    """
+
+    label = "Cell_Shape"
+    cell_blocks = blocks.get("cell_shape", [])
+    if len(cell_blocks) != 1:
+        raise ParsecInputError("a periodic cell requires exactly one Cell_Shape block")
+    lines = cell_blocks[0].value
+    if len(lines) == 1:
+        values, unit = _block_numbers(lines, label=label)
+        if len(values) != 3 or unit:
+            raise ParsecInputError(
+                "a one-line Cell_Shape block must contain exactly the three "
+                "orthorhombic side lengths"
+            )
+        vectors = np.diag(values)
+    elif len(lines) == 3:
+        rows = []
+        for row_index, line in enumerate(lines, start=1):
+            row_values, unit = _block_numbers((line,), label=label)
+            if len(row_values) != 3 or unit:
+                raise ParsecInputError(
+                    f"Cell_Shape line {row_index} must contain exactly three components"
+                )
+            rows.append(row_values)
+        vectors = np.array(rows, dtype=np.float64)
+    else:
+        raise ParsecInputError(
+            "Cell_Shape must contain 1 line (orthorhombic side lengths) or "
+            f"3 lines (general lattice vectors), not {len(lines)}"
+        )
+
+    scale_occurrences = scalar.get("lattice_vector_scale", [])
+    if len(scale_occurrences) > 1:
+        lines_str = ", ".join(str(item.line) for item in scale_occurrences)
+        raise ParsecInputError(
+            f"duplicate lattice_vector_scale values on lines {lines_str}; provide it once"
+        )
+    scale_text = (
+        str(scale_occurrences[0].value) if scale_occurrences else "1 bohr"
+    )
+    scale = _physical_length(scale_text, label="Lattice_Vector_Scale")
+    return PeriodicCell(lattice_vectors=vectors * scale)
+
+
 def _coordinate_factor(value: str) -> float:
     normalized = _normalize_label(value)
     if normalized in {"cartesian_ang", "cartesianang"}:
@@ -341,7 +393,7 @@ def _parse_parsec_input(
         "so_psp",
         "atomic_energy_correction",
     }
-    block_keys = {"atom_coord", "domain_shape_parameters"}
+    block_keys = {"atom_coord", "domain_shape_parameters", "cell_shape"}
     accepted_global = {
         "restart_run",
         "relax_restart",
@@ -409,6 +461,7 @@ def _parse_parsec_input(
         "ml_density_regenerate",
         "ml_density_chunk_size",
         "normalize_initial_density",
+        "lattice_vector_scale",
     }
     unknown_scalars = sorted(set(scalar).difference(species_keys | accepted_global))
     unknown_blocks = sorted(set(blocks).difference(block_keys))
@@ -460,14 +513,20 @@ def _parse_parsec_input(
             "Old_Pseudopotential_Format=true is not supported; use PARSEC's "
             "new Martins pseudopotential format"
         )
-    if optional_bool("periodic_system"):
-        raise UnsupportedParsecOptionError(
-            "Periodic_System=true is outside the isolated single-point solver"
-        )
     boundary = _normalize_label(one("boundary_conditions", "cluster"))
-    if boundary not in {"cluster", "0d"}:
+    is_periodic = boundary in {"bulk", "3d", "pbc"}
+    if boundary not in {"cluster", "0d", "bulk", "3d", "pbc"}:
         raise UnsupportedParsecOptionError(
-            f"Boundary_Conditions={boundary!r} is not an isolated cluster"
+            f"Boundary_Conditions={boundary!r}; only cluster (isolated) and "
+            "bulk (periodic, Gamma-point, orthorhombic cell) are supported "
+            "-- wire and slab are not"
+        )
+    periodic_flag = optional_bool("periodic_system")
+    if periodic_flag != is_periodic:
+        raise UnsupportedParsecOptionError(
+            "Periodic_System and Boundary_Conditions disagree: "
+            "Periodic_System=true requires Boundary_Conditions=bulk, and "
+            "Boundary_Conditions=cluster requires Periodic_System=false"
         )
     if optional_bool("spin_polarization"):
         raise UnsupportedParsecOptionError("spin-polarized calculations are not supported")
@@ -495,53 +554,72 @@ def _parse_parsec_input(
         raise UnsupportedParsecOptionError(
             f"Correlation_Type={correlation!r}; supported choices are CA/PZ LDA and PBE"
         )
-
-    shape = _normalize_label(one("cluster_domain_shape", "sphere"))
-    spacing = _physical_length(one("grid_spacing"), label="Grid_Spacing")
-    if shape == "sphere":
-        radius = _physical_length(
-            one("boundary_sphere_radius"), label="Boundary_Sphere_Radius"
-        )
-        box_lengths = None
-    elif shape == "box":
-        domain_blocks = blocks.get("domain_shape_parameters", [])
-        if len(domain_blocks) != 1:
-            raise ParsecInputError(
-                "box domain requires exactly one Domain_Shape_Parameters block"
-            )
-        values, unit = _block_numbers(
-            domain_blocks[0].value, label="Domain_Shape_Parameters"
-        )
-        if len(values) != 3:
-            raise ParsecInputError(
-                "box Domain_Shape_Parameters must contain three full side lengths"
-            )
-        # PARSEC reads this block directly in bohr. Permit an explicit unit as
-        # a convenience, while retaining raw-bohr behavior when absent.
-        factor = (
-            _physical_length(f"1 {unit}", label="Domain_Shape_Parameters")
-            if unit
-            else 1.0
-        )
-        box_lengths = tuple(float(value * factor) for value in values)
-        radius = 0.5 * float(np.linalg.norm(box_lengths))
-    else:
+    if is_periodic and xc_functional != "ca":
         raise UnsupportedParsecOptionError(
-            f"Cluster_Domain_Shape={shape!r}; only sphere and box are supported"
+            "the periodic (Boundary_Conditions=bulk) path only supports "
+            "Correlation_Type=CA: PBE's density gradient assumes the "
+            "isolated domain's zero-padded boundary, which is wrong under "
+            "periodic wraparound"
         )
 
+    spacing = _physical_length(one("grid_spacing"), label="Grid_Spacing")
     ignore_symmetry = optional_bool("ignore_symmetry")
-    shift = (0.0, 0.0, 0.0) if ignore_symmetry else (0.5, 0.5, 0.5)
-    grid = GridSettings(
-        spacing=spacing,
-        radius=radius,
-        expansion_order=_integer(
-            one("expansion_order", "12"), label="Expansion_Order"
-        ),
-        shift=shift,
-        domain_shape=shape,
-        box_lengths=box_lengths,
-    )
+    periodic_cell = None
+    shape: str | None = None
+    if is_periodic:
+        periodic_cell = _parse_cell_shape(scalar, blocks)
+        grid = PeriodicGridSettings(
+            spacing=spacing,
+            expansion_order=_integer(
+                one("expansion_order", "12"), label="Expansion_Order"
+            ),
+            box_lengths=tuple(np.diag(periodic_cell.lattice_vectors))
+        )
+    else:
+        shape = _normalize_label(one("cluster_domain_shape", "sphere"))
+        if shape == "sphere":
+            radius = _physical_length(
+                one("boundary_sphere_radius"), label="Boundary_Sphere_Radius"
+            )
+            box_lengths = None
+        elif shape == "box":
+            domain_blocks = blocks.get("domain_shape_parameters", [])
+            if len(domain_blocks) != 1:
+                raise ParsecInputError(
+                    "box domain requires exactly one Domain_Shape_Parameters block"
+                )
+            values, unit = _block_numbers(
+                domain_blocks[0].value, label="Domain_Shape_Parameters"
+            )
+            if len(values) != 3:
+                raise ParsecInputError(
+                    "box Domain_Shape_Parameters must contain three full side lengths"
+                )
+            # PARSEC reads this block directly in bohr. Permit an explicit unit as
+            # a convenience, while retaining raw-bohr behavior when absent.
+            factor = (
+                _physical_length(f"1 {unit}", label="Domain_Shape_Parameters")
+                if unit
+                else 1.0
+            )
+            box_lengths = tuple(float(value * factor) for value in values)
+            radius = 0.5 * float(np.linalg.norm(box_lengths))
+        else:
+            raise UnsupportedParsecOptionError(
+                f"Cluster_Domain_Shape={shape!r}; only sphere and box are supported"
+            )
+
+        shift = (0.0, 0.0, 0.0) if ignore_symmetry else (0.5, 0.5, 0.5)
+        grid = GridSettings(
+            spacing=spacing,
+            radius=radius,
+            expansion_order=_integer(
+                one("expansion_order", "12"), label="Expansion_Order"
+            ),
+            shift=shift,
+            domain_shape=shape,
+            box_lengths=box_lengths,
+        )
 
     coordinate_factor = _coordinate_factor(
         one("coordinate_unit", "cartesian_bohr")
@@ -889,13 +967,13 @@ def _parse_parsec_input(
             "implementation currently reports energies only."
         )
 
-    if ignore_symmetry:
+    if ignore_symmetry and not is_periodic:
         warnings.append(
             "Ignore_Symmetry=true reproduces PARSEC's zero grid shift and "
             "disables accelerated symmetry reduction unless --symmetry=on "
             "explicitly overrides it."
         )
-    if shape == "box" and hartree.boundary_method != "direct":
+    if not is_periodic and shape == "box" and hartree.boundary_method != "direct":
         warnings.append(
             "Box Hartree boundaries use the exact direct Coulomb sum in auto mode "
             "and may be expensive."
@@ -905,12 +983,13 @@ def _parse_parsec_input(
         atoms=atoms,
         pseudopotentials=specifications,
         grid=grid,
+        periodic_cell=periodic_cell,
         scf=scf,
         hartree=hartree,
         eigensolver=eigensolver,
         mixing=mixing,
         initial_density_settings=initial_density_settings,
-        recenter_geometry=recenter,
+        recenter_geometry=recenter and not is_periodic,
     )
     return ParsecInputTranslation(
         source=source,
@@ -927,7 +1006,7 @@ def parse_parsec_input(
     *,
     pseudopotential_directory: str | Path | None = None,
 ) -> ParsecInputTranslation:
-    """Translate a supported isolated ``parsec.in`` into ``SinglePointInput``."""
+    """Translate a supported ``parsec.in`` (isolated or periodic) into ``SinglePointInput``."""
     try:
         return _parse_parsec_input(
             path,
@@ -953,14 +1032,27 @@ def summarize_translation(translation: ParsecInputTranslation) -> str:
         )
     else:
         first_solver_summary = "first_solver=arpack"
+    if problem.periodic_cell is None:
+        grid_summary = (
+            f"Grid: {problem.grid.domain_shape}, h={problem.grid.spacing:.12g} bohr, "
+            f"order={problem.grid.expansion_order}, shift={problem.grid.shift}"
+        )
+    else:
+        side_lengths = np.diag(problem.periodic_cell.lattice_vectors)
+        grid_summary = (
+            f"Grid: periodic, cell={list(side_lengths)} bohr, "
+            f"h_target={problem.grid.spacing:.12g} bohr, "
+            f"order={problem.grid.expansion_order}"
+        )
     lines = [
         f"Input: {translation.source}",
         f"Atoms: {len(problem.atoms)}",
         f"Species: {', '.join(problem.pseudopotentials)}",
-        (
-            f"Grid: {problem.grid.domain_shape}, h={problem.grid.spacing:.12g} bohr, "
-            f"order={problem.grid.expansion_order}, shift={problem.grid.shift}"
-        ),
+        grid_summary,
+        #AG (
+        #AG     f"Grid: {problem.grid.domain_shape}, h={problem.grid.spacing:.12g} bohr, "
+        #AG     f"order={problem.grid.expansion_order}, shift={problem.grid.shift}"
+        #AG ),
         (
             f"SCF: states={problem.scf.number_of_states}, "
             f"max_iter={problem.scf.max_iterations}, "

@@ -5,7 +5,6 @@ from .single_point import PreparedSinglePointSystem, prepare_single_point, run_s
 from .pbc import (
     PeriodicPreparedSinglePointSystem,
     prepare_periodic_single_point,
-    run_periodic_single_point,
 )
 
 __all__ = [
@@ -14,5 +13,4 @@ __all__ = [
     "run_scf",
     "PeriodicPreparedSinglePointSystem",
     "prepare_periodic_single_point",
-    "run_periodic_single_point",
 ]

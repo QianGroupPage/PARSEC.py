@@ -156,6 +156,55 @@ class GridSettings:
 
 
 @dataclass(frozen=True)
+class PeriodicCell:
+    """Real-space lattice vectors for a periodic unit cell, in bohr.
+    """
+
+    lattice_vectors: np.ndarray
+    """Rows are the lattice vectors ``a1``, ``a2``, ``a3``."""
+
+    def __post_init__(self) -> None:
+        vectors = np.asarray(self.lattice_vectors, dtype=np.float64)
+        if vectors.shape != (3, 3):
+            raise ValueError("lattice_vectors must have shape (3, 3)")
+        if not np.all(np.isfinite(vectors)):
+            raise ValueError("lattice_vectors must be finite")
+        if abs(float(np.linalg.det(vectors))) <= 0.0:
+            raise ValueError("lattice_vectors must span a nondegenerate cell")
+        object.__setattr__(self, "lattice_vectors", vectors)
+
+    @property
+    def volume(self) -> float:
+        """Unit-cell volume in bohr**3."""
+        return float(abs(np.linalg.det(self.lattice_vectors)))
+
+
+@dataclass(frozen=True)
+class PeriodicGridSettings:
+    """
+    Finite-difference grid settings for a periodic cell.
+    Mostly a copy of GridSettings with fewer arguments (may want to fold into GridSettings later)
+    """
+
+    spacing: float
+    expansion_order: int = 12
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.spacing) or self.spacing <= 0:
+            raise ValueError("grid spacing must be positive")
+        order = int(self.expansion_order)
+        if order != self.expansion_order:
+            raise ValueError("PARSEC expansion_order must be an integer")
+        if order < 2 or order > 20 or order % 2:
+            raise ValueError("PARSEC expansion_order must be an even integer from 2 to 20")
+        object.__setattr__(self, "expansion_order", order)
+
+    @property
+    def stencil_half_width(self) -> int:
+        return self.expansion_order // 2
+
+
+@dataclass(frozen=True)
 class HartreeSettings:
     """Finite-cluster Poisson settings matching ``hartset``/``hpotcg``."""
 
@@ -419,11 +468,14 @@ class InitialDensitySettings:
 
 @dataclass(frozen=True)
 class SinglePointInput:
-    """Complete input to the modular isolated single-point calculator."""
+    """
+    Complete input to the modular single-point calculator.
+    """
 
     atoms: Sequence[Atom]
     pseudopotentials: Mapping[str, SpeciesPotential]
-    grid: GridSettings
+    grid: GridSettings | PeriodicGridSettings
+    periodic_cell: PeriodicCell | None = None
     scf: SCFSettings = field(default_factory=SCFSettings)
     hartree: HartreeSettings = field(default_factory=HartreeSettings)
     eigensolver: EigensolverSettings = field(default_factory=EigensolverSettings)
@@ -441,6 +493,15 @@ class SinglePointInput:
         if missing:
             raise ValueError(f"missing pseudopotential specifications for: {', '.join(missing)}")
         object.__setattr__(self, "atoms", atoms)
+        if self.periodic_cell is None:
+            if not isinstance(self.grid, GridSettings):
+                raise ValueError(
+                    "an isolated calculation (periodic_cell=None) requires GridSettings"
+                )
+        elif not isinstance(self.grid, PeriodicGridSettings):
+            raise ValueError(
+                "a periodic calculation (periodic_cell set) requires PeriodicGridSettings"
+            )
 
 
 @dataclass(frozen=True)

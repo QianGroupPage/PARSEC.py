@@ -12,6 +12,7 @@ from .ionic_potential import (
     real_spherical_harmonics,
     superpose_atomic_density,
 )
+from .ewald import ewald_ion_ion_energy, ewald_local_ionic_potential
 
 __all__ = [
     "NonlocalProjectorOperator",
@@ -24,4 +25,6 @@ __all__ = [
     "normalize_density",
     "real_spherical_harmonics",
     "superpose_atomic_density",
+    "ewald_ion_ion_energy",
+    "ewald_local_ionic_potential",
 ]

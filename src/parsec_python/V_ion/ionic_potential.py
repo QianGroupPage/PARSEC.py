@@ -164,6 +164,7 @@ def superpose_atomic_density(
     atoms: Sequence[Atom],
     potentials: Mapping[str, ParsecPseudopotential],
     specifications: Mapping[str, SpeciesPotential],
+    lattice_vectors: np.ndarray | None = None,
     *,
     core: bool = False,
 ) -> np.ndarray:
@@ -200,8 +201,17 @@ def superpose_atomic_density(
         # Species without an NLCC table contribute no frozen core density.
         if core and not potential.has_nonlinear_core_correction:
             continue
-        radius = np.linalg.norm(grid.coordinates - atom.position, axis=1)
-        if not core and not specification.read_valence_density:
+
+        position = np.asarray(atom.position, dtype=np.float64)
+        translations = (
+            np.zeros((1, 3))  # No translations if 0D
+            if lattice_vectors is None
+            else _periodic_image_translations(
+                lattice_vectors, potential.interpolation_cutoff
+            )
+        )
+        reconstruct_from_wavefunctions = not core and not specification.read_valence_density
+        if reconstruct_from_wavefunctions:
             # u_l is the reduced radial function: the normalized spherical
             # orbital is u_l(r)Y_lm(Omega)/r.  Spherical occupation averaging
             # produces f_l*u_l(r)**2/(4*pi*r**2).
@@ -213,25 +223,31 @@ def superpose_atomic_density(
                     * wavefunction
                     / (4.0 * np.pi * potential.radii * potential.radii)
                 )
-            contribution = np.zeros_like(radius)
-            inside = radius < potential.interpolation_cutoff
-            contribution[inside] = np.interp(
-                radius[inside],
-                potential.radii,
-                radial_density,
-                left=radial_density[0],
-            )
-            density += contribution
-        else:
-            # PARSEC's initial valence-density path is linear even when the
-            # optional spline is used for other radial quantities.
-            density += potential.interpolate_density(
-                radius,
-                core=core,
-                # ``initchrg.f90`` always uses linear interpolation.
-                use_spline=specification.use_spline if core else False,
-                spline_padding_width=grid.settings.stencil_half_width,
-            )
+
+        for translation in translations:
+            radius = np.linalg.norm(grid.coordinates - (position + translation), axis=1)
+            if not np.any(radius < potential.interpolation_cutoff):
+                continue
+            if reconstruct_from_wavefunctions:
+                contribution = np.zeros_like(radius)
+                inside = radius < potential.interpolation_cutoff
+                contribution[inside] = np.interp(
+                    radius[inside],
+                    potential.radii,
+                    radial_density,
+                    left=radial_density[0],
+                )
+                density += contribution
+            else:
+                # PARSEC's initial valence-density path is linear even when
+                # the optional spline is used for other radial quantities.
+                density += potential.interpolate_density(
+                    radius,
+                    core=core,
+                    # ``initchrg.f90`` always uses linear interpolation.
+                    use_spline=specification.use_spline if core else False,
+                    spline_padding_width=grid.settings.stencil_half_width,
+                )
     return density
 
 
@@ -447,11 +463,48 @@ def _projector_support_radius(potential: ParsecPseudopotential) -> float:
     return float(potential.radii[next_index])
 
 
+def _periodic_image_translations(
+    lattice_vectors: np.ndarray, support_radius: float
+) -> np.ndarray:
+    """Enumerate periodic translations whose projector image can reach the cell.
+
+    Unlike the local ionic potential's Coulomb tail, a KB projector's radial
+    function is *exactly* zero beyond ``support_radius`` (see
+    ``build_nonlocal_projectors``'s ``np.interp(..., right=0.0)``), so no
+    Ewald-style real/reciprocal split is needed here -- periodic images are a
+    plain, exact finite sum; an image whose support ball cannot reach any grid
+    point contributes exactly zero, not approximately.
+
+    Restricted to an orthorhombic cell (diagonal ``lattice_vectors``),
+    matching :func:`~..Grid.pbc.build_periodic_grid`'s own restriction --
+    there is no orthorhombic-only grid to call this for otherwise.  For each
+    axis, an image ``n`` cells away is offset by at least ``(n-1)`` times that
+    axis's side length from a point already inside the cell (every atom
+    position is validated to lie in ``[0, side_length)``), so translations
+    with ``n`` beyond ``ceil(support_radius/side_length) + 1`` cannot reach
+    the cell and are excluded.
+    """
+
+    off_diagonal = lattice_vectors - np.diag(np.diag(lattice_vectors))
+    if not np.allclose(off_diagonal, 0.0, atol=1.0e-10):
+        raise ValueError(
+            "periodic KB projector images only support an orthorhombic cell "
+            "(diagonal lattice_vectors), matching build_periodic_grid"
+        )
+    side_lengths = np.diag(lattice_vectors)
+    max_index = np.ceil(support_radius / side_lengths).astype(int) + 1
+    ranges = [np.arange(-m, m + 1) for m in max_index]
+    grid = np.meshgrid(*ranges, indexing="ij")
+    integer_combinations = np.column_stack([axis.reshape(-1) for axis in grid])
+    return integer_combinations * side_lengths
+
+
 def build_nonlocal_projectors(
     grid: RealSpaceGrid,
     atoms: Sequence[Atom],
     potentials: Mapping[str, ParsecPseudopotential],
     specifications: Mapping[str, SpeciesPotential],
+    lattice_vectors: np.ndarray | None = None,
 ) -> NonlocalProjectorOperator:
     """Construct the separable nonlocal pseudopotential on the active grid.
 
@@ -483,6 +536,14 @@ def build_nonlocal_projectors(
     the active grid, matching PARSEC's default ``Double_grid_order=1``.  Its
     optional finer ``Double_grid_order > 1`` subgrid averaging is not part of
     this implementation.
+
+    ``lattice_vectors``, if given, sums each ``(atom, l, m)`` projector over
+    every periodic image whose support ball can reach the grid (see
+    :func:`_periodic_image_translations`) -- unlike the local ionic
+    potential's long-ranged Coulomb tail, a KB projector's radial function is
+    exactly zero beyond its support radius, so this is a plain, exact finite
+    sum, not an Ewald-style split.  ``None`` (the default) reproduces the
+    original isolated single-copy behavior exactly.
     """
     rows: list[np.ndarray] = []
     columns: list[np.ndarray] = []
@@ -498,14 +559,27 @@ def build_nonlocal_projectors(
     for atom_index, atom in enumerate(atoms):
         potential = potentials[atom.symbol]
         local_l = specifications[atom.symbol].local_angular_momentum
-        relative = grid.coordinates - atom.position
-        radius = np.linalg.norm(relative, axis=1)
+
+        position = np.asarray(atom.position, dtype=np.float64)
+
+        support_radius = _projector_support_radius(potential)
+        translations = (
+            np.zeros((1, 3))  # No translations if 0D
+            if lattice_vectors is None
+            else _periodic_image_translations(lattice_vectors, support_radius)
+        )
 
         # KB projectors are localized.  Restrict all following interpolation
         # and harmonic work to grid points within their radial support.
-        support = radius <= _projector_support_radius(potential)
-        support_rows = np.flatnonzero(support)
-        if support_rows.size == 0:
+        images: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        for translation in translations:
+            relative = grid.coordinates - (position + translation)
+            radius = np.linalg.norm(relative, axis=1)
+            support = radius <= support_radius
+            support_rows = np.flatnonzero(support)
+            if support_rows.size:
+                images.append((support_rows, relative[support], radius[support]))
+        if not images:
             continue
 
         for angular_momentum in sorted(potential.radial_wavefunctions):
@@ -519,45 +593,60 @@ def build_nonlocal_projectors(
             radial_grid, denominator_sign = potential.radial_projector(
                 angular_momentum, local_l
             )
-            if specifications[atom.symbol].use_spline:
-                radial_spline = ParsecRadialSpline.from_positive_grid(
-                    potential.radii,
-                    radial_grid,
-                    grid.settings.stencil_half_width,
-                )
-                # ``nonloc.F90`` clamps the radial interpolation coordinate
-                # to the first positive POTRE radius.  Angular harmonics still
-                # use the actual atom-grid displacement below.
-                interpolation_radius = np.maximum(
-                    radius[support], potential.radii[0]
-                )
-                radial = radial_spline(interpolation_radius)
-            else:
-                radial = np.interp(
-                    radius[support],
-                    potential.radii,
-                    radial_grid,
-                    left=radial_grid[0],
-                    right=0.0,
-                )
-
-            # The same normalized radial function is paired with every one of
-            # the 2*l+1 real harmonics in this angular-momentum channel.
-            harmonics = real_spherical_harmonics(
-                angular_momentum, relative[support]
-            )
-            for harmonic_index in range(harmonics.shape[1]):
-                projector = sqrt_dv * radial * harmonics[:, harmonic_index]
-
-                # Drop only values at numerical zero so the stored columns
-                # remain sparse without changing physically relevant entries.
-                keep = np.abs(projector) > 1.0e-16
-                rows.append(support_rows[keep])
-                columns.append(np.full(np.count_nonzero(keep), column, dtype=np.int64))
-                values.append(projector[keep])
+            # One column per real harmonic (2*l+1 of them), shared by every
+            # image below: a periodic projector is one function per (atom,
+            # l, m), not one per image, so images accumulate into the same
+            # column rather than adding separate ones.  COO->CSC sums
+            # duplicate (row, column) entries, so an image that happens to
+            # overlap another image's rows near a small cell's edge is
+            # handled automatically.
+            channel_columns = list(range(column, column + 2 * angular_momentum + 1))
+            column += len(channel_columns)
+            for harmonic_index in range(len(channel_columns)):
                 signs.append(denominator_sign)
                 labels.append((atom_index, angular_momentum, harmonic_index))
-                column += 1
+
+            for support_rows, relative_support, radius_support in images:
+                if specifications[atom.symbol].use_spline:
+                    radial_spline = ParsecRadialSpline.from_positive_grid(
+                        potential.radii,
+                        radial_grid,
+                        grid.settings.stencil_half_width,
+                    )
+                    # ``nonloc.F90`` clamps the radial interpolation coordinate
+                    # to the first positive POTRE radius.  Angular harmonics
+                    # still use the actual atom-image-grid displacement below.
+                    interpolation_radius = np.maximum(
+                        radius_support, potential.radii[0]
+                    )
+                    radial = radial_spline(interpolation_radius)
+                else:
+                    radial = np.interp(
+                        radius_support,
+                        potential.radii,
+                        radial_grid,
+                        left=radial_grid[0],
+                        right=0.0,
+                    )
+
+                # The same normalized radial function is paired with every one
+                # of the 2*l+1 real harmonics in this angular-momentum channel.
+                harmonics = real_spherical_harmonics(
+                    angular_momentum, relative_support
+                )
+                for harmonic_index, target_column in enumerate(channel_columns):
+                    projector = sqrt_dv * radial * harmonics[:, harmonic_index]
+
+                    # Drop only values at numerical zero so the stored columns
+                    # remain sparse without changing physically relevant entries.
+                    keep = np.abs(projector) > 1.0e-16
+                    if not np.any(keep):
+                        continue
+                    rows.append(support_rows[keep])
+                    columns.append(
+                        np.full(np.count_nonzero(keep), target_column, dtype=np.int64)
+                    )
+                    values.append(projector[keep])
 
     # CSC is natural here because projectors are stored and contracted by
     # column.  An all-local pseudopotential legitimately produces zero columns.

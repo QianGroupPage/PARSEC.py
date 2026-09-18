@@ -82,6 +82,7 @@ class PreparedSinglePointSystem:
     core_density: np.ndarray
     ion_ion_energy: float
     atomic_reference_correction: float = 0.0
+    alpha_z_energy: float = 0.0
     timings: PreparationTimings = field(default_factory=PreparationTimings)
 
     def hamiltonian(self, effective_potential: np.ndarray) -> KohnShamHamiltonian:
@@ -634,6 +635,7 @@ def run_scf(
             xc.total_energy,
             system.ion_ion_energy,
             system.grid.volume_element,
+            alpha_z_energy=getattr(system, "alpha_z_energy", 0.0),
         )
         # 7. Mix the effective potential and apply PARSEC's SCF stop test.
         # Only V_eff is mixed.  T, V_NL, and the fixed local ionic component

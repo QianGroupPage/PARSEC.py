@@ -244,4 +244,36 @@ def ewald_local_ionic_potential(
     return total
 
 
-__all__ = ["ewald_ion_ion_energy", "ewald_local_ionic_potential"]
+def ewald_alpha_z_energy(
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    lattice_vectors: np.ndarray,
+    electron_count: float,
+    *,
+    eta: float | None = None,
+    tolerance: float = 1.0e-14,
+) -> float:
+    """Return the "alpha_Z" total-energy correction, in Rydberg.
+    """
+
+    lattice_vectors = np.asarray(lattice_vectors, dtype=np.float64)
+    if lattice_vectors.shape != (3, 3):
+        raise ValueError("lattice_vectors must have shape (3, 3)")
+    volume = float(abs(np.linalg.det(lattice_vectors)))
+    if volume <= 0.0:
+        raise ValueError("lattice_vectors must span a nondegenerate cell")
+    if not atoms:
+        return 0.0
+
+    eta, _, _ = _ewald_cutoffs(volume, eta, tolerance)
+    total_ionic_charge = float(
+        sum(potentials[atom.symbol].ionic_charge for atom in atoms)
+    )
+    return float(electron_count) * (2.0 * np.pi / (eta**2 * volume)) * total_ionic_charge
+
+
+__all__ = [
+    "ewald_alpha_z_energy",
+    "ewald_ion_ion_energy",
+    "ewald_local_ionic_potential",
+]

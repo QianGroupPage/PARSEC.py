@@ -25,6 +25,7 @@ from ..Pseudopotential import ParsecPseudopotential
 from ..V_ion import (
     NonlocalProjectorOperator,
     build_nonlocal_projectors,
+    ewald_alpha_z_energy,
     ewald_ion_ion_energy,
     ewald_local_ionic_potential,
     ionic_charge,
@@ -53,6 +54,7 @@ class PeriodicPreparedSinglePointSystem:
     core_density: np.ndarray
     ion_ion_energy: float
     atomic_reference_correction: float = 0.0
+    alpha_z_energy: float = 0.0
     timings: PreparationTimings = field(default_factory=PreparationTimings)
 
     def hamiltonian(self, effective_potential: np.ndarray) -> KohnShamHamiltonian:
@@ -206,6 +208,12 @@ def prepare_periodic_single_point(
     repulsion = ewald_ion_ion_energy(
         atoms, pseudopotentials, problem.periodic_cell.lattice_vectors
     )
+    alpha_z_energy = ewald_alpha_z_energy(
+        atoms,
+        pseudopotentials,
+        problem.periodic_cell.lattice_vectors,
+        electron_count,
+    )
     atomic_reference_correction = float(
         sum(
             problem.pseudopotentials[atom.symbol].atomic_energy_correction
@@ -238,6 +246,7 @@ def prepare_periodic_single_point(
         core_density=core_density,
         ion_ion_energy=repulsion,
         atomic_reference_correction=atomic_reference_correction,
+        alpha_z_energy=alpha_z_energy,
         timings=preparation_timings,
     )
 

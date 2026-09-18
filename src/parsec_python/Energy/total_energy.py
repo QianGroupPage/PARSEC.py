@@ -18,6 +18,7 @@ def total_energy(
     exchange_correlation_energy: float,
     ion_ion_energy: float,
     volume_element: float,
+    alpha_z_energy: float = 0.0,
 ) -> EnergyBreakdown:
     """Evaluate the input-potential/new-density PARSEC energy expression."""
     eigenvalues = np.asarray(eigenvalues, dtype=float)
@@ -34,7 +35,7 @@ def total_energy(
     if any(np.asarray(value).shape != density.shape for value in arrays):
         raise ValueError("all potentials must match the density")
 
-    band_energy = float(2.0 * np.dot(occupations, eigenvalues))
+    band_energy = float(2.0 * np.dot(occupations, eigenvalues)) + float(alpha_z_energy)
     old_hxc = np.asarray(input_effective_potential) - np.asarray(ionic_potential)
     old_hxc_integral = float(volume_element * np.dot(density, old_hxc))
     hartree_integral = float(

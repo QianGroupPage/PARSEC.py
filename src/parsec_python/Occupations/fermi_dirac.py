@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
 BOLTZMANN_RYDBERG_PER_KELVIN = 6.33327186e-6
 
 
@@ -120,8 +119,17 @@ def fermi_occupations(
     lower = float(eigenvalues[0] - 36.0 * kbt)
     upper = float(eigenvalues[-1] + 36.0 * kbt)
     occupations = _fermi_function(eigenvalues, 0.5 * (lower + upper), kbt)
+    previous_chemical_potential: float | None = None
     for _ in range(max_iterations):
         chemical_potential = 0.5 * (lower + upper)
+        if chemical_potential == previous_chemical_potential:
+            print(f"Warning:")
+            print(f"\tFermi-level bisection has stopped advancing (old chemical potential is equal to new chemical potential")
+            print(f"\tTarget electron count:\t{target}")
+            print(f"\tCurrent electron count:\t{count}")
+            print(f"\tDifference =           \t{abs(count - target)}")
+            break
+        previous_chemical_potential = chemical_potential
         occupations = _fermi_function(eigenvalues, chemical_potential, kbt)
         count = float(np.sum(occupations))
         if abs(count - target) <= count_tolerance:

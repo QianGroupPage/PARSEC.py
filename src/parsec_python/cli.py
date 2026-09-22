@@ -333,12 +333,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     is_periodic = translation.problem.periodic_cell is not None
 
-    symmetry_mode = (
-        arguments.symmetry
-        if arguments.symmetry is not None
-        else ("off" if translation.ignore_symmetry else "auto")
-    )
-
     summary = summarize_translation(translation)
     if arguments.dry_run:
         try:

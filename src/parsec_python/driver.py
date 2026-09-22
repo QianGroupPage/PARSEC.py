@@ -12,7 +12,6 @@ from typing import Callable
 from .SCF.pbc import (
     PeriodicPreparedSinglePointSystem,
     prepare_periodic_single_point as _prepare_periodic_single_point,
-    #run_periodic_single_point as _run_periodic_single_point,
 )
 from .SCF.single_point import (
     PreparedSinglePointSystem,
@@ -57,15 +56,6 @@ def prepare_periodic_single_point(
     return _prepare_periodic_single_point(problem)
 
 
-#def run_periodic_single_point(
-#    problem: SinglePointInput,
-#    *,
-#    callback: Callable[[SCFIteration], None] | None = None,
-#) -> SinglePointResult:
-#    """Run the complete two-stage Gamma-point periodic single-point workflow."""
-#    return _run_periodic_single_point(problem, callback=callback)
-
-
 __all__ = [
     "PreparedSinglePointSystem",
     "prepare_single_point",
@@ -73,5 +63,4 @@ __all__ = [
     "run_single_point",
     "PeriodicPreparedSinglePointSystem",
     "prepare_periodic_single_point",
-#    "run_periodic_single_point",
 ]

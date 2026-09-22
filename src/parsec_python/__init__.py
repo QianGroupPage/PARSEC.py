@@ -116,7 +116,6 @@ from .driver import (
     run_single_point as run_reference_single_point,
     PeriodicPreparedSinglePointSystem,
     prepare_periodic_single_point,
-#    run_periodic_single_point,
 )
 from .acceleration.driver import (
     AcceleratedPreparedSinglePointSystem,
@@ -235,6 +234,5 @@ __all__ = [
     "neutralize_density",
     "solve_periodic_hartree",
     "prepare_periodic_single_point",
-    "run_periodic_single_point",
     "solve_periodic_hartree",
 ]

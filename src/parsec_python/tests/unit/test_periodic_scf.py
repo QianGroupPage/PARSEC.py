@@ -16,7 +16,7 @@ from parsec_python.models import (
     SinglePointInput,
     SpeciesPotential,
 )
-from parsec_python.SCF import prepare_periodic_single_point, run_periodic_single_point
+from parsec_python.SCF import prepare_periodic_single_point
 
 _H_POTRE = Path(__file__).resolve().parents[1] / "data" / "H_POTRE.DAT"
 
@@ -80,24 +80,6 @@ class PreparePeriodicSinglePointTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prepare_periodic_single_point(problem)
 
-
-class RunPeriodicSinglePointTests(unittest.TestCase):
-    def test_hydrogen_in_a_box_converges(self) -> None:
-        problem = _hydrogen_box(6.0, 0.6)
-        result = run_periodic_single_point(problem)
-
-        self.assertTrue(result.converged)
-        self.assertTrue(np.isfinite(result.energies.total))
-        self.assertTrue(np.isfinite(result.ionic_potential).all())
-        self.assertTrue(np.all(np.isfinite(result.density)))
-        self.assertAlmostEqual(
-            float(np.sum(result.density) * result.grid.volume_element),
-            result.electron_count,
-            places=4,
-        )
-        # A single positive point charge's own Ewald self-energy (against its
-        # neutralizing background) is negative.
-        self.assertLess(result.energies.ion_ion, 0.0)
 
 
 if __name__ == "__main__":

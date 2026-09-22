@@ -332,16 +332,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     is_periodic = translation.problem.periodic_cell is not None
-    #if translation.problem.periodic_cell is not None:
-    #    print(
-    #        "Input error: this CLI's accelerated backend selection, symmetry "
-    #        "detection, and dry-run diagnostics are isolated-only. A periodic "
-    #        "(Boundary_Conditions=bulk) input parses successfully but must be "
-    #        "run through parsec_python.SCF.pbc.run_periodic_single_point() "
-    #        "(or driver.run_periodic_single_point()) directly for now.",
-    #        file=sys.stderr,
-    #    )
-    #    return 2
 
     symmetry_mode = (
         arguments.symmetry

@@ -58,6 +58,13 @@ from .eigval import (
 )
 from .lapack_random import LapackRandom, PARSEC_RANDOM_ARRAY_SEED
 from .orthogonalize import OrthonormalizationResult, orthonormalize
+from .perturbative_soc import (
+    AtomSpinOrbitProjectors,
+    PerturbativeSpinOrbitResult,
+    build_spin_orbit_projectors,
+    complex_spherical_harmonics,
+    perturbative_spin_orbit_correction,
+)
 from .rayleigh_ritz import RayleighRitzResult, rayleigh_ritz
 from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
 from .subspace import (
@@ -68,6 +75,11 @@ from .subspace import (
 )
 
 __all__ = [
+    "AtomSpinOrbitProjectors",
+    "PerturbativeSpinOrbitResult",
+    "build_spin_orbit_projectors",
+    "complex_spherical_harmonics",
+    "perturbative_spin_orbit_correction",
     "ChebFFCycle",
     "ChebFFResult",
     "ChebFFSettings",

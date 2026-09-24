@@ -24,6 +24,22 @@ import numpy as np
 
 
 @dataclass(frozen=True)
+class SpinPolarizedXCResult:
+    """Pointwise spin-polarized CA-LDA (LSDA) fields and their integral.
+
+    ``potential_up``/``potential_down`` are ``V_xc,up(r_i)``/``V_xc,down(r_i)``,
+    the quantities placed on the diagonal of each spin channel's Kohn--Sham
+    Hamiltonian.  ``total_energy`` is in Rydberg and is the uniform-grid
+    integral of the pointwise exchange-correlation energy density.
+    """
+
+    potential_up: np.ndarray
+    potential_down: np.ndarray
+    energy_density: np.ndarray
+    total_energy: float
+
+
+@dataclass(frozen=True)
 class XCResult:
     """Pointwise CA-LDA fields and their real-space integral.
 
@@ -154,4 +170,135 @@ def ca_lda(
     )
 
 
-__all__ = ["XCResult", "ca_lda"]
+def ca_lda_spin_polarized(
+    density_up: np.ndarray,
+    density_down: np.ndarray,
+    volume_element: float,
+    core_density: np.ndarray | None = None,
+) -> SpinPolarizedXCResult:
+    """Evaluate the spin-polarized (LSDA) CA/PZ functional, PARSEC's ``exc_spn.f90``.
+
+    For spin densities ``rho_up``, ``rho_down`` define the total density
+    ``rho_bar = rho_up + rho_down`` (plus any frozen NLCC ``core_density``,
+    split evenly so the total matches the unpolarized convention) and the
+    relative spin polarization ``zeta = (rho_up - rho_down)/rho_bar``.
+    Exchange is evaluated on each spin channel directly via the exact
+    spin-scaling relation; Perdew-Zunger correlation is evaluated at the
+    unpolarized (``zeta=0``) and fully polarized (``zeta=1``) limits and
+    combined with the standard interpolation
+
+    ``f(zeta) = [(1+zeta)^(4/3) + (1-zeta)^(4/3) - 2] / gamma``,
+    ``gamma = 2^(4/3) - 2``,
+
+    ``ec(zeta) = ec_u + f(zeta)*(ec_p - ec_u)``.
+
+    Potentials are obtained from the same thermodynamic derivative used by
+    the unpolarized branch, differentiated per spin channel.  This mirrors
+    ``exc_spn.f90``'s ``icorr == 'ca'`` branch exactly, including its
+    asymmetric-looking (but numerically equivalent to the unpolarized
+    high-density branch) regrouping of the Perdew-Zunger coefficients.
+    """
+    rho_up = np.asarray(density_up, dtype=float)
+    rho_down = np.asarray(density_down, dtype=float)
+    if rho_up.shape != rho_down.shape:
+        raise ValueError("spin densities must have the same shape")
+    if core_density is not None:
+        core = np.asarray(core_density, dtype=float)
+        if core.shape != rho_up.shape:
+            raise ValueError("core and valence densities must have the same shape")
+        # Split the frozen core density evenly between channels, matching
+        # PARSEC's unpolarized convention of adding rho_core to the total
+        # density seen by XC while leaving the spin split (zeta) determined
+        # by the valence density alone.
+        rho_up = rho_up + 0.5 * core
+        rho_down = rho_down + 0.5 * core
+
+    potential_up = np.zeros_like(rho_up)
+    potential_down = np.zeros_like(rho_down)
+    energy_density = np.zeros_like(rho_up)
+
+    positive = (rho_up > 0.0) & (rho_down > 0.0)
+    if np.any(positive):
+        rh1 = rho_up[positive]
+        rh2 = rho_down[positive]
+        total = rh1 + rh2
+
+        # Dirac exchange, Rydberg units, evaluated directly on each spin
+        # channel via the exact spin-scaling relation (exc_spn.f90's ax).
+        ax = -0.738558766382022405884230032680836
+        ex1 = ax * (2.0 * rh1) ** (1.0 / 3.0)
+        vx1 = (4.0 / 3.0) * ex1
+        ex2 = ax * (2.0 * rh2) ** (1.0 / 3.0)
+        vx2 = (4.0 / 3.0) * ex2
+
+        rs = (0.75 / np.pi / total) ** (1.0 / 3.0)
+        zeta = (rh1 - rh2) / total
+        gamma = 0.5198421
+        f = ((1.0 + zeta) ** (4.0 / 3.0) + (1.0 - zeta) ** (4.0 / 3.0) - 2.0) / gamma
+        fz = (
+            (4.0 / 3.0)
+            * ((1.0 + zeta) ** (1.0 / 3.0) - (1.0 - zeta) ** (1.0 / 3.0))
+            / gamma
+        )
+
+        # Perdew-Zunger correlation: unpolarized ("u") and fully polarized
+        # ("s", zeta=1) branches, each with their own high/low-density forms.
+        c1, c2, c3, c4 = 0.0622, 0.0960, 0.0040, 0.0232
+        g, b1, b2 = -0.2846, 1.0529, 0.3334
+        as_, bs, cs, ds = 0.0311, -0.0538, 0.0014, -0.0096
+        gs, b1s, b2s = -0.1686, 1.3981, 0.2611
+
+        eu = np.empty_like(rs)
+        vc_u = np.empty_like(rs)
+        es = np.empty_like(rs)
+        vc_s = np.empty_like(rs)
+
+        high_density = rs < 1.0
+        if np.any(high_density):
+            r = rs[high_density]
+            lrs = np.log(r)
+            eu[high_density] = c1 * lrs - c2 + (c3 * lrs - c4) * r
+            vc_u[high_density] = eu[high_density] - (
+                c1 + (c3 * lrs + c3 - c4) * r
+            ) / 3.0
+            es[high_density] = as_ * lrs + bs + (cs * lrs + ds) * r
+            vc_s[high_density] = es[high_density] - (
+                as_ + (cs * lrs + cs + ds) * r
+            ) / 3.0
+
+        low_density = ~high_density
+        if np.any(low_density):
+            r = rs[low_density]
+            srs = np.sqrt(r)
+            eu[low_density] = g / (1.0 + b1 * srs + b2 * r)
+            vc_u[low_density] = (
+                eu[low_density]
+                * eu[low_density]
+                * (1.0 + (7.0 / 6.0) * b1 * srs + (4.0 / 3.0) * b2 * r)
+                / g
+            )
+            es[low_density] = gs / (1.0 + b1s * srs + b2s * r)
+            vc_s[low_density] = (
+                es[low_density]
+                * es[low_density]
+                * (1.0 + (7.0 / 6.0) * b1s * srs + (4.0 / 3.0) * b2s * r)
+                / gs
+            )
+
+        vc_down = vc_u + f * (vc_s - vc_u) - (es - eu) * (1.0 + zeta) * fz
+        vc_up = vc_u + f * (vc_s - vc_u) + (es - eu) * (1.0 - zeta) * fz
+        ec = eu + f * (es - eu)
+
+        potential_up[positive] = 2.0 * vx1 + vc_up
+        potential_down[positive] = 2.0 * vx2 + vc_down
+        energy_density[positive] = 2.0 * (rh1 * ex1 + rh2 * ex2) + ec * total
+
+    return SpinPolarizedXCResult(
+        potential_up=potential_up,
+        potential_down=potential_down,
+        energy_density=energy_density,
+        total_energy=float(np.sum(energy_density) * volume_element),
+    )
+
+
+__all__ = ["XCResult", "SpinPolarizedXCResult", "ca_lda", "ca_lda_spin_polarized"]

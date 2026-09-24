@@ -401,6 +401,12 @@ def run_scf(
     # internally works with number_of_states + subspace_buffer vectors.
     number_of_states = _number_of_states(system)
     settings = system.input.scf
+    if settings.spin_polarized:
+        raise NotImplementedError(
+            "run_scf is the spin-unpolarized SCF path; use "
+            "parsec_python.SCF.spin_polarized.run_scf_spin_polarized for a "
+            "problem with SCFSettings.spin_polarized=True"
+        )
     eigensolver_settings = system.input.eigensolver
     if eigensolver_settings.method not in {"chebff", "chebdav"}:
         raise NotImplementedError(

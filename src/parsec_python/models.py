@@ -70,6 +70,14 @@ class SpeciesPotential:
     Reading such a species is supported; applying the spin-orbit term in the
     Hamiltonian (Fortran's perturbative or self-consistent SOC) is a separate
     capability not yet implemented here.
+
+    ``initial_spin_polarization`` mirrors PARSEC's per-species
+    ``Initial_Spin_Polarization`` (``p_pot%spol``, default ``0.1``): the
+    fraction ``(rho_up-rho_down)/rho`` used only to seed this species'
+    contribution to the initial spin-polarized density guess, breaking the
+    up/down symmetry so SCF does not stay trapped at zero moment.  It has no
+    effect on spin-unpolarized calculations and no effect on the converged
+    self-consistent solution beyond which local minimum it may find.
     """
 
     path: str | Path
@@ -79,6 +87,7 @@ class SpeciesPotential:
     element_symbol: str | None = None
     atomic_energy_correction: float = 0.0
     spin_orbit: bool = False
+    initial_spin_polarization: float = 0.1
 
     def __post_init__(self) -> None:
         local_l = int(self.local_angular_momentum)
@@ -95,6 +104,8 @@ class SpeciesPotential:
         correction = float(self.atomic_energy_correction)
         if not np.isfinite(correction):
             raise ValueError("atomic_energy_correction must be finite")
+        if not -1.0 <= self.initial_spin_polarization <= 1.0:
+            raise ValueError("initial_spin_polarization must lie in [-1, 1]")
         object.__setattr__(self, "path", Path(self.path))
         object.__setattr__(self, "local_angular_momentum", local_l)
         object.__setattr__(
@@ -368,7 +379,16 @@ class MixingSettings:
 
 @dataclass(frozen=True)
 class SCFSettings:
-    """Spin-unpolarized, isolated single-point SCF controls."""
+    """Isolated single-point SCF controls.
+
+    ``spin_polarized`` mirrors PARSEC's ``Spin_Polarization`` flag.  It is
+    accepted here and by :class:`SpeciesPotential`'s
+    ``initial_spin_polarization``, but only
+    :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized` (a
+    separate entry point, not yet wired into the CLI driver) implements it;
+    the ordinary spin-unpolarized :func:`~parsec_python.SCF.single_point.run_scf`
+    refuses a spin-polarized problem rather than silently ignoring the flag.
+    """
 
     max_iterations: int = 50
     convergence_criterion: float = 2.0e-4
@@ -378,6 +398,7 @@ class SCFSettings:
     use_plain_residual: bool = False
     normalize_initial_density: bool = True
     xc_functional: XCFunctional = "ca"
+    spin_polarized: bool = False
 
     def __post_init__(self) -> None:
         max_iterations = int(self.max_iterations)
@@ -648,3 +669,36 @@ class SinglePointResult:
         """Pseudo total plus optional atomic reference corrections, in Ry."""
 
         return float(self.energies.total + self.atomic_reference_correction)
+
+
+@dataclass
+class SpinPolarizedSinglePointResult:
+    """Result of :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized`.
+
+    A deliberately narrower counterpart to :class:`SinglePointResult`: it
+    carries what a caller (in particular PARSEC's ``pls.F90``-style
+    perturbative spin-orbit diagonalization) needs from a converged
+    collinear spin-polarized ground state -- both channels' eigenpairs, the
+    shared Fermi level, and the converged energy -- without the unpolarized
+    path's full per-iteration timing/history instrumentation.
+    """
+
+    converged: bool
+    iterations: int
+    atoms: tuple[Atom, ...]
+    electron_count: float
+    eigenvalues_up: np.ndarray
+    eigenvalues_down: np.ndarray
+    occupations_up: np.ndarray
+    occupations_down: np.ndarray
+    wavefunctions_up: np.ndarray
+    wavefunctions_down: np.ndarray
+    fermi_level: float
+    density_up: np.ndarray
+    density_down: np.ndarray
+    energies: EnergyBreakdown
+
+    @property
+    def magnetic_moment(self) -> float:
+        """``N_up - N_down`` in Bohr magnetons (PARSEC's ``<S>`` diagnostic)."""
+        return float(np.sum(self.occupations_up) - np.sum(self.occupations_down))

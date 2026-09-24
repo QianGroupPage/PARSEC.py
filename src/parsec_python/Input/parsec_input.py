@@ -392,6 +392,7 @@ def _parse_parsec_input(
         "cubic_spline",
         "so_psp",
         "atomic_energy_correction",
+        "initial_spin_polarization",
     }
     block_keys = {"atom_coord", "domain_shape_parameters", "cell_shape"}
     accepted_global = {
@@ -532,8 +533,7 @@ def _parse_parsec_input(
             "Periodic_System=true requires Boundary_Conditions=bulk, and "
             "Boundary_Conditions=cluster requires Periodic_System=false"
         )
-    if optional_bool("spin_polarization"):
-        raise UnsupportedParsecOptionError("spin-polarized calculations are not supported")
+    spin_polarization = optional_bool("spin_polarization")
     if optional_bool("dynamic_diag_tol"):
         raise UnsupportedParsecOptionError("Dynamic_Diag_Tol is not supported")
     if optional_bool("old_interpolation_format"):
@@ -686,6 +686,10 @@ def _parse_parsec_input(
             species_value("so_psp", species_index, "false"),
             label=f"{symbol} SO_PSP",
         )
+        initial_spin_polarization = _strict_float(
+            species_value("initial_spin_polarization", species_index, "0.1"),
+            label=f"{symbol} Initial_Spin_Polarization",
+        )
         read_vcd = _boolean(
             species_value("read_vcd", species_index, "false"),
             label=f"{symbol} Read_VCD",
@@ -724,6 +728,7 @@ def _parse_parsec_input(
             element_symbol=element_symbol,
             atomic_energy_correction=correction,
             spin_orbit=spin_orbit,
+            initial_spin_polarization=initial_spin_polarization,
         )
 
         for coordinate_line in coordinate_item.value:
@@ -897,6 +902,7 @@ def _parse_parsec_input(
             "normalize_initial_density", True
         ),
         xc_functional=xc_functional,
+        spin_polarized=spin_polarization,
     )
 
     initial_labels = []

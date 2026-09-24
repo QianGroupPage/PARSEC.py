@@ -34,8 +34,17 @@ def fermi_occupations(
     count_tolerance: float = 1.0e-12,
     max_iterations: int = 100,
     degeneracy_tolerance: float = 1.0e-12,
+    degeneracy: float = 2.0,
 ) -> OccupationResult:
-    """Occupy spin-degenerate states with PARSEC's ``f_i in [0,1]`` convention."""
+    """Occupy states with PARSEC's ``f_i in [0,1]`` convention.
+
+    ``degeneracy`` is the maximum electron count per orbital: 2 for the
+    default spin-unpolarized case (two spin-degenerate electrons per spatial
+    orbital), or 1 when occupying a single spin channel's non-degenerate
+    orbitals -- e.g. by pooling both channels' eigenvalues into one call for
+    a spin-polarized calculation's single shared Fermi level (``flevel.f90``),
+    then splitting the returned ``occupations`` back by channel.
+    """
     eigenvalues = np.asarray(eigenvalues, dtype=float)
     if eigenvalues.ndim != 1 or eigenvalues.size == 0:
         raise ValueError("eigenvalues must be a nonempty one-dimensional array")
@@ -43,12 +52,14 @@ def fermi_occupations(
         raise ValueError("eigenvalues must be finite")
     if np.any(np.diff(eigenvalues) < 0):
         raise ValueError("eigenvalues must be sorted")
+    if not np.isfinite(degeneracy) or degeneracy <= 0:
+        raise ValueError("degeneracy must be a positive finite number")
     if (
         not np.isfinite(electron_count)
         or electron_count < 0
-        or electron_count > 2.0 * eigenvalues.size
+        or electron_count > degeneracy * eigenvalues.size
     ):
-        raise ValueError("electron count exceeds the available spin-degenerate states")
+        raise ValueError("electron count exceeds the available degenerate states")
     if (
         not np.isfinite(count_tolerance)
         or count_tolerance <= 0
@@ -60,7 +71,7 @@ def fermi_occupations(
         raise ValueError("max_iterations must be a positive integer")
     if not np.isfinite(temperature_kelvin):
         raise ValueError("temperature must be finite")
-    target = 0.5 * float(electron_count)
+    target = float(electron_count) / degeneracy
 
     if temperature_kelvin == 0:
         occupations = np.zeros_like(eigenvalues)
@@ -103,7 +114,7 @@ def fermi_occupations(
         return OccupationResult(
             fermi_level=fermi_level,
             occupations=occupations,
-            electron_count=float(2.0 * np.sum(occupations)),
+            electron_count=float(degeneracy * np.sum(occupations)),
         )
     if temperature_kelvin < 0:
         raise ValueError("negative-temperature file occupations are not supported")
@@ -144,7 +155,7 @@ def fermi_occupations(
     return OccupationResult(
         fermi_level=float(0.5 * (lower + upper)),
         occupations=occupations,
-        electron_count=float(2.0 * np.sum(occupations)),
+        electron_count=float(degeneracy * np.sum(occupations)),
     )
 
 
@@ -152,11 +163,16 @@ def density_from_orbitals(
     wavefunctions: np.ndarray,
     occupations: np.ndarray,
     volume_element: float,
+    *,
+    degeneracy: float = 2.0,
 ) -> np.ndarray:
-    """Build ``rho = 2/dV * sum_i f_i |psi_i|**2``.
+    """Build ``rho = degeneracy/dV * sum_i f_i |psi_i|**2``.
 
     Columns of ``wavefunctions`` must have Euclidean norm one, matching PARSEC's
-    eigensolver convention.
+    eigensolver convention.  ``degeneracy`` matches
+    :func:`fermi_occupations`: 2 for the default spin-unpolarized case, or 1
+    when building one spin channel's density from that channel's own orbitals
+    and occupations.
     """
     wavefunctions = np.asarray(wavefunctions, dtype=float)
     occupations = np.asarray(occupations, dtype=float)
@@ -166,7 +182,9 @@ def density_from_orbitals(
         raise ValueError("occupation count does not match the wavefunction columns")
     if volume_element <= 0:
         raise ValueError("volume_element must be positive")
-    return (2.0 / volume_element) * np.sum(
+    if not np.isfinite(degeneracy) or degeneracy <= 0:
+        raise ValueError("degeneracy must be a positive finite number")
+    return (degeneracy / volume_element) * np.sum(
         wavefunctions * wavefunctions * occupations[None, :], axis=1
     )
 

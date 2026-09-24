@@ -55,8 +55,17 @@ def load_pseudopotentials(
 
     * the species' physical element agrees with the symbol stored in the file;
     * the user-selected local angular-momentum channel exists;
-    * no spin-orbit channels are present; and
+    * a species requesting ``SO_PSP`` has a relativistic POTRE file carrying
+      the matching p/d spin-orbit channels; and
     * the pseudopotential was generated for the selected XC family.
+
+    A file's spin-orbit channels (if present) are always parsed into
+    :attr:`~parsec_python.Pseudopotential.ParsecPseudopotential.spin_orbit_channel_potentials`
+    regardless of ``SO_PSP``, matching PARSEC's own read behavior. Applying
+    the resulting spin-orbit projectors in the Hamiltonian -- Fortran's
+    perturbative or self-consistent SOC -- is a separate capability this
+    scalar single-point solver does not yet implement; requesting
+    ``SO_PSP=true`` here only validates that the file supports it.
 
     The returned objects retain radial channel potentials ``V_l(r)``, reduced
     radial pseudo-wavefunctions ``u_l(r)``, occupations, cutoff radii, atomic
@@ -83,10 +92,11 @@ def load_pseudopotentials(
                 f"in {specification.path}"
             )
         potential.validate_local_channel(specification.local_angular_momentum)
-        if potential.number_of_spin_orbit_channels:
+        if specification.spin_orbit and not potential.has_spin_orbit_channels:
             raise ValueError(
-                f"{specification.path} contains spin-orbit channels; "
-                "the scalar single-point solver does not support them"
+                f"species {symbol!r} requests SO_PSP, but {specification.path} "
+                f"does not contain spin-orbit potentials (relativity="
+                f"{potential.relativity!r})"
             )
         pp_xc = potential.correlation.strip().lower()
         if pp_xc not in compatible[requested]:

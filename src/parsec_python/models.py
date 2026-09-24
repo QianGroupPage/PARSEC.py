@@ -62,6 +62,14 @@ class SpeciesPotential:
     Such a correction is required before comparing total energies obtained
     with ordinary and core-hole pseudopotentials having different valence
     charges.
+
+    ``spin_orbit`` mirrors PARSEC's per-species ``SO_PSP`` flag and requires
+    the POTRE file to be a relativistic (``irel='rel'``) potential carrying
+    explicit p/d spin-orbit channels (see
+    :attr:`~parsec_python.Pseudopotential.ParsecPseudopotential.has_spin_orbit_channels`).
+    Reading such a species is supported; applying the spin-orbit term in the
+    Hamiltonian (Fortran's perturbative or self-consistent SOC) is a separate
+    capability not yet implemented here.
     """
 
     path: str | Path
@@ -70,6 +78,7 @@ class SpeciesPotential:
     use_spline: bool = False
     element_symbol: str | None = None
     atomic_energy_correction: float = 0.0
+    spin_orbit: bool = False
 
     def __post_init__(self) -> None:
         local_l = int(self.local_angular_momentum)

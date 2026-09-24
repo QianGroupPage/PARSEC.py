@@ -8,7 +8,7 @@ by the rest of the Python solver.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 
@@ -66,6 +66,7 @@ class ParsecPseudopotential:
     channel_occupations: dict[int, float]
     channel_cutoffs: dict[int, float]
     source: Path
+    spin_orbit_channel_potentials: dict[int, np.ndarray] = field(default_factory=dict)
 
     @property
     def has_nonlinear_core_correction(self) -> bool:
@@ -208,6 +209,98 @@ class ParsecPseudopotential:
             projector[:8] = projector[16]
         return projector, float(np.sign(denominator))
 
+    @property
+    def has_spin_orbit_channels(self) -> bool:
+        return bool(self.spin_orbit_channel_potentials)
+
+    def spin_orbit_projectors(
+        self, angular_momentum: int, local_l: int
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Return PARSEC's KB-normalized average and spin-orbit projectors.
+
+        A relativistic (``irel='rel'``) POTRE file stores, for a spin-orbit
+        channel ``l`` (PARSEC supports only ``l=1`` and ``l=2``), the ordinary
+        channel potential ``V_l`` together with a raw spin-orbit correction
+        ``V_so_raw`` (the ``"Minor comp. of Pseudop. follows"`` block).
+        ``pseudo.f90`` reconstructs the two total-angular-momentum channels as
+
+        ``V_(j=l+1/2) = V_l + (l/2)*V_so_raw``
+        ``V_(j=l-1/2) = V_l - ((l+1)/2)*V_so_raw``
+
+        Each j-channel is then Kleinman-Bylander-normalized independently
+        against the *same* reduced pseudo-wavefunction ``u_l(r)`` (PARSEC
+        stores one wavefunction per ``l``, not per ``j``), exactly as
+        :meth:`radial_projector` normalizes a single channel against the
+        local potential.  The two normalized projectors are finally
+        recombined into PARSEC's "average" (``vionr``) and "spin-orbit"
+        (``vsor``) nonlocal projector pair:
+
+        ``V_ion,l = [(l+1)*proj_(j+) + l*proj_(j-)] / (2l+1)``
+        ``V_so,l  = 2*(proj_(j+) - proj_(j-)) / (2l+1)``
+
+        The returned ``sign`` reconciles the two j-channels' KB-denominator
+        signs the way ``pseudo.f90:797-819`` does: when they agree, that
+        shared sign is used; when they disagree, the larger-magnitude
+        channel's sign wins.  ``V_ion``/``V_so`` are themselves separable
+        nonlocal projector radial functions, not local potentials -- they
+        feed the spin-orbit nonlocal operator, not
+        :meth:`local_potential`.
+        """
+        if angular_momentum not in (1, 2):
+            raise ValueError(
+                "spin-orbit projectors are only defined for l=1 (p) and l=2 (d)"
+            )
+        if angular_momentum not in self.spin_orbit_channel_potentials:
+            raise ValueError(f"no spin-orbit channel for l={angular_momentum}")
+        self.validate_local_channel(local_l)
+        if angular_momentum not in self.channel_potentials:
+            raise ValueError(f"no potential channel for l={angular_momentum}")
+        if angular_momentum not in self.radial_wavefunctions:
+            raise ValueError(f"no pseudo-wavefunction for l={angular_momentum}")
+
+        channel_v = self.channel_potentials[angular_momentum]
+        so_raw = self.spin_orbit_channel_potentials[angular_momentum]
+        local_v = self.channel_potentials[local_l]
+        radial_wave = self.radial_wavefunctions[angular_momentum]
+
+        v_plus = channel_v + 0.5 * angular_momentum * so_raw
+        v_minus = channel_v - 0.5 * (angular_momentum + 1) * so_raw
+
+        def _normalize(v_j: np.ndarray) -> tuple[np.ndarray, float]:
+            delta_v = v_j - local_v
+            denominator = parsec_radial_integral(
+                self.radii, radial_wave * radial_wave * delta_v
+            )
+            if abs(denominator) < 1.0e-18:
+                raise ValueError(
+                    "nearly zero spin-orbit Kleinman-Bylander denominator for "
+                    f"l={angular_momentum}"
+                )
+            projector = delta_v * radial_wave / self.radii
+            projector /= np.sqrt(abs(denominator))
+            if projector.size > 16:
+                projector[:8] = projector[16]
+            return projector, denominator
+
+        proj_plus, denom_plus = _normalize(v_plus)
+        proj_minus, denom_minus = _normalize(v_minus)
+
+        sign_plus = float(np.sign(denom_plus))
+        sign_minus = float(np.sign(denom_minus))
+        if sign_plus == sign_minus:
+            sign = sign_plus
+        elif abs(denom_plus) > abs(denom_minus):
+            sign = sign_plus
+        else:
+            sign = sign_minus
+
+        weight = 1.0 / (2 * angular_momentum + 1)
+        v_ion = weight * (
+            (angular_momentum + 1) * proj_plus + angular_momentum * proj_minus
+        )
+        v_so = 2.0 * weight * (proj_plus - proj_minus)
+        return v_ion, v_so, sign
+
 
 def read_parsec_pseudopotential(path: str | Path) -> ParsecPseudopotential:
     """Read a PARSEC ``MARTINS_NEW``/``*_POTRE.DAT`` pseudopotential."""
@@ -244,6 +337,7 @@ def read_parsec_pseudopotential(path: str | Path) -> ParsecPseudopotential:
         raise ValueError(f"radial grid in {source} must be positive and increasing")
 
     channel_potentials: dict[int, np.ndarray] = {}
+    spin_orbit_channel_potentials: dict[int, np.ndarray] = {}
     radial_wavefunctions: dict[int, np.ndarray] = {}
     channel_occupations: dict[int, float] = {}
     channel_cutoffs: dict[int, float] = {}
@@ -253,7 +347,20 @@ def read_parsec_pseudopotential(path: str | Path) -> ParsecPseudopotential:
     for index, line in enumerate(lines):
         lower = line.lower()
         compact_marker = re.sub(r"[^a-z]", "", lower)
-        if "pseudopotential follows" in lower:
+        if "minorcompofpseudopfollows" in compact_marker:
+            # A relativistic (``irel='rel'``) file's raw spin-orbit
+            # correction block, e.g. "Minor comp. of Pseudop. follows (l on
+            # next line)".  Checked before the plain "pseudopotential
+            # follows" channels below since this marker does not contain
+            # that substring, but keeping the SO check first documents the
+            # dependency explicitly.
+            l_values = _numbers(lines[index + 1])
+            if not l_values:
+                raise ValueError(f"missing angular momentum after line {index + 1} in {source}")
+            angular_momentum = int(l_values[0])
+            radial_so, _ = _read_values(lines, index + 2, radial_count)
+            spin_orbit_channel_potentials[angular_momentum] = radial_so / radii
+        elif "pseudopotential follows" in lower:
             l_values = _numbers(lines[index + 1])
             if not l_values:
                 raise ValueError(f"missing angular momentum after line {index + 1} in {source}")
@@ -288,6 +395,17 @@ def read_parsec_pseudopotential(path: str | Path) -> ParsecPseudopotential:
             f"{source} is missing pseudo-wavefunctions for potential "
             f"channels {channels}"
         )
+    if len(spin_orbit_channel_potentials) != number_of_spin_orbit_channels:
+        raise ValueError(
+            f"{source} declares {number_of_spin_orbit_channels} spin-orbit "
+            f"channels but contains {len(spin_orbit_channel_potentials)}"
+        )
+    invalid_so_channels = sorted(set(spin_orbit_channel_potentials) - {1, 2})
+    if invalid_so_channels:
+        raise ValueError(
+            f"{source} has spin-orbit channels for unsupported l="
+            f"{invalid_so_channels}; PARSEC only supports l=1 (p) and l=2 (d)"
+        )
 
     radial_to_volume = 1.0 / (4.0 * np.pi * radii * radii)
     return ParsecPseudopotential(
@@ -310,4 +428,5 @@ def read_parsec_pseudopotential(path: str | Path) -> ParsecPseudopotential:
         channel_occupations=channel_occupations,
         channel_cutoffs=channel_cutoffs,
         source=source,
+        spin_orbit_channel_potentials=spin_orbit_channel_potentials,
     )

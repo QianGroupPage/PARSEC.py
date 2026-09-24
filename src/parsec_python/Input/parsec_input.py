@@ -682,11 +682,10 @@ def _parse_parsec_input(
             raise ParsecInputError(
                 f"Atom_Type {symbol}: Local_Component must be s, p, d, or f"
             )
-        if _boolean(
+        spin_orbit = _boolean(
             species_value("so_psp", species_index, "false"),
             label=f"{symbol} SO_PSP",
-        ):
-            raise UnsupportedParsecOptionError("spin-orbit pseudopotentials are not supported")
+        )
         read_vcd = _boolean(
             species_value("read_vcd", species_index, "false"),
             label=f"{symbol} Read_VCD",
@@ -724,6 +723,7 @@ def _parse_parsec_input(
             use_spline=use_spline,
             element_symbol=element_symbol,
             atomic_energy_correction=correction,
+            spin_orbit=spin_orbit,
         )
 
         for coordinate_line in coordinate_item.value:

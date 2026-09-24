@@ -17,6 +17,9 @@ import numpy as np
 from parsec_python.SCF.single_point import (
     prepare_single_point as prepare_reference_single_point,
 )
+from parsec_python.SCF.pbc import (
+    prepare_periodic_single_point as prepare_reference_periodic_single_point,
+)
 from parsec_python.models import (
     PreparationTimings,
     SCFIteration,
@@ -95,6 +98,7 @@ def _reference_cache_key(
         problem.mixing,
         problem.initial_density_settings,
         problem.recenter_geometry,
+        problem.periodic_cell,
     ):
         digest.update(repr(settings).encode("utf-8"))
     initial_source = problem.initial_density_settings.file
@@ -216,6 +220,12 @@ def _prepare_reference_physics(
                 cache_directory=deferred_laplacian_cache_directory,
                 lookup_seconds=perf_counter() - cache_started,
             )
+
+    if getattr(problem, "periodic_cell", None) is not None:
+        reference = prepare_reference_periodic_single_point(problem)
+        if cache_key is not None:
+            _remember_reference(cache_key, reference, cache_capacity)
+        return reference
 
     # Static construction and repeated Hamiltonian execution are independent
     # choices.  In the default hybrid path C++ builds the compressed-grid
@@ -389,6 +399,52 @@ def _build_native_boundary_builder(
     )
 
 
+def _selection_for_problem(
+    selection: BackendSelection, problem: SinglePointInput
+) -> BackendSelection:
+    """Route a periodic problem's static construction to the reference builder.
+
+    The native C++ finite-difference/ionic construction kernels and the
+    native/CuPy multipole-boundary Hartree solve are both isolated-cluster
+    specific -- neither is periodic-wraparound aware. Forcing
+    ``finite_difference_builder``/``hartree_backend`` to the reference/scipy
+    values here means every downstream branch keyed on those two fields
+    (native boundary setup, native XC, the diagnostic implementation
+    strings) is automatically inert for a periodic problem without needing
+    its own ``periodic_cell`` check.
+
+    ``selected`` -- the Hamiltonian-apply execution backend used for the
+    eigensolver's repeated matrix-vector products -- is deliberately left
+    alone: ``negative_laplacian``/``nonlocal_operator`` are plain sparse
+    matrices regardless of periodicity (see the comment in
+    :func:`_build_backend`), so CuPy/native can still accelerate that step
+    for a periodic problem. Only the Hartree *solve* itself still needs an
+    explicit ``periodic_cell`` branch in :func:`prepare_single_point`, since
+    forcing ``hartree_backend="scipy"`` would otherwise route into the
+    isolated-only scipy Hartree path rather than skipping it.
+    """
+
+    if getattr(problem, "periodic_cell", None) is None:
+        return selection
+    if (
+        selection.finite_difference_builder == "reference"
+        and selection.hartree_backend == "scipy"
+    ):
+        return selection
+    return replace(
+        selection,
+        finite_difference_builder="reference",
+        hartree_backend="scipy",
+        fallback_reasons=selection.fallback_reasons
+        + (
+            "periodic cell: finite-difference/ionic construction and the "
+            "Hartree solve are routed to the reference (Python) "
+            "implementation -- native/CuPy construction and boundary "
+            "kernels are isolated-cluster only",
+        ),
+    )
+
+
 def _resolve_and_prepare_reference(
     problem: SinglePointInput,
     backend: BackendName | str,
@@ -433,7 +489,7 @@ def _resolve_and_prepare_reference(
     can_overlap = overlap_requested and normalized == "auto"
     if not can_overlap:
         resolution_started = perf_counter()
-        selection = resolve_backend(backend, problem)
+        selection = _selection_for_problem(resolve_backend(backend, problem), problem)
         resolution_seconds = perf_counter() - resolution_started
         reference_started = perf_counter()
         reference = prepare_reference(selection)
@@ -451,20 +507,23 @@ def _resolve_and_prepare_reference(
     from .backends.selection import _native_status
 
     native_available, _ = _native_status()
-    provisional = BackendSelection(
-        requested="auto",
-        selected="native" if native_available else "scipy",
-        finite_difference_builder=(
-            "native" if native_available else "reference"
+    provisional = _selection_for_problem(
+        BackendSelection(
+            requested="auto",
+            selected="native" if native_available else "scipy",
+            finite_difference_builder=(
+                "native" if native_available else "reference"
+            ),
+            hartree_backend="native" if native_available else "scipy",
         ),
-        hartree_backend="native" if native_available else "scipy",
+        problem,
     )
 
     overlap_started = perf_counter()
 
     def timed_resolution():
         started = perf_counter()
-        selected = resolve_backend(backend, problem)
+        selected = _selection_for_problem(resolve_backend(backend, problem), problem)
         return selected, perf_counter() - started
 
     with ThreadPoolExecutor(
@@ -521,6 +580,13 @@ def prepare_single_point(
     """
 
     symmetry_mode = _normalize_symmetry_mode(symmetry)
+    is_periodic = getattr(problem, "periodic_cell", None) is not None
+    if is_periodic and symmetry_mode == "on":
+        raise ValueError(
+            "symmetry='on' is not supported for periodic problems: exact "
+            "space-group symmetry detection is not implemented for the "
+            "accelerated periodic path"
+        )
     selection, reference, preparation_overlap = _resolve_and_prepare_reference(
         problem,
         backend,
@@ -543,7 +609,12 @@ def prepare_single_point(
     symmetry_representation_cache_info = None
     detected_group_order = 1
     symmetry_detection = "disabled by option"
-    if symmetry_mode != "off":
+    if is_periodic:
+        symmetry_detection = (
+            "skipped: periodic cell (space-group symmetry detection is not "
+            "implemented for the accelerated path; the full grid is used)"
+        )
+    elif symmetry_mode != "off":
         from .Symmetry import load_or_detect_reflection_reduction
 
         try:
@@ -833,7 +904,18 @@ def prepare_single_point(
 
         native_xc_evaluator = symmetry_xc_evaluator
 
-    if selection.hartree_backend == "cupy":
+    if is_periodic:
+        # solve_scipy_hartree/CuPyPoissonSolver/NativePoissonSolver all build
+        # an isolated-cluster boundary (multipole or direct Coulomb); none
+        # apply to a periodic cell. Delegate straight to the already-
+        # validated periodic CG solve (SCF.pbc.solve_periodic_hartree via
+        # reference.solve_hartree) -- _selection_for_problem forces
+        # hartree_backend to "scipy" for periodic precisely so none of the
+        # branches below this one can be reached instead.
+        def accelerated_hartree(density, initial_potential=None, **kwargs):
+            return reference.solve_hartree(density, initial_potential, **kwargs)
+
+    elif selection.hartree_backend == "cupy":
         from .Hartree.cupy_poisson import CuPyPoissonSolver
 
         if selection.selected != "cupy":
@@ -1125,6 +1207,16 @@ def prepare_single_point(
         "reference": "validated vectorized Python/SciPy compressed-grid CSR builder",
         "native": "C++17 compressed-grid CSR builder (exact stencil parity)",
     }[selection.finite_difference_builder]
+    if is_periodic:
+        hartree_implementation = (
+            "periodic Ewald-consistent conjugate-gradient solve "
+            "(SCF.pbc.solve_periodic_hartree); no accelerated periodic "
+            "Hartree backend yet"
+        )
+        finite_difference_implementation = (
+            "validated vectorized Python/SciPy periodic-wraparound CSR "
+            "builder (SCF.pbc.prepare_periodic_single_point)"
+        )
     component_details = (
         (
             "cuda_initialization_overlap",

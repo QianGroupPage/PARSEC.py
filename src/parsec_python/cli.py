@@ -11,7 +11,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .driver import prepare_single_point, run_scf
+from .driver import prepare_single_point, prepare_periodic_single_point, run_scf
 from .Input import (
     ParsecInputError,
     parse_parsec_input,
@@ -331,6 +331,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
 
+    is_periodic = translation.problem.periodic_cell is not None
+
     summary = summarize_translation(translation)
     if arguments.dry_run:
         try:
@@ -391,7 +393,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             for warning in translation.warnings:
                 log.write(f"WARNING: {warning}")
             log.write()
-            system = prepare_single_point(translation.problem)
+            if is_periodic:
+                system = prepare_periodic_single_point(translation.problem)
+            else:
+                system = prepare_single_point(translation.problem)
             reporter.setup(system)
 
             scf_start = time.perf_counter()

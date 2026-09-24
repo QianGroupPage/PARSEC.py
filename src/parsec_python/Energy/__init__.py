@@ -1,5 +1,5 @@
 """Kohn--Sham energy components and total-energy evaluation."""
 
-from .total_energy import total_energy
+from .total_energy import total_energy, total_energy_spin_polarized
 
-__all__ = ["total_energy"]
+__all__ = ["total_energy", "total_energy_spin_polarized"]

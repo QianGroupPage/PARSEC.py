@@ -19,8 +19,18 @@ def total_energy(
     ion_ion_energy: float,
     volume_element: float,
     alpha_z_energy: float = 0.0,
+    band_energy_weight: float = 1.0,
 ) -> EnergyBreakdown:
-    """Evaluate the input-potential/new-density PARSEC energy expression."""
+    """Evaluate the input-potential/new-density PARSEC energy expression.
+
+    ``band_energy_weight`` scales the ``2*dot(occ,eig)`` band-energy term
+    only (everything else is a density-dotted integral and is already
+    correct once ``density`` itself is built consistently).  The default 1
+    is the ordinary single-Gamma-point case; k-point sampling
+    (:mod:`~parsec_python.SCF.kpoints`) passes each k-point's Brillouin-zone
+    weight here, since ``eigenvalues``/``occupations`` there are pooled
+    across k-points without that weight otherwise applied.
+    """
     eigenvalues = np.asarray(eigenvalues, dtype=float)
     occupations = np.asarray(occupations, dtype=float)
     density = np.asarray(density, dtype=float)
@@ -35,7 +45,9 @@ def total_energy(
     if any(np.asarray(value).shape != density.shape for value in arrays):
         raise ValueError("all potentials must match the density")
 
-    band_energy = float(2.0 * np.dot(occupations, eigenvalues)) + float(alpha_z_energy)
+    band_energy = float(
+        2.0 * band_energy_weight * np.dot(occupations, eigenvalues)
+    ) + float(alpha_z_energy)
     old_hxc = np.asarray(input_effective_potential) - np.asarray(ionic_potential)
     old_hxc_integral = float(volume_element * np.dot(density, old_hxc))
     hartree_integral = float(

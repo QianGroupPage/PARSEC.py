@@ -7,14 +7,16 @@ point-group representation numbers, forces, dipoles, and MPI statistics.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, Sequence, TYPE_CHECKING
 
 import numpy as np
 
 from ..models import SCFIteration, SinglePointResult
 
 if TYPE_CHECKING:
+    from ..Eigensolvers.perturbative_soc import PerturbativeSpinOrbitResult
     from ..Input.parsec_input import ParsecInputTranslation
+    from ..models import SpinPolarizedSCFIteration, SpinPolarizedSinglePointResult
     from ..SCF import PreparedSinglePointSystem
 
 
@@ -504,6 +506,142 @@ class ParsecTextReporter:
                 " =================================================================",
             ]
         )
+        self.write("\n".join(lines))
+
+    def _spin_channel_table(
+        self,
+        label: str,
+        eigenvalues: Sequence[float],
+        occupations: Sequence[float],
+    ) -> list[str]:
+        lines = [
+            f"   Spin {label}",
+            "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.",
+            "",
+        ]
+        for index, (eigenvalue, occupation) in enumerate(
+            zip(eigenvalues, occupations), start=1
+        ):
+            lines.append(
+                f"{index:5d}   {eigenvalue:18.10f}"
+                f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
+                f" {occupation:9.4f}"
+            )
+        lines.append("")
+        return lines
+
+    def iteration_spin_polarized(self, step: "SpinPolarizedSCFIteration") -> None:
+        """Per-iteration report for :func:`run_scf_spin_polarized`.
+
+        A leaner counterpart to :meth:`iteration`: the spin-polarized driver
+        does not yet carry per-stage timing instrumentation (see its module
+        docstring), so this omits the timing breakdown ``iteration`` prints.
+        """
+        energies = step.energies
+        atom_count = len(self.problem.atoms)
+        energy_per_atom_ev = energies.total * RYDBERG_TO_EV / max(atom_count, 1)
+        lines = [
+            f" Spin-polarized SCF iter # {step.iteration:3d}",
+            "",
+            f" Fermi level at {step.fermi_level:10.4f} [Ry]",
+            "",
+        ]
+        lines.extend(
+            self._spin_channel_table("up", step.eigenvalues_up, step.occupations_up)
+        )
+        lines.extend(
+            self._spin_channel_table(
+                "down", step.eigenvalues_down, step.occupations_down
+            )
+        )
+        moment = sum(step.occupations_up) - sum(step.occupations_down)
+        lines.extend(
+            [
+                f"   Magnetic moment N_up - N_down = {moment:12.4f}",
+                "",
+                f"   Eigenvalue Energy             = {energies.eigenvalue:20.8f} [Ry]",
+                f"   Hartree Energy                = {energies.hartree:20.8f} [Ry]",
+                (
+                    "   Integral_{Vxc*rho}            = "
+                    f"{energies.integral_vxc_rho:20.8f} [Ry]"
+                ),
+                (
+                    "   Exc = Integral{eps_xc*rho}    = "
+                    f"{energies.exchange_correlation:20.8f} [Ry]"
+                ),
+                (
+                    "   Electron-Ion energy           = "
+                    f"{energies.electron_ion:20.8f} [Ry]"
+                ),
+                f"   Ion-Ion Energy                = {energies.ion_ion:20.8f} [Ry]",
+                "",
+                f"   Total Energy = {energies.total:22.8f} [Ry]",
+                f"   Energy/atom  = {energy_per_atom_ev:22.8f} [eV]",
+                "",
+                (
+                    f"  0-{step.iteration:3d}    "
+                    "SRE of pot. & charge weighted pot = "
+                    f"{step.plain_residual:14.10f}"
+                    f" {step.weighted_residual:14.10f}"
+                ),
+                "",
+            ]
+        )
+        self.write("\n".join(lines))
+
+    def finish_spin_polarized(
+        self, result: "SpinPolarizedSinglePointResult", elapsed_seconds: float
+    ) -> None:
+        status = (
+            "Self-consistency convergence achieved."
+            if result.converged
+            else "Maximum SCF iterations reached without convergence."
+        )
+        lines = [
+            status,
+            "",
+            f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
+            "",
+            f"Converged magnetic moment N_up - N_down = {result.magnetic_moment:12.4f}",
+            f"Total Energy = {result.energies.total:22.8f} [Ry]",
+            (
+                "Energy/atom  = "
+                f"{result.energies.total * RYDBERG_TO_EV / max(len(result.atoms), 1):22.8f} [eV]"
+            ),
+            "",
+            (
+                "Forces, dipoles, and MPI statistics are not calculated by "
+                "this Python single-point implementation."
+            ),
+            "",
+            " =================================================================",
+        ]
+        self.write("\n".join(lines))
+
+    def spin_orbit_correction(self, result: "PerturbativeSpinOrbitResult") -> None:
+        """Report PARSEC's ``pls.F90``-style perturbative spin-orbit split.
+
+        Diagonalizing the small ``2N x 2N`` spin-mixing matrix replaces the
+        two independent spin channels above with ``2N`` SOC-split spinor
+        eigenstates; ``magnetic_moment`` here is each spinor's own
+        ``<S_z>``, not a single system-wide total.
+        """
+        lines = [
+            " Perturbative spin-orbit correction (pls.F90-style)",
+            " ---------------------------------------------------",
+            "",
+            "   State   Eigenvalue [Ry]      Eigenvalue [eV]   <S_z>",
+            "",
+        ]
+        for index, (eigenvalue, moment) in enumerate(
+            zip(result.eigenvalues, result.magnetic_moment), start=1
+        ):
+            lines.append(
+                f"{index:5d}   {eigenvalue:18.10f}"
+                f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
+                f" {moment:9.4f}"
+            )
+        lines.append("")
         self.write("\n".join(lines))
 
 

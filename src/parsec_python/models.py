@@ -633,6 +633,23 @@ class SCFIteration:
     total_seconds: float = 0.0
 
 
+@dataclass(frozen=True)
+class SpinPolarizedSCFIteration:
+    """Diagnostics retained for one :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized`
+    iteration -- the spin-polarized counterpart to :class:`SCFIteration`, with
+    both channels' eigenpairs instead of one combined set."""
+
+    iteration: int
+    weighted_residual: float
+    plain_residual: float
+    energies: EnergyBreakdown
+    eigenvalues_up: tuple[float, ...] = ()
+    eigenvalues_down: tuple[float, ...] = ()
+    occupations_up: tuple[float, ...] = ()
+    occupations_down: tuple[float, ...] = ()
+    fermi_level: float = float("nan")
+
+
 @dataclass
 class SinglePointResult:
     """Result of a modular isolated single-point calculation."""

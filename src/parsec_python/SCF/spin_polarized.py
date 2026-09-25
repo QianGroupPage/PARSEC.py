@@ -15,12 +15,14 @@ fixed; the magnetic moment ``N_up-N_down`` is free), not two independently
 constrained channels.
 
 Unlike :func:`~parsec_python.SCF.single_point.run_scf`, this function does
-not yet carry PARSEC's full per-iteration timing/history instrumentation or
-CLI/Output wiring -- see :class:`~parsec_python.models.SpinPolarizedSinglePointResult`.
-It exists to produce a converged collinear ground state (eigenvalues,
-occupations, and orbitals for both channels) that
-:mod:`parsec_python.Eigensolvers.perturbative_soc`-style code can then use
-for PARSEC's default perturbative spin-orbit correction.
+not yet carry PARSEC's full per-iteration timing/history instrumentation --
+see :class:`~parsec_python.models.SpinPolarizedSinglePointResult`.  It is
+wired into the CLI/Output path (:mod:`parsec_python.cli`,
+:class:`~parsec_python.Output.ParsecTextReporter`) for isolated,
+non-periodic inputs, and produces a converged collinear ground state
+(eigenvalues, occupations, and orbitals for both channels) that
+:mod:`parsec_python.Eigensolvers.perturbative_soc` then uses for PARSEC's
+default perturbative spin-orbit correction.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import density_from_orbitals, fermi_occupations
 from ..SCF.single_point import PreparedSinglePointSystem
 from ..V_xc import ca_lda_spin_polarized
-from ..models import SpinPolarizedSinglePointResult
+from ..models import SpinPolarizedSCFIteration, SpinPolarizedSinglePointResult
 
 
 def _weighted_initial_polarization(system: PreparedSinglePointSystem) -> float:
@@ -136,7 +138,7 @@ def _eigval_settings(system: PreparedSinglePointSystem, filter_degree: int) -> E
 def run_scf_spin_polarized(
     system: PreparedSinglePointSystem,
     *,
-    callback: Callable[[int, float], None] | None = None,
+    callback: Callable[[SpinPolarizedSCFIteration], None] | None = None,
 ) -> SpinPolarizedSinglePointResult:
     """Run collinear spin-polarized PARSEC-style potential mixing.
 
@@ -287,7 +289,19 @@ def run_scf_spin_polarized(
             metrics.plain if settings.use_plain_residual else metrics.weighted
         )
         if callback is not None:
-            callback(iteration, selected_residual)
+            callback(
+                SpinPolarizedSCFIteration(
+                    iteration=iteration,
+                    weighted_residual=metrics.weighted,
+                    plain_residual=metrics.plain,
+                    energies=energies,
+                    eigenvalues_up=tuple(float(value) for value in eigenvalues_up),
+                    eigenvalues_down=tuple(float(value) for value in eigenvalues_down),
+                    occupations_up=tuple(float(value) for value in occupations_up),
+                    occupations_down=tuple(float(value) for value in occupations_down),
+                    fermi_level=float(fermi_level),
+                )
+            )
         if (
             iteration > 5
             and metrics.weighted < 100.0 * settings.convergence_criterion

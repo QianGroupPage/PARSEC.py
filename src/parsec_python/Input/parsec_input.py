@@ -411,6 +411,7 @@ def _parse_parsec_input(
         "net_charges",
         "fermi_temp",
         "spin_polarization",
+        "scf_so",
         "max_iter",
         "convergence_criterion",
         "use_plain_sre",
@@ -534,6 +535,18 @@ def _parse_parsec_input(
             "Boundary_Conditions=cluster requires Periodic_System=false"
         )
     spin_polarization = optional_bool("spin_polarization")
+    if spin_polarization and is_periodic:
+        raise UnsupportedParsecOptionError(
+            "Spin_Polarization=true with a periodic Boundary_Conditions is "
+            "not supported; run_scf_spin_polarized only handles isolated "
+            "(cluster) inputs"
+        )
+    if optional_bool("scf_so"):
+        raise UnsupportedParsecOptionError(
+            "SCF_SO=true (self-consistent spin-orbit) is not yet implemented; "
+            "only the default perturbative spin-orbit correction "
+            "(SO_PSP=true with SCF_SO unset/false) is supported"
+        )
     if optional_bool("dynamic_diag_tol"):
         raise UnsupportedParsecOptionError("Dynamic_Diag_Tol is not supported")
     if optional_bool("old_interpolation_format"):

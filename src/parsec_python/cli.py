@@ -12,13 +12,18 @@ from typing import Sequence
 import numpy as np
 
 from .driver import prepare_single_point, prepare_periodic_single_point, run_scf
+from .Eigensolvers.perturbative_soc import (
+    PerturbativeSpinOrbitResult,
+    perturbative_spin_orbit_correction,
+)
 from .Input import (
     ParsecInputError,
     parse_parsec_input,
     summarize_translation,
 )
-from .models import SinglePointResult
+from .models import SinglePointResult, SpinPolarizedSinglePointResult
 from .Output import ParsecTextReporter
+from .SCF.spin_polarized import run_scf_spin_polarized
 from .V_ion import load_pseudopotentials
 
 
@@ -261,6 +266,59 @@ def save_result_archive(
     return output
 
 
+def save_spin_polarized_result_archive(
+    path: str | Path,
+    result: SpinPolarizedSinglePointResult,
+    soc_result: PerturbativeSpinOrbitResult | None = None,
+    *,
+    include_wavefunctions: bool = False,
+) -> Path:
+    """Save a portable NumPy archive for a spin-polarized (LSDA) result.
+
+    A leaner counterpart to :func:`save_result_archive`: the spin-polarized
+    driver does not yet carry per-iteration history or preparation timings
+    (see ``SCF.spin_polarized``'s module docstring), so this saves only the
+    converged final state -- both channels' eigenpairs, energies, and the
+    magnetic moment -- plus the perturbative spin-orbit correction's
+    SOC-split eigenvalues/spinors when ``soc_result`` is supplied.
+    """
+    output = _npz_path(Path(path).expanduser().resolve())
+    output.parent.mkdir(parents=True, exist_ok=True)
+    energy = asdict(result.energies)
+    payload: dict[str, np.ndarray] = {
+        "atom_symbols": np.asarray([atom.symbol for atom in result.atoms]),
+        "atom_coordinates_bohr": np.asarray(
+            [atom.position for atom in result.atoms], dtype=float
+        ),
+        "density_up_e_per_bohr3": result.density_up,
+        "density_down_e_per_bohr3": result.density_down,
+        "eigenvalues_up_ry": result.eigenvalues_up,
+        "eigenvalues_down_ry": result.eigenvalues_down,
+        "occupations_up": result.occupations_up,
+        "occupations_down": result.occupations_down,
+        "fermi_level_ry": np.asarray(result.fermi_level),
+        "electron_count": np.asarray(result.electron_count),
+        "magnetic_moment": np.asarray(result.magnetic_moment),
+        "converged": np.asarray(result.converged),
+        "iterations": np.asarray(result.iterations),
+    }
+    for name, value in energy.items():
+        payload[f"energy_{name}_ry"] = np.asarray(value)
+    if include_wavefunctions:
+        payload["wavefunctions_up"] = result.wavefunctions_up
+        payload["wavefunctions_down"] = result.wavefunctions_down
+    if soc_result is not None:
+        payload["soc_eigenvalues_ry"] = soc_result.eigenvalues
+        payload["soc_magnetic_moment"] = soc_result.magnetic_moment
+        if include_wavefunctions:
+            payload["soc_spinor_coefficients_up"] = soc_result.spinor_coefficients_up
+            payload["soc_spinor_coefficients_down"] = (
+                soc_result.spinor_coefficients_down
+            )
+    np.savez_compressed(output, **payload)
+    return output
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -384,6 +442,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 2
 
+    spin_polarized = translation.problem.scf.spin_polarized
+    has_soc_species = any(
+        specification.spin_orbit
+        for specification in translation.problem.pseudopotentials.values()
+    )
+
     start = time.perf_counter()
     run_log = _RunLog(log_path, quiet=arguments.quiet)
     try:
@@ -400,6 +464,41 @@ def main(argv: Sequence[str] | None = None) -> int:
             reporter.setup(system)
 
             scf_start = time.perf_counter()
+            if spin_polarized:
+                result = run_scf_spin_polarized(
+                    system, callback=reporter.iteration_spin_polarized
+                )
+                scf_elapsed = time.perf_counter() - scf_start
+                reporter.finish_spin_polarized(result, scf_elapsed)
+
+                soc_result = None
+                if has_soc_species:
+                    soc_result = perturbative_spin_orbit_correction(
+                        system.grid,
+                        result,
+                        system.atoms,
+                        system.pseudopotentials,
+                        translation.problem.pseudopotentials,
+                    )
+                    reporter.spin_orbit_correction(soc_result)
+
+                total_elapsed = time.perf_counter() - start
+                log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
+
+                if not arguments.no_archive:
+                    saved = save_spin_polarized_result_archive(
+                        archive_path,
+                        result,
+                        soc_result,
+                        include_wavefunctions=(
+                            arguments.save_wavefunctions
+                            or translation.output_all_states
+                        ),
+                    )
+                    log.write(f"Result archive: {saved}")
+                log.write(f"Text log: {log_path}")
+                return 0 if result.converged else 3
+
             result = run_scf(system, callback=reporter.iteration)
             scf_elapsed = time.perf_counter() - scf_start
             reporter.finish(result, scf_elapsed)

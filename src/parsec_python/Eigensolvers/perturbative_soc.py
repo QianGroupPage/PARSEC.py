@@ -214,6 +214,7 @@ def _projector_overlaps(
 
 
 def _lzsz_block(
+    projectors: Sequence[AtomSpinOrbitProjectors],
     dotio: Sequence[np.ndarray],
     dotso: Sequence[np.ndarray],
     spin_sign: int,
@@ -222,17 +223,25 @@ def _lzsz_block(
 
     Directly transcribes ``lzsz``'s grid computation plus ``pls.F90``'s
     ``h_spin(i,j) += conjg(dot_product(psi_i, q_tmp))``, without building any
-    grid-space vector: ``<psi_i|v_ion,lm> = conj(<v_ion,lm|psi_i>) =
-    conj(dotio_i(lm))``, so every term is expressible directly from the
-    precomputed ``dotio``/``dotso`` overlap tables (one array per SOC atom,
-    shape ``(n_states, 8)``, from :func:`_projector_overlaps`).  ``spin_sign``
-    is +1 for the up channel, -1 for down (``lzsz``'s ``m``).
+    grid-space vector.  ``dotio``/``dotso`` (from :func:`_projector_overlaps`)
+    already carry the per-``(atom,l)`` KB sign baked in once, matching how
+    ``lzsz`` uses them directly as ``q_tmp``'s coefficients on the *ket*
+    side.  Reading the *same* stored value as a *bra*,
+    ``<psi_i|v_ion,lm> = conj(<v_ion,lm|psi_i>) = conj(dotio_i(lm)/sign(lm))
+    = sign(lm)*conj(dotio_i(lm))`` (since ``sign(lm) = +/-1``) -- an extra
+    factor of ``sign(lm)`` that is easy to drop by eye and was in fact
+    missing from an earlier version of this function (caught only by
+    cross-checking against the independently-verified matrix-free grid
+    operator in ``Hamiltonian.spinor_operator``, not by this function's own
+    Hermiticity, which a self-consistently-missing sign still satisfies).
+    ``spin_sign`` is +1 for the up channel, -1 for down (``lzsz``'s ``m``).
     """
     n_states = dotio[0].shape[0]
     h = np.zeros((n_states, n_states), dtype=complex)
     lz = spin_sign * 0.5 * _LM_TO_ML
     quarter_ll1 = 0.25 * _LM_TO_L * (_LM_TO_L + 1)
-    for atom_dotio, atom_dotso in zip(dotio, dotso):
+    for atom, atom_dotio, atom_dotso in zip(projectors, dotio, dotso):
+        sign_by_lm = np.where(_LM_TO_L == 1, atom.sign[0], atom.sign[1])
         for lm in range(8):
             dotio_col = atom_dotio[:, lm]
             dotso_col = atom_dotso[:, lm]
@@ -241,11 +250,12 @@ def _lzsz_block(
                 + np.outer(np.conj(dotso_col), dotio_col)
                 - 0.5 * np.outer(np.conj(dotso_col), dotso_col)
             ) + quarter_ll1[lm] * np.outer(np.conj(dotso_col), dotso_col)
-            h += np.conj(term)
+            h += sign_by_lm[lm] * np.conj(term)
     return h
 
 
 def _lsxy_block(
+    projectors: Sequence[AtomSpinOrbitProjectors],
     dotio_in: Sequence[np.ndarray],
     dotso_in: Sequence[np.ndarray],
     dotio_out: Sequence[np.ndarray],
@@ -258,7 +268,9 @@ def _lsxy_block(
     index ``j``, unshifted ``lm``).  ``dotio_out``/``dotso_out`` are the
     *output*-channel sigma' overlaps (state index ``i``): ``lsxy`` samples
     the output-channel projector overlap at the ladder-shifted index
-    ``lm+m``, so ``<psi_i,sigma'|v_ion,lm+m> = conj(dotio_out_i(lm+m))``.
+    ``lm+m``, so ``<psi_i,sigma'|v_ion,lm+m> = sign(lm+m)*conj(dotio_out_i(lm+m))``
+    -- see :func:`_lzsz_block`'s docstring for why the extra ``sign`` factor
+    is needed when reading a sign-included stored overlap as a bra.
     ``spin_sign`` is ``pls.F90``'s ``m`` argument to ``lsxy`` -- the ladder
     direction, not sigma' itself: ``m=-1`` (down input) produces the up-row
     block, ``m=+1`` (up input) produces the down-row block.
@@ -266,8 +278,8 @@ def _lsxy_block(
     n_out = dotio_out[0].shape[0]
     n_in = dotio_in[0].shape[0]
     h = np.zeros((n_out, n_in), dtype=complex)
-    for atom_in_io, atom_in_so, atom_out_io, atom_out_so in zip(
-        dotio_in, dotso_in, dotio_out, dotso_out
+    for atom, atom_in_io, atom_in_so, atom_out_io, atom_out_so in zip(
+        projectors, dotio_in, dotso_in, dotio_out, dotso_out
     ):
         for lm in range(8):
             target = lm + spin_sign
@@ -279,12 +291,13 @@ def _lsxy_block(
             if number <= 0:
                 continue
             weight = 0.5 * np.sqrt(float(number))
+            target_sign = atom.sign[0] if _LM_TO_L[target] == 1 else atom.sign[1]
 
             dotso_j = atom_in_so[:, lm]
             dotio_j = atom_in_io[:, lm]
             v_ion_overlap_i = atom_out_io[:, target]
             v_so_overlap_i = atom_out_so[:, target]
-            term = weight * (
+            term = target_sign * weight * (
                 np.outer(np.conj(v_ion_overlap_i), dotso_j)
                 + np.outer(np.conj(v_so_overlap_i), dotio_j)
                 - 0.5 * np.outer(np.conj(v_so_overlap_i), dotso_j)
@@ -346,15 +359,17 @@ def perturbative_spin_orbit_correction(
     h_spin[:n_states, :n_states] = np.diag(scf_result.eigenvalues_up.astype(complex))
     h_spin[n_states:, n_states:] = np.diag(scf_result.eigenvalues_down.astype(complex))
 
-    h_spin[:n_states, :n_states] += _lzsz_block(dotio_up, dotso_up, spin_sign=1)
-    h_spin[n_states:, n_states:] += _lzsz_block(dotio_down, dotso_down, spin_sign=-1)
+    h_spin[:n_states, :n_states] += _lzsz_block(projectors, dotio_up, dotso_up, spin_sign=1)
+    h_spin[n_states:, n_states:] += _lzsz_block(
+        projectors, dotio_down, dotso_down, spin_sign=-1
+    )
     # up-down block: lsxy(m=-1) maps a down input to an up-indexed row.
     h_spin[:n_states, n_states:] += _lsxy_block(
-        dotio_down, dotso_down, dotio_up, dotso_up, spin_sign=-1
+        projectors, dotio_down, dotso_down, dotio_up, dotso_up, spin_sign=-1
     )
     # down-up block: lsxy(m=+1) maps an up input to a down-indexed row.
     h_spin[n_states:, :n_states] += _lsxy_block(
-        dotio_up, dotso_up, dotio_down, dotso_down, spin_sign=1
+        projectors, dotio_up, dotso_up, dotio_down, dotso_down, spin_sign=1
     )
 
     # Hermitize: pls.F90 builds each block independently via separate lzsz/

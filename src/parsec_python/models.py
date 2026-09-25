@@ -381,13 +381,21 @@ class MixingSettings:
 class SCFSettings:
     """Isolated single-point SCF controls.
 
-    ``spin_polarized`` mirrors PARSEC's ``Spin_Polarization`` flag.  It is
-    accepted here and by :class:`SpeciesPotential`'s
-    ``initial_spin_polarization``, but only
-    :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized` (a
-    separate entry point, not yet wired into the CLI driver) implements it;
-    the ordinary spin-unpolarized :func:`~parsec_python.SCF.single_point.run_scf`
-    refuses a spin-polarized problem rather than silently ignoring the flag.
+    ``spin_polarized`` mirrors PARSEC's ``Spin_Polarization`` flag,
+    implemented by :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized`
+    (isolated or periodic Gamma-point) and wired into the CLI; the ordinary
+    spin-unpolarized :func:`~parsec_python.SCF.single_point.run_scf` refuses
+    a spin-polarized problem rather than silently ignoring the flag.
+
+    ``self_consistent_spin_orbit`` mirrors PARSEC's ``SO_from_scratch``
+    (and, as a deliberate simplification of Fortran's more convoluted
+    ``Non_Collinear_magnetism``-gated logic, ``SCF_SO`` treated the same
+    way): implemented by
+    :func:`~parsec_python.SCF.self_consistent_soc.run_self_consistent_soc`
+    for isolated inputs with at least one ``SO_PSP=true`` species and
+    ``spin_polarized=False`` (both spinor components share one
+    spin-unpolarized potential; combining with collinear/non-collinear
+    magnetism is not implemented).
     """
 
     max_iterations: int = 50
@@ -399,6 +407,7 @@ class SCFSettings:
     normalize_initial_density: bool = True
     xc_functional: XCFunctional = "ca"
     spin_polarized: bool = False
+    self_consistent_spin_orbit: bool = False
 
     def __post_init__(self) -> None:
         max_iterations = int(self.max_iterations)

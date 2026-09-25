@@ -14,6 +14,7 @@ import numpy as np
 from .driver import prepare_single_point, prepare_periodic_single_point, run_scf
 from .Eigensolvers.perturbative_soc import (
     PerturbativeSpinOrbitResult,
+    build_spin_orbit_projectors,
     perturbative_spin_orbit_correction,
 )
 from .Input import (
@@ -21,8 +22,13 @@ from .Input import (
     parse_parsec_input,
     summarize_translation,
 )
-from .models import SinglePointResult, SpinPolarizedSinglePointResult
+from .models import (
+    SelfConsistentSOCResult,
+    SinglePointResult,
+    SpinPolarizedSinglePointResult,
+)
 from .Output import ParsecTextReporter
+from .SCF.self_consistent_soc import run_self_consistent_soc
 from .SCF.spin_polarized import run_scf_spin_polarized
 from .V_ion import load_pseudopotentials
 
@@ -319,6 +325,38 @@ def save_spin_polarized_result_archive(
     return output
 
 
+def save_self_consistent_soc_result_archive(
+    path: str | Path,
+    result: SelfConsistentSOCResult,
+    *,
+    include_wavefunctions: bool = False,
+) -> Path:
+    """Save a portable NumPy archive for a self-consistent-SOC result."""
+    output = _npz_path(Path(path).expanduser().resolve())
+    output.parent.mkdir(parents=True, exist_ok=True)
+    energy = asdict(result.energies)
+    payload: dict[str, np.ndarray] = {
+        "atom_symbols": np.asarray([atom.symbol for atom in result.atoms]),
+        "atom_coordinates_bohr": np.asarray(
+            [atom.position for atom in result.atoms], dtype=float
+        ),
+        "density_e_per_bohr3": result.density,
+        "eigenvalues_ry": result.eigenvalues,
+        "occupations": result.occupations,
+        "magnetic_moment_per_state": result.magnetic_moment_per_state,
+        "fermi_level_ry": np.asarray(result.fermi_level),
+        "electron_count": np.asarray(result.electron_count),
+        "converged": np.asarray(result.converged),
+        "iterations": np.asarray(result.iterations),
+    }
+    for name, value in energy.items():
+        payload[f"energy_{name}_ry"] = np.asarray(value)
+    if include_wavefunctions:
+        payload["spinors"] = result.spinors
+    np.savez_compressed(output, **payload)
+    return output
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -443,10 +481,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
 
     spin_polarized = translation.problem.scf.spin_polarized
+    self_consistent_spin_orbit = translation.problem.scf.self_consistent_spin_orbit
     has_soc_species = any(
         specification.spin_orbit
         for specification in translation.problem.pseudopotentials.values()
     )
+    if self_consistent_spin_orbit and not has_soc_species:
+        print(
+            "Input error: SO_from_scratch/SCF_SO=true requires at least one "
+            "species with SO_PSP=true",
+            file=sys.stderr,
+        )
+        return 2
 
     start = time.perf_counter()
     run_log = _RunLog(log_path, quiet=arguments.quiet)
@@ -464,6 +510,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             reporter.setup(system)
 
             scf_start = time.perf_counter()
+            if self_consistent_spin_orbit:
+                soc_projectors = tuple(
+                    build_spin_orbit_projectors(
+                        system.grid,
+                        system.atoms,
+                        system.pseudopotentials,
+                        translation.problem.pseudopotentials,
+                    )
+                )
+                result = run_self_consistent_soc(
+                    system,
+                    soc_projectors,
+                    callback=reporter.iteration_self_consistent_soc,
+                )
+                scf_elapsed = time.perf_counter() - scf_start
+                reporter.finish_self_consistent_soc(result, scf_elapsed)
+
+                total_elapsed = time.perf_counter() - start
+                log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
+
+                if not arguments.no_archive:
+                    saved = save_self_consistent_soc_result_archive(
+                        archive_path,
+                        result,
+                        include_wavefunctions=(
+                            arguments.save_wavefunctions
+                            or translation.output_all_states
+                        ),
+                    )
+                    log.write(f"Result archive: {saved}")
+                log.write(f"Text log: {log_path}")
+                return 0 if result.converged else 3
+
             if spin_polarized:
                 result = run_scf_spin_polarized(
                     system, callback=reporter.iteration_spin_polarized

@@ -412,6 +412,7 @@ def _parse_parsec_input(
         "fermi_temp",
         "spin_polarization",
         "scf_so",
+        "so_from_scratch",
         "max_iter",
         "convergence_criterion",
         "use_plain_sre",
@@ -535,11 +536,29 @@ def _parse_parsec_input(
             "Boundary_Conditions=cluster requires Periodic_System=false"
         )
     spin_polarization = optional_bool("spin_polarization")
-    if optional_bool("scf_so"):
+    # Fortran only actually routes through the complex spinor path when
+    # SO_from_scratch=true (or, a combination this port does not implement,
+    # Non_Collinear_magnetism=true together with SCF_SO or a species'
+    # SO_PSP).  SCF_SO=true alone is otherwise inert in Fortran -- it is only
+    # consulted inside that NCL branch.  Treating SCF_SO=true here as also
+    # requesting self-consistent SOC is a deliberate simplification (users
+    # asking for "self-consistent spin-orbit" by either name get the same
+    # behavior) rather than strict key-for-key Fortran fidelity.
+    self_consistent_spin_orbit = optional_bool("so_from_scratch") or optional_bool(
+        "scf_so"
+    )
+    if self_consistent_spin_orbit and is_periodic:
         raise UnsupportedParsecOptionError(
-            "SCF_SO=true (self-consistent spin-orbit) is not yet implemented; "
-            "only the default perturbative spin-orbit correction "
-            "(SO_PSP=true with SCF_SO unset/false) is supported"
+            "SO_from_scratch/SCF_SO=true with a periodic Boundary_Conditions "
+            "is not supported; self-consistent SOC only handles isolated "
+            "(cluster) inputs -- no k-point sampling"
+        )
+    if self_consistent_spin_orbit and spin_polarization:
+        raise UnsupportedParsecOptionError(
+            "SO_from_scratch/SCF_SO=true with Spin_Polarization=true is not "
+            "supported; self-consistent SOC shares one spin-unpolarized "
+            "effective potential between spinor components (no "
+            "Non_Collinear_magnetism/B_xc.sigma term)"
         )
     if optional_bool("dynamic_diag_tol"):
         raise UnsupportedParsecOptionError("Dynamic_Diag_Tol is not supported")
@@ -920,6 +939,7 @@ def _parse_parsec_input(
         ),
         xc_functional=xc_functional,
         spin_polarized=spin_polarization,
+        self_consistent_spin_orbit=self_consistent_spin_orbit,
     )
 
     initial_labels = []

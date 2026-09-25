@@ -16,7 +16,12 @@ from ..models import SCFIteration, SinglePointResult
 if TYPE_CHECKING:
     from ..Eigensolvers.perturbative_soc import PerturbativeSpinOrbitResult
     from ..Input.parsec_input import ParsecInputTranslation
-    from ..models import SpinPolarizedSCFIteration, SpinPolarizedSinglePointResult
+    from ..models import (
+        SelfConsistentSOCIteration,
+        SelfConsistentSOCResult,
+        SpinPolarizedSCFIteration,
+        SpinPolarizedSinglePointResult,
+    )
     from ..SCF import PreparedSinglePointSystem
 
 
@@ -642,6 +647,109 @@ class ParsecTextReporter:
                 f" {moment:9.4f}"
             )
         lines.append("")
+        self.write("\n".join(lines))
+
+    def iteration_self_consistent_soc(self, step: "SelfConsistentSOCIteration") -> None:
+        """Per-iteration report for :func:`run_self_consistent_soc`.
+
+        Eigenvalues here are already SOC-split spinor states (one set, not
+        two spin channels), each holding at most one electron.
+        """
+        energies = step.energies
+        atom_count = len(self.problem.atoms)
+        energy_per_atom_ev = energies.total * RYDBERG_TO_EV / max(atom_count, 1)
+        lines = [
+            f" Self-consistent SOC iter # {step.iteration:3d}",
+            "",
+            f" Fermi level at {step.fermi_level:10.4f} [Ry]",
+            "",
+            "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.",
+            "",
+        ]
+        for index, (eigenvalue, occupation) in enumerate(
+            zip(step.eigenvalues, step.occupations), start=1
+        ):
+            lines.append(
+                f"{index:5d}   {eigenvalue:18.10f}"
+                f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
+                f" {occupation:9.4f}"
+            )
+        lines.extend(
+            [
+                "",
+                f"   Eigenvalue Energy             = {energies.eigenvalue:20.8f} [Ry]",
+                f"   Hartree Energy                = {energies.hartree:20.8f} [Ry]",
+                (
+                    "   Integral_{Vxc*rho}            = "
+                    f"{energies.integral_vxc_rho:20.8f} [Ry]"
+                ),
+                (
+                    "   Exc = Integral{eps_xc*rho}    = "
+                    f"{energies.exchange_correlation:20.8f} [Ry]"
+                ),
+                (
+                    "   Electron-Ion energy           = "
+                    f"{energies.electron_ion:20.8f} [Ry]"
+                ),
+                f"   Ion-Ion Energy                = {energies.ion_ion:20.8f} [Ry]",
+                "",
+                f"   Total Energy = {energies.total:22.8f} [Ry]",
+                f"   Energy/atom  = {energy_per_atom_ev:22.8f} [eV]",
+                "",
+                (
+                    f"  0-{step.iteration:3d}    "
+                    "SRE of pot. & charge weighted pot = "
+                    f"{step.plain_residual:14.10f}"
+                    f" {step.weighted_residual:14.10f}"
+                ),
+                "",
+            ]
+        )
+        self.write("\n".join(lines))
+
+    def finish_self_consistent_soc(
+        self, result: "SelfConsistentSOCResult", elapsed_seconds: float
+    ) -> None:
+        status = (
+            "Self-consistency convergence achieved."
+            if result.converged
+            else "Maximum SCF iterations reached without convergence."
+        )
+        lines = [
+            status,
+            "",
+            f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
+            "",
+            "Converged spin-orbit-split spinor states",
+            "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.    <S_z>",
+            "",
+        ]
+        moments = result.magnetic_moment_per_state
+        for index, (eigenvalue, occupation, moment) in enumerate(
+            zip(result.eigenvalues, result.occupations, moments), start=1
+        ):
+            lines.append(
+                f"{index:5d}   {eigenvalue:18.10f}"
+                f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
+                f" {occupation:9.4f} {moment:9.4f}"
+            )
+        lines.extend(
+            [
+                "",
+                f"Total Energy = {result.energies.total:22.8f} [Ry]",
+                (
+                    "Energy/atom  = "
+                    f"{result.energies.total * RYDBERG_TO_EV / max(len(result.atoms), 1):22.8f} [eV]"
+                ),
+                "",
+                (
+                    "Forces, dipoles, and MPI statistics are not calculated by "
+                    "this Python single-point implementation."
+                ),
+                "",
+                " =================================================================",
+            ]
+        )
         self.write("\n".join(lines))
 
 

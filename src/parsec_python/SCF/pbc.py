@@ -14,7 +14,7 @@ import scipy.sparse as sp
 from ..Grid.pbc import PeriodicRealSpaceGrid, build_periodic_grid
 from ..Hamiltonian import KohnShamHamiltonian
 from ..Hartree.pbc import PeriodicHartreeResult, solve_periodic_hartree
-from ..Laplacian import build_negative_laplacian
+from ..Laplacian import build_gradient, build_negative_laplacian
 from ..models import (
     PreparationTimings,
     SCFIteration,
@@ -48,6 +48,7 @@ class PeriodicPreparedSinglePointSystem:
     pseudopotentials: dict[str, ParsecPseudopotential]
     grid: PeriodicRealSpaceGrid
     negative_laplacian: sp.csr_matrix
+    gradient: tuple[sp.csr_matrix, sp.csr_matrix, sp.csr_matrix]
     ionic_potential: np.ndarray
     nonlocal_operator: NonlocalProjectorOperator
     initial_density: np.ndarray
@@ -152,6 +153,11 @@ def prepare_periodic_single_point(
 
     stage_start = time.perf_counter()
     negative_laplacian = build_negative_laplacian(grid)
+    # Only needed for k-point sampling's -2i*k.grad kinetic term
+    # (Hamiltonian.kpoint_operator); computed unconditionally here since it
+    # is cheap relative to the Laplacian and keeps this prepared system
+    # self-contained for either the Gamma-only or k-point SCF path.
+    gradient = build_gradient(grid)
     finite_difference_seconds = time.perf_counter() - stage_start
 
     # 3. Local and Kleinman--Bylander nonlocal ionic terms.
@@ -240,6 +246,7 @@ def prepare_periodic_single_point(
         pseudopotentials=pseudopotentials,
         grid=grid,
         negative_laplacian=negative_laplacian,
+        gradient=gradient,
         ionic_potential=ionic_potential,
         nonlocal_operator=nonlocal_operator,
         initial_density=initial_density,

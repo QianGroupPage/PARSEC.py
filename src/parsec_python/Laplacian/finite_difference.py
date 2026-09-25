@@ -22,6 +22,40 @@ import scipy.sparse as sp
 from ..Grid import RealSpaceGrid
 
 
+def first_derivative_coefficients(expansion_order: int) -> np.ndarray:
+    """Return centered ``d/dx`` weights for a requested even order.
+
+    With ``M=expansion_order/2`` and grid spacing ``h``,
+
+    ``(D f)_i = h**(-1) * sum_j d_j f_(i+j) + O(h**(2*M))``,
+
+    ``d_j = (-1)**(j+1) * (M!)**2 /
+            (j * (M-j)! * (M+j)!)`` for ``j=1,...,M``,
+
+    and ``d_-j=-d_j``.  The returned weights are dimensionless and ordered
+    from ``-M`` through ``+M``.  Duplicated (not imported) from
+    ``V_xc.pbe.first_derivative_coefficients``, which uses this same
+    centered stencil for its density gradient, to avoid a
+    ``Laplacian -> V_xc`` package dependency; the two are kept numerically
+    identical.
+    """
+
+    expansion_order = int(expansion_order)
+    if expansion_order < 2 or expansion_order > 20 or expansion_order % 2:
+        raise ValueError("expansion_order must be an even integer from 2 to 20")
+    width = expansion_order // 2
+    weights = np.zeros(2 * width + 1, dtype=np.float64)
+    for shell in range(1, width + 1):
+        value = (
+            (-1.0) ** (shell + 1)
+            * factorial(width) ** 2
+            / (shell * factorial(width - shell) * factorial(width + shell))
+        )
+        weights[width + shell] = value
+        weights[width - shell] = -value
+    return weights
+
+
 def second_derivative_coefficients(expansion_order: int) -> np.ndarray:
     """Return centered coefficients for the positive derivative ``d²/dx²``.
 
@@ -228,9 +262,62 @@ def apply_negative_laplacian_boundary(
     return rhs
 
 
+def build_gradient(grid: RealSpaceGrid) -> tuple[sp.csr_matrix, sp.csr_matrix, sp.csr_matrix]:
+    """Build the three sparse centered first-derivative operators ``d/dx,y,z``.
+
+    Needed for a periodic Bloch Hamiltonian's ``-2ik.grad`` kinetic term
+    (:mod:`~parsec_python.Hamiltonian.kpoint_operator`): with
+    ``psi_nk(r) = e^{ik.r}u_nk(r)``,
+    ``e^{-ik.r}(-nabla^2)e^{ik.r} = -nabla^2 - 2ik.grad + |k|^2``, so the
+    existing :func:`build_negative_laplacian` supplies the first and third
+    terms and this function supplies the middle one.
+
+    Unlike :func:`build_negative_laplacian`, there is no center-point
+    contribution (``d/dx`` of a constant is zero: the stencil is exactly
+    antisymmetric, ``d_-j = -d_j``), so each returned matrix has at most
+    ``2*M`` nonzeros per row.  On the isolated cluster grid, a missing
+    neighbor (outside the active domain) is dropped exactly as in
+    :func:`build_negative_laplacian` -- appropriate for evaluating a
+    density gradient there (as :mod:`~parsec_python.V_xc.pbe` already does
+    with the same coefficients), but a k-point kinetic term is only
+    physically meaningful on a periodic grid, where every neighbor lookup
+    wraps around and none are ever missing.
+    """
+    coeff = first_derivative_coefficients(grid.settings.expansion_order)
+    width = grid.settings.stencil_half_width
+    inv_h = 1.0 / grid.spacing
+    n = grid.size
+
+    axis_parts: list[list[np.ndarray]] = [[], [], []]
+    for axis, signed_shell, neighbor_rows, _points in neighbor_shells(grid):
+        valid = neighbor_rows >= 0
+        if not np.any(valid):
+            continue
+        weight = coeff[width + signed_shell] * inv_h
+        rows = np.flatnonzero(valid)
+        cols = neighbor_rows[valid]
+        values = np.full(rows.size, weight, dtype=float)
+        axis_parts[axis].append((rows, cols, values))
+
+    matrices = []
+    for parts in axis_parts:
+        if not parts:
+            matrices.append(sp.csr_matrix((n, n)))
+            continue
+        rows = np.concatenate([part[0] for part in parts])
+        cols = np.concatenate([part[1] for part in parts])
+        values = np.concatenate([part[2] for part in parts])
+        matrix = sp.coo_matrix((values, (rows, cols)), shape=(n, n)).tocsr()
+        matrix.sum_duplicates()
+        matrices.append(matrix)
+    return tuple(matrices)
+
+
 __all__ = [
     "apply_negative_laplacian_boundary",
+    "build_gradient",
     "build_negative_laplacian",
+    "first_derivative_coefficients",
     "neighbor_shells",
     "second_derivative_coefficients",
 ]

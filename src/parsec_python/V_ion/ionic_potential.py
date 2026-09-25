@@ -418,15 +418,22 @@ class NonlocalProjectorOperator:
         return (self.projectors.shape[0], self.projectors.shape[0])
 
     def apply(self, vectors: np.ndarray) -> np.ndarray:
-        """Apply ``B*diag(signs)*B.T`` to one vector or a vector block.
+        """Apply ``B*diag(signs)*B^H`` to one vector or a vector block.
 
         The first multiplication computes all projector overlaps
-        ``c_q = <beta_q|psi>``.  After applying the denominator signs, the
-        second multiplication accumulates ``sum_q s_q*beta_q*c_q``.
+        ``c_q = <beta_q|psi> = sum_r conj(beta_q[r])*psi[r]``.  After
+        applying the denominator signs, the second multiplication
+        accumulates ``sum_q s_q*beta_q*c_q``.  ``B^H`` (conjugate
+        transpose, not plain transpose) matters only for a k-point Bloch
+        projector matrix (:func:`build_nonlocal_projectors`'s ``k_point``
+        argument), which is genuinely complex; the ordinary real-harmonic
+        Gamma-point projectors satisfy ``B^H=B.T`` so this is unchanged for
+        them.  The input dtype is preserved (not forced to float) so a
+        complex spinor or Bloch wavefunction is not silently truncated.
         """
-        vectors = np.asarray(vectors, dtype=float)
-        # B.T @ vectors evaluates every <beta_q|psi> overlap at once.
-        coefficients = self.projectors.T @ vectors
+        vectors = np.asarray(vectors)
+        # B^H @ vectors evaluates every <beta_q|psi> overlap at once.
+        coefficients = self.projectors.conj().T @ vectors
         if vectors.ndim == 1:
             coefficients = self.signs * coefficients
         else:
@@ -515,6 +522,7 @@ def build_nonlocal_projectors(
     potentials: Mapping[str, ParsecPseudopotential],
     specifications: Mapping[str, SpeciesPotential],
     lattice_vectors: np.ndarray | None = None,
+    k_point: np.ndarray | None = None,
 ) -> NonlocalProjectorOperator:
     """Construct the separable nonlocal pseudopotential on the active grid.
 
@@ -554,6 +562,13 @@ def build_nonlocal_projectors(
     exactly zero beyond its support radius, so this is a plain, exact finite
     sum, not an Ewald-style split.  ``None`` (the default) reproduces the
     original isolated single-copy behavior exactly.
+
+    ``k_point``, if given (requires ``lattice_vectors``), weights each
+    periodic image's contribution by the Bloch phase ``exp(i*k.R_image)``
+    before summing, matching Fortran's ``nloc_p_pot%right``/``left``
+    k-point phase arrays, and the returned operator's ``projectors`` become
+    complex.  ``None`` (the default) is the Gamma-point case, where every
+    phase is exactly 1 and the projectors stay real.
     """
     rows: list[np.ndarray] = []
     columns: list[np.ndarray] = []
@@ -561,6 +576,11 @@ def build_nonlocal_projectors(
     signs: list[float] = []
     labels: list[tuple[int, int, int]] = []
     column = 0
+    complex_valued = k_point is not None
+    value_dtype = complex if complex_valued else float
+    if complex_valued and lattice_vectors is None:
+        raise ValueError("k_point requires lattice_vectors")
+    k_point = None if k_point is None else np.asarray(k_point, dtype=float)
 
     # Convert a continuous projector beta(r_i) into the Euclidean grid vector
     # b_i=sqrt(dV_grid)*beta(r_i).
@@ -581,14 +601,19 @@ def build_nonlocal_projectors(
 
         # KB projectors are localized.  Restrict all following interpolation
         # and harmonic work to grid points within their radial support.
-        images: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        images: list[tuple[np.ndarray, np.ndarray, np.ndarray, complex]] = []
         for translation in translations:
             relative = grid.coordinates - (position + translation)
             radius = np.linalg.norm(relative, axis=1)
             support = radius <= support_radius
             support_rows = np.flatnonzero(support)
             if support_rows.size:
-                images.append((support_rows, relative[support], radius[support]))
+                phase = (
+                    1.0
+                    if k_point is None
+                    else np.exp(1j * np.dot(k_point, translation))
+                )
+                images.append((support_rows, relative[support], radius[support], phase))
         if not images:
             continue
 
@@ -616,7 +641,7 @@ def build_nonlocal_projectors(
                 signs.append(denominator_sign)
                 labels.append((atom_index, angular_momentum, harmonic_index))
 
-            for support_rows, relative_support, radius_support in images:
+            for support_rows, relative_support, radius_support, phase in images:
                 if specifications[atom.symbol].use_spline:
                     radial_spline = ParsecRadialSpline.from_positive_grid(
                         potential.radii,
@@ -645,7 +670,7 @@ def build_nonlocal_projectors(
                     angular_momentum, relative_support
                 )
                 for harmonic_index, target_column in enumerate(channel_columns):
-                    projector = sqrt_dv * radial * harmonics[:, harmonic_index]
+                    projector = phase * (sqrt_dv * radial * harmonics[:, harmonic_index])
 
                     # Drop only values at numerical zero so the stored columns
                     # remain sparse without changing physically relevant entries.
@@ -656,16 +681,17 @@ def build_nonlocal_projectors(
                     columns.append(
                         np.full(np.count_nonzero(keep), target_column, dtype=np.int64)
                     )
-                    values.append(projector[keep])
+                    values.append(projector[keep].astype(value_dtype, copy=False))
 
     # CSC is natural here because projectors are stored and contracted by
     # column.  An all-local pseudopotential legitimately produces zero columns.
     if column == 0:
-        matrix = sp.csc_matrix((grid.size, 0), dtype=float)
+        matrix = sp.csc_matrix((grid.size, 0), dtype=value_dtype)
     else:
         matrix = sp.coo_matrix(
             (np.concatenate(values), (np.concatenate(rows), np.concatenate(columns))),
             shape=(grid.size, column),
+            dtype=value_dtype,
         ).tocsc()
     return NonlocalProjectorOperator(
         projectors=matrix,

@@ -153,15 +153,27 @@ def _random_vectors(
     it does not replace this LAPACK seed.
     """
 
-    if complex_values:
-        raise NotImplementedError(
-            "strict CHEBFF currently implements PARSEC's real scalar path"
-        )
     # random_array calls DLARNV once per complete Fortran column.
-    return generator.uniform_minus_1_1(
+    real_part = generator.uniform_minus_1_1(
         (dimension, count),
         column_major=True,
     )
+    if not complex_values:
+        return real_part
+    # A self-consistent-SOC/k-point Hamiltonian needs a genuinely complex
+    # trial subspace.  This draws a second real block from the same LAPACK
+    # stream for the imaginary part (Fortran's ZLARNV(IDIST=2) draws complex
+    # values directly from one stream instead; this reproduces the same
+    # column-major uniform-on-[-1,1] real/imaginary distribution but not
+    # ZLARNV's exact bit sequence -- Chebyshev filtering converges to the
+    # true subspace regardless of the specific trial-vector seed, so this
+    # does not affect correctness, only reproducibility against a Fortran
+    # run bit-for-bit).
+    imaginary_part = generator.uniform_minus_1_1(
+        (dimension, count),
+        column_major=True,
+    )
+    return real_part + 1j * imaginary_part
 
 
 def _initial_filter_lower_bound(

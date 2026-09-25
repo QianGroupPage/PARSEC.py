@@ -719,3 +719,58 @@ class SpinPolarizedSinglePointResult:
     def magnetic_moment(self) -> float:
         """``N_up - N_down`` in Bohr magnetons (PARSEC's ``<S>`` diagnostic)."""
         return float(np.sum(self.occupations_up) - np.sum(self.occupations_down))
+
+
+@dataclass(frozen=True)
+class SelfConsistentSOCIteration:
+    """Diagnostics for one iteration of
+    :func:`~parsec_python.SCF.self_consistent_soc.run_self_consistent_soc`.
+
+    Unlike :class:`SpinPolarizedSCFIteration`, there is only one set of
+    (SOC-split, spinor) eigenpairs per iteration -- spin is not a separate
+    axis here, it is folded into each ``2*n_grid``-length eigenvector.
+    """
+
+    iteration: int
+    weighted_residual: float
+    plain_residual: float
+    energies: EnergyBreakdown
+    eigenvalues: tuple[float, ...] = ()
+    occupations: tuple[float, ...] = ()
+    fermi_level: float = float("nan")
+
+
+@dataclass
+class SelfConsistentSOCResult:
+    """Result of :func:`~parsec_python.SCF.self_consistent_soc.run_self_consistent_soc`.
+
+    Fortran's ``SO_from_scratch`` without ``Non_Collinear_magnetism``: SOC is
+    in the Hamiltonian from the first SCF iteration (unlike
+    :class:`PerturbativeSpinOrbitResult`, which only ever diagonalizes a
+    small fixed-basis matrix after an ordinary scalar SCF converges), but
+    both spinor components still share one spin-unpolarized effective
+    potential (no ``B_xc.sigma`` term) -- see
+    :mod:`parsec_python.Hamiltonian.spinor_operator`'s module docstring.
+    """
+
+    converged: bool
+    iterations: int
+    atoms: tuple[Atom, ...]
+    electron_count: float
+    eigenvalues: np.ndarray
+    occupations: np.ndarray
+    spinors: np.ndarray
+    """Shape ``(2*n_grid, n_states)`` complex: rows ``0:n_grid`` are each
+    state's spin-up component, rows ``n_grid:2*n_grid`` are spin-down."""
+    fermi_level: float
+    density: np.ndarray
+    energies: EnergyBreakdown
+
+    @property
+    def magnetic_moment_per_state(self) -> np.ndarray:
+        """Each SOC-split state's own ``<S_z>`` (up-component weight minus
+        down-component weight), matching ``elec_st%magmom``."""
+        n_grid = self.spinors.shape[0] // 2
+        up_weight = np.sum(np.abs(self.spinors[:n_grid, :]) ** 2, axis=0)
+        down_weight = np.sum(np.abs(self.spinors[n_grid:, :]) ** 2, axis=0)
+        return up_weight - down_weight

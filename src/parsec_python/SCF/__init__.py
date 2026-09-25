@@ -2,6 +2,7 @@
 
 from .single_point import PreparedSinglePointSystem, prepare_single_point, run_scf
 from .spin_polarized import run_scf_spin_polarized
+from .self_consistent_soc import run_self_consistent_soc
 
 from .pbc import (
     PeriodicPreparedSinglePointSystem,
@@ -13,6 +14,7 @@ __all__ = [
     "prepare_single_point",
     "run_scf",
     "run_scf_spin_polarized",
+    "run_self_consistent_soc",
     "PeriodicPreparedSinglePointSystem",
     "prepare_periodic_single_point",
 ]

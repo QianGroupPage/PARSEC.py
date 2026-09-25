@@ -535,12 +535,6 @@ def _parse_parsec_input(
             "Boundary_Conditions=cluster requires Periodic_System=false"
         )
     spin_polarization = optional_bool("spin_polarization")
-    if spin_polarization and is_periodic:
-        raise UnsupportedParsecOptionError(
-            "Spin_Polarization=true with a periodic Boundary_Conditions is "
-            "not supported; run_scf_spin_polarized only handles isolated "
-            "(cluster) inputs"
-        )
     if optional_bool("scf_so"):
         raise UnsupportedParsecOptionError(
             "SCF_SO=true (self-consistent spin-orbit) is not yet implemented; "
@@ -756,6 +750,16 @@ def _parse_parsec_input(
             )
         if not any(atom.symbol == symbol for atom in atoms):
             raise ParsecInputError(f"Atom_Type {symbol} has an empty Atom_Coord block")
+
+    if is_periodic and any(
+        specification.spin_orbit for specification in specifications.values()
+    ):
+        raise UnsupportedParsecOptionError(
+            "SO_PSP=true with a periodic Boundary_Conditions is not supported; "
+            "the spin-orbit projector construction only handles isolated "
+            "(cluster) inputs -- no periodic image summation or k-point "
+            "Bloch phases"
+        )
 
     warnings: list[str] = []
     if "total_atom_num" in scalar:

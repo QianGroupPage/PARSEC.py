@@ -1,10 +1,12 @@
-"""Collinear spin-polarized PARSEC-style SCF for isolated single points.
+"""Collinear spin-polarized PARSEC-style SCF for isolated and periodic
+(Gamma-point) single points.
 
-This is the spin-polarized counterpart to :mod:`single_point`, following the
-same overall potential-mixing algorithm but iterating two independent
-Kohn--Sham eigenproblems (spin up, spin down) that share the grid, kinetic
-operator, KB nonlocal projectors, local ionic potential, and Hartree
-potential, and differ only in their exchange-correlation field:
+This is the spin-polarized counterpart to :mod:`single_point` (and, for
+periodic inputs, :mod:`pbc`), following the same overall potential-mixing
+algorithm but iterating two independent Kohn--Sham eigenproblems (spin up,
+spin down) that share the grid, kinetic operator, KB nonlocal projectors,
+local ionic potential, and Hartree potential, and differ only in their
+exchange-correlation field:
 
 ``H_sigma[V_eff,sigma] = -nabla_FD^2 + diag(V_eff,sigma) + V_NL``,
 ``V_eff,sigma = V_ion,local + V_H[rho] + V_xc,sigma[rho_up,rho_down]``.
@@ -14,20 +16,32 @@ Fermi-level bisection with a shared chemical potential (electron count is
 fixed; the magnetic moment ``N_up-N_down`` is free), not two independently
 constrained channels.
 
+``run_scf_spin_polarized`` accepts either
+:class:`~parsec_python.SCF.single_point.PreparedSinglePointSystem` (isolated)
+or :class:`~parsec_python.SCF.pbc.PeriodicPreparedSinglePointSystem`
+(periodic, Gamma-point only) unchanged: every attribute/method this module
+uses (``ionic_potential``, ``initial_density``, ``core_density``,
+``solve_hartree``, ``hamiltonian``, ``grid.volume_element``, ``grid.size``,
+``electron_count``, ``ion_ion_energy``, ``alpha_z_energy``, ``atoms``,
+``input``) already has the same shape and meaning on both.  Neither
+:mod:`parsec_python.Eigensolvers.perturbative_soc` nor real periodic k-point
+sampling is included: only the Gamma-point real-arithmetic SCF loop is
+shared, matching :mod:`pbc`'s own scope.
+
 Unlike :func:`~parsec_python.SCF.single_point.run_scf`, this function does
 not yet carry PARSEC's full per-iteration timing/history instrumentation --
 see :class:`~parsec_python.models.SpinPolarizedSinglePointResult`.  It is
 wired into the CLI/Output path (:mod:`parsec_python.cli`,
-:class:`~parsec_python.Output.ParsecTextReporter`) for isolated,
-non-periodic inputs, and produces a converged collinear ground state
-(eigenvalues, occupations, and orbitals for both channels) that
+:class:`~parsec_python.Output.ParsecTextReporter`), and produces a converged
+collinear ground state (eigenvalues, occupations, and orbitals for both
+channels) that, for isolated inputs,
 :mod:`parsec_python.Eigensolvers.perturbative_soc` then uses for PARSEC's
 default perturbative spin-orbit correction.
 """
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Union
 
 import numpy as np
 
@@ -42,12 +56,15 @@ from ..Eigensolvers import (
 from ..Energy import total_energy_spin_polarized
 from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import density_from_orbitals, fermi_occupations
+from ..SCF.pbc import PeriodicPreparedSinglePointSystem
 from ..SCF.single_point import PreparedSinglePointSystem
 from ..V_xc import ca_lda_spin_polarized
 from ..models import SpinPolarizedSCFIteration, SpinPolarizedSinglePointResult
 
+_PreparedSystem = Union[PreparedSinglePointSystem, PeriodicPreparedSinglePointSystem]
 
-def _weighted_initial_polarization(system: PreparedSinglePointSystem) -> float:
+
+def _weighted_initial_polarization(system: _PreparedSystem) -> float:
     """Ionic-charge-weighted average of each species' ``Initial_Spin_Polarization``.
 
     PARSEC seeds the spin-polarized initial density per atom, via
@@ -73,7 +90,7 @@ def _weighted_initial_polarization(system: PreparedSinglePointSystem) -> float:
     return weighted / total_charge
 
 
-def _number_of_states_per_channel(system: PreparedSinglePointSystem) -> int:
+def _number_of_states_per_channel(system: _PreparedSystem) -> int:
     """States requested from *each* spin channel's eigensolver.
 
     Each spin channel's orbitals hold at most one electron (no spin
@@ -93,7 +110,7 @@ def _number_of_states_per_channel(system: PreparedSinglePointSystem) -> int:
     return requested
 
 
-def _eigval_settings(system: PreparedSinglePointSystem, filter_degree: int) -> EigvalSettings:
+def _eigval_settings(system: _PreparedSystem, filter_degree: int) -> EigvalSettings:
     eigensolver_settings = system.input.eigensolver
     if eigensolver_settings.method not in {"chebff", "chebdav"}:
         raise NotImplementedError(
@@ -136,7 +153,7 @@ def _eigval_settings(system: PreparedSinglePointSystem, filter_degree: int) -> E
 
 
 def run_scf_spin_polarized(
-    system: PreparedSinglePointSystem,
+    system: _PreparedSystem,
     *,
     callback: Callable[[SpinPolarizedSCFIteration], None] | None = None,
 ) -> SpinPolarizedSinglePointResult:

@@ -70,17 +70,29 @@ class SpinOrbitMatrixHermiticityTests(unittest.TestCase):
         self.assertEqual(self.projectors[0].sign, (1.0, -1.0))
 
     def test_diagonal_blocks_are_exactly_hermitian(self) -> None:
-        up_up = _lzsz_block(self.dotio_up, self.dotso_up, spin_sign=1)
-        down_down = _lzsz_block(self.dotio_down, self.dotso_down, spin_sign=-1)
+        up_up = _lzsz_block(self.projectors, self.dotio_up, self.dotso_up, spin_sign=1)
+        down_down = _lzsz_block(
+            self.projectors, self.dotio_down, self.dotso_down, spin_sign=-1
+        )
         np.testing.assert_allclose(up_up, up_up.conj().T, atol=1e-12)
         np.testing.assert_allclose(down_down, down_down.conj().T, atol=1e-12)
 
     def test_off_diagonal_blocks_are_mutual_hermitian_conjugates(self) -> None:
         up_down = _lsxy_block(
-            self.dotio_down, self.dotso_down, self.dotio_up, self.dotso_up, spin_sign=-1
+            self.projectors,
+            self.dotio_down,
+            self.dotso_down,
+            self.dotio_up,
+            self.dotso_up,
+            spin_sign=-1,
         )
         down_up = _lsxy_block(
-            self.dotio_up, self.dotso_up, self.dotio_down, self.dotso_down, spin_sign=1
+            self.projectors,
+            self.dotio_up,
+            self.dotso_up,
+            self.dotio_down,
+            self.dotso_down,
+            spin_sign=1,
         )
         np.testing.assert_allclose(up_down, down_up.conj().T, atol=1e-12)
 
@@ -88,9 +100,44 @@ class SpinOrbitMatrixHermiticityTests(unittest.TestCase):
         """A degenerate all-zero result would make the Hermiticity check
         vacuous; confirm the SOC coupling is actually nonzero here."""
         up_down = _lsxy_block(
-            self.dotio_down, self.dotso_down, self.dotio_up, self.dotso_up, spin_sign=-1
+            self.projectors,
+            self.dotio_down,
+            self.dotso_down,
+            self.dotio_up,
+            self.dotso_up,
+            spin_sign=-1,
         )
         self.assertGreater(np.max(np.abs(up_down)), 1e-8)
+
+    def test_matrix_elements_match_the_matrix_free_grid_operator(self) -> None:
+        """The decisive check that caught the missing KB-sign factor in an
+        earlier version of ``_lzsz_block``/``_lsxy_block``: build the same
+        matrix elements two structurally independent ways -- via this
+        module's small-matrix contraction, and via
+        ``Hamiltonian.spinor_operator``'s matrix-free grid application
+        (itself verified against a from-scratch, unvectorized transliteration
+        of ``lzsz.f90``) -- and require exact agreement, not just internal
+        Hermitian self-consistency (which a self-consistently-wrong formula
+        can still satisfy).
+        """
+        from parsec_python.Hamiltonian.spinor_operator import apply_lzsz, apply_lsxy
+
+        wf_up = _random_normalized_wavefunctions(self.grid.size, self.n_states, seed=4)
+        wf_down = _random_normalized_wavefunctions(self.grid.size, self.n_states, seed=5)
+        dotio_up, dotso_up = _projector_overlaps(self.projectors, wf_up)
+        dotio_down, dotso_down = _projector_overlaps(self.projectors, wf_down)
+
+        up_up_matrix = _lzsz_block(self.projectors, dotio_up, dotso_up, spin_sign=1)
+        q_up_up = apply_lzsz(self.projectors, wf_up, spin_sign=1)
+        up_up_grid = np.conj(wf_up.conj().T @ q_up_up)
+        np.testing.assert_allclose(up_up_matrix, up_up_grid, atol=1e-10)
+
+        up_down_matrix = _lsxy_block(
+            self.projectors, dotio_down, dotso_down, dotio_up, dotso_up, spin_sign=-1
+        )
+        q_up_from_down = apply_lsxy(self.projectors, wf_down, spin_sign=-1)
+        up_down_grid = np.conj(wf_up.conj().T @ q_up_from_down)
+        np.testing.assert_allclose(up_down_matrix, up_down_grid, atol=1e-10)
 
 
 class PerturbativeSpinOrbitCorrectionTests(unittest.TestCase):

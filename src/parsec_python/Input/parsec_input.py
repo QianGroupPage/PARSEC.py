@@ -394,7 +394,13 @@ def _parse_parsec_input(
         "atomic_energy_correction",
         "initial_spin_polarization",
     }
-    block_keys = {"atom_coord", "domain_shape_parameters", "cell_shape"}
+    block_keys = {
+        "atom_coord",
+        "domain_shape_parameters",
+        "cell_shape",
+        "monkhorst_pack_grid",
+        "monkhorst_pack_shift",
+    }
     accepted_global = {
         "restart_run",
         "relax_restart",
@@ -413,6 +419,7 @@ def _parse_parsec_input(
         "spin_polarization",
         "scf_so",
         "so_from_scratch",
+        "kpoint_method",
         "max_iter",
         "convergence_criterion",
         "use_plain_sre",
@@ -595,6 +602,7 @@ def _parse_parsec_input(
     spacing = _physical_length(one("grid_spacing"), label="Grid_Spacing")
     ignore_symmetry = optional_bool("ignore_symmetry")
     periodic_cell = None
+    monkhorst_pack_dimensions: tuple[int, int, int] | None = None
     shape: str | None = None
     if is_periodic:
         periodic_cell = _parse_cell_shape(scalar, blocks)
@@ -605,6 +613,43 @@ def _parse_parsec_input(
             ),
             box_lengths=tuple(np.diag(periodic_cell.lattice_vectors))
         )
+        kpoint_method = _normalize_label(one("kpoint_method", "none"))
+        if kpoint_method == "mp":
+            mp_blocks = blocks.get("monkhorst_pack_grid", [])
+            if len(mp_blocks) != 1 or len(mp_blocks[0].value) != 1:
+                raise ParsecInputError(
+                    "Kpoint_Method=mp requires exactly one Monkhorst_Pack_Grid "
+                    "block with exactly one line of three integers"
+                )
+            values, unit = _block_numbers(mp_blocks[0].value, label="Monkhorst_Pack_Grid")
+            if len(values) != 3 or unit or any(value <= 0 for value in values):
+                raise ParsecInputError(
+                    "Monkhorst_Pack_Grid must contain exactly three positive integers"
+                )
+            monkhorst_pack_dimensions = tuple(int(value) for value in values)
+            if any(value != original for value, original in zip(monkhorst_pack_dimensions, values)):
+                raise ParsecInputError("Monkhorst_Pack_Grid values must be integers")
+            if "monkhorst_pack_shift" in blocks:
+                raise UnsupportedParsecOptionError(
+                    "Monkhorst_Pack_Shift is not supported; only an unshifted "
+                    "Monkhorst-Pack grid is implemented"
+                )
+            if spin_polarization:
+                raise UnsupportedParsecOptionError(
+                    "Kpoint_Method=mp with Spin_Polarization=true is not "
+                    "supported; run_scf_kpoints only implements the "
+                    "spin-unpolarized path (would need per-(k,spin) pooling)"
+                )
+        elif kpoint_method == "manual":
+            raise UnsupportedParsecOptionError(
+                "Kpoint_Method=manual (an explicit k-point list) is not "
+                "supported; only 'none' (Gamma point) and 'mp' "
+                "(Monkhorst-Pack) are implemented"
+            )
+        elif kpoint_method != "none":
+            raise ParsecInputError(
+                f"Kpoint_Method must be 'none', 'mp', or 'manual', got {kpoint_method!r}"
+            )
     else:
         shape = _normalize_label(one("cluster_domain_shape", "sphere"))
         if shape == "sphere":
@@ -1048,6 +1093,7 @@ def _parse_parsec_input(
         mixing=mixing,
         initial_density_settings=initial_density_settings,
         recenter_geometry=recenter and not is_periodic,
+        monkhorst_pack_dimensions=monkhorst_pack_dimensions,
     )
     return ParsecInputTranslation(
         source=source,

@@ -27,7 +27,9 @@ from .models import (
     SinglePointResult,
     SpinPolarizedSinglePointResult,
 )
+from .Grid import monkhorst_pack_grid
 from .Output import ParsecTextReporter
+from .SCF.kpoints import run_scf_kpoints
 from .SCF.self_consistent_soc import run_self_consistent_soc
 from .SCF.spin_polarized import run_scf_spin_polarized
 from .V_ion import load_pseudopotentials
@@ -482,6 +484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     spin_polarized = translation.problem.scf.spin_polarized
     self_consistent_spin_orbit = translation.problem.scf.self_consistent_spin_orbit
+    monkhorst_pack_dimensions = translation.problem.monkhorst_pack_dimensions
     has_soc_species = any(
         specification.spin_orbit
         for specification in translation.problem.pseudopotentials.values()
@@ -578,7 +581,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.write(f"Text log: {log_path}")
                 return 0 if result.converged else 3
 
-            result = run_scf(system, callback=reporter.iteration)
+            if monkhorst_pack_dimensions is not None:
+                k_points, k_weights = monkhorst_pack_grid(
+                    translation.problem.periodic_cell, monkhorst_pack_dimensions
+                )
+                result = run_scf_kpoints(
+                    system, k_points, k_weights, callback=reporter.iteration
+                )
+            else:
+                result = run_scf(system, callback=reporter.iteration)
             scf_elapsed = time.perf_counter() - scf_start
             reporter.finish(result, scf_elapsed)
             total_elapsed = time.perf_counter() - start

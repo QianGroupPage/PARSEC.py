@@ -540,6 +540,12 @@ class SinglePointInput:
         default_factory=InitialDensitySettings
     )
     recenter_geometry: bool = True
+    monkhorst_pack_dimensions: tuple[int, int, int] | None = None
+    """PARSEC's ``Kpoint_Method: mp`` + ``Monkhorst_Pack_Grid`` block: an
+    unreduced, uniform (equal-weight) Brillouin-zone sample, implemented by
+    :func:`~parsec_python.SCF.kpoints.run_scf_kpoints` for periodic,
+    spin-unpolarized, non-SOC inputs.  ``None`` (the default) is the
+    ordinary Gamma-only periodic path."""
 
     def __post_init__(self) -> None:
         atoms = tuple(atom if isinstance(atom, Atom) else Atom(**atom) for atom in self.atoms)
@@ -558,6 +564,13 @@ class SinglePointInput:
             raise ValueError(
                 "a periodic calculation (periodic_cell set) requires PeriodicGridSettings"
             )
+        if self.monkhorst_pack_dimensions is not None:
+            if self.periodic_cell is None:
+                raise ValueError("monkhorst_pack_dimensions requires periodic_cell")
+            dims = tuple(int(value) for value in self.monkhorst_pack_dimensions)
+            if len(dims) != 3 or any(value < 1 for value in dims):
+                raise ValueError("monkhorst_pack_dimensions must be three positive integers")
+            object.__setattr__(self, "monkhorst_pack_dimensions", dims)
 
 
 @dataclass(frozen=True)

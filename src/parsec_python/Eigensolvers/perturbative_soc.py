@@ -36,7 +36,7 @@ import numpy as np
 from ..Grid import RealSpaceGrid
 from ..models import Atom, SpeciesPotential, SpinPolarizedSinglePointResult
 from ..Pseudopotential import ParsecPseudopotential
-from ..V_ion.ionic_potential import _projector_support_radius
+from ..V_ion.ionic_potential import _periodic_image_translations, _projector_support_radius
 
 # Angular-momentum channels PARSEC supports for spin-orbit: l=1 (p, 3
 # m_l components) then l=2 (d, 5 m_l components), 8 (l,m_l) slots total,
@@ -106,6 +106,8 @@ def build_spin_orbit_projectors(
     atoms: Sequence[Atom],
     potentials: Mapping[str, ParsecPseudopotential],
     specifications: Mapping[str, SpeciesPotential],
+    lattice_vectors: np.ndarray | None = None,
+    k_point: np.ndarray | None = None,
 ) -> list[AtomSpinOrbitProjectors]:
     """Build the complex-harmonic SOC projector pair for every SOC atom.
 
@@ -115,6 +117,19 @@ def build_spin_orbit_projectors(
     contribute.  Mirrors ``nonloc.F90``'s SOC branch: one projector pair per
     ``(atom, l)`` spanning ``2l+1`` complex spherical harmonics, sampled
     directly on the active grid (``Double_Grid_order=1``).
+
+    ``lattice_vectors``/``k_point`` mirror
+    :func:`~parsec_python.V_ion.ionic_potential.build_nonlocal_projectors`'s
+    same-named arguments: with ``lattice_vectors`` given, each atom's
+    projector sums over every periodic image whose support ball can reach
+    the grid (:func:`~parsec_python.V_ion.ionic_potential._periodic_image_translations`);
+    with ``k_point`` also given, each image is weighted by the Bloch phase
+    ``exp(i*k.R_image)`` before summing.  ``None``/``None`` (the default)
+    reproduces the original isolated single-copy behavior exactly.  Unlike
+    the ordinary real-harmonic KB projectors, ``v_ion``/``v_so`` are always
+    complex (the ladder-operator structure needs complex spherical
+    harmonics regardless of periodicity), so no separate real/complex
+    dtype branch is needed here.
     """
     sqrt_dv = np.sqrt(grid.volume_element)
     result: list[AtomSpinOrbitProjectors] = []
@@ -127,55 +142,78 @@ def build_spin_orbit_projectors(
 
         support_radius = _projector_support_radius(potential)
         position = np.asarray(atom.position, dtype=np.float64)
-        relative = grid.coordinates - position
-        radius = np.linalg.norm(relative, axis=1)
-        support = radius <= support_radius
-        support_rows = np.flatnonzero(support)
-        if support_rows.size == 0:
-            continue
-        relative_support = relative[support]
-        radius_support = radius[support]
+        translations = (
+            np.zeros((1, 3))
+            if lattice_vectors is None
+            else _periodic_image_translations(lattice_vectors, support_radius)
+        )
 
-        v_ion = np.zeros((support_rows.size, 8), dtype=complex)
-        v_so = np.zeros((support_rows.size, 8), dtype=complex)
+        images: list[tuple[np.ndarray, np.ndarray, np.ndarray, complex]] = []
+        for translation in translations:
+            relative = grid.coordinates - (position + translation)
+            radius = np.linalg.norm(relative, axis=1)
+            support = radius <= support_radius
+            support_rows = np.flatnonzero(support)
+            if support_rows.size:
+                phase = (
+                    1.0
+                    if k_point is None
+                    else np.exp(1j * np.dot(np.asarray(k_point, dtype=float), translation))
+                )
+                images.append((support_rows, relative[support], radius[support], phase))
+        if not images:
+            continue
+
+        # A periodic atom's images can touch different, only partially
+        # overlapping sets of grid rows near a small cell's edge; union
+        # them once so every image accumulates into the same dense arrays
+        # at the right rows, the way build_nonlocal_projectors's sparse
+        # COO->CSC duplicate-row summation does for the ordinary KB case.
+        support_rows_union = np.unique(np.concatenate([image[0] for image in images]))
+        v_ion = np.zeros((support_rows_union.size, 8), dtype=complex)
+        v_so = np.zeros((support_rows_union.size, 8), dtype=complex)
         sign_by_l: dict[int, float] = {}
-        column = 0
+        column_by_l = {1: 0, 2: 3}
         for angular_momentum in _SOC_ANGULAR_MOMENTA:
-            width = 2 * angular_momentum + 1
             if angular_momentum not in potential.spin_orbit_channel_potentials:
-                column += width
                 continue
+            width = 2 * angular_momentum + 1
+            column = column_by_l[angular_momentum]
             radial_ion, radial_so, sign = potential.spin_orbit_projectors(
                 angular_momentum, local_l
             )
-            interpolated_ion = np.interp(
-                radius_support,
-                potential.radii,
-                radial_ion,
-                left=radial_ion[0],
-                right=0.0,
-            )
-            interpolated_so = np.interp(
-                radius_support,
-                potential.radii,
-                radial_so,
-                left=radial_so[0],
-                right=0.0,
-            )
-            harmonics = complex_spherical_harmonics(angular_momentum, relative_support)
-            v_ion[:, column : column + width] = (
-                sqrt_dv * interpolated_ion[:, None] * harmonics
-            )
-            v_so[:, column : column + width] = (
-                sqrt_dv * interpolated_so[:, None] * harmonics
-            )
             sign_by_l[angular_momentum] = sign
-            column += width
+
+            for support_rows, relative_support, radius_support, phase in images:
+                interpolated_ion = np.interp(
+                    radius_support,
+                    potential.radii,
+                    radial_ion,
+                    left=radial_ion[0],
+                    right=0.0,
+                )
+                interpolated_so = np.interp(
+                    radius_support,
+                    potential.radii,
+                    radial_so,
+                    left=radial_so[0],
+                    right=0.0,
+                )
+                harmonics = complex_spherical_harmonics(
+                    angular_momentum, relative_support
+                )
+                local_rows = np.searchsorted(support_rows_union, support_rows)
+                v_ion[local_rows, column : column + width] += phase * (
+                    sqrt_dv * interpolated_ion[:, None] * harmonics
+                )
+                v_so[local_rows, column : column + width] += phase * (
+                    sqrt_dv * interpolated_so[:, None] * harmonics
+                )
 
         result.append(
             AtomSpinOrbitProjectors(
                 atom_index=atom_index,
-                support_rows=support_rows,
+                support_rows=support_rows_union,
                 v_ion=v_ion,
                 v_so=v_so,
                 sign=(sign_by_l.get(1, 0.0), sign_by_l.get(2, 0.0)),

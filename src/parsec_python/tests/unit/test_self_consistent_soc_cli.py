@@ -93,7 +93,10 @@ class SelfConsistentSOCCliTests(unittest.TestCase):
         exit_code = cli_main([str(input_path), "--quiet"])
         self.assertEqual(exit_code, 2)
 
-    def test_self_consistent_soc_with_periodic_boundary_is_rejected(self) -> None:
+    def test_self_consistent_soc_with_periodic_boundary_is_accepted(self) -> None:
+        """Periodic self-consistent SOC (k-point sampling + SOC) is
+        supported; see run_self_consistent_soc_kpoints and
+        test_periodic_self_consistent_soc_cli.py for a full run."""
         input_path = self._write_input(
             "parsec.in",
             extra=(
@@ -103,6 +106,24 @@ class SelfConsistentSOCCliTests(unittest.TestCase):
                 "8.0 8.0 8.0\n"
                 "end Cell_Shape\n"
             ),
+        )
+        exit_code = cli_main([str(input_path), "--dry-run"])
+        self.assertEqual(exit_code, 0)
+
+    def test_periodic_so_psp_without_self_consistent_soc_is_rejected(self) -> None:
+        """Periodic SO_PSP is only supported together with
+        SO_from_scratch/SCF_SO; the default perturbative path does not
+        handle k-point sampling."""
+        text = _BASE_INPUT.replace("SO_from_scratch: .true.\n", "")
+        input_path = self.directory / "parsec.in"
+        input_path.write_text(
+            text
+            + "Periodic_System: .true.\n"
+            "Boundary_Conditions: bulk\n"
+            "begin Cell_Shape\n"
+            "8.0 8.0 8.0\n"
+            "end Cell_Shape\n",
+            encoding="utf-8",
         )
         exit_code = cli_main([str(input_path), "--dry-run"])
         self.assertEqual(exit_code, 2)

@@ -30,6 +30,7 @@ from .models import (
 from .Grid import monkhorst_pack_grid
 from .Output import ParsecTextReporter
 from .SCF.kpoints import run_scf_kpoints
+from .SCF.kpoints_soc import run_self_consistent_soc_kpoints
 from .SCF.self_consistent_soc import run_self_consistent_soc
 from .SCF.spin_polarized import run_scf_spin_polarized
 from .V_ion import load_pseudopotentials
@@ -514,19 +515,35 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             scf_start = time.perf_counter()
             if self_consistent_spin_orbit:
-                soc_projectors = tuple(
-                    build_spin_orbit_projectors(
-                        system.grid,
-                        system.atoms,
-                        system.pseudopotentials,
-                        translation.problem.pseudopotentials,
+                if is_periodic:
+                    if monkhorst_pack_dimensions is not None:
+                        k_points, k_weights = monkhorst_pack_grid(
+                            translation.problem.periodic_cell,
+                            monkhorst_pack_dimensions,
+                        )
+                    else:
+                        k_points = np.zeros((1, 3))
+                        k_weights = np.ones(1)
+                    result = run_self_consistent_soc_kpoints(
+                        system,
+                        k_points,
+                        k_weights,
+                        callback=reporter.iteration_self_consistent_soc,
                     )
-                )
-                result = run_self_consistent_soc(
-                    system,
-                    soc_projectors,
-                    callback=reporter.iteration_self_consistent_soc,
-                )
+                else:
+                    soc_projectors = tuple(
+                        build_spin_orbit_projectors(
+                            system.grid,
+                            system.atoms,
+                            system.pseudopotentials,
+                            translation.problem.pseudopotentials,
+                        )
+                    )
+                    result = run_self_consistent_soc(
+                        system,
+                        soc_projectors,
+                        callback=reporter.iteration_self_consistent_soc,
+                    )
                 scf_elapsed = time.perf_counter() - scf_start
                 reporter.finish_self_consistent_soc(result, scf_elapsed)
 

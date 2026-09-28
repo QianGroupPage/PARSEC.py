@@ -554,12 +554,6 @@ def _parse_parsec_input(
     self_consistent_spin_orbit = optional_bool("so_from_scratch") or optional_bool(
         "scf_so"
     )
-    if self_consistent_spin_orbit and is_periodic:
-        raise UnsupportedParsecOptionError(
-            "SO_from_scratch/SCF_SO=true with a periodic Boundary_Conditions "
-            "is not supported; self-consistent SOC only handles isolated "
-            "(cluster) inputs -- no k-point sampling"
-        )
     if self_consistent_spin_orbit and spin_polarization:
         raise UnsupportedParsecOptionError(
             "SO_from_scratch/SCF_SO=true with Spin_Polarization=true is not "
@@ -815,14 +809,17 @@ def _parse_parsec_input(
         if not any(atom.symbol == symbol for atom in atoms):
             raise ParsecInputError(f"Atom_Type {symbol} has an empty Atom_Coord block")
 
-    if is_periodic and any(
-        specification.spin_orbit for specification in specifications.values()
+    if (
+        is_periodic
+        and any(specification.spin_orbit for specification in specifications.values())
+        and not self_consistent_spin_orbit
     ):
         raise UnsupportedParsecOptionError(
-            "SO_PSP=true with a periodic Boundary_Conditions is not supported; "
-            "the spin-orbit projector construction only handles isolated "
-            "(cluster) inputs -- no periodic image summation or k-point "
-            "Bloch phases"
+            "SO_PSP=true with a periodic Boundary_Conditions is only supported "
+            "together with SO_from_scratch/SCF_SO=true (self-consistent SOC, "
+            "run_self_consistent_soc_kpoints); the default perturbative "
+            "spin-orbit correction does not yet handle periodic k-point "
+            "sampling"
         )
 
     warnings: list[str] = []

@@ -85,6 +85,7 @@ def total_energy_no_degeneracy(
     ion_ion_energy: float,
     volume_element: float,
     alpha_z_energy: float = 0.0,
+    band_energy_weight: float = 1.0,
 ) -> EnergyBreakdown:
     """:func:`total_energy` for orbitals holding at most one electron.
 
@@ -94,6 +95,9 @@ def total_energy_no_degeneracy(
     ordinary scalar path's two-electron orbitals) but still share one
     spin-unpolarized ``V_eff``/density (unlike
     :func:`total_energy_spin_polarized`'s two separate potential channels).
+    ``band_energy_weight`` is :func:`total_energy`'s same per-k-point
+    Brillouin-zone weight, for :mod:`~parsec_python.SCF.kpoints_soc`'s
+    periodic self-consistent SOC (default 1: the ordinary Gamma-only case).
     """
     eigenvalues = np.asarray(eigenvalues, dtype=float)
     occupations = np.asarray(occupations, dtype=float)
@@ -109,7 +113,9 @@ def total_energy_no_degeneracy(
     if any(np.asarray(value).shape != density.shape for value in arrays):
         raise ValueError("all potentials must match the density")
 
-    band_energy = float(np.dot(occupations, eigenvalues)) + float(alpha_z_energy)
+    band_energy = float(
+        band_energy_weight * np.dot(occupations, eigenvalues)
+    ) + float(alpha_z_energy)
     old_hxc = np.asarray(input_effective_potential) - np.asarray(ionic_potential)
     old_hxc_integral = float(volume_element * np.dot(density, old_hxc))
     hartree_integral = float(

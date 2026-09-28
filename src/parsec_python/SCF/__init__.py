@@ -9,6 +9,7 @@ from .pbc import (
     prepare_periodic_single_point,
 )
 from .kpoints import run_scf_kpoints
+from .kpoints_soc import run_self_consistent_soc_kpoints
 
 __all__ = [
     "PreparedSinglePointSystem",
@@ -19,4 +20,5 @@ __all__ = [
     "PeriodicPreparedSinglePointSystem",
     "prepare_periodic_single_point",
     "run_scf_kpoints",
+    "run_self_consistent_soc_kpoints",
 ]

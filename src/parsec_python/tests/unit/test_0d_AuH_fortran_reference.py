@@ -129,5 +129,63 @@ class SelfConsistentSOCFortranReferenceTests(unittest.TestCase):
             self.assertAlmostEqual(moments[i] + moments[i + 1], 0.0, delta=0.05)
 
 
+class SelfConsistentSOCSpinPolarizedFortranReferenceTests(unittest.TestCase):
+    """examples/0d_AuH/reduced_self_consistent_soc/parsec_spin_polarized.in:
+    SO_from_scratch=true, Spin_Polarization=true, SO_PSP=true on Au -- the
+    combined feature (run_self_consistent_soc_spin_polarized), run against
+    the *same* fortran_reference.out as
+    SelfConsistentSOCFortranReferenceTests above (that Fortran run always
+    had Spin_Polarization=true, since Fortran's input parser requires it;
+    this is the first PARSEC.py input that matches it structurally, not
+    just numerically through AuH's incidental zero net moment). Tolerances
+    are noticeably tighter than the no-spin-polarization comparison above,
+    since the physics genuinely matches now rather than approximating it."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        directory = Path(cls._tmpdir.name)
+        shutil.copytree(
+            _FIXTURES / "reduced_self_consistent_soc", directory, dirs_exist_ok=True
+        )
+        exit_code = cli_main(
+            [str(directory / "parsec_spin_polarized.in"), "--quiet"]
+        )
+        if exit_code != 0:
+            raise AssertionError(f"CLI run failed with exit code {exit_code}")
+        cls.archive = np.load(directory / "parsec_python_results.npz")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmpdir.cleanup()
+
+    def test_converged_total_energy_matches_fortran(self) -> None:
+        # Fortran: -68.34107156 Ry (fortran_reference.out).
+        self.assertAlmostEqual(
+            float(self.archive["energy_total_ry"]), -68.34107156, delta=3.0e-5
+        )
+
+    def test_state_1_eigenvalue_and_moment_match_fortran(self) -> None:
+        # Fortran: -0.821060 Ry, <S_z>=0.9766 (fortran_reference.out).
+        self.assertAlmostEqual(
+            float(self.archive["eigenvalues_ry"][0]), -0.821060, delta=1.5e-3
+        )
+        self.assertAlmostEqual(
+            float(self.archive["magnetic_moment_per_state"][0]), 0.9766, delta=0.01
+        )
+
+    def test_states_are_only_approximately_paired(self) -> None:
+        """Unlike the no-spin-polarization case above, exact Kramers
+        degeneracy is *not* a rigorous guarantee here: the converged
+        xc_delta field only needs AuH's *net* moment to vanish, not its
+        local spin density pointwise, so it can still break time-reversal
+        symmetry locally even at zero net moment. The splitting should
+        still be small (a fraction of the underlying SOC splitting itself,
+        not comparable to the level spacing)."""
+        eigenvalues = self.archive["eigenvalues_ry"]
+        for i in range(0, len(eigenvalues) - 3, 2):
+            self.assertLess(abs(eigenvalues[i] - eigenvalues[i + 1]), 5.0e-3)
+
+
 if __name__ == "__main__":
     unittest.main()

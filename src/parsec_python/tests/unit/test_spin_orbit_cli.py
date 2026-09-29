@@ -86,10 +86,15 @@ class SpinOrbitCliTests(unittest.TestCase):
         # electron.
         self.assertAlmostEqual(float(archive["magnetic_moment"]), 1.0, places=1)
 
-    def test_scf_so_is_rejected(self) -> None:
+    def test_scf_so_combined_with_spin_polarization_is_accepted(self) -> None:
+        """Cluster self-consistent SOC combined with spin polarization is
+        supported (run_self_consistent_soc_spin_polarized); see
+        test_self_consistent_soc_spin_polarized.py and
+        test_0d_AuH_fortran_reference.py for the physics-level and
+        real-Fortran-reference validation."""
         input_path = self._write_input("parsec.in", extra="SCF_SO: .true.\n")
         exit_code = cli_main([str(input_path), "--dry-run"])
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 0)
 
     def test_periodic_spin_polarized_is_rejected(self) -> None:
         input_path = self._write_input(

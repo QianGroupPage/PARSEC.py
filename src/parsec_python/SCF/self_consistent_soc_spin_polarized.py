@@ -1,33 +1,38 @@
-"""Self-consistent spin-orbit coupling: Fortran's ``SO_from_scratch``.
+"""Self-consistent spin-orbit coupling combined with collinear spin
+polarization (Fortran's ``SO_from_scratch``/``SCF_SO`` together with
+``Spin_Polarization``).
 
-Unlike :mod:`~parsec_python.Eigensolvers.perturbative_soc` (SOC added as a
-one-shot small-matrix diagonalization after an ordinary scalar SCF
-converges -- PARSEC's default, cheaper ``SCF_SO=false`` path), this module
-puts the spin-orbit term directly in the Hamiltonian from the first SCF
-iteration, using :class:`~parsec_python.Hamiltonian.spinor_operator.SpinorKohnShamHamiltonian`
-as a matrix-free operator inside the same Chebyshev-filtered-subspace
-eigensolver the scalar path already uses.
+Fortran's own input parser requires ``Spin_Polarization=true`` whenever any
+species has ``SO_PSP=true``, even under ``SCF_SO`` (``usrinputfile.F90``:
+``if (p_pot%is_so) ... if (nspin==1) ... ierr=151``) -- there is no Fortran
+input that runs self-consistent SOC without collinear spin machinery
+alongside it. :mod:`~parsec_python.SCF.self_consistent_soc` (this module's
+prerequisite) implements the simpler spin-unpolarized case anyway, since a
+system with zero net moment converges to the same physics either way (see
+``examples/0d_AuH/reduced_self_consistent_soc``); this module adds the
+piece needed for a system with nonzero net moment.
 
-Both spinor components share one spin-unpolarized effective potential
-``V_eff = V_ion,local + V_H[rho] + V_xc[rho]`` (the ordinary
-:meth:`~parsec_python.SCF.single_point.PreparedSinglePointSystem.evaluate_xc`,
-unchanged) -- this is ``SO_from_scratch`` *without* ``Non_Collinear_magnetism``,
-matching the module docstring of :mod:`~parsec_python.Hamiltonian.spinor_operator`.
-Combining self-consistent SOC with *collinear* spin polarization is
-:mod:`~parsec_python.SCF.self_consistent_soc_spin_polarized`, a separate
-driver built on the same :class:`~parsec_python.Hamiltonian.spinor_operator.SpinorKohnShamHamiltonian`
-with its ``xc_delta`` field populated; fully non-collinear magnetism (a
-rotating local moment / off-diagonal spin-density-matrix term) is still not
-implemented.
+Physically, one extra term is needed relative to
+:mod:`self_consistent_soc`: the exchange-correlation potential built from
+the *spinor-projected* spin density (``rho_up(r) = sum_n f_n |psi_up,n(r)|^2``,
+``rho_down(r)`` likewise) is no longer spin-independent.
+:func:`~parsec_python.V_xc.ca_lda_spin_polarized` splits it into
+``V_xc,avg = (V_xc,up + V_xc,down)/2`` (added to the ordinary spin-unpolarized
+effective potential shared by both spinor channels, exactly as in
+:mod:`self_consistent_soc`) and ``V_xc,delta = (V_xc,up - V_xc,down)/2`` (a
+new diagonal collinear Zeeman-like term, ``+V_xc,delta`` on the up channel
+and ``-V_xc,delta`` on the down channel --
+:class:`~parsec_python.Hamiltonian.spinor_operator.SpinorKohnShamHamiltonian`'s
+``xc_delta`` field). The spin-orbit L.S term itself
+(:mod:`~parsec_python.Eigensolvers.perturbative_soc`'s projectors, applied via
+``apply_lzsz``/``apply_lsxy``) is unchanged.
 
-The nonlinear map is the same shape as the scalar path,
-``V_in -> eigensolver -> occupations -> rho -> (V_H,V_xc) -> V_out -> mix``,
-except the eigensolver diagonalizes one ``2*n_grid``-dimensional complex
-Hermitian operator instead of a real ``n_grid``-dimensional one, and each of
-its ``2*n_grid``-length eigenvectors is one (already SOC-split) spinor state
-holding at most one electron (``degeneracy=1``, matching
-:mod:`~parsec_python.SCF.spin_polarized`'s pooled-channel convention, not
-the unpolarized path's implicit factor of two).
+This is still not full non-collinear magnetism (Fortran's
+``Non_Collinear_magnetism`` flag): the local moment is always aligned along
+z (the spinor's own up/down projection axis), never a rotating vector field,
+and there is no off-diagonal spin-density-matrix term. Periodic (k-point)
+self-consistent SOC combined with spin polarization is also not
+implemented -- see :mod:`~parsec_python.SCF.kpoints_soc`'s module docstring.
 """
 
 from __future__ import annotations
@@ -45,25 +50,27 @@ from ..Eigensolvers import (
     solve_eigval,
 )
 from ..Eigensolvers.perturbative_soc import AtomSpinOrbitProjectors
-from ..Energy import total_energy_no_degeneracy
+from ..Energy import total_energy_no_degeneracy_spin_polarized
 from ..Hamiltonian.spinor_operator import SpinorKohnShamHamiltonian
 from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
 from ..SCF.single_point import PreparedSinglePointSystem
+from ..SCF.spin_polarized import _weighted_initial_polarization
+from ..V_xc import ca_lda_spin_polarized
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
 
 
-def spinor_density_from_orbitals(
+def spinor_spin_densities(
     spinors: np.ndarray,
     occupations: np.ndarray,
     volume_element: float,
-) -> np.ndarray:
-    """``rho = 1/dV * sum_n f_n * (|psi_n,up|**2 + |psi_n,down|**2)``.
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(rho_up, rho_down)`` from stacked spinor eigenvectors.
 
-    ``spinors`` is ``(2*n_grid, n_states)`` complex; each column is
-    Euclidean-normalized as a *whole* 2-component spinor (the up and down
-    halves do not separately normalize to 1), matching the eigensolver's
-    convention for :class:`SpinorKohnShamHamiltonian`.
+    Unlike :func:`~parsec_python.SCF.self_consistent_soc.spinor_density_from_orbitals`
+    (which returns only the summed total density), each spinor component's
+    own projected density is kept separate -- the input to
+    :func:`~parsec_python.V_xc.ca_lda_spin_polarized`.
     """
     spinors = np.asarray(spinors)
     if spinors.ndim != 2 or spinors.shape[0] % 2:
@@ -76,18 +83,12 @@ def spinor_density_from_orbitals(
     n_grid = spinors.shape[0] // 2
     psi_up = spinors[:n_grid, :]
     psi_down = spinors[n_grid:, :]
-    weighted = (np.abs(psi_up) ** 2 + np.abs(psi_down) ** 2) * occupations[None, :]
-    return np.sum(weighted, axis=1) / volume_element
+    density_up = (np.abs(psi_up) ** 2) @ occupations / volume_element
+    density_down = (np.abs(psi_down) ** 2) @ occupations / volume_element
+    return density_up, density_down
 
 
 def _number_of_states(system: PreparedSinglePointSystem) -> int:
-    """States requested from the ``2*n_grid``-dimensional spinor eigensolver.
-
-    Each spinor state holds at most one electron (no spin degeneracy: spin
-    is already explicit in the 2-component eigenvector), so this sizes like
-    :mod:`~parsec_python.SCF.spin_polarized`'s per-channel count, not the
-    unpolarized path's ``N_e/2``-orbital sizing.
-    """
     requested = system.input.scf.number_of_states
     if requested is None:
         requested = int(np.ceil(system.electron_count)) + 6
@@ -128,35 +129,54 @@ def _eigval_settings(system: PreparedSinglePointSystem, filter_degree: int) -> E
     )
 
 
-def run_self_consistent_soc(
+def run_self_consistent_soc_spin_polarized(
     system: PreparedSinglePointSystem,
     soc_projectors: tuple[AtomSpinOrbitProjectors, ...],
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
 ) -> SelfConsistentSOCResult:
-    """Run self-consistent-SOC PARSEC-style potential mixing.
+    """Run self-consistent SOC combined with collinear spin polarization.
 
-    ``soc_projectors`` is
-    :func:`~parsec_python.Eigensolvers.perturbative_soc.build_spin_orbit_projectors`'s
-    output for ``system``'s atoms/pseudopotentials/specifications; an empty
-    tuple degenerates this to an (expensive, real-eigenvalue-pair-doubled)
-    ordinary scalar calculation, which is not a useful way to invoke this
-    function but is not rejected -- the physics is well-defined either way.
-
-    Requires ``system.input.scf.xc_functional`` supported by
-    :meth:`~parsec_python.SCF.single_point.PreparedSinglePointSystem.evaluate_xc`
-    (``'ca'`` or ``'pbe'``) and ``system.input.eigensolver.method == 'chebff'``.
+    Requires ``system.input.scf.spin_polarized`` and
+    ``system.input.scf.self_consistent_spin_orbit`` both set, and
+    ``xc_functional == 'ca'`` (LSDA; matching
+    :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized`'s own
+    current limitation).
     """
     settings = system.input.scf
+    if not settings.spin_polarized:
+        raise ValueError(
+            "run_self_consistent_soc_spin_polarized requires "
+            "SCFSettings.spin_polarized=True"
+        )
+    if not settings.self_consistent_spin_orbit:
+        raise ValueError(
+            "run_self_consistent_soc_spin_polarized requires "
+            "SCFSettings.self_consistent_spin_orbit=True"
+        )
+    if settings.xc_functional != "ca":
+        raise NotImplementedError(
+            "spin-polarized PBE is not yet implemented; only xc_functional='ca' "
+            "(LSDA) is supported by run_self_consistent_soc_spin_polarized"
+        )
+
     number_of_states = _number_of_states(system)
     ionic_potential = system.ionic_potential
+    n_grid = system.grid.size
+
+    polarization = _weighted_initial_polarization(system)
+    density_up = 0.5 * (1.0 + polarization) * system.initial_density
+    density_down = 0.5 * (1.0 - polarization) * system.initial_density
 
     initial_hartree = system.solve_hartree(
-        system.initial_density, initial_potential=-ionic_potential
+        density_up + density_down, initial_potential=-ionic_potential
     )
     hartree_potential = initial_hartree.potential
-    xc = system.evaluate_xc(system.initial_density)
-    input_potential = ionic_potential + hartree_potential + xc.potential
+    xc = ca_lda_spin_polarized(
+        density_up, density_down, system.grid.volume_element, system.core_density
+    )
+    input_potential_up = ionic_potential + hartree_potential + xc.potential_up
+    input_potential_down = ionic_potential + hartree_potential + xc.potential_down
 
     eigval_state: EigvalState | None = None
     mixer = AndersonMixer(system.input.mixing)
@@ -165,21 +185,26 @@ def run_self_consistent_soc(
 
     eigenvalues = np.empty(0)
     occupations = np.empty(0)
-    spinors = np.empty((2 * system.grid.size, 0), dtype=complex)
+    spinors = np.empty((2 * n_grid, 0), dtype=complex)
     fermi_level = float("nan")
-    density = system.initial_density
+    density_up_out = density_up
+    density_down_out = density_down
     energies = None
     converged = False
 
     for iteration in range(1, settings.max_iterations + 1):
         eigval_settings = _eigval_settings(system, filter_degree)
 
-        scalar_hamiltonian = system.hamiltonian(input_potential)
+        effective_potential_avg = 0.5 * (input_potential_up + input_potential_down)
+        xc_delta = 0.5 * (input_potential_up - input_potential_down)
+
+        scalar_hamiltonian = system.hamiltonian(effective_potential_avg)
         hamiltonian = SpinorKohnShamHamiltonian(
             scalar_hamiltonian.negative_laplacian,
             scalar_hamiltonian.effective_potential,
             scalar_hamiltonian.nonlocal_operator,
             soc_projectors,
+            xc_delta=xc_delta,
         )
         solution = solve_eigval(
             hamiltonian.as_linear_operator(),
@@ -200,38 +225,53 @@ def run_self_consistent_soc(
         occupations = occupation_result.occupations
         fermi_level = occupation_result.fermi_level
 
-        density = spinor_density_from_orbitals(
+        density_up_out, density_down_out = spinor_spin_densities(
             spinors, occupations, system.grid.volume_element
         )
+        density = density_up_out + density_down_out
 
         hartree = system.solve_hartree(density, initial_potential=hartree_potential)
         hartree_potential = hartree.potential
-        xc = system.evaluate_xc(density)
-        output_potential = ionic_potential + hartree_potential + xc.potential
+        xc = ca_lda_spin_polarized(
+            density_up_out,
+            density_down_out,
+            system.grid.volume_element,
+            system.core_density,
+        )
+        output_potential_up = ionic_potential + hartree_potential + xc.potential_up
+        output_potential_down = ionic_potential + hartree_potential + xc.potential_down
 
+        input_combined = np.concatenate([input_potential_up, input_potential_down])
+        output_combined = np.concatenate([output_potential_up, output_potential_down])
+        density_combined = np.concatenate([density_up_out, density_down_out])
         metrics = potential_residual_metrics(
-            input_potential,
-            output_potential,
-            density,
+            input_combined,
+            output_combined,
+            density_combined,
             system.grid.volume_element,
             system.electron_count,
         )
 
-        energies = total_energy_no_degeneracy(
+        energies = total_energy_no_degeneracy_spin_polarized(
             eigenvalues,
             occupations,
-            density,
-            input_potential,
+            density_up_out,
+            density_down_out,
+            input_potential_up,
+            input_potential_down,
             ionic_potential,
             hartree_potential,
-            xc.potential,
+            xc.potential_up,
+            xc.potential_down,
             xc.total_energy,
             system.ion_ion_energy,
             system.grid.volume_element,
             alpha_z_energy=system.alpha_z_energy,
         )
 
-        mixed_potential = mixer.mix(input_potential, output_potential, iteration=iteration)
+        mixed_combined = mixer.mix(input_combined, output_combined, iteration=iteration)
+        input_potential_up = mixed_combined[:n_grid]
+        input_potential_down = mixed_combined[n_grid:]
 
         selected_residual = (
             metrics.plain if settings.use_plain_residual else metrics.weighted
@@ -254,7 +294,6 @@ def run_self_consistent_soc(
             and filter_degree > minimum_filter_degree
         ):
             filter_degree -= 1
-        input_potential = mixed_potential
         if selected_residual < settings.convergence_criterion:
             converged = True
             break
@@ -268,9 +307,9 @@ def run_self_consistent_soc(
         occupations=occupations,
         spinors=spinors,
         fermi_level=fermi_level,
-        density=density,
+        density=density_up_out + density_down_out,
         energies=energies,
     )
 
 
-__all__ = ["run_self_consistent_soc", "spinor_density_from_orbitals"]
+__all__ = ["run_self_consistent_soc_spin_polarized", "spinor_spin_densities"]

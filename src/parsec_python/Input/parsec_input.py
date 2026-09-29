@@ -554,12 +554,15 @@ def _parse_parsec_input(
     self_consistent_spin_orbit = optional_bool("so_from_scratch") or optional_bool(
         "scf_so"
     )
-    if self_consistent_spin_orbit and spin_polarization:
+    if self_consistent_spin_orbit and spin_polarization and is_periodic:
         raise UnsupportedParsecOptionError(
-            "SO_from_scratch/SCF_SO=true with Spin_Polarization=true is not "
-            "supported; self-consistent SOC shares one spin-unpolarized "
-            "effective potential between spinor components (no "
-            "Non_Collinear_magnetism/B_xc.sigma term)"
+            "SO_from_scratch/SCF_SO=true with Spin_Polarization=true and a "
+            "periodic Boundary_Conditions is not supported; the periodic "
+            "(k-point) self-consistent SOC driver "
+            "(run_self_consistent_soc_kpoints) does not yet carry the "
+            "collinear spin-density XC term "
+            "(run_self_consistent_soc_spin_polarized's cluster-only "
+            "xc_delta term)"
         )
     if optional_bool("dynamic_diag_tol"):
         raise UnsupportedParsecOptionError("Dynamic_Diag_Tol is not supported")

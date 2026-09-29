@@ -79,12 +79,17 @@ class SelfConsistentSOCCliTests(unittest.TestCase):
             self.assertAlmostEqual(eigenvalues[i], eigenvalues[i + 1], delta=1.0e-4)
             self.assertAlmostEqual(moments[i] + moments[i + 1], 0.0, delta=0.05)
 
-    def test_self_consistent_soc_with_spin_polarization_is_rejected(self) -> None:
+    def test_self_consistent_soc_with_spin_polarization_is_accepted(self) -> None:
+        """Cluster self-consistent SOC combined with spin polarization is
+        supported (run_self_consistent_soc_spin_polarized); see
+        test_self_consistent_soc_spin_polarized.py for the physics-level
+        validation and examples/0d_AuH/reduced_self_consistent_soc for a
+        real-Fortran-reference regression."""
         input_path = self._write_input(
             "parsec.in", extra="Spin_Polarization: .true.\n"
         )
         exit_code = cli_main([str(input_path), "--dry-run"])
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 0)
 
     def test_self_consistent_soc_without_so_psp_species_is_rejected(self) -> None:
         text = _BASE_INPUT.replace("SO_PSP: .true.\n", "")

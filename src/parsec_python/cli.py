@@ -32,6 +32,9 @@ from .Output import ParsecTextReporter
 from .SCF.kpoints import run_scf_kpoints
 from .SCF.kpoints_soc import run_self_consistent_soc_kpoints
 from .SCF.self_consistent_soc import run_self_consistent_soc
+from .SCF.self_consistent_soc_spin_polarized import (
+    run_self_consistent_soc_spin_polarized,
+)
 from .SCF.spin_polarized import run_scf_spin_polarized
 from .V_ion import load_pseudopotentials
 
@@ -539,11 +542,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                             translation.problem.pseudopotentials,
                         )
                     )
-                    result = run_self_consistent_soc(
-                        system,
-                        soc_projectors,
-                        callback=reporter.iteration_self_consistent_soc,
-                    )
+                    if spin_polarized:
+                        result = run_self_consistent_soc_spin_polarized(
+                            system,
+                            soc_projectors,
+                            callback=reporter.iteration_self_consistent_soc,
+                        )
+                    else:
+                        result = run_self_consistent_soc(
+                            system,
+                            soc_projectors,
+                            callback=reporter.iteration_self_consistent_soc,
+                        )
                 scf_elapsed = time.perf_counter() - scf_start
                 reporter.finish_self_consistent_soc(result, scf_elapsed)
 

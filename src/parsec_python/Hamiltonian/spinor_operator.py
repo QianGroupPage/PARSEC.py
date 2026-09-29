@@ -27,13 +27,17 @@ the *same* per-atom projector overlaps
 already validated in the perturbative path -- the two modules share that one
 overlap primitive so their formulas cannot silently drift apart.
 
-This module deliberately does not yet support non-collinear magnetism's
-``B_xc.sigma`` term (Fortran's ``Non_Collinear_magnetism`` flag): both spinor
-channels share one spin-unpolarized effective potential ``V_eff``, matching
-``SO_from_scratch`` without ``Non_Collinear_magnetism`` -- the simplest and
-most common self-consistent-SOC configuration (SOC band splitting on a
-non-magnetic system), not a combination with collinear/non-collinear
-magnetism.
+``xc_delta``, when given, adds a diagonal collinear Zeeman-like term
+``+diag(xc_delta)`` to the up channel and ``-diag(xc_delta)`` to the down
+channel -- ``(V_xc,up - V_xc,down)/2`` from
+:func:`~parsec_python.V_xc.ca_lda_spin_polarized`, used by
+``SCF.self_consistent_soc_spin_polarized`` to combine self-consistent SOC
+with *collinear* spin polarization (the spin-density projection of the
+spinor wavefunctions along z, not a rotating local moment). This module
+still does not support fully non-collinear magnetism (Fortran's
+``Non_Collinear_magnetism`` flag, an off-diagonal spin-density-matrix term):
+``xc_delta=None`` (the default) recovers the original spin-unpolarized
+``SO_from_scratch`` Hamiltonian exactly.
 """
 
 from __future__ import annotations
@@ -172,6 +176,7 @@ class SpinorKohnShamHamiltonian:
     effective_potential: np.ndarray
     nonlocal_operator: NonlocalProjectorOperator
     soc_projectors: tuple[AtomSpinOrbitProjectors, ...]
+    xc_delta: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         potential = np.asarray(self.effective_potential, dtype=float)
@@ -184,6 +189,11 @@ class SpinorKohnShamHamiltonian:
             raise ValueError("nonlocal operator does not match the kinetic operator")
         object.__setattr__(self, "effective_potential", potential)
         object.__setattr__(self, "soc_projectors", tuple(self.soc_projectors))
+        if self.xc_delta is not None:
+            xc_delta = np.asarray(self.xc_delta, dtype=float)
+            if xc_delta.shape != (size,):
+                raise ValueError("xc_delta does not match the kinetic operator")
+            object.__setattr__(self, "xc_delta", xc_delta)
 
     @property
     def grid_size(self) -> int:
@@ -217,6 +227,10 @@ class SpinorKohnShamHamiltonian:
 
         q_up = self.apply_channel(psi_up)
         q_down = self.apply_channel(psi_down)
+
+        if self.xc_delta is not None:
+            q_up = q_up + self.xc_delta[:, None] * psi_up
+            q_down = q_down - self.xc_delta[:, None] * psi_down
 
         if self.soc_projectors:
             q_up = q_up + apply_lzsz(self.soc_projectors, psi_up, spin_sign=1)

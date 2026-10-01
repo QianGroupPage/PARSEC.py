@@ -235,5 +235,17 @@ class CuPySpinorHamiltonian:
     def __matmul__(self, vectors):
         return self.apply(vectors)
 
+    def as_eigensolver_operator(self) -> "CuPySpinorHamiltonian":
+        """Identity hook matching the reference/accelerated scalar paths'
+        ``getattr(hamiltonian, "as_eigensolver_operator", ...)`` convention
+        (see ``SCF.self_consistent_soc.run_self_consistent_soc``). Unlike
+        the scalar ``CuPyBoundHamiltonian``, there is no separate persistent
+        device allocation to return here -- ``self`` already is the
+        device-resident operator, exposing exactly the ``.shape``/``.apply``
+        interface :mod:`chebff_spinor` needs.
+        """
+
+        return self
+
 
 __all__ = ["CuPySpinorHamiltonian", "apply_lzsz", "apply_lsxy"]

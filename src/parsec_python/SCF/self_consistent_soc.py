@@ -128,11 +128,25 @@ def _eigval_settings(system: PreparedSinglePointSystem, filter_degree: int) -> E
     )
 
 
+def _default_spinor_hamiltonian_builder(scalar_hamiltonian, soc_projectors):
+    return SpinorKohnShamHamiltonian(
+        scalar_hamiltonian.negative_laplacian,
+        scalar_hamiltonian.effective_potential,
+        scalar_hamiltonian.nonlocal_operator,
+        soc_projectors,
+    )
+
+
 def run_self_consistent_soc(
     system: PreparedSinglePointSystem,
     soc_projectors: tuple[AtomSpinOrbitProjectors, ...],
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
+    eigenproblem_solver: Callable[..., object] | None = None,
+    spinor_hamiltonian_builder: Callable[..., object] | None = None,
+    orbital_density_builder: Callable[..., np.ndarray] | None = None,
+    mixer_factory: Callable[..., object] | None = None,
+    total_energy_evaluator: Callable[..., object] | None = None,
 ) -> SelfConsistentSOCResult:
     """Run self-consistent-SOC PARSEC-style potential mixing.
 
@@ -146,10 +160,46 @@ def run_self_consistent_soc(
     Requires ``system.input.scf.xc_functional`` supported by
     :meth:`~parsec_python.SCF.single_point.PreparedSinglePointSystem.evaluate_xc`
     (``'ca'`` or ``'pbe'``) and ``system.input.eigensolver.method == 'chebff'``.
+
+    The five keyword-only callables mirror
+    :func:`~parsec_python.SCF.single_point.run_scf`'s accelerated-backend
+    injection points (all default to this module's/the reference's own
+    behavior, so CPU callers see no change): ``eigenproblem_solver`` replaces
+    :func:`~parsec_python.Eigensolvers.eigval.solve_eigval` (same
+    ``(operator, requested_states, *, settings, state=None)`` call
+    signature); ``spinor_hamiltonian_builder`` replaces the construction of
+    :class:`~parsec_python.Hamiltonian.spinor_operator.SpinorKohnShamHamiltonian`
+    from ``(scalar_hamiltonian, soc_projectors)`` -- an accelerated backend
+    whose bound Hamiltonian does not expose raw
+    ``negative_laplacian``/``nonlocal_operator`` attributes supplies its own
+    complex spinor operator here instead; ``orbital_density_builder``
+    replaces :func:`spinor_density_from_orbitals`; ``mixer_factory`` replaces
+    :class:`~parsec_python.Mixer.AndersonMixer` (called as
+    ``mixer_factory(system.input.mixing)``); ``total_energy_evaluator``
+    replaces :func:`~parsec_python.Energy.total_energy_no_degeneracy`.
     """
     settings = system.input.scf
     number_of_states = _number_of_states(system)
     ionic_potential = system.ionic_potential
+    solve_eigenproblem = (
+        solve_eigval if eigenproblem_solver is None else eigenproblem_solver
+    )
+    build_spinor_hamiltonian = (
+        _default_spinor_hamiltonian_builder
+        if spinor_hamiltonian_builder is None
+        else spinor_hamiltonian_builder
+    )
+    build_orbital_density = (
+        spinor_density_from_orbitals
+        if orbital_density_builder is None
+        else orbital_density_builder
+    )
+    build_mixer = AndersonMixer if mixer_factory is None else mixer_factory
+    evaluate_total_energy = (
+        total_energy_no_degeneracy
+        if total_energy_evaluator is None
+        else total_energy_evaluator
+    )
 
     initial_hartree = system.solve_hartree(
         system.initial_density, initial_potential=-ionic_potential
@@ -159,7 +209,7 @@ def run_self_consistent_soc(
     input_potential = ionic_potential + hartree_potential + xc.potential
 
     eigval_state: EigvalState | None = None
-    mixer = AndersonMixer(system.input.mixing)
+    mixer = build_mixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
 
@@ -175,14 +225,12 @@ def run_self_consistent_soc(
         eigval_settings = _eigval_settings(system, filter_degree)
 
         scalar_hamiltonian = system.hamiltonian(input_potential)
-        hamiltonian = SpinorKohnShamHamiltonian(
-            scalar_hamiltonian.negative_laplacian,
-            scalar_hamiltonian.effective_potential,
-            scalar_hamiltonian.nonlocal_operator,
-            soc_projectors,
+        hamiltonian = build_spinor_hamiltonian(scalar_hamiltonian, soc_projectors)
+        operator_factory = getattr(
+            hamiltonian, "as_eigensolver_operator", hamiltonian.as_linear_operator
         )
-        solution = solve_eigval(
-            hamiltonian.as_linear_operator(),
+        solution = solve_eigenproblem(
+            operator_factory(),
             number_of_states,
             settings=eigval_settings,
             state=eigval_state,
@@ -200,7 +248,7 @@ def run_self_consistent_soc(
         occupations = occupation_result.occupations
         fermi_level = occupation_result.fermi_level
 
-        density = spinor_density_from_orbitals(
+        density = build_orbital_density(
             spinors, occupations, system.grid.volume_element
         )
 
@@ -217,7 +265,7 @@ def run_self_consistent_soc(
             system.electron_count,
         )
 
-        energies = total_energy_no_degeneracy(
+        energies = evaluate_total_energy(
             eigenvalues,
             occupations,
             density,

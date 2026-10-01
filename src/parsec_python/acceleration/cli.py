@@ -8,13 +8,18 @@ import sys
 import time
 from typing import Sequence
 
+from parsec_python.Eigensolvers.perturbative_soc import build_spin_orbit_projectors
 from parsec_python.Input import (
     ParsecInputError,
     parse_parsec_input,
     summarize_translation,
 )
 from parsec_python.V_ion import load_pseudopotentials
-from parsec_python.cli import main as reference_main, save_result_archive
+from parsec_python.cli import (
+    main as reference_main,
+    save_result_archive,
+    save_self_consistent_soc_result_archive,
+)
 
 from .Output import AcceleratedTextReporter
 from .backends.selection import resolve_backend
@@ -24,6 +29,7 @@ from .driver import (
     run_scf,
 )
 from .models import BackendUnavailableError
+from .SCF.self_consistent_soc import run_self_consistent_soc
 
 
 class _RunLog:
@@ -201,20 +207,62 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _reference_only_features(translation) -> list[str]:
+def _accelerated_self_consistent_soc_eligible(translation) -> bool:
+    """Whether this input matches the one self-consistent-SOC shape the
+    accelerated path implements: Gamma-point only, not combined with
+    collinear spin polarization.
+
+    See :mod:`parsec_python.acceleration.SCF.self_consistent_soc`'s module
+    docstring.  Combined with spin polarization or a periodic
+    ``Boundary_Conditions`` always delegates to the reference CPU solver
+    (:mod:`parsec_python.SCF.self_consistent_soc_spin_polarized`/
+    ``kpoints_soc`` have no CuPy counterpart yet).
+    """
+
+    problem = translation.problem
+    return (
+        problem.scf.self_consistent_spin_orbit
+        and not problem.scf.spin_polarized
+        and problem.periodic_cell is None
+    )
+
+
+def _reference_only_features(
+    translation, *, accelerated_backend_selected: bool
+) -> list[str]:
     """Input features only the reference :mod:`parsec_python.cli` dispatches.
 
-    The accelerated driver runs a scalar spin-unpolarized Gamma-point SCF, so
-    without this check these flags would be silently ignored.
+    The accelerated driver runs a scalar spin-unpolarized Gamma-point SCF
+    plus (when ``accelerated_backend_selected`` and the input is
+    Gamma-point-only self-consistent SOC without spin polarization --
+    :func:`_accelerated_self_consistent_soc_eligible`) the CuPy spinor
+    Hamiltonian/eigensolver in
+    :mod:`parsec_python.acceleration.SCF.self_consistent_soc`.  Without this
+    check every other SOC/spin/k-point flag would be silently ignored.
     """
 
     problem = translation.problem
     features = []
     if problem.scf.self_consistent_spin_orbit:
-        features.append("self-consistent spin-orbit coupling (SO_from_scratch)")
-    if problem.scf.spin_polarized:
+        if problem.scf.spin_polarized:
+            features.append(
+                "self-consistent spin-orbit coupling combined with spin "
+                "polarization (SO_from_scratch + Spin_Polarization)"
+            )
+        elif problem.periodic_cell is not None:
+            features.append(
+                "periodic self-consistent spin-orbit coupling "
+                "(SO_from_scratch with a periodic Boundary_Conditions)"
+            )
+        elif not accelerated_backend_selected:
+            features.append("self-consistent spin-orbit coupling (SO_from_scratch)")
+        # else: Gamma-point-only self-consistent SOC on a resolved CuPy
+        # backend -- accelerated, not reference-only.
+    elif problem.scf.spin_polarized:
         features.append("spin polarization")
-    if problem.monkhorst_pack_dimensions is not None:
+    if problem.monkhorst_pack_dimensions is not None and not (
+        problem.scf.self_consistent_spin_orbit and problem.periodic_cell is not None
+    ):
         features.append("Monkhorst-Pack k-point sampling")
     return features
 
@@ -256,7 +304,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
 
-    unsupported = _reference_only_features(translation)
+    accelerated_self_consistent_soc = False
+    if _accelerated_self_consistent_soc_eligible(translation):
+        try:
+            selection_probe = resolve_backend(arguments.backend, translation.problem)
+        except (BackendUnavailableError, NotImplementedError):
+            selection_probe = None
+        accelerated_self_consistent_soc = (
+            selection_probe is not None and selection_probe.selected == "cupy"
+        )
+
+    unsupported = _reference_only_features(
+        translation, accelerated_backend_selected=accelerated_self_consistent_soc
+    )
     if unsupported:
         features = ", ".join(unsupported)
         if arguments.backend in ("cupy", "native"):
@@ -395,6 +455,50 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.write()
 
             scf_started = time.perf_counter()
+            if accelerated_self_consistent_soc:
+                soc_projectors = tuple(
+                    build_spin_orbit_projectors(
+                        system.grid,
+                        system.atoms,
+                        system.pseudopotentials,
+                        translation.problem.pseudopotentials,
+                    )
+                )
+                result = run_self_consistent_soc(
+                    system,
+                    soc_projectors,
+                    callback=reporter.reference.iteration_self_consistent_soc,
+                )
+                scf_completed = time.perf_counter()
+                reporter.reference.finish_self_consistent_soc(
+                    result, scf_completed - scf_started
+                )
+                reporting_completed = time.perf_counter()
+                log.write(
+                    f" Pre-SCF setup/reporting wall time [sec] : "
+                    f"{scf_started - started:11.6f}"
+                )
+                log.write(
+                    f" Post-SCF finalization/reporting [sec] : "
+                    f"{reporting_completed - scf_completed:11.6f}"
+                )
+                log.write(
+                    f" Total accelerated Python wall time [sec] : "
+                    f"{time.perf_counter() - started:11.2f}"
+                )
+                if not arguments.no_archive:
+                    saved = save_self_consistent_soc_result_archive(
+                        archive_path,
+                        result,
+                        include_wavefunctions=(
+                            arguments.save_wavefunctions
+                            or translation.output_all_states
+                        ),
+                    )
+                    log.write(f"Result archive: {saved}")
+                log.write(f"Text log: {log_path}")
+                return 0 if result.converged else 3
+
             result = run_scf(system, callback=reporter.iteration)
             scf_completed = time.perf_counter()
             reporter.finish(result, scf_completed - scf_started)

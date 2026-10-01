@@ -227,6 +227,46 @@ def _accelerated_self_consistent_soc_eligible(translation) -> bool:
     )
 
 
+def _resolve_symmetry_mode(
+    requested_symmetry: str | None,
+    ignore_symmetry: bool,
+    *,
+    accelerated_self_consistent_soc: bool,
+) -> str:
+    """Resolve ``--symmetry``/``Ignore_Symmetry`` to an effective mode.
+
+    Self-consistent SOC on the accelerated path always forces "off": the
+    orbital-sector symmetry decomposition
+    (``CuPySymmetrySCFEigensolver``/``SymmetrySCFReducer``) assumes
+    real-valued, spin-diagonal 1-D irreps, but the spin-orbit L.S cross term
+    (``lzsz``/``lsxy``) mixes spin channels and breaks that assumption, and
+    ``CuPySpinorHamiltonian``/``run_chebff_spinor`` only accept plain
+    complex128 ndarrays, not the compact ``SymmetryScalarField``
+    representation the symmetry-reduced Hartree/XC/mixing hooks would
+    otherwise produce for this system. "auto"/unset falls back to full-grid
+    silently (its own documented contract); "on" explicitly promises a
+    nontrivial reduction, which this tier cannot deliver, so that
+    combination is rejected with a ``ValueError`` instead of silently
+    overriding the user's explicit request.
+    """
+
+    mode = (
+        requested_symmetry
+        if requested_symmetry is not None
+        else ("off" if ignore_symmetry else "auto")
+    )
+    if accelerated_self_consistent_soc:
+        if requested_symmetry == "on":
+            raise ValueError(
+                "self-consistent spin-orbit coupling on the accelerated "
+                "path does not yet support symmetry reduction, so "
+                "--symmetry on cannot be satisfied for this input; omit "
+                "--symmetry or pass --symmetry off"
+            )
+        return "off"
+    return mode
+
+
 def _reference_only_features(
     translation, *, accelerated_backend_selected: bool
 ) -> list[str]:
@@ -335,11 +375,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return reference_main(_reference_argv(arguments))
 
-    symmetry_mode = (
-        arguments.symmetry
-        if arguments.symmetry is not None
-        else ("off" if translation.ignore_symmetry else "auto")
-    )
+    try:
+        symmetry_mode = _resolve_symmetry_mode(
+            arguments.symmetry,
+            translation.ignore_symmetry,
+            accelerated_self_consistent_soc=accelerated_self_consistent_soc,
+        )
+    except ValueError as error:
+        print(f"Input error: {error}", file=sys.stderr)
+        return 2
 
     summary = summarize_translation(translation)
     if arguments.dry_run:

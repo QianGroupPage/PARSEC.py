@@ -26,6 +26,7 @@ from parsec_python.acceleration.backends.cupy import cupy_available
 from parsec_python.acceleration.cli import (
     _accelerated_self_consistent_soc_eligible,
     _reference_only_features,
+    _resolve_symmetry_mode,
     main as accelerated_main,
 )
 
@@ -145,6 +146,56 @@ class EligibilityPredicateTests(unittest.TestCase):
         # One periodic-SOC message, not a second redundant k-point message.
         self.assertEqual(len(features), 1)
         self.assertIn("periodic self-consistent spin-orbit coupling", features[0])
+
+
+class SymmetryModeResolutionTests(unittest.TestCase):
+    """Found via a real GPU run of examples/0d_AuH/reduced_self_consistent_soc:
+    AuH has a nontrivial reflection symmetry that --symmetry auto happily
+    detects and exploits for the scalar path, but self-consistent SOC's
+    CuPySpinorHamiltonian/run_chebff_spinor only accept plain complex128
+    ndarrays, not the compact SymmetryScalarField representation symmetry
+    reduction produces -- crashing with
+    "TypeError: unsupported operand type(s) for +: 'float' and
+    'SymmetryScalarField'" at the very first SCF step. These tests cover the
+    fix (force symmetry off for accelerated self-consistent SOC) without
+    needing a GPU, since the resolution logic itself is pure."""
+
+    def test_non_soc_requests_are_unaffected(self) -> None:
+        for requested in (None, "auto", "on", "off"):
+            with self.subTest(requested=requested):
+                resolved = _resolve_symmetry_mode(
+                    requested, False, accelerated_self_consistent_soc=False
+                )
+                expected = requested if requested is not None else "auto"
+                self.assertEqual(resolved, expected)
+
+    def test_soc_forces_off_when_unset_or_auto(self) -> None:
+        for requested in (None, "auto"):
+            with self.subTest(requested=requested):
+                resolved = _resolve_symmetry_mode(
+                    requested, False, accelerated_self_consistent_soc=True
+                )
+                self.assertEqual(resolved, "off")
+
+    def test_soc_forces_off_when_explicitly_off(self) -> None:
+        resolved = _resolve_symmetry_mode(
+            "off", False, accelerated_self_consistent_soc=True
+        )
+        self.assertEqual(resolved, "off")
+
+    def test_soc_rejects_explicit_on(self) -> None:
+        with self.assertRaises(ValueError):
+            _resolve_symmetry_mode(
+                "on", False, accelerated_self_consistent_soc=True
+            )
+
+    def test_ignore_symmetry_input_flag_does_not_bypass_the_soc_rejection(self) -> None:
+        # Ignore_Symmetry=true only changes the *unset* default; an explicit
+        # --symmetry on must still be rejected for SOC regardless of it.
+        with self.assertRaises(ValueError):
+            _resolve_symmetry_mode(
+                "on", True, accelerated_self_consistent_soc=True
+            )
 
 
 class AcceleratedCliDelegationTests(unittest.TestCase):

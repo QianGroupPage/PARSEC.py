@@ -15,8 +15,8 @@ from parsec_python import (
     SCFSettings,
     SinglePointInput,
     SpeciesPotential,
-    prepare_single_point,
 )
+from parsec_python.SCF.single_point import prepare_single_point
 from parsec_python.SCF.spin_polarized import run_scf_spin_polarized
 
 _EXAMPLES = Path(__file__).resolve().parents[4] / "examples"

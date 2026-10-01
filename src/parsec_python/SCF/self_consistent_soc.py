@@ -226,11 +226,18 @@ def run_self_consistent_soc(
 
         scalar_hamiltonian = system.hamiltonian(input_potential)
         hamiltonian = build_spinor_hamiltonian(scalar_hamiltonian, soc_projectors)
-        operator_factory = getattr(
-            hamiltonian, "as_eigensolver_operator", hamiltonian.as_linear_operator
-        )
+        # getattr's default argument is evaluated eagerly, so
+        # getattr(hamiltonian, "as_eigensolver_operator", hamiltonian.as_linear_operator)
+        # would raise AttributeError on any hamiltonian lacking
+        # as_linear_operator even when it has as_eigensolver_operator (as
+        # CuPySpinorHamiltonian does, by design -- it has no need for a
+        # scipy LinearOperator wrapper).  Branch explicitly instead.
+        if hasattr(hamiltonian, "as_eigensolver_operator"):
+            operator = hamiltonian.as_eigensolver_operator()
+        else:
+            operator = hamiltonian.as_linear_operator()
         solution = solve_eigenproblem(
-            operator_factory(),
+            operator,
             number_of_states,
             settings=eigval_settings,
             state=eigval_state,

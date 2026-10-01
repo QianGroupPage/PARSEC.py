@@ -181,6 +181,7 @@ class SymmetrySCFReducer:
         exchange_correlation_energy: float,
         ion_ion_energy: float,
         volume_element: float,
+        alpha_z_energy: float = 0.0,
     ) -> EnergyBreakdown:
         """Evaluate the unchanged PARSEC energy using weighted wedge dots."""
 
@@ -198,7 +199,9 @@ class SymmetrySCFReducer:
                 * np.dot(multiplicities * density_wedge, field_wedge)
             )
 
-        band_energy = float(2.0 * np.dot(occupations, eigenvalues))
+        band_energy = float(2.0 * np.dot(occupations, eigenvalues)) + float(
+            alpha_z_energy
+        )
         old_hxc_integral = float(
             volume_element
             * np.dot(

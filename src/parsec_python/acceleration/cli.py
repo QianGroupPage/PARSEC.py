@@ -14,7 +14,7 @@ from parsec_python.Input import (
     summarize_translation,
 )
 from parsec_python.V_ion import load_pseudopotentials
-from parsec_python.cli import save_result_archive
+from parsec_python.cli import main as reference_main, save_result_archive
 
 from .Output import AcceleratedTextReporter
 from .backends.selection import resolve_backend
@@ -201,6 +201,47 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _reference_only_features(translation) -> list[str]:
+    """Input features only the reference :mod:`parsec_python.cli` dispatches.
+
+    The accelerated driver runs a scalar spin-unpolarized Gamma-point SCF, so
+    without this check these flags would be silently ignored.
+    """
+
+    problem = translation.problem
+    features = []
+    if problem.scf.self_consistent_spin_orbit:
+        features.append("self-consistent spin-orbit coupling (SO_from_scratch)")
+    if problem.scf.spin_polarized:
+        features.append("spin polarization")
+    if problem.monkhorst_pack_dimensions is not None:
+        features.append("Monkhorst-Pack k-point sampling")
+    return features
+
+
+def _reference_argv(arguments: argparse.Namespace) -> list[str]:
+    """Forward the options the reference CLI shares with this one."""
+
+    argv = [str(arguments.input)]
+    for flag, value in (
+        ("--pp-dir", arguments.pp_dir),
+        ("--output", arguments.output),
+        ("--log", arguments.log),
+    ):
+        if value is not None:
+            argv += [flag, str(value)]
+    for flag, enabled in (
+        ("--no-archive", arguments.no_archive),
+        ("--save-wavefunctions", arguments.save_wavefunctions),
+        ("--dry-run", arguments.dry_run),
+        ("--quiet", arguments.quiet),
+        ("--debug", arguments.debug),
+    ):
+        if enabled:
+            argv.append(flag)
+    return argv
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
     if arguments.profile_repeats < 1:
@@ -214,6 +255,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ParsecInputError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
+
+    unsupported = _reference_only_features(translation)
+    if unsupported:
+        features = ", ".join(unsupported)
+        if arguments.backend in ("cupy", "native"):
+            print(
+                f"Input error: {features} is not implemented on the accelerated "
+                f"path, so --backend {arguments.backend} cannot run this input; "
+                "use --backend scipy (or auto) to run it with the reference "
+                "solver",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"NOTE: {features} is not implemented on the accelerated path; "
+            "running the reference parsec_python.cli solver instead",
+            file=sys.stderr,
+        )
+        return reference_main(_reference_argv(arguments))
 
     symmetry_mode = (
         arguments.symmetry

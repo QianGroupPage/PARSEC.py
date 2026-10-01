@@ -390,6 +390,29 @@ class AxisReflectionReductionTests(unittest.TestCase):
                 getattr(full_energy, field), getattr(wedge_energy, field), 12
             )
 
+        # The SCF loop always passes alpha_z_energy by keyword, so the
+        # reducer must accept it and apply it exactly like total_energy.
+        energy_arguments = (
+            eigenvalues,
+            occupations,
+            density,
+            input_potential,
+            ionic,
+            hartree,
+            xc,
+            -3.2,
+            4.1,
+            0.125,
+        )
+        full_energy = total_energy(*energy_arguments, alpha_z_energy=0.37)
+        wedge_energy = reducer.total_energy(
+            *energy_arguments, alpha_z_energy=0.37
+        )
+        for field in full_energy.__dataclass_fields__:
+            self.assertAlmostEqual(
+                getattr(full_energy, field), getattr(wedge_energy, field), 12
+            )
+
     def test_compact_scalar_fields_stay_compact_and_match_full_algebra(self) -> None:
         reducer = SymmetrySCFReducer(self.reduction)
         generator = np.random.default_rng(37)

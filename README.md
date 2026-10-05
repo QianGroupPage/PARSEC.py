@@ -538,4 +538,7 @@ python src\tools\upf_to_parsec.py input.UPF output_POTRE.DAT
 
 ## License
 
-See [LICENSE](LICENSE).
+PARSEC.py is distributed under the GNU General Public License, version 3 or
+(at your option) any later version. See [LICENSE](LICENSE) for the Berkeley Lab
+license notice, [COPYING](COPYING) for the complete GNU GPL v3 text, and
+[COPYRIGHT](COPYRIGHT) for the copyright notice and U.S. Government rights.

@@ -787,6 +787,9 @@ class SelfConsistentSOCResult:
     fermi_level: float
     density: np.ndarray
     energies: EnergyBreakdown
+    magnetic_moment: float | None = None
+    """Net ``N_up - N_down`` (Bohr magnetons) from the spin densities when
+    the run was spin-polarized; ``None`` for the spin-unpolarized drivers."""
 
     @property
     def magnetic_moment_per_state(self) -> np.ndarray:

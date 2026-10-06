@@ -554,16 +554,6 @@ def _parse_parsec_input(
     self_consistent_spin_orbit = optional_bool("so_from_scratch") or optional_bool(
         "scf_so"
     )
-    if self_consistent_spin_orbit and spin_polarization and is_periodic:
-        raise UnsupportedParsecOptionError(
-            "SO_from_scratch/SCF_SO=true with Spin_Polarization=true and a "
-            "periodic Boundary_Conditions is not supported; the periodic "
-            "(k-point) self-consistent SOC driver "
-            "(run_self_consistent_soc_kpoints) does not yet carry the "
-            "collinear spin-density XC term "
-            "(run_self_consistent_soc_spin_polarized's cluster-only "
-            "xc_delta term)"
-        )
     if optional_bool("dynamic_diag_tol"):
         raise UnsupportedParsecOptionError("Dynamic_Diag_Tol is not supported")
     if optional_bool("old_interpolation_format"):
@@ -624,11 +614,13 @@ def _parse_parsec_input(
                     "Monkhorst_Pack_Shift is not supported; only an unshifted "
                     "Monkhorst-Pack grid is implemented"
                 )
-            if spin_polarization:
+            if spin_polarization and not self_consistent_spin_orbit:
                 raise UnsupportedParsecOptionError(
-                    "Kpoint_Method=mp with Spin_Polarization=true is not "
-                    "supported; run_scf_kpoints only implements the "
-                    "spin-unpolarized path (would need per-(k,spin) pooling)"
+                    "Kpoint_Method=mp with Spin_Polarization=true is only "
+                    "supported together with SO_from_scratch/SCF_SO=true "
+                    "(periodic spin-polarized spin-orbit); the non-SOC "
+                    "run_scf_kpoints implements only the spin-unpolarized "
+                    "path (would need per-(k,spin) pooling)"
                 )
         elif kpoint_method == "manual":
             raise UnsupportedParsecOptionError(

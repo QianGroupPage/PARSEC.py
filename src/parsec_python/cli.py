@@ -30,7 +30,10 @@ from .models import (
 from .Grid import monkhorst_pack_grid
 from .Output import ParsecTextReporter
 from .SCF.kpoints import run_scf_kpoints
-from .SCF.kpoints_soc import run_self_consistent_soc_kpoints
+from .SCF.kpoints_soc import (
+    run_self_consistent_soc_kpoints,
+    run_self_consistent_soc_kpoints_spin_polarized,
+)
 from .SCF.self_consistent_soc import run_self_consistent_soc
 from .SCF.self_consistent_soc_spin_polarized import (
     run_self_consistent_soc_spin_polarized,
@@ -357,6 +360,8 @@ def save_self_consistent_soc_result_archive(
     }
     for name, value in energy.items():
         payload[f"energy_{name}_ry"] = np.asarray(value)
+    if result.magnetic_moment is not None:
+        payload["magnetic_moment"] = np.asarray(result.magnetic_moment)
     if include_wavefunctions:
         payload["spinors"] = result.spinors
     np.savez_compressed(output, **payload)
@@ -527,7 +532,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else:
                         k_points = np.zeros((1, 3))
                         k_weights = np.ones(1)
-                    result = run_self_consistent_soc_kpoints(
+                    periodic_soc_driver = (
+                        run_self_consistent_soc_kpoints_spin_polarized
+                        if spin_polarized
+                        else run_self_consistent_soc_kpoints
+                    )
+                    result = periodic_soc_driver(
                         system,
                         k_points,
                         k_weights,

@@ -733,6 +733,14 @@ class ParsecTextReporter:
                 f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
                 f" {occupation:9.4f} {moment:9.4f}"
             )
+        if result.magnetic_moment is not None:
+            lines.extend(
+                [
+                    "",
+                    "Converged magnetic moment N_up - N_down = "
+                    f"{result.magnetic_moment:12.4f}",
+                ]
+            )
         lines.extend(
             [
                 "",

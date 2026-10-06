@@ -104,14 +104,32 @@ class PeriodicSelfConsistentSOCCliTests(unittest.TestCase):
         # 2 k-points x 20 states each = 40 pooled eigenvalues.
         self.assertEqual(archive["eigenvalues_ry"].shape, (40,))
 
-    def test_periodic_self_consistent_soc_with_spin_polarization_is_rejected(
+    def test_periodic_self_consistent_soc_with_spin_polarization_is_accepted(
         self,
     ) -> None:
+        """Periodic spin-polarized SOC is implemented (see
+        ``test_periodic_soc_spin_polarized``); input validation must accept it."""
         input_path = self._write_input(
             "parsec.in", extra="Spin_Polarization: .true.\n"
         )
         exit_code = cli_main([str(input_path), "--dry-run"])
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 0)
+
+    def test_periodic_kpoints_with_spin_but_without_soc_is_still_rejected(
+        self,
+    ) -> None:
+        """k-points + spin polarization without SO_from_scratch has no driver."""
+        text = _BASE_INPUT.replace("SO_from_scratch: .true.\n", "").replace(
+            "SO_PSP: .true.", "SO_PSP: .false."
+        )
+        path = self.directory / "parsec.in"
+        path.write_text(
+            text
+            + "Spin_Polarization: .true.\nKpoint_Method: mp\n"
+            "begin Monkhorst_Pack_Grid\n2 1 1\nend Monkhorst_Pack_Grid\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(cli_main([str(path), "--dry-run"]), 2)
 
 
 if __name__ == "__main__":

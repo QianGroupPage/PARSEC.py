@@ -297,6 +297,9 @@ def run_self_consistent_soc_spin_polarized(
         fermi_level=fermi_level,
         density=density_up_out + density_down_out,
         energies=energies,
+        magnetic_moment=float(
+            system.grid.volume_element * np.sum(density_up_out - density_down_out)
+        ),
     )
 
 

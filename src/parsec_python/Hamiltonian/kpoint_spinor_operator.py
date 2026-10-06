@@ -15,8 +15,13 @@ same k-point's Bloch phase
 ``k_point`` argument).
 
 As with :mod:`~parsec_python.Hamiltonian.spinor_operator`, both spinor
-components share one spin-unpolarized ``V_eff``; combining this with
-collinear/non-collinear magnetism is not implemented.
+components share one spin-unpolarized ``V_eff`` unless ``xc_delta`` is given:
+that adds the diagonal collinear Zeeman-like term ``+diag(xc_delta)`` to the
+up component and ``-diag(xc_delta)`` to the down component
+(``xc_delta = (V_xc,up - V_xc,down)/2``), exactly as in the cluster
+:class:`~parsec_python.Hamiltonian.spinor_operator.SpinorKohnShamHamiltonian`.
+It is real and k-independent, so it needs no Bloch phase.  Non-collinear
+magnetism (an off-diagonal ``B_xc.sigma`` term) is not implemented.
 """
 
 from __future__ import annotations
@@ -48,9 +53,15 @@ class KPointSpinorKohnShamHamiltonian:
 
     scalar_hamiltonian: KPointKohnShamHamiltonian
     soc_projectors: tuple[AtomSpinOrbitProjectors, ...]
+    xc_delta: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "soc_projectors", tuple(self.soc_projectors))
+        if self.xc_delta is not None:
+            xc_delta = np.asarray(self.xc_delta, dtype=float)
+            if xc_delta.shape != (self.scalar_hamiltonian.shape[0],):
+                raise ValueError("xc_delta does not match the kinetic operator")
+            object.__setattr__(self, "xc_delta", xc_delta)
 
     @property
     def grid_size(self) -> int:
@@ -78,6 +89,10 @@ class KPointSpinorKohnShamHamiltonian:
             q_up = q_up + apply_lsxy(self.soc_projectors, psi_down, spin_sign=-1)
             q_down = q_down + apply_lzsz(self.soc_projectors, psi_down, spin_sign=-1)
             q_down = q_down + apply_lsxy(self.soc_projectors, psi_up, spin_sign=1)
+
+        if self.xc_delta is not None:
+            q_up = q_up + self.xc_delta[:, None] * psi_up
+            q_down = q_down - self.xc_delta[:, None] * psi_down
 
         result = np.concatenate([q_up, q_down], axis=0)
         return result[:, 0] if was_1d else result

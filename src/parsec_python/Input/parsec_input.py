@@ -22,6 +22,7 @@ from ..models import (
     PeriodicCell,
     PeriodicGridSettings,
 )
+from ..Grid.kpoints import explicit_kpoints, read_kpoint_file
 from ..MLDensity.field import normalize_density_units
 
 
@@ -401,6 +402,7 @@ def _parse_parsec_input(
         "monkhorst_pack_grid",
         "monkhorst_pack_shift",
         "initial_ncl_moment",
+        "kpoint_list",
     }
     accepted_global = {
         "restart_run",
@@ -422,6 +424,8 @@ def _parse_parsec_input(
         "so_from_scratch",
         "non_collinear_magnetism",
         "kpoint_method",
+        "kpoint_unit",
+        "kpoint_file",
         "max_iter",
         "convergence_criterion",
         "use_plain_sre",
@@ -586,6 +590,8 @@ def _parse_parsec_input(
     ignore_symmetry = optional_bool("ignore_symmetry")
     periodic_cell = None
     monkhorst_pack_dimensions: tuple[int, int, int] | None = None
+    explicit_kpoint_array: np.ndarray | None = None
+    explicit_kpoint_weights: np.ndarray | None = None
     shape: str | None = None
     if is_periodic:
         periodic_cell = _parse_cell_shape(scalar, blocks)
@@ -618,16 +624,62 @@ def _parse_parsec_input(
                     "Monkhorst-Pack grid is implemented"
                 )
         elif kpoint_method == "manual":
-            raise UnsupportedParsecOptionError(
-                "Kpoint_Method=manual (an explicit k-point list) is not "
-                "supported; only 'none' (Gamma point) and 'mp' "
-                "(Monkhorst-Pack) are implemented"
-            )
+            list_blocks = blocks.get("kpoint_list", [])
+            file_path = input_relative_path("kpoint_file")
+            if len(list_blocks) > 1:
+                raise ParsecInputError("provide a single Kpoint_List block")
+            if bool(list_blocks) == (file_path is not None):
+                raise ParsecInputError(
+                    "Kpoint_Method=manual requires exactly one of a Kpoint_List "
+                    "block or a Kpoint_File (rows of 'kx ky kz [weight]')"
+                )
+            try:
+                if list_blocks:
+                    rows = []
+                    for line in list_blocks[0].value:
+                        values, unit = _block_numbers((line,), label="Kpoint_List")
+                        if unit or len(values) not in (3, 4):
+                            raise ParsecInputError(
+                                f"line {list_blocks[0].line}: every Kpoint_List row "
+                                "must be 'kx ky kz' or 'kx ky kz weight'"
+                            )
+                        rows.append(list(values))
+                    if len({len(row) for row in rows}) != 1:
+                        raise ParsecInputError(
+                            "every Kpoint_List row must have the same number of columns"
+                        )
+                    raw_kpoints = np.asarray(rows, dtype=float)
+                else:
+                    raw_kpoints = read_kpoint_file(file_path)
+                explicit_kpoint_array, explicit_kpoint_weights = explicit_kpoints(
+                    raw_kpoints,
+                    unit=_normalize_label(one("kpoint_unit", "cartesian_inverse_bohr")),
+                    cell=periodic_cell,
+                )
+            except (OSError, ValueError) as error:
+                raise ParsecInputError(f"Kpoint_Method=manual: {error}") from error
+            if not np.allclose(explicit_kpoint_weights, explicit_kpoint_weights[0]):
+                raise UnsupportedParsecOptionError(
+                    "Kpoint_Method=manual with unequal sampling weights is not "
+                    "supported yet: the SCF drivers pool every k-point into one "
+                    "Fermi level and need equal weights (an unreduced uniform "
+                    "sample).  Give equal weights, or omit the weight column"
+                )
         elif kpoint_method != "none":
             raise ParsecInputError(
                 f"Kpoint_Method must be 'none', 'mp', or 'manual', got {kpoint_method!r}"
             )
+        if kpoint_method != "manual" and (
+            "kpoint_list" in blocks or "kpoint_file" in scalar or "kpoint_unit" in scalar
+        ):
+            raise ParsecInputError(
+                "Kpoint_List/Kpoint_File/Kpoint_Unit require Kpoint_Method: manual"
+            )
     else:
+        if "kpoint_list" in blocks or "kpoint_file" in scalar or "kpoint_unit" in scalar:
+            raise ParsecInputError(
+                "Kpoint_List/Kpoint_File/Kpoint_Unit apply only to periodic systems"
+            )
         shape = _normalize_label(one("cluster_domain_shape", "sphere"))
         if shape == "sphere":
             radius = _physical_length(
@@ -1115,6 +1167,8 @@ def _parse_parsec_input(
         initial_density_settings=initial_density_settings,
         recenter_geometry=recenter and not is_periodic,
         monkhorst_pack_dimensions=monkhorst_pack_dimensions,
+        kpoints=explicit_kpoint_array,
+        kpoint_weights=explicit_kpoint_weights,
     )
     return ParsecInputTranslation(
         source=source,

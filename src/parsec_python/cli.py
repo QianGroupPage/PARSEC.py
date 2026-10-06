@@ -27,7 +27,7 @@ from .models import (
     SinglePointResult,
     SpinPolarizedSinglePointResult,
 )
-from .Grid import monkhorst_pack_grid
+from .Grid import kpoint_sampling
 from .Output import ParsecTextReporter
 from .SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_polarized
 from .SCF.noncollinear import (
@@ -501,7 +501,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     spin_polarized = translation.problem.scf.spin_polarized
     self_consistent_spin_orbit = translation.problem.scf.self_consistent_spin_orbit
-    monkhorst_pack_dimensions = translation.problem.monkhorst_pack_dimensions
+    k_sampling = kpoint_sampling(translation.problem) if is_periodic else None
     has_soc_species = any(
         specification.spin_orbit
         for specification in translation.problem.pseudopotentials.values()
@@ -533,11 +533,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             scf_start = time.perf_counter()
             if self_consistent_spin_orbit or noncollinear:
                 if is_periodic:
-                    if monkhorst_pack_dimensions is not None:
-                        k_points, k_weights = monkhorst_pack_grid(
-                            translation.problem.periodic_cell,
-                            monkhorst_pack_dimensions,
-                        )
+                    if k_sampling is not None:
+                        k_points, k_weights = k_sampling
                     else:
                         k_points = np.zeros((1, 3))
                         k_weights = np.ones(1)
@@ -607,10 +604,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0 if result.converged else 3
 
             if spin_polarized:
-                if monkhorst_pack_dimensions is not None:
-                    k_points, k_weights = monkhorst_pack_grid(
-                        translation.problem.periodic_cell, monkhorst_pack_dimensions
-                    )
+                if k_sampling is not None:
+                    k_points, k_weights = k_sampling
                     result = run_scf_kpoints_spin_polarized(
                         system,
                         k_points,
@@ -652,10 +647,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.write(f"Text log: {log_path}")
                 return 0 if result.converged else 3
 
-            if monkhorst_pack_dimensions is not None:
-                k_points, k_weights = monkhorst_pack_grid(
-                    translation.problem.periodic_cell, monkhorst_pack_dimensions
-                )
+            if k_sampling is not None:
+                k_points, k_weights = k_sampling
                 result = run_scf_kpoints(
                     system, k_points, k_weights, callback=reporter.iteration
                 )

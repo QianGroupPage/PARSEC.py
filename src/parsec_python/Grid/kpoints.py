@@ -1,9 +1,12 @@
 """Brillouin-zone k-point sampling for an orthorhombic periodic cell.
 
-Only a uniform, unreduced Monkhorst-Pack grid is implemented: every k-point
-carries the *same* weight ``1/(n1*n2*n3)`` (no symmetry-based irreducible-BZ
-reduction, no user-supplied explicit k-point list with individual weights).
-This deliberately keeps :mod:`~parsec_python.SCF.kpoints`'s Fermi-level
+Two sources are supported: a uniform, unreduced Monkhorst-Pack grid
+(:func:`monkhorst_pack_grid`) and a user-supplied explicit list
+(:func:`explicit_kpoints`, :func:`read_kpoint_file`, Fortran's
+``Kpoint_Method: manual``).  The SCF drivers currently require every
+k-point to carry the *same* weight (no symmetry-reduced weighted lists); the
+Monkhorst-Pack grid satisfies that by construction and an explicit list must
+too.  This deliberately keeps :mod:`~parsec_python.SCF.kpoints`'s Fermi-level
 pooling simple: reusing
 :func:`~parsec_python.Occupations.fermi_dirac.fermi_occupations`'s existing
 scalar ``degeneracy`` parameter (``degeneracy = 2*weight``, spin-unpolarized)
@@ -68,4 +71,118 @@ def monkhorst_pack_grid(
     return k_points, weights
 
 
-__all__ = ["monkhorst_pack_grid"]
+KPOINT_UNITS = ("cartesian_inverse_bohr", "reciprocal_lattice_vectors")
+
+
+def explicit_kpoints(
+    rows,
+    *,
+    unit: str = "cartesian_inverse_bohr",
+    cell: PeriodicCell | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert a user k-point list to ``(k_points, weights)``.
+
+    ``rows`` is ``(n, 3)`` (equal weights are assumed) or ``(n, 4)`` with the
+    sampling weight in the last column, the Fortran ``Kpoint_List`` row
+    ``kx ky kz weight``.  ``unit`` is either ``"cartesian_inverse_bohr"``
+    (the Fortran default: Cartesian components in 1/bohr) or
+    ``"reciprocal_lattice_vectors"`` (fractional coordinates along the
+    reciprocal lattice vectors ``b_i``, so ``k = sum_i f_i b_i`` with
+    ``b = 2*pi*inv(A).T`` for lattice vectors ``A`` in the rows; this needs
+    ``cell``).  The returned k-points are always Cartesian 1/bohr; weights
+    are normalized to sum to 1 and must be non-negative.
+    """
+
+    array = np.asarray(rows, dtype=float)
+    if array.ndim != 2 or array.shape[0] < 1 or array.shape[1] not in (3, 4):
+        raise ValueError(
+            "k-points must be an (n, 3) array or an (n, 4) array with a weight column"
+        )
+    if not np.all(np.isfinite(array)):
+        raise ValueError("k-points and weights must be finite")
+    coordinates = array[:, :3]
+    if array.shape[1] == 4:
+        weights = array[:, 3].copy()
+    else:
+        weights = np.ones(array.shape[0])
+    if np.any(weights < 0.0):
+        raise ValueError("k-point sampling weights must be non-negative")
+    total = float(np.sum(weights))
+    if total <= 0.0:
+        raise ValueError("k-point sampling weights must not all be zero")
+    weights = weights / total
+
+    normalized_unit = unit.strip().lower()
+    if normalized_unit not in KPOINT_UNITS:
+        raise ValueError(
+            f"Kpoint_Unit must be one of {', '.join(KPOINT_UNITS)}; got {unit!r}"
+        )
+    if normalized_unit == "reciprocal_lattice_vectors":
+        if cell is None:
+            raise ValueError("reciprocal_lattice_vectors units need the periodic cell")
+        reciprocal = 2.0 * np.pi * np.linalg.inv(np.asarray(cell.lattice_vectors)).T
+        coordinates = coordinates @ reciprocal
+    return np.ascontiguousarray(coordinates), weights
+
+
+def read_kpoint_file(path) -> np.ndarray:
+    """Read a k-point file: one ``kx ky kz [weight]`` row per line.
+
+    Blank lines and anything after ``#`` or ``!`` are ignored.  All rows must
+    have the same number of columns (three, or four with a weight).  Returns
+    the raw ``(n, 3)`` or ``(n, 4)`` array; apply units with
+    :func:`explicit_kpoints`.
+    """
+
+    from pathlib import Path
+
+    source = Path(path)
+    rows: list[list[float]] = []
+    for number, raw in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw
+        for marker in ("#", "!"):
+            position = line.find(marker)
+            if position >= 0:
+                line = line[:position]
+        fields = line.split()
+        if not fields:
+            continue
+        try:
+            values = [float(field) for field in fields]
+        except ValueError as error:
+            raise ValueError(f"{source}: line {number}: non-numeric entry") from error
+        if len(values) not in (3, 4):
+            raise ValueError(
+                f"{source}: line {number}: expected 'kx ky kz [weight]', got {len(values)} numbers"
+            )
+        rows.append(values)
+    if not rows:
+        raise ValueError(f"{source}: no k-points found")
+    if len({len(row) for row in rows}) != 1:
+        raise ValueError(f"{source}: every row must have the same number of columns")
+    return np.asarray(rows, dtype=float)
+
+
+def kpoint_sampling(problem) -> tuple[np.ndarray, np.ndarray] | None:
+    """``(k_points, weights)`` requested by a ``SinglePointInput``, or ``None``.
+
+    An explicit list (``problem.kpoints``) or a Monkhorst-Pack grid
+    (``problem.monkhorst_pack_dimensions``); ``None`` means Gamma only.
+    """
+
+    if getattr(problem, "kpoints", None) is not None:
+        return np.asarray(problem.kpoints, dtype=float), np.asarray(
+            problem.kpoint_weights, dtype=float
+        )
+    if problem.monkhorst_pack_dimensions is not None:
+        return monkhorst_pack_grid(problem.periodic_cell, problem.monkhorst_pack_dimensions)
+    return None
+
+
+__all__ = [
+    "KPOINT_UNITS",
+    "explicit_kpoints",
+    "kpoint_sampling",
+    "monkhorst_pack_grid",
+    "read_kpoint_file",
+]

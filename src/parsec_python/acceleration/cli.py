@@ -303,11 +303,11 @@ def _reference_only_features(
         # backend -- accelerated, not reference-only.
     elif problem.scf.spin_polarized:
         features.append("spin polarization")
-    if problem.monkhorst_pack_dimensions is not None and not (
+    if problem.has_kpoint_sampling and not (
         (problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear)
         and problem.periodic_cell is not None
     ):
-        features.append("Monkhorst-Pack k-point sampling")
+        features.append("k-point sampling (Monkhorst-Pack or explicit list)")
     return features
 
 

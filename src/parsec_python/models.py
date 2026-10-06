@@ -567,6 +567,19 @@ class SinglePointInput:
     :func:`~parsec_python.SCF.kpoints.run_scf_kpoints` for periodic,
     spin-unpolarized, non-SOC inputs.  ``None`` (the default) is the
     ordinary Gamma-only periodic path."""
+    kpoints: np.ndarray | None = None
+    """An explicit k-point list (Fortran ``Kpoint_Method: manual``), shape
+    ``(n, 3)`` in Cartesian 1/bohr; mutually exclusive with
+    ``monkhorst_pack_dimensions`` and requiring ``periodic_cell``.  Convert
+    user units with :func:`~parsec_python.Grid.kpoints.explicit_kpoints`."""
+    kpoint_weights: np.ndarray | None = None
+    """Sampling weights for ``kpoints`` (non-negative, normalized to sum 1;
+    equal if omitted).  The SCF drivers currently require them equal."""
+
+    @property
+    def has_kpoint_sampling(self) -> bool:
+        """Whether k-points beyond Gamma are requested (grid or explicit list)."""
+        return self.monkhorst_pack_dimensions is not None or self.kpoints is not None
 
     def __post_init__(self) -> None:
         atoms = tuple(atom if isinstance(atom, Atom) else Atom(**atom) for atom in self.atoms)
@@ -592,6 +605,32 @@ class SinglePointInput:
             if len(dims) != 3 or any(value < 1 for value in dims):
                 raise ValueError("monkhorst_pack_dimensions must be three positive integers")
             object.__setattr__(self, "monkhorst_pack_dimensions", dims)
+        if self.kpoints is not None:
+            if self.periodic_cell is None:
+                raise ValueError("an explicit k-point list requires periodic_cell")
+            if self.monkhorst_pack_dimensions is not None:
+                raise ValueError(
+                    "give either monkhorst_pack_dimensions or an explicit kpoints "
+                    "list, not both"
+                )
+            k_points = np.asarray(self.kpoints, dtype=float)
+            if k_points.ndim != 2 or k_points.shape[0] < 1 or k_points.shape[1] != 3:
+                raise ValueError("kpoints must have shape (n, 3) with n >= 1")
+            if not np.all(np.isfinite(k_points)):
+                raise ValueError("kpoints must be finite")
+            if self.kpoint_weights is None:
+                weights = np.full(k_points.shape[0], 1.0 / k_points.shape[0])
+            else:
+                weights = np.asarray(self.kpoint_weights, dtype=float)
+                if weights.shape != (k_points.shape[0],) or not np.all(np.isfinite(weights)):
+                    raise ValueError("kpoint_weights must have one finite value per k-point")
+                if np.any(weights < 0.0) or float(np.sum(weights)) <= 0.0:
+                    raise ValueError("kpoint_weights must be non-negative and not all zero")
+                weights = weights / float(np.sum(weights))
+            object.__setattr__(self, "kpoints", k_points)
+            object.__setattr__(self, "kpoint_weights", weights)
+        elif self.kpoint_weights is not None:
+            raise ValueError("kpoint_weights given without kpoints")
 
 
 @dataclass(frozen=True)

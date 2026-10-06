@@ -33,7 +33,7 @@ from ..V_ion import (
     normalize_density,
     superpose_atomic_density,
 )
-from ..V_xc import XCResult, ca_lda
+from ..V_xc import XCResult, ca_lda, pbe
 from .single_point import run_scf as _run_scf
 
 
@@ -97,10 +97,11 @@ class PeriodicPreparedSinglePointSystem:
 
         if self.input.scf.xc_functional == "ca":
             return ca_lda(density, self.grid.volume_element, self.core_density)
+        if self.input.scf.xc_functional == "pbe":
+            return pbe(density, self.grid, self.core_density)
         raise NotImplementedError(
             f"xc_functional={self.input.scf.xc_functional!r} is not supported for "
-            "the periodic path: pbe's density gradient zero-pads outside the "
-            "active domain (the isolated convention), not periodic wraparound"
+            "the periodic path"
         )
 
 

@@ -1,4 +1,5 @@
-"""Spin-unpolarized PBE exchange and correlation on the real-space grid.
+"""Spin-unpolarized PBE exchange and correlation on the real-space grid
+(isolated clusters with zero padding, or periodic cells with wraparound).
 
 PBE is a generalized-gradient approximation (GGA).  Its energy has the
 discrete form
@@ -206,6 +207,32 @@ def pbe_energy_partials(
     return energy_density, derivative_density, derivative_sigma
 
 
+def _is_periodic(grid) -> bool:
+    return hasattr(grid, "cell") and hasattr(grid, "points_per_axis")
+
+
+def _to_box(values: np.ndarray, grid) -> np.ndarray:
+    """Cartesian-box view of a grid vector.
+
+    A periodic grid already stores every point of its orthorhombic cell in
+    row-major order, so the box is a plain reshape and derivatives wrap
+    around.  An isolated cluster grid is embedded in a zero-valued box.
+    """
+
+    if _is_periodic(grid):
+        values = np.asarray(values, dtype=np.float64)
+        if values.shape != (grid.size,):
+            raise ValueError("field does not match the periodic real-space grid")
+        return values.reshape(grid.shape)
+    return _embed_active(values, grid)
+
+
+def _from_box(box: np.ndarray, grid) -> np.ndarray:
+    if _is_periodic(grid):
+        return np.ascontiguousarray(box.reshape(-1))
+    return _gather_active(box, grid)
+
+
 def _embed_active(values: np.ndarray, grid: RealSpaceGrid) -> np.ndarray:
     """Embed one active-grid vector into its zero-valued Cartesian box."""
 
@@ -230,10 +257,15 @@ def pbe(
 ) -> XCResult:
     """Evaluate unpolarized PBE and its exact discrete grid derivative.
 
-    The density is extended by zero outside the active cluster, matching the
-    orbital finite-domain convention.  Centered derivatives retain their full
-    stencil beside the boundary; missing samples therefore contribute zero
-    instead of triggering a one-sided or renormalized formula.
+    On an isolated cluster grid the density is extended by zero outside the
+    active domain, matching the orbital finite-domain convention.  Centered
+    derivatives retain their full stencil beside the boundary; missing samples
+    therefore contribute zero instead of triggering a one-sided or
+    renormalized formula.  On a periodic grid (``PeriodicRealSpaceGrid``) the
+    stencil wraps around the cell instead, so the same code serves bulk
+    calculations; wraparound makes the discrete gradient an exactly
+    antisymmetric circulant operator, so the transpose used for the
+    potential is still the exact derivative of the summed energy.
     """
 
     valence = np.asarray(valence_density, dtype=np.float64)
@@ -251,7 +283,9 @@ def pbe(
 
     weights = first_derivative_coefficients(grid.settings.expansion_order)
     weights = weights / grid.spacing
-    full_density = _embed_active(density, grid)
+    # Periodic cells wrap the stencil around; clusters zero-pad outside.
+    boundary = "wrap" if _is_periodic(grid) else "constant"
+    full_density = _to_box(density, grid)
     gradients = np.empty((3, grid.size), dtype=np.float64)
     sigma = np.zeros(grid.size, dtype=np.float64)
     for axis in range(3):
@@ -259,10 +293,10 @@ def pbe(
             full_density,
             weights,
             axis=axis,
-            mode="constant",
+            mode=boundary,
             cval=0.0,
         )
-        gradient = _gather_active(derivative_box, grid)
+        gradient = _from_box(derivative_box, grid)
         gradients[axis] = gradient
         sigma += gradient * gradient
 
@@ -271,19 +305,17 @@ def pbe(
     )
     potential_hartree = fn_hartree.copy()
     for axis in range(3):
-        flux_box = _embed_active(
-            2.0 * fsigma_hartree * gradients[axis], grid
-        )
+        flux_box = _to_box(2.0 * fsigma_hartree * gradients[axis], grid)
         # For the antisymmetric centered stencil D.T = -D.  Applying the
         # reversed weights is the exact transpose of the zero-padded action.
         adjoint_box = correlate1d(
             flux_box,
             -weights,
             axis=axis,
-            mode="constant",
+            mode=boundary,
             cval=0.0,
         )
-        potential_hartree += _gather_active(adjoint_box, grid)
+        potential_hartree += _from_box(adjoint_box, grid)
 
     # Convert Hartree -> Rydberg only at the public boundary.
     energy_density = 2.0 * energy_hartree

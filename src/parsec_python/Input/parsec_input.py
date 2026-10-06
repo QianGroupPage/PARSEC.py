@@ -588,13 +588,6 @@ def _parse_parsec_input(
         raise UnsupportedParsecOptionError(
             f"Correlation_Type={correlation!r}; supported choices are CA/PZ LDA and PBE"
         )
-    if is_periodic and xc_functional != "ca":
-        raise UnsupportedParsecOptionError(
-            "the periodic (Boundary_Conditions=bulk) path only supports "
-            "Correlation_Type=CA: PBE's density gradient assumes the "
-            "isolated domain's zero-padded boundary, which is wrong under "
-            "periodic wraparound"
-        )
 
     spacing = _physical_length(one("grid_spacing"), label="Grid_Spacing")
     ignore_symmetry = optional_bool("ignore_symmetry")

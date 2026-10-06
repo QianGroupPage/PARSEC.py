@@ -20,8 +20,9 @@ that adds the diagonal collinear Zeeman-like term ``+diag(xc_delta)`` to the
 up component and ``-diag(xc_delta)`` to the down component
 (``xc_delta = (V_xc,up - V_xc,down)/2``), exactly as in the cluster
 :class:`~parsec_python.Hamiltonian.spinor_operator.SpinorKohnShamHamiltonian`.
-It is real and k-independent, so it needs no Bloch phase.  Non-collinear
-magnetism (an off-diagonal ``B_xc.sigma`` term) is not implemented.
+It is real and k-independent, so it needs no Bloch phase.  The general
+non-collinear term ``B_xc . sigma`` is available through ``xc_field`` (shape
+``(3, n_grid)``, mutually exclusive with ``xc_delta``).
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
 
 from ..Eigensolvers.perturbative_soc import AtomSpinOrbitProjectors
 from .kpoint_operator import KPointKohnShamHamiltonian
-from .spinor_operator import _as_block, apply_lsxy, apply_lzsz
+from .spinor_operator import _as_block, apply_lsxy, apply_lzsz, apply_zeeman_field
 
 
 @dataclass(frozen=True)
@@ -54,9 +55,17 @@ class KPointSpinorKohnShamHamiltonian:
     scalar_hamiltonian: KPointKohnShamHamiltonian
     soc_projectors: tuple[AtomSpinOrbitProjectors, ...]
     xc_delta: np.ndarray | None = None
+    xc_field: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "soc_projectors", tuple(self.soc_projectors))
+        if self.xc_field is not None:
+            if self.xc_delta is not None:
+                raise ValueError("give xc_delta or xc_field, not both")
+            xc_field = np.asarray(self.xc_field, dtype=float)
+            if xc_field.shape != (3, self.scalar_hamiltonian.shape[0]):
+                raise ValueError("xc_field must have shape (3, n_grid)")
+            object.__setattr__(self, "xc_field", xc_field)
         if self.xc_delta is not None:
             xc_delta = np.asarray(self.xc_delta, dtype=float)
             if xc_delta.shape != (self.scalar_hamiltonian.shape[0],):
@@ -93,6 +102,10 @@ class KPointSpinorKohnShamHamiltonian:
         if self.xc_delta is not None:
             q_up = q_up + self.xc_delta[:, None] * psi_up
             q_down = q_down - self.xc_delta[:, None] * psi_down
+        if self.xc_field is not None:
+            zeeman_up, zeeman_down = apply_zeeman_field(self.xc_field, psi_up, psi_down)
+            q_up = q_up + zeeman_up
+            q_down = q_down + zeeman_down
 
         result = np.concatenate([q_up, q_down], axis=0)
         return result[:, 0] if was_1d else result

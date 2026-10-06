@@ -319,9 +319,96 @@ def total_energy_no_degeneracy_spin_polarized(
     )
 
 
+def total_energy_noncollinear(
+    eigenvalues: np.ndarray,
+    occupations: np.ndarray,
+    density: np.ndarray,
+    magnetization: np.ndarray,
+    input_potential: np.ndarray,
+    input_field: np.ndarray,
+    ionic_potential: np.ndarray,
+    output_hartree_potential: np.ndarray,
+    output_xc_potential: np.ndarray,
+    output_xc_field: np.ndarray,
+    exchange_correlation_energy: float,
+    ion_ion_energy: float,
+    volume_element: float,
+    alpha_z_energy: float = 0.0,
+    band_energy_weight: float = 1.0,
+) -> EnergyBreakdown:
+    """Total energy for a non-collinear spinor calculation.
+
+    The Hxc potential is ``V_avg * 1 + B . sigma``, so the double-counting
+    and ``Integral V_xc rho`` terms carry both the charge and the
+    magnetization parts: ``int (n V_avg + m . B)``.  With ``m`` along z and
+    ``B = (V_up - V_down)/2 z`` this equals
+    :func:`total_energy_no_degeneracy_spin_polarized` exactly (``n_up V_up +
+    n_down V_down = n V_avg + m_z B_z``).  Each pooled eigenvalue holds at
+    most one electron (no factor of two), as for the other spinor energies.
+    """
+    eigenvalues = np.asarray(eigenvalues, dtype=float)
+    occupations = np.asarray(occupations, dtype=float)
+    density = np.asarray(density, dtype=float)
+    magnetization = np.asarray(magnetization, dtype=float)
+    input_field = np.asarray(input_field, dtype=float)
+    output_xc_field = np.asarray(output_xc_field, dtype=float)
+    if occupations.shape != eigenvalues.shape:
+        raise ValueError("eigenvalues and occupations must have the same shape")
+    scalar_fields = (
+        input_potential,
+        ionic_potential,
+        output_hartree_potential,
+        output_xc_potential,
+    )
+    if any(np.asarray(value).shape != density.shape for value in scalar_fields):
+        raise ValueError("all scalar fields must share the density's shape")
+    vector_fields = (magnetization, input_field, output_xc_field)
+    if any(value.shape != (3, density.size) for value in vector_fields):
+        raise ValueError("magnetization and B fields must have shape (3, n_grid)")
+
+    band_energy = float(band_energy_weight * np.dot(occupations, eigenvalues)) + float(
+        alpha_z_energy
+    )
+    old_hxc_integral = float(
+        volume_element
+        * (
+            np.dot(density, np.asarray(input_potential) - np.asarray(ionic_potential))
+            + np.sum(magnetization * input_field)
+        )
+    )
+    hartree_integral = float(
+        volume_element * np.dot(density, output_hartree_potential)
+    )
+    vxc_integral = float(
+        volume_element
+        * (
+            np.dot(density, output_xc_potential)
+            + np.sum(magnetization * output_xc_field)
+        )
+    )
+    electron_ion = float(volume_element * np.dot(density, ionic_potential))
+    electronic = float(
+        band_energy
+        - old_hxc_integral
+        + 0.5 * hartree_integral
+        + exchange_correlation_energy
+    )
+    return EnergyBreakdown(
+        eigenvalue=band_energy,
+        hartree=0.5 * hartree_integral,
+        integral_vxc_rho=vxc_integral,
+        exchange_correlation=float(exchange_correlation_energy),
+        electron_ion=electron_ion,
+        ion_ion=float(ion_ion_energy),
+        electronic=electronic,
+        total=electronic + float(ion_ion_energy),
+    )
+
+
 __all__ = [
     "total_energy",
     "total_energy_no_degeneracy",
     "total_energy_spin_polarized",
     "total_energy_no_degeneracy_spin_polarized",
+    "total_energy_noncollinear",
 ]

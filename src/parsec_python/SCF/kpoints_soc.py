@@ -159,6 +159,7 @@ def _spinor_hamiltonian(
     soc_projectors_k,
     effective_potential: np.ndarray,
     xc_delta: np.ndarray | None = None,
+    xc_field: np.ndarray | None = None,
 ) -> KPointSpinorKohnShamHamiltonian:
     scalar_hamiltonian_k = KPointKohnShamHamiltonian(
         system.negative_laplacian,
@@ -168,7 +169,7 @@ def _spinor_hamiltonian(
         k_point,
     )
     return KPointSpinorKohnShamHamiltonian(
-        scalar_hamiltonian_k, soc_projectors_k, xc_delta=xc_delta
+        scalar_hamiltonian_k, soc_projectors_k, xc_delta=xc_delta, xc_field=xc_field
     )
 
 

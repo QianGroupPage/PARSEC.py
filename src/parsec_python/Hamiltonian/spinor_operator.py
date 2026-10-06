@@ -34,10 +34,11 @@ channel -- ``(V_xc,up - V_xc,down)/2`` from
 ``SCF.self_consistent_soc_spin_polarized`` to combine self-consistent SOC
 with *collinear* spin polarization (the spin-density projection of the
 spinor wavefunctions along z, not a rotating local moment). This module
-still does not support fully non-collinear magnetism (Fortran's
-``Non_Collinear_magnetism`` flag, an off-diagonal spin-density-matrix term):
-``xc_delta=None`` (the default) recovers the original spin-unpolarized
-``SO_from_scratch`` Hamiltonian exactly.
+supports the general non-collinear form through ``xc_field = B_xc`` of shape
+``(3, n_grid)``, adding ``B_xc . sigma`` (see
+:func:`apply_zeeman_field`).  ``xc_delta`` and ``xc_field`` are mutually
+exclusive; with both ``None`` (the default) the original spin-unpolarized
+``SO_from_scratch`` Hamiltonian is recovered exactly.
 """
 
 from __future__ import annotations
@@ -157,6 +158,22 @@ def apply_lsxy(
     return output[:, 0] if was_1d else output
 
 
+def apply_zeeman_field(
+    field: np.ndarray, psi_up: np.ndarray, psi_down: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(B . sigma) psi`` for a spatially varying field ``B = (Bx, By, Bz)``.
+
+    ``[[Bz, Bx - i By], [Bx + i By, -Bz]]`` acting on ``(psi_up, psi_down)``;
+    ``field`` has shape ``(3, n_grid)`` and is real, so the operator is
+    Hermitian.  ``B = (0, 0, xc_delta)`` reproduces the collinear term.
+    """
+
+    bx, by, bz = field
+    delta_up = bz[:, None] * psi_up + (bx - 1j * by)[:, None] * psi_down
+    delta_down = (bx + 1j * by)[:, None] * psi_up - bz[:, None] * psi_down
+    return delta_up, delta_down
+
+
 @dataclass(frozen=True)
 class SpinorKohnShamHamiltonian:
     """The self-consistent-SOC Hamiltonian acting on stacked complex spinors.
@@ -177,6 +194,7 @@ class SpinorKohnShamHamiltonian:
     nonlocal_operator: NonlocalProjectorOperator
     soc_projectors: tuple[AtomSpinOrbitProjectors, ...]
     xc_delta: np.ndarray | None = None
+    xc_field: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         potential = np.asarray(self.effective_potential, dtype=float)
@@ -194,6 +212,13 @@ class SpinorKohnShamHamiltonian:
             if xc_delta.shape != (size,):
                 raise ValueError("xc_delta does not match the kinetic operator")
             object.__setattr__(self, "xc_delta", xc_delta)
+        if self.xc_field is not None:
+            if self.xc_delta is not None:
+                raise ValueError("give xc_delta or xc_field, not both")
+            xc_field = np.asarray(self.xc_field, dtype=float)
+            if xc_field.shape != (3, size):
+                raise ValueError("xc_field must have shape (3, n_grid)")
+            object.__setattr__(self, "xc_field", xc_field)
 
     @property
     def grid_size(self) -> int:
@@ -231,6 +256,10 @@ class SpinorKohnShamHamiltonian:
         if self.xc_delta is not None:
             q_up = q_up + self.xc_delta[:, None] * psi_up
             q_down = q_down - self.xc_delta[:, None] * psi_down
+        if self.xc_field is not None:
+            zeeman_up, zeeman_down = apply_zeeman_field(self.xc_field, psi_up, psi_down)
+            q_up = q_up + zeeman_up
+            q_down = q_down + zeeman_down
 
         if self.soc_projectors:
             q_up = q_up + apply_lzsz(self.soc_projectors, psi_up, spin_sign=1)
@@ -257,4 +286,5 @@ __all__ = [
     "SpinorKohnShamHamiltonian",
     "apply_lzsz",
     "apply_lsxy",
+    "apply_zeeman_field",
 ]

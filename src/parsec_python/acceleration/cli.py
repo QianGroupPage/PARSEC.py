@@ -223,6 +223,7 @@ def _accelerated_self_consistent_soc_eligible(translation) -> bool:
     return (
         problem.scf.self_consistent_spin_orbit
         and not problem.scf.spin_polarized
+        and not problem.scf.noncollinear
         and problem.periodic_cell is None
     )
 
@@ -283,7 +284,9 @@ def _reference_only_features(
 
     problem = translation.problem
     features = []
-    if problem.scf.self_consistent_spin_orbit:
+    if problem.scf.noncollinear:
+        features.append("non-collinear magnetism (Non_Collinear_magnetism)")
+    elif problem.scf.self_consistent_spin_orbit:
         if problem.scf.spin_polarized:
             features.append(
                 "self-consistent spin-orbit coupling combined with spin "
@@ -301,7 +304,8 @@ def _reference_only_features(
     elif problem.scf.spin_polarized:
         features.append("spin polarization")
     if problem.monkhorst_pack_dimensions is not None and not (
-        problem.scf.self_consistent_spin_orbit and problem.periodic_cell is not None
+        (problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear)
+        and problem.periodic_cell is not None
     ):
         features.append("Monkhorst-Pack k-point sampling")
     return features

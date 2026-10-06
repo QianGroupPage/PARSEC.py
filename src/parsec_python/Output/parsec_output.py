@@ -733,7 +733,17 @@ class ParsecTextReporter:
                 f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
                 f" {occupation:9.4f} {moment:9.4f}"
             )
-        if result.magnetic_moment is not None:
+        if result.magnetic_moment_vector is not None:
+            mx, my, mz = (float(v) for v in result.magnetic_moment_vector)
+            lines.extend(
+                [
+                    "",
+                    "Converged magnetic moment vector (mx, my, mz) = "
+                    f"{mx:10.4f} {my:10.4f} {mz:10.4f}   |m| = "
+                    f"{float(result.magnetic_moment):10.4f}",
+                ]
+            )
+        elif result.magnetic_moment is not None:
             lines.extend(
                 [
                     "",

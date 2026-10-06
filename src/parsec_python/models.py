@@ -34,6 +34,12 @@ class Atom:
 
     symbol: str
     position: np.ndarray | Sequence[float]
+    initial_moment: np.ndarray | Sequence[float] | None = None
+    """Direction of this atom's initial magnetic moment for a non-collinear
+    calculation (Fortran's per-atom ``Initial_NCL_Moment``).  Only the
+    direction matters: it is normalized here, and the initial magnitude comes
+    from the species' ``initial_spin_polarization``.  ``None`` (or the zero
+    vector) seeds no moment on this atom."""
 
     def __post_init__(self) -> None:
         symbol = self.symbol.strip()
@@ -44,6 +50,14 @@ class Atom:
             raise ValueError("atom position must contain three finite Cartesian coordinates")
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "position", position)
+        if self.initial_moment is not None:
+            moment = np.asarray(self.initial_moment, dtype=float)
+            if moment.shape != (3,) or not np.all(np.isfinite(moment)):
+                raise ValueError("initial_moment must be three finite numbers")
+            norm = float(np.linalg.norm(moment))
+            object.__setattr__(
+                self, "initial_moment", None if norm == 0.0 else moment / norm
+            )
 
 
 @dataclass(frozen=True)
@@ -394,8 +408,14 @@ class SCFSettings:
     :func:`~parsec_python.SCF.self_consistent_soc.run_self_consistent_soc`
     for isolated inputs with at least one ``SO_PSP=true`` species and
     ``spin_polarized=False`` (both spinor components share one
-    spin-unpolarized potential; combining with collinear/non-collinear
-    magnetism is not implemented).
+    spin-unpolarized potential).
+
+    ``noncollinear`` mirrors PARSEC's ``Non_Collinear_magnetism``: the
+    magnetization is a vector field ``m(r)`` whose direction varies in space
+    (see :mod:`parsec_python.SCF.noncollinear`).  Spin-orbit coupling is
+    added on top when ``self_consistent_spin_orbit`` is also set (as in
+    Fortran, a species with ``SO_PSP`` together with ``Non_Collinear_magnetism``
+    switches the self-consistent spin-orbit term on).
     """
 
     max_iterations: int = 50
@@ -408,6 +428,7 @@ class SCFSettings:
     xc_functional: XCFunctional = "ca"
     spin_polarized: bool = False
     self_consistent_spin_orbit: bool = False
+    noncollinear: bool = False
 
     def __post_init__(self) -> None:
         max_iterations = int(self.max_iterations)
@@ -797,7 +818,13 @@ class SelfConsistentSOCResult:
     energies: EnergyBreakdown
     magnetic_moment: float | None = None
     """Net ``N_up - N_down`` (Bohr magnetons) from the spin densities when
-    the run was spin-polarized; ``None`` for the spin-unpolarized drivers."""
+    the run was spin-polarized; for a non-collinear run, the length of
+    ``magnetic_moment_vector``.  ``None`` for the spin-unpolarized drivers."""
+    magnetic_moment_vector: np.ndarray | None = None
+    """Net moment ``(m_x, m_y, m_z)`` in Bohr magnetons (non-collinear runs)."""
+    magnetization: np.ndarray | None = None
+    """Magnetization density ``m(r)``, shape ``(3, n_grid)``, in Bohr
+    magnetons per bohr^3 (non-collinear runs)."""
 
     @property
     def magnetic_moment_per_state(self) -> np.ndarray:

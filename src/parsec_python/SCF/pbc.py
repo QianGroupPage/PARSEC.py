@@ -34,11 +34,13 @@ from ..V_ion import (
     superpose_atomic_density,
 )
 from ..V_xc import (
+    NoncollinearXCResult,
     SpinPolarizedXCResult,
     XCResult,
     ca_lda,
     ca_lda_spin_polarized,
     pbe,
+    noncollinear_xc,
     pbe_spin_polarized,
 )
 from .single_point import run_scf as _run_scf
@@ -129,6 +131,13 @@ class PeriodicPreparedSinglePointSystem:
                 density_up, density_down, self.grid, self.core_density
             )
         raise ValueError(f"unsupported XC functional {functional!r}")
+
+    def evaluate_xc_noncollinear(
+        self, density: np.ndarray, magnetization: np.ndarray
+    ) -> NoncollinearXCResult:
+        """Non-collinear XC (``V_avg`` and ``B_xc``) from ``n`` and ``m(r)``."""
+
+        return noncollinear_xc(density, magnetization, self.evaluate_xc_spin_polarized)
 
 
 def prepare_periodic_single_point(

@@ -400,6 +400,7 @@ def _parse_parsec_input(
         "cell_shape",
         "monkhorst_pack_grid",
         "monkhorst_pack_shift",
+        "initial_ncl_moment",
     }
     accepted_global = {
         "restart_run",
@@ -419,6 +420,7 @@ def _parse_parsec_input(
         "spin_polarization",
         "scf_so",
         "so_from_scratch",
+        "non_collinear_magnetism",
         "kpoint_method",
         "max_iter",
         "convergence_criterion",
@@ -543,6 +545,7 @@ def _parse_parsec_input(
             "Boundary_Conditions=cluster requires Periodic_System=false"
         )
     spin_polarization = optional_bool("spin_polarization")
+    noncollinear = optional_bool("non_collinear_magnetism")
     # Fortran only actually routes through the complex spinor path when
     # SO_from_scratch=true (or, a combination this port does not implement,
     # Non_Collinear_magnetism=true together with SCF_SO or a species'
@@ -706,6 +709,17 @@ def _parse_parsec_input(
             )
         return default
 
+    moment_blocks = blocks.get("initial_ncl_moment", [])
+    if moment_blocks and not noncollinear:
+        raise ParsecInputError(
+            "Initial_NCL_Moment blocks require Non_Collinear_magnetism: .true."
+        )
+    if moment_blocks and len(moment_blocks) != declared_types:
+        raise ParsecInputError(
+            f"expected {declared_types} Initial_NCL_Moment blocks (one per "
+            f"Atom_Type, in order), found {len(moment_blocks)}"
+        )
+
     local_map = {"s": 0, "p": 1, "d": 2, "f": 3}
     atoms: list[Atom] = []
     specifications: dict[str, SpeciesPotential] = {}
@@ -776,7 +790,27 @@ def _parse_parsec_input(
             initial_spin_polarization=initial_spin_polarization,
         )
 
-        for coordinate_line in coordinate_item.value:
+        species_moments: list[np.ndarray | None] = [None] * len(coordinate_item.value)
+        if moment_blocks:
+            moment_item = moment_blocks[species_index]
+            if len(moment_item.value) != len(coordinate_item.value):
+                raise ParsecInputError(
+                    f"Atom_Type {symbol}: Initial_NCL_Moment has "
+                    f"{len(moment_item.value)} rows but there are "
+                    f"{len(coordinate_item.value)} atoms of this type"
+                )
+            for row_index, moment_line in enumerate(moment_item.value):
+                moment_values, moment_unit = _block_numbers(
+                    (moment_line,), label=f"{symbol} Initial_NCL_Moment"
+                )
+                if moment_unit or len(moment_values) != 3:
+                    raise ParsecInputError(
+                        f"line {moment_item.line}: every Initial_NCL_Moment row "
+                        "must contain exactly three numbers"
+                    )
+                species_moments[row_index] = np.asarray(moment_values, dtype=float)
+
+        for atom_row, coordinate_line in enumerate(coordinate_item.value):
             values, unit = _block_numbers((coordinate_line,), label=f"{symbol} Atom_Coord")
             if unit or len(values) != 3:
                 raise ParsecInputError(
@@ -784,7 +818,11 @@ def _parse_parsec_input(
                     "contain exactly three numbers"
                 )
             atoms.append(
-                Atom(symbol, np.asarray(values, dtype=float) * coordinate_factor)
+                Atom(
+                    symbol,
+                    np.asarray(values, dtype=float) * coordinate_factor,
+                    initial_moment=species_moments[atom_row],
+                )
             )
         if not any(atom.symbol == symbol for atom in atoms):
             raise ParsecInputError(f"Atom_Type {symbol} has an empty Atom_Coord block")
@@ -793,6 +831,7 @@ def _parse_parsec_input(
         is_periodic
         and any(specification.spin_orbit for specification in specifications.values())
         and not self_consistent_spin_orbit
+        and not noncollinear
     ):
         raise UnsupportedParsecOptionError(
             "SO_PSP=true with a periodic Boundary_Conditions is only supported "
@@ -961,7 +1000,12 @@ def _parse_parsec_input(
         ),
         xc_functional=xc_functional,
         spin_polarized=spin_polarization,
-        self_consistent_spin_orbit=self_consistent_spin_orbit,
+        self_consistent_spin_orbit=self_consistent_spin_orbit
+        or (
+            noncollinear
+            and any(specification.spin_orbit for specification in specifications.values())
+        ),
+        noncollinear=noncollinear,
     )
 
     initial_labels = []

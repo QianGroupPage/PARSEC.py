@@ -30,6 +30,10 @@ from .models import (
 from .Grid import monkhorst_pack_grid
 from .Output import ParsecTextReporter
 from .SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_polarized
+from .SCF.noncollinear import (
+    run_self_consistent_noncollinear,
+    run_self_consistent_noncollinear_kpoints,
+)
 from .SCF.kpoints_soc import (
     run_self_consistent_soc_kpoints,
     run_self_consistent_soc_kpoints_spin_polarized,
@@ -362,6 +366,10 @@ def save_self_consistent_soc_result_archive(
         payload[f"energy_{name}_ry"] = np.asarray(value)
     if result.magnetic_moment is not None:
         payload["magnetic_moment"] = np.asarray(result.magnetic_moment)
+    if result.magnetic_moment_vector is not None:
+        payload["magnetic_moment_vector"] = np.asarray(result.magnetic_moment_vector)
+    if result.magnetization is not None:
+        payload["magnetization_mu_b_per_bohr3"] = result.magnetization
     if include_wavefunctions:
         payload["spinors"] = result.spinors
     np.savez_compressed(output, **payload)
@@ -498,7 +506,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         specification.spin_orbit
         for specification in translation.problem.pseudopotentials.values()
     )
-    if self_consistent_spin_orbit and not has_soc_species:
+    noncollinear = translation.problem.scf.noncollinear
+    if self_consistent_spin_orbit and not has_soc_species and not noncollinear:
         print(
             "Input error: SO_from_scratch/SCF_SO=true requires at least one "
             "species with SO_PSP=true",
@@ -522,7 +531,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             reporter.setup(system)
 
             scf_start = time.perf_counter()
-            if self_consistent_spin_orbit:
+            if self_consistent_spin_orbit or noncollinear:
                 if is_periodic:
                     if monkhorst_pack_dimensions is not None:
                         k_points, k_weights = monkhorst_pack_grid(
@@ -532,17 +541,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else:
                         k_points = np.zeros((1, 3))
                         k_weights = np.ones(1)
-                    periodic_soc_driver = (
-                        run_self_consistent_soc_kpoints_spin_polarized
-                        if spin_polarized
-                        else run_self_consistent_soc_kpoints
-                    )
-                    result = periodic_soc_driver(
-                        system,
-                        k_points,
-                        k_weights,
-                        callback=reporter.iteration_self_consistent_soc,
-                    )
+                    if noncollinear:
+                        result = run_self_consistent_noncollinear_kpoints(
+                            system,
+                            k_points,
+                            k_weights,
+                            callback=reporter.iteration_self_consistent_soc,
+                        )
+                    else:
+                        periodic_soc_driver = (
+                            run_self_consistent_soc_kpoints_spin_polarized
+                            if spin_polarized
+                            else run_self_consistent_soc_kpoints
+                        )
+                        result = periodic_soc_driver(
+                            system,
+                            k_points,
+                            k_weights,
+                            callback=reporter.iteration_self_consistent_soc,
+                        )
                 else:
                     soc_projectors = tuple(
                         build_spin_orbit_projectors(
@@ -552,7 +569,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                             translation.problem.pseudopotentials,
                         )
                     )
-                    if spin_polarized:
+                    if noncollinear:
+                        result = run_self_consistent_noncollinear(
+                            system,
+                            soc_projectors,
+                            callback=reporter.iteration_self_consistent_soc,
+                        )
+                    elif spin_polarized:
                         result = run_self_consistent_soc_spin_polarized(
                             system,
                             soc_projectors,

@@ -16,7 +16,9 @@ Physically, one extra term is needed relative to
 :mod:`self_consistent_soc`: the exchange-correlation potential built from
 the *spinor-projected* spin density (``rho_up(r) = sum_n f_n |psi_up,n(r)|^2``,
 ``rho_down(r)`` likewise) is no longer spin-independent.
-:func:`~parsec_python.V_xc.ca_lda_spin_polarized` splits it into
+the spin-polarized XC functional (LSDA, or collinear PBE via
+:meth:`~parsec_python.SCF.single_point.PreparedSinglePointSystem.evaluate_xc_spin_polarized`)
+splits it into
 ``V_xc,avg = (V_xc,up + V_xc,down)/2`` (added to the ordinary spin-unpolarized
 effective potential shared by both spinor channels, exactly as in
 :mod:`self_consistent_soc`) and ``V_xc,delta = (V_xc,up - V_xc,down)/2`` (a
@@ -56,7 +58,6 @@ from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
 from ..SCF.single_point import PreparedSinglePointSystem
 from ..SCF.spin_polarized import _weighted_initial_polarization
-from ..V_xc import ca_lda_spin_polarized
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
 
 
@@ -70,7 +71,7 @@ def spinor_spin_densities(
     Unlike :func:`~parsec_python.SCF.self_consistent_soc.spinor_density_from_orbitals`
     (which returns only the summed total density), each spinor component's
     own projected density is kept separate -- the input to
-    :func:`~parsec_python.V_xc.ca_lda_spin_polarized`.
+    the spin-polarized XC functional.
     """
     spinors = np.asarray(spinors)
     if spinors.ndim != 2 or spinors.shape[0] % 2:
@@ -139,9 +140,8 @@ def run_self_consistent_soc_spin_polarized(
 
     Requires ``system.input.scf.spin_polarized`` and
     ``system.input.scf.self_consistent_spin_orbit`` both set, and
-    ``xc_functional == 'ca'`` (LSDA; matching
-    :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized`'s own
-    current limitation).
+    ``xc_functional`` either ``'ca'`` (LSDA) or ``'pbe'`` (collinear
+    spin-polarized PBE with the spinor-projected spin densities).
     """
     settings = system.input.scf
     if not settings.spin_polarized:
@@ -153,11 +153,6 @@ def run_self_consistent_soc_spin_polarized(
         raise ValueError(
             "run_self_consistent_soc_spin_polarized requires "
             "SCFSettings.self_consistent_spin_orbit=True"
-        )
-    if settings.xc_functional != "ca":
-        raise NotImplementedError(
-            "spin-polarized PBE is not yet implemented; only xc_functional='ca' "
-            "(LSDA) is supported by run_self_consistent_soc_spin_polarized"
         )
 
     number_of_states = _number_of_states(system)
@@ -172,9 +167,7 @@ def run_self_consistent_soc_spin_polarized(
         density_up + density_down, initial_potential=-ionic_potential
     )
     hartree_potential = initial_hartree.potential
-    xc = ca_lda_spin_polarized(
-        density_up, density_down, system.grid.volume_element, system.core_density
-    )
+    xc = system.evaluate_xc_spin_polarized(density_up, density_down)
     input_potential_up = ionic_potential + hartree_potential + xc.potential_up
     input_potential_down = ionic_potential + hartree_potential + xc.potential_down
 
@@ -232,12 +225,7 @@ def run_self_consistent_soc_spin_polarized(
 
         hartree = system.solve_hartree(density, initial_potential=hartree_potential)
         hartree_potential = hartree.potential
-        xc = ca_lda_spin_polarized(
-            density_up_out,
-            density_down_out,
-            system.grid.volume_element,
-            system.core_density,
-        )
+        xc = system.evaluate_xc_spin_polarized(density_up_out, density_down_out)
         output_potential_up = ionic_potential + hartree_potential + xc.potential_up
         output_potential_down = ionic_potential + hartree_potential + xc.potential_down
 

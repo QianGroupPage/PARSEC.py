@@ -1,4 +1,4 @@
-"""Spin-unpolarized PBE exchange and correlation on the real-space grid
+"""PBE exchange and correlation (spin-unpolarized, and collinear spin-polarized) on the real-space grid
 (isolated clusters with zero padding, or periodic cells with wraparound).
 
 PBE is a generalized-gradient approximation (GGA).  Its energy has the
@@ -30,7 +30,7 @@ import numpy as np
 from scipy.ndimage import correlate1d
 
 from ..Grid import RealSpaceGrid
-from .ca_lda import XCResult
+from .ca_lda import SpinPolarizedXCResult, XCResult
 
 
 # Original PBE constants.  GAMMA is (1-ln(2))/pi**2.
@@ -331,8 +331,222 @@ def pbe(
     )
 
 
+# ---------------------------------------------------------------------------
+# Spin-polarized (collinear) PBE
+# ---------------------------------------------------------------------------
+
+# PW92 parameter sets (A, alpha1, beta1..beta4): eps_c(rs, zeta=0),
+# eps_c(rs, zeta=1), and minus the spin stiffness alpha_c(rs).  The
+# unpolarized set reuses _GAMMA as A so that the zeta=0 limit reproduces
+# :func:`pbe_energy_partials` to round-off.
+_PW92_SETS = {
+    "unpolarized": (_GAMMA, 0.21370, 7.5957, 3.5876, 1.6382, 0.49294),
+    "polarized": (0.01554535, 0.20548, 14.1189, 6.1977, 3.3662, 0.62517),
+    "stiffness": (0.0168869, 0.11125, 10.357, 3.6231, 0.88026, 0.49671),
+}
+_FZ_SECOND_DERIVATIVE = 1.709921
+_FZ_DENOMINATOR = 2.0 ** (4.0 / 3.0) - 2.0
+_COMPLEX_STEP = 1.0e-30
+_SPIN_DENSITY_FLOOR = 1.0e-16
+
+
+def _pw92_g(rs, parameters):
+    """PW92 ``G(rs)`` (their Eq. 10); safe for complex-step arguments."""
+
+    a, alpha1, beta1, beta2, beta3, beta4 = parameters
+    sqrt_rs = rs ** 0.5
+    polynomial = (
+        beta1 * sqrt_rs + beta2 * rs + beta3 * rs * sqrt_rs + beta4 * rs * rs
+    )
+    return -2.0 * a * (1.0 + alpha1 * rs) * np.log1p(1.0 / (2.0 * a * polynomial))
+
+
+def _pbe_spin_energy_density(n_up, n_down, s_uu, s_ud, s_dd):
+    """Spin-polarized PBE energy per volume in Hartree.
+
+    ``s_uu, s_ud, s_dd`` are ``grad n_a . grad n_b``.  Exchange follows the
+    exact spin-scaling relation ``E_x[n_up, n_down] = (E_x[2 n_up] +
+    E_x[2 n_down])/2``; correlation is PW92 ``eps_c(rs, zeta)`` plus the PBE
+    gradient term ``H(rs, zeta, t)`` with the ``phi(zeta)`` spin scaling.
+    Written with operations that are analytic in complex arguments so that
+    the partial derivatives can be taken by complex-step differentiation.
+    """
+
+    total = n_up + n_down
+
+    exchange = 0.0
+    for density, sigma in ((n_up, s_uu), (n_down, s_dd)):
+        n2 = 2.0 * density
+        n13 = n2 ** (1.0 / 3.0)
+        kf = _KF_COEFFICIENT * n13
+        s2 = (4.0 * sigma) / (4.0 * kf * kf * n2 * n2)
+        enhancement = 1.0 + _KAPPA - _KAPPA / (1.0 + (_MU / _KAPPA) * s2)
+        exchange = exchange + 0.5 * (-_CX * n2 * n13 * enhancement)
+
+    rs = (3.0 / (4.0 * np.pi * total)) ** (1.0 / 3.0)
+    zeta = (n_up - n_down) / total
+    f_zeta = (
+        (1.0 + zeta) ** (4.0 / 3.0) + (1.0 - zeta) ** (4.0 / 3.0) - 2.0
+    ) / _FZ_DENOMINATOR
+    zeta4 = zeta ** 4
+    epsilon_0 = _pw92_g(rs, _PW92_SETS["unpolarized"])
+    epsilon_1 = _pw92_g(rs, _PW92_SETS["polarized"])
+    alpha_c = -_pw92_g(rs, _PW92_SETS["stiffness"])
+    epsilon_lda = (
+        epsilon_0
+        + alpha_c * f_zeta / _FZ_SECOND_DERIVATIVE * (1.0 - zeta4)
+        + (epsilon_1 - epsilon_0) * f_zeta * zeta4
+    )
+
+    phi = 0.5 * ((1.0 + zeta) ** (2.0 / 3.0) + (1.0 - zeta) ** (2.0 / 3.0))
+    phi3 = phi * phi * phi
+    kf_total = _KF_COEFFICIENT * total ** (1.0 / 3.0)
+    ks2 = 4.0 * kf_total / np.pi
+    sigma_total = s_uu + 2.0 * s_ud + s_dd
+    t2 = sigma_total / (4.0 * phi * phi * ks2 * total * total)
+    beta_over_gamma = _BETA / _GAMMA
+    a_parameter = beta_over_gamma / np.expm1(-epsilon_lda / (_GAMMA * phi3))
+    at = a_parameter * t2
+    q = beta_over_gamma * t2 * (1.0 + at) / (1.0 + at + at * at)
+    h = _GAMMA * phi3 * np.log1p(q)
+    return exchange + total * (epsilon_lda + h)
+
+
+def pbe_spin_energy_partials(n_up, n_down, s_uu, s_ud, s_dd):
+    """Spin-polarized PBE ``f`` and its five partial derivatives (Hartree).
+
+    Returns ``(f, df/dn_up, df/dn_down, df/ds_uu, df/ds_ud, df/ds_dd)`` with
+    ``s_ab = grad n_a . grad n_b``.  The derivatives are exact to machine
+    precision (complex-step differentiation of the analytic energy), not
+    finite differences.  Densities are clamped to a tiny positive floor;
+    entries whose total density is below the usual PBE vacuum threshold
+    return zeros.
+    """
+
+    arrays = [
+        np.asarray(value, dtype=np.float64)
+        for value in (n_up, n_down, s_uu, s_ud, s_dd)
+    ]
+    shape = arrays[0].shape
+    if any(array.shape != shape for array in arrays):
+        raise ValueError("PBE spin densities and gradients must share one shape")
+    if np.any(arrays[0] < -1.0e-14) or np.any(arrays[1] < -1.0e-14):
+        raise ValueError("PBE requires nonnegative spin densities")
+    if np.any(arrays[2] < -1.0e-14) or np.any(arrays[4] < -1.0e-14):
+        raise ValueError("PBE requires nonnegative squared spin-density gradients")
+
+    outputs = [np.zeros(shape) for _ in range(6)]
+    active = (arrays[0] + arrays[1]) > _DENSITY_THRESHOLD
+    if not np.any(active):
+        return tuple(outputs)
+
+    n_u = np.maximum(arrays[0][active], _SPIN_DENSITY_FLOOR)
+    n_d = np.maximum(arrays[1][active], _SPIN_DENSITY_FLOOR)
+    suu = np.maximum(arrays[2][active], 0.0)
+    sud = arrays[3][active]
+    sdd = np.maximum(arrays[4][active], 0.0)
+    base = (n_u, n_d, suu, sud, sdd)
+
+    outputs[0][active] = _pbe_spin_energy_density(*base)
+    for index in range(5):
+        perturbed = [value.astype(np.complex128) for value in base]
+        perturbed[index] = perturbed[index] + 1j * _COMPLEX_STEP
+        outputs[index + 1][active] = (
+            _pbe_spin_energy_density(*perturbed).imag / _COMPLEX_STEP
+        )
+    return tuple(outputs)
+
+
+def pbe_spin_polarized(
+    density_up: np.ndarray,
+    density_down: np.ndarray,
+    grid,
+    core_density: np.ndarray | None = None,
+) -> SpinPolarizedXCResult:
+    """Collinear spin-polarized PBE and its exact discrete grid derivative.
+
+    Uses the same centered stencil, zero-padded (cluster) or wraparound
+    (periodic) boundary treatment and exact-transpose potential construction
+    as :func:`pbe`.  With ``s_ab = D n_a . D n_b`` the potential of spin
+    channel ``a`` is
+
+    ``v_a = df/dn_a + D.T @ (2 f_aa D n_a + f_ab D n_b)``,
+
+    the derivative of the summed energy ``h**3 * sum_i f``.  A frozen NLCC
+    ``core_density`` is split evenly between the channels, as in the LSDA
+    branch (it enters the gradients too).  Results are in Rydberg.
+    """
+
+    up = np.asarray(density_up, dtype=np.float64)
+    down = np.asarray(density_down, dtype=np.float64)
+    if up.shape != (grid.size,) or down.shape != (grid.size,):
+        raise ValueError("PBE spin densities do not match the real-space grid")
+    if core_density is not None:
+        core = np.asarray(core_density, dtype=np.float64)
+        if core.shape != up.shape:
+            raise ValueError("core and valence densities must have the same shape")
+        up = up + 0.5 * core
+        down = down + 0.5 * core
+    if np.any(up < -1.0e-14) or np.any(down < -1.0e-14):
+        raise ValueError("PBE requires nonnegative spin densities")
+
+    weights = first_derivative_coefficients(grid.settings.expansion_order)
+    weights = weights / grid.spacing
+    boundary = "wrap" if _is_periodic(grid) else "constant"
+
+    def gradient(field):
+        box = _to_box(field, grid)
+        return [
+            _from_box(
+                correlate1d(box, weights, axis=axis, mode=boundary, cval=0.0),
+                grid,
+            )
+            for axis in range(3)
+        ]
+
+    grad_up = gradient(up)
+    grad_down = gradient(down)
+    s_uu = sum(g * g for g in grad_up)
+    s_dd = sum(g * g for g in grad_down)
+    s_ud = sum(a * b for a, b in zip(grad_up, grad_down))
+
+    f, f_up, f_down, f_uu, f_ud, f_dd = pbe_spin_energy_partials(
+        up, down, s_uu, s_ud, s_dd
+    )
+
+    def divergence_adjoint(fluxes):
+        total = np.zeros(grid.size, dtype=np.float64)
+        for axis in range(3):
+            adjoint_box = correlate1d(
+                _to_box(fluxes[axis], grid),
+                -weights,
+                axis=axis,
+                mode=boundary,
+                cval=0.0,
+            )
+            total += _from_box(adjoint_box, grid)
+        return total
+
+    potential_up = f_up + divergence_adjoint(
+        [2.0 * f_uu * gu + f_ud * gd for gu, gd in zip(grad_up, grad_down)]
+    )
+    potential_down = f_down + divergence_adjoint(
+        [2.0 * f_dd * gd + f_ud * gu for gu, gd in zip(grad_up, grad_down)]
+    )
+
+    energy_density = 2.0 * f
+    return SpinPolarizedXCResult(
+        potential_up=2.0 * potential_up,
+        potential_down=2.0 * potential_down,
+        energy_density=energy_density,
+        total_energy=float(grid.volume_element * np.sum(energy_density)),
+    )
+
+
 __all__ = [
     "first_derivative_coefficients",
     "pbe",
     "pbe_energy_partials",
+    "pbe_spin_energy_partials",
+    "pbe_spin_polarized",
 ]

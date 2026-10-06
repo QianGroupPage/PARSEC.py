@@ -58,7 +58,6 @@ from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import density_from_orbitals, fermi_occupations
 from ..SCF.pbc import PeriodicPreparedSinglePointSystem
 from ..SCF.single_point import PreparedSinglePointSystem
-from ..V_xc import ca_lda_spin_polarized
 from ..models import SpinPolarizedSCFIteration, SpinPolarizedSinglePointResult
 
 _PreparedSystem = Union[PreparedSinglePointSystem, PeriodicPreparedSinglePointSystem]
@@ -159,18 +158,14 @@ def run_scf_spin_polarized(
 ) -> SpinPolarizedSinglePointResult:
     """Run collinear spin-polarized PARSEC-style potential mixing.
 
-    Requires ``system.input.scf.xc_functional == 'ca'``; spin-polarized PBE
-    (``exc_spn.f90``'s gradient-corrected branch) is not yet implemented.
+    The XC functional is ``system.input.scf.xc_functional``: ``'ca'`` is
+    LSDA (``exc_spn.f90``); ``'pbe'`` is collinear spin-polarized PBE
+    (:func:`~parsec_python.V_xc.pbe_spin_polarized`).
     """
     settings = system.input.scf
     if not settings.spin_polarized:
         raise ValueError(
             "run_scf_spin_polarized requires SCFSettings.spin_polarized=True"
-        )
-    if settings.xc_functional != "ca":
-        raise NotImplementedError(
-            "spin-polarized PBE is not yet implemented; only xc_functional='ca' "
-            "(LSDA) is supported by run_scf_spin_polarized"
         )
 
     number_of_states = _number_of_states_per_channel(system)
@@ -184,9 +179,7 @@ def run_scf_spin_polarized(
         density_up + density_down, initial_potential=-ionic_potential
     )
     hartree_potential = initial_hartree.potential
-    xc = ca_lda_spin_polarized(
-        density_up, density_down, system.grid.volume_element, system.core_density
-    )
+    xc = system.evaluate_xc_spin_polarized(density_up, density_down)
     input_potential_up = ionic_potential + hartree_potential + xc.potential_up
     input_potential_down = ionic_potential + hartree_potential + xc.potential_down
 
@@ -262,9 +255,7 @@ def run_scf_spin_polarized(
             density_up + density_down, initial_potential=hartree_potential
         )
         hartree_potential = hartree.potential
-        xc = ca_lda_spin_polarized(
-            density_up, density_down, system.grid.volume_element, system.core_density
-        )
+        xc = system.evaluate_xc_spin_polarized(density_up, density_down)
         output_potential_up = ionic_potential + hartree_potential + xc.potential_up
         output_potential_down = ionic_potential + hartree_potential + xc.potential_down
 

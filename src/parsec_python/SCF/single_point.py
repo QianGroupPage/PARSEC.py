@@ -56,7 +56,14 @@ from ..models import (
     SinglePointInput,
     SinglePointResult,
 )
-from ..V_xc import XCResult, ca_lda, pbe
+from ..V_xc import (
+    SpinPolarizedXCResult,
+    XCResult,
+    ca_lda,
+    ca_lda_spin_polarized,
+    pbe,
+    pbe_spin_polarized,
+)
 
 
 @dataclass(frozen=True)
@@ -135,6 +142,25 @@ class PreparedSinglePointSystem:
         raise ValueError(
             f"unsupported XC functional {self.input.scf.xc_functional!r}"
         )
+
+    def evaluate_xc_spin_polarized(
+        self, density_up: np.ndarray, density_down: np.ndarray
+    ) -> SpinPolarizedXCResult:
+        """Collinear spin-polarized XC (LSDA or PBE) including frozen NLCC."""
+
+        functional = self.input.scf.xc_functional
+        if functional == "ca":
+            return ca_lda_spin_polarized(
+                density_up,
+                density_down,
+                self.grid.volume_element,
+                self.core_density,
+            )
+        if functional == "pbe":
+            return pbe_spin_polarized(
+                density_up, density_down, self.grid, self.core_density
+            )
+        raise ValueError(f"unsupported XC functional {functional!r}")
 
 
 def prepare_single_point(

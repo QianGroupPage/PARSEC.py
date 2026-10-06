@@ -90,6 +90,8 @@ from .V_xc import (
     first_derivative_coefficients,
     pbe,
     pbe_energy_partials,
+    pbe_spin_energy_partials,
+    pbe_spin_polarized,
 )
 from .flow_map import PARSEC_SINGLE_POINT_FLOW, format_flow_map
 from .models import (
@@ -210,6 +212,8 @@ __all__ = [
     "first_derivative_coefficients",
     "pbe",
     "pbe_energy_partials",
+    "pbe_spin_energy_partials",
+    "pbe_spin_polarized",
     "center_cluster_geometry",
     "density_from_orbitals",
     "density_multipoles",

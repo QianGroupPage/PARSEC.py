@@ -614,14 +614,6 @@ def _parse_parsec_input(
                     "Monkhorst_Pack_Shift is not supported; only an unshifted "
                     "Monkhorst-Pack grid is implemented"
                 )
-            if spin_polarization and not self_consistent_spin_orbit:
-                raise UnsupportedParsecOptionError(
-                    "Kpoint_Method=mp with Spin_Polarization=true is only "
-                    "supported together with SO_from_scratch/SCF_SO=true "
-                    "(periodic spin-polarized spin-orbit); the non-SOC "
-                    "run_scf_kpoints implements only the spin-unpolarized "
-                    "path (would need per-(k,spin) pooling)"
-                )
         elif kpoint_method == "manual":
             raise UnsupportedParsecOptionError(
                 "Kpoint_Method=manual (an explicit k-point list) is not "

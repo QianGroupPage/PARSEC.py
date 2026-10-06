@@ -29,7 +29,7 @@ from .models import (
 )
 from .Grid import monkhorst_pack_grid
 from .Output import ParsecTextReporter
-from .SCF.kpoints import run_scf_kpoints
+from .SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_polarized
 from .SCF.kpoints_soc import (
     run_self_consistent_soc_kpoints,
     run_self_consistent_soc_kpoints_spin_polarized,
@@ -584,9 +584,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0 if result.converged else 3
 
             if spin_polarized:
-                result = run_scf_spin_polarized(
-                    system, callback=reporter.iteration_spin_polarized
-                )
+                if monkhorst_pack_dimensions is not None:
+                    k_points, k_weights = monkhorst_pack_grid(
+                        translation.problem.periodic_cell, monkhorst_pack_dimensions
+                    )
+                    result = run_scf_kpoints_spin_polarized(
+                        system,
+                        k_points,
+                        k_weights,
+                        callback=reporter.iteration_spin_polarized,
+                    )
+                else:
+                    result = run_scf_spin_polarized(
+                        system, callback=reporter.iteration_spin_polarized
+                    )
                 scf_elapsed = time.perf_counter() - scf_start
                 reporter.finish_spin_polarized(result, scf_elapsed)
 

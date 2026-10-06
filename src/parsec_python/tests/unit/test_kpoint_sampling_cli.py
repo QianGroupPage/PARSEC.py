@@ -79,12 +79,14 @@ class KPointSamplingCliTests(unittest.TestCase):
         # 8 k-points (2x2x2) x 10 states each = 80 pooled eigenvalues.
         self.assertEqual(archive["eigenvalues_ry"].shape, (80,))
 
-    def test_mp_with_spin_polarization_is_rejected(self) -> None:
+    def test_mp_with_spin_polarization_is_accepted(self) -> None:
+        """k-points with collinear spin polarization is implemented (see
+        ``test_periodic_kpoints_spin_polarized`` for real runs)."""
         input_path = self._write_input(
             "parsec.in", extra="Spin_Polarization: .true.\n"
         )
         exit_code = cli_main([str(input_path), "--dry-run"])
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 0)
 
     def test_manual_kpoint_method_is_rejected(self) -> None:
         text = _BASE_INPUT.replace("Kpoint_Method: mp", "Kpoint_Method: manual")

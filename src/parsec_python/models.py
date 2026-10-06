@@ -736,11 +736,19 @@ class SpinPolarizedSinglePointResult:
     density_up: np.ndarray
     density_down: np.ndarray
     energies: EnergyBreakdown
+    occupation_weight: float = 1.0
+    """Brillouin-zone weight carried by each pooled eigenvalue: 1 for a
+    single (Gamma or cluster) calculation, ``1/n_k`` for an unreduced uniform
+    k-point grid whose eigenvalues and occupations are pooled over k."""
 
     @property
     def magnetic_moment(self) -> float:
-        """``N_up - N_down`` in Bohr magnetons (PARSEC's ``<S>`` diagnostic)."""
-        return float(np.sum(self.occupations_up) - np.sum(self.occupations_down))
+        """``N_up - N_down`` in Bohr magnetons (PARSEC's ``<S>`` diagnostic),
+        summed with each pooled state's k-point weight."""
+        return float(
+            self.occupation_weight
+            * (np.sum(self.occupations_up) - np.sum(self.occupations_down))
+        )
 
 
 @dataclass(frozen=True)

@@ -115,10 +115,9 @@ class PeriodicSelfConsistentSOCCliTests(unittest.TestCase):
         exit_code = cli_main([str(input_path), "--dry-run"])
         self.assertEqual(exit_code, 0)
 
-    def test_periodic_kpoints_with_spin_but_without_soc_is_still_rejected(
-        self,
-    ) -> None:
-        """k-points + spin polarization without SO_from_scratch has no driver."""
+    def test_periodic_kpoints_with_spin_but_without_soc_is_accepted(self) -> None:
+        """k-points + spin polarization without SOC is implemented too (see
+        ``test_periodic_kpoints_spin_polarized``)."""
         text = _BASE_INPUT.replace("SO_from_scratch: .true.\n", "").replace(
             "SO_PSP: .true.", "SO_PSP: .false."
         )
@@ -129,7 +128,7 @@ class PeriodicSelfConsistentSOCCliTests(unittest.TestCase):
             "begin Monkhorst_Pack_Grid\n2 1 1\nend Monkhorst_Pack_Grid\n",
             encoding="utf-8",
         )
-        self.assertEqual(cli_main([str(path), "--dry-run"]), 2)
+        self.assertEqual(cli_main([str(path), "--dry-run"]), 0)
 
 
 if __name__ == "__main__":

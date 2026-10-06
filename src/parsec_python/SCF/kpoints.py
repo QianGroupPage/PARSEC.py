@@ -24,10 +24,11 @@ spin-unpolarized), rather than needing a genuinely per-state weight
 generalization of that bisection.  ``Energy.total_energy``'s
 ``band_energy_weight`` gets the same ``weight`` for the same reason.
 
-Not included: spin-orbit coupling (the k-point-phase-weighted spin-orbit
-projectors this would need are not built anywhere -- see
-:mod:`~parsec_python.Hamiltonian.kpoint_operator`'s module docstring) and
-spin polarization (would need per-(k,spin) pooling, not attempted here).
+Spin-orbit coupling lives in :mod:`~parsec_python.SCF.kpoints_soc`.
+:func:`run_scf_kpoints_spin_polarized` adds collinear spin polarization
+without spin-orbit: one Hamiltonian per (k-point, spin channel) -- sharing
+each k-point's Bloch-phase nonlocal projectors, differing only in the spin
+potential -- with every (k, spin) eigenvalue pooled into a single Fermi level.
 """
 
 from __future__ import annotations
@@ -44,13 +45,22 @@ from ..Eigensolvers import (
     SubspaceSettings,
     solve_eigval,
 )
-from ..Energy import total_energy
+from ..Energy import total_energy, total_energy_no_degeneracy_spin_polarized
 from ..Hamiltonian.kpoint_operator import KPointKohnShamHamiltonian
 from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
 from ..SCF.pbc import PeriodicPreparedSinglePointSystem
+from ..SCF.spin_polarized import (
+    _number_of_states_per_channel,
+    _weighted_initial_polarization,
+)
 from ..V_ion import build_nonlocal_projectors
-from ..models import SCFIteration, SinglePointResult
+from ..models import (
+    SCFIteration,
+    SinglePointResult,
+    SpinPolarizedSCFIteration,
+    SpinPolarizedSinglePointResult,
+)
 
 
 def _number_of_states(system: PeriodicPreparedSinglePointSystem) -> int:
@@ -302,4 +312,241 @@ def run_scf_kpoints(
     )
 
 
-__all__ = ["run_scf_kpoints"]
+def run_scf_kpoints_spin_polarized(
+    system: PeriodicPreparedSinglePointSystem,
+    k_points: np.ndarray,
+    weights: np.ndarray,
+    *,
+    callback: Callable[[SpinPolarizedSCFIteration], None] | None = None,
+) -> SpinPolarizedSinglePointResult:
+    """K-point-sampled periodic collinear spin-polarized SCF (no spin-orbit).
+
+    Needs ``SCFSettings.spin_polarized`` (LSDA or collinear PBE per
+    ``xc_functional``).  Each iteration diagonalizes one real-potential
+    Hamiltonian per (k-point, spin channel); a channel's orbitals hold at
+    most one electron, so every pooled level carries ``degeneracy = weight``
+    and one Fermi level is found over all ``2 * n_kpoints * n_states``
+    eigenvalues.  The spin densities are
+    ``rho_a(r) = sum_k w_k/dV * sum_n f_nk,a |u_nk,a(r)|**2`` and the two spin
+    potentials are mixed as one stacked vector, as in
+    :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized`.
+
+    Every k-point must carry the same weight and the set must be the full
+    unreduced grid: spin polarization breaks time-reversal symmetry, so
+    ``k`` and ``-k`` are not equivalent.  ``States_Num`` is a per-channel,
+    per-k-point count.  The returned eigenvalues and occupations are pooled
+    over k-points (k-point-major within each spin); each carries
+    ``result.occupation_weight`` (= the k-point weight) in any sum such as
+    the electron count or ``magnetic_moment``.  Wavefunctions are not retained.
+    """
+    settings = system.input.scf
+    if not settings.spin_polarized:
+        raise ValueError(
+            "run_scf_kpoints_spin_polarized requires SCFSettings.spin_polarized=True"
+        )
+    k_points = np.asarray(k_points, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    n_kpoints = k_points.shape[0]
+    if k_points.ndim != 2 or k_points.shape[1] != 3 or weights.shape != (n_kpoints,):
+        raise ValueError("k_points must be (n_kpoints, 3) and weights (n_kpoints,)")
+    if n_kpoints < 1:
+        raise ValueError("at least one k-point is required")
+    if not np.allclose(weights, weights[0]):
+        raise ValueError(
+            "run_scf_kpoints_spin_polarized requires every k-point to carry "
+            "the same weight (an unreduced uniform Monkhorst-Pack grid)"
+        )
+    if not np.isclose(np.sum(weights), 1.0):
+        raise ValueError("k-point weights must sum to 1")
+    weight = float(weights[0])
+    n_grid = system.grid.size
+
+    number_of_states = _number_of_states_per_channel(system)
+    ionic_potential = system.ionic_potential
+    lattice_vectors = system.input.periodic_cell.lattice_vectors
+    # Bloch-phase projectors depend only on geometry and k: build them once.
+    nonlocal_operators = [
+        build_nonlocal_projectors(
+            system.grid,
+            system.atoms,
+            system.pseudopotentials,
+            system.input.pseudopotentials,
+            lattice_vectors,
+            k_point=k_point,
+        )
+        for k_point in k_points
+    ]
+
+    polarization = _weighted_initial_polarization(system)
+    density_up = 0.5 * (1.0 + polarization) * system.initial_density
+    density_down = 0.5 * (1.0 - polarization) * system.initial_density
+    initial_hartree = system.solve_hartree(
+        density_up + density_down, initial_potential=-ionic_potential
+    )
+    hartree_potential = initial_hartree.potential
+    xc = system.evaluate_xc_spin_polarized(density_up, density_down)
+    input_potential_up = ionic_potential + hartree_potential + xc.potential_up
+    input_potential_down = ionic_potential + hartree_potential + xc.potential_down
+
+    # eigval_states[spin][k]
+    eigval_states: list[list[EigvalState | None]] = [
+        [None] * n_kpoints,
+        [None] * n_kpoints,
+    ]
+    mixer = AndersonMixer(system.input.mixing)
+    filter_degree = system.input.eigensolver.filter_degree
+    minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
+
+    eigenvalues_up = eigenvalues_down = np.empty(0)
+    occupations_up = occupations_down = np.empty(0)
+    fermi_level = float("nan")
+    energies = None
+    converged = False
+
+    for iteration in range(1, settings.max_iterations + 1):
+        eigval_settings = _eigval_settings(system, filter_degree)
+
+        potentials = (input_potential_up, input_potential_down)
+        eigenvalues_by_spin_k: list[list[np.ndarray]] = [[], []]
+        vectors_by_spin_k: list[list[np.ndarray]] = [[], []]
+        for spin_index in range(2):
+            for k_index, k_point in enumerate(k_points):
+                hamiltonian = KPointKohnShamHamiltonian(
+                    system.negative_laplacian,
+                    system.gradient,
+                    potentials[spin_index],
+                    nonlocal_operators[k_index],
+                    k_point,
+                )
+                solution = solve_eigval(
+                    hamiltonian.as_linear_operator(),
+                    number_of_states,
+                    settings=eigval_settings,
+                    state=eigval_states[spin_index][k_index],
+                )
+                eigval_states[spin_index][k_index] = solution.state
+                eigenvalues_by_spin_k[spin_index].append(
+                    np.asarray(solution.eigenvalues, dtype=float)
+                )
+                vectors_by_spin_k[spin_index].append(np.asarray(solution.vectors))
+
+        eigenvalues_up = np.concatenate(eigenvalues_by_spin_k[0])
+        eigenvalues_down = np.concatenate(eigenvalues_by_spin_k[1])
+        pooled = np.concatenate([eigenvalues_up, eigenvalues_down])
+        order = np.argsort(pooled, kind="stable")
+        occupation_result = fermi_occupations(
+            pooled[order],
+            system.electron_count,
+            settings.fermi_temperature_kelvin,
+            degeneracy=weight,
+        )
+        pooled_occupations = np.empty_like(pooled)
+        pooled_occupations[order] = occupation_result.occupations
+        occupations_up = pooled_occupations[: eigenvalues_up.size]
+        occupations_down = pooled_occupations[eigenvalues_up.size :]
+        fermi_level = occupation_result.fermi_level
+
+        densities = []
+        for spin_index, occupations in enumerate((occupations_up, occupations_down)):
+            density = np.zeros(n_grid)
+            offset = 0
+            for k_index in range(n_kpoints):
+                count = eigenvalues_by_spin_k[spin_index][k_index].size
+                occ_k = occupations[offset : offset + count]
+                offset += count
+                weighted = (np.abs(vectors_by_spin_k[spin_index][k_index]) ** 2) @ occ_k
+                density += (weight / system.grid.volume_element) * weighted
+            densities.append(density)
+        density_up, density_down = densities
+
+        hartree = system.solve_hartree(
+            density_up + density_down, initial_potential=hartree_potential
+        )
+        hartree_potential = hartree.potential
+        xc = system.evaluate_xc_spin_polarized(density_up, density_down)
+        output_potential_up = ionic_potential + hartree_potential + xc.potential_up
+        output_potential_down = ionic_potential + hartree_potential + xc.potential_down
+
+        input_combined = np.concatenate([input_potential_up, input_potential_down])
+        output_combined = np.concatenate([output_potential_up, output_potential_down])
+        density_combined = np.concatenate([density_up, density_down])
+        metrics = potential_residual_metrics(
+            input_combined,
+            output_combined,
+            density_combined,
+            system.grid.volume_element,
+            system.electron_count,
+        )
+        energies = total_energy_no_degeneracy_spin_polarized(
+            pooled,
+            pooled_occupations,
+            density_up,
+            density_down,
+            input_potential_up,
+            input_potential_down,
+            ionic_potential,
+            hartree_potential,
+            xc.potential_up,
+            xc.potential_down,
+            xc.total_energy,
+            system.ion_ion_energy,
+            system.grid.volume_element,
+            alpha_z_energy=system.alpha_z_energy,
+            band_energy_weight=weight,
+        )
+
+        mixed_combined = mixer.mix(input_combined, output_combined, iteration=iteration)
+        selected_residual = (
+            metrics.plain if settings.use_plain_residual else metrics.weighted
+        )
+        if callback is not None:
+            first_k = eigenvalues_by_spin_k[0][0].size
+            callback(
+                SpinPolarizedSCFIteration(
+                    iteration=iteration,
+                    weighted_residual=metrics.weighted,
+                    plain_residual=metrics.plain,
+                    energies=energies,
+                    eigenvalues_up=tuple(
+                        float(value) for value in eigenvalues_by_spin_k[0][0]
+                    ),
+                    eigenvalues_down=tuple(
+                        float(value) for value in eigenvalues_by_spin_k[1][0]
+                    ),
+                    occupations_up=tuple(float(v) for v in occupations_up[:first_k]),
+                    occupations_down=tuple(float(v) for v in occupations_down[:first_k]),
+                    fermi_level=float(fermi_level),
+                )
+            )
+        input_potential_up = mixed_combined[:n_grid]
+        input_potential_down = mixed_combined[n_grid:]
+        if (
+            iteration > 5
+            and metrics.weighted < 100.0 * settings.convergence_criterion
+            and filter_degree > minimum_filter_degree
+        ):
+            filter_degree -= 1
+        if selected_residual < settings.convergence_criterion:
+            converged = True
+            break
+
+    return SpinPolarizedSinglePointResult(
+        converged=converged,
+        iterations=iteration,
+        atoms=system.atoms,
+        electron_count=system.electron_count,
+        eigenvalues_up=eigenvalues_up,
+        eigenvalues_down=eigenvalues_down,
+        occupations_up=occupations_up,
+        occupations_down=occupations_down,
+        wavefunctions_up=np.empty((n_grid, 0)),
+        wavefunctions_down=np.empty((n_grid, 0)),
+        fermi_level=fermi_level,
+        density_up=density_up,
+        density_down=density_down,
+        energies=energies,
+        occupation_weight=weight,
+    )
+
+
+__all__ = ["run_scf_kpoints", "run_scf_kpoints_spin_polarized"]

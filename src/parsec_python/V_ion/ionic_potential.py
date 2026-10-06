@@ -563,11 +563,12 @@ def build_nonlocal_projectors(
     sum, not an Ewald-style split.  ``None`` (the default) reproduces the
     original isolated single-copy behavior exactly.
 
-    ``k_point``, if given (requires ``lattice_vectors``), weights each
-    periodic image's contribution by the Bloch phase ``exp(i*k.R_image)``
-    before summing, matching Fortran's ``nloc_p_pot%right``/``left``
-    k-point phase arrays, and the returned operator's ``projectors`` become
-    complex.  ``None`` (the default) is the Gamma-point case, where every
+    ``k_point``, if given (requires ``lattice_vectors``), builds the
+    projector for the periodic Bloch factor ``u_k`` (``psi = e^{ik.r} u_k``,
+    the representation the k-point kinetic operator acts in): each image
+    ``T`` is weighted by the position-dependent phase ``exp(-i*k.(r-T))``,
+    which is ``e^{-ik.r} * e^{ik.T}``, and the returned operator's
+    ``projectors`` become complex.  ``None`` (the default) is the Gamma-point case, where every
     phase is exactly 1 and the projectors stay real.
     """
     rows: list[np.ndarray] = []
@@ -608,10 +609,18 @@ def build_nonlocal_projectors(
             support = radius <= support_radius
             support_rows = np.flatnonzero(support)
             if support_rows.size:
+                # Bloch factor of this image's projector in the periodic-u
+                # picture (psi = e^{ik.r} u, the picture the k-point kinetic
+                # term -nabla^2 - 2ik.grad + k^2 acts in):
+                #   e^{-ik.r} * sum_T e^{ik.T} beta(r - R - T)
+                # i.e. a *position-dependent* phase e^{-ik.(r-T)} per image,
+                # not just the constant e^{ik.T}.  They coincide at k = 0.
                 phase = (
                     1.0
                     if k_point is None
-                    else np.exp(1j * np.dot(k_point, translation))
+                    else np.exp(
+                        -1j * ((grid.coordinates[support] - translation) @ k_point)
+                    )
                 )
                 images.append((support_rows, relative[support], radius[support], phase))
         if not images:

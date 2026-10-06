@@ -123,8 +123,10 @@ def build_spin_orbit_projectors(
     same-named arguments: with ``lattice_vectors`` given, each atom's
     projector sums over every periodic image whose support ball can reach
     the grid (:func:`~parsec_python.V_ion.ionic_potential._periodic_image_translations`);
-    with ``k_point`` also given, each image is weighted by the Bloch phase
-    ``exp(i*k.R_image)`` before summing.  ``None``/``None`` (the default)
+    with ``k_point`` also given, each image ``T`` is weighted by the
+    position-dependent Bloch phase ``exp(-i k.(r-T))`` -- the projector in
+    the periodic-u picture (``psi = e^{ik.r} u``) that the k-point kinetic
+    operator acts in, not merely the constant ``exp(i k.T)``.  ``None``/``None`` (the default)
     reproduces the original isolated single-copy behavior exactly.  Unlike
     the ordinary real-harmonic KB projectors, ``v_ion``/``v_so`` are always
     complex (the ladder-operator structure needs complex spherical
@@ -155,10 +157,18 @@ def build_spin_orbit_projectors(
             support = radius <= support_radius
             support_rows = np.flatnonzero(support)
             if support_rows.size:
+                # Position-dependent Bloch phase exp(-i k.(r - T)) for the
+                # periodic-u picture; see build_nonlocal_projectors.
                 phase = (
                     1.0
                     if k_point is None
-                    else np.exp(1j * np.dot(np.asarray(k_point, dtype=float), translation))
+                    else np.exp(
+                        -1j
+                        * (
+                            (grid.coordinates[support] - translation)
+                            @ np.asarray(k_point, dtype=float)
+                        )
+                    )
                 )
                 images.append((support_rows, relative[support], radius[support], phase))
         if not images:
@@ -203,10 +213,11 @@ def build_spin_orbit_projectors(
                     angular_momentum, relative_support
                 )
                 local_rows = np.searchsorted(support_rows_union, support_rows)
-                v_ion[local_rows, column : column + width] += phase * (
+                phase_column = phase if np.isscalar(phase) else phase[:, None]
+                v_ion[local_rows, column : column + width] += phase_column * (
                     sqrt_dv * interpolated_ion[:, None] * harmonics
                 )
-                v_so[local_rows, column : column + width] += phase * (
+                v_so[local_rows, column : column + width] += phase_column * (
                     sqrt_dv * interpolated_so[:, None] * harmonics
                 )
 

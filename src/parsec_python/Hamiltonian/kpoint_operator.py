@@ -24,7 +24,7 @@ currently only builds isolated, single-copy ones) and is not implemented.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -61,6 +61,9 @@ class KPointKohnShamHamiltonian:
     effective_potential: np.ndarray
     nonlocal_operator: NonlocalProjectorOperator
     k_point: np.ndarray
+    # k.grad as one real sparse matrix and V_eff + |k|^2, both built once.
+    _k_gradient: sp.csr_matrix | None = field(init=False, repr=False, compare=False)
+    _diagonal: np.ndarray = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         potential = np.asarray(self.effective_potential, dtype=float)
@@ -79,6 +82,17 @@ class KPointKohnShamHamiltonian:
         object.__setattr__(self, "effective_potential", potential)
         object.__setattr__(self, "gradient", tuple(self.gradient))
         object.__setattr__(self, "k_point", k_point)
+        k_gradient = None
+        for axis, gradient_axis in enumerate(self.gradient):
+            if k_point[axis] != 0.0:
+                term = k_point[axis] * gradient_axis
+                k_gradient = term if k_gradient is None else k_gradient + term
+        object.__setattr__(
+            self, "_k_gradient", None if k_gradient is None else k_gradient.tocsr()
+        )
+        object.__setattr__(
+            self, "_diagonal", potential + float(np.dot(k_point, k_point))
+        )
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -87,17 +101,16 @@ class KPointKohnShamHamiltonian:
     def apply(self, vectors: np.ndarray) -> np.ndarray:
         """Apply ``H_k = -nabla^2 - 2i*k.grad + |k|^2 + V_eff + V_NL,k``."""
         block, was_1d = _as_block(vectors)
-        result = self.negative_laplacian @ block
-        k_squared = float(np.dot(self.k_point, self.k_point))
-        for axis, gradient_axis in enumerate(self.gradient):
-            k_component = self.k_point[axis]
-            if k_component == 0.0:
-                continue
-            result = result - (2j * k_component) * (gradient_axis @ block)
-        if k_squared != 0.0:
-            result = result + k_squared * block
-        result = result + self.effective_potential[:, None] * block
-        result = result + self.nonlocal_operator.apply(block)
+        block = np.ascontiguousarray(block)
+        # The Laplacian and gradient are real: applying them to the real view
+        # (n, 2*n_vectors) of the complex block halves the sparse-product work
+        # and avoids upcasting the matrices.
+        real_view = block.view(np.float64)
+        result = (self.negative_laplacian @ real_view).view(np.complex128)
+        if self._k_gradient is not None:
+            result -= 2j * (self._k_gradient @ real_view).view(np.complex128)
+        result += self._diagonal[:, None] * block
+        result += self.nonlocal_operator.apply(block)
         return result[:, 0] if was_1d else result
 
     def as_linear_operator(self) -> "LinearOperator":

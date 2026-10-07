@@ -158,6 +158,76 @@ def apply_lsxy(
     return output[:, 0] if was_1d else output
 
 
+def _ladder_matrix(spin_sign: int) -> np.ndarray:
+    """``W[target, lm]``: the ``lsxy`` weight that moves harmonic ``lm`` to
+    ``lm + spin_sign`` (same selection rule as :func:`apply_lsxy`)."""
+    matrix = np.zeros((8, 8))
+    for lm in range(8):
+        target = lm + spin_sign
+        if target < 0 or target > 7 or _LM_TO_L[target] != _LM_TO_L[lm]:
+            continue
+        l = int(_LM_TO_L[lm])
+        m_l = int(_LM_TO_ML[lm])
+        number = l * (l + 1) - m_l * (spin_sign + m_l)
+        if number > 0:
+            matrix[target, lm] = 0.5 * np.sqrt(float(number))
+    return matrix
+
+
+_LADDER_FROM_UP = _ladder_matrix(+1)  # up input -> down output
+_LADDER_FROM_DOWN = _ladder_matrix(-1)  # down input -> up output
+_LZ_HALF = 0.5 * _LM_TO_ML.astype(float)
+_QUARTER_LL1 = 0.25 * _LM_TO_L * (_LM_TO_L + 1.0)
+
+
+def apply_spin_orbit(
+    projectors: Sequence[AtomSpinOrbitProjectors], spinor: np.ndarray
+) -> np.ndarray:
+    """The whole spin-orbit term ``lzsz + lsxy`` on a stacked spinor block.
+
+    Equivalent to ``[lzsz(up) + lsxy(down); lzsz(down) + lsxy(up)]`` from
+    :func:`apply_lzsz` and :func:`apply_lsxy`, but each atom's projector
+    overlaps are taken once for both spin halves with a single GEMM, the
+    ladder structure is an 8x8 matrix product instead of per-harmonic outer
+    products, and the result is scattered back once per atom.
+
+    ``spinor`` has shape ``(2*n_grid, n_vectors)`` (complex); the result has
+    the same shape.
+    """
+    block = np.asarray(spinor, dtype=complex)
+    n_grid = block.shape[0] // 2
+    output = np.zeros_like(block)
+    n_vectors = block.shape[1]
+    for atom in projectors:
+        rows = atom.support_rows
+        # (2, n_support, n_vectors): spin-up then spin-down rows of the support.
+        gathered = np.stack((block[rows], block[rows + n_grid]))
+        overlaps = atom.stacked_conj_transpose @ gathered  # (2, 16, n_vectors)
+        sign = np.where(_LM_TO_L == 1, atom.sign[0], atom.sign[1])[:, None]
+        # dotio / dotso of the sign-included overlaps, per spin: (8, n_vectors).
+        io_up, so_up = sign * overlaps[0, :8], sign * overlaps[0, 8:]
+        io_dn, so_dn = sign * overlaps[1, :8], sign * overlaps[1, 8:]
+
+        coefficients = np.empty((2, 16, n_vectors), dtype=complex)
+        for spin, (sigma, io_same, so_same, ladder, io_other, so_other) in enumerate(
+            (
+                (+1.0, io_up, so_up, _LADDER_FROM_DOWN, io_dn, so_dn),
+                (-1.0, io_dn, so_dn, _LADDER_FROM_UP, io_up, so_up),
+            )
+        ):
+            lz = (sigma * _LZ_HALF)[:, None]
+            coefficients[spin, :8] = lz * so_same + ladder @ so_other
+            coefficients[spin, 8:] = (
+                lz * io_same
+                + (_QUARTER_LL1[:, None] - 0.5 * lz) * so_same
+                + ladder @ (io_other - 0.5 * so_other)
+            )
+        contribution = atom.stacked @ coefficients  # (2, n_support, n_vectors)
+        output[rows] += contribution[0]
+        output[rows + n_grid] += contribution[1]
+    return output
+
+
 def apply_zeeman_field(
     field: np.ndarray, psi_up: np.ndarray, psi_down: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -261,13 +331,9 @@ class SpinorKohnShamHamiltonian:
             q_up = q_up + zeeman_up
             q_down = q_down + zeeman_down
 
-        if self.soc_projectors:
-            q_up = q_up + apply_lzsz(self.soc_projectors, psi_up, spin_sign=1)
-            q_up = q_up + apply_lsxy(self.soc_projectors, psi_down, spin_sign=-1)
-            q_down = q_down + apply_lzsz(self.soc_projectors, psi_down, spin_sign=-1)
-            q_down = q_down + apply_lsxy(self.soc_projectors, psi_up, spin_sign=1)
-
         result = np.concatenate([q_up, q_down], axis=0)
+        if self.soc_projectors:
+            result += apply_spin_orbit(self.soc_projectors, block)
         return result[:, 0] if was_1d else result
 
     def as_linear_operator(self) -> "LinearOperator":
@@ -286,5 +352,6 @@ __all__ = [
     "SpinorKohnShamHamiltonian",
     "apply_lzsz",
     "apply_lsxy",
+    "apply_spin_orbit",
     "apply_zeeman_field",
 ]

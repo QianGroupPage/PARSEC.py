@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 from ..Eigensolvers.perturbative_soc import AtomSpinOrbitProjectors
 from .kpoint_operator import KPointKohnShamHamiltonian
-from .spinor_operator import _as_block, apply_lsxy, apply_lzsz, apply_zeeman_field
+from .spinor_operator import _as_block, apply_spin_orbit, apply_zeeman_field
 
 
 @dataclass(frozen=True)
@@ -92,22 +92,20 @@ class KPointSpinorKohnShamHamiltonian:
 
         q_up = self.scalar_hamiltonian.apply(psi_up)
         q_down = self.scalar_hamiltonian.apply(psi_down)
-
-        if self.soc_projectors:
-            q_up = q_up + apply_lzsz(self.soc_projectors, psi_up, spin_sign=1)
-            q_up = q_up + apply_lsxy(self.soc_projectors, psi_down, spin_sign=-1)
-            q_down = q_down + apply_lzsz(self.soc_projectors, psi_down, spin_sign=-1)
-            q_down = q_down + apply_lsxy(self.soc_projectors, psi_up, spin_sign=1)
+        # scalar_hamiltonian.apply returns fresh arrays, so the in-place
+        # additions below do not touch the caller's input.
 
         if self.xc_delta is not None:
-            q_up = q_up + self.xc_delta[:, None] * psi_up
-            q_down = q_down - self.xc_delta[:, None] * psi_down
+            q_up += self.xc_delta[:, None] * psi_up
+            q_down -= self.xc_delta[:, None] * psi_down
         if self.xc_field is not None:
             zeeman_up, zeeman_down = apply_zeeman_field(self.xc_field, psi_up, psi_down)
-            q_up = q_up + zeeman_up
-            q_down = q_down + zeeman_down
+            q_up += zeeman_up
+            q_down += zeeman_down
 
         result = np.concatenate([q_up, q_down], axis=0)
+        if self.soc_projectors:
+            result += apply_spin_orbit(self.soc_projectors, block)
         return result[:, 0] if was_1d else result
 
     def as_linear_operator(self) -> "LinearOperator":

@@ -29,6 +29,7 @@ plus a constant ``(1/4)*l(l+1)|Vso><Vso|`` piece (``lzsz`` only).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -99,6 +100,16 @@ class AtomSpinOrbitProjectors:
     v_ion: np.ndarray
     v_so: np.ndarray
     sign: tuple[float, float]
+
+    @cached_property
+    def stacked(self) -> np.ndarray:
+        """``[v_ion | v_so]``, shape ``(len(support_rows), 16)``, C-contiguous."""
+        return np.ascontiguousarray(np.hstack((self.v_ion, self.v_so)))
+
+    @cached_property
+    def stacked_conj_transpose(self) -> np.ndarray:
+        """``[v_ion | v_so]^H``, shape ``(16, len(support_rows))``, C-contiguous."""
+        return np.ascontiguousarray(self.stacked.conj().T)
 
 
 def build_spin_orbit_projectors(

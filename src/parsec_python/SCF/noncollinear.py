@@ -46,6 +46,7 @@ from .kpoints_soc import (
     _k_point_operators,
     _number_of_states,
     _spinor_hamiltonian,
+    _state_sz,
     _validated_k_points,
 )
 
@@ -128,6 +129,7 @@ def _run_noncollinear(
     n_kpoints: int,
     weight: float,
     callback: Callable[[SelfConsistentSOCIteration], None] | None,
+    k_points: np.ndarray | None = None,
 ) -> SelfConsistentSOCResult:
     settings = system.input.scf
     n_grid = system.grid.size
@@ -280,6 +282,9 @@ def _run_noncollinear(
         magnetic_moment=float(np.linalg.norm(moment_vector)),
         magnetic_moment_vector=moment_vector,
         magnetization=magnetization,
+        k_points=k_points,
+        k_weights=None if k_points is None else np.full(n_kpoints, weight),
+        state_moments=None if k_points is None else _state_sz(spinors_by_k),
     )
 
 
@@ -350,7 +355,7 @@ def run_self_consistent_noncollinear_kpoints(
         )
 
     return _run_noncollinear(
-        system, hamiltonian_for_k, k_points.shape[0], weight, callback
+        system, hamiltonian_for_k, k_points.shape[0], weight, callback, k_points
     )
 
 

@@ -762,6 +762,12 @@ class SinglePointResult:
         default_factory=lambda: np.empty(0, dtype=np.int32)
     )
     atomic_reference_correction: float = 0.0
+    k_points: np.ndarray | None = None
+    """Cartesian k-points, shape ``(n_k, 3)`` in bohr^-1, for a k-point-sampled
+    run (``None`` otherwise).  Pooled eigenvalue/occupation arrays are
+    k-major: entries ``i*n_states:(i+1)*n_states`` belong to ``k_points[i]``."""
+    k_weights: np.ndarray | None = None
+    """Normalized k-point weights, shape ``(n_k,)``."""
 
     @property
     def all_electron_total(self) -> float:
@@ -800,6 +806,12 @@ class SpinPolarizedSinglePointResult:
     """Brillouin-zone weight carried by each pooled eigenvalue: 1 for a
     single (Gamma or cluster) calculation, ``1/n_k`` for an unreduced uniform
     k-point grid whose eigenvalues and occupations are pooled over k."""
+    k_points: np.ndarray | None = None
+    """Cartesian k-points, shape ``(n_k, 3)`` in bohr^-1, for a k-point-sampled
+    run (``None`` otherwise).  Pooled eigenvalue/occupation arrays are
+    k-major: entries ``i*n_states:(i+1)*n_states`` belong to ``k_points[i]``."""
+    k_weights: np.ndarray | None = None
+    """Normalized k-point weights, shape ``(n_k,)``."""
 
     @property
     def magnetic_moment(self) -> float:
@@ -864,11 +876,23 @@ class SelfConsistentSOCResult:
     magnetization: np.ndarray | None = None
     """Magnetization density ``m(r)``, shape ``(3, n_grid)``, in Bohr
     magnetons per bohr^3 (non-collinear runs)."""
+    k_points: np.ndarray | None = None
+    """Cartesian k-points, shape ``(n_k, 3)`` in bohr^-1, for a k-point-sampled
+    run (``None`` otherwise).  Pooled eigenvalue/occupation arrays are
+    k-major: entries ``i*n_states:(i+1)*n_states`` belong to ``k_points[i]``."""
+    k_weights: np.ndarray | None = None
+    """Normalized k-point weights, shape ``(n_k,)``."""
+    state_moments: np.ndarray | None = None
+    """``<S_z>`` of every pooled state (same k-major layout as ``eigenvalues``)
+    for k-point runs, where ``spinors`` only holds the first k-point."""
 
     @property
     def magnetic_moment_per_state(self) -> np.ndarray:
         """Each SOC-split state's own ``<S_z>`` (up-component weight minus
-        down-component weight), matching ``elec_st%magmom``."""
+        down-component weight), matching ``elec_st%magmom``.  For a
+        k-point run this covers every pooled state (``state_moments``)."""
+        if self.state_moments is not None:
+            return self.state_moments
         n_grid = self.spinors.shape[0] // 2
         up_weight = np.sum(np.abs(self.spinors[:n_grid, :]) ** 2, axis=0)
         down_weight = np.sum(np.abs(self.spinors[n_grid:, :]) ** 2, axis=0)

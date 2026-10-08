@@ -252,10 +252,9 @@ def run_scf_kpoints(
         selected_residual = (
             metrics.plain if settings.use_plain_residual else metrics.weighted
         )
-        # Report the Gamma-point-equivalent first k-point's own eigenvalues
-        # (a representative slice, not the full k-resolved band structure --
-        # there is no single "the" eigenvalue list across multiple
-        # k-points).  The full per-k-point results are not retained here.
+        # The per-iteration record carries only the first k-point's
+        # eigenvalues; the final result pools every k-point (k-major) with
+        # the k-point list, and the reporter prints them all at the end.
         first_k_count = eigenvalues_by_k[0].size
         iteration_record = SCFIteration(
             iteration=iteration,
@@ -309,6 +308,8 @@ def run_scf_kpoints(
         energies=energies,
         history=history,
         atomic_reference_correction=system.atomic_reference_correction,
+        k_points=k_points,
+        k_weights=weights,
     )
 
 
@@ -546,6 +547,8 @@ def run_scf_kpoints_spin_polarized(
         density_down=density_down,
         energies=energies,
         occupation_weight=weight,
+        k_points=k_points,
+        k_weights=weights,
     )
 
 

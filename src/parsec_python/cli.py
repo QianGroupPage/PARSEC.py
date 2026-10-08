@@ -103,6 +103,33 @@ def _npz_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".npz")
 
 
+def _k_point_payload(result) -> dict[str, np.ndarray]:
+    """Archive entries describing the k-point sampling of a pooled result.
+
+    ``eigenvalues_ry``/``occupations`` (and the spin-resolved or
+    per-state-moment arrays) are k-major: reshape to
+    ``(n_kpoints, n_states_per_kpoint)`` to index them by k-point.
+    """
+    k_points = getattr(result, "k_points", None)
+    if k_points is None:
+        return {}
+    k_points = np.asarray(k_points, dtype=float)
+    weights = getattr(result, "k_weights", None)
+    if weights is None:
+        weights = np.full(k_points.shape[0], 1.0 / k_points.shape[0])
+    eigenvalues = getattr(result, "eigenvalues", None)
+    if eigenvalues is None:
+        eigenvalues = result.eigenvalues_up
+    return {
+        "k_points_cartesian_inv_bohr": k_points,
+        "k_weights": np.asarray(weights, dtype=float),
+        "n_kpoints": np.asarray(k_points.shape[0]),
+        "n_states_per_kpoint": np.asarray(
+            np.asarray(eigenvalues).size // k_points.shape[0]
+        ),
+    }
+
+
 def save_result_archive(
     path: str | Path,
     result: SinglePointResult,
@@ -281,6 +308,7 @@ def save_result_archive(
                 payload[f"backend_statistic_{name}"] = np.asarray(value)
     if include_wavefunctions:
         payload["wavefunctions"] = result.wavefunctions
+    payload.update(_k_point_payload(result))
     np.savez_compressed(output, **payload)
     return output
 
@@ -334,6 +362,7 @@ def save_spin_polarized_result_archive(
             payload["soc_spinor_coefficients_down"] = (
                 soc_result.spinor_coefficients_down
             )
+    payload.update(_k_point_payload(result))
     np.savez_compressed(output, **payload)
     return output
 
@@ -372,6 +401,7 @@ def save_self_consistent_soc_result_archive(
         payload["magnetization_mu_b_per_bohr3"] = result.magnetization
     if include_wavefunctions:
         payload["spinors"] = result.spinors
+    payload.update(_k_point_payload(result))
     np.savez_compressed(output, **payload)
     return output
 

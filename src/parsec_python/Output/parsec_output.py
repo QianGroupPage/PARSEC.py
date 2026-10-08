@@ -332,6 +332,7 @@ class ParsecTextReporter:
             "",
             f" Fermi level at {step.fermi_level:10.4f} [Ry]",
             "",
+            *self._kpoint_note(),
             "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.     Repr.",
             "",
         ]
@@ -407,6 +408,75 @@ class ParsecTextReporter:
         )
         self._previous_total = energies.total
         self.write("\n".join(lines))
+
+    def _kpoint_note(self) -> list[str]:
+        """Reminder in each iteration block that only one k-point is listed."""
+        if not self.problem.has_kpoint_sampling:
+            return []
+        return [
+            " (eigenvalues of the first k-point only; the converged states of "
+            "every k-point are listed at the end)",
+            "",
+        ]
+
+    def _kpoint_header(
+        self, index: int, count: int, k_point: Sequence[float], weight: float
+    ) -> list[str]:
+        """Banner for one k-point block: Cartesian k [bohr^-1], fractional
+        coordinates of the reciprocal lattice vectors, and the weight."""
+        k_point = np.asarray(k_point, dtype=float)
+        cell = self.problem.periodic_cell
+        fractional = (
+            cell.lattice_vectors @ k_point / (2.0 * np.pi) if cell is not None else None
+        )
+        text = (
+            f" k-point {index:3d} of {count:3d}   "
+            f"k = ({k_point[0]:10.6f} {k_point[1]:10.6f} {k_point[2]:10.6f}) [1/bohr]"
+        )
+        if fractional is not None:
+            text += (
+                f"   frac = ({fractional[0]:8.5f} {fractional[1]:8.5f} "
+                f"{fractional[2]:8.5f})"
+            )
+        return [text + f"   weight = {weight:9.6f}"]
+
+    def _k_blocks(self, result, array_size: int):
+        """Yield ``(slice, header_lines)`` per k-point for pooled arrays of
+        ``array_size`` entries; a single unlabeled block without k-points."""
+        k_points = getattr(result, "k_points", None)
+        if k_points is None or len(k_points) == 0:
+            yield slice(0, array_size), []
+            return
+        count = len(k_points)
+        per_k = array_size // count
+        weights = getattr(result, "k_weights", None)
+        if weights is None:
+            weights = np.full(count, 1.0 / count)
+        for index in range(count):
+            yield (
+                slice(index * per_k, (index + 1) * per_k),
+                self._kpoint_header(index + 1, count, k_points[index], weights[index]),
+            )
+
+    def _final_k_tables(self, result) -> list[str]:
+        """Converged eigenvalues of every k-point (scalar k-point runs)."""
+        if getattr(result, "k_points", None) is None:
+            return []
+        lines = ["", "Converged eigenvalues by k-point", ""]
+        eigenvalues = np.asarray(result.eigenvalues)
+        occupations = np.asarray(result.occupations)
+        for block, header in self._k_blocks(result, eigenvalues.size):
+            lines.extend(header)
+            lines.append("   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.")
+            for index, (eigenvalue, occupation) in enumerate(
+                zip(eigenvalues[block], occupations[block]), start=1
+            ):
+                lines.append(
+                    f"{index:5d}   {eigenvalue:18.10f}"
+                    f"   {eigenvalue * RYDBERG_TO_EV:18.10f} {occupation:9.4f}"
+                )
+            lines.append("")
+        return lines
 
     def finish(self, result: SinglePointResult, elapsed_seconds: float) -> None:
         status = (
@@ -502,6 +572,7 @@ class ParsecTextReporter:
                     " --------------------------------------------------",
                 ]
             )
+        lines.extend(self._final_k_tables(result))
         lines.extend(
             [
                 "",
@@ -550,6 +621,7 @@ class ParsecTextReporter:
             "",
             f" Fermi level at {step.fermi_level:10.4f} [Ry]",
             "",
+            *self._kpoint_note(),
         ]
         lines.extend(
             self._spin_channel_table("up", step.eigenvalues_up, step.occupations_up)
@@ -594,6 +666,28 @@ class ParsecTextReporter:
         )
         self.write("\n".join(lines))
 
+    def _final_spin_k_tables(self, result) -> list[str]:
+        """Converged up/down eigenvalues of every k-point."""
+        if getattr(result, "k_points", None) is None:
+            return []
+        lines = ["Converged eigenvalues by k-point", ""]
+        up = np.asarray(result.eigenvalues_up)
+        down = np.asarray(result.eigenvalues_down)
+        for block, header in self._k_blocks(result, up.size):
+            lines.extend(header)
+            lines.append("")
+            lines.extend(
+                self._spin_channel_table(
+                    "up", up[block], np.asarray(result.occupations_up)[block]
+                )
+            )
+            lines.extend(
+                self._spin_channel_table(
+                    "down", down[block], np.asarray(result.occupations_down)[block]
+                )
+            )
+        return lines
+
     def finish_spin_polarized(
         self, result: "SpinPolarizedSinglePointResult", elapsed_seconds: float
     ) -> None:
@@ -614,6 +708,7 @@ class ParsecTextReporter:
                 f"{result.energies.total * RYDBERG_TO_EV / max(len(result.atoms), 1):22.8f} [eV]"
             ),
             "",
+            *self._final_spin_k_tables(result),
             (
                 "Forces, dipoles, and MPI statistics are not calculated by "
                 "this Python single-point implementation."
@@ -663,6 +758,7 @@ class ParsecTextReporter:
             "",
             f" Fermi level at {step.fermi_level:10.4f} [Ry]",
             "",
+            *self._kpoint_note(),
             "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.",
             "",
         ]
@@ -721,18 +817,26 @@ class ParsecTextReporter:
             f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
             "",
             "Converged spin-orbit-split spinor states",
-            "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.    <S_z>",
             "",
         ]
-        moments = result.magnetic_moment_per_state
-        for index, (eigenvalue, occupation, moment) in enumerate(
-            zip(result.eigenvalues, result.occupations, moments), start=1
-        ):
+        moments = np.asarray(result.magnetic_moment_per_state)
+        eigenvalues = np.asarray(result.eigenvalues)
+        occupations = np.asarray(result.occupations)
+        for block, header in self._k_blocks(result, eigenvalues.size):
+            lines.extend(header)
             lines.append(
-                f"{index:5d}   {eigenvalue:18.10f}"
-                f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
-                f" {occupation:9.4f} {moment:9.4f}"
+                "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.    <S_z>"
             )
+            lines.append("")
+            for index, (eigenvalue, occupation, moment) in enumerate(
+                zip(eigenvalues[block], occupations[block], moments[block]), start=1
+            ):
+                lines.append(
+                    f"{index:5d}   {eigenvalue:18.10f}"
+                    f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
+                    f" {occupation:9.4f} {moment:9.4f}"
+                )
+            lines.append("")
         if result.magnetic_moment_vector is not None:
             mx, my, mz = (float(v) for v in result.magnetic_moment_vector)
             lines.extend(

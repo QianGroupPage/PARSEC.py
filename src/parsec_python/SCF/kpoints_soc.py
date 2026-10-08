@@ -98,6 +98,19 @@ def _eigval_settings(
     )
 
 
+def _state_sz(spinors_by_k: list[np.ndarray]) -> np.ndarray:
+    """``<S_z>`` (up weight minus down weight) of every state at every k-point,
+    k-major like the pooled eigenvalues."""
+    moments = []
+    for spinors in spinors_by_k:
+        n_grid = spinors.shape[0] // 2
+        moments.append(
+            np.sum(np.abs(spinors[:n_grid, :]) ** 2, axis=0)
+            - np.sum(np.abs(spinors[n_grid:, :]) ** 2, axis=0)
+        )
+    return np.concatenate(moments)
+
+
 def _validated_k_points(
     k_points: np.ndarray, weights: np.ndarray, caller: str
 ) -> tuple[np.ndarray, float]:
@@ -216,11 +229,9 @@ def run_self_consistent_soc_kpoints(
     fermi_level = float("nan")
     energies = None
     converged = False
-    # SelfConsistentSOCResult.spinors has no single canonical value across
-    # multiple k-points; this keeps only k_points[0]'s own converged
-    # spinors as a representative sample (so magnetic_moment_per_state
-    # still means something for that one k-point), not a full k-resolved
-    # band structure.
+    # SelfConsistentSOCResult.spinors keeps only k_points[0]'s converged
+    # spinors (storing all k-points would multiply the memory); the
+    # per-state <S_z> of every k-point is stored separately (state_moments).
     spinors_first_k = np.empty((2 * system.grid.size, 0), dtype=complex)
 
     for iteration in range(1, settings.max_iterations + 1):
@@ -349,6 +360,9 @@ def run_self_consistent_soc_kpoints(
         fermi_level=fermi_level,
         density=density,
         energies=energies,
+        k_points=k_points,
+        k_weights=np.full(n_kpoints, weight),
+        state_moments=_state_sz(spinors_by_k),
     )
 
 
@@ -559,6 +573,9 @@ def run_self_consistent_soc_kpoints_spin_polarized(
         magnetic_moment=float(
             system.grid.volume_element * np.sum(density_up_out - density_down_out)
         ),
+        k_points=k_points,
+        k_weights=np.full(n_kpoints, weight),
+        state_moments=_state_sz(spinors_by_k),
     )
 
 

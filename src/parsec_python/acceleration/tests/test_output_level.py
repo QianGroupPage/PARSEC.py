@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 from parsec_python.Input import parse_parsec_input
 from parsec_python.acceleration.Output import AcceleratedTextReporter
+from parsec_python.acceleration.models import BackendStatistics
 
 
 DATA = Path(__file__).resolve().parents[2] / 'tests/data/H_cli_smoke.in'
@@ -26,6 +27,7 @@ class BackendOutputLevelTests(unittest.TestCase):
                 requested='auto', selected='cupy', dtype='float64', device='CUDA:0',
                 implementation='Detailed kernel implementation',
                 details=(('finite_difference_builder', 'native'),
+                         ('symmetry_cache_directory', 'disabled'),
                          ('hartree_backend', 'native'),
                          ('native_openmp_max_threads', '28'),
                          ('orbital_sector_later_filter_precision', 'float64'),
@@ -41,6 +43,7 @@ class BackendOutputLevelTests(unittest.TestCase):
         reporter.setup(system)
         report = '\n'.join(messages)
         for text in ('Selected backend  = cupy', 'hartree_backend = native',
+                     'symmetry_cache_directory = disabled',
                      'native_openmp_max_threads = 28',
                      'orbital_sector_later_filter_precision = float64',
                      'example fallback warning', 'Output_Level: 2'):
@@ -62,6 +65,51 @@ class BackendOutputLevelTests(unittest.TestCase):
                     self.assertIn(f'{key} = {value}', report)
                 self.assertIn('example fallback warning', report)
                 self.assertNotIn('set Output_Level', report)
+
+    def test_setup_says_which_stages_ran_beside_the_preparation(self):
+        note = 'are not part of the preparation wall time'
+        for level in (1, 2):
+            with self.subTest(level=level):
+                for setup in ((), (('ionic_setup', 'inline'),)):
+                    reporter, messages = self.reporter(level)
+                    system = self.system()
+                    system.backend_info.details += setup
+                    reporter.setup(system)
+                    self.assertNotIn(note, '\n'.join(messages))
+                reporter, messages = self.reporter(level)
+                system = self.system()
+                system.backend_info.details += (
+                    ('ionic_setup', 'overlapped with symmetry and orbital setup'),
+                    ('ionic_setup_seconds', '4.905000'), ('ionic_setup_wait_seconds', '0.250000'))
+                reporter.setup(system)
+                report = '\n'.join(messages)
+                self.assertIn(note, report)
+                # Under the setup timings of the reference report, before the backend block.
+                self.assertLess(report.index(note), report.index('Acceleration backend:'))
+                self.assertIn('Thread [sec] = 4.905000, wait at its join [sec] = 0.250000.', report)
+
+    def test_finish_says_which_filter_graphs_were_recorded_where_the_setup_named_others(self):
+        key, line = 'orbital_sector_filter_graphs', 'Sector filter graphs as recorded = '
+        shared = 'one per block width and degree'
+
+        def report(level, at_setup, at_finish):
+            reporter, messages = self.reporter(level)
+            system = self.system()
+            if at_setup is not None:
+                system.backend_info.details += ((key, at_setup),)
+            reporter.setup(system)
+            details = () if at_finish is None else ((key, at_finish),)
+            reporter.finish(SimpleNamespace(backend=SimpleNamespace(selected='cupy', details=details),
+                                            backend_statistics=BackendStatistics()), 1.0)
+            return '\n'.join(messages)
+
+        # The detailed setup prints the switch; a filter that recorded no graph, or other ones, is said.
+        for recorded in ('none recorded', 'one per block of a plan'):
+            self.assertIn(f' {line}{recorded}', report(2, shared, recorded))
+        self.assertNotIn(line, report(2, shared, shared))
+        # Nothing where the setup said nothing of the graphs: the short report, and a run without sectors.
+        self.assertNotIn(line, report(1, shared, 'none recorded'))
+        self.assertNotIn(line, report(2, None, None))
 
     def test_scf_iterations_delegate_unchanged_at_both_levels(self):
         for level in (1, 2):

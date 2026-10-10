@@ -4,6 +4,8 @@
 #include "fused_hamiltonian.h"
 #include "hartree_boundary.h"
 #include "radial_grid.h"
+#include "sector_operator.h"
+#include "sector_stencil.h"
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -80,7 +82,8 @@ PYBIND11_MODULE(parsec_accelerated_native, module) {
     module.def("build_info", [openmp]() {
         py::dict info;
         info["module"] = "parsec_accelerated_native";
-        info["version"] = "0.5.0";
+        info["version"] = "0.6.1";
+        info["maximum_multipole_order"] = 60;
         info["dtype"] = "float64";
         info["fixed_summation_order"] = true;
         info["implemented_kernels"] = py::make_tuple(
@@ -308,6 +311,8 @@ Export the exact wedge multipole and exterior-boundary geometry buffers.
 )pbdoc"
         )
         .def_property_readonly("size", &MultipoleBoundaryBuilder::size)
+        .def("export_full_geometry", &MultipoleBoundaryBuilder::export_full_geometry,
+             "Copy the exact source and exterior-stencil geometry for GPU evaluation.")
         .def_property_readonly(
             "boundary_term_count",
             &MultipoleBoundaryBuilder::boundary_term_count
@@ -343,6 +348,36 @@ Export the exact wedge multipole and exterior-boundary geometry buffers.
         .def_property_readonly("dtype", [](const CALDAEvaluator&) {
             return py::dtype::of<double>();
         });
+
+    module.def("reduce_sector_csr", &parsec_accelerated_native::reduce_sector_csr,
+        "Project canonical CSR representative rows with bounded thread scratch.");
+
+    module.def(
+        "build_sector_stencil",
+        &parsec_accelerated_native::build_sector_stencil,
+        py::arg("integer_coordinates"),
+        py::arg("index_min"),
+        py::arg("lookup"),
+        py::arg("expansion_order"),
+        py::arg("spacing"),
+        py::arg("representatives"),
+        py::arg("full_to_orbit"),
+        py::arg("orbit_to_sector"),
+        py::arg("multiplicities"),
+        py::arg("phases"),
+        py::arg("threads") = 0,
+        R"pbdoc(
+Build the slot-major stencil of one symmetry sector from the grid lookup.
+
+Only the representative rows of the sector are visited and no full-grid matrix
+is formed.  The neighbors, coefficient codes and palette equal those obtained
+by reducing the full-grid CSR with reduce_sector_csr and packing the result.
+
+The rows are taken in blocks of ``block_rows`` (returned) by ``threads`` OpenMP
+threads, 0 meaning the default team; a sector of fewer rows than one block runs
+on the calling thread.  The arrays do not depend on either number.
+)pbdoc"
+    );
 
     py::class_<RadialGridEvaluator>(module, "RadialGridEvaluator")
         .def(

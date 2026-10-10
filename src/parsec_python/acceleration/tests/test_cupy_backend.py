@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 from types import SimpleNamespace
 import unittest
@@ -171,6 +172,11 @@ class TestCuPyComponentParity(unittest.TestCase):
             self.kinetic, self.potential, self.nonlocal_operator
         )
 
+    def tearDown(self):
+        # Operators and solvers that a test left in a reference cycle are destroyed
+        # here, between the tests, and not by a collection inside the next one.
+        gc.collect()
+
     def test_lazy_symmetry_orbitals_materialize_signed_full_vectors(self):
         wedge = np.asarray(
             ((0.1, -0.2), (0.3, 0.4), (-0.5, 0.6)), dtype=np.float64
@@ -196,6 +202,66 @@ class TestCuPyComponentParity(unittest.TestCase):
         expected = wedge[mapping].copy()
         expected[:, 1] *= phases[1]
         np.testing.assert_array_equal(actual, expected)
+
+    def test_symmetry_orbitals_expand_from_host_maps_like_device_maps(self):
+        cp = self.cp
+        generator = np.random.default_rng(77)
+        # Two sectors on a five-orbit wedge; the second rejects orbit 1.
+        sector_orbits = (np.arange(5), np.asarray((0, 2, 3, 4)))
+        multiplicities = np.asarray((2, 1, 2, 2, 2))
+        scales = tuple(1.0 / np.sqrt(multiplicities[item]) for item in sector_orbits)
+        # The eigensolver shares its orbit lists and scales read-only.
+        for item in (*sector_orbits, *scales):
+            item.setflags(write=False)
+        mapping = np.asarray((0, 1, 2, 3, 4, 0, 2, 3, 4), dtype=np.int64)
+        phases = np.asarray(
+            ((1,) * 9, (1, 0, 1, 1, 1, -1, -1, -1, -1)), dtype=np.int8
+        )
+        hosts = (
+            generator.standard_normal((5, 3)),
+            generator.standard_normal((4, 2)),
+        )
+        representations = np.asarray((1, 0, 0, 1, 0), dtype=np.int32)
+        columns = np.asarray((0, 0, 1, 1, 2), dtype=np.int32)
+        vectors = tuple(cp.asarray(values, order="F") for values in hosts)
+
+        def orbitals(device_full_to_wedge, phase_table):
+            return CuPySymmetryOrbitals(
+                scaled_wedge_vectors=None,
+                representations=representations,
+                full_to_wedge=mapping,
+                device_full_to_wedge=device_full_to_wedge,
+                phases=phase_table,
+                full_size=mapping.size,
+                representation_columns=columns,
+                sector_vectors=vectors,
+                sector_orbits=sector_orbits,
+                sector_scales=scales,
+                wedge_size=5,
+            )
+
+        expected = np.empty((mapping.size, representations.size))
+        for column, (representation, source) in enumerate(
+            zip(representations, columns)
+        ):
+            wedge = np.zeros(5)
+            wedge[sector_orbits[representation]] = (
+                hosts[representation][:, source] * scales[representation]
+            )
+            expected[:, column] = wedge[mapping] * phases[representation]
+        # Host maps, as the eigensolver now hands them out, and the device
+        # maps it used to upload give the same signed full-grid states.
+        host_maps = orbitals(None, phases)
+        device_maps = orbitals(
+            cp.asarray(mapping), cp.asarray(phases, dtype=cp.float64)
+        )
+        for item in (host_maps, device_maps):
+            np.testing.assert_array_equal(
+                cp.asnumpy(item.to_full_device()), expected
+            )
+            np.testing.assert_array_equal(
+                item.to_full_host(block_states=2), expected
+            )
 
     def test_hamiltonian_terms_vector_and_block(self):
         rng = np.random.default_rng(8)
@@ -268,6 +334,67 @@ class TestCuPyComponentParity(unittest.TestCase):
             rtol=2e-9,
             atol=2e-11,
         )
+
+    def test_cusolver_generalized_ritz_matches_orthonormal_ritz(self):
+        # The eigensolver setting belongs to the host solve.
+        with patch.dict(
+            os.environ,
+            {
+                "PARSEC_CUPY_RITZ_DENSE_BACKEND": "host",
+                "PARSEC_CUPY_RITZ_EIGH_BACKEND": "cupy",
+            },
+        ):
+            self.test_generalized_ritz_matches_orthonormal_ritz_and_reuses_workspace()
+
+    def test_consumed_ritz_rotation_swaps_disjoint_buffers(self):
+        cp = self.cp
+        rng = np.random.default_rng(831)
+        basis = cp.asarray(rng.standard_normal((self.kinetic.shape[0], 5)), order="F")
+        saved = basis.copy()
+        workspace = cp.empty_like(basis, order="F")
+        reference = generalized_rayleigh_ritz(self.gpu, basis)
+        with patch.dict(os.environ, {"PARSEC_CUPY_RITZ_ROTATION": "reuse"}):
+            actual = generalized_rayleigh_ritz(
+                self.gpu, basis, workspace=workspace, consume_basis=True)
+        self.assertIs(actual.wavefunctions, workspace)
+        self.assertIs(actual.workspace, basis)
+        self.assertFalse(cp.may_share_memory(actual.workspace, actual.wavefunctions))
+        np.testing.assert_array_equal(cp.asnumpy(basis), cp.asnumpy(saved))
+        np.testing.assert_allclose(cp.asnumpy(actual.wavefunctions),
+                                   cp.asnumpy(reference.wavefunctions), rtol=2e-12, atol=2e-12)
+        np.testing.assert_allclose(cp.asnumpy(actual.wavefunctions.T @ actual.wavefunctions),
+                                   np.eye(5), rtol=2e-11, atol=2e-11)
+        # A second call may overwrite scratch but must preserve prior orbitals.
+        old_vectors = actual.wavefunctions.copy()
+        next_basis = cp.asarray(rng.standard_normal(basis.shape), order="F")
+        with patch.dict(os.environ, {"PARSEC_CUPY_RITZ_ROTATION": "reuse"}):
+            generalized_rayleigh_ritz(self.gpu, next_basis,
+                                     workspace=actual.workspace, consume_basis=True)
+        np.testing.assert_array_equal(cp.asnumpy(actual.wavefunctions), cp.asnumpy(old_vectors))
+
+    def test_reuse_ritz_preserves_diagnostics_and_unconsumed_input(self):
+        with patch.dict(os.environ, {"PARSEC_CUPY_RITZ_ROTATION": "reuse"}):
+            self.test_generalized_ritz_matches_orthonormal_ritz_and_reuses_workspace()
+        cp = self.cp
+        basis = cp.asarray(np.random.default_rng(832).standard_normal(
+            (self.kinetic.shape[0], 5)), order="F")
+        saved = basis.copy()
+        with patch.dict(os.environ, {"PARSEC_CUPY_RITZ_ROTATION": "reuse"}):
+            actual = generalized_rayleigh_ritz(self.gpu, basis, workspace=basis,
+                                               consume_basis=True, compute_residuals=True)
+        self.assertFalse(cp.may_share_memory(actual.workspace, basis))
+        np.testing.assert_array_equal(cp.asnumpy(basis), cp.asnumpy(saved))
+        self.assertIsNotNone(actual.residual_norms)
+
+    def test_cusolver_generalized_ritz_retains_dependence_guard(self):
+        with patch.dict(
+            os.environ,
+            {
+                "PARSEC_CUPY_RITZ_DENSE_BACKEND": "host",
+                "PARSEC_CUPY_RITZ_EIGH_BACKEND": "cupy",
+            },
+        ):
+            self.test_generalized_ritz_rejects_dependent_filtered_basis()
 
     def test_tsqr_is_orthonormal_and_preserves_the_input_span(self):
         rng = np.random.default_rng(1207)
@@ -552,6 +679,11 @@ class TestCuPyComponentParity(unittest.TestCase):
 
 @unittest.skipUnless(GPU_AVAILABLE, "CuPy/CUDA are not available")
 class TestCuPyEigvalPolicy(unittest.TestCase):
+    def tearDown(self):
+        # Operators and solvers that a test left in a reference cycle are destroyed
+        # here, between the tests, and not by a collection inside the next one.
+        gc.collect()
+
     def test_first_chebff_then_one_subspace_pass_keeps_device_state(self):
         cp, _ = require_cupy()
         kinetic, potential, nonlocal_operator, reference = _small_hamiltonian()

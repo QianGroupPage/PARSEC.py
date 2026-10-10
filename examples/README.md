@@ -101,17 +101,25 @@ python src\parsec_python\main.py examples\0d_benzene\parsec.in `
   --log benzene_new.out --output benzene_new.npz
 ```
 
-Automatic symmetry uses an exact-key cache under `.parsec_cache` beside the
-input. The cache changes setup time only, not the physical result or fresh SCF
-state. To test a calculation without that persistent symmetry cache:
+Automatic symmetry keeps no persistent cache unless a directory is named: a
+first calculation of a structure is fastest without one. For repeated
+calculations of the same structure and grid, `--symmetry-cache DIRECTORY`
+keeps exact-key symmetry maps and operators there. The cache changes setup
+time only, not the physical result or fresh SCF state. Earlier versions wrote
+it to `.parsec_cache/symmetry` beside the input; that directory is no longer
+read unless it is named:
 
 ```powershell
 python src\parsec_python\main.py examples\0d_naphthalene\parsec.in `
-  --no-symmetry-cache --no-archive
+  --symmetry-cache examples\0d_naphthalene\.parsec_cache\symmetry --no-archive
 ```
 
 Selected `parsec_reference.out`, `parsec_python.out`, and comparison documents
-are retained as validation evidence. The reference coverage is:
+are retained as validation evidence. The retained Python outputs that list
+symmetry-cache entries were written while the cache beside the input was the
+default; a run of the current code reports
+`symmetry_cache_directory = disabled` instead.
+The reference coverage is:
 
 | Case | Python reference | Independent reference |
 |---|---|---|
@@ -122,6 +130,15 @@ are retained as validation evidence. The reference coverage is:
 | `0d_Si28H36` | `parsec_python.out` | `parsec_reference.out` and `parsec_reference_time.txt` from the 30-rank Fortran run |
 | `0_CH4_CF4/python_pbe` | One `parsec_python.out` in each IS/FS directory | Corresponding ARES PBE `ares.log` files and the comparison in its README |
 | `ml_initial_density` | CHEBDAV `parsec.out` and retained CHEBFF `parsec_chebff.out` | Paired SAD/SCDP/ChargE3Net regression data |
+
+The Hartree boundary values of the Python solver differ from PARSEC's by
+default where an estimate from the geometry says PARSEC's are inaccurate
+(`src/parsec_python/README.md`). Of these cases only `0d_Si28H36` is large
+enough: it now runs at multipole order 10 with the atomic tail, and its
+`parsec_python.out` and the Fortran reference were made with PARSEC's
+boundary. Add `Hartree_Boundary_Tolerance: off` to the input, or set
+`PARSEC_HARTREE_BOUNDARY=legacy` for the accelerated driver, to reproduce
+them.
 
 Reference timings are hardware-specific; energies and convergence histories
 are the portable validation quantities. Ordinary new outputs, NumPy result

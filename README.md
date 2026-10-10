@@ -56,6 +56,25 @@ The default text result is `parsec.out` beside the input. Unless
 `--no-archive` is used, arrays and metadata are also stored in
 `parsec_python_results.npz`.
 
+A sphere input may leave `Boundary_Sphere_Radius` out. The radius and the
+tolerance of the Hartree boundary are then chosen from the geometry and the
+free atoms of the pseudopotential files, for an estimated energy error of
+`Domain_Energy_Tolerance` (default `1e-3 Ry`; this is not the SCF criterion
+`Convergence_Criterion`). `parsec.out` and `--dry-run` print the choice and
+the two input lines that reproduce it; after the SCF every sphere run
+reports what its sphere adds to the energy, estimated from the converged
+density. An input with a radius keeps its sphere. Its Hartree boundary
+values differ from PARSEC's, and from those of earlier versions of this
+code, where an estimate from the geometry says PARSEC's are inaccurate;
+`Hartree_Boundary_Tolerance: off` in the input restores them. With
+`PARSEC_DOMAIN_REPORT=0` in the environment its report leaves the estimates
+of the sphere out.
+See "Sphere radius left to the code" in
+[the package README](src/parsec_python/README.md); the switches that came
+with it for the GPU drivers, their defaults and the values that restore the
+former behaviour are in one table in
+[the acceleration README](src/parsec_python/acceleration/README.md).
+
 When `src` is importable, the equivalent package command is:
 
 ```powershell
@@ -83,7 +102,7 @@ Useful options include:
 |---|---|
 | `--backend auto|scipy|native|cupy` | Select automatic hybrid execution or a controlled comparison backend. |
 | `--symmetry auto|on|off` | Detect exact supported symmetries, require them, or force the full grid. |
-| `--no-symmetry-cache` | Disable persistent exact-key representation caches. |
+| `--symmetry-cache DIR` | Keep exact-key symmetry maps and operators in `DIR`. No cache is the default (`--no-symmetry-cache` says so explicitly): a first calculation is fastest without one. |
 | `--pp-dir DIR` | Search an additional directory for `*_POTRE.DAT`. |
 | `--dry-run` | Parse and validate without constructing the grid. |
 | `--no-archive` | Write only the text output. |
@@ -148,7 +167,12 @@ python -c "import parsec_accelerated_native as n; print(n.build_info())"
 ```
 
 Check that `openmp_enabled` is `True`. Rebuild the extension after updating its
-C++ sources. Windows `.pyd` files and Windows wheels cannot be reused on Linux.
+C++ sources: this version is meant for extension 0.6.1 (`build_info()['version']`).
+With an older build a cluster whose Hartree boundary is raised above order 9
+stops with a message that asks for the rebuild, the stencils of the symmetry
+sectors are built by a slower NumPy route, and the launch script of section 5
+stops at its start, because the GPU Hartree boundary needs the newer
+extension. Windows `.pyd` files and Windows wheels cannot be reused on Linux.
 
 ```bash
 python src/parsec_python/main.py examples/h2_canonical_nodg/parsec.in \
@@ -235,9 +259,32 @@ respect the site's GPU visibility settings. Do not use `mpirun` to launch this
 single-process command: that would start independent calculations, potentially
 writing to the same files, rather than distribute one SCF calculation.
 
-For a new-system timing comparison, run without `--resident` and add
-`--no-symmetry-cache`. CuPy compilation/driver caches are separate, so this is
+For a new-system timing comparison, run without `--resident` and without
+`--symmetry-cache`: no symmetry cache is read or written unless that option
+names a directory. A cache pays only for repeated calculations of the same
+structure and grid; `src/parsec_python/acceleration/README.md` gives the
+measured figures. CuPy compilation/driver caches are separate, so this is
 not a guarantee of a completely cold GPU runtime.
+
+### 5. Several GPUs and several nodes
+
+`scripts/run_multi_gpu_scf.sh` runs one SCF calculation of an isolated system
+(the runner refuses periodic cells) on the GPUs of one node or of several
+nodes, one MPI rank per node, with the launch settings the multi-GPU solver
+was measured with (1 to 16 A100 80 GB GPUs). Most of these settings are not
+defaults of the code: started without them, a calculation takes slower
+routes. The script needs the native extension, CuPy and mpi4py built with the
+MPI of the machine, and runs inside an existing Slurm allocation; call it by
+its path in the checkout rather than handing it to `sbatch`:
+
+```bash
+scripts/run_multi_gpu_scf.sh parsec.in output_directory
+scripts/run_multi_gpu_scf.sh --nodes 1 --gpus-per-node 2 parsec.in output_directory
+```
+
+The first form uses every node of the allocation with four GPUs each.
+`src/parsec_python/acceleration/MULTI_GPU.md` ("Several nodes") lists the
+settings and says which ones the solver chooses for itself.
 
 ### Troubleshooting
 
@@ -267,6 +314,8 @@ examples/                          runnable calculations and benchmark data
 ├── 0d_naphthalene/
 ├── 0d_Si28H36/
 └── 0_CH4_CF4/
+scripts/
+└── run_multi_gpu_scf.sh           launch script for several GPUs and nodes
 src/
 ├── parsec_python/                 canonical DFT package
 │   ├── main.py                    default command-line launcher

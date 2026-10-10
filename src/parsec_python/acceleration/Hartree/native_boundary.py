@@ -21,6 +21,7 @@ from time import perf_counter
 import numpy as np
 
 from parsec_python.Grid import RealSpaceGrid
+from parsec_python.models import MAXIMUM_MULTIPOLE_ORDER
 
 from ..backends.native import _load_native
 from ..SCF.symmetry_fields import SymmetryScalarField
@@ -33,15 +34,49 @@ _SYMMETRY_BOUNDARY_CACHE_FORMAT = 2
 
 @dataclass(frozen=True)
 class NativeBoundaryCacheInfo:
-    """Persistent native Hartree-geometry cache provenance and timings."""
+    """Persistent native Hartree-geometry cache provenance and timings.
+
+    ``key`` is ``None`` when the cache is disabled and no key was hashed.
+    """
 
     status: str
-    key: str
+    key: str | None
     path: Path | None
     hash_seconds: float = 0.0
     load_seconds: float = 0.0
     build_seconds: float = 0.0
     write_seconds: float = 0.0
+
+
+def _checked_order(multipole_order) -> int:
+    order = int(multipole_order)
+    if order != multipole_order or not 0 <= order <= MAXIMUM_MULTIPOLE_ORDER:
+        raise ValueError(
+            f"multipole_order must be between 0 and {MAXIMUM_MULTIPOLE_ORDER}"
+        )
+    return order
+
+
+def _require_native_order(native, order: int) -> None:
+    """Refuse an order the loaded extension stores no arrays for.
+
+    Extensions before 0.6.0 hold the angular arrays of order 9 and report no
+    maximum.
+    """
+
+    if order <= 9:
+        return
+    supported = 9
+    build_info = getattr(native, "build_info", None)
+    if build_info is not None:
+        supported = int(dict(build_info()).get("maximum_multipole_order", 9))
+    if order > supported:
+        raise RuntimeError(
+            f"multipole order {order} of the Hartree boundary needs the native "
+            f"extension 0.6.0 or newer; the loaded one stops at {supported}. "
+            "Rebuild it from src/parsec_python/acceleration/native, or keep "
+            "Solver_Lpole at 9 or below with Hartree_Boundary_Tolerance: off"
+        )
 
 
 def _hash_array(digest, name: str, values: np.ndarray) -> None:
@@ -130,11 +165,10 @@ class NativeMultipoleBoundaryBuilder:
                 "the origin-centered native multipole boundary requires a "
                 "spherical grid"
             )
-        order = int(multipole_order)
-        if order != multipole_order or not 0 <= order <= 9:
-            raise ValueError("multipole_order must be between 0 and 9")
+        order = _checked_order(multipole_order)
 
         native = _load_native()
+        _require_native_order(native, order)
         self.grid = grid
         self.order = order
         self._native_builder = native.MultipoleBoundaryBuilder(
@@ -147,6 +181,23 @@ class NativeMultipoleBoundaryBuilder:
             float(grid.spacing),
             order,
         )
+
+    # Static atomic tail added to every right-hand side, ``None`` for the
+    # multipole expansion alone.
+    boundary_tail = None
+
+    def set_boundary_tail(self, tail) -> None:
+        """Add the rows of ``tail`` to every later right-hand side.
+
+        ``tail`` is an :class:`parsec_python.Hartree.AtomicTail` built for
+        the order of this builder; ``None`` removes it.
+        """
+        if tail is not None and tail.order != self.order:
+            raise ValueError(
+                f"the atomic tail was built for multipole order {tail.order}, "
+                f"not {self.order}"
+            )
+        self.boundary_tail = tail
 
     @property
     def boundary_term_count(self) -> int:
@@ -177,6 +228,9 @@ class NativeMultipoleBoundaryBuilder:
         right_hand_side = np.asarray(
             payload["right_hand_side"], dtype=np.float64
         )
+        if self.boundary_tail is not None:
+            right_hand_side = np.require(right_hand_side, requirements="W")
+            right_hand_side[self.boundary_tail.rows] += self.boundary_tail.values
         return right_hand_side, boundary
 
 
@@ -194,12 +248,15 @@ class NativeSymmetryMultipoleBoundaryBuilder(NativeMultipoleBoundaryBuilder):
     ) -> None:
         if reduction.full_size != grid.size:
             raise ValueError("symmetry reduction does not match the Hartree grid")
-        order = int(multipole_order)
-        if order != multipole_order or not 0 <= order <= 9:
-            raise ValueError("multipole_order must be between 0 and 9")
-        hash_started = perf_counter()
-        key = _symmetry_boundary_key(grid, reduction, order, cache_key_seed)
-        hash_seconds = perf_counter() - hash_started
+        order = _checked_order(multipole_order)
+        # The key only addresses the cache entry.  Without a seed it hashes
+        # both full-grid coordinate arrays, so skip it when nothing reads it.
+        key = None
+        hash_seconds = 0.0
+        if cache_directory is not None:
+            hash_started = perf_counter()
+            key = _symmetry_boundary_key(grid, reduction, order, cache_key_seed)
+            hash_seconds = perf_counter() - hash_started
         path = (
             None
             if cache_directory is None
@@ -208,6 +265,7 @@ class NativeSymmetryMultipoleBoundaryBuilder(NativeMultipoleBoundaryBuilder):
         )
         moment_path = None if path is None else _moment_cache_path(path)
         native = _load_native()
+        _require_native_order(native, order)
         self.grid = grid
         self.order = order
         self.reduction = reduction
@@ -321,6 +379,17 @@ class NativeSymmetryMultipoleBoundaryBuilder(NativeMultipoleBoundaryBuilder):
             write_seconds=write_seconds,
         )
 
+    _reduced_tail = None
+
+    def set_boundary_tail(self, tail) -> None:
+        """Add ``U.T`` of the rows of ``tail`` to every later right-hand side."""
+        super().set_boundary_tail(tail)
+        self._reduced_tail = None
+        if tail is not None:
+            reduced = self.reduction.reduce_vector(tail.full(self.grid.size))
+            rows = np.flatnonzero(reduced)
+            self._reduced_tail = (rows, reduced[rows])
+
     def build_reduced(
         self,
         density: np.ndarray,
@@ -360,8 +429,13 @@ class NativeSymmetryMultipoleBoundaryBuilder(NativeMultipoleBoundaryBuilder):
                     moments[(angular_momentum, -magnetic)] = (
                         ((-1) ** magnetic) * np.conjugate(moment)
                     )
+        right_hand_side = np.asarray(payload["right_hand_side"], dtype=np.float64)
+        if self._reduced_tail is not None:
+            rows, values = self._reduced_tail
+            right_hand_side = np.require(right_hand_side, requirements="W")
+            right_hand_side[rows] += values
         return (
-            np.asarray(payload["right_hand_side"], dtype=np.float64),
+            right_hand_side,
             FastMultipoleExpansion(order=self.order, moments=moments),
         )
 

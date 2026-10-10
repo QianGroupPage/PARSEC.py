@@ -37,6 +37,7 @@ conjugate gradients.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import scipy.sparse as sp
@@ -45,6 +46,9 @@ from scipy.special import sph_harm_y
 from ..Grid import RealSpaceGrid
 from ..Laplacian import apply_negative_laplacian_boundary
 from ..models import HartreeSettings
+
+if TYPE_CHECKING:
+    from .boundary import AtomicTail
 
 
 @dataclass(frozen=True)
@@ -259,6 +263,9 @@ class HartreeResult:
         ``8*pi*rho_I - A_IB*V_B`` actually passed to CG.
     ``boundary``
         Boundary model constructed from the current density.
+    ``boundary_tail``
+        Static atomic tail that was added to the boundary values of
+        ``boundary``, ``None`` where the multipole expansion stands alone.
     ``iterations`` and ``matrix_vector_products``
         CG work counters.  Matrix-vector products include initial/final
         residual evaluations as well as iteration products.
@@ -274,6 +281,7 @@ class HartreeResult:
     matrix_vector_products: int
     residual_norm: float
     initial_residual_norm: float
+    boundary_tail: "AtomicTail | None" = None
 
 
 def _conjugate_gradient(
@@ -354,6 +362,20 @@ def _conjugate_gradient(
     )
 
 
+def _check_boundary_tail(boundary_tail, boundary_method, settings) -> None:
+    """Refuse a tail that does not complement the boundary being built."""
+
+    if boundary_method != "multipole":
+        raise ValueError(
+            "the atomic tail complements a multipole boundary, not a direct sum"
+        )
+    if boundary_tail.order != settings.multipole_order:
+        raise ValueError(
+            f"the atomic tail was built for multipole order {boundary_tail.order}, "
+            f"not {settings.multipole_order}"
+        )
+
+
 def solve_hartree(
     density: np.ndarray,
     grid: RealSpaceGrid,
@@ -362,6 +384,7 @@ def solve_hartree(
     initial_potential: np.ndarray | None = None,
     *,
     raise_on_nonconvergence: bool = True,
+    boundary_tail: "AtomicTail | None" = None,
 ) -> HartreeResult:
     """Construct and solve the isolated-system Hartree Poisson problem.
 
@@ -382,6 +405,10 @@ def solve_hartree(
     raise_on_nonconvergence
         Raise ``RuntimeError`` when CG misses its tolerance.  If false,
         return the unconverged result and its diagnostics.
+    boundary_tail
+        Static atomic tail of the multipole boundary values
+        (:mod:`parsec_python.Hartree.boundary`), built for the order of
+        ``settings``.  ``None`` leaves the expansion as PARSEC has it.
 
     Notes
     -----
@@ -435,6 +462,10 @@ def solve_hartree(
     # build_negative_laplacian stores only A_II.  Add the known exterior
     # values through b_eff = 8*pi*rho_I - A_IB*V_B.
     rhs = apply_negative_laplacian_boundary(rhs, grid, boundary.potential)
+    if boundary_tail is not None:
+        # V_B = M_L[rho] + C_L: the static rows are -A_IB C_L.
+        _check_boundary_tail(boundary_tail, boundary_method, settings)
+        rhs[boundary_tail.rows] += boundary_tail.values
 
     # Reusing the previous SCF potential can greatly reduce the initial
     # residual; zero is a valid starting guess for the first solve.
@@ -462,4 +493,5 @@ def solve_hartree(
         matrix_vector_products=matvecs,
         residual_norm=residual,
         initial_residual_norm=initial_residual,
+        boundary_tail=boundary_tail,
     )

@@ -231,7 +231,7 @@ class CuPySparseProjectorProjection:
         kernels = _kernels(cp)
         self.kernel = kernels[0] if self.parallel_reduction else kernels[2]
 
-    def __call__(self, vectors: Any):
+    def __call__(self, vectors: Any, *, output: Any | None = None):
         cp = self.cp
         # Chebyshev recurrences pass an already validated float64 CuPy view.
         # Avoid routing that hot path through ``cp.asarray`` thousands of
@@ -248,9 +248,12 @@ class CuPySparseProjectorProjection:
         if block.ndim != 2:
             raise ValueError("projector input must be a vector or column block")
         width = int(block.shape[1])
-        output = cp.empty(
-            (self.projector_count, width), dtype=cp.float64, order="F"
-        )
+        if output is None:
+            output = cp.empty(
+                (self.projector_count, width), dtype=cp.float64, order="F"
+            )
+        elif output.shape != (self.projector_count, width) or output.dtype != cp.dtype(cp.float64):
+            raise ValueError("projector output must match the float64 coefficients")
         threads = 128
         pair_count = self.projector_count * width
         itemsize = int(block.dtype.itemsize)

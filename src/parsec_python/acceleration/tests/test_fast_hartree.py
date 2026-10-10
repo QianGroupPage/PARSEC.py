@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
+import parsec_python.acceleration.Hartree.native_boundary as native_boundary_module
 from parsec_python.acceleration.Hartree.native_boundary import (
     NativeMultipoleBoundaryBuilder,
     NativeSymmetryMultipoleBoundaryBuilder,
@@ -208,6 +210,23 @@ class FastHartreeTests(unittest.TestCase):
             np.testing.assert_array_equal(second_rhs, first_rhs)
             for key, expected in first_boundary.moments.items():
                 self.assertEqual(second_boundary.moments[key], expected)
+
+            # Without a cache directory the key addresses nothing and is not
+            # hashed; the builder itself is the one that was cached above.
+            with patch.object(
+                native_boundary_module,
+                "_symmetry_boundary_key",
+                side_effect=AssertionError("a disabled cache hashed its key"),
+            ):
+                plain = NativeSymmetryMultipoleBoundaryBuilder(grid, reduction, 9)
+            plain_rhs, plain_boundary = plain.build_reduced(density)
+            self.assertIsNone(plain.cache_info.key)
+            self.assertIsNone(plain.cache_info.path)
+            self.assertEqual(plain.cache_info.status, "disabled-built")
+            self.assertEqual(plain.cache_info.hash_seconds, 0.0)
+            np.testing.assert_array_equal(plain_rhs, first_rhs)
+            for key, expected in first_boundary.moments.items():
+                self.assertEqual(plain_boundary.moments[key], expected)
         finally:
             for generated in directory.iterdir():
                 generated.unlink()

@@ -505,6 +505,9 @@ class CuPyHamiltonianBackend(HamiltonianBackend):
         self.statistics.initial_block_orth_fallbacks = (
             self.timing_stats.initial_block_orth_fallbacks
         )
+        self.statistics.eigensolver_bound_prepare_wall_seconds = (
+            self.timing_stats.eigensolver_bound_prepare_wall_seconds
+        )
         self.statistics.subspace_bound_seconds = (
             self.timing_stats.subspace_bound_seconds
         )
@@ -545,6 +548,7 @@ class CuPyHamiltonianBackend(HamiltonianBackend):
         self.statistics.device_seconds = (
             self.timing_stats.first_solve_seconds
             + self.timing_stats.subspace_solve_seconds
+            + self.timing_stats.eigensolver_bound_prepare_wall_seconds
         )
         self.statistics.device_to_host_seconds = self.timing_stats.download_seconds
         poisson_solver = getattr(self, "poisson_solver", None)

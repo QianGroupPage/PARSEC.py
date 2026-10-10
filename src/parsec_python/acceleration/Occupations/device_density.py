@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from time import perf_counter
 from typing import Any
 
@@ -53,6 +54,20 @@ class CuPyDeviceDensityBuilder:
             self.kernel.compile()
 
     def __call__(
+        self,
+        wavefunctions: Any,
+        occupations: np.ndarray,
+        volume_element: float,
+    ) -> np.ndarray:
+        # CuPy.asarray copies arrays from another CUDA device to the current
+        # device.  Reduce each sector where its orbitals already live instead
+        # of gathering O(grid * states) data onto GPU 0 at every SCF step.
+        device = getattr(wavefunctions, "device", None)
+        context = device if hasattr(device, "__enter__") else nullcontext()
+        with context:
+            return self._on_current_device(wavefunctions, occupations, volume_element)
+
+    def _on_current_device(
         self,
         wavefunctions: Any,
         occupations: np.ndarray,

@@ -34,7 +34,11 @@ std::uint64_t factorial(const int value) {
     return result;
 }
 
-std::vector<double> second_derivative_coefficients(const int expansion_order) {
+}  // namespace
+
+std::vector<double> centered_second_derivative_coefficients(
+    const int expansion_order
+) {
     if (
         expansion_order < 2 || expansion_order > 20 ||
         expansion_order % 2 != 0
@@ -67,8 +71,6 @@ std::vector<double> second_derivative_coefficients(const int expansion_order) {
     return coefficients;
 }
 
-}  // namespace
-
 py::dict build_negative_laplacian_buffers(
     const IndexArray& integer_coordinates,
     const IndexArray& index_min,
@@ -94,7 +96,8 @@ py::dict build_negative_laplacian_buffers(
         throw std::invalid_argument("spacing must be positive and finite");
     }
 
-    const auto coefficients = second_derivative_coefficients(expansion_order);
+    const auto coefficients =
+        centered_second_derivative_coefficients(expansion_order);
     const int width = expansion_order / 2;
     const double inverse_spacing_squared = 1.0 / (spacing * spacing);
     const std::int64_t point_count =

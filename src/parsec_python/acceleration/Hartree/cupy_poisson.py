@@ -93,6 +93,7 @@ def build_boundary_corrected_rhs(
     density: np.ndarray,
     grid: RealSpaceGrid,
     settings: HartreeSettings = HartreeSettings(),
+    boundary_tail=None,
 ) -> tuple[np.ndarray, HartreeBoundary]:
     """Build the exact reference Rydberg Poisson RHS on the host.
 
@@ -107,7 +108,7 @@ def build_boundary_corrected_rhs(
     stencil logic in CUDA code.
     """
 
-    return build_hartree_problem(density, grid, settings)
+    return build_hartree_problem(density, grid, settings, boundary_tail)
 
 
 def _device_scalar(value: Any) -> float:
@@ -230,6 +231,7 @@ class CuPyPoissonSolver:
         initial_potential: np.ndarray | None = None,
         *,
         raise_on_nonconvergence: bool = True,
+        boundary_tail=None,
     ) -> HartreeResult:
         """Construct the host boundary problem and solve it on the GPU."""
 
@@ -241,7 +243,9 @@ class CuPyPoissonSolver:
             raise ValueError("negative_laplacian shape does not match the grid")
 
         rhs_started = perf_counter()
-        rhs, boundary = build_boundary_corrected_rhs(density, grid, settings)
+        rhs, boundary = build_boundary_corrected_rhs(
+            density, grid, settings, boundary_tail
+        )
         rhs_seconds = perf_counter() - rhs_started
 
         if initial_potential is None:
@@ -307,6 +311,7 @@ class CuPyPoissonSolver:
             matrix_vector_products=matrix_vector_products,
             residual_norm=residual_norm,
             initial_residual_norm=initial_residual_norm,
+            boundary_tail=boundary_tail,
         )
 
 
@@ -318,6 +323,7 @@ def solve_hartree_cupy(
     initial_potential: np.ndarray | None = None,
     *,
     raise_on_nonconvergence: bool = True,
+    boundary_tail=None,
 ) -> HartreeResult:
     """One-shot convenience wrapper around :class:`CuPyPoissonSolver`.
 
@@ -332,6 +338,7 @@ def solve_hartree_cupy(
         settings,
         initial_potential,
         raise_on_nonconvergence=raise_on_nonconvergence,
+        boundary_tail=boundary_tail,
     )
 
 

@@ -13,12 +13,14 @@ from parsec_python.Input import (
     parse_parsec_input,
     summarize_translation,
 )
+from parsec_python.Output.parsec_output import domain_dry_run_lines
 from parsec_python.V_ion import load_pseudopotentials
 from parsec_python.cli import save_result_archive
 
 from .Output import AcceleratedTextReporter
 from .backends.selection import resolve_backend
 from .driver import (
+    hartree_boundary_check_seconds,
     prepare_single_point,
     profile_hamiltonian_components,
     run_scf,
@@ -80,6 +82,20 @@ def _npz_path(path: Path) -> Path:
     return path if path.suffix.lower() == ".npz" else path.with_suffix(path.suffix + ".npz")
 
 
+def _symmetry_cache_directory(arguments: argparse.Namespace) -> Path | None:
+    """Return the symmetry cache directory the command line named, if any.
+
+    A first calculation of a structure is fastest without a cache, so none
+    is read or written unless ``--symmetry-cache`` names its directory;
+    ``--no-symmetry-cache`` spells that default out.  A relative directory
+    is taken from the working directory, as it always was.
+    """
+
+    if arguments.symmetry_cache is None:
+        return None
+    return arguments.symmetry_cache.resolve()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -118,15 +134,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--symmetry-cache",
         type=Path,
         default=None,
+        metavar="DIRECTORY",
         help=(
-            "directory for exact-key cached representation operators; "
-            "defaults to .parsec_cache/symmetry beside parsec.in"
+            "read and write exact-key symmetry maps, representation "
+            "operators and Hartree boundary geometry in DIRECTORY; it pays "
+            "only for repeated calculations of the same structure and grid, "
+            "and no directory is read or written unless it is named here"
         ),
     )
     cache_group.add_argument(
         "--no-symmetry-cache",
         action="store_true",
-        help="disable the persistent representation-operator cache",
+        help="use no persistent symmetry cache (the default)",
     )
     parser.add_argument(
         "--pp-dir",
@@ -224,15 +243,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary = summarize_translation(translation)
     if arguments.dry_run:
         try:
-            load_pseudopotentials(
+            pseudopotentials = load_pseudopotentials(
                 translation.problem.pseudopotentials,
                 xc_functional=translation.problem.scf.xc_functional,
             )
+            domain_lines = domain_dry_run_lines(translation, pseudopotentials)
             selection = resolve_backend(arguments.backend, translation.problem)
         except (OSError, ValueError, BackendUnavailableError, NotImplementedError) as error:
             print(f"Validation error: {error}", file=sys.stderr)
             return 2
         print(summary)
+        for line in domain_lines:
+            print(line)
         for warning in translation.warnings:
             print(f"WARNING: {warning}")
         print(
@@ -254,15 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     input_directory = translation.source.parent
-    symmetry_cache_directory = (
-        None
-        if arguments.no_symmetry_cache
-        else (
-            arguments.symmetry_cache.resolve()
-            if arguments.symmetry_cache is not None
-            else input_directory / ".parsec_cache" / "symmetry"
-        )
-    )
+    symmetry_cache_directory = _symmetry_cache_directory(arguments)
     log_path = _resolve_output(
         arguments.log, input_directory, "parsec.out"
     )
@@ -291,7 +305,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("Input error: --log and --output resolve to the same path", file=sys.stderr)
             return 2
 
-    started = time.perf_counter()
+    # The default rule of the sphere ran in the parser, before this clock:
+    # its seconds belong to the calculation.  None for an input with a radius.
+    started = time.perf_counter() - translation.domain_rule_seconds
     run_log = _RunLog(log_path, quiet=arguments.quiet)
     try:
         with run_log as log:
@@ -337,7 +353,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             scf_started = time.perf_counter()
             result = run_scf(system, callback=reporter.iteration)
             scf_completed = time.perf_counter()
-            reporter.finish(result, scf_completed - scf_started)
+            # run_scf makes the optional check of the Hartree boundary before
+            # it returns: it is finalization, not SCF.
+            check_seconds = hartree_boundary_check_seconds(result)
+            reporter.finish(result, scf_completed - scf_started - check_seconds)
             reporting_completed = time.perf_counter()
             log.write(
                 f" Pre-SCF setup/reporting wall time [sec] : "
@@ -345,7 +364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             log.write(
                 f" Post-SCF finalization/reporting [sec] : "
-                f"{reporting_completed - scf_completed:11.6f}"
+                f"{reporting_completed - scf_completed + check_seconds:11.6f}"
             )
             log.write(
                 f" Total accelerated Python wall time [sec] : "

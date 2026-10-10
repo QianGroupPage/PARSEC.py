@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
-from typing import Iterable
+from time import perf_counter
+from typing import TYPE_CHECKING, Iterable
 
 import numpy as np
 
@@ -23,6 +24,9 @@ from ..models import (
     PeriodicGridSettings,
 )
 from ..MLDensity.field import normalize_density_units
+
+if TYPE_CHECKING:
+    from ..Hartree.domain import DomainChoice
 
 
 # PARSEC's ESDF table uses 1 bohr = 0.529177 angstrom exactly.
@@ -53,6 +57,16 @@ class ParsecInputTranslation:
     output_all_states: bool
     output_level: int
     ignore_symmetry: bool = False
+    # Domain_Energy_Tolerance in Ry.  ``domain`` is what the default rule
+    # chose where the input leaves the sphere radius to it, and ``None`` for
+    # an input with a radius or a box.  ``boundary_tolerance_from`` says
+    # where the Hartree boundary tolerance of the problem comes from: its
+    # own line ("input"), the fixed default beside a radius ("default"), or
+    # the rule ("rule").  ``domain_rule_seconds`` is what the rule took.
+    domain_energy_tolerance: float = 1.0e-3
+    domain: "DomainChoice | None" = None
+    boundary_tolerance_from: str = "default"
+    domain_rule_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -431,6 +445,9 @@ def _parse_parsec_input(
         "mixing_backoff",
         "solver_lpole",
         "full_hartree",
+        "hartree_boundary_tolerance",
+        "hartree_atomic_tail",
+        "domain_energy_tolerance",
         "atom_types_num",
         "correlation_type",
         "electric_field",
@@ -566,11 +583,13 @@ def _parse_parsec_input(
             "periodic wraparound"
         )
 
-    spacing = _physical_length(one("grid_spacing"), label="Grid_Spacing")
-    ignore_symmetry = optional_bool("ignore_symmetry")
     periodic_cell = None
     shape: str | None = None
+    # Only the sphere of a cluster can leave its radius to the default rule.
+    default_radius = False
     if is_periodic:
+        spacing = _physical_length(one("grid_spacing"), label="Grid_Spacing")
+        ignore_symmetry = optional_bool("ignore_symmetry")
         periodic_cell = _parse_cell_shape(scalar, blocks)
         grid = PeriodicGridSettings(
             spacing=spacing,
@@ -581,7 +600,18 @@ def _parse_parsec_input(
         )
     else:
         shape = _normalize_label(one("cluster_domain_shape", "sphere"))
-        if shape == "sphere":
+        spacing = _physical_length(one("grid_spacing"), label="Grid_Spacing")
+        # A sphere whose radius the input leaves out, or gives as "auto", gets
+        # it from the default rule, below, once the atoms and the charge are
+        # known.
+        default_radius = (
+            shape == "sphere"
+            and _normalize_label(one("boundary_sphere_radius", "auto")) == "auto"
+        )
+        if default_radius:
+            radius = None
+            box_lengths = None
+        elif shape == "sphere":
             radius = _physical_length(
                 one("boundary_sphere_radius"), label="Boundary_Sphere_Radius"
             )
@@ -613,10 +643,13 @@ def _parse_parsec_input(
                 f"Cluster_Domain_Shape={shape!r}; only sphere and box are supported"
             )
 
+        ignore_symmetry = optional_bool("ignore_symmetry")
         shift = (0.0, 0.0, 0.0) if ignore_symmetry else (0.5, 0.5, 0.5)
         grid = GridSettings(
             spacing=spacing,
-            radius=radius,
+            # The settings are checked here whatever the radius: with the
+            # default rule a stand-in, which the rule replaces below.
+            radius=spacing if default_radius else radius,
             expansion_order=_integer(
                 one("expansion_order", "12"), label="Expansion_Order"
             ),
@@ -875,10 +908,53 @@ def _parse_parsec_input(
             one("mixing_backoff", "0.5"), label="Mixing_Backoff"
         ),
     )
-    hartree = HartreeSettings(
-        multipole_order=_integer(one("solver_lpole", "9"), label="Solver_Lpole"),
-        boundary_method="direct" if optional_bool("full_hartree") else "auto",
+    # Solver_Lpole is PARSEC's keyword.  The two below are not: they control
+    # what a prepared system adds to the multipole boundary values, and
+    # "Hartree_Boundary_Tolerance: off" restores PARSEC's boundary.  "auto",
+    # and no line beside a radius left to the default rule, is the tolerance
+    # that rule derives from the electron count: it replaces the default
+    # below.
+    boundary_tolerance_text = one("hartree_boundary_tolerance", "1e-3 Ry")
+    boundary_tolerance_label = re.sub(
+        r"[.\s_-]", "", boundary_tolerance_text.lower()
     )
+    default_tolerance = boundary_tolerance_label == "auto" or (
+        default_radius and "hartree_boundary_tolerance" not in scalar
+    )
+    if boundary_tolerance_label == "auto":
+        boundary_tolerance_text = "1e-3 Ry"
+    if boundary_tolerance_label in {"off", "none", "no", "false"}:
+        boundary_tolerance = None
+    else:
+        boundary_tolerance = _energy_rydberg(
+            boundary_tolerance_text, label="Hartree_Boundary_Tolerance"
+        )
+    atomic_tail_text = re.sub(
+        r"[.\s_-]", "", one("hartree_atomic_tail", "auto").lower()
+    )
+    if atomic_tail_text == "auto":
+        atomic_tail = "auto"
+    else:
+        atomic_tail = (
+            "on"
+            if _boolean(atomic_tail_text, label="Hartree_Atomic_Tail")
+            else "off"
+        )
+    try:
+        hartree = HartreeSettings(
+            multipole_order=_integer(
+                one("solver_lpole", "9"), label="Solver_Lpole"
+            ),
+            boundary_method="direct" if optional_bool("full_hartree") else "auto",
+            boundary_tolerance=boundary_tolerance,
+            atomic_tail=atomic_tail,
+        )
+    except ValueError as error:
+        if isinstance(error, ParsecInputError):
+            raise
+        raise ParsecInputError(
+            f"Solver_Lpole/Hartree_Boundary_Tolerance: {error}"
+        ) from error
     scf = SCFSettings(
         max_iterations=_integer(one("max_iter", "50"), label="Max_Iter"),
         convergence_criterion=_energy_rydberg(
@@ -994,6 +1070,95 @@ def _parse_parsec_input(
             "and may be expensive."
         )
 
+    domain_energy_tolerance = _energy_rydberg(
+        one("domain_energy_tolerance", "1e-3 Ry"), label="Domain_Energy_Tolerance"
+    )
+    if not domain_energy_tolerance > 0.0:
+        raise ParsecInputError("Domain_Energy_Tolerance must be positive")
+    multipole_boundary = shape == "sphere" and hartree.boundary_method != "direct"
+    if default_radius and multipole_boundary and (
+        boundary_tolerance is None or atomic_tail == "off"
+    ):
+        raise ParsecInputError(
+            "Boundary_Sphere_Radius is left to the default rule, and the "
+            "default radius is chosen for the controlled Hartree boundary: "
+            "with Hartree_Boundary_Tolerance: off or Hartree_Atomic_Tail: off "
+            "give Boundary_Sphere_Radius"
+        )
+    domain = None
+    domain_rule_seconds = 0.0
+    boundary_tolerance_from = (
+        "input" if "hartree_boundary_tolerance" in scalar else "default"
+    )
+    if default_radius or (default_tolerance and multipole_boundary):
+        # The rule reads the geometry as the driver places it and the free
+        # atoms of the pseudopotential files.  An input with a radius and
+        # without "Hartree_Boundary_Tolerance: auto" does not come here.
+        from ..Hartree.domain import auto_boundary_tolerance, default_domain
+        from ..V_ion import (
+            center_cluster_geometry,
+            ionic_charge,
+            load_pseudopotentials,
+        )
+
+        rule_started = perf_counter()
+        placed = center_cluster_geometry(atoms) if recenter else tuple(atoms)
+        potentials = load_pseudopotentials(
+            specifications, xc_functional=xc_functional
+        )
+        electrons = ionic_charge(placed, potentials) - scf.net_charge
+        if electrons <= 0:
+            raise ParsecInputError("the requested system has no valence electrons")
+        if default_radius:
+            domain = default_domain(
+                placed,
+                potentials,
+                electrons,
+                spacing=grid.spacing,
+                shift=grid.shift[0],
+                stencil_half_width=grid.stencil_half_width,
+                budget=domain_energy_tolerance,
+                boundary_tolerance=None if default_tolerance else boundary_tolerance,
+                multipole_boundary=multipole_boundary,
+            )
+            # The run takes what the two texts read back to, as an input
+            # that holds them does.
+            grid = replace(
+                grid,
+                radius=_physical_length(
+                    domain.radius_text, label="Boundary_Sphere_Radius"
+                ),
+            )
+            rule_tolerance_text = domain.tolerance_text
+            if domain.extra_electrons > 1.0e-6:
+                warnings.append(
+                    f"{domain.extra_electrons:g} electron(s) more than the free "
+                    "atoms hold: their tail is unknown before the SCF; the "
+                    "vacuum was raised from "
+                    f"{domain.wall_vacuum / ANGSTROM_TO_BOHR:.1f} to "
+                    f"{domain.vacuum / ANGSTROM_TO_BOHR:.1f} ang. This does not "
+                    'guarantee Domain_Energy_Tolerance. Read "Density at the '
+                    'sphere" after the SCF; with the highest occupied level '
+                    "above zero the energy has no limit for a large sphere."
+                )
+        else:
+            vacuum = grid.radius - max(
+                float(np.linalg.norm(atom.position)) for atom in placed
+            )
+            tolerance = auto_boundary_tolerance(
+                electrons, domain_energy_tolerance, vacuum
+            )
+            rule_tolerance_text = f"{tolerance:.1e} Ry"
+        if rule_tolerance_text is not None:
+            hartree = replace(
+                hartree,
+                boundary_tolerance=_energy_rydberg(
+                    rule_tolerance_text, label="Hartree_Boundary_Tolerance"
+                ),
+            )
+            boundary_tolerance_from = "rule"
+        domain_rule_seconds = perf_counter() - rule_started
+
     problem = SinglePointInput(
         atoms=atoms,
         pseudopotentials=specifications,
@@ -1013,6 +1178,10 @@ def _parse_parsec_input(
         output_all_states=optional_bool("output_all_states"),
         output_level=_integer(one("output_level", "1"), label="Output_Level"),
         ignore_symmetry=ignore_symmetry,
+        domain_energy_tolerance=domain_energy_tolerance,
+        domain=domain,
+        boundary_tolerance_from=boundary_tolerance_from,
+        domain_rule_seconds=domain_rule_seconds,
     )
 
 
@@ -1092,6 +1261,26 @@ def summarize_translation(translation: ParsecInputTranslation) -> str:
             "Initial density: "
             f"{problem.initial_density_settings.method}, "
             f"normalize={problem.scf.normalize_initial_density}"
+        ),
+        # A periodic cell has no Hartree boundary values to control.
+        *(
+            ()
+            if problem.periodic_cell is not None
+            else (
+                f"Hartree boundary: Solver_Lpole={problem.hartree.multipole_order}, "
+                "tolerance="
+                + (
+                    "off"
+                    if problem.hartree.boundary_tolerance is None
+                    else f"{problem.hartree.boundary_tolerance:.6g} Ry"
+                )
+                + f", atomic_tail={problem.hartree.atomic_tail}"
+                + (
+                    " (direct Coulomb sum)"
+                    if problem.hartree.boundary_method == "direct"
+                    else ""
+                ),
+            )
         ),
         (
             f"Output: level={translation.output_level}, "

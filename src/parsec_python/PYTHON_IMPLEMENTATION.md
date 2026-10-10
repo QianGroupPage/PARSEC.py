@@ -309,6 +309,21 @@ PARSEC's `Full_Hartree` sum and is much more expensive. An origin-centered
 multipole series is deliberately rejected at general box faces because charge
 near a corner can lie outside its convergence radius.
 
+`solve_hartree` called with `HartreeSettings` alone builds PARSEC's boundary.
+A prepared system (`prepare_single_point`) first makes a plan of the boundary
+from the geometry (`Hartree/boundary.py`, `system.hartree_boundary`): the
+estimate `e(L)` of the potential the order-`L` expansion omits for the
+valence point charges at the nuclei. Where `e(Solver_Lpole)` exceeds a tenth
+of `boundary_tolerance`, the order becomes the smallest `L >= Solver_Lpole`
+with `e(L) <= boundary_tolerance` (60 with a warning if there is none), is
+written into `system.input.hartree.multipole_order`, and the static atomic
+tail `C_L(P) = 2 sum_a q_a/|P-R_a| - M_L[q](P)` at the exterior stencil
+points is added by `system.solve_hartree` to the right-hand side as the rows
+`-A_IB C_L`. `boundary_tolerance=None` with `atomic_tail="auto"` is PARSEC's
+boundary, bitwise. The reference path evaluates SciPy harmonics, which is
+slow at the orders large clusters get; those are runs for the accelerated
+path.
+
 ### CA-LDA and PBE
 
 ```python
@@ -344,7 +359,11 @@ well-defined:
 |---|---:|
 | `GridSettings.expansion_order` | 12 |
 | `GridSettings.shift` | `(0.5,0.5,0.5)` |
-| Hartree multipole order | 9 |
+| sphere radius (`Boundary_Sphere_Radius`) in an input | chosen by the default rule of `Hartree/domain.py`; `GridSettings.radius` itself has no default |
+| `Domain_Energy_Tolerance` of that rule | `1e-3 Ry` |
+| Hartree multipole order (`Solver_Lpole`, 0 to 60) | 9 |
+| Hartree boundary tolerance (`Hartree_Boundary_Tolerance`) | `1e-3 Ry`; with the radius left to the rule, at most that and tightened with the electron count (`README.md`) |
+| Hartree atomic tail (`Hartree_Atomic_Tail`) | `auto` |
 | Hartree boundary method | `auto` |
 | Hartree relative/absolute tolerance | `1e-7` / `1e-13` |
 | Hartree max matrix-vector products | 1600 |

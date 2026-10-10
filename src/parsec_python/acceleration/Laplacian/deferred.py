@@ -1,15 +1,17 @@
-"""Defer the full-grid finite-difference CSR when symmetry caches suffice.
+"""Defer the full-grid finite-difference CSR until something reads it.
 
 The finite-difference operator is determined completely by the active integer
-grid, its lookup table, the stencil order, and the grid spacing.  A SHA-256
-fingerprint of those exact inputs can therefore validate a cached reduced
-operator without first allocating the much larger full-grid CSR matrix.
+grid, its lookup table, the stencil order, and the grid spacing.  The symmetry
+sector route builds its packed stencils from those inputs directly, and a
+SHA-256 fingerprint of them validates a cached reduced operator, so neither
+needs the much larger full-grid CSR matrix.
 
-This object is deliberately narrow: it exposes only ``shape`` and ``nnz`` for
-setup reporting, an exact ``cache_key`` for downstream content-addressed
-caches, and :meth:`materialize` for every cache-miss or full-grid fallback.
-Materialization still calls the validated C++ builder and checks its shape and
-nonzero count, so deferral changes setup order rather than the operator.
+This object is deliberately narrow: it exposes the grid, ``shape`` and ``nnz``
+for setup reporting, an exact ``cache_key`` for downstream content-addressed
+caches, and :meth:`materialize` for every consumer of the full-grid matrix;
+``operator @ vectors`` materializes too.  Materialization still calls the
+validated C++ builder and checks its shape and nonzero count, so deferral
+changes setup order rather than the operator.
 """
 
 from __future__ import annotations
@@ -56,46 +58,28 @@ def _operator_key(grid: RealSpaceGrid) -> str:
 def _operator_nnz(grid: RealSpaceGrid) -> int:
     """Count the exact centered and in-domain axial stencil entries.
 
-    This vectorized count is far cheaper than allocating CSR indices and
-    float64 coefficients.  It follows the same signed-shell enumeration as
-    ``build_negative_laplacian_buffers`` and is checked again if the matrix is
-    eventually materialized.
+    A row has its centered entry and one entry for every stencil neighbor
+    inside the domain.  Two active points ``j`` steps apart along an axis are
+    neighbors of each other, so the count is the active points plus twice the
+    active pairs of every axis and shell.  The pairs are read off the Boolean
+    mask of the lookup table, which is far cheaper than gathering a neighbor
+    row for every grid point and shell.  The total is checked again if the
+    matrix is eventually materialized.
     """
 
-    coordinates = np.asarray(grid.integer_coordinates, dtype=np.int64)
-    local = coordinates - np.asarray(grid.index_min, dtype=np.int64)
-    lookup = np.asarray(grid.lookup, dtype=np.int64)
-    flat_lookup = lookup.reshape(-1)
-    shape = np.asarray(lookup.shape, dtype=np.int64)
-    strides = np.asarray(
-        (int(shape[1] * shape[2]), int(shape[2]), 1), dtype=np.int64
-    )
-    base_offsets = (
-        local[:, 0] * strides[0]
-        + local[:, 1] * strides[1]
-        + local[:, 2]
-    )
-    count = int(coordinates.shape[0])  # centered coefficient in every row
+    active = np.asarray(grid.lookup) >= 0
     width = int(grid.settings.expansion_order) // 2
+    pairs = 0
     for axis in range(3):
-        axis_local = local[:, axis]
-        axis_stride = int(strides[axis])
-        axis_extent = int(shape[axis])
-        for signed_shell in range(-width, width + 1):
-            if signed_shell == 0:
-                continue
-            displaced = axis_local + signed_shell
-            valid = (displaced >= 0) & (displaced < axis_extent)
-            if not np.any(valid):
-                continue
-            offsets = base_offsets[valid] + signed_shell * axis_stride
-            count += int(np.count_nonzero(flat_lookup[offsets] >= 0))
-    return count
+        along = np.moveaxis(active, axis, 0)
+        for shell in range(1, min(width, along.shape[0] - 1) + 1):
+            pairs += int(np.count_nonzero(along[shell:] & along[:-shell]))
+    return int(np.count_nonzero(active)) + 2 * pairs
 
 
 def _nnz_cache_path(
     cache_directory: os.PathLike[str] | str | None,
-    cache_key: str,
+    cache_key: str | None,
 ) -> Path | None:
     if cache_directory is None:
         return None
@@ -131,11 +115,14 @@ def _validated_cached_nnz(
 
 def _load_or_count_nnz(
     grid: RealSpaceGrid,
-    cache_key: str,
+    cache_key: str | None,
     shape: tuple[int, int],
     cache_directory: os.PathLike[str] | str | None,
 ) -> tuple[int, str, Path | None]:
-    """Resolve exact NNZ metadata without rescanning a known full grid."""
+    """Resolve exact NNZ metadata without rescanning a known full grid.
+
+    ``cache_key`` may be ``None`` only without a cache directory.
+    """
 
     path = _nnz_cache_path(cache_directory, cache_key)
     if path is None:
@@ -187,40 +174,82 @@ def _load_or_count_nnz(
 
 
 class DeferredNativeNegativeLaplacian:
-    """Exact lazy proxy for one native full-grid ``-nabla_FD^2`` matrix."""
+    """Exact lazy proxy for one native full-grid ``-nabla_FD^2`` matrix.
+
+    ``sharing_matrix_with`` is an earlier descriptor of the same grid.  The
+    two then hold one memoized matrix, whichever of them builds it.  A
+    resident process gives every calculation a descriptor of its own for the
+    report, and the matrix must not be built again for each of them.
+    """
 
     def __init__(
         self,
         grid: RealSpaceGrid,
         *,
         cache_directory: os.PathLike[str] | str | None = None,
+        sharing_matrix_with: DeferredNativeNegativeLaplacian | None = None,
     ) -> None:
-        started = perf_counter()
+        if sharing_matrix_with is not None and sharing_matrix_with.grid is not grid:
+            raise ValueError("descriptors sharing a matrix must have the same grid")
         self.grid = grid
         self.shape = (int(grid.size), int(grid.size))
-        self.cache_key = _operator_key(grid)
-        self.hash_seconds = perf_counter() - started
+        self._cache_key: str | None = None
+        self.hash_seconds = 0.0
+        # Only a cache looks the key up.  Without a cache directory it is
+        # hashed when something asks for it, which a calculation that builds
+        # its sector stencils from the grid never does.
+        if cache_directory is not None:
+            self._cache_key = self._hashed_key()
         started = perf_counter()
         self.nnz, self.nnz_cache_status, self.nnz_cache_path = (
             _load_or_count_nnz(
                 grid,
-                self.cache_key,
+                self._cache_key,
                 self.shape,
                 cache_directory,
             )
         )
         self.nnz_count_seconds = perf_counter() - started
         self.materialization_seconds = 0.0
-        self._matrix: sp.csr_matrix | None = None
+        # One cell for every descriptor that shares the matrix.
+        self._memo: list[sp.csr_matrix | None] = (
+            [None] if sharing_matrix_with is None else sharing_matrix_with._memo
+        )
+        # ``built`` once this descriptor has run the builder, ``shared`` once
+        # it has handed out a matrix another descriptor built.
+        self.matrix_origin: str | None = None
+
+    def _hashed_key(self) -> str:
+        started = perf_counter()
+        key = _operator_key(self.grid)
+        self.hash_seconds += perf_counter() - started
+        return key
+
+    @property
+    def cache_key(self) -> str:
+        """Exact content key of the operator, hashed on first request."""
+
+        if self._cache_key is None:
+            self._cache_key = self._hashed_key()
+        return self._cache_key
+
+    @property
+    def hashed_cache_key(self) -> str | None:
+        """The content key if something has asked for it, else ``None``."""
+
+        return self._cache_key
 
     @property
     def materialized(self) -> bool:
-        return self._matrix is not None
+        """Whether the matrix is in memory, built here or shared."""
+
+        return self._memo[0] is not None
 
     def materialize(self) -> sp.csr_matrix:
         """Build and memoize the validated native CSR on first demand."""
 
-        if self._matrix is None:
+        matrix = self._memo[0]
+        if matrix is None:
             # Local import avoids importing the optional extension merely to
             # construct an exact cache key.
             from ..backends.native import build_native_negative_laplacian
@@ -233,8 +262,21 @@ class DeferredNativeNegativeLaplacian:
                     "materialized finite-difference operator does not match "
                     "its exact deferred descriptor"
                 )
-            self._matrix = matrix
-        return self._matrix
+            self._memo[0] = matrix
+            self.matrix_origin = "built"
+        elif self.matrix_origin is None:
+            self.matrix_origin = "shared"
+        return matrix
+
+    def __matmul__(self, vectors: Any) -> Any:
+        """Apply the operator, building its matrix on first use.
+
+        The reference Hamiltonian and Poisson solve of a prepared system
+        apply their kinetic operator this way.  The accelerated SCF calls
+        neither; a diagnostic that does gets the full-grid action.
+        """
+
+        return self.materialize() @ vectors
 
     def __repr__(self) -> str:
         state = "materialized" if self.materialized else "deferred"

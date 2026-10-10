@@ -36,9 +36,17 @@ class AcceleratedPreparedSinglePointSystem:
     total_energy_evaluator: Callable[..., object] | None = None
     scalar_field_adapter: object | None = None
     materialize_final_wavefunctions: bool = True
+    # ``max |C_L|`` of the atomic tail the substituted Hartree solver adds.
+    boundary_tail_maximum: float | None = None
 
     def __getattr__(self, name: str):
         return getattr(self.reference, name)
+
+    @property
+    def hartree_boundary_tail_maximum(self) -> float | None:
+        if self.boundary_tail_maximum is not None:
+            return self.boundary_tail_maximum
+        return getattr(self.reference, "hartree_boundary_tail_maximum", None)
 
     def hamiltonian(self, effective_potential) -> BoundHamiltonian:
         return self.backend.bind(effective_potential)
@@ -77,10 +85,14 @@ def run_scf(
             total_energy_evaluator=system.total_energy_evaluator,
             scalar_field_adapter=system.scalar_field_adapter,
         )
-    except Exception:
+        return _finalize_result(system, result, symmetry_eigensolver)
+    finally:
         if callable(restore_allocator):
             restore_allocator()
-        raise
+
+
+def _finalize_result(system, result, symmetry_eigensolver):
+    """Finalize output inside the allocator-restoration scope, including OOMs."""
     # The CuPy SCF downloads only density vectors during nonlinear iterations.
     # Materialize the requested orbitals once for the public final result.
     if (
@@ -95,15 +107,18 @@ def run_scf(
 
         cp, _ = require_cupy()
         wavefunctions = result.wavefunctions
+        materialize_host = getattr(wavefunctions, "to_full_host", None)
         materialize = getattr(wavefunctions, "to_full_device", None)
         if callable(materialize) or isinstance(wavefunctions, cp.ndarray):
             synchronize()
             started = perf_counter()
-            if callable(materialize):
+            if callable(materialize_host):
+                result.wavefunctions = materialize_host()
+            elif callable(materialize):
                 wavefunctions = materialize()
-            result.wavefunctions = np.asarray(
-                cp.asnumpy(wavefunctions), dtype=np.float64
-            )
+                result.wavefunctions = np.asarray(cp.asnumpy(wavefunctions), dtype=np.float64)
+            else:
+                result.wavefunctions = np.asarray(cp.asnumpy(wavefunctions), dtype=np.float64)
             synchronize()
             timing_stats = getattr(system.backend, "timing_stats", None)
             if timing_stats is not None:
@@ -122,8 +137,21 @@ def run_scf(
             "orbital_memory_allocator",
             "orbital_sector_state_storage",
         }
+        # Written at preparation from what the sectors held and from the
+        # switch of the filter graphs; now from the later passes that ran
+        # and from the graphs that the filters of the sectors recorded.
+        ran = {
+            "orbital_sector_later_filter_precision": getattr(
+                symmetry_eigensolver, "later_filter_precision", None
+            ),
+            "orbital_sector_filter_graphs": getattr(
+                symmetry_eigensolver, "recorded_filter_graphs", None
+            ),
+        }
         details = tuple(
-            item for item in system.backend_info.details if item[0] not in keys
+            (item[0], ran[item[0]]) if ran.get(item[0]) is not None else item
+            for item in system.backend_info.details
+            if item[0] not in keys
         ) + (
             (
                 "orbital_sector_final_state_counts",
@@ -145,8 +173,6 @@ def run_scf(
             system.backend_info, details=details
         )
         system.backend.info = system.backend_info
-    if callable(restore_allocator):
-        restore_allocator()
     return AcceleratedSinglePointResult(
         result=result,
         backend=system.backend_info,

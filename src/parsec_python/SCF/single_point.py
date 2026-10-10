@@ -15,7 +15,7 @@ eigenpair or energy residual.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import time
 from typing import Callable
 
@@ -33,7 +33,15 @@ from ..Eigensolvers import (
 from ..Energy import total_energy
 from ..Grid import RealSpaceGrid, build_cluster_grid
 from ..Hamiltonian import KohnShamHamiltonian
-from ..Hartree import HartreeResult, solve_hartree
+from ..Hartree import (
+    AtomicTail,
+    HartreeBoundaryPlan,
+    HartreeResult,
+    build_atomic_tail as build_reference_atomic_tail,
+    plan_hartree_boundary,
+    solve_hartree,
+    valence_point_charges,
+)
 from ..Laplacian import build_negative_laplacian
 from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import density_from_orbitals, fermi_occupations
@@ -50,6 +58,7 @@ from ..V_ion import (
     superpose_atomic_density,
 )
 from ..models import (
+    GridSettings,
     PreparationTimings,
     RunTimings,
     SCFIteration,
@@ -68,6 +77,11 @@ class PreparedSinglePointSystem:
     change when only the electronic density is iterated.  Hartree and XC
     potentials are therefore absent here: they are rebuilt from the current
     density inside :func:`run_scf`.
+
+    ``hartree_boundary`` is the plan of the Hartree boundary values made
+    from the geometry (:mod:`parsec_python.Hartree.boundary`), and
+    ``hartree_boundary_tail`` the static atomic tail where the plan has one.
+    A system built without a plan has PARSEC's multipole boundary.
     """
 
     input: SinglePointInput
@@ -84,6 +98,15 @@ class PreparedSinglePointSystem:
     atomic_reference_correction: float = 0.0
     alpha_z_energy: float = 0.0
     timings: PreparationTimings = field(default_factory=PreparationTimings)
+    hartree_boundary: HartreeBoundaryPlan | None = None
+    hartree_boundary_tail: AtomicTail | None = None
+
+    @property
+    def hartree_boundary_tail_maximum(self) -> float | None:
+        """``max |C_L|`` of the atomic tail in Ry, ``None`` without one."""
+
+        tail = self.hartree_boundary_tail
+        return None if tail is None else tail.maximum
 
     def hamiltonian(self, effective_potential: np.ndarray) -> KohnShamHamiltonian:
         """Compose the current SCF Hamiltonian without forming a dense matrix.
@@ -116,6 +139,16 @@ class PreparedSinglePointSystem:
         density source and multipole/direct Dirichlet boundary determine the
         physical solution independently of that warm start.
         """
+        plan = self.hartree_boundary
+        if (
+            plan is not None
+            and plan.atomic_tail
+            and self.hartree_boundary_tail is None
+        ):
+            raise RuntimeError(
+                "the Hartree boundary of this system includes the atomic "
+                "tail, which was not built with it"
+            )
         return solve_hartree(
             density,
             self.grid,
@@ -123,6 +156,7 @@ class PreparedSinglePointSystem:
             self.input.hartree,
             initial_potential,
             raise_on_nonconvergence=raise_on_nonconvergence,
+            boundary_tail=self.hartree_boundary_tail,
         )
 
     def evaluate_xc(self, density: np.ndarray) -> XCResult:
@@ -140,18 +174,36 @@ class PreparedSinglePointSystem:
 def prepare_single_point(
     problem: SinglePointInput,
     *,
+    grid_builder: Callable[[GridSettings], RealSpaceGrid] | None = None,
     negative_laplacian_builder: Callable[[RealSpaceGrid], sp.csr_matrix] | None = None,
     local_ionic_builder: Callable[..., np.ndarray] | None = None,
     nonlocal_projector_builder: Callable[..., NonlocalProjectorOperator] | None = None,
     atomic_density_builder: Callable[..., np.ndarray] | None = None,
+    orbital_operators_only: bool = False,
+    build_atomic_tail: bool = True,
 ) -> PreparedSinglePointSystem:
     """Build every static component, but do not enter the SCF loop.
 
     The optional builders are execution-only extension points for the sibling
     accelerated package.  Omitting them preserves the validated NumPy/SciPy
-    construction exactly.  Supplied builders must return the same
-    compressed-grid Laplacian, local ionic field, KB projector factorization,
-    and atomic-density superposition respectively.
+    construction exactly.  Supplied builders must return the same cluster
+    grid, compressed-grid Laplacian, local ionic field, KB projector
+    factorization, and atomic-density superposition respectively.
+
+    ``orbital_operators_only`` serves a process that applies the Hamiltonian
+    for an SCF loop running in another process.  It builds the grid, the
+    kinetic operator and the KB projectors and stops there: the local ionic
+    potential and both densities are ``None`` and the two ionic energies are
+    NaN.  Such a system must not be passed to :func:`run_scf`.
+
+    The plan of the Hartree boundary is made here from the geometry, also
+    with ``orbital_operators_only``.  Where it raises the multipole order
+    above ``Solver_Lpole``, ``input.hartree.multipole_order`` of the returned
+    system is the order in use and ``minimum_multipole_order`` the
+    ``Solver_Lpole`` that was asked.  ``build_atomic_tail=False`` leaves the
+    static tail of a plan that has one to the caller, who builds it for the
+    Hartree solver it substitutes; ``solve_hartree`` of the returned system
+    then refuses to run.
     """
     preparation_start = time.perf_counter()
     # 1. Geometry, pseudopotentials, and electron count.
@@ -169,12 +221,31 @@ def prepare_single_point(
     electron_count = ionic_charge(atoms, pseudopotentials) - problem.scf.net_charge
     if electron_count <= 0:
         raise ValueError("the requested system has no valence electrons")
+    boundary_plan = plan_hartree_boundary(
+        problem.hartree,
+        problem.grid,
+        *valence_point_charges(atoms, pseudopotentials, electron_count),
+    )
+    if boundary_plan.order != problem.hartree.multipole_order:
+        # Every Hartree builder reads the order from the input of the
+        # prepared system.  The Solver_Lpole that was asked stays beside it:
+        # a preparation of that input starts its plan there again.
+        problem = replace(
+            problem,
+            hartree=replace(
+                problem.hartree,
+                multipole_order=boundary_plan.order,
+                minimum_multipole_order=boundary_plan.minimum_order,
+            ),
+        )
 
     # 2. Real-space domain and finite-difference kinetic operator.  In
     # Rydberg units this full sparse operator is T=-nabla_FD^2.  It is static
     # and reused in every eigensolver Hamiltonian application.
     stage_start = time.perf_counter()
-    grid = build_cluster_grid(problem.grid)
+    grid = (build_cluster_grid if grid_builder is None else grid_builder)(
+        problem.grid
+    )
     grid_seconds = time.perf_counter() - stage_start
     for atom in atoms:
         coordinate = np.asarray(atom.position)
@@ -206,8 +277,12 @@ def prepare_single_point(
         if local_ionic_builder is None
         else local_ionic_builder
     )
-    ionic_potential = build_local(
-        grid, atoms, pseudopotentials, problem.pseudopotentials
+    ionic_potential = (
+        None
+        if orbital_operators_only
+        else build_local(
+            grid, atoms, pseudopotentials, problem.pseudopotentials
+        )
     )
     local_ionic_seconds = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
@@ -221,6 +296,83 @@ def prepare_single_point(
     )
     nonlocal_ionic_seconds = time.perf_counter() - stage_start
 
+    if orbital_operators_only:
+        # Everything below is read only by the SCF loop: the starting
+        # density and its normalization, the frozen core density of the XC
+        # term, and the ionic energies.  None of it enters H.
+        return PreparedSinglePointSystem(
+            input=problem,
+            atoms=atoms,
+            electron_count=electron_count,
+            pseudopotentials=pseudopotentials,
+            grid=grid,
+            negative_laplacian=negative_laplacian,
+            ionic_potential=None,
+            nonlocal_operator=nonlocal_operator,
+            initial_density=None,
+            core_density=None,
+            ion_ion_energy=float("nan"),
+            atomic_reference_correction=float("nan"),
+            timings=PreparationTimings(
+                pseudopotential_loading_seconds=pseudopotential_loading_seconds,
+                grid_seconds=grid_seconds,
+                finite_difference_seconds=finite_difference_seconds,
+                nonlocal_ionic_seconds=nonlocal_ionic_seconds,
+                hartree_boundary_seconds=boundary_plan.seconds,
+                total_seconds=time.perf_counter() - preparation_start,
+            ),
+            hartree_boundary=boundary_plan,
+        )
+
+    fields, stage_seconds = _density_and_energy_stages(
+        problem,
+        grid,
+        atoms,
+        pseudopotentials,
+        electron_count,
+        atomic_density_builder,
+        boundary_plan,
+        build_atomic_tail,
+    )
+    preparation_timings = PreparationTimings(
+        pseudopotential_loading_seconds=pseudopotential_loading_seconds,
+        grid_seconds=grid_seconds,
+        finite_difference_seconds=finite_difference_seconds,
+        local_ionic_seconds=local_ionic_seconds,
+        nonlocal_ionic_seconds=nonlocal_ionic_seconds,
+        **stage_seconds,
+        total_seconds=time.perf_counter() - preparation_start,
+    )
+    return PreparedSinglePointSystem(
+        input=problem,
+        atoms=atoms,
+        electron_count=electron_count,
+        pseudopotentials=pseudopotentials,
+        grid=grid,
+        negative_laplacian=negative_laplacian,
+        ionic_potential=ionic_potential,
+        nonlocal_operator=nonlocal_operator,
+        **fields,
+        timings=preparation_timings,
+        hartree_boundary=boundary_plan,
+    )
+
+
+def _density_and_energy_stages(
+    problem: SinglePointInput,
+    grid: RealSpaceGrid,
+    atoms: tuple,
+    pseudopotentials: dict[str, ParsecPseudopotential],
+    electron_count: float,
+    atomic_density_builder: Callable[..., np.ndarray] | None,
+    boundary_plan: HartreeBoundaryPlan | None,
+    build_atomic_tail: bool,
+) -> tuple[dict[str, object], dict[str, float]]:
+    """Run stages 4 to 6 of the preparation.
+
+    Returns the fields of :class:`PreparedSinglePointSystem` they build and
+    the seconds of each stage under its :class:`PreparationTimings` name.
+    """
     # 4. Initial valence density and nonlinear core-correction density.  SAD
     # remains the PARSEC-compatible default.  A file/ML provider returns the
     # same one-dimensional volume-density representation on this exact DFT
@@ -274,31 +426,92 @@ def prepare_single_point(
         )
     )
     ion_ion_seconds = time.perf_counter() - stage_start
-    preparation_timings = PreparationTimings(
-        pseudopotential_loading_seconds=pseudopotential_loading_seconds,
-        grid_seconds=grid_seconds,
-        finite_difference_seconds=finite_difference_seconds,
-        local_ionic_seconds=local_ionic_seconds,
-        nonlocal_ionic_seconds=nonlocal_ionic_seconds,
-        initial_density_seconds=initial_density_seconds,
-        core_density_seconds=core_density_seconds,
-        ion_ion_seconds=ion_ion_seconds,
-        total_seconds=time.perf_counter() - preparation_start,
+
+    # 6. Static atomic tail of the Hartree boundary values, where the plan
+    # made from the geometry has one.  Only the Hartree solver reads it.
+    boundary_tail = None
+    boundary_seconds = 0.0 if boundary_plan is None else boundary_plan.seconds
+    if boundary_plan is not None and boundary_plan.atomic_tail and build_atomic_tail:
+        boundary_tail = build_reference_atomic_tail(
+            grid,
+            *valence_point_charges(atoms, pseudopotentials, electron_count),
+            boundary_plan.order,
+        )
+        boundary_seconds += boundary_tail.seconds
+    return (
+        dict(
+            initial_density=initial_density,
+            core_density=core_density,
+            ion_ion_energy=repulsion,
+            atomic_reference_correction=atomic_reference_correction,
+            hartree_boundary_tail=boundary_tail,
+        ),
+        dict(
+            initial_density_seconds=initial_density_seconds,
+            core_density_seconds=core_density_seconds,
+            ion_ion_seconds=ion_ion_seconds,
+            hartree_boundary_seconds=boundary_seconds,
+        ),
     )
-    return PreparedSinglePointSystem(
-        input=problem,
-        atoms=atoms,
-        electron_count=electron_count,
-        pseudopotentials=pseudopotentials,
-        grid=grid,
-        negative_laplacian=negative_laplacian,
+
+
+def complete_single_point(
+    system: PreparedSinglePointSystem,
+    *,
+    local_ionic_builder: Callable[..., np.ndarray] | None = None,
+    atomic_density_builder: Callable[..., np.ndarray] | None = None,
+    build_atomic_tail: bool = True,
+) -> PreparedSinglePointSystem:
+    """Add what ``orbital_operators_only`` left out of ``system``.
+
+    The local ionic potential, both densities and the two ionic energies are
+    built by the calls :func:`prepare_single_point` makes for them, from the
+    grid, atoms and pseudopotentials of ``system`` and with the same optional
+    builders, so each equals the field of a complete preparation bit for bit.
+    None of them reads the kinetic operator or the projectors, and nothing
+    before :func:`run_scf` reads them: a caller may run this on another
+    thread beside the set-up that follows the preparation.
+
+    The static atomic tail of the Hartree boundary is built with them where
+    the plan of ``system`` has one, unless ``build_atomic_tail`` is false.
+
+    The returned system shares every other field with ``system``.  The times
+    of its stages are measured here.  ``total_seconds`` stays the wall
+    time of the call that prepared ``system``: this call may have run beside
+    other work of the caller, who alone knows what it added to the wall time.
+    """
+    if system.ionic_potential is not None:
+        raise ValueError("the system already has the fields of the SCF loop")
+    started = time.perf_counter()
+    problem = system.input
+    build_local = (
+        build_local_ionic_potential
+        if local_ionic_builder is None
+        else local_ionic_builder
+    )
+    ionic_potential = build_local(
+        system.grid, system.atoms, system.pseudopotentials, problem.pseudopotentials
+    )
+    local_ionic_seconds = time.perf_counter() - started
+    fields, stage_seconds = _density_and_energy_stages(
+        problem,
+        system.grid,
+        system.atoms,
+        system.pseudopotentials,
+        system.electron_count,
+        atomic_density_builder,
+        system.hartree_boundary,
+        build_atomic_tail,
+    )
+    return replace(
+        system,
         ionic_potential=ionic_potential,
-        nonlocal_operator=nonlocal_operator,
-        initial_density=initial_density,
-        core_density=core_density,
-        ion_ion_energy=repulsion,
-        atomic_reference_correction=atomic_reference_correction,
-        timings=preparation_timings,
+        **fields,
+        timings=replace(
+            system.timings,
+            local_ionic_seconds=local_ionic_seconds,
+            **stage_seconds,
+        ),
     )
 
 

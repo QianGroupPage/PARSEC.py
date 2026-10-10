@@ -436,6 +436,183 @@ class IntegrationTests(unittest.TestCase):
             + result.xc_potential,
         )
 
+    def test_orbital_operators_only_builds_the_same_hamiltonian_terms(self) -> None:
+        path = Path(__file__).parent / "data" / "H_CORE_POTRE.DAT"
+        problem = SinglePointInput(
+            atoms=[Atom("H", [0.3, 0.0, -0.2]), Atom("H", [-0.9, 0.4, 0.5])],
+            pseudopotentials={"H": SpeciesPotential(path, 0)},
+            grid=GridSettings(spacing=0.8, radius=4.0, expansion_order=4),
+            scf=SCFSettings(max_iterations=1, number_of_states=3),
+            eigensolver=EigensolverSettings(method="chebff"),
+        )
+        complete = prepare_single_point(problem)
+
+        def unused(*_args, **_kwargs):
+            raise AssertionError("a field of the SCF loop was built")
+
+        # The public driver takes the problem alone; this option belongs to
+        # the builder-level entry point the accelerated package calls.
+        from parsec_python.SCF import prepare_single_point as prepare_components
+
+        reduced = prepare_components(
+            problem,
+            orbital_operators_only=True,
+            local_ionic_builder=unused,
+            atomic_density_builder=unused,
+        )
+        # Everything that enters H is the complete preparation, bit for bit.
+        self.assertEqual(len(reduced.atoms), len(complete.atoms))
+        for atom, expected in zip(reduced.atoms, complete.atoms, strict=True):
+            self.assertEqual(atom.symbol, expected.symbol)
+            np.testing.assert_array_equal(atom.position, expected.position)
+        self.assertEqual(reduced.electron_count, complete.electron_count)
+        np.testing.assert_array_equal(
+            reduced.grid.coordinates, complete.grid.coordinates
+        )
+        for name in ("indptr", "indices", "data"):
+            with self.subTest(buffer=name):
+                np.testing.assert_array_equal(
+                    getattr(reduced.negative_laplacian, name),
+                    getattr(complete.negative_laplacian, name),
+                )
+                np.testing.assert_array_equal(
+                    getattr(reduced.nonlocal_operator.projectors, name),
+                    getattr(complete.nonlocal_operator.projectors, name),
+                )
+        np.testing.assert_array_equal(
+            reduced.nonlocal_operator.signs, complete.nonlocal_operator.signs
+        )
+        self.assertGreater(reduced.nonlocal_operator.projectors.nnz, 0)
+        # The fields of the SCF loop are absent, not empty or zero.
+        self.assertIsNone(reduced.ionic_potential)
+        self.assertIsNone(reduced.initial_density)
+        self.assertIsNone(reduced.core_density)
+        self.assertTrue(np.isnan(reduced.ion_ion_energy))
+        self.assertTrue(np.isnan(reduced.atomic_reference_correction))
+        self.assertTrue(np.isfinite(complete.ion_ion_energy))
+        self.assertGreater(complete.ion_ion_energy, 0.0)
+        for name in (
+            "local_ionic_seconds",
+            "initial_density_seconds",
+            "core_density_seconds",
+            "ion_ion_seconds",
+        ):
+            with self.subTest(preparation_timing=name):
+                self.assertEqual(getattr(reduced.timings, name), 0.0)
+
+    def test_completion_adds_the_fields_of_a_complete_preparation(self) -> None:
+        from threading import Thread, get_ident
+
+        from parsec_python.SCF import complete_single_point
+        from parsec_python.SCF import prepare_single_point as prepare_components
+        from parsec_python.V_ion import (
+            build_local_ionic_potential,
+            superpose_atomic_density,
+        )
+
+        path = Path(__file__).parent / "data" / "H_CORE_POTRE.DAT"
+        problem = SinglePointInput(
+            atoms=[Atom("H", [0.3, 0.0, -0.2]), Atom("H", [-0.9, 0.4, 0.5])],
+            pseudopotentials={"H": SpeciesPotential(path, 0)},
+            grid=GridSettings(spacing=0.8, radius=4.0, expansion_order=4),
+            scf=SCFSettings(max_iterations=1, number_of_states=3),
+            eigensolver=EigensolverSettings(method="chebff"),
+        )
+        complete = prepare_single_point(problem)
+        reduced = prepare_components(problem, orbital_operators_only=True)
+
+        # On another thread, where the accelerated driver runs it.
+        outcome = []
+        worker = Thread(target=lambda: outcome.append(complete_single_point(reduced)))
+        worker.start()
+        worker.join()
+        (completed,) = outcome
+
+        def assert_same_fields(actual) -> None:
+            for name in ("ionic_potential", "initial_density", "core_density"):
+                with self.subTest(field=name):
+                    left, right = getattr(actual, name), getattr(complete, name)
+                    self.assertEqual(left.dtype, right.dtype)
+                    self.assertEqual(left.shape, right.shape)
+                    # Bit for bit, the sign of a zero included.
+                    self.assertEqual(left.tobytes(), right.tobytes())
+            self.assertEqual(actual.ion_ion_energy, complete.ion_ion_energy)
+            self.assertEqual(
+                actual.atomic_reference_correction,
+                complete.atomic_reference_correction,
+            )
+
+        assert_same_fields(completed)
+        self.assertGreater(float(np.max(completed.core_density)), 0.0)
+        # What enters H is shared with the reduced system, not built again.
+        for name in (
+            "input",
+            "atoms",
+            "pseudopotentials",
+            "grid",
+            "negative_laplacian",
+            "nonlocal_operator",
+        ):
+            with self.subTest(shared=name):
+                self.assertIs(getattr(completed, name), getattr(reduced, name))
+        self.assertEqual(completed.electron_count, reduced.electron_count)
+        for name in (
+            "pseudopotential_loading_seconds",
+            "grid_seconds",
+            "finite_difference_seconds",
+            "nonlocal_ionic_seconds",
+            # The wall time of the call that left the fields out: the
+            # completion may have run beside other work and adds nothing.
+            "total_seconds",
+        ):
+            with self.subTest(kept_timing=name):
+                self.assertEqual(
+                    getattr(completed.timings, name), getattr(reduced.timings, name)
+                )
+        self.assertGreater(reduced.timings.total_seconds, 0.0)
+        added = sum(
+            getattr(completed.timings, name)
+            for name in (
+                "local_ionic_seconds",
+                "initial_density_seconds",
+                "core_density_seconds",
+                "ion_ion_seconds",
+            )
+        )
+        self.assertGreater(added, 0.0)
+        # The reduced system is left as it was.
+        self.assertIsNone(reduced.ionic_potential)
+        self.assertTrue(np.isnan(reduced.ion_ion_energy))
+
+        # The optional builders are the ones of the preparation.
+        calls = []
+
+        def local(*args):
+            calls.append(("local", get_ident()))
+            return build_local_ionic_potential(*args)
+
+        def density(*args, core=False):
+            calls.append(("core" if core else "valence", get_ident()))
+            return superpose_atomic_density(*args, core=core)
+
+        with_builders = complete_single_point(
+            reduced, local_ionic_builder=local, atomic_density_builder=density
+        )
+        self.assertEqual(
+            calls,
+            [("local", get_ident()), ("valence", get_ident()), ("core", get_ident())],
+        )
+        assert_same_fields(with_builders)
+
+        with self.assertRaisesRegex(ValueError, "already has the fields"):
+            complete_single_point(complete)
+
+        # The completed system is a complete one for the SCF loop.
+        expected = run_scf(complete)
+        actual = run_scf(completed)
+        self.assertEqual(actual.energies.total, expected.energies.total)
+        self.assertEqual(actual.density.tobytes(), expected.density.tobytes())
+
     def test_nlcc_density_enters_xc_but_is_kept_separate(self) -> None:
         path = Path(__file__).parent / "data" / "H_CORE_POTRE.DAT"
         problem = SinglePointInput(

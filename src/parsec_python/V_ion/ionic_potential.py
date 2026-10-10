@@ -304,15 +304,29 @@ def ion_ion_energy(
     This is the nonperiodic molecular expression; no Ewald or minimum-image
     sum is performed.
     """
+    if len(atoms) < 2:
+        return 0.0
+    positions = np.array(
+        [atom.position for atom in atoms], dtype=np.float64
+    ).reshape(len(atoms), 3)
+    charges = np.array(
+        [potentials[atom.symbol].ionic_charge for atom in atoms],
+        dtype=np.float64,
+    )
+    # One vectorized row per atom replaces the O(N^2) Python pair loop, which
+    # took seconds beyond a few thousand atoms.  ``cumsum`` accumulates
+    # strictly left to right, so pairs enter the sum in the original order.
     energy = 0.0
-    for left, atom_i in enumerate(atoms):
-        charge_i = potentials[atom_i.symbol].ionic_charge
-        for atom_j in atoms[left + 1 :]:
-            distance = float(np.linalg.norm(atom_i.position - atom_j.position))
-            if distance <= 0:
-                raise ValueError("two nuclei occupy the same position")
-            charge_j = potentials[atom_j.symbol].ionic_charge
-            energy += 2.0 * charge_i * charge_j / distance
+    for left in range(len(atoms) - 1):
+        delta = positions[left] - positions[left + 1 :]
+        distance = np.sqrt(
+            (delta[:, 0] * delta[:, 0] + delta[:, 1] * delta[:, 1])
+            + delta[:, 2] * delta[:, 2]
+        )
+        if np.any(distance <= 0):
+            raise ValueError("two nuclei occupy the same position")
+        terms = 2.0 * charges[left] * charges[left + 1 :] / distance
+        energy = float(np.cumsum(np.concatenate(((energy,), terms)))[-1])
     return float(energy)
 
 

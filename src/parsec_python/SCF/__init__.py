@@ -1,6 +1,11 @@
 """Self-consistent-field preparation and iteration for isolated single points."""
 
-from .single_point import PreparedSinglePointSystem, prepare_single_point, run_scf
+from .single_point import (
+    PreparedSinglePointSystem,
+    complete_single_point,
+    prepare_single_point,
+    run_scf,
+)
 
 from .pbc import (
     PeriodicPreparedSinglePointSystem,
@@ -9,6 +14,7 @@ from .pbc import (
 
 __all__ = [
     "PreparedSinglePointSystem",
+    "complete_single_point",
     "prepare_single_point",
     "run_scf",
     "PeriodicPreparedSinglePointSystem",

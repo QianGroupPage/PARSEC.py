@@ -7,22 +7,107 @@ from typing import Callable
 
 from parsec_python.Output import ParsecTextReporter
 
+from ..backends.cupy_capture import capture_statistics
 from ..models import AcceleratedSinglePointResult
 
 
 # Keep execution placement and precision visible even in the short report.
 # In particular, "Selected backend = cupy" alone does not distinguish the
-# default hybrid from a pure-CuPy run. Everything remains in backend_info;
-# this allowlist controls text presentation only.
+# default hybrid from a pure-CuPy run. A run that read a symmetry cache is no
+# first calculation of its structure, so the directory, or that none was
+# named, is kept as well. It says nothing of what a resident worker kept in
+# memory; reference_static_cache and orbital_operator_cache of the detailed
+# report do. Everything remains in backend_info; this allowlist controls text
+# presentation only.
 _SUMMARY_DETAIL_KEYS = frozenset({
+    "symmetry_cache_directory",
     "finite_difference_builder",
     "hartree_backend",
+    "hartree_boundary",
     "native_openmp_max_threads",
     "gpu_later_subspace_filter_precision",
     "orbital_sector_later_filter_precision",
     "orbital_symmetry",
     "hartree_symmetry",
 })
+
+
+def domain_details(domain) -> tuple[tuple[str, str], ...]:
+    """Entries of the backend details for the record of a sphere domain.
+
+    ``domain`` is the record the reference reporter keeps: radius, vacuum
+    and what set them, the estimates before the SCF of what the wall and the
+    boundary values add, and the estimate from the final density.  A batch
+    table reads them from the details of a result like those of the Hartree
+    boundary.  No entries for a box, nor before the set-up was reported.
+    """
+
+    if not isinstance(domain, dict) or "radius_bohr" not in domain:
+        return ()
+
+    def energy(value):
+        return "none" if value is None else f"{value:.6e} Ry"
+
+    boundary = domain.get("boundary", {})
+    after = domain.get("after_scf", {})
+    details = (
+        (
+            "domain_radius",
+            f"{domain['radius_bohr']:.6f} bohr "
+            f"({domain['boundary_sphere_radius'] or 'input'}; set by "
+            f"{domain['set_by']})",
+        ),
+        (
+            "domain_vacuum",
+            f"{domain['vacuum_angstrom']:.3f} ang beyond the outermost atom "
+            f"({domain['outermost_atom']})",
+        ),
+        (
+            "domain_energy_tolerance",
+            f"{domain['domain_energy_tolerance_ry']:.6e} Ry",
+        ),
+        ("domain_wall_estimate", energy(domain.get("wall_estimate_ry"))),
+        (
+            "domain_boundary_energy",
+            f"about {energy(boundary.get('about_ry'))}, calibrated bound "
+            f"{energy(boundary.get('bound_ry'))} ({boundary.get('plan')})",
+        ),
+    )
+    if after.get("status") == "estimated":
+        details += (
+            (
+                "domain_wall_after_scf",
+                f"{energy(after['energy_ry'])}, decay constant "
+                f"{after['decay_per_bohr']:.3f} /bohr"
+                + (", rough" if after["rough"] else ""),
+            ),
+            (
+                "domain_radius_for_wall_share",
+                # No radius where none could be given: the record says why.
+                str(after.get("radius_set_by", "none"))
+                if after["boundary_sphere_radius"] is None
+                else " ".join(
+                    part
+                    for part in (after["radius_limit"], after["boundary_sphere_radius"])
+                    if part
+                )
+                + (
+                    ""
+                    if after["hartree_boundary_tolerance"] is None
+                    else " with Hartree_Boundary_Tolerance "
+                    + after["hartree_boundary_tolerance"]
+                )
+                # What held the radius where the density did not.
+                + (
+                    ""
+                    if after.get("radius_set_by", "density").startswith("density")
+                    else f" (set by {after['radius_set_by']})"
+                ),
+            ),
+        )
+    elif after:
+        details += (("domain_wall_after_scf", f"none ({after['status']})"),)
+    return details
 
 
 class AcceleratedTextReporter:
@@ -45,6 +130,18 @@ class AcceleratedTextReporter:
         )
         self.reference = ParsecTextReporter(write, report_translation)
         self.output_level = report_translation.output_level
+        # The counts are of the process; a reporter is made for one
+        # calculation, before its preparation, and reports what was added
+        # since.
+        self._captures_before = capture_statistics()
+        self._prepared_filter_precision = "float64"
+        self._prepared_filter_graphs = None
+
+    @property
+    def domain(self) -> dict | None:
+        """The record of the sphere domain the reference reporter keeps."""
+
+        return self.reference.domain
 
     def header(self) -> None:
         self.reference.header()
@@ -53,6 +150,10 @@ class AcceleratedTextReporter:
         self.reference.setup(system)
         info = system.backend_info
         details = dict(info.details)
+        self._prepared_filter_precision = details.get(
+            "orbital_sector_later_filter_precision", "float64"
+        )
+        self._prepared_filter_graphs = details.get("orbital_sector_filter_graphs")
         lines = [
             " Acceleration backend:",
             " ---------------------",
@@ -77,6 +178,17 @@ class AcceleratedTextReporter:
                 " The full-grid statement above applies to orbitals; "
                 "Hartree uses the proven symmetry wedge reported below.\n",
             )
+        if details.get("ionic_setup", "").startswith("overlapped"):
+            # Their rows above are thread times; the wall time is that of
+            # the preparation that left them out.
+            lines.insert(
+                0,
+                " The local ionic, density and ion-ion setups above ran on a "
+                "thread beside the symmetry and sector setup and are not "
+                "part of the preparation wall time.  Thread [sec] = "
+                f"{details['ionic_setup_seconds']}, wait at its join [sec] = "
+                f"{details['ionic_setup_wait_seconds']}.\n",
+            )
         for key, value in info.details:
             if detailed or key in _SUMMARY_DETAIL_KEYS:
                 lines.append(f" {key} = {value}")
@@ -100,6 +212,14 @@ class AcceleratedTextReporter:
         elapsed_seconds: float,
     ) -> None:
         self.reference.finish(result, elapsed_seconds)
+        # What the reference reporter estimated of the sphere joins the
+        # details of the result, where the archive and the timing files
+        # keep it beside the Hartree boundary.
+        added = domain_details(self.domain)
+        if added:
+            result.backend = replace(
+                result.backend, details=result.backend.details + added
+            )
         stats = result.backend_statistics
         average = (
             stats.apply_seconds / stats.applications
@@ -199,6 +319,37 @@ class AcceleratedTextReporter:
                     ),
                 ]
             )
+        captures = capture_statistics()
+        repetitions = captures["repetitions"] - self._captures_before["repetitions"]
+        if repetitions:
+            # Lines only where a capture was invalidated and recorded again
+            # during this calculation; they are of this process, so of one
+            # rank in an MPI run (timing.json has every rank).
+            lines.extend(
+                [
+                    f" CUDA graph capture repetitions (this process) = {repetitions:12d}",
+                    (
+                        " CUDA graphs captured (this process) = "
+                        f"{captures['captures'] - self._captures_before['captures']:12d}"
+                    ),
+                ]
+            )
+        boundary_check = dict(result.backend.details)
+        if "hartree_boundary_check_max" in boundary_check:
+            # The maximum of a sample unless every point was taken.
+            lines.extend(
+                [
+                    " Hartree boundary check: max |V_B - direct sum| = "
+                    f"{boundary_check['hartree_boundary_check_max']} over "
+                    f"{boundary_check['hartree_boundary_check_sample']}",
+                    " Hartree boundary check: rms over them "
+                    f"{boundary_check['hartree_boundary_check_rms']}; PARSEC's "
+                    "boundary on them "
+                    f"{boundary_check['hartree_boundary_check_legacy_max']}; "
+                    f"{boundary_check['hartree_boundary_check_seconds']} s after "
+                    "the SCF, outside its wall time",
+                ]
+            )
         final_sector_counts = dict(result.backend.details).get(
             "orbital_sector_final_state_counts"
         )
@@ -207,6 +358,25 @@ class AcceleratedTextReporter:
                 " Final active states by representation = "
                 f"{final_sector_counts}"
             )
+        filter_precision = dict(result.backend.details).get(
+            "orbital_sector_later_filter_precision", "float64"
+        )
+        if (
+            filter_precision != "float64"
+            or self._prepared_filter_precision != "float64"
+        ):
+            # Only where the FP32 filter was asked for: the setup above said
+            # what was prepared, this is what the later passes ran in.
+            lines.append(
+                f" Later filter precision as run = {filter_precision}"
+            )
+        filter_graphs = dict(result.backend.details).get(
+            "orbital_sector_filter_graphs"
+        )
+        if self.output_level >= 2 and filter_graphs != self._prepared_filter_graphs:
+            # Only where the detailed setup above named the route of the
+            # switch and the sector filters recorded otherwise, or nothing.
+            lines.append(f" Sector filter graphs as recorded = {filter_graphs}")
         if stats.eigensolver_download_seconds:
             lines.append(
                 " Requested-eigenpair download [sec] = "

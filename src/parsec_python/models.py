@@ -17,6 +17,11 @@ import numpy as np
 DomainShape = Literal["sphere", "box"]
 EigensolverName = Literal["chebff", "chebdav", "arpack"]
 HartreeBoundaryMethod = Literal["auto", "multipole", "direct"]
+HartreeAtomicTail = Literal["auto", "on", "off"]
+# The largest multipole order of the Hartree boundary every builder accepts.
+# The recurrences are sound beyond it; the normalization prefactor of Y_lm
+# becomes subnormal at l = m = 86 and would silently drop terms.
+MAXIMUM_MULTIPOLE_ORDER = 60
 XCFunctional = Literal["ca", "pbe"]
 InitialDensityMethod = Literal["sad", "file", "charge3net", "scdp"]
 DensityUnits = Literal[
@@ -213,7 +218,29 @@ class PeriodicGridSettings:
 
 @dataclass(frozen=True)
 class HartreeSettings:
-    """Finite-cluster Poisson settings matching ``hartset``/``hpotcg``."""
+    """Finite-cluster Poisson settings matching ``hartset``/``hpotcg``.
+
+    ``multipole_order`` is PARSEC's ``Solver_Lpole``, the order of the
+    multipole expansion of the density that gives the boundary values.  In
+    the input it is the smallest order used; in a prepared system it is the
+    order in use.
+
+    ``boundary_tolerance`` (Ry) and ``atomic_tail`` control what a prepared
+    system does beyond that expansion
+    (:mod:`parsec_python.Hartree.boundary`).  The tolerance is the largest
+    estimate of the potential the expansion omits for the atoms at the
+    boundary: the order is raised until the estimate meets it; ``None``
+    switches the estimate off and fixes the order.  ``atomic_tail`` adds the
+    omitted terms of the valence point charges at the nuclei: ``"auto"``
+    where the estimate asks for it, ``"on"`` always, ``"off"`` never.
+    ``boundary_tolerance=None`` with ``atomic_tail="auto"`` is PARSEC's
+    boundary, and so is every solver that is called with these settings
+    outside a prepared system.
+
+    ``minimum_multipole_order`` is ``None`` in an input.  A prepared system
+    whose order was raised keeps the ``Solver_Lpole`` that was asked there,
+    so that its input, prepared again, gets the same boundary.
+    """
 
     multipole_order: int = 9
     relative_tolerance: float = 1.0e-7
@@ -221,13 +248,36 @@ class HartreeSettings:
     max_iterations: int = 1600
     boundary_method: HartreeBoundaryMethod = "auto"
     direct_chunk_size: int = 16
+    boundary_tolerance: float | None = 1.0e-3
+    atomic_tail: HartreeAtomicTail = "auto"
+    minimum_multipole_order: int | None = None
 
     def __post_init__(self) -> None:
         order = int(self.multipole_order)
         max_iterations = int(self.max_iterations)
         direct_chunk_size = int(self.direct_chunk_size)
-        if order != self.multipole_order or not 0 <= order <= 9:
-            raise ValueError("multipole_order must be between 0 and 9")
+        if (
+            order != self.multipole_order
+            or not 0 <= order <= MAXIMUM_MULTIPOLE_ORDER
+        ):
+            raise ValueError(
+                f"multipole_order must be between 0 and {MAXIMUM_MULTIPOLE_ORDER}"
+            )
+        if self.boundary_tolerance is not None and not (
+            np.isfinite(self.boundary_tolerance) and self.boundary_tolerance > 0
+        ):
+            raise ValueError(
+                "Hartree boundary_tolerance must be positive, or None for off"
+            )
+        if self.atomic_tail not in {"auto", "on", "off"}:
+            raise ValueError("Hartree atomic_tail must be auto, on, or off")
+        minimum = self.minimum_multipole_order
+        if minimum is not None and not (
+            int(minimum) == minimum and 0 <= minimum <= order
+        ):
+            raise ValueError(
+                "minimum_multipole_order must be between 0 and multipole_order"
+            )
         if (
             not np.isfinite(self.relative_tolerance)
             or not np.isfinite(self.absolute_tolerance)
@@ -245,6 +295,8 @@ class HartreeSettings:
         ):
             raise ValueError("direct_chunk_size must be a positive integer")
         object.__setattr__(self, "multipole_order", order)
+        if minimum is not None:
+            object.__setattr__(self, "minimum_multipole_order", int(minimum))
         object.__setattr__(self, "max_iterations", max_iterations)
         object.__setattr__(self, "direct_chunk_size", direct_chunk_size)
 
@@ -552,6 +604,8 @@ class PreparationTimings:
     initial_density_seconds: float = 0.0
     core_density_seconds: float = 0.0
     ion_ion_seconds: float = 0.0
+    # Estimate of the Hartree boundary and, where one is built, its tail.
+    hartree_boundary_seconds: float = 0.0
     total_seconds: float = 0.0
 
 

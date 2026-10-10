@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import os
 from pathlib import Path
 import sys
 import time
@@ -19,7 +20,36 @@ from .Input import (
 )
 from .models import SinglePointResult
 from .Output import ParsecTextReporter
+from .Output.parsec_output import domain_dry_run_lines
 from .V_ion import load_pseudopotentials
+
+
+# Switches of the Hartree boundary values that only the accelerated driver
+# reads.  This driver takes the values from the input keywords.
+_ACCELERATED_BOUNDARY_SWITCHES = (
+    "PARSEC_HARTREE_BOUNDARY",
+    "PARSEC_HARTREE_BOUNDARY_TOLERANCE",
+    "PARSEC_HARTREE_ATOMIC_TAIL",
+    "PARSEC_HARTREE_LPOLE",
+)
+
+
+def ignored_boundary_switch_warnings() -> list[str]:
+    """Name the boundary switches that are set and that this driver ignores.
+
+    A run of the accelerated driver under one of them has another Hartree
+    boundary than a reference run of the same input, which a comparison of
+    the two would take for an error of either.
+    """
+
+    return [
+        f"{name}={os.environ[name].strip()} is a switch of the accelerated "
+        "driver and is ignored by the reference driver: the Hartree boundary "
+        "of this run follows the input keywords Solver_Lpole, "
+        "Hartree_Boundary_Tolerance and Hartree_Atomic_Tail"
+        for name in _ACCELERATED_BOUNDARY_SWITCHES
+        if os.environ.get(name, "").strip()
+    ]
 
 
 class _RunLog:
@@ -85,7 +115,11 @@ def save_result_archive(
     *,
     include_wavefunctions: bool = False,
 ) -> Path:
-    """Save a portable NumPy result archive without wavefunctions by default."""
+    """Save a portable NumPy result archive without wavefunctions by default.
+
+    The members are stored uncompressed.  ``np.load`` reads the archive like
+    a compressed one.
+    """
     output = _npz_path(Path(path).expanduser().resolve())
     output.parent.mkdir(parents=True, exist_ok=True)
     energy = asdict(result.energies)
@@ -257,7 +291,10 @@ def save_result_archive(
                 payload[f"backend_statistic_{name}"] = np.asarray(value)
     if include_wavefunctions:
         payload["wavefunctions"] = result.wavefunctions
-    np.savez_compressed(output, **payload)
+    # Almost all bytes are full-grid coordinates and scalar fields.  Deflating
+    # them runs zlib on one core (about 30 s for a 1.3 GB archive), so the
+    # members are written as they are.
+    np.savez(output, **payload)
     return output
 
 
@@ -336,14 +373,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary = summarize_translation(translation)
     if arguments.dry_run:
         try:
-            load_pseudopotentials(
+            pseudopotentials = load_pseudopotentials(
                 translation.problem.pseudopotentials,
                 xc_functional=translation.problem.scf.xc_functional,
             )
+            domain_lines = domain_dry_run_lines(translation, pseudopotentials)
         except (OSError, ValueError) as error:
             print(f"Input error: {error}", file=sys.stderr)
             return 2
         print(summary)
+        for line in domain_lines:
+            print(line)
         for warning in translation.warnings:
             print(f"WARNING: {warning}")
         print("Dry run successful; no grid or SCF calculation was started.")
@@ -384,13 +424,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 2
 
-    start = time.perf_counter()
+    # The default rule of the sphere ran in the parser, before this clock:
+    # its seconds belong to the calculation.  None for an input with a radius.
+    start = time.perf_counter() - translation.domain_rule_seconds
     run_log = _RunLog(log_path, quiet=arguments.quiet)
     try:
         with run_log as log:
             reporter = ParsecTextReporter(log.write, translation)
             reporter.header()
-            for warning in translation.warnings:
+            # A periodic cell has no Hartree boundary values for a switch of
+            # the accelerated driver to change.
+            switch_warnings = () if is_periodic else ignored_boundary_switch_warnings()
+            for warning in (*translation.warnings, *switch_warnings):
                 log.write(f"WARNING: {warning}")
             log.write()
             if is_periodic:

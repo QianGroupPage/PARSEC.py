@@ -21,9 +21,12 @@
 namespace parsec_accelerated_native {
 namespace {
 
-constexpr int kMaximumMultipoleOrder = 9;
-constexpr int kAngularStride = kMaximumMultipoleOrder + 1;
-constexpr int kAngularStorage = kAngularStride * kAngularStride;
+// The normalization prefactor becomes subnormal at l = m = 86.
+constexpr int kMaximumMultipoleOrder = 60;
+// The stride of the angular arrays of extensions before 0.6.0, whose largest
+// order was 9.  The GPU kernels of the Python trees of that time read the
+// exported prefactors at l*10+m whatever the order.
+constexpr int kFormerAngularStride = 10;
 constexpr std::size_t kMomentBlockSize = 4096;
 constexpr std::size_t kMaximumSymmetryCoefficientBytes =
     512ULL * 1024ULL * 1024ULL;
@@ -90,10 +93,9 @@ std::vector<double> second_derivative_coefficients(int expansion_order) {
     return coefficients;
 }
 
-std::size_t angular_index(int angular_momentum, int magnetic) {
-    return static_cast<std::size_t>(
-        angular_momentum * kAngularStride + magnetic
-    );
+// Arrays over (l, m) are stored at l*stride+m with stride = order+1.
+std::size_t angular_index(int stride, int angular_momentum, int magnetic) {
+    return static_cast<std::size_t>(angular_momentum * stride + magnetic);
 }
 
 std::size_t compact_angular_index(int angular_momentum, int magnetic) {
@@ -110,9 +112,10 @@ void evaluate_positive_harmonics(
     double phase_imag,
     int order,
     const std::vector<double>& normalization,
-    std::array<std::complex<double>, kAngularStorage>& harmonic,
-    std::array<double, kAngularStride>& radius_power
+    std::vector<std::complex<double>>& harmonic,
+    std::vector<double>& radius_power
 ) {
+    const int stride = order + 1;
     const std::complex<double> phase_unit(phase_real, phase_imag);
     std::complex<double> phase(1.0, 0.0);
     double diagonal = 1.0;  // P_0^0, including the Condon--Shortley phase.
@@ -131,8 +134,8 @@ void evaluate_positive_harmonics(
         }
 
         double previous = diagonal;
-        harmonic[angular_index(magnetic, magnetic)] =
-            normalization[angular_index(magnetic, magnetic)] *
+        harmonic[angular_index(stride, magnetic, magnetic)] =
+            normalization[angular_index(stride, magnetic, magnetic)] *
             previous * phase;
         if (magnetic == order) {
             continue;
@@ -140,8 +143,8 @@ void evaluate_positive_harmonics(
 
         double current =
             static_cast<double>(2 * magnetic + 1) * cosine * diagonal;
-        harmonic[angular_index(magnetic + 1, magnetic)] =
-            normalization[angular_index(magnetic + 1, magnetic)] *
+        harmonic[angular_index(stride, magnetic + 1, magnetic)] =
+            normalization[angular_index(stride, magnetic + 1, magnetic)] *
             current * phase;
         for (int angular_momentum = magnetic + 2;
              angular_momentum <= order; ++angular_momentum) {
@@ -153,8 +156,8 @@ void evaluate_positive_harmonics(
                         previous
                 ) /
                 static_cast<double>(angular_momentum - magnetic);
-            harmonic[angular_index(angular_momentum, magnetic)] =
-                normalization[angular_index(angular_momentum, magnetic)] *
+            harmonic[angular_index(stride, angular_momentum, magnetic)] =
+                normalization[angular_index(stride, angular_momentum, magnetic)] *
                 following * phase;
             previous = current;
             current = following;
@@ -170,15 +173,16 @@ double boundary_potential(
     double phase_imag,
     int order,
     const std::vector<double>& normalization,
-    const std::vector<std::complex<double>>& moments
+    const std::vector<std::complex<double>>& moments,
+    std::vector<std::complex<double>>& harmonic,
+    std::vector<double>& unused_radius_power
 ) {
     if (!(radius > 0.0)) {
         throw std::runtime_error(
             "multipole boundary potential is undefined at the origin"
         );
     }
-    std::array<std::complex<double>, kAngularStorage> harmonic;
-    std::array<double, kAngularStride> unused_radius_power;
+    const int stride = order + 1;
     evaluate_positive_harmonics(
         radius,
         cosine,
@@ -199,7 +203,8 @@ double boundary_potential(
             4.0 * kPi / static_cast<double>(2 * angular_momentum + 1) *
             inverse_radius_power;
         for (int magnetic = 0; magnetic <= angular_momentum; ++magnetic) {
-            const std::size_t index = angular_index(angular_momentum, magnetic);
+            const std::size_t index =
+                angular_index(stride, angular_momentum, magnetic);
             const double positive_real =
                 std::real(moments[index] * harmonic[index]);
             // For a real density, Q_l,-m Y_l,-m is the conjugate of the
@@ -232,7 +237,7 @@ MultipoleBoundaryBuilder::MultipoleBoundaryBuilder(
     const FloatArray& boundary_phase_imag
 ) {
     if (multipole_order < 0 || multipole_order > kMaximumMultipoleOrder) {
-        throw std::invalid_argument("multipole_order must be between 0 and 9");
+        throw std::invalid_argument("multipole_order must be between 0 and 60");
     }
     if (!(volume_element > 0.0) || !std::isfinite(volume_element)) {
         throw std::invalid_argument("volume_element must be finite and positive");
@@ -310,16 +315,18 @@ MultipoleBoundaryBuilder::MultipoleBoundaryBuilder(
 
     point_count_ = wedge_count;
     multipole_order_ = multipole_order;
+    stride_ = multipole_order + 1;
+    storage_ = static_cast<std::size_t>(stride_) * static_cast<std::size_t>(stride_);
     volume_element_ = volume_element;
     symmetry_angular_count_ = angular_count;
-    normalization_.assign(kAngularStorage, 0.0);
+    normalization_.assign(storage_, 0.0);
     for (int angular_momentum = 0; angular_momentum <= multipole_order_;
          ++angular_momentum) {
         for (int magnetic = 0; magnetic <= angular_momentum; ++magnetic) {
             const double log_ratio =
                 std::lgamma(static_cast<double>(angular_momentum - magnetic + 1)) -
                 std::lgamma(static_cast<double>(angular_momentum + magnetic + 1));
-            normalization_[angular_index(angular_momentum, magnetic)] =
+            normalization_[angular_index(stride_, angular_momentum, magnetic)] =
                 std::sqrt(
                     static_cast<double>(2 * angular_momentum + 1) *
                     std::exp(log_ratio) / (4.0 * kPi)
@@ -415,7 +422,7 @@ MultipoleBoundaryBuilder::MultipoleBoundaryBuilder(
         throw std::invalid_argument("spacing must be finite and positive");
     }
     if (multipole_order < 0 || multipole_order > kMaximumMultipoleOrder) {
-        throw std::invalid_argument("multipole_order must be between 0 and 9");
+        throw std::invalid_argument("multipole_order must be between 0 and 60");
     }
 
     const std::vector<double> coefficients =
@@ -424,6 +431,8 @@ MultipoleBoundaryBuilder::MultipoleBoundaryBuilder(
     const double inverse_spacing_squared = 1.0 / (spacing * spacing);
     point_count_ = static_cast<std::size_t>(coordinates.shape(0));
     multipole_order_ = multipole_order;
+    stride_ = multipole_order + 1;
+    storage_ = static_cast<std::size_t>(stride_) * static_cast<std::size_t>(stride_);
     volume_element_ = spacing * spacing * spacing;
 
     const auto integer = integer_coordinates.unchecked<2>();
@@ -448,7 +457,7 @@ MultipoleBoundaryBuilder::MultipoleBoundaryBuilder(
     source_phase_real_.resize(point_count_);
     source_phase_imag_.resize(point_count_);
     boundary_indptr_.resize(point_count_ + 1, 0);
-    normalization_.assign(kAngularStorage, 0.0);
+    normalization_.assign(storage_, 0.0);
 
     for (int angular_momentum = 0; angular_momentum <= multipole_order_;
          ++angular_momentum) {
@@ -460,7 +469,7 @@ MultipoleBoundaryBuilder::MultipoleBoundaryBuilder(
                 std::lgamma(
                     static_cast<double>(angular_momentum + magnetic + 1)
                 );
-            normalization_[angular_index(angular_momentum, magnetic)] =
+            normalization_[angular_index(stride_, angular_momentum, magnetic)] =
                 std::sqrt(
                     static_cast<double>(2 * angular_momentum + 1) *
                     std::exp(log_ratio) / (4.0 * kPi)
@@ -725,15 +734,17 @@ void MultipoleBoundaryBuilder::configure_symmetry(
     );
     {
         py::gil_scoped_release release;
-#pragma omp parallel for schedule(static) if(wedge_count >= 4096)
+#pragma omp parallel if(wedge_count >= 4096)
+        {
+        std::vector<std::complex<double>> harmonic(storage_);
+        std::vector<double> radius_power(static_cast<std::size_t>(stride_));
+#pragma omp for schedule(static)
         for (std::int64_t wedge_index = 0;
              wedge_index < static_cast<std::int64_t>(wedge_count);
              ++wedge_index) {
             const std::size_t wedge = static_cast<std::size_t>(wedge_index);
             std::complex<double>* output =
                 coefficients.data() + wedge * angular_count;
-            std::array<std::complex<double>, kAngularStorage> harmonic;
-            std::array<double, kAngularStride> radius_power;
             const std::size_t start = static_cast<std::size_t>(orbit_indptr[wedge]);
             const std::size_t stop = static_cast<std::size_t>(orbit_indptr[wedge + 1]);
             for (std::size_t position = start; position < stop; ++position) {
@@ -759,7 +770,7 @@ void MultipoleBoundaryBuilder::configure_symmetry(
                     for (int magnetic = 0; magnetic <= angular_momentum;
                          ++magnetic) {
                         const std::size_t angular =
-                            angular_index(angular_momentum, magnetic);
+                            angular_index(stride_, angular_momentum, magnetic);
                         const std::size_t compact =
                             compact_angular_index(angular_momentum, magnetic);
                         output[compact] +=
@@ -767,6 +778,7 @@ void MultipoleBoundaryBuilder::configure_symmetry(
                     }
                 }
             }
+        }
         }
     }
 
@@ -800,12 +812,10 @@ py::dict MultipoleBoundaryBuilder::build_reduced(
     }
 
     py::array_t<double> right_hand_side(static_cast<py::ssize_t>(wedge_count));
-    py::array_t<std::complex<double>> moment_array(
-        {kAngularStride, kAngularStride}
-    );
+    py::array_t<std::complex<double>> moment_array({stride_, stride_});
     double* rhs = right_hand_side.mutable_data();
     std::vector<std::complex<double>> moments(
-        kAngularStorage,
+        storage_,
         std::complex<double>(0.0, 0.0)
     );
     {
@@ -813,7 +823,7 @@ py::dict MultipoleBoundaryBuilder::build_reduced(
         const std::size_t moment_block_count =
             (wedge_count + kMomentBlockSize - 1) / kMomentBlockSize;
         std::vector<std::complex<double>> partial_moments(
-            moment_block_count * kAngularStorage,
+            moment_block_count * storage_,
             std::complex<double>(0.0, 0.0)
         );
 #pragma omp parallel for schedule(static) if(wedge_count >= kMomentBlockSize) \
@@ -823,7 +833,7 @@ py::dict MultipoleBoundaryBuilder::build_reduced(
              ++block) {
             std::complex<double>* local =
                 partial_moments.data() +
-                static_cast<std::size_t>(block) * kAngularStorage;
+                static_cast<std::size_t>(block) * storage_;
             const std::size_t start =
                 static_cast<std::size_t>(block) * kMomentBlockSize;
             const std::size_t stop = std::min(
@@ -841,7 +851,7 @@ py::dict MultipoleBoundaryBuilder::build_reduced(
                     for (int magnetic = 0; magnetic <= angular_momentum;
                          ++magnetic) {
                         const std::size_t angular =
-                            angular_index(angular_momentum, magnetic);
+                            angular_index(stride_, angular_momentum, magnetic);
                         const std::size_t compact =
                             compact_angular_index(angular_momentum, magnetic);
                         local[angular] += density_value * coefficients[compact];
@@ -851,21 +861,25 @@ py::dict MultipoleBoundaryBuilder::build_reduced(
         }
         for (std::size_t block = 0; block < moment_block_count; ++block) {
             const std::complex<double>* local =
-                partial_moments.data() + block * kAngularStorage;
+                partial_moments.data() + block * storage_;
             for (int angular_momentum = 0;
                  angular_momentum <= multipole_order_;
                  ++angular_momentum) {
                 for (int magnetic = 0; magnetic <= angular_momentum;
                      ++magnetic) {
                     const std::size_t angular =
-                        angular_index(angular_momentum, magnetic);
+                        angular_index(stride_, angular_momentum, magnetic);
                     moments[angular] += local[angular];
                 }
             }
         }
 
-#pragma omp parallel for schedule(static) if(wedge_count >= 4096) \
+#pragma omp parallel if(wedge_count >= 4096) \
     num_threads(grid_vector_worker_count(wedge_count))
+        {
+        std::vector<std::complex<double>> harmonic(storage_);
+        std::vector<double> radius_power(static_cast<std::size_t>(stride_));
+#pragma omp for schedule(static)
         for (std::int64_t wedge_index = 0;
              wedge_index < static_cast<std::int64_t>(wedge_count);
              ++wedge_index) {
@@ -889,7 +903,9 @@ py::dict MultipoleBoundaryBuilder::build_reduced(
                     boundary_phase_imag_[term],
                     multipole_order_,
                     normalization_,
-                    moments
+                    moments,
+                    harmonic,
+                    radius_power
                 );
                 value -= boundary_operator_coefficient_[term] * potential;
             }
@@ -898,6 +914,7 @@ py::dict MultipoleBoundaryBuilder::build_reduced(
             rhs[wedge] = value * std::sqrt(
                 static_cast<double>(symmetry_multiplicities_[wedge])
             );
+        }
         }
     }
 
@@ -991,6 +1008,56 @@ py::dict MultipoleBoundaryBuilder::export_symmetry_cache() const {
     return result;
 }
 
+py::dict MultipoleBoundaryBuilder::export_full_geometry() const {
+    if (source_radius_.size() != point_count_ || point_count_ == 0) {
+        throw std::runtime_error("full-grid source geometry is unavailable");
+    }
+    py::dict result;
+    auto copy_float = [&result](const char* name, const std::vector<double>& values) {
+        py::array_t<double> output(static_cast<py::ssize_t>(values.size()));
+        std::copy(values.begin(), values.end(), output.mutable_data());
+        result[name] = std::move(output);
+    };
+    copy_float("source_radius", source_radius_);
+    copy_float("source_cosine", source_cosine_);
+    copy_float("source_sine", source_sine_);
+    copy_float("source_phase_real", source_phase_real_);
+    copy_float("source_phase_imag", source_phase_imag_);
+    copy_float("boundary_radius", boundary_radius_);
+    copy_float("boundary_cosine", boundary_cosine_);
+    copy_float("boundary_sine", boundary_sine_);
+    copy_float("boundary_phase_real", boundary_phase_real_);
+    copy_float("boundary_phase_imag", boundary_phase_imag_);
+    copy_float("boundary_operator_coefficient", boundary_operator_coefficient_);
+    if (stride_ < kFormerAngularStride) {
+        // Orders below 9 keep the layout that every Python tree reads: a
+        // tree before 0.6.0 knows no other and would take its prefactors
+        // from the wrong places without an error, the present one accepts
+        // both.  At order 9 the two layouts are one.
+        std::vector<double> former(
+            static_cast<std::size_t>(kFormerAngularStride * kFormerAngularStride),
+            0.0
+        );
+        for (int angular_momentum = 0; angular_momentum <= multipole_order_;
+             ++angular_momentum) {
+            for (int magnetic = 0; magnetic <= angular_momentum; ++magnetic) {
+                former[angular_index(
+                    kFormerAngularStride, angular_momentum, magnetic
+                )] = normalization_[
+                    angular_index(stride_, angular_momentum, magnetic)
+                ];
+            }
+        }
+        copy_float("normalization", former);
+    } else {
+        copy_float("normalization", normalization_);
+    }
+    py::array_t<std::int64_t> indptr(static_cast<py::ssize_t>(boundary_indptr_.size()));
+    std::copy(boundary_indptr_.begin(), boundary_indptr_.end(), indptr.mutable_data());
+    result["boundary_indptr"] = std::move(indptr);
+    return result;
+}
+
 py::dict MultipoleBoundaryBuilder::build(const FloatArray& density) const {
     if (
         density.ndim() != 1 ||
@@ -1008,12 +1075,10 @@ py::dict MultipoleBoundaryBuilder::build(const FloatArray& density) const {
     py::array_t<double> right_hand_side(
         static_cast<py::ssize_t>(point_count_)
     );
-    py::array_t<std::complex<double>> moment_array(
-        {kAngularStride, kAngularStride}
-    );
+    py::array_t<std::complex<double>> moment_array({stride_, stride_});
     double* rhs = right_hand_side.mutable_data();
     std::vector<std::complex<double>> moments(
-        kAngularStorage,
+        storage_,
         std::complex<double>(0.0, 0.0)
     );
 
@@ -1023,19 +1088,21 @@ py::dict MultipoleBoundaryBuilder::build(const FloatArray& density) const {
         const std::size_t moment_block_count =
             (point_count_ + kMomentBlockSize - 1) / kMomentBlockSize;
         std::vector<std::complex<double>> partial_moments(
-            moment_block_count * kAngularStorage,
+            moment_block_count * storage_,
             std::complex<double>(0.0, 0.0)
         );
 
-#pragma omp parallel for schedule(static) if(point_count_ >= kMomentBlockSize) \
+#pragma omp parallel if(point_count_ >= kMomentBlockSize) \
     num_threads(grid_vector_worker_count(point_count_))
+        {
+        std::vector<std::complex<double>> harmonic(storage_);
+        std::vector<double> radius_power(static_cast<std::size_t>(stride_));
+#pragma omp for schedule(static)
         for (std::int64_t block = 0;
              block < static_cast<std::int64_t>(moment_block_count); ++block) {
             std::complex<double>* local =
                 partial_moments.data() +
-                static_cast<std::size_t>(block) * kAngularStorage;
-            std::array<std::complex<double>, kAngularStorage> harmonic;
-            std::array<double, kAngularStride> radius_power;
+                static_cast<std::size_t>(block) * storage_;
             const std::size_t start =
                 static_cast<std::size_t>(block) * kMomentBlockSize;
             const std::size_t stop =
@@ -1060,32 +1127,37 @@ py::dict MultipoleBoundaryBuilder::build(const FloatArray& density) const {
                     for (int magnetic = 0; magnetic <= angular_momentum;
                          ++magnetic) {
                         const std::size_t angular =
-                            angular_index(angular_momentum, magnetic);
+                            angular_index(stride_, angular_momentum, magnetic);
                         local[angular] +=
                             radial_weight * std::conj(harmonic[angular]);
                     }
                 }
             }
         }
+        }
 
         // Fixed source blocks and a block-order merge make the moments
         // independent of the number of OpenMP workers.
         for (std::size_t block = 0; block < moment_block_count; ++block) {
             const std::complex<double>* local =
-                partial_moments.data() + block * kAngularStorage;
+                partial_moments.data() + block * storage_;
             for (int angular_momentum = 0;
                  angular_momentum <= multipole_order_; ++angular_momentum) {
                 for (int magnetic = 0; magnetic <= angular_momentum;
                      ++magnetic) {
                     const std::size_t angular =
-                        angular_index(angular_momentum, magnetic);
+                        angular_index(stride_, angular_momentum, magnetic);
                     moments[angular] += local[angular];
                 }
             }
         }
 
-#pragma omp parallel for schedule(static) if(point_count_ >= 4096) \
+#pragma omp parallel if(point_count_ >= 4096) \
     num_threads(grid_vector_worker_count(point_count_))
+        {
+        std::vector<std::complex<double>> harmonic(storage_);
+        std::vector<double> radius_power(static_cast<std::size_t>(stride_));
+#pragma omp for schedule(static)
         for (std::int64_t row = 0;
              row < static_cast<std::int64_t>(point_count_); ++row) {
             const std::size_t index = static_cast<std::size_t>(row);
@@ -1103,11 +1175,14 @@ py::dict MultipoleBoundaryBuilder::build(const FloatArray& density) const {
                     boundary_phase_imag_[term],
                     multipole_order_,
                     normalization_,
-                    moments
+                    moments,
+                    harmonic,
+                    radius_power
                 );
                 value -= boundary_operator_coefficient_[term] * potential;
             }
             rhs[index] = value;
+        }
         }
     }
 

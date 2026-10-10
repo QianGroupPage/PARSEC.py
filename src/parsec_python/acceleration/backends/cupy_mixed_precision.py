@@ -9,20 +9,69 @@ SCF convergence tests, and energy evaluation.
 This module deliberately owns only the recurrence work.  It mirrors the
 production stencil-major and separable Kleinman--Bylander projector kernels,
 using FP32 values and vectors while preserving their sparse traversal and
-PARSEC polynomial.  Automatic selection is restricted to large sectors; the
-ordinary FP64 kernels stay the authoritative fallback and can be forced.
+PARSEC polynomial.  It is an opt-in: with ``PARSEC_CUPY_MIXED_FILTER`` unset
+every filter runs in the FP64 kernels (see :func:`mixed_filter_policy`).
 """
 
 from __future__ import annotations
 
+import os
 from threading import Lock
 from typing import Any
 
 import numpy as np
 
 from .cupy_compile import compile_cupy_raw
+from .cupy_launch import kernel_parameters, launch_arguments
 from .cupy_projectors import _SOURCE as _PROJECTOR_SOURCE
 from .cupy_stencil_major import _CUDA_SOURCE as _STENCIL_SOURCE
+
+
+_MIXED_FILTER_SETTINGS = {
+    "off": "off", "0": "off", "false": "off", "no": "off",
+    "auto": "auto",
+    "on": "on", "1": "on", "true": "on", "yes": "on",
+}
+
+
+def mixed_filter_policy() -> str:
+    """Return ``PARSEC_CUPY_MIXED_FILTER`` as ``off``, ``auto`` or ``on``.
+
+    ``off``, the default, keeps every filter in FP64.  ``auto`` asks for the
+    FP32 later filter in operators of at least
+    ``PARSEC_CUPY_MIXED_FILTER_MIN_ROWS`` rows, ``on`` in every operator.
+    """
+
+    value = os.environ.get("PARSEC_CUPY_MIXED_FILTER", "off").strip().lower()
+    try:
+        return _MIXED_FILTER_SETTINGS[value]
+    except KeyError:
+        raise ValueError(
+            "PARSEC_CUPY_MIXED_FILTER must be auto, on, or off"
+        ) from None
+
+
+def mixed_filter_minimum_rows() -> int:
+    """Rows from which ``auto`` asks for the FP32 later filter."""
+
+    raw = os.environ.get("PARSEC_CUPY_MIXED_FILTER_MIN_ROWS", "100000").strip()
+    try:
+        minimum_rows = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "PARSEC_CUPY_MIXED_FILTER_MIN_ROWS must be an integer"
+        ) from error
+    if minimum_rows < 1:
+        raise ValueError("PARSEC_CUPY_MIXED_FILTER_MIN_ROWS must be positive")
+    return minimum_rows
+
+
+def float32_filter_requested(rows: int) -> bool:
+    """Whether an operator of ``rows`` rows is to own an FP32 recurrence."""
+
+    policy = mixed_filter_policy()
+    minimum_rows = mixed_filter_minimum_rows()
+    return policy == "on" or (policy == "auto" and int(rows) >= minimum_rows)
 
 
 def _float_source(source: str, names: tuple[str, ...]) -> str:
@@ -81,6 +130,16 @@ def _kernels(cp: Any) -> tuple[Any, Any, Any]:
     return kernels
 
 
+def _strides(prefix: str, array: Any) -> dict[str, int]:
+    """Row and column stride of ``array`` in elements, as the kernels name them."""
+
+    itemsize = int(array.dtype.itemsize)
+    return {
+        f"{prefix}_row_stride": array.strides[0] // itemsize,
+        f"{prefix}_column_stride": array.strides[1] // itemsize,
+    }
+
+
 class CuPyMixedPrecisionRecurrence:
     """FP32 stencil/projector recurrence used only inside Chebyshev filters."""
 
@@ -94,6 +153,13 @@ class CuPyMixedPrecisionRecurrence:
         projector_signs: np.ndarray,
         effective_potential: np.ndarray,
     ) -> None:
+        if hasattr(stencil, "implicit_statistics"):
+            # The FP32 kernel is compiled from the slot-major source and
+            # would read the packed tile descriptors as neighbor rows.
+            raise ValueError(
+                "the FP32 recurrence does not read a stencil packed into "
+                "implicit tiles; set PARSEC_CUPY_IMPLICIT_TILE=0"
+            )
         host = host_projectors.tocsr(copy=True)
         host.sum_duplicates()
         host.sort_indices()
@@ -141,9 +207,16 @@ class CuPyMixedPrecisionRecurrence:
         )
 
         kernels = _kernels(cp)
-        self.recurrence_kernel = kernels[0]
-        self.projection_kernel = (
-            kernels[1] if self.parallel_projection else kernels[2]
+        selected = (0, 1 if self.parallel_projection else 2)
+        self.recurrence_kernel, self.projection_kernel = (
+            kernels[index] for index in selected
+        )
+        # The FP32 kernels are compiled from the FP64 sources, so their
+        # parameter lists move with those.  The launches name their values
+        # and are ordered by these declarations.
+        self.recurrence_parameters, self.projection_parameters = (
+            kernel_parameters(_SOURCE, _KERNEL_NAMES[index])
+            for index in selected
         )
 
     def update_potential(self, effective_potential: Any) -> None:
@@ -180,29 +253,27 @@ class CuPyMixedPrecisionRecurrence:
             return output
         threads = 128
         pair_count = self.projector_count * width
-        itemsize = int(vectors.dtype.itemsize)
         grid = (
             (pair_count,)
             if self.parallel_projection
             else ((pair_count + threads - 1) // threads,)
         )
+        values = dict(
+            projector_count=self.projector_count,
+            width=width,
+            row_offsets=self.transpose_row_offsets,
+            grid_rows=self.transpose_grid_rows,
+            projector_values=self.transpose_values,
+            signs=self.projector_signs,
+            vectors=vectors,
+            **_strides("vector", vectors),
+            output=output,
+            **_strides("output", output),
+        )
         self.projection_kernel(
             grid,
             (threads,),
-            (
-                np.int32(self.projector_count),
-                np.int32(width),
-                self.transpose_row_offsets,
-                self.transpose_grid_rows,
-                self.transpose_values,
-                self.projector_signs,
-                vectors,
-                np.int64(vectors.strides[0] // itemsize),
-                np.int64(vectors.strides[1] // itemsize),
-                output,
-                np.int64(output.strides[0] // itemsize),
-                np.int64(output.strides[1] // itemsize),
-            ),
+            launch_arguments(self.projection_parameters, values),
         )
         return output
 
@@ -234,47 +305,57 @@ class CuPyMixedPrecisionRecurrence:
         output = cp.empty(block.shape, dtype=cp.float32, order="F")
         threads = 256
         grid = ((self.shape[0] + threads - 1) // threads,)
-        itemsize = int(block.dtype.itemsize)
+        fixed = dict(
+            row_count=self.shape[0],
+            slot_count=self.slot_count,
+            neighbors=self.neighbors,
+            coefficient_codes=self.coefficient_codes,
+            coefficient_palette=self.coefficient_palette,
+            local_potential=self.effective_potential,
+            projector_row_offsets=self.projector_row_offsets,
+            projector_columns=self.projector_columns,
+            projector_values=self.projector_values,
+            add_nonlocal=add_nonlocal,
+            add_previous=add_previous,
+            center_argument=center,
+            scale_argument=scale,
+            sigma_argument=sigma,
+            sigma_next_argument=sigma_next,
+            # The coefficient table of the filter graphs is not used here;
+            # as in the FP64 launch, the palette stands in for it unread.
+            recurrence_parameters=self.coefficient_palette,
+            parameter_step=0,
+            use_parameters=0,
+        )
         for start in range(0, int(block.shape[1]), self.chunk_width):
             stop = min(start + self.chunk_width, int(block.shape[1]))
             source = block[:, start:stop]
             previous_source = previous_block[:, start:stop]
             coefficient_source = coefficients[:, start:stop]
             target = output[:, start:stop]
+            values = dict(
+                fixed,
+                projector_coefficients=coefficient_source,
+                **_strides("coefficient", coefficient_source),
+                current=source,
+                **_strides("current", source),
+                previous=previous_source,
+                **_strides("previous", previous_source),
+                width=stop - start,
+                output=target,
+                **_strides("output", target),
+            )
             self.recurrence_kernel(
                 grid,
                 (threads,),
-                (
-                    np.int64(self.shape[0]),
-                    np.int32(self.slot_count),
-                    self.neighbors,
-                    self.coefficient_codes,
-                    self.coefficient_palette,
-                    self.effective_potential,
-                    self.projector_row_offsets,
-                    self.projector_columns,
-                    self.projector_values,
-                    coefficient_source,
-                    np.int64(coefficient_source.strides[0] // itemsize),
-                    np.int64(coefficient_source.strides[1] // itemsize),
-                    np.int32(add_nonlocal),
-                    source,
-                    np.int64(source.strides[0] // itemsize),
-                    np.int64(source.strides[1] // itemsize),
-                    previous_source,
-                    np.int64(previous_source.strides[0] // itemsize),
-                    np.int64(previous_source.strides[1] // itemsize),
-                    np.int32(add_previous),
-                    np.int32(stop - start),
-                    np.float32(center),
-                    np.float32(scale),
-                    np.float32(sigma),
-                    np.float32(sigma_next),
-                    target,
-                    np.int64(target.strides[0] // itemsize),
-                    np.int64(target.strides[1] // itemsize),
-                ),
+                launch_arguments(self.recurrence_parameters, values),
             )
         return output[:, 0] if was_vector else output
 
-__all__ = ["CuPyMixedPrecisionRecurrence"]
+
+__all__ = [
+    "CuPyMixedPrecisionRecurrence",
+    "float32_filter_requested",
+    "mixed_filter_minimum_rows",
+    "mixed_filter_policy",
+]

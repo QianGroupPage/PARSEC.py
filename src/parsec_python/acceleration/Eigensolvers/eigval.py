@@ -21,6 +21,12 @@ from ..backends.cupy import (
 )
 from .chebdav import DeviceChebDavResult, run_chebdav
 from .chebff import DeviceChebFFResult, run_chebff
+from .distributed_state import (
+    DistributedBasis,
+    run_distributed_chebff,
+    run_distributed_subspace,
+    sector_device_group,
+)
 from .subspace import (
     DeviceSubspaceResult,
     DeviceSubspaceState,
@@ -58,6 +64,9 @@ class CuPyEigvalResult:
     requested_states: int
     working_states: int
     solve_seconds: float
+    # What the Chebyshev recurrence of this solve ran in: ``float32`` for a
+    # later pass that took the opt-in FP32 filter, ``float64`` otherwise.
+    filter_precision: str = "float64"
 
     @property
     def wavefunctions(self) -> np.ndarray:
@@ -69,6 +78,27 @@ class CuPyEigvalResult:
 def _reject_unsupported_settings(settings: EigvalSettings) -> None:
     if settings.initial_method not in {"chebff", "chebdav"}:
         raise ValueError("CuPy initial_method must be 'chebff' or 'chebdav'")
+
+
+def spill_download_order() -> str:
+    """The order that the download of a spilled basis asks of ``cupy.asnumpy``.
+
+    ``PARSEC_CUPY_SPILL_DOWNLOAD_ORDER``: ``A``, the default, takes the
+    array in the order it has; ``C`` asks for C order, which is what the
+    download asked before by naming none.  The basis of a sector is
+    Fortran-ordered.  Asked for C order, CuPy first makes a C-ordered copy
+    of it on its device, a second array of its size, and the host array it
+    returns is copied once more into Fortran order: a spill then needs twice
+    the basis on the device and cannot move one above half of it.  With
+    ``A`` no array is taken on the device and none is copied on the host,
+    and the host array is the same to the last bit.  A C-ordered array is
+    downloaded as before under either value.
+    """
+
+    order = os.environ.get("PARSEC_CUPY_SPILL_DOWNLOAD_ORDER", "A").strip().upper()
+    if order not in {"A", "C"}:
+        raise ValueError("PARSEC_CUPY_SPILL_DOWNLOAD_ORDER must be A or C")
+    return order
 
 
 class CuPyEigvalSolver:
@@ -152,7 +182,10 @@ class CuPyEigvalSolver:
         systems whose independent representation states do not all fit on one
         device.  The Rayleigh--Ritz workspace is scratch and is deliberately
         discarded; all mathematical state (vectors, eigenvalues, bounds, and
-        filter counters) is retained without conversion loss.
+        filter counters) is retained without conversion loss.  A basis that
+        several devices share stays on them.  The vectors are downloaded in
+        the order they have on the device (:func:`spill_download_order`),
+        so that the download takes no second array there.
         """
 
         state = self._state
@@ -168,7 +201,8 @@ class CuPyEigvalSolver:
                 cp.asnumpy(saved.eigenvalues), dtype=np.float64
             ),
             vectors=np.asfortranarray(
-                cp.asnumpy(saved.vectors), dtype=np.float64
+                cp.asnumpy(saved.vectors, order=spill_download_order()),
+                dtype=np.float64,
             ),
             ritz_workspace=None,
         )
@@ -183,7 +217,9 @@ class CuPyEigvalSolver:
             return None
         cp, _ = require_cupy()
         saved = state.subspace
-        if isinstance(saved.vectors, cp.ndarray):
+        # A basis shared among devices never left them: the spill above
+        # moves a single device array only.
+        if isinstance(saved.vectors, (cp.ndarray, DistributedBasis)):
             return state
         device_subspace = replace(
             saved,
@@ -361,15 +397,24 @@ class CuPyEigvalSolver:
         reason = self._incompatibility(requested_states, working_states)
         restart = previous_state is not None and reason is not None
         fallback_reason = None
+        # A first solve filters in FP64 whatever the later filter is set to.
+        filter_precision = "float64"
 
         if previous_state is None or reason is not None:
             if self.settings.initial_method == "chebff":
-                first_solver = run_chebff
+                # Several devices serving this one sector may hold its basis
+                # jointly.  Only the CHEBFF first solve creates such a basis,
+                # so no group (and no operator replica on its devices) is
+                # asked for with another one.
+                group = sector_device_group(self.operator, working_states)
+                first_solver = run_chebff if group is None else run_distributed_chebff
                 first_settings = self.settings.chebff
             else:
                 first_solver = run_chebdav
                 first_settings = self.settings.chebdav
             first_options = {"settings": first_settings}
+            if first_solver is run_distributed_chebff:
+                first_options["group"] = group
             if spectral_bound is not None:
                 first_options["spectral_bound"] = spectral_bound
             try:
@@ -417,7 +462,9 @@ class CuPyEigvalSolver:
                 self.settings.initial_method,
             )
             solver_path = (
-                "chebff" if first_solver is run_chebff else "chebdav"
+                "chebff"
+                if first_solver in (run_chebff, run_distributed_chebff)
+                else "chebdav"
             )
             residual_device = (
                 None
@@ -432,12 +479,33 @@ class CuPyEigvalSolver:
                 subspace_options["spectral_bound"] = spectral_bound
             if not self.compute_subspace_residuals:
                 subspace_options["compute_residuals"] = False
+                if os.environ.get("PARSEC_CUPY_RECYCLE_STATE", "0") == "1":
+                    subspace_options["consume_state"] = True
+            later_solver = run_subspace_filter
+            saved_basis = previous_state.subspace.vectors
+            if isinstance(saved_basis, DistributedBasis):
+                # A later pass follows the basis that the first solve left:
+                # the devices that hold it filter and rotate it.  Asking the
+                # policy again could answer differently for the fewer states
+                # of a trimmed sector.
+                later_solver = run_distributed_subspace
+                subspace_options["group"] = saved_basis.group
+            # ``subspace_filter`` counts, on the record of this operator, the
+            # passes that it ran in the FP32 recurrence.
+            float32_passes = getattr(
+                self.timing_stats, "subspace_filter_float32_passes", 0
+            )
             later, solve_seconds = synchronized_call(
-                run_subspace_filter,
+                later_solver,
                 self.operator,
                 previous_state.subspace,
                 **subspace_options,
             )
+            if (
+                getattr(self.timing_stats, "subspace_filter_float32_passes", 0)
+                > float32_passes
+            ):
+                filter_precision = "float32"
             resolve_device_stages(self.timing_stats)
             self._state = CuPyEigvalDeviceState(
                 operator_dimension=previous_state.operator_dimension,
@@ -499,6 +567,7 @@ class CuPyEigvalSolver:
             requested_states=requested_states,
             working_states=working_states,
             solve_seconds=float(solve_seconds),
+            filter_precision=filter_precision,
         )
 
 
@@ -507,4 +576,5 @@ __all__ = [
     "CuPyEigvalResult",
     "CuPyEigvalSolver",
     "EigvalSettings",
+    "spill_download_order",
 ]

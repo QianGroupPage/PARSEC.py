@@ -23,7 +23,7 @@ public:
         const IndexArray& indptr,
         const IndexArray& indices,
         const FloatArray& data
-    ) const;
+    );
 
     py::dict solve(
         const FloatArray& right_hand_side,
@@ -31,7 +31,7 @@ public:
         double relative_tolerance,
         double absolute_tolerance,
         std::int64_t max_iterations
-    );
+    ) const;
 
     [[nodiscard]] std::pair<std::int64_t, std::int64_t> shape() const noexcept;
     [[nodiscard]] std::int64_t size() const noexcept;

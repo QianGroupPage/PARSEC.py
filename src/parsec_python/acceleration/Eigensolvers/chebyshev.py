@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 
 from ..backends.cupy import require_cupy
+from ..backends.cupy_mixed_precision import mixed_filter_policy
 
 
 @dataclass(frozen=True)
@@ -78,15 +79,16 @@ def _mixed_filter_requested(
     operator: Any,
     vector_count: int | None = None,
 ) -> bool:
-    """Use FP32 only for recurrence work large enough to benefit."""
+    """Use FP32 only where asked, and under ``auto`` only for enough work.
 
-    value = os.environ.get(
-        "PARSEC_CUPY_MIXED_FILTER", "auto"
-    ).strip().lower()
-    if value in {"0", "false", "no", "off"}:
+    FP64 is the default (:func:`mixed_filter_policy`).
+    """
+
+    policy = mixed_filter_policy()
+    if policy == "off":
         return False
     available = getattr(operator, "mixed_precision_recurrence", None) is not None
-    if not available or value in {"on", "1", "true"}:
+    if not available or policy == "on":
         return available
     if vector_count is None:
         # ``chebyshev_filter`` receives one six-vector memory block; its
@@ -361,12 +363,26 @@ def chebff_filter(
     block_size: int = 6,
     reset_recurrence_per_block: bool = False,
     batch_blocks: bool | None = None,
+    out: Any | None = None,
 ):
-    """Apply CHEBFF in memory blocks, preserving PARSEC's sigma carry."""
+    """Apply CHEBFF in memory blocks, preserving PARSEC's sigma carry.
+
+    ``out`` (which may be ``vectors`` itself when the caller owns it) is used
+    only by the captured-graph route; always use the returned array.
+    """
 
     cp, _ = require_cupy()
     matrix, was_vector = _as_device_columns(vectors)
     blocks = uniform_filter_blocks(matrix.shape[1], block_size, degree)
+    from .filter_graph import graph_filter
+
+    captured = graph_filter(
+        operator, matrix, blocks, lower_bound, upper_bound,
+        reference_eigenvalue, reset_recurrence_per_block,
+        out=out if out is matrix else None,
+    )
+    if captured is not None:
+        return captured[:, 0] if was_vector else captured
     use_batching = _batching_requested() if batch_blocks is None else batch_blocks
     if use_batching and _batch_workspace_fits(matrix, len(blocks)):
         batched = _batched_block_filter(
@@ -381,7 +397,8 @@ def chebff_filter(
         if batched is not None:
             return batched[:, 0] if was_vector else batched
 
-    filtered = cp.empty_like(matrix, dtype=cp.float64)
+    order = "F" if os.environ.get("PARSEC_CUPY_FILTER_COLUMN_MAJOR", "0") == "1" else "K"
+    filtered = cp.empty_like(matrix, dtype=cp.float64, order=order)
     carried_sigma: float | None = None
     for block in blocks:
         result, final_sigma = chebyshev_filter(
@@ -451,8 +468,14 @@ def subspace_filter(
     reset_recurrence_per_block: bool = False,
     batch_blocks: bool | None = None,
     mixed_precision: bool | None = None,
+    out: Any | None = None,
 ):
-    """Apply the one-pass later-SCF PARSEC filter on the GPU."""
+    """Apply the one-pass later-SCF PARSEC filter on the GPU.
+
+    ``out`` (which may be ``vectors`` itself when the caller owns it) is used
+    only by the captured-graph and distributed routes; always use the
+    returned array.
+    """
 
     cp, _ = require_cupy()
     matrix, was_vector = _as_device_columns(vectors)
@@ -464,6 +487,23 @@ def subspace_filter(
     blocks = subspace_filter_blocks(
         matrix.shape[1], block_size, degree, degree_delta
     )
+    if os.environ.get("PARSEC_CUPY_DISTRIBUTED_FILTER", "0") == "1":
+        if use_mixed_precision:
+            raise ValueError("distributed filter experiment requires FP64")
+        from .distributed_filter import distributed_filter
+        return distributed_filter(operator, matrix, blocks, lower_bound,
+                                  upper_bound, reset_recurrence_per_block,
+                                  out=out if out is matrix else None)
+    if not use_mixed_precision:
+        from .filter_graph import graph_filter
+
+        captured = graph_filter(
+            operator, matrix, blocks, lower_bound, upper_bound,
+            lower_bound, reset_recurrence_per_block,
+            out=out if out is matrix else None,
+        )
+        if captured is not None:
+            return captured[:, 0] if was_vector else captured
     use_batching = _batching_requested() if batch_blocks is None else batch_blocks
     if use_batching and _batch_workspace_fits(matrix, len(blocks)):
         batched = _batched_block_filter(
@@ -478,7 +518,15 @@ def subspace_filter(
         if batched is not None:
             return batched[:, 0] if was_vector else batched
 
-    filtered = cp.empty_like(matrix, dtype=cp.float64)
+    if use_mixed_precision and _mixed_filter_requested(operator):
+        # The blocks below run the FP32 recurrence: ``chebyshev_filter`` asks
+        # the same of the operator.  No other route of this pass does, and
+        # the precision report is read from this count.
+        stats = getattr(operator, "timing_stats", None)
+        if stats is not None:
+            stats.subspace_filter_float32_passes += 1
+    order = "F" if os.environ.get("PARSEC_CUPY_FILTER_COLUMN_MAJOR", "0") == "1" else "K"
+    filtered = cp.empty_like(matrix, dtype=cp.float64, order=order)
     carried_sigma: float | None = None
     for block in blocks:
         result, final_sigma = chebyshev_filter(

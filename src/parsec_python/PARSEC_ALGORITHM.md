@@ -336,6 +336,13 @@ V_H(R) =
 The default/effective maximum `l` is 9. Multipoles are centered at the domain
 origin.
 
+The Python port keeps this expansion. Where an estimate made from the
+geometry says that it omits too much at the boundary, the port raises the
+order (up to 60) and adds what the expansion still omits for the valence
+charges placed at the nuclei (`Hartree_Boundary_Tolerance`,
+`Hartree_Atomic_Tail`; see `README.md`). `Hartree_Boundary_Tolerance: off` is
+the algorithm described here.
+
 For every active row and every stencil neighbor outside the domain, `hartset`
 moves the known boundary value to the right-hand side:
 
@@ -607,7 +614,8 @@ internal energy rather than a Mermin free energy.
 ## Source behaviors to treat carefully
 
 - `Ignore_Symmetry` also changes the grid shift.
-- `Solver_Lpole` is read but reset to 9 later in this commit.
+- `Solver_Lpole` is read but reset to 9 later in this commit. The Python
+  port accepts 0 to 60 and treats the value as the minimum order.
 - dynamic diagonalization tolerance is effectively prevented from tightening
   by the current input/loop assignments.
 - later Chebyshev subspace iterations do not test Ritz residuals.

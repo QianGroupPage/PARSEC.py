@@ -6,6 +6,7 @@ import unittest
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import scipy.sparse as sp
@@ -51,6 +52,30 @@ class AxisReflectionReductionTests(unittest.TestCase):
         cls.reduction = AxisReflectionReduction.detect(
             cls.grid, (Atom("H", (0.0, 0.0, 0.0)),)
         )
+
+    def test_large_species_groups_match_on_the_same_threshold_graph(self) -> None:
+        from parsec_python.acceleration.Symmetry import axis_reflection
+
+        generator = np.random.default_rng(5)
+        for count, tolerance in ((700, 1.0e-6), (900, 0.3)):
+            candidates = generator.uniform(-6.0, 6.0, size=(count, 3))
+            transformed = candidates[generator.permutation(count)] + generator.normal(
+                scale=tolerance / 2, size=(count, 3)
+            )
+            # Pairs at the threshold and one ulp either side of it.
+            for row, scale in enumerate((1.0, np.nextafter(1.0, 2.0), np.nextafter(1.0, 0.0))):
+                transformed[row] = candidates[row] + (tolerance * scale, 0.0, 0.0)
+            distances = np.linalg.norm(transformed[:, None, :] - candidates[None, :, :], axis=2)
+            dense = [np.flatnonzero(row <= tolerance).tolist() for row in distances]
+            self.assertEqual(axis_reflection._threshold_neighbours(transformed, candidates, tolerance), dense)
+        # An atom-centred cubic lattice has the three twofold axes; moving one atom removes them.
+        axis = np.arange(-4, 5, dtype=np.float64)
+        lattice = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
+        self.assertGreater(len(lattice), axis_reflection._DENSE_MATCHING_LIMIT)
+        signs = np.array((1.0, -1.0, -1.0))
+        self.assertTrue(axis_reflection._has_tolerance_perfect_matching(lattice * signs, lattice, 1.0e-6))
+        lattice[7] += 1.0e-3
+        self.assertFalse(axis_reflection._has_tolerance_perfect_matching(lattice * signs, lattice, 1.0e-6))
 
     def test_half_shifted_sphere_has_eight_equal_images(self) -> None:
         reduction = self.reduction
@@ -390,6 +415,85 @@ class AxisReflectionReductionTests(unittest.TestCase):
                 getattr(full_energy, field), getattr(wedge_energy, field), 12
             )
 
+    def test_wedge_energy_takes_what_the_scf_loop_gives_the_reference_energy(self) -> None:
+        import inspect
+
+        # The reference SCF loop calls whichever evaluator it has with the
+        # same arguments, the alpha_Z term of a periodic cell among them.
+        self.assertEqual(
+            list(inspect.signature(SymmetrySCFReducer.total_energy).parameters)[1:],
+            list(inspect.signature(total_energy).parameters),
+        )
+        reducer = SymmetrySCFReducer(self.reduction)
+        generator = np.random.default_rng(37)
+
+        def invariant() -> np.ndarray:
+            return reducer.expand_values(
+                generator.standard_normal(self.reduction.wedge_size)
+            )
+
+        arguments = (
+            np.sort(generator.standard_normal(5)),
+            generator.random(5),
+            np.abs(invariant()) + 0.1,
+            invariant(),
+            invariant(),
+            invariant(),
+            invariant(),
+            -3.2,
+            4.1,
+            0.125,
+        )
+        shifted_full = total_energy(*arguments, alpha_z_energy=0.75)
+        shifted_wedge = reducer.total_energy(*arguments, alpha_z_energy=0.75)
+        for field in shifted_full.__dataclass_fields__:
+            self.assertAlmostEqual(
+                getattr(shifted_full, field), getattr(shifted_wedge, field), 12
+            )
+        # The term is in the band energy and so in the sums above it.
+        plain = reducer.total_energy(*arguments)
+        self.assertEqual(shifted_wedge.eigenvalue, plain.eigenvalue + 0.75)
+        self.assertAlmostEqual(shifted_wedge.total, plain.total + 0.75, 12)
+        self.assertEqual(shifted_wedge.hartree, plain.hartree)
+        # Zero, the value of every cluster, leaves each number as it was.
+        self.assertEqual(reducer.total_energy(*arguments, alpha_z_energy=0.0), plain)
+
+    def test_full_grid_residual_is_expanded_only_when_it_is_read(self) -> None:
+        reducer = SymmetrySCFReducer(self.reduction)
+        generator = np.random.default_rng(43)
+        wedge_size = self.reduction.wedge_size
+        input_potential = reducer.field(generator.standard_normal(wedge_size))
+        output_potential = reducer.field(generator.standard_normal(wedge_size))
+        density = reducer.field(np.abs(generator.standard_normal(wedge_size)) + 0.2)
+        # The SCF loop asks for the two norms only; that must not touch the
+        # full grid.
+        with patch.object(
+            SymmetrySCFReducer,
+            "expand_values",
+            side_effect=AssertionError("the residual was expanded before a read"),
+        ):
+            metrics = reducer.potential_residual_metrics(
+                input_potential, output_potential, density, 0.125, 10.0
+            )
+            norms = (metrics.weighted, metrics.plain)
+        full_metrics = potential_residual_metrics(
+            reducer.to_full(input_potential),
+            reducer.to_full(output_potential),
+            reducer.to_full(density),
+            0.125,
+            10.0,
+        )
+        self.assertAlmostEqual(norms[0], full_metrics.weighted, 13)
+        self.assertAlmostEqual(norms[1], full_metrics.plain, 13)
+        np.testing.assert_array_equal(
+            metrics.wedge_residual, output_potential.values - input_potential.values
+        )
+        # Reading the attribute gives the reference full-grid residual.
+        residual = metrics.residual
+        self.assertEqual(residual.shape, (self.reduction.full_size,))
+        self.assertTrue(residual.flags.c_contiguous)
+        np.testing.assert_array_equal(residual, full_metrics.residual)
+
     def test_compact_scalar_fields_stay_compact_and_match_full_algebra(self) -> None:
         reducer = SymmetrySCFReducer(self.reduction)
         generator = np.random.default_rng(37)
@@ -488,6 +592,67 @@ class ReflectionRepresentationTests(unittest.TestCase):
         gram = decomposition.characters @ decomposition.characters.T
         np.testing.assert_array_equal(gram, 8 * np.eye(8, dtype=np.int8))
 
+    def test_sector_orbit_lists_are_built_once_and_match_the_sector_map(self) -> None:
+        # A zero-shift grid has stabilizers, hence sectors of different size.
+        grid = build_cluster_grid(
+            GridSettings(
+                spacing=1.0,
+                radius=2.2,
+                expansion_order=2,
+                shift=(0.0, 0.0, 0.0),
+            )
+        )
+        reduction = AxisReflectionReduction.detect(
+            grid, (Atom("H", (0.0, 0.0, 0.0)),)
+        )
+        decomposition = ReflectionRepresentationDecomposition.build(grid, reduction)
+        self.assertGreater(
+            max(decomposition.sector_sizes), min(decomposition.sector_sizes)
+        )
+        for representation in range(decomposition.representation_count):
+            with self.subTest(representation=representation):
+                orbits = decomposition.sector_orbit_indices(representation)
+                # Sector column j is the orbit that the sector map sends to j.
+                mapping = decomposition.orbit_to_sector[representation]
+                expected = np.full(
+                    decomposition.sector_size(representation), -1, dtype=np.int64
+                )
+                expected[mapping[mapping >= 0]] = np.flatnonzero(mapping >= 0)
+                np.testing.assert_array_equal(orbits, expected)
+                self.assertEqual(orbits.dtype, np.int64)
+                self.assertTrue(orbits.flags.c_contiguous)
+                # Later requests return the same array, which callers share.
+                self.assertIs(
+                    decomposition.sector_orbit_indices(representation), orbits
+                )
+                self.assertFalse(orbits.flags.writeable)
+        # The lists belong to one decomposition and are not part of its value.
+        other = ReflectionRepresentationDecomposition.build(grid, reduction)
+        self.assertIsNot(
+            other.sector_orbit_indices(0), decomposition.sector_orbit_indices(0)
+        )
+        with self.assertRaises(IndexError):
+            decomposition.sector_orbit_indices(decomposition.representation_count)
+        # The batched Python assembly reads the sector map itself: reducing a
+        # sector there asks for no orbit list, and gives the operator of the
+        # single-sector route, which selects its rows through the list.
+        operator = build_negative_laplacian(grid)
+        with (
+            patch.dict(os.environ, PARSEC_NATIVE_SECTOR_ASSEMBLY="0"),
+            patch.object(
+                ReflectionRepresentationDecomposition,
+                "sector_orbit_indices",
+                side_effect=AssertionError("the batched assembly built an orbit list"),
+            ),
+        ):
+            batched = other.reduce_operators(operator)
+        for representation, reduced in enumerate(batched):
+            with self.subTest(representation=representation):
+                single = decomposition.reduce_operator(operator, representation)
+                np.testing.assert_array_equal(reduced.indptr, single.indptr)
+                np.testing.assert_array_equal(reduced.indices, single.indices)
+                np.testing.assert_array_equal(reduced.data, single.data)
+
     def test_cold_operator_worker_policy_is_size_adaptive(self) -> None:
         original = os.environ.pop("PARSEC_SYMMETRY_OPERATOR_WORKERS", None)
         try:
@@ -580,6 +745,51 @@ class ReflectionRepresentationTests(unittest.TestCase):
                 np.testing.assert_allclose(
                     reduced.apply(wedge), expected, atol=3.0e-13
                 )
+
+    def test_partial_build_matches_selected_sectors_of_the_full_build(self) -> None:
+        generator = np.random.default_rng(57)
+        nonlocal_operator = NonlocalProjectorOperator(
+            projectors=sp.csc_matrix(generator.standard_normal((self.grid.size, 3))),
+            signs=np.asarray((1.0, -1.0, 1.0)),
+            labels=tuple((0, 0, index) for index in range(3)),
+        )
+        wanted = (5, 0, 5)
+        full = load_or_build_reduced_operators(
+            self.decomposition, self.operator, nonlocal_operator, cache_directory=None
+        )
+        partial = load_or_build_reduced_operators(
+            self.decomposition, self.operator, nonlocal_operator,
+            cache_directory=None, representations=wanted,
+        )
+        self.assertEqual(partial.cache_info.status, "disabled-partial")
+        for representation in range(self.decomposition.representation_count):
+            with self.subTest(representation=representation):
+                stencil = partial.stencil_metadata[representation]
+                projector = partial.nonlocal_operators[representation]
+                if representation not in wanted:
+                    self.assertIsNone(stencil)
+                    self.assertIsNone(projector)
+                    continue
+                expected = full.stencil_metadata[representation]
+                np.testing.assert_array_equal(stencil.neighbors, expected.neighbors)
+                np.testing.assert_array_equal(
+                    stencil.coefficient_codes, expected.coefficient_codes
+                )
+                np.testing.assert_array_equal(
+                    stencil.coefficient_palette, expected.coefficient_palette
+                )
+                reference = full.nonlocal_operators[representation].projectors
+                np.testing.assert_array_equal(projector.projectors.indptr, reference.indptr)
+                np.testing.assert_array_equal(projector.projectors.indices, reference.indices)
+                np.testing.assert_array_equal(projector.projectors.data, reference.data)
+        # Naming every sector is the ordinary complete build.
+        complete = load_or_build_reduced_operators(
+            self.decomposition, self.operator, nonlocal_operator, cache_directory=None,
+            representations=tuple(range(self.decomposition.representation_count)),
+        )
+        self.assertEqual(complete.cache_info.status, "disabled")
+        with self.assertRaises(IndexError):
+            self.decomposition.reduce_operators(self.operator, (8,))
 
     def test_reduced_operator_cache_is_exact_and_content_addressed(self) -> None:
         generator = np.random.default_rng(59)

@@ -11,7 +11,10 @@ from parsec_python.Hartree import (
     HartreeResult,
     MultipoleExpansion,
 )
-from parsec_python.Hartree.poisson import _conjugate_gradient
+from parsec_python.Hartree.poisson import (
+    _check_boundary_tail,
+    _conjugate_gradient,
+)
 from parsec_python.Laplacian import apply_negative_laplacian_boundary
 from parsec_python.models import HartreeSettings
 
@@ -22,8 +25,13 @@ def build_hartree_problem(
     density: np.ndarray,
     grid: RealSpaceGrid,
     settings: HartreeSettings,
+    boundary_tail=None,
 ) -> tuple[np.ndarray, MultipoleExpansion | DirectCoulombBoundary]:
-    """Return the identical isolated boundary-corrected Poisson right side."""
+    """Return the identical isolated boundary-corrected Poisson right side.
+
+    ``boundary_tail`` is the static atomic tail of the multipole boundary
+    values, as in :func:`parsec_python.Hartree.solve_hartree`.
+    """
 
     density = np.asarray(density, dtype=np.float64)
     if density.shape != (grid.size,):
@@ -50,6 +58,9 @@ def build_hartree_problem(
     right_hand_side = apply_negative_laplacian_boundary(
         source, grid, boundary.potential
     )
+    if boundary_tail is not None:
+        _check_boundary_tail(boundary_tail, method, settings)
+        right_hand_side[boundary_tail.rows] += boundary_tail.values
     return right_hand_side, boundary
 
 
@@ -61,12 +72,15 @@ def solve_scipy_hartree(
     initial_potential: np.ndarray | None = None,
     *,
     raise_on_nonconvergence: bool = True,
+    boundary_tail=None,
 ) -> HartreeResult:
     """Solve Hartree with fast multipoles and reference-equivalent host CG."""
 
     if negative_laplacian.shape != (grid.size, grid.size):
         raise ValueError("negative_laplacian shape does not match the grid")
-    right_hand_side, boundary = build_hartree_problem(density, grid, settings)
+    right_hand_side, boundary = build_hartree_problem(
+        density, grid, settings, boundary_tail
+    )
     if initial_potential is None:
         initial = np.zeros(grid.size, dtype=np.float64)
     else:
@@ -96,6 +110,7 @@ def solve_scipy_hartree(
         matrix_vector_products=matvecs,
         residual_norm=residual,
         initial_residual_norm=initial_residual,
+        boundary_tail=boundary_tail,
     )
 
 

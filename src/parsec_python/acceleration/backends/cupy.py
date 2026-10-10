@@ -32,10 +32,19 @@ from .cupy_stencil_major import (
     CuPyStencilMajorFiniteDifference,
     StencilMajorHostMetadata,
 )
-from .cupy_mixed_precision import CuPyMixedPrecisionRecurrence
+from .cupy_mixed_precision import (
+    CuPyMixedPrecisionRecurrence,
+    float32_filter_requested,
+    mixed_filter_policy,
+)
 from .cupy_projectors import (
     CuPySparseProjectorFactors,
     CuPySparseProjectorProjection,
+)
+from .implicit_stencil import (
+    PackedTileHostMetadata,
+    implicit_tile_setting,
+    pack_worker_setting,
 )
 
 
@@ -166,9 +175,16 @@ class CuPyTimingStats:
     solve_calls: int = 0
     first_solve_calls: int = 0
     subspace_solve_calls: int = 0
+    # Later filter passes that ran the FP32 recurrence, an opt-in.
+    subspace_filter_float32_passes: int = 0
     density_calls: int = 0
     hamiltonian_applications: int = 0
     orbital_vectors_applied: int = 0
+    filter_graph_launches: int = 0
+    filter_graph_builds: int = 0
+    filter_graph_buffer_bytes: int = 0
+    initial_random_device_values: int = 0
+    eigensolver_bound_prepare_wall_seconds: float = 0.0
     _pending_stage_events: list[tuple[str, Any, Any]] = field(
         default_factory=list,
         init=False,
@@ -280,9 +296,12 @@ class CuPyHamiltonian:
         retain_generic_laplacian: bool = True,
         prefer_stencil_major: bool = True,
         use_compact_finite_difference: bool = True,
-        finite_difference_metadata: StencilMajorHostMetadata | None = None,
+        finite_difference_metadata: (
+            StencilMajorHostMetadata | PackedTileHostMetadata | None
+        ) = None,
         shared_stencil_neighbors: Any | None = None,
         shared_effective_potential: Any | None = None,
+        implicit_tile: int | None = None,
     ) -> None:
         self.timing_stats = timing_stats or CuPyTimingStats()
 
@@ -346,20 +365,49 @@ class CuPyHamiltonian:
                     prefer_stencil_major
                 )
                 if stencil_requested:
-                    try:
-                        self.compact_finite_difference = (
-                            CuPyStencilMajorFiniteDifference(
-                                cp,
-                                host_a,
-                                metadata=finite_difference_metadata,
-                                device_neighbors=shared_stencil_neighbors,
+                    # Affine tiles are a layout of the stencil-major kernels.
+                    # A size that the environment names is built or is an
+                    # error; one that the default chose for a sector gives
+                    # way to the slot-major layout, which every route reads,
+                    # and never to the CSR-order kernel below.
+                    named_tile = implicit_tile_setting()
+                    tile = (
+                        (named_tile or 0)
+                        if implicit_tile is None
+                        else int(implicit_tile)
+                    )
+                    if tile:
+                        # A setting of the packer that is no thread count is
+                        # an error as well, whoever chose the tiles.
+                        pack_worker_setting()
+                    # A stencil that arrives packed, the tiles of a sector
+                    # for another of its devices, has that layout alone.
+                    packed = isinstance(
+                        finite_difference_metadata, PackedTileHostMetadata
+                    )
+                    for layout in dict.fromkeys((tile, 0)):
+                        try:
+                            self.compact_finite_difference = (
+                                CuPyStencilMajorFiniteDifference(
+                                    cp,
+                                    host_a,
+                                    metadata=finite_difference_metadata,
+                                    device_neighbors=shared_stencil_neighbors,
+                                    implicit_tile=layout,
+                                )
                             )
-                        )
-                    except Exception as error:
-                        failures.append(
-                            "stencil-major "
-                            f"{type(error).__name__}: {error}"
-                        )
+                            break
+                        except Exception as error:
+                            if packed or (layout and named_tile is not None):
+                                raise
+                            failures.append(
+                                (
+                                    f"affine tiles of {layout} "
+                                    if layout
+                                    else "stencil-major "
+                                )
+                                + f"{type(error).__name__}: {error}"
+                            )
                 else:
                     failures.append(
                         "stencil-major disabled by operator policy/environment"
@@ -502,40 +550,13 @@ class CuPyHamiltonian:
                     )
                 )
             )
-            mixed_filter_policy = os.environ.get(
-                "PARSEC_CUPY_MIXED_FILTER", "auto"
-            ).strip().lower()
-            if mixed_filter_policy not in {
-                "auto", "on", "off", "1", "0", "true", "false"
-            }:
-                raise ValueError(
-                    "PARSEC_CUPY_MIXED_FILTER must be auto, on, or off"
-                )
-            raw_mixed_minimum = os.environ.get(
-                "PARSEC_CUPY_MIXED_FILTER_MIN_ROWS", "100000"
-            ).strip()
-            try:
-                mixed_minimum_rows = int(raw_mixed_minimum)
-            except ValueError as error:
-                raise ValueError(
-                    "PARSEC_CUPY_MIXED_FILTER_MIN_ROWS must be an integer"
-                ) from error
-            if mixed_minimum_rows < 1:
-                raise ValueError(
-                    "PARSEC_CUPY_MIXED_FILTER_MIN_ROWS must be positive"
-                )
-            mixed_filter_requested = bool(
-                mixed_filter_policy in {"on", "1", "true"}
-                or (
-                    mixed_filter_policy == "auto"
-                    and dimension >= mixed_minimum_rows
-                )
-            )
+            # FP64 unless PARSEC_CUPY_MIXED_FILTER asks for the FP32 filter.
+            mixed_filter = mixed_filter_policy()
+            mixed_filter_requested = float32_filter_requested(dimension)
             self.mixed_precision_recurrence = None
             self.mixed_precision_filter_reason = (
                 "below automatic row threshold"
-                if mixed_filter_policy == "auto"
-                and dimension < mixed_minimum_rows
+                if mixed_filter == "auto" and not mixed_filter_requested
                 else "disabled by policy"
             )
             if mixed_filter_requested and isinstance(
@@ -557,7 +578,7 @@ class CuPyHamiltonian:
                     self.mixed_precision_filter_reason = (
                         f"{type(error).__name__}: {error}"
                     )
-                    if mixed_filter_policy in {"on", "1", "true"}:
+                    if mixed_filter == "on":
                         raise
             elif mixed_filter_requested:
                 self.mixed_precision_filter_reason = (

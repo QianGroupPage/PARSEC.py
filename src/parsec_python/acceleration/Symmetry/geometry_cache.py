@@ -10,6 +10,9 @@ atomic coordinate, tolerance, or cache format produces a different key.  A
 loaded entry is also checked structurally before it is accepted.  Missing,
 old, or damaged entries are rebuilt by the same exact routines used when the
 cache is disabled.
+
+A key only addresses a cache entry.  Without a cache directory nothing looks
+it up, so the full-grid arrays are not hashed and the key is ``None``.
 """
 
 from __future__ import annotations
@@ -36,10 +39,13 @@ _REPRESENTATION_FORMAT = 3
 
 @dataclass(frozen=True)
 class SymmetryCacheInfo:
-    """Provenance and wall time for one symmetry metadata cache lookup."""
+    """Provenance and wall time for one symmetry metadata cache lookup.
+
+    ``key`` is ``None`` when the cache is disabled and no key was hashed.
+    """
 
     status: str
-    key: str
+    key: str | None
     path: Path | None
     hash_seconds: float = 0.0
     load_seconds: float = 0.0
@@ -265,9 +271,14 @@ def load_or_detect_reflection_reduction(
     # metadata is inspected.
     if not atoms:
         raise ValueError("axis-reflection detection requires at least one atom")
-    hash_started = perf_counter()
-    key = _geometry_key(grid, atoms, atom_tolerance, lattice_tolerance)
-    hash_seconds = perf_counter() - hash_started
+    # Hashing both full-grid coordinate arrays is needed only to address a
+    # cache entry.
+    key = None
+    hash_seconds = 0.0
+    if cache_directory is not None:
+        hash_started = perf_counter()
+        key = _geometry_key(grid, atoms, atom_tolerance, lattice_tolerance)
+        hash_seconds = perf_counter() - hash_started
     path = (
         None
         if cache_directory is None
@@ -342,14 +353,26 @@ def load_or_build_reflection_decomposition(
     grid: RealSpaceGrid,
     reduction: AxisReflectionReduction,
     *,
-    reduction_key: str,
+    reduction_key: str | None,
     cache_directory: os.PathLike[str] | str | None,
 ) -> tuple[ReflectionRepresentationDecomposition, SymmetryCacheInfo]:
-    """Load or build the exact character phases for a free grid action."""
+    """Load or build the exact character phases for a free grid action.
 
-    hash_started = perf_counter()
-    key = _representation_key(reduction_key, reduction)
-    hash_seconds = perf_counter() - hash_started
+    ``reduction_key`` is the content key of ``reduction``.  It may be ``None``
+    only together with a disabled cache, where no key is derived from it.
+    """
+
+    key = None
+    hash_seconds = 0.0
+    if cache_directory is not None:
+        if reduction_key is None:
+            raise ValueError(
+                "a cached reflection decomposition requires the content key "
+                "of its reduction"
+            )
+        hash_started = perf_counter()
+        key = _representation_key(reduction_key, reduction)
+        hash_seconds = perf_counter() - hash_started
     path = (
         None
         if cache_directory is None

@@ -9,6 +9,7 @@ from parsec_python.models import HartreeSettings
 
 from ..Symmetry import AxisReflectionReduction
 from ..SCF.symmetry_fields import SymmetryScalarField
+from ..backends.cupy_stencil_major import StencilMajorHostMetadata
 from .native_poisson import NativePoissonResult, NativePoissonSolver
 
 
@@ -27,9 +28,25 @@ class SymmetryReducedPoissonSolver:
         reduction: AxisReflectionReduction,
         *,
         operator_is_reduced: bool = False,
+        solver_factory=None,
     ) -> None:
         self.reduction = reduction
-        if operator_is_reduced:
+        if operator_is_reduced and isinstance(
+            negative_laplacian, StencilMajorHostMetadata
+        ):
+            # The packed stencil of the totally symmetric orbital sector goes
+            # to the solver as it is.  ``solver_factory`` must accept it; the
+            # CSR form below is then formed only if it is asked for.
+            if tuple(negative_laplacian.shape) != (
+                reduction.wedge_size,
+                reduction.wedge_size,
+            ):
+                raise ValueError(
+                    "pre-reduced Hartree operator does not match the symmetry wedge"
+                )
+            reduced = negative_laplacian
+            self._reduced_negative_laplacian = None
+        elif operator_is_reduced:
             reduced = sp.csr_matrix(negative_laplacian, dtype=np.float64)
             if reduced.shape != (reduction.wedge_size, reduction.wedge_size):
                 raise ValueError(
@@ -37,17 +54,33 @@ class SymmetryReducedPoissonSolver:
                 )
             reduced.sum_duplicates()
             reduced.sort_indices()
-            self.reduced_negative_laplacian = reduced
+            self._reduced_negative_laplacian = reduced
         else:
-            self.reduced_negative_laplacian = reduction.reduce_operator(
-                negative_laplacian
-            )
-        self.solver = NativePoissonSolver(self.reduced_negative_laplacian)
-        self.negative_laplacian = self.solver.negative_laplacian
+            reduced = reduction.reduce_operator(negative_laplacian)
+            self._reduced_negative_laplacian = reduced
+        factory = NativePoissonSolver if solver_factory is None else solver_factory
+        self.solver = factory(reduced)
         self.shape = self.solver.shape
         self.storage_mode = self.solver.storage_mode
         self.worker_count = self.solver.worker_count
         self.coefficient_palette_size = self.solver.coefficient_palette_size
+
+    @property
+    def reduced_negative_laplacian(self) -> sp.csr_matrix:
+        """Reduced CSR operator this adapter was built from.
+
+        For a packed stencil it is the solver's matrix, formed on first use.
+        """
+
+        if self._reduced_negative_laplacian is None:
+            self._reduced_negative_laplacian = self.solver.negative_laplacian
+        return self._reduced_negative_laplacian
+
+    @property
+    def negative_laplacian(self) -> sp.csr_matrix:
+        """Canonical reduced CSR operator held by the wrapped solver."""
+
+        return self.solver.negative_laplacian
 
     def solve(
         self,

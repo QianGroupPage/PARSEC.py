@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import gc
 from types import SimpleNamespace
 import unittest
 
@@ -378,6 +379,11 @@ class TestCuPyPoissonWithoutCUDA(unittest.TestCase):
 
 @unittest.skipUnless(REAL_CUDA_AVAILABLE, "CuPy/CUDA are not available")
 class TestCuPyPoissonRealCUDA(unittest.TestCase):
+    def tearDown(self):
+        # Operators and solvers that a test left in a reference cycle are destroyed
+        # here, between the tests, and not by a collection inside the next one.
+        gc.collect()
+
     def test_real_cuda_sphere_matches_reference(self):
         grid, negative_laplacian, density = _sphere_problem()
         settings = HartreeSettings(

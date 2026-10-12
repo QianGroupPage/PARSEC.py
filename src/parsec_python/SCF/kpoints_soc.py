@@ -68,16 +68,21 @@ def _number_of_states(system: PeriodicPreparedSinglePointSystem) -> int:
 def _eigval_settings(
     system: PeriodicPreparedSinglePointSystem, filter_degree: int
 ) -> EigvalSettings:
+    """First-solver and later-filter policy for the complex (k-point) drivers.
+
+    ``Eigensolver: chebff`` or ``chebdav`` (the Fortran default): both have
+    complex-capable arithmetic.  CHEBDAV converges the first solve to
+    ``Diag_Tolerance``; CHEBFF only applies ``FF_MaxIter`` filter cycles.
+    """
     eigensolver_settings = system.input.eigensolver
-    if eigensolver_settings.method != "chebff":
+    if eigensolver_settings.method not in ("chebff", "chebdav"):
         raise NotImplementedError(
             f"Eigensolver={eigensolver_settings.method!r} is not supported for "
-            "periodic self-consistent SOC; only 'chebff' has a complex-capable "
-            "trial basis and internal working arrays"
+            "k-point / spin-orbit calculations; use 'chebff' or 'chebdav'"
         )
     return EigvalSettings(
         safety_buffer=eigensolver_settings.subspace_buffer,
-        initial_method="chebff",
+        initial_method=eigensolver_settings.method,
         chebff=ChebFFSettings(
             polynomial_degree=eigensolver_settings.first_filter_degree,
             filter_cycles=eigensolver_settings.first_filter_cycles,
@@ -86,7 +91,19 @@ def _eigval_settings(
             reset_recurrence_per_block=False,
             random_seed=eigensolver_settings.random_seed,
         ),
-        chebdav=ChebDavSettings(),
+        chebdav=(
+            ChebDavSettings(
+                polynomial_degree=eigensolver_settings.first_filter_degree,
+                convergence_tolerance=eigensolver_settings.tolerance,
+                block_size=eigensolver_settings.matvec_block_size,
+                workspace_window=12,
+                lanczos_steps=5,
+                max_outer_restarts=2,
+                random_seed=eigensolver_settings.random_seed,
+            )
+            if eigensolver_settings.method == "chebdav"
+            else ChebDavSettings()
+        ),
         subspace=SubspaceSettings(
             polynomial_degree=filter_degree,
             degree_delta=eigensolver_settings.filter_degree_delta,
@@ -363,6 +380,7 @@ def run_self_consistent_soc_kpoints(
         k_points=k_points,
         k_weights=np.full(n_kpoints, weight),
         state_moments=_state_sz(spinors_by_k),
+        scf_potentials={"effective_potential": output_potential},
     )
 
 
@@ -576,6 +594,10 @@ def run_self_consistent_soc_kpoints_spin_polarized(
         k_points=k_points,
         k_weights=np.full(n_kpoints, weight),
         state_moments=_state_sz(spinors_by_k),
+        scf_potentials={
+            "effective_potential": 0.5 * (output_potential_up + output_potential_down),
+            "xc_delta": 0.5 * (output_potential_up - output_potential_down),
+        },
     )
 
 

@@ -163,6 +163,45 @@ def read_kpoint_file(path) -> np.ndarray:
     return np.asarray(rows, dtype=float)
 
 
+def band_path_kpoints(
+    starts: np.ndarray, ends: np.ndarray, points_in_shortest_segment: int
+) -> list[np.ndarray]:
+    """K-points of each band-path segment, as in Fortran ``calc_bands``.
+
+    ``starts``/``ends`` are the Cartesian (1/bohr) end points of every
+    segment.  The shortest segment gets ``points_in_shortest_segment`` points
+    and the others proportionally more, so the point density along the path is
+    constant: ``nkpt = int(length / min_length * points)`` (truncated, as in
+    the Fortran integer assignment).  A segment does not include its end
+    point -- that is the first point of the next segment -- except the last
+    segment, which gets one extra point to close the path.
+    """
+
+    starts = np.asarray(starts, dtype=float)
+    ends = np.asarray(ends, dtype=float)
+    if starts.shape != ends.shape or starts.ndim != 2 or starts.shape[1] != 3:
+        raise ValueError("segment end points must be two (n, 3) arrays")
+    if starts.shape[0] < 1:
+        raise ValueError("a band path needs at least one segment")
+    if points_in_shortest_segment < 1:
+        raise ValueError("bandstruc_points must be at least 1")
+    lengths = np.linalg.norm(ends - starts, axis=1)
+    if np.any(lengths <= 0.0):
+        raise ValueError("band-path segments must have non-zero length")
+    shortest = float(lengths.min())
+    segments = []
+    last = starts.shape[0] - 1
+    for index, (start, end, length) in enumerate(zip(starts, ends, lengths)):
+        count = int(length / shortest * points_in_shortest_segment)
+        if index == last:
+            count += 1
+            fractions = np.arange(count) / (count - 1) if count > 1 else np.zeros(1)
+        else:
+            fractions = np.arange(count) / count
+        segments.append(start + fractions[:, None] * (end - start))
+    return segments
+
+
 def kpoint_sampling(problem) -> tuple[np.ndarray, np.ndarray] | None:
     """``(k_points, weights)`` requested by a ``SinglePointInput``, or ``None``.
 
@@ -182,6 +221,7 @@ def kpoint_sampling(problem) -> tuple[np.ndarray, np.ndarray] | None:
 __all__ = [
     "KPOINT_UNITS",
     "explicit_kpoints",
+    "band_path_kpoints",
     "kpoint_sampling",
     "monkhorst_pack_grid",
     "read_kpoint_file",

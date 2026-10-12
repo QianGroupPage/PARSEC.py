@@ -2,6 +2,7 @@
 
 from .cluster import RealSpaceGrid, build_cluster_grid
 from .kpoints import (
+    band_path_kpoints,
     explicit_kpoints,
     kpoint_sampling,
     monkhorst_pack_grid,
@@ -14,6 +15,7 @@ __all__ = [
     "RealSpaceGrid",
     "build_cluster_grid",
     "build_periodic_grid",
+    "band_path_kpoints",
     "explicit_kpoints",
     "kpoint_sampling",
     "monkhorst_pack_grid",

@@ -55,6 +55,7 @@ from ..SCF.spin_polarized import (
     _weighted_initial_polarization,
 )
 from ..V_ion import build_nonlocal_projectors
+from .kpoints_soc import _eigval_settings
 from ..models import (
     SCFIteration,
     SinglePointResult,
@@ -72,38 +73,6 @@ def _number_of_states(system: PeriodicPreparedSinglePointSystem) -> int:
         raise ValueError("the grid is too small for the requested states and eigensolver buffer")
     return requested
 
-
-def _eigval_settings(
-    system: PeriodicPreparedSinglePointSystem, filter_degree: int
-) -> EigvalSettings:
-    eigensolver_settings = system.input.eigensolver
-    if eigensolver_settings.method != "chebff":
-        raise NotImplementedError(
-            f"Eigensolver={eigensolver_settings.method!r} is not supported for "
-            "k-point sampling; only 'chebff' has a complex-capable trial "
-            "basis and internal working arrays"
-        )
-    return EigvalSettings(
-        safety_buffer=eigensolver_settings.subspace_buffer,
-        initial_method="chebff",
-        chebff=ChebFFSettings(
-            polynomial_degree=eigensolver_settings.first_filter_degree,
-            filter_cycles=eigensolver_settings.first_filter_cycles,
-            lanczos_steps=10,
-            block_size=eigensolver_settings.matvec_block_size,
-            reset_recurrence_per_block=False,
-            random_seed=eigensolver_settings.random_seed,
-        ),
-        chebdav=ChebDavSettings(),
-        subspace=SubspaceSettings(
-            polynomial_degree=filter_degree,
-            degree_delta=eigensolver_settings.filter_degree_delta,
-            lanczos_steps=eigensolver_settings.lanczos_steps,
-            block_size=eigensolver_settings.matvec_block_size,
-            reset_recurrence_per_block=False,
-            random_seed=eigensolver_settings.random_seed,
-        ),
-    )
 
 
 def run_scf_kpoints(
@@ -549,6 +518,10 @@ def run_scf_kpoints_spin_polarized(
         occupation_weight=weight,
         k_points=k_points,
         k_weights=weights,
+        scf_potentials={
+            "potential_up": output_potential_up,
+            "potential_down": output_potential_down,
+        },
     )
 
 

@@ -335,6 +335,10 @@ def run_scf_spin_polarized(
         density_up=density_up,
         density_down=density_down,
         energies=energies,
+        scf_potentials={
+            "potential_up": output_potential_up,
+            "potential_down": output_potential_down,
+        },
     )
 
 

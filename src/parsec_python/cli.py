@@ -29,6 +29,8 @@ from .models import (
 )
 from .Grid import kpoint_sampling
 from .Output import ParsecTextReporter
+from .Output.bands import save_band_structure_archive, write_bands_files
+from .SCF.bands import band_mode, band_potentials, run_band_structure
 from .SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_polarized
 from .SCF.noncollinear import (
     run_self_consistent_noncollinear,
@@ -406,6 +408,35 @@ def save_self_consistent_soc_result_archive(
     return output
 
 
+def _run_band_structure(system, translation, result, reporter, directory: Path) -> None:
+    """Fortran ``calc_bands``: bands along the ``bandstruc`` path after the SCF."""
+    bands = translation.problem.bands
+    if bands is None:
+        return
+    mode = band_mode(translation.problem)
+    if not result.converged:
+        reporter.write(
+            " WARNING: the SCF did not converge; the bands use its last potential."
+        )
+    eigenvalues = getattr(result, "eigenvalues", None)
+    if eigenvalues is None:
+        eigenvalues = result.eigenvalues_up
+    k_points = getattr(result, "k_points", None)
+    k_count = 1 if k_points is None else len(k_points)
+    start = time.perf_counter()
+    band_result = run_band_structure(
+        system,
+        bands,
+        mode=mode,
+        potentials=band_potentials(result, mode),
+        fermi_level=result.fermi_level,
+        number_of_states=np.asarray(eigenvalues).size // k_count,
+    )
+    files = list(write_bands_files(directory, band_result))
+    files.append(save_band_structure_archive(directory / "parsec_python_bands.npz", band_result))
+    reporter.band_structure(band_result, files, time.perf_counter() - start)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -545,6 +576,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
+    if translation.problem.bands is not None:
+        try:
+            band_mode(translation.problem)
+        except ValueError as error:
+            print(f"Input error: {error}", file=sys.stderr)
+            return 2
+
     start = time.perf_counter()
     run_log = _RunLog(log_path, quiet=arguments.quiet)
     try:
@@ -616,6 +654,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                 scf_elapsed = time.perf_counter() - scf_start
                 reporter.finish_self_consistent_soc(result, scf_elapsed)
+                _run_band_structure(
+                    system, translation, result, reporter, input_directory
+                )
 
                 total_elapsed = time.perf_counter() - start
                 log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
@@ -659,6 +700,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         translation.problem.pseudopotentials,
                     )
                     reporter.spin_orbit_correction(soc_result)
+                _run_band_structure(
+                    system, translation, result, reporter, input_directory
+                )
 
                 total_elapsed = time.perf_counter() - start
                 log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
@@ -686,6 +730,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = run_scf(system, callback=reporter.iteration)
             scf_elapsed = time.perf_counter() - scf_start
             reporter.finish(result, scf_elapsed)
+            _run_band_structure(system, translation, result, reporter, input_directory)
             total_elapsed = time.perf_counter() - start
             log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
 

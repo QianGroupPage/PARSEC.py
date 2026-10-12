@@ -337,6 +337,54 @@ The Hamiltonian and nonlocal potential remain matrix-free during iterative
 eigensolution. Static terms are prepared once; only density-dependent local
 fields change during SCF.
 
+## Band structures (periodic systems)
+
+A `bandstruc` block adds a non-self-consistent band structure after the SCF, as in
+Fortran PARSEC's `calc_bands`. Each line is a path segment in *relative*
+(reciprocal-lattice) coordinates followed by a label, and `bandstruc_points` is the number of
+k-points on the shortest segment (default 20); longer segments get proportionally more, so the
+density along the path is constant:
+
+```
+begin bandstruc
+1 0.0 0.0 0.0   0.5 0.0 0.0   gamma-X
+2 0.5 0.0 0.0   0.5 0.5 0.0   X-M
+3 0.5 0.5 0.0   0.0 0.0 0.0   M-gamma
+end bandstruc
+bandstruc_points 20
+```
+
+The Hamiltonian follows the SCF mode, so the same block gives scalar, collinear spin-polarized
+(up and down channels), self-consistent spin-orbit (`SO_from_scratch` with `SO_PSP`),
+spin-orbit plus collinear spin, and non-collinear bands. Running the same input with and
+without the spin-orbit switches gives the effect of spin-orbit coupling. The perturbative
+spin-orbit route (`Spin_Polarization` with `SO_PSP` but no `SO_from_scratch`) is rejected for
+bands.
+
+At each k-point the Bloch Hamiltonian is built from the converged SCF potential and solved from
+scratch by the SCF's first eigensolver (`Eigensolver`, default `chebdav`, which converges to
+`Diag_Tolerance`; `chebff` only applies `FF_MaxIter` filter cycles and can leave the upper bands
+poorly converged). The log reports the largest residual `|Hv - ev|` and warns when the bands are
+not converged.
+
+Outputs (written next to `parsec.in`):
+
+* `bands.dat` and `bands_plot.dat` in Fortran's formats (eigenvalues in Ry / eV, not shifted by
+  the Fermi level; `bands.dat` carries the SCF Fermi level),
+* `parsec_python_bands.npz` with the k-points, segment names, eigenvalues, residuals and (for
+  spinor Hamiltonians) `<sigma>` of every state.
+
+Overlay several runs, e.g. without and with spin-orbit coupling:
+
+```bash
+python -m parsec_python.Output.bands noso/bands.dat soc/bands.dat \
+    --labels "no SOC" "with SOC" --names "G-X,X-M,M-G" -o bands.png
+```
+
+PARSEC.py needs an orthorhombic cell, so cubic conventional cells are used for fcc/bcc
+crystals and their bands are folded into the simple-cubic Brillouin zone. Fortran's
+`nscf_kpoints` (an explicit k-point list read from a `parsec.dat` restart) is not implemented.
+
 ## Modular Python API
 
 With `src` on `PYTHONPATH`, individual scientific pieces can be used without

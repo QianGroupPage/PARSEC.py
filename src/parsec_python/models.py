@@ -544,6 +544,56 @@ class InitialDensitySettings:
 
 
 @dataclass(frozen=True)
+class BandSegment:
+    """One straight piece of a band path (Fortran ``bandstruc`` block line).
+
+    ``start``/``end`` are in *relative* coordinates, i.e. multiples of the
+    reciprocal lattice vectors; ``name`` is the segment label (``gamma-X``).
+    """
+
+    start: tuple[float, float, float]
+    end: tuple[float, float, float]
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in ("start", "end"):
+            values = tuple(float(value) for value in getattr(self, field_name))
+            if len(values) != 3 or not all(np.isfinite(values)):
+                raise ValueError(f"band segment {field_name} must be three finite numbers")
+            object.__setattr__(self, field_name, values)
+        if self.start == self.end:
+            raise ValueError("a band segment must have non-zero length")
+
+
+@dataclass(frozen=True)
+class BandStructureSettings:
+    """Fortran ``bandstruc`` / ``bandstruc_points``: a band structure computed
+    after the SCF along a path of segments.
+
+    The shortest segment gets ``points`` k-points and the others
+    proportionally more (see :func:`~parsec_python.Grid.kpoints.band_path_kpoints`).
+    Each k-point is solved from scratch with the SCF's first eigensolver
+    (CHEBFF: ``FF_MaxIter`` filter cycles of degree ``Chebdav_Degree``) in the
+    converged self-consistent potential, exactly as Fortran ``calc_bands``.
+    """
+
+    segments: tuple[BandSegment, ...]
+    points: int = 20
+
+    def __post_init__(self) -> None:
+        segments = tuple(
+            segment if isinstance(segment, BandSegment) else BandSegment(**segment)
+            for segment in self.segments
+        )
+        if not segments:
+            raise ValueError("a band structure needs at least one segment")
+        object.__setattr__(self, "segments", segments)
+        if int(self.points) < 1:
+            raise ValueError("bandstruc_points must be at least 1")
+        object.__setattr__(self, "points", int(self.points))
+
+
+@dataclass(frozen=True)
 class SinglePointInput:
     """
     Complete input to the modular single-point calculator.
@@ -575,6 +625,9 @@ class SinglePointInput:
     kpoint_weights: np.ndarray | None = None
     """Sampling weights for ``kpoints`` (non-negative, normalized to sum 1;
     equal if omitted).  The SCF drivers currently require them equal."""
+    bands: BandStructureSettings | None = None
+    """Non-self-consistent band structure to compute after the SCF (periodic
+    systems only); see :class:`BandStructureSettings`."""
 
     @property
     def has_kpoint_sampling(self) -> bool:
@@ -631,6 +684,47 @@ class SinglePointInput:
             object.__setattr__(self, "kpoint_weights", weights)
         elif self.kpoint_weights is not None:
             raise ValueError("kpoint_weights given without kpoints")
+        if self.bands is not None and self.periodic_cell is None:
+            raise ValueError("a band structure requires periodic_cell")
+
+
+@dataclass
+class BandStructureResult:
+    """Eigenvalues along a band path computed with a fixed SCF potential.
+
+    ``eigenvalues`` has shape ``(n_channels, n_kpoints, n_states)`` in Ry,
+    with ``channels`` naming the first axis: ``("all",)`` for scalar and
+    spinor Hamiltonians, ``("up", "down")`` for collinear spin-polarized runs
+    without spin-orbit.  ``k_points`` are Cartesian (1/bohr) and flattened
+    over the segments; ``segment_counts[i]`` consecutive k-points belong to
+    segment ``i`` (``segment_names[i]``).  ``fermi_level`` is the SCF Fermi
+    level in the same energy zero.  ``residual_norms`` (channel, k) is the
+    largest ``|H v - e v|`` over the reported states: the Fortran CHEBFF
+    solver has no convergence test, so this is the quality diagnostic.
+    ``spin_expectation`` (spinor Hamiltonians) is ``<sigma_x,y,z>`` of every
+    state, shape ``(1, n_kpoints, n_states, 3)``.
+    """
+
+    mode: str
+    channels: tuple[str, ...]
+    segment_names: tuple[str, ...]
+    segment_counts: np.ndarray
+    k_points: np.ndarray
+    eigenvalues: np.ndarray
+    residual_norms: np.ndarray
+    fermi_level: float
+    spin_expectation: np.ndarray | None = None
+
+    @property
+    def segment_index(self) -> np.ndarray:
+        """Segment number (0-based) of every k-point."""
+        return np.repeat(np.arange(len(self.segment_counts)), self.segment_counts)
+
+    @property
+    def path_distance(self) -> np.ndarray:
+        """Cumulative Cartesian arc length along the path (1/bohr)."""
+        steps = np.linalg.norm(np.diff(self.k_points, axis=0), axis=1)
+        return np.concatenate([[0.0], np.cumsum(steps)])
 
 
 @dataclass(frozen=True)
@@ -806,6 +900,9 @@ class SpinPolarizedSinglePointResult:
     """Brillouin-zone weight carried by each pooled eigenvalue: 1 for a
     single (Gamma or cluster) calculation, ``1/n_k`` for an unreduced uniform
     k-point grid whose eigenvalues and occupations are pooled over k."""
+    scf_potentials: dict[str, np.ndarray] | None = None
+    """Converged local potentials of a periodic run (output side of the last
+    iteration), the input of a non-self-consistent band calculation."""
     k_points: np.ndarray | None = None
     """Cartesian k-points, shape ``(n_k, 3)`` in bohr^-1, for a k-point-sampled
     run (``None`` otherwise).  Pooled eigenvalue/occupation arrays are
@@ -876,6 +973,9 @@ class SelfConsistentSOCResult:
     magnetization: np.ndarray | None = None
     """Magnetization density ``m(r)``, shape ``(3, n_grid)``, in Bohr
     magnetons per bohr^3 (non-collinear runs)."""
+    scf_potentials: dict[str, np.ndarray] | None = None
+    """Converged local potentials of a periodic run (output side of the last
+    iteration), the input of a non-self-consistent band calculation."""
     k_points: np.ndarray | None = None
     """Cartesian k-points, shape ``(n_k, 3)`` in bohr^-1, for a k-point-sampled
     run (``None`` otherwise).  Pooled eigenvalue/occupation arrays are

@@ -875,4 +875,42 @@ class ParsecTextReporter:
         self.write("\n".join(lines))
 
 
+    def band_structure(self, result, files: Sequence[object] = (), elapsed_seconds: float = 0.0) -> None:
+        """Summary of the post-SCF band structure (Fortran ``calc_bands``)."""
+        counts = [int(value) for value in result.segment_counts]
+        states = result.eigenvalues.shape[2]
+        worst = float(np.max(result.residual_norms)) if result.residual_norms.size else 0.0
+        lines = [
+            " Band structure (non-self-consistent, Fortran calc_bands)",
+            " -------------------------------------------------------",
+            f" Hamiltonian                   : {result.mode}"
+            + (f" (channels: {', '.join(result.channels)})" if len(result.channels) > 1 else ""),
+            f" Segments / k-points / states  : {len(counts)} / {sum(counts)} / {states}",
+            f" Fermi level (SCF)             : {result.fermi_level:16.8f} [Ry]",
+            "",
+            "   Segment  Name                       k-points",
+        ]
+        for index, (count, name) in enumerate(zip(counts, result.segment_names), start=1):
+            lines.append(f"   {index:7d}  {name:<26s} {count:8d}")
+        lines.extend(
+            [
+                "",
+                f" Largest eigenpair residual |H v - e v| : {worst:12.4E} [Ry]",
+            ]
+        )
+        if worst > 1.0e-2:
+            lines.append(
+                " WARNING: the bands are poorly converged (CHEBFF has no convergence test);"
+            )
+            lines.append(
+                "          increase FF_MaxIter and/or Chebdav_Degree to tighten them."
+            )
+        if elapsed_seconds:
+            lines.append(f" Time for band structure [sec] : {elapsed_seconds:10.2f}")
+        for path in files:
+            lines.append(f" Wrote {path}")
+        lines.append("")
+        self.write("\n".join(lines))
+
+
 __all__ = ["ParsecTextReporter", "RYDBERG_TO_EV"]

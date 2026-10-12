@@ -308,6 +308,8 @@ def _reference_only_features(
         and problem.periodic_cell is not None
     ):
         features.append("k-point sampling (Monkhorst-Pack or explicit list)")
+    if problem.bands is not None:
+        features.append("band structure along a k-path (bandstruc)")
     return features
 
 

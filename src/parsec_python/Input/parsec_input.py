@@ -11,6 +11,8 @@ import numpy as np
 
 from ..models import (
     Atom,
+    BandSegment,
+    BandStructureSettings,
     EigensolverSettings,
     GridSettings,
     HartreeSettings,
@@ -403,6 +405,7 @@ def _parse_parsec_input(
         "monkhorst_pack_shift",
         "initial_ncl_moment",
         "kpoint_list",
+        "bandstruc",
     }
     accepted_global = {
         "restart_run",
@@ -426,6 +429,7 @@ def _parse_parsec_input(
         "kpoint_method",
         "kpoint_unit",
         "kpoint_file",
+        "bandstruc_points",
         "max_iter",
         "convergence_criterion",
         "use_plain_sre",
@@ -1155,6 +1159,48 @@ def _parse_parsec_input(
             "and may be expensive."
         )
 
+    band_settings: BandStructureSettings | None = None
+    band_blocks = blocks.get("bandstruc", [])
+    if band_blocks or "bandstruc_points" in scalar:
+        if not is_periodic:
+            raise ParsecInputError("bandstruc applies only to periodic systems")
+        if len(band_blocks) != 1:
+            raise ParsecInputError(
+                "bandstruc_points requires exactly one bandstruc block"
+                if not band_blocks
+                else "provide a single bandstruc block"
+            )
+        segments = []
+        for line in band_blocks[0].value:
+            tokens = line.replace("\t", " ").split()
+            try:
+                if len(tokens) < 7:
+                    raise ValueError("expected 'n kx0 ky0 kz0 kx1 ky1 kz1 label'")
+                int(tokens[0])
+                numbers = [float(token.lower().replace("d", "e")) for token in tokens[1:7]]
+                segments.append(
+                    BandSegment(
+                        start=tuple(numbers[:3]),
+                        end=tuple(numbers[3:]),
+                        name=" ".join(tokens[7:]),
+                    )
+                )
+            except ValueError as error:
+                raise ParsecInputError(
+                    f"bandstruc line {band_blocks[0].line}: {error}; every line is "
+                    "'n kx0 ky0 kz0 kx1 ky1 kz1 label' in reciprocal-lattice coordinates"
+                ) from error
+        points = _integer(one("bandstruc_points", "20"), label="Bandstruc_Points")
+        try:
+            band_settings = BandStructureSettings(segments=tuple(segments), points=points)
+        except ValueError as error:
+            raise ParsecInputError(f"bandstruc: {error}") from error
+        if periodic_cell is not None and not np.allclose(
+            periodic_cell.lattice_vectors, np.diag(np.diag(periodic_cell.lattice_vectors))
+        ):
+            raise UnsupportedParsecOptionError("bandstruc needs an orthorhombic cell")
+
+
     problem = SinglePointInput(
         atoms=atoms,
         pseudopotentials=specifications,
@@ -1169,6 +1215,7 @@ def _parse_parsec_input(
         monkhorst_pack_dimensions=monkhorst_pack_dimensions,
         kpoints=explicit_kpoint_array,
         kpoint_weights=explicit_kpoint_weights,
+        bands=band_settings,
     )
     return ParsecInputTranslation(
         source=source,

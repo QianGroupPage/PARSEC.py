@@ -1,4 +1,4 @@
-"""Native real-scalar translation of PARSEC's Chebyshev--Davidson solver.
+"""Native translation of PARSEC's Chebyshev--Davidson solver (real and complex).
 
 PARSEC uses ``chebdav_diag`` only for the first diagonalization of an SCF
 sequence.  The routine builds a block Davidson subspace, but its expansion
@@ -19,6 +19,12 @@ This module follows the non-``BETA`` ``flag='new'`` path in
 
 The Hamiltonian remains matrix-free.  Only basis blocks, their cached
 Hamiltonian images, and small projected matrices are stored.
+
+A complex Hermitian operator (``operator.dtype`` complex: a Bloch
+Hamiltonian at k != 0, a spinor) selects the complex arithmetic of
+``zchebdav_diag``: conjugate-transposed projections and Hermitian mirroring
+of the authoritative upper triangle.  For a real operator every conjugation is
+a no-op, so the real path is unchanged.
 """
 
 from __future__ import annotations
@@ -154,12 +160,19 @@ def _operator_dimension(operator: Any) -> int:
     dimension = int(shape[0])
     if dimension < 1:
         raise ValueError("operator dimension must be positive")
-    dtype = getattr(operator, "dtype", np.float64)
-    if np.issubdtype(np.dtype(dtype), np.complexfloating):
-        raise NotImplementedError(
-            "native CHEBDAV currently implements PARSEC's real scalar path"
-        )
     return dimension
+
+
+def _working_dtype(operator: Any) -> type:
+    """``complex`` for a complex operator, ``float`` otherwise."""
+    dtype = getattr(operator, "dtype", np.float64)
+    return complex if np.issubdtype(np.dtype(dtype), np.complexfloating) else float
+
+
+def _hermitian_from_upper(raw: np.ndarray) -> np.ndarray:
+    """Mirror the upper triangle of ``raw`` into a Hermitian matrix (LAPACK 'U')."""
+    upper = np.triu(raw)
+    return upper + np.triu(upper, 1).conj().T
 
 
 def _apply(operator: Any, vectors: np.ndarray) -> np.ndarray:
@@ -168,7 +181,7 @@ def _apply(operator: Any, vectors: np.ndarray) -> np.ndarray:
         raise ValueError("operator must preserve the vector or block shape")
     if not np.all(np.isfinite(result)):
         raise FloatingPointError("operator application produced nonfinite values")
-    return np.asarray(result, dtype=float)
+    return np.asarray(result)
 
 
 def _rayleigh_ritz_upper(
@@ -177,16 +190,15 @@ def _rayleigh_ritz_upper(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Rayleigh--Ritz using CHEBDAV's authoritative upper triangle.
 
-    ``chebdav.f90z`` calls ``DSYEV('U')``.  The lower triangle of the raw
+    ``chebdav.f90z`` calls ``DSYEV('U')`` (``ZHEEV`` for complex).  The lower triangle of the raw
     floating-point product is therefore ignored, even though the exact
     projected Hamiltonian is symmetric.  Mirroring the computed upper
     triangle reproduces that convention before NumPy's dense eigensolve.
     """
 
     applied = _apply(operator, basis)
-    raw = basis.T @ applied
-    upper = np.triu(raw)
-    projected = upper + np.triu(upper, 1).T
+    raw = basis.conj().T @ applied
+    projected = _hermitian_from_upper(raw)
     eigenvalues, rotations = np.linalg.eigh(projected)
     vectors = basis @ rotations
     applied_vectors = applied @ rotations
@@ -196,7 +208,7 @@ def _rayleigh_ritz_upper(
     )
     return (
         np.asarray(eigenvalues, dtype=float),
-        np.asarray(vectors, dtype=float),
+        np.asarray(vectors),
         np.asarray(residual_norms, dtype=float),
     )
 
@@ -385,7 +397,7 @@ def _final_approximate_subspace(
     order = np.argsort(values, kind="stable")[:wanted_states]
     return (
         np.asarray(values[order], dtype=float),
-        np.asarray(vectors[:, order], dtype=float),
+        np.asarray(vectors[:, order]),
         np.asarray(residuals[order], dtype=float),
         # PARSEC's printed num_mv includes the filter but omits the final
         # ZmatvecB used for this Rayleigh--Ritz projection.
@@ -451,9 +463,10 @@ def run_chebdav(
     if not lower_bound < upper_bound:
         raise RuntimeError("CHEBDAV estimated an invalid filter interval")
 
-    basis = np.zeros((dimension, maximum_subspace_dimension), dtype=float)
-    applied_basis = np.zeros((dimension, active_limit), dtype=float)
-    projected = np.zeros((active_limit, active_limit), dtype=float)
+    scalar_type = _working_dtype(operator)
+    basis = np.zeros((dimension, maximum_subspace_dimension), dtype=scalar_type)
+    applied_basis = np.zeros((dimension, active_limit), dtype=scalar_type)
+    projected = np.zeros((active_limit, active_limit), dtype=scalar_type)
     locked_values = np.empty(maximum_subspace_dimension, dtype=float)
     locked_residuals = np.empty(maximum_subspace_dimension, dtype=float)
 
@@ -512,7 +525,7 @@ def run_chebdav(
         active_basis = basis[
             :, locked_count : locked_count + full_active_size
         ]
-        last_columns = active_basis.T @ applied_new
+        last_columns = active_basis.conj().T @ applied_new
         # PARSEC fills the new columns and calls DSYEV('U'); entries below the
         # diagonal are not authoritative.  Copy only each new column's upper
         # triangle, then mirror it for NumPy's full symmetric eigensolver.
@@ -521,8 +534,7 @@ def run_chebdav(
             projected[: projected_column + 1, projected_column] = (
                 last_columns[: projected_column + 1, local_column]
             )
-        upper = np.triu(projected[:full_active_size, :full_active_size])
-        small = upper + np.triu(upper, 1).T
+        small = _hermitian_from_upper(projected[:full_active_size, :full_active_size])
         ritz_values, rotations = np.linalg.eigh(small)
         last_ritz_values = np.asarray(ritz_values, dtype=float)
         last_full_active_size = full_active_size

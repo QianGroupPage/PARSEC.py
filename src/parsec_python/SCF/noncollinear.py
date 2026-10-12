@@ -285,6 +285,10 @@ def _run_noncollinear(
         k_points=k_points,
         k_weights=None if k_points is None else np.full(n_kpoints, weight),
         state_moments=None if k_points is None else _state_sz(spinors_by_k),
+        scf_potentials={
+            "effective_potential": output_potential,
+            "xc_field": output_field,
+        },
     )
 
 

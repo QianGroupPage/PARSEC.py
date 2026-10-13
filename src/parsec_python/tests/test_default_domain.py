@@ -1730,6 +1730,417 @@ class DensityAtTheSphereTests(unittest.TestCase):
             (wanted.wall_radius_text, "density at the sphere", 0, None),
         )
 
+    def far_atoms(self):
+        """Two hydrogen atoms 40 ang from the centre, the sphere of the rule
+        for them, their point charges and four fits of a density in it.
+
+        The largest order holds the radius of the rule (43.9 ang), so that a
+        search after the SCF asks for estimates: six from the step in of a
+        wall energy far below its share, one where the wall asks for the
+        sphere it has, and none further out.
+        """
+
+        distance = 40.0 * domain.ANGSTROM
+        atoms = [Atom("H", (0.0, 0.0, distance)), Atom("H", (0.0, 0.0, -distance))]
+        rule = domain.default_domain(atoms, self.potentials, 2.0, spacing=0.4)
+        self.assertEqual(
+            (rule.radius_text, rule.tolerance_text, rule.set_by),
+            ("43.9 ang", "1.0e-03 Ry", "multipole order"),
+        )
+        fits = {
+            name: domain.WallFit(
+                prefactor=2.0 * decay * energy, decay=decay, energy=energy,
+                rms=0.02, at_scan_end=False, shells=8,
+            )
+            for name, energy, decay in (
+                ("far below the share", 1.0e-12, 0.9),
+                ("at the share", domain.WALL_SHARE * 1.0e-3 / domain.RADIUS_SAFETY, 0.9),
+                ("above the share", 0.1, 0.9),
+                ("thin sphere", 0.1, 0.15),
+            )
+        }
+        return atoms, rule, valence_point_charges(atoms, self.potentials, 2.0), fits
+
+    def test_search_after_the_scf_reads_the_estimates_that_were_prepared(self) -> None:
+        atoms, rule, (positions, charges), fits = self.far_atoms()
+        made = []
+
+        def counted(*arguments, **options):
+            made.append(arguments[2])
+            return estimate_omitted_potential(*arguments, **options)
+
+        def search(fit, **options):
+            del made[:]
+            return domain.radius_for_budget(
+                fit, rule.radius, atoms, self.potentials, 2.0,
+                spacing=0.4, highest_occupied=-0.5, **options,
+            )
+
+        with patch.object(domain, "estimate_omitted_potential", counted):
+            # The search as it was: every estimate made where it is asked for.
+            expected, asked = {}, {}
+            for name, fit in fits.items():
+                expected[name] = search(fit)
+                asked[name] = tuple(made)
+                self.assertEqual(expected[name].estimates, len(made))
+            self.assertEqual(
+                {name: (wanted.radius_text, wanted.set_by, wanted.limit, wanted.estimates)
+                 for name, wanted in expected.items()},
+                {
+                    "far below the share": ("43.9 ang", "multipole order", "", 6),
+                    "at the share": ("43.9 ang", "density at the sphere", "", 1),
+                    "above the share": ("45.6 ang", "density at the sphere", "", 0),
+                    "thin sphere": ("46.1 ang", "density at the sphere", "", 0),
+                },
+            )
+            # The estimates of every start a step can reach, each radius once.
+            prepared = domain.PreparedEstimates(positions, charges)
+            self.assertEqual((len(prepared), prepared.get(rule.radius)), (0, None))
+            del made[:]
+            domain.prepare_radius_search(prepared, rule.radius, 2.0, spacing=0.4)
+            self.assertEqual((len(prepared), len(set(made))), (len(made), len(made)))
+            self.assertGreater(len(prepared), 6)
+            for name, fit in fits.items():
+                with self.subTest(fit=name):
+                    # The same radius, tolerance, limit and count of
+                    # estimates, and none of them made by the search.
+                    self.assertEqual(search(fit, prepared=prepared), expected[name])
+                    self.assertEqual(made, [])
+                    for radius in asked[name]:
+                        self.assertIsNotNone(prepared.get(radius))
+            # What was prepared is the estimate itself, to the last bit.
+            for radius in asked["far below the share"]:
+                self.assertEqual(
+                    prepared.get(radius),
+                    float(estimate_omitted_potential(positions, charges, radius)[-1]),
+                )
+            # A second preparation makes nothing again.
+            del made[:]
+            domain.prepare_radius_search(prepared, rule.radius, 2.0, spacing=0.4)
+            self.assertEqual(made, [])
+            # Estimates of some of the radii: the search makes the others.
+            some = domain.PreparedEstimates(positions, charges)
+            domain.prepare_radius_search(some, rule.radius, 2.0, spacing=0.4, limit=3)
+            self.assertEqual(len(some), 3)
+            for name, fit in fits.items():
+                with self.subTest(fit=name, prepared="some"):
+                    self.assertEqual(search(fit, prepared=some), expected[name])
+                    self.assertEqual(
+                        made, [radius for radius in asked[name] if some.get(radius) is None]
+                    )
+            # The first one prepared is that of the sphere of the run.
+            first = domain.PreparedEstimates(positions, charges)
+            domain.prepare_radius_search(first, rule.radius, 2.0, spacing=0.4, limit=1)
+            self.assertEqual(list(first._values), [rule.radius])
+            # Estimates of other positions or charges are not read: values
+            # that would move the radius are kept for them.
+            name = "far below the share"
+            for other in (
+                domain.PreparedEstimates(positions + 1.0e-9, charges),
+                domain.PreparedEstimates(positions, charges * (1.0 + 1.0e-12)),
+            ):
+                other._values.update({radius: 1.0 for radius in asked[name]})
+                self.assertFalse(other.holds(positions, charges))
+                self.assertEqual(search(fits[name], prepared=other), expected[name])
+                self.assertEqual(tuple(made), asked[name])
+            # The same values for these atoms are read, and move it.
+            wrong = domain.PreparedEstimates(positions, charges)
+            wrong._values.update({radius: 1.0 for radius in asked[name]})
+            self.assertTrue(wrong.holds(positions, charges))
+            self.assertNotEqual(
+                search(fits[name], prepared=wrong).radius_text, expected[name].radius_text
+            )
+            # A prepared estimate that lies within the round-off of its
+            # potentials of the tolerance decides nothing: the search makes
+            # that estimate itself.  The potential of the two charges at a
+            # point of the sphere is at most 2 * 2 / (R - 40 ang).
+            def spacing(radius):
+                return float(np.spacing(4.0 / (radius - 40.0 * domain.ANGSTROM)))
+
+            close = domain.PreparedEstimates(positions, charges)
+            close._values.update(
+                {
+                    radius: 1.0e-3 + count * spacing(radius)
+                    for count, radius in zip((60, -60, 1, -1, 0, 20), asked[name])
+                }
+            )
+            self.assertEqual(search(fits[name], prepared=close), expected[name])
+            self.assertEqual(tuple(made), asked[name])
+            # Further from it a prepared estimate is read: below the
+            # tolerance the search ends where it starts, with nothing made,
+            # and above it the search moves on to radii it was not given.
+            start = asked[name][0]
+            below = domain.PreparedEstimates(positions, charges)
+            below._values[start] = 1.0e-3 - 70 * spacing(start)
+            read = search(fits[name], prepared=below)
+            self.assertEqual((read.radius_text, read.estimates, made), ("43.0 ang", 1, []))
+            above = domain.PreparedEstimates(positions, charges)
+            above._values.update(
+                {radius: 1.0e-3 + 70 * spacing(radius) for radius in asked[name]}
+            )
+            self.assertNotEqual(search(fits[name], prepared=above), expected[name])
+            self.assertTrue(made and set(made).isdisjoint(asked[name]))
+            # A tolerance of the input asks for no estimate, prepared or not.
+            given = search(fits[name], prepared=wrong, boundary_tolerance=1.0e-3)
+            self.assertEqual(
+                (given.estimates, given.radius_text, given.set_by, made),
+                (0, "43.0 ang", "minimum vacuum", []),
+            )
+
+    def test_prepared_estimate_is_read_outside_the_round_off_of_its_potentials(self) -> None:
+        # Two charges of 20,000 electrons 40 ang from the centre and a
+        # sphere of 44 ang: the potential at the sphere reaches a tenth of
+        # 2 * 40,000 / (4 ang) = 1.06e4 Ry and more, and one spacing of that
+        # number, 1.8e-12 Ry, is what another order of the sums can move an
+        # estimate by.  That is 1e-8 of the tolerance of 2e-4 Ry that the
+        # rule gives so many electrons.
+        distance = 40.0 * domain.ANGSTROM
+        positions = np.array([[0.0, 0.0, distance], [0.0, 0.0, -distance]])
+        charges = np.array([2.0e4, 2.0e4])
+        value, tolerance = Decimal("44.0"), 2.0e-4
+        radius = domain._bohr(value)
+        unit = float(np.spacing(2.0 * 4.0e4 / (radius - distance)))
+        self.assertAlmostEqual(unit, 1.8e-12, delta=1.0e-13)
+        self.assertEqual(domain._PREPARED_SPACINGS, 64)
+        self.assertEqual(domain._prepared_margin(positions, charges, radius), 64 * unit)
+        # More charge and a thinner vacuum widen it; an atom on the sphere
+        # or beyond it leaves no prepared estimate to be read.
+        self.assertEqual(
+            domain._prepared_margin(positions, -8.0 * charges, radius), 8 * 64 * unit
+        )
+        self.assertGreater(
+            domain._prepared_margin(positions, charges, distance + 0.5 * (radius - distance)),
+            64 * unit,
+        )
+        for sphere in (distance, 0.9 * distance):
+            self.assertEqual(domain._prepared_margin(positions, charges, sphere), math.inf)
+        made = []
+
+        def estimate(_positions, _charges, at):
+            # In line every radius meets the tolerance.
+            made.append(at)
+            return np.full(domain.MAXIMUM_MULTIPOLE_ORDER + 1, 1.0e-5)
+
+        def settle(held):
+            del made[:]
+            prepared = SimpleNamespace(get=lambda at: held if at == radius else None)
+            return domain._settle_radius(
+                value, "wall", positions, charges, 0.4, 0.5, tolerance, prepared
+            )
+
+        with patch.object(domain, "estimate_omitted_potential", estimate), patch.object(
+            domain, "series_bound", return_value=math.inf
+        ):
+            in_line = domain._settle_radius(value, "wall", positions, charges, 0.4, 0.5, tolerance)
+            self.assertEqual((in_line, made), ((value, "wall", 1), [radius]))
+            # Within 64 spacings on either side: made again, and counted once.
+            for count in (0, 1, -1, 9, -9, 63, -63):
+                with self.subTest(spacings=count):
+                    self.assertEqual(settle(tolerance + count * unit), in_line)
+                    self.assertEqual(made, [radius])
+            # Beyond them: read.  Below the tolerance the radius stands
+            # with nothing made; above it the search goes on, to 44.5 ang
+            # and back to the lattice radius next to the one that missed.
+            for count in (-66, -1000):
+                with self.subTest(spacings=count):
+                    self.assertEqual((settle(tolerance + count * unit), made), (in_line, []))
+            for count in (66, 1000):
+                with self.subTest(spacings=count):
+                    self.assertEqual(
+                        settle(tolerance + count * unit), (Decimal("44.1"), "multipole order", 4)
+                    )
+                    self.assertEqual(
+                        made, [domain._bohr(Decimal(text)) for text in ("44.5", "44.2", "44.1")]
+                    )
+
+    def test_preparation_ends_when_it_is_told_to_and_stops_no_search(self) -> None:
+        atoms, rule, (positions, charges), fits = self.far_atoms()
+        options = dict(spacing=0.4)
+        # Asked before every new estimate; false ends the preparation.
+        prepared = domain.PreparedEstimates(positions, charges)
+        domain.prepare_radius_search(prepared, rule.radius, 2.0, proceed=lambda: False, **options)
+        self.assertEqual(len(prepared), 0)
+        answers = iter([True, True, True, False])
+        domain.prepare_radius_search(
+            prepared, rule.radius, 2.0, proceed=lambda: next(answers), **options
+        )
+        self.assertEqual(len(prepared), 3)
+        # It goes on from what it holds, and a limit counts the new ones.
+        domain.prepare_radius_search(prepared, rule.radius, 2.0, limit=2, **options)
+        self.assertEqual(len(prepared), 5)
+        domain.prepare_radius_search(prepared, rule.radius, 2.0, limit=0, **options)
+        self.assertEqual(len(prepared), 5)
+        # No atoms, nothing to estimate.
+        domain.prepare_radius_search(
+            domain.PreparedEstimates(np.zeros((0, 3)), np.zeros(0)), rule.radius, 2.0, **options
+        )
+        # Where no radius meets the tolerance the search of every start
+        # gives up with an error; the preparation passes on to the next
+        # start until its limit, and raises nothing.
+        hopeless = domain.PreparedEstimates(positions, charges)
+        with patch.object(
+            domain, "estimate_omitted_potential", return_value=np.full(61, 1.0)
+        ), patch.object(domain, "series_bound", return_value=math.inf):
+            with self.assertRaisesRegex(ValueError, "no radius meets"):
+                domain.radius_for_budget(
+                    fits["at the share"], rule.radius, atoms, self.potentials, 2.0, **options
+                )
+            domain.prepare_radius_search(hopeless, rule.radius, 2.0, limit=40, **options)
+        self.assertEqual(len(hopeless), 40)
+        # The benchmark cluster of the tree: the series bound spares every
+        # start the estimate, and the preparation makes none.
+        system = stand_in(nanodiamond(radius=True))
+        small = domain.PreparedEstimates(
+            *valence_point_charges(system.atoms, system.pseudopotentials, system.electron_count)
+        )
+        with patch.object(domain, "estimate_omitted_potential", side_effect=AssertionError):
+            domain.prepare_radius_search(
+                small, system.input.grid.radius, system.electron_count,
+                spacing=system.input.grid.spacing,
+            )
+        self.assertEqual(len(small), 0)
+
+    def test_preparation_searches_every_start_with_the_tolerance_of_the_rule_there(self) -> None:
+        atoms, rule, (positions, charges), fits = self.far_atoms()
+        # An energy tolerance at which the boundary tolerance of the rule
+        # lies below its largest value: it is then 1.1e-4 Ry from 4 ang of
+        # vacuum on and half of that in a thinner one, and the starts that a
+        # step reaches from the sphere of 43.9 ang (3.9 ang of vacuum) lie
+        # on both sides.  The fits are those of the other tests, scaled so
+        # that their steps stay.
+        budget = 2.0e-6
+        fits = {
+            name: replace(
+                fit,
+                energy=fit.energy * budget / 1.0e-3,
+                prefactor=fit.prefactor * budget / 1.0e-3,
+            )
+            for name, fit in fits.items()
+        }
+        options = dict(spacing=0.4, budget=budget)
+        searched: dict[Decimal, float] = {}
+        made = []
+        settle = domain._settle_radius
+
+        def recorded(value, *arguments):
+            # One tolerance for a start, whoever searches from it.
+            self.assertEqual(searched.setdefault(value, arguments[5]), arguments[5])
+            return settle(value, *arguments)
+
+        def counted(*arguments, **keywords):
+            made.append(arguments[2])
+            return estimate_omitted_potential(*arguments, **keywords)
+
+        with patch.object(domain, "_settle_radius", recorded):
+            prepared = domain.PreparedEstimates(positions, charges)
+            domain.prepare_radius_search(prepared, rule.radius, 2.0, **options)
+            starts = dict(searched)
+            # Every lattice radius from the minimum vacuum to 2.5 ang
+            # beyond the sphere, each with the tolerance of its own vacuum.
+            self.assertEqual(
+                sorted(starts), [Decimal("43.0") + index * Decimal("0.1") for index in range(35)]
+            )
+            self.assertEqual(
+                starts,
+                {
+                    start: 5.6e-5 if start < Decimal("44.0") else 1.1e-4
+                    for start in starts
+                },
+            )
+            # The search after the SCF from the same starts: the tolerance
+            # the preparation searched with (the recorder fails on another),
+            # and no estimate that was not prepared.
+            walls = {}
+            with patch.object(domain, "estimate_omitted_potential", counted):
+                for name, fit in fits.items():
+                    wanted = domain.radius_for_budget(
+                        fit, rule.radius, atoms, self.potentials, 2.0,
+                        highest_occupied=-0.5, **options,
+                    )
+                    asked = len(made)
+                    del made[:]
+                    read = domain.radius_for_budget(
+                        fit, rule.radius, atoms, self.potentials, 2.0,
+                        highest_occupied=-0.5, prepared=prepared, **options,
+                    )
+                    self.assertEqual((read, made), (wanted, []))
+                    walls[name] = (wanted.wall_radius_text, wanted.tolerance_text, asked)
+        self.assertEqual(sorted(searched), sorted(starts))
+        self.assertEqual(
+            walls,
+            {
+                "far below the share": ("43.0 ang", "5.6e-05 Ry", 7),
+                "at the share": ("43.9 ang", "5.6e-05 Ry", 7),
+                "above the share": ("45.6 ang", "1.1e-04 Ry", 1),
+                "thin sphere": ("46.1 ang", "1.1e-04 Ry", 0),
+            },
+        )
+
+    def test_block_after_the_scf_is_the_same_with_prepared_estimates(self) -> None:
+        atoms, rule, (positions, charges), fits = self.far_atoms()
+        translation = SimpleNamespace(
+            domain_energy_tolerance=1.0e-3, boundary_tolerance_from="default"
+        )
+        settings = GridSettings(spacing=0.4, radius=rule.radius)
+        result = SimpleNamespace(
+            converged=True,
+            grid=SimpleNamespace(
+                settings=settings, coordinates=np.zeros((1, 3)), volume_element=0.064
+            ),
+            density=np.zeros(1),
+            eigenvalues=np.array([-0.6, -0.5, 0.05]),
+            occupations=np.array([1.0, 1.0, 0.0]),
+            atoms=atoms,
+            pseudopotentials=self.potentials,
+            electron_count=2.0,
+        )
+        prepared = domain.PreparedEstimates(positions, charges)
+        domain.prepare_radius_search(prepared, rule.radius, 2.0, spacing=0.4)
+        times = ("shell_seconds", "radius_seconds", "seconds")
+        made = []
+
+        def counted(*arguments, **options):
+            made.append(arguments[2])
+            return estimate_omitted_potential(*arguments, **options)
+
+        for name, fit in fits.items():
+            with self.subTest(fit=name), patch.object(
+                parsec_output, "fit_wall", return_value=fit
+            ), patch.object(domain, "estimate_omitted_potential", counted):
+                del made[:]
+                lines, record = domain_finish_lines(result, translation, HartreeSettings())
+                asked = len(made)
+                self.assertEqual(record["estimates"], asked)
+                del made[:]
+                read_lines, read = domain_finish_lines(
+                    result, translation, HartreeSettings(), prepared
+                )
+                self.assertEqual(made, [])
+                # Every line, and every entry of the record that is no time.
+                self.assertEqual(read_lines, lines)
+                self.assertEqual(sorted(read), sorted(record))
+                self.assertEqual(
+                    {key: value for key, value in read.items() if key not in times},
+                    {key: value for key, value in record.items() if key not in times},
+                )
+                for key in times:
+                    self.assertGreaterEqual(read[key], 0.0)
+        self.assertEqual(
+            (record["boundary_sphere_radius"], record["estimates"]), ("46.1 ang", 0)
+        )
+        # The reporter hands the block what a caller prepared, and nothing
+        # where none did.
+        reporter = ParsecTextReporter(lambda _text: None, nanodiamond(radius=True))
+        self.assertIsNone(reporter.prepared_estimates)
+        for given in (None, prepared):
+            reporter.prepared_estimates = given
+            with patch.object(
+                parsec_output, "domain_finish_lines", return_value=([], None)
+            ) as block:
+                reporter.finish(SimpleNamespace(converged=True, timings=None), 0.0)
+            self.assertIs(block.call_args.args[3], given)
+            self.assertEqual(len(block.call_args.args), 4)
+
     def test_lines_say_what_set_the_radius(self) -> None:
         translation = SimpleNamespace(
             domain_energy_tolerance=1.0e-3, boundary_tolerance_from="default"

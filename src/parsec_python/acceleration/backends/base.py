@@ -51,6 +51,17 @@ class HamiltonianBackend(ABC):
     def update_local(self, effective_potential: np.ndarray) -> None:
         """Replace the current diagonal local potential."""
 
+    def replace_nonlocal_operator(self, nonlocal_operator) -> None:
+        """Replace the Kleinman--Bylander projector factors of moved atoms.
+
+        The kinetic operator and the grid are unchanged, so everything else
+        the backend cached stays.  A backend that cannot do this says so.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot replace its projector factors"
+        )
+
     @abstractmethod
     def apply(self, vectors: np.ndarray) -> np.ndarray:
         """Apply the complete Hamiltonian to a host vector/block."""

@@ -1,0 +1,125 @@
+{
+  "schema_version": 2,
+  "element": "Nb",
+  "prefix": "nb_3d_hole_1_pbe_tm",
+  "backend": "pyfhi98pp",
+  "family": "ncpp",
+  "xc": "pbe",
+  "scheme": "tm",
+  "relativistic": "scalar",
+  "variant": null,
+  "core_hole": {
+    "shell": "3d",
+    "removed_electrons": 1.0
+  },
+  "ionic_charge": 6.0,
+  "reference_electrons": 5.0,
+  "reference_charge": 1.0,
+  "ae_energy_hartree": -3811.867790769069,
+  "pseudo_energy_hartree": -7.336074375564458,
+  "atomic_energy_correction_rydberg": -7609.063432787009,
+  "lmax": 2,
+  "channels": [
+    {
+      "angular_momentum": 0,
+      "scheme": "t",
+      "cutoff_radius": 2.773218672120472,
+      "match_radius": 2.8417171733218476,
+      "ae_eigenvalue_ev": -10.758714041282937,
+      "pseudo_eigenvalue_ev": -10.758732085268782,
+      "norm_test": 0.999999941846502,
+      "slope_test": 1.0000120626233875
+    },
+    {
+      "angular_momentum": 1,
+      "scheme": "t",
+      "cutoff_radius": 2.9838317049142185,
+      "match_radius": 3.0575323480255996,
+      "ae_eigenvalue_ev": 7.2817,
+      "pseudo_eigenvalue_ev": 7.281761962392705,
+      "norm_test": 0.9999989876140485,
+      "slope_test": 0.9999989876140484
+    },
+    {
+      "angular_momentum": 2,
+      "scheme": "t",
+      "cutoff_radius": 2.454711372205842,
+      "match_radius": 2.515342743099326,
+      "ae_eigenvalue_ev": -12.967312089393875,
+      "pseudo_eigenvalue_ev": -12.967344628407213,
+      "norm_test": 0.9999993563673439,
+      "slope_test": 1.000004492966353
+    }
+  ],
+  "core_radius": 0.0,
+  "reference_shift_ev": -7.718338022088243,
+  "kinetic_cutoff_rydberg": {
+    "0": 24.0,
+    "2": 46.0
+  },
+  "ghost_free": true,
+  "selected_local_channel": 1,
+  "local_channel_results": [
+    {
+      "local_channel": 1,
+      "passed": true,
+      "minimum_margin_hartree": 0.04250668540337005,
+      "report_path": "nb_3d_hole_1_pbe_tm.local-1.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.04250668540337005,
+          "reference_energy_hartree": -0.39537318423675627,
+          "local_ground_energy_hartree": -0.3528664988333862,
+          "local_first_excited_energy_hartree": -0.10501125768691627,
+          "projector_sign": -1
+        },
+        {
+          "angular_momentum": 2,
+          "label": "d",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.362721634139818,
+          "reference_energy_hartree": -0.47653782774313747,
+          "local_ground_energy_hartree": -0.11381619360331945,
+          "local_first_excited_energy_hartree": -0.04309340451858615,
+          "projector_sign": -1
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    "Matched to the ground-state potential: lmax 2, local channel p, same cutoff radii.",
+    "Reference energies of the unbound channels (p) shifted by -7.72 eV, the shift of the highest valence level caused by the core hole.",
+    "Generating atomic reference charge +1; choose the electron count (full or neutralized core hole) explicitly in the many-electron calculation."
+  ],
+  "artifacts": {
+    "dat": {
+      "path": "nb_3d_hole_1_pbe_tm.dat",
+      "sha256": "882c2cd15105675c6b359b70d556645756698d1acc855bfb2fae52ae3e9bd057"
+    },
+    "aep": {
+      "path": "nb_3d_hole_1_pbe_tm.aep",
+      "sha256": "4e6558dacc2b8285169b9b635c57caf11d176387eef376856e81eebbbf58cd9f"
+    },
+    "test": {
+      "path": "nb_3d_hole_1_pbe_tm.test",
+      "sha256": "a753d03ef3aa67962552302a34e71e03d7ae259ae5fc6659f6b6861f18845513"
+    },
+    "fhi_species": {
+      "path": "../FHI/Nb-3d_FHIPP.DAT",
+      "sha256": "b85d7ee8a5438d7d6afd1137c8f87ad141c27f0b84c408d9e62bc5c8b33fdcae"
+    },
+    "upf": {
+      "path": "../UPF/nb_3d_hole_1_pbe_tm.UPF",
+      "sha256": "4e28dd5ede2b0e1a1ec8a63bf2f5132a66bf00364bdedfcb19c1c826dee58fd9"
+    },
+    "parsec_species": {
+      "path": "../PARSEC/Nb-3d_POTRE.DAT",
+      "sha256": "7ad71932b21964fd6a91a90cdeecd61e965593ddc64f061bb73429b93690552a"
+    }
+  }
+}

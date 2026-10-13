@@ -17,6 +17,14 @@ from parsec_python.acceleration.backends.cupy import (
     cupy_available,
     require_cupy,
 )
+from parsec_python.acceleration.backends import cupy_projectors
+from parsec_python.acceleration.backends.cupy_launch import kernel_parameters
+from parsec_python.acceleration.backends.cupy_projectors import (
+    CuPySparseProjectorFactors,
+    projection_launches,
+    projection_reduction,
+    projector_block_columns,
+)
 from parsec_python.acceleration.Eigensolvers import (
     CuPyEigvalSolver,
     CuPySymmetryOrbitals,
@@ -80,7 +88,134 @@ def _small_hamiltonian():
     return kinetic, potential, nonlocal_operator, reference
 
 
+def _long_row_hamiltonian(dimension=400):
+    """Kinetic matrix, potential, projectors and signs with projector rows that take the tree reduction.
+
+    Projectors of 400, 300 and 5 entries and one without any: the longest
+    one decides the reduction of them all.
+    """
+
+    kinetic = sp.diags(
+        (
+            -0.25 * np.ones(dimension - 3),
+            -np.ones(dimension - 1),
+            2.4 * np.ones(dimension),
+            -np.ones(dimension - 1),
+        ),
+        (-3, -1, 0, 1),
+        format="csr",
+    )
+    potential = np.linspace(-0.75, 0.35, dimension)
+    generator = np.random.default_rng(61)
+    dense = np.zeros((dimension, 4), dtype=np.float64)
+    dense[:, 0] = 0.05 * generator.standard_normal(dimension)
+    dense[60:360, 1] = 0.05 * generator.standard_normal(300)
+    dense[11:16, 3] = (0.2, -0.35, 0.15, 0.1, -0.3)
+    return kinetic, potential, sp.csr_matrix(dense), np.array((1.0, -1.0, 1.0, -1.0))
+
+
+def _bits(array):
+    """The bits of a host array of FP64 values: a zero of the other sign differs too."""
+
+    return np.ascontiguousarray(array).view(np.uint64)
+
+
+def _block_columns(value=None):
+    """The environment with ``PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS`` at ``value``, or without it."""
+
+    name = "PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS"
+    kept = {key: item for key, item in os.environ.items() if key != name}
+    return patch.dict(
+        os.environ, kept if value is None else {**kept, name: value}, clear=True
+    )
+
+
 class TestCuPyOptionalImport(unittest.TestCase):
+    def test_projection_block_columns_are_six_unless_the_former_kernel_is_named(self):
+        for value, columns in ((None, 6), ("6", 6), (" 6 ", 6), ("", 6), ("1", 1)):
+            with self.subTest(value=value), _block_columns(value):
+                self.assertEqual(projector_block_columns(), columns)
+        for value in ("0", "2", "12", "auto", "on", "six"):
+            with self.subTest(value=value), _block_columns(value):
+                with self.assertRaisesRegex(
+                    ValueError, "PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS must be 6 or 1"
+                ):
+                    projector_block_columns()
+        # What an operator reports: the former names where its kernels run.
+        self.assertEqual(
+            [
+                projection_reduction(parallel, columns)
+                for parallel in (False, True)
+                for columns in (1, 6)
+            ],
+            ["serial", "serial", "parallel", "parallel6"],
+        )
+        with self.assertRaisesRegex(ValueError, "6 columns or 1"):
+            projection_reduction(True, 3)
+
+    def test_projection_launches_take_every_projector_and_column_once(self):
+        for projectors in (1, 5, 4601):
+            for width in (1, 2, 5, 6, 7, 12, 13, 128):
+                with self.subTest(projectors=projectors, width=width):
+                    pairs = projectors * width
+                    # As before: one launch, with a block or a thread per
+                    # projector and column.
+                    self.assertEqual(
+                        projection_launches("parallel", projectors, width),
+                        ((pairs, 0, width),),
+                    )
+                    self.assertEqual(
+                        projection_launches("serial", projectors, width),
+                        ((-(-pairs // 128), 0, width),),
+                    )
+                    # A block per projector for six columns, the rest in
+                    # the last launch.
+                    six = projection_launches("parallel6", projectors, width)
+                    self.assertEqual(
+                        [blocks for blocks, _start, _stop in six],
+                        [projectors] * -(-width // 6),
+                    )
+                    self.assertEqual(
+                        [column for _blocks, start, stop in six for column in range(start, stop)],
+                        list(range(width)),
+                    )
+                    self.assertTrue(all(0 < stop - start <= 6 for _blocks, start, stop in six))
+                    self.assertEqual(
+                        [stop - start for _blocks, start, stop in six][:-1],
+                        [6] * (len(six) - 1),
+                    )
+        self.assertEqual(projection_launches("parallel6", 7, 0), ())
+        with self.assertRaisesRegex(ValueError, "unknown projection reduction"):
+            projection_launches("tree", 1, 1)
+
+    def test_the_three_projection_kernels_declare_the_same_parameters(self):
+        # One argument tuple serves them: only the blocks of a launch differ.
+        former = kernel_parameters(cupy_projectors._SOURCE, "sparse_projector_projection")
+        self.assertEqual(len(former), 12)
+        for name in ("sparse_projector_projection6", "sparse_projector_projection_serial"):
+            with self.subTest(kernel=name):
+                self.assertEqual(kernel_parameters(cupy_projectors._SOURCE, name), former)
+        # The six-column kernel sums a column as the former kernel does: a
+        # partial sum per thread over every 128th entry, and the same tree.
+        source = cupy_projectors._SOURCE
+        start = source.index("void sparse_projector_projection6(")
+        six = source[start : source.index("void sparse_projector_projection_serial(")]
+        one = source[source.index("void sparse_projector_projection(") : start]
+        for text in (
+            "int position = row_offsets[projector] + threadIdx.x;",
+            "position += blockDim.x",
+            "for (int offset = 64; offset > 0; offset >>= 1) {",
+            "if (threadIdx.x < offset) {",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual((one.count(text), six.count(text)), (1, 1))
+        self.assertIn("sums[threadIdx.x] += sums[threadIdx.x + offset];", one)
+        self.assertIn(
+            "sums[column][threadIdx.x] += sums[column][threadIdx.x + offset];", six
+        )
+        self.assertIn("] = signs[projector] * sums[0];", one)
+        self.assertIn("] = signs[projector] * sums[column][0];", six)
+
     def test_chebdav_block_orth_policy_is_large_basis_only_by_default(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PARSEC_CUPY_CHEBDAV_BLOCK_ORTH", None)
@@ -520,16 +655,228 @@ class TestCuPyComponentParity(unittest.TestCase):
             signs=np.ones(1, dtype=np.float64),
             labels=((0, 0, 0),),
         )
-        gpu = CuPyHamiltonian(
-            kinetic,
-            np.zeros(dimension, dtype=np.float64),
-            nonlocal_operator,
+        # The tree reduction, of six columns per block unless the former
+        # kernel is named.
+        for value, reduction in ((None, "parallel6"), ("1", "parallel")):
+            with self.subTest(block_columns=value), _block_columns(value):
+                gpu = CuPyHamiltonian(
+                    kinetic,
+                    np.zeros(dimension, dtype=np.float64),
+                    nonlocal_operator,
+                )
+
+                projection = gpu.custom_projector_projection
+                self.assertIsNotNone(projection)
+                self.assertEqual(projection.max_row_entries, dimension)
+                self.assertEqual(projection.reduction_mode, reduction)
+
+    def test_six_columns_per_block_give_the_coefficients_of_one_column_per_block(self):
+        cp = self.cp
+        generator = np.random.default_rng(71)
+        rows = 3000
+        # Rows around the 128 threads of a block and around the 256 entries
+        # from which a row takes the tree, a full one and one without entries.
+        lengths = (1, 127, 128, 129, 255, 256, 257, 700, 1500, rows, 0)
+        dense = np.zeros((rows, len(lengths)))
+        for projector, entries in enumerate(lengths):
+            picked = generator.choice(rows, size=entries, replace=False)
+            dense[picked, projector] = generator.standard_normal(entries)
+        host = sp.csr_matrix(dense)
+        host_signs = np.where(np.arange(len(lengths)) % 3 == 0, -1.0, 1.0)
+        signs = cp.asarray(host_signs)
+        former = CuPySparseProjectorFactors(cp, host, signs, block_columns=1).projection
+        six = CuPySparseProjectorFactors(cp, host, signs, block_columns=6).projection
+        kernels = cupy_projectors._kernels(cp)
+        self.assertEqual(
+            (former.reduction_mode, former.block_columns, six.reduction_mode, six.block_columns),
+            ("parallel", 1, "parallel6", 6),
+        )
+        self.assertIs(former.kernel, kernels[0])
+        self.assertIs(six.kernel, kernels[3])
+
+        wide = generator.standard_normal((rows, 29))
+        reference = host_signs[:, None] * (host.T @ wide)
+        device = cp.asarray(wide, order="F")
+        for width in range(1, 15):
+            # Columns as a filter block holds them, the same rows first,
+            # and every other column of a wider block.
+            views = (
+                ("columns", device[:, :width], slice(0, width)),
+                ("rows first", cp.ascontiguousarray(device[:, :width]), slice(0, width)),
+                ("every other column", device[:, : 2 * width : 2], slice(0, 2 * width, 2)),
+            )
+            for name, block, columns in views:
+                with self.subTest(width=width, block=name):
+                    expected = cp.asnumpy(former(block))
+                    actual = cp.asnumpy(six(block))
+                    self.assertEqual(actual.shape, (len(lengths), width))
+                    np.testing.assert_array_equal(_bits(actual), _bits(expected))
+                    np.testing.assert_allclose(
+                        actual, reference[:, columns], rtol=0.0, atol=1e-11
+                    )
+            # Into the buffer of a caller, column-major and row-major, as a
+            # filter graph passes a view of its coefficient buffer.
+            for order in ("F", "C"):
+                with self.subTest(width=width, output=order):
+                    buffers = [
+                        cp.full((len(lengths), 15), np.nan, order=order) for _ in range(2)
+                    ]
+                    self.assertIs(
+                        six(device[:, :width], output=buffers[1][:, :width]).base,
+                        buffers[1],
+                    )
+                    former(device[:, :width], output=buffers[0][:, :width])
+                    np.testing.assert_array_equal(
+                        _bits(cp.asnumpy(buffers[1])), _bits(cp.asnumpy(buffers[0]))
+                    )
+                    self.assertTrue(bool(cp.isfinite(buffers[1][:, :width]).all()))
+        # A single vector, as the Lanczos bound applies the operator.
+        vector = cp.asnumpy(six(device[:, 3]))
+        self.assertEqual(vector.shape, (len(lengths),))
+        np.testing.assert_array_equal(
+            _bits(vector), _bits(cp.asnumpy(former(device[:, 3])))
         )
 
-        projection = gpu.custom_projector_projection
-        self.assertIsNotNone(projection)
-        self.assertEqual(projection.max_row_entries, dimension)
-        self.assertEqual(projection.reduction_mode, "parallel")
+        # The launches: one of a block per projector and column, against one
+        # of a block per projector for every six columns.
+        launched = {}
+        for name, projection in (("former", former), ("six", six)):
+            launched[name] = calls = []
+
+            def counting(grid, block, arguments, kernel=projection.kernel, calls=calls):
+                calls.append((grid, block, int(arguments[1])))
+                return kernel(grid, block, arguments)
+
+            with patch.object(projection, "kernel", counting):
+                projection(device[:, :14])
+                projection(device[:, :6])
+        count = len(lengths)
+        self.assertEqual(
+            launched["former"],
+            [((count * 14,), (128,), 14), ((count * 6,), (128,), 6)],
+        )
+        self.assertEqual(
+            launched["six"],
+            [((count,), (128,), 6), ((count,), (128,), 6), ((count,), (128,), 2),
+             ((count,), (128,), 6)],
+        )
+
+    def test_projection_block_columns_switch_restores_the_former_kernel(self):
+        cp = self.cp
+        kinetic, potential, projectors, signs = _long_row_hamiltonian()
+        kernels = cupy_projectors._kernels(cp)
+        generator = np.random.default_rng(72)
+        host = generator.standard_normal((kinetic.shape[0], 13))
+        step = dict(center=0.5, scale=1.0 / 64.0, sigma=0.4, sigma_next=1.5)
+
+        def results(operator):
+            """What an operator gives with its projection: H X, into a buffer, and recurrence steps."""
+
+            values = []
+            for width in (1, 6, 13):
+                block = cp.asarray(host[:, :width], order="F")
+                former = cp.asarray(host[::-1, :width], order="F")
+                values.append(cp.asnumpy(operator.apply(block)))
+                values.append(cp.asnumpy(operator.apply_into(block, cp.empty_like(block))))
+                values.append(cp.asnumpy(operator.chebyshev_recurrence(block, **step, previous=former)))
+                values.append(
+                    cp.asnumpy(operator.chebyshev_recurrence(block, center=0.5, scale=1.0 / 64.0))
+                )
+            values.append(cp.asnumpy(operator.apply(cp.asarray(host[:, 2]))))
+            if operator.raw_projector_factors is not None:
+                # The nonlocal part alone, which the full-grid operator
+                # leaves to cuSPARSE and its own order of summation.
+                values.append(cp.asnumpy(operator.apply_nonlocal(cp.asarray(host, order="F"))))
+            return values
+
+        # The operator of the full grid, with its cuSPARSE matrices, and the
+        # operator of a symmetry sector, with raw factors alone.
+        for sector in (False, True):
+            built = {}
+            for value in (None, "6", "1"):
+                with _block_columns(value):
+                    built[value] = CuPyHamiltonian(
+                        kinetic,
+                        potential,
+                        projectors=projectors,
+                        projector_signs=signs,
+                        retain_generic_laplacian=not sector,
+                    )
+            with self.subTest(sector=sector):
+                self.assertEqual(
+                    [built[value].raw_projector_factors is not None for value in built],
+                    [sector] * 3,
+                )
+                self.assertEqual(
+                    [built[value].custom_projector_projection.reduction_mode for value in built],
+                    ["parallel6", "parallel6", "parallel"],
+                )
+                self.assertEqual(
+                    [built[value].custom_projector_projection.block_columns for value in built],
+                    [6, 6, 1],
+                )
+                self.assertIs(built[None].custom_projector_projection.kernel, kernels[3])
+                self.assertIs(built["1"].custom_projector_projection.kernel, kernels[0])
+                # The former value launches what the code launched before
+                # the switch: one launch, a block per projector and column.
+                projection = built["1"].custom_projector_projection
+                calls = []
+
+                def counting(grid, block, arguments, kernel=projection.kernel):
+                    calls.append((grid, block, int(arguments[0]), int(arguments[1])))
+                    return kernel(grid, block, arguments)
+
+                with patch.object(projection, "kernel", counting):
+                    built["1"].apply(cp.asarray(host, order="F"))
+                self.assertEqual(calls, [((4 * 13,), (128,), 4, 13)])
+                expected = results(built["1"])
+                self.assertTrue(all(np.isfinite(value).all() and value.any() for value in expected))
+                for value in (None, "6"):
+                    for actual, former in zip(results(built[value]), expected, strict=True):
+                        np.testing.assert_array_equal(_bits(actual), _bits(former))
+
+        # Short projector rows keep their canonical-order kernel under either value.
+        small_kinetic, small_potential, small_nonlocal, _ = _small_hamiltonian()
+        for value in (None, "1"):
+            with self.subTest(short_rows=value), _block_columns(value):
+                short = CuPyHamiltonian(small_kinetic, small_potential, small_nonlocal)
+                projection = short.custom_projector_projection
+                self.assertEqual(
+                    (projection.reduction_mode, projection.block_columns), ("serial", 1)
+                )
+                self.assertIs(projection.kernel, kernels[2])
+
+        # A value that the switch does not know is an error of the operator,
+        # with projectors and without: it is not left to cuSPARSE.
+        with _block_columns("2"):
+            for arguments in (
+                dict(projectors=projectors, projector_signs=signs),
+                {},
+            ):
+                with self.assertRaisesRegex(ValueError, "PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS"):
+                    CuPyHamiltonian(kinetic, potential, **arguments)
+
+        # The columns that a caller names outrank the switch, as a sector
+        # group names those of its owner for its other devices.
+        for value, named, reduction in (("6", 1, "parallel"), ("1", 6, "parallel6")):
+            with self.subTest(switch=value, named=named), _block_columns(value):
+                given = CuPyHamiltonian(
+                    kinetic,
+                    potential,
+                    projectors=projectors,
+                    projector_signs=signs,
+                    retain_generic_laplacian=False,
+                    projection_block_columns=named,
+                )
+                self.assertEqual(given.custom_projector_projection.reduction_mode, reduction)
+        with self.assertRaisesRegex(ValueError, "6 columns or 1"):
+            CuPyHamiltonian(
+                kinetic,
+                potential,
+                projectors=projectors,
+                projector_signs=signs,
+                projection_block_columns=3,
+            )
 
     def test_lanczos_filter_orthogonalize_and_rayleigh_ritz(self):
         rng = np.random.default_rng(15)

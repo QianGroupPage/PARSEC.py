@@ -37,15 +37,33 @@ from ..backends.cupy import (
     synchronize,
 )
 from ..backends.cupy_mixed_precision import float32_filter_requested
-from ..backends.implicit_stencil import implicit_tile_for_sector
+from ..backends.implicit_stencil import (
+    FilterPlan,
+    FilterWork,
+    implicit_tile_for_sector,
+    regular_tile_share,
+)
 from .distributed_state import shared_basis_devices, shared_block_bytes
 from .eigval import CuPyEigvalResult, CuPyEigvalSolver, spill_download_order
 from .filter_graph import graph_route_name
 from .rayleigh_ritz import (
+    _tile_follows_slab,
     gram_multiple,
+    one_array_buffer_limit,
     streaming_ritz_requested,
     streaming_workspace_bytes,
 )
+from .spill_buffers import (
+    SpillBuffers,
+    spill_buffer_mode,
+    spill_pinned_bytes,
+    spill_pinned_pool,
+)
+
+# The share of a device's memory that the states of its sectors and one Ritz
+# buffer may take where ``auto`` decides their storage
+# (:meth:`CuPySymmetrySCFEigensolver._configure_large_problem_allocator`).
+_SECTOR_STATE_SHARE = "0.974"
 
 
 @dataclass(frozen=True)
@@ -279,7 +297,7 @@ def sector_pool_release_requested() -> bool:
 
     CuPy's memory pool keeps the blocks that arrays gave back in one free
     list per stream, and a process with several devices gives each sector a
-    stream of its own.  The Ritz buffer that a sector gave back (1 to 4 GiB,
+    stream of its own.  The Ritz buffer that a sector gave back (1 to 2 GiB,
     :func:`rayleigh_ritz._streaming_workspace`) can then not serve the next
     sector of the same device, which takes another one: both stay until the
     density step empties the pool, although the sectors of a device are
@@ -340,6 +358,7 @@ class CuPySymmetrySCFEigensolver:
         kinetic_cache_key: str | None = None,
         decomposition_cache_key: str | None = None,
         mpi_context: Any | None = None,
+        filter_plan: FilterPlan | None = None,
     ) -> None:
         self.full_operator = full_operator
         self.decomposition = decomposition
@@ -358,6 +377,12 @@ class CuPySymmetrySCFEigensolver:
         # ``_state_fit_bytes``); ``None`` where no ``auto`` asked, and
         # where it decided by the former rule, which counts no such bytes.
         self.state_fit_bytes: dict[int, int] | None = None
+        # Of sector states kept on the host: the staging, the host buffers
+        # of the sectors where it has them, and per sector the calls and
+        # seconds of its moves (see ``spill_staging``).
+        self._spill_staging: str | None = None
+        self._spill_buffers: SpillBuffers | None = None
+        self._spill_seconds: dict[int, list] = {}
         self._previous_memory_allocator = None
         self._memory_allocator_evaluated = False
         self.mpi_context = mpi_context
@@ -575,6 +600,11 @@ class CuPySymmetrySCFEigensolver:
                     decomposition.sector_size(representation)
                 ),
                 sectors_on_device=self._device_sector_count(representation),
+                work=self._sector_filter_work(
+                    representation,
+                    filter_plan,
+                    static_operators.stencil_metadata[representation],
+                ),
             )
             for representation in self._owned_representations
         }
@@ -690,6 +720,32 @@ class CuPySymmetrySCFEigensolver:
             else "private_per_representation"
         )
 
+    def _sector_filter_work(
+        self,
+        representation: int,
+        filter_plan: FilterPlan | None,
+        stencil_metadata: Any,
+    ) -> FilterWork | None:
+        """Return the filter work of a run in one sector, for the rule of its tiles.
+
+        ``None`` where the caller of the constructor gave no plan: the tiles
+        then follow the row limits.  The columns are those the first solve
+        gives the sector, the devices those of this process, which work side
+        by side while its host packs, and the share of regular tiles is
+        taken from the stencil of the sector when the rule asks for it.
+        """
+
+        if filter_plan is None:
+            return None
+        return FilterWork(
+            columns=self._initial_sector_count(
+                representation, filter_plan.states, filter_plan.buffer
+            ),
+            applications=filter_plan.applications,
+            devices=len(self.device_ids),
+            regular_share=lambda: regular_tile_share(stencil_metadata),
+        )
+
     def _filter_device_count(self, representation: int) -> int:
         """Return how many devices filter the basis of one sector solved here.
 
@@ -727,8 +783,9 @@ class CuPySymmetrySCFEigensolver:
         """The device that holds the Hartree objects of this process, as the driver names it.
 
         ``None`` where they share no device.  Every sector operator is told:
-        a sector that shares its basis gives that device, the fullest of the
-        process, no work beside its own
+        a sector that shares its basis gives that device work beside its
+        own only where it has no other device for it and the sharing rule
+        counts the room
         (:meth:`distributed_state.SectorDeviceGroup._condition_helper`).
         """
 
@@ -910,6 +967,158 @@ class CuPySymmetrySCFEigensolver:
                 solver.reset()
         self._state = None
         self._sector_counts = None
+        # A result of an earlier solve may hold views of the spill buffers:
+        # the next solve must not write over them.
+        buffers = getattr(self, "_spill_buffers", None)
+        if buffers is not None:
+            buffers.release()
+
+    # ----- ionic steps --------------------------------------------------
+
+    #: Set by the driver that prepared the system: a callable returning the
+    #: gradients of the present projectors
+    #: (:class:`parsec_python.Forces.NonlocalProjectorGradients`), with their
+    #: columns in the order of the projectors.
+    projector_gradient_provider = None
+    #: Set by the same driver: a callable taking the ``(atoms, 3)`` positions
+    #: of moved atoms and rebuilding what this process holds for them.
+    geometry_handler = None
+
+    def start_new_scf_loop(self):
+        """Keep every sector subspace for the SCF loop of the next structure.
+
+        Each sector solver, on whichever rank holds it, marks its saved
+        subspace as the start of a new loop (``solver%firstfilt`` of
+        ``parsec.F90``).  Returns the state to hand to that loop, ``None``
+        before any solve.
+        """
+
+        context = getattr(self, "mpi_context", None)
+        if context is not None:
+            context.execute(self, "new_scf_loop")
+        else:
+            self._start_new_scf_loop_local()
+        return self._state
+
+    def _start_new_scf_loop_local(self) -> None:
+        for solver in self._solvers:
+            if solver is not None:
+                solver.start_new_scf_loop()
+        self._mpi_latest_results = {}
+
+    def replace_nonlocal_operator(self, nonlocal_operator) -> None:
+        """Install the projectors of moved atoms in the sectors solved here.
+
+        The full-grid projectors are reduced to every sector of this process
+        as they were at construction, and each sector operator takes them in
+        place, with its replicas on the other devices of a shared sector.
+        Stencils, potential buffers and saved subspaces stay.  In an MPI run
+        every rank does this for its own sectors.
+        """
+
+        from .distributed_filter import replace_operator_projectors
+
+        reduced = self.decomposition.reduce_nonlocal_operators(
+            nonlocal_operator, self._owned_representations
+        )
+        for representation in self._owned_representations:
+            replace_operator_projectors(
+                self._operators[representation], reduced[representation]
+            )
+
+    def projector_force_terms(
+        self,
+        representations: np.ndarray,
+        columns: np.ndarray,
+        occupations: np.ndarray,
+    ) -> np.ndarray:
+        """Nonlocal force terms per projector, summed over all sectors.
+
+        ``representations`` and ``columns`` name, in global eigenvalue order,
+        the sector and the sector column of every selected state, and
+        ``occupations`` holds their occupations: what the density of the last
+        SCF iteration was built from.  The result is the host array
+        ``t[q, c] = 4*sum_n f_n s_q <beta_q|psi_n><d_c beta_q|psi_n>`` of
+        shape ``(projectors, 3)``; the orbitals stay on their devices and
+        ranks.
+        """
+
+        payload = (
+            np.ascontiguousarray(representations, dtype=np.int32),
+            np.ascontiguousarray(columns, dtype=np.int32),
+            np.ascontiguousarray(occupations, dtype=np.float64),
+        )
+        context = getattr(self, "mpi_context", None)
+        if context is not None:
+            return context.execute(self, "forces", payload)
+        return self._projector_force_terms_local(*payload)
+
+    def _projector_force_terms_local(
+        self,
+        representations: np.ndarray,
+        columns: np.ndarray,
+        occupations: np.ndarray,
+    ) -> np.ndarray:
+        from time import perf_counter
+        from types import SimpleNamespace
+
+        from ..Forces.nonlocal_device import gradient_transposes, projector_force_terms
+
+        provider = self.projector_gradient_provider
+        if provider is None:
+            raise RuntimeError(
+                "this eigensolver was not given the projector gradients of its system"
+            )
+        started = perf_counter()
+        gradients = provider()
+        built = perf_counter()
+        reduced = [
+            self.decomposition.reduce_nonlocal_operators(
+                SimpleNamespace(
+                    projectors=component,
+                    signs=gradients.signs,
+                    labels=gradients.labels,
+                ),
+                self._owned_representations,
+            )
+            for component in gradients.components
+        ]
+        reduced_at = perf_counter()
+        total = np.zeros((len(gradients.labels), 3), dtype=np.float64)
+        for representation in self._owned_representations:
+            selected = np.flatnonzero(representations == representation)
+            if not selected.size:
+                continue
+            weights = occupations[selected]
+            if not np.array_equal(columns[selected], np.arange(selected.size)):
+                raise RuntimeError(
+                    "the selected states of a sector are not its leading columns"
+                )
+            occupied = np.flatnonzero(weights != 0.0)
+            if not occupied.size:
+                continue
+            weights = weights[: int(occupied[-1]) + 1]
+            state = self._solvers[representation].device_state
+            if state is None or int(state.subspace.vectors.shape[1]) < weights.size:
+                raise RuntimeError(
+                    "a sector no longer holds the orbitals of the last SCF iteration"
+                )
+            total += projector_force_terms(
+                self._operators[representation],
+                state.subspace.vectors,
+                weights,
+                gradient_transposes(
+                    tuple(reduced[axis][representation].projectors for axis in range(3))
+                ),
+            )
+        # Wall seconds of this process: building the gradients on the full
+        # grid, reducing them to its sectors, contracting them on its devices.
+        self.force_phase_seconds = {
+            "gradients": built - started,
+            "reduction": reduced_at - built,
+            "contraction": perf_counter() - reduced_at,
+        }
+        return total
 
     def _state_fit_bytes(self, counts: list[int]) -> dict[int, int]:
         """Bytes that the rule of the state storage counts on each device for the sectors solved here.
@@ -934,14 +1143,23 @@ class CuPySymmetrySCFEigensolver:
         (``PARSEC_CUPY_STREAMING_RITZ``) is counted as the one with one.  A
         device that this count overfills cannot keep the states of its
         sectors on any route; one that it does not may still be too small
-        for them (58.8 GiB were sampled where it gives 56.0).
+        for them (56.8 GiB were sampled where it gives 54.0).  The buffer
+        is counted as the step takes it, within the limit of one array
+        where no budget is set: 2 GiB for these sectors, 4 GiB before
+        (:func:`rayleigh_ritz.one_array_buffer_limit`).
 
         For a shared basis the count is not a lower limit.  It is the count
         of the rule that shares the basis, whose workspace is that of slabs
         as wide as their budget allows
         (:func:`distributed_state.slab_workspace`); the slabs that are cut
-        can be narrower.  Of 10,456 electrons on 16 GPUs every device counts
-        9,945 MiB, and devices of that run sampled as little as 10,005 MiB,
+        can be narrower.  So is its exchange buffer, the most that a buffer
+        which follows a slab can take where no chunk size is named
+        (:func:`distributed_state.exchange_chunk_limit`): up to 128 MiB above
+        the chunk on four devices, from 10.7 GiB of basis and all of it from
+        12 GiB.  Of 10,456 electrons
+        on 16 GPUs every device counted 9,945 MiB with the chunk of 1 GiB
+        that it had (10,073 MiB where none is named), and devices of that
+        run sampled as little as 10,005 MiB,
         426 of them the CUDA context: 366 MiB less than the count outside
         the context.  So it was, by that or less, on 61 of the 208 devices
         with shared blocks in the first runs of one series, all from 14,680
@@ -989,7 +1207,7 @@ class CuPySymmetrySCFEigensolver:
         devices and the pool of CuPy unless the sectors of some device
         cannot fit it (:meth:`_state_fit_bytes` above
         ``PARSEC_CUPY_SECTOR_STATE_AUTO_FRACTION`` of the memory of the
-        device, 0.978 by default): then the states are spilled to the host
+        device, 0.974 by default): then the states are spilled to the host
         after every solve and the allocations bypass the pool, so that a
         device holds the blocks of one sector at a time.  A run whose
         sectors fit thus takes the route of ``device`` and ``pool`` without
@@ -997,17 +1215,34 @@ class CuPySymmetrySCFEigensolver:
 
         The count leaves out what else a device holds, so it is held
         against a share of the device and not all of it.  In first runs on
-        A100 nodes every device with a basis of its own sampled at least
-        1.026 times its count (39 devices of 15 runs, 3.2 to 75.5 GiB
-        counted), and from 50 GiB counted up 1.8 GiB or more above it.  At
-        0.978 the rule therefore takes a device as too small only where
-        that ratio puts its peak above its memory, 1.74 GiB below the
-        79.25 GiB of such a device.  The fullest device that ran, 75.5 GiB
-        counted and 78.3 sampled, keeps its states.  10,456 electrons on
-        one device count 77.7 GiB, 1.5 GiB below the device, and are
-        spilled, as the rule before spilled them: by those figures they
-        would not have fitted.  ``1`` holds the count against all of the
-        device.  A shared basis is counted as the rule that shares it
+        A100 nodes, with the Ritz buffer of at most 4 GiB that a sector on
+        one device took then, every device with a basis of its own sampled
+        at least 1.026 times its count (39 devices of 15 runs, 3.2 to 75.5
+        GiB counted), and from 50 GiB counted up 1.8 GiB or more above it.
+        The share was 0.978 with that count: a device was taken as too
+        small only where that ratio put its peak above its memory, and
+        10,456 electrons on one device, 77.7 GiB counted and 0.981 of the
+        device, were spilled; held against all of the device they stopped
+        for memory.
+
+        The buffer takes 2 GiB at most since
+        (:func:`rayleigh_ritz.one_array_buffer_limit`), and the count with
+        it.  In first runs with that buffer the peak of a device fell by
+        the 2 GiB that its count fell by: the fullest device that ran,
+        14,680 electrons on two, counts 73.5 GiB and sampled 75.5 and 76.3,
+        1.027 times its count and more.  10,456 electrons on one device
+        now count 77.4 GiB, 0.976 of the device, below the former share.
+        Nothing says that they fit: the same sectors in a smaller sphere
+        ran on one device at 2.5 GiB above their count (71.3 counted, 73.8
+        sampled), which would be 79.9 GiB here, of 79.25.  The share is
+        therefore 0.974, the reciprocal of 1.027: a device is still taken
+        as too small only where the least ratio that was measured puts its
+        peak above its memory, 2.06 GiB below a device of 79.25 GiB, and
+        those sectors are spilled as they were.  ``0.978`` is the former
+        share and ``1`` holds the count against all of the device.  A
+        device of 79.25 GiB keeps the states of sectors of 32 GiB and more
+        up to 75.2 GiB of them, where it kept them up to 73.5.  A shared
+        basis is counted as the rule that shares it
         counts it and is held by that rule to
         ``PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION`` of a device (0.85),
         so this share decides nothing for it unless that one is raised
@@ -1025,6 +1260,14 @@ class CuPySymmetrySCFEigensolver:
         (:func:`eigval.spill_download_order`).  Naming
         ``PARSEC_CUPY_DIRECT_ALLOCATOR_FRACTION`` selects that rule, with
         the fraction it names; ``0.5`` was its default.
+
+        Which sectors are spilled is decided above and by nothing below.
+        Where they are, the host buffers of their states are planned here
+        (``PARSEC_CUPY_SPILL_BUFFERS``, :class:`spill_buffers.SpillBuffers`):
+        one per sector of this process, page-locked within the bound of
+        :func:`spill_buffers.page_lock_bound`, which reads the memory that
+        the host has available now.  No device holds more or less for it:
+        an upload takes the one array that it took, and a download none.
         """
 
         if self._memory_allocator_evaluated:
@@ -1052,15 +1295,25 @@ class CuPySymmetrySCFEigensolver:
                 "PARSEC_CUPY_SECTOR_STATE_STORAGE must be auto, device, or host"
             )
         share = float(
-            os.environ.get("PARSEC_CUPY_SECTOR_STATE_AUTO_FRACTION", "0.978")
+            os.environ.get(
+                "PARSEC_CUPY_SECTOR_STATE_AUTO_FRACTION", _SECTOR_STATE_SHARE
+            )
         )
         if not 0.0 < share <= 1.0:
             raise ValueError(
                 "PARSEC_CUPY_SECTOR_STATE_AUTO_FRACTION must be in (0, 1]"
             )
         # Read by the download of a spill, after the first solve: a value
-        # it does not know stops the run here, before that solve.
+        # it does not know stops the run here, before that solve.  So do
+        # those of its staging, which the density step reads as well.
         spill_download_order()
+        staging = spill_buffer_mode()
+        spill_pinned_pool()
+        spill_pinned_bytes()
+        # Read by the Ritz step of a sector on one device, inside the first
+        # solve, and by the count below where ``auto`` asks for it.
+        one_array_buffer_limit(0)
+        _tile_follows_slab()
 
         cp, _ = require_cupy()
         persistent_bytes: dict[int, int] = {
@@ -1105,6 +1358,22 @@ class CuPySymmetrySCFEigensolver:
             if self._host_spill_sector_states
             else "persistent CUDA representation states"
         )
+        # The host buffers of the spilled sectors and which of them may be
+        # page-locked (PARSEC_CUPY_SPILL_BUFFERS): planned here from the
+        # bytes of each basis at the counts of the first solve, in the
+        # order of the sectors, and taken by each sector when it is first
+        # downloaded.  ``fresh`` plans none: the staging is the former one.
+        self._spill_staging = staging if self._host_spill_sector_states else None
+        self._spill_buffers = None
+        self._spill_seconds = {}
+        if self._host_spill_sector_states and staging == "persistent":
+            self._spill_buffers = SpillBuffers({
+                representation: self.decomposition.sector_size(representation)
+                * int(count)
+                * np.dtype(np.float64).itemsize
+                for representation, count in enumerate(counts)
+                if self._solvers[representation] is not None
+            })
         # PARSEC_CUPY_STREAMING_RITZ=auto: a sector whose basis lies on one
         # device keeps one array of its subspace.  The ordinary Ritz solve
         # keeps two (measured peak about twice the persistent orbitals plus
@@ -1309,20 +1578,41 @@ class CuPySymmetrySCFEigensolver:
         """Run one independent solver on its assigned CUDA stream."""
 
         cp, _ = require_cupy()
+        spilled = getattr(self, "_host_spill_sector_states", False)
+        # The host buffer that the sector keeps, where the staging has
+        # them (PARSEC_CUPY_SPILL_BUFFERS); a solver is handed none
+        # otherwise and moves its states by the former calls.
+        buffers = getattr(self, "_spill_buffers", None)
+        staged = () if buffers is None else (buffers.get(representation),)
+        # Calls and wall seconds of the two moves of this sector, under
+        # either staging: [restores, their seconds, offloads, theirs].
+        moves = (
+            getattr(self, "_spill_seconds", {}).setdefault(
+                representation, [0, 0.0, 0, 0.0]
+            )
+            if spilled
+            else None
+        )
         with cp.cuda.Device(self._sector_device_ids[representation]):
             with self._streams[representation]:
                 solver = self._solvers[representation]
                 if reset:
                     solver.reset()
-                elif getattr(self, "_host_spill_sector_states", False):
-                    solver.restore_state_to_device()
+                elif spilled:
+                    started = perf_counter()
+                    solver.restore_state_to_device(*staged)
+                    moves[0] += 1
+                    moves[1] += perf_counter() - started
                 result = solver.solve(
                     count,
                     settings=settings,
                     spectral_bound=spectral_bound,
                 )
-                if getattr(self, "_host_spill_sector_states", False):
-                    host_state = solver.offload_state_to_host()
+                if spilled:
+                    started = perf_counter()
+                    host_state = solver.offload_state_to_host(*staged)
+                    moves[2] += 1
+                    moves[3] += perf_counter() - started
                     assert host_state is not None
                     result = replace(
                         result,
@@ -1410,6 +1700,42 @@ class CuPySymmetrySCFEigensolver:
                 getattr(self, "_pool_releases", None) or {}
             ).items()
         }
+
+    @property
+    def spill_staging(self) -> dict[str, Any] | None:
+        """How the sector states of this process went to the host and back.
+
+        ``None`` where they stay on their devices.  Otherwise ``buffers``
+        names the staging (``PARSEC_CUPY_SPILL_BUFFERS``), and under either
+        ``restores`` and ``offloads`` count the calls that moved the states
+        of a sector to its device before a solve and to the host behind
+        it, with the wall seconds of those calls.  With ``fresh`` the
+        seconds of a restore end where ``cupy.asarray`` returns, which can
+        be before its copy to the device has completed.  With
+        ``persistent`` they are those of complete copies, the offloads
+        hold the page-locking of each buffer once, and the record of the
+        buffers is added (:attr:`spill_buffers.SpillBuffers.record`): the
+        bound and where it comes from, the bytes that are page-locked and
+        pageable, and the bytes that went up and down.  The uploads of the
+        density step are counted by its builder.  Reports what ran, so it
+        is read after a solve.
+        """
+
+        staging = getattr(self, "_spill_staging", None)
+        if staging is None:
+            return None
+        moves = list((getattr(self, "_spill_seconds", None) or {}).values())
+        record = dict(
+            buffers=staging,
+            restores=sum(item[0] for item in moves),
+            restore_seconds=sum(item[1] for item in moves),
+            offloads=sum(item[2] for item in moves),
+            offload_seconds=sum(item[3] for item in moves),
+        )
+        buffers = getattr(self, "_spill_buffers", None)
+        if buffers is not None:
+            record.update(buffers.record)
+        return record
 
     def _run_one_bound(
         self,

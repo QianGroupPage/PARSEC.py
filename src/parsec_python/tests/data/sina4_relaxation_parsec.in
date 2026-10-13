@@ -1,0 +1,59 @@
+# Cluster SiNa4 with structural relaxation (BFGS),
+# manual input of level occupancy.
+
+Boundary_Sphere_Radius:  4.0 ang
+Grid_Spacing:  0.8
+
+States_Num:  8
+Fermi_Temp:  -1
+Max_Iter:  50
+Eigensolver: chebff   #arpack
+
+Coordinate_Unit: Cartesian_Ang
+
+Mixing_Method: Anderson
+Mixing_Param:  0.28
+Memory_Param:  3
+
+Correlation_Type: CA
+
+Minimization: BFGS
+Movement_Num:  10
+Force_Min:  0.03
+
+Atom_Types_Num:  2
+
+#------------ new atom type ---------------- 
+Atom_Type: Si
+
+Pseudopotential_Format: martins_old
+Core_Cutoff_Radius:  2.5
+Local_Component: p
+Potential_Num:  2
+
+begin Electron_Per_Orbital
+# S P D F
+2 2 0
+end Electron_Per_Orbital
+
+Move_Flag:  0
+begin Atom_Coord
+       0.000000    0.000000    0.000000
+end Atom_Coord
+
+#------------ end of atom type ------------- 
+
+#------------ new atom type ----------------
+Atom_Type: Na
+
+Pseudopotential_Format: martins_new
+Local_Component: p
+
+begin Atom_Coord
+     1.014049     1.014953     1.013144
+    -1.014049    -1.014953     1.013144
+    -1.014049     1.014953    -1.013144
+     1.014049    -1.014953    -1.013144
+end Atom_Coord
+
+#------------ end of atom type -------------

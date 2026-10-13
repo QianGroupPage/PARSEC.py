@@ -98,6 +98,19 @@ RADIUS_SAFETY = 1.5
 RADIUS_STEP_LIMIT = 2.5
 _SHELL_BLOCK_ROWS = 1 << 20
 _WALL_BLOCK_ATOMS = 2000
+# Estimates made ahead of a search (:class:`PreparedEstimates`).  An estimate
+# is a difference of two potentials of all the charges at the sphere, so the
+# order in which a BLAS sums the one product in it moves it by spacings of
+# those potentials, whatever its own size and that of the tolerance: by 4 to
+# 9 of them between that product and the same sums in other orders, for the
+# atoms of 3,480 to 39,368 electrons on the host of a laptop (2e-12 Ry for
+# the largest, whose tolerance is 2e-4 Ry).  A prepared estimate that lies
+# within this many spacings of the largest potential the charges can have on
+# the sphere from the tolerance is made again by the search itself
+# (:func:`_prepared_margin`); and no more than the second number are made
+# for one sphere.
+_PREPARED_SPACINGS = 64
+PREPARED_ESTIMATES_LIMIT = 96
 
 
 def _bohr(value: Decimal) -> float:
@@ -337,6 +350,72 @@ def _on_grid_shell(radius: float, spacing: float, shift: float) -> bool:
     return abs(squared - nearest) / squared < 1.0e-9
 
 
+class PreparedEstimates:
+    """Estimates of the omitted potential at the largest order, made ahead of a search.
+
+    One geometry, any radius: :meth:`make` estimates at a radius (bohr) and
+    keeps the value, :meth:`get` returns a kept value or ``None``.  A search
+    that is handed the object (:func:`radius_for_budget`) reads the estimate
+    of a radius from it where it holds that radius and makes the others
+    itself, so what it finds does not depend on what was prepared: every
+    value is that of
+    :func:`~parsec_python.Hartree.boundary.estimate_omitted_potential` for
+    the same positions, charges and radius.  Nothing here is locked: one
+    thread makes the values, and a search reads them once that thread has
+    ended.
+    """
+
+    def __init__(self, positions: np.ndarray, charges: np.ndarray) -> None:
+        self.positions = np.array(positions, dtype=np.float64).reshape(-1, 3)
+        self.charges = np.array(charges, dtype=np.float64)
+        self._values: dict[float, float] = {}
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def holds(self, positions: np.ndarray, charges: np.ndarray) -> bool:
+        """Whether the estimates are those of these positions and charges, bit for bit."""
+
+        return np.array_equal(self.positions, positions) and np.array_equal(
+            self.charges, charges
+        )
+
+    def get(self, radius: float) -> float | None:
+        return self._values.get(float(radius))
+
+    def make(self, radius: float) -> float:
+        radius = float(radius)
+        value = self._values.get(radius)
+        if value is None:
+            value = float(
+                estimate_omitted_potential(self.positions, self.charges, radius)[
+                    MAXIMUM_MULTIPOLE_ORDER
+                ]
+            )
+            self._values[radius] = value
+        return value
+
+
+def _prepared_margin(
+    positions: np.ndarray, charges: np.ndarray, radius: float
+) -> float:
+    """Return how near the tolerance a prepared estimate is made again (Ry).
+
+    ``_PREPARED_SPACINGS`` spacings of ``2 sum_a |q_a| / (R - r_max)``, which
+    no potential of the charges at a point of the sphere exceeds, and no
+    partial sum of their multipole series there: every number the estimate
+    is a difference of has that spacing at most.  Infinite where an atom
+    lies on the sphere or beyond it.
+    """
+
+    reach = radius - float(np.linalg.norm(positions, axis=1).max())
+    if not reach > 0.0:
+        return math.inf
+    return _PREPARED_SPACINGS * float(
+        np.spacing(2.0 * float(np.abs(charges).sum()) / reach)
+    )
+
+
 def _settle_radius(
     value: Decimal,
     set_by: str,
@@ -345,6 +424,7 @@ def _settle_radius(
     spacing: float,
     shift: float,
     tolerance: float | None,
+    prepared=None,
 ) -> tuple[Decimal, str, int]:
     """Grow a lattice radius until the largest order meets the tolerance and
     no grid point lies on the sphere.
@@ -352,6 +432,14 @@ def _settle_radius(
     Returns the radius, what set it, and the estimates that were made.  With
     ``tolerance=None`` the boundary values are exact and only the grid is
     looked at.
+
+    ``prepared`` may hold estimates of these positions and charges that were
+    made before (``get(radius)`` returns one or ``None``).  One that it holds
+    is counted like one made here and is not made again, unless it lies
+    within the round-off of its potentials of the tolerance
+    (:func:`_prepared_margin`): there the last bits decide, which another
+    order of the sums may give otherwise, and the estimate is made here as
+    without ``prepared``.
     """
 
     estimates = 0
@@ -366,12 +454,14 @@ def _settle_radius(
             ):
                 return False
             estimates += 1
-            return bool(
-                estimate_omitted_potential(positions, charges, radius)[
+            estimate = None if prepared is None else prepared.get(radius)
+            if estimate is None or abs(estimate - tolerance) <= _prepared_margin(
+                positions, charges, radius
+            ):
+                estimate = estimate_omitted_potential(positions, charges, radius)[
                     MAXIMUM_MULTIPOLE_ORDER
                 ]
-                > tolerance
-            )
+            return bool(estimate > tolerance)
 
         if misses(value):
             low, step = value, Decimal("0.5")
@@ -811,6 +901,107 @@ class RadiusForBudget:
     wall_radius_text: str = ""
 
 
+def _start_of_search(
+    stepped: Decimal, largest: float, spacing: float, stencil_half_width: int
+) -> tuple[Decimal, str]:
+    """Return the radius a step of the wall leads to, and what set it.
+
+    ``stepped`` is the lattice radius of the step and ``largest`` the
+    distance of the outermost atom (bohr): the radius keeps the minimum
+    vacuum and the stencil beyond that atom.
+    """
+
+    floor = lattice_radius(largest + MINIMUM_VACUUM * ANGSTROM)
+    value = max(stepped, floor)
+    set_by = "density at the sphere" if value > floor else "minimum vacuum"
+    stencil = largest + (stencil_half_width + 1) * spacing
+    if _bohr(value) < stencil:
+        value = lattice_radius(stencil)
+        set_by = "stencil"
+    return value, set_by
+
+
+class _PreparationEnded(Exception):
+    """Raised inside a search of :func:`prepare_radius_search` that is to end."""
+
+
+def prepare_radius_search(
+    prepared: PreparedEstimates,
+    radius: float,
+    electron_count: float,
+    *,
+    spacing: float,
+    shift: float = 0.5,
+    stencil_half_width: int = 6,
+    budget: float = DOMAIN_ENERGY_TOLERANCE,
+    proceed=None,
+    limit: int = PREPARED_ESTIMATES_LIMIT,
+) -> None:
+    """Make the estimates that :func:`radius_for_budget` can ask for after an SCF.
+
+    That function steps from ``radius``, the sphere of the run, by what the
+    fit of the final density says, at most ``RADIUS_STEP_LIMIT`` either way,
+    and from the lattice radius it reaches searches the smallest one at
+    which the largest order meets the tolerance of the rule.  The step is
+    known only after the SCF; the estimates the search asks for depend on
+    the geometry and the radius alone.  Here the search is made from every
+    radius a step can reach, those nearest to ``radius`` first, each with
+    the tolerance the rule gives it, and what it estimates is kept in
+    ``prepared``, whose positions and charges are those of the atoms.
+
+    Nothing is returned and nothing is decided: the search after the SCF is
+    made as before and finds in ``prepared`` the estimates it would make.
+    ``proceed`` is asked before every new estimate and ends the preparation
+    by returning false; ``limit`` new estimates end it too.  A start from
+    which no radius meets the tolerance is passed over: the search after the
+    SCF says so if the fit leads there.
+    """
+
+    positions, charges = prepared.positions, prepared.charges
+    if not positions.size:
+        return
+    largest = float(np.linalg.norm(positions, axis=1).max())
+    reach = RADIUS_STEP_LIMIT * ANGSTROM
+    lowest, highest = lattice_radius(radius - reach), lattice_radius(radius + reach)
+    centre = lattice_radius(radius)
+    count = int((highest - lowest) / RADIUS_LATTICE)
+    steps = sorted(
+        (lowest + index * RADIUS_LATTICE for index in range(count + 1)),
+        key=lambda stepped: (abs(stepped - centre), stepped),
+    )
+    made = 0
+
+    class Making:
+        @staticmethod
+        def get(candidate: float) -> float:
+            nonlocal made
+            value = prepared.get(candidate)
+            if value is None:
+                if made >= limit or (proceed is not None and not proceed()):
+                    raise _PreparationEnded
+                value = prepared.make(candidate)
+                made += 1
+            return value
+
+    starts = set()
+    for stepped in steps:
+        value, _set_by = _start_of_search(stepped, largest, spacing, stencil_half_width)
+        if value in starts:
+            continue
+        starts.add(value)
+        tolerance = auto_boundary_tolerance(
+            electron_count, budget, _bohr(value) - largest
+        )
+        try:
+            _settle_radius(
+                value, "", positions, charges, spacing, shift, tolerance, Making
+            )
+        except _PreparationEnded:
+            return
+        except ValueError:
+            continue
+
+
 def radius_for_budget(
     fit: WallFit,
     radius: float,
@@ -825,6 +1016,7 @@ def radius_for_budget(
     highest_occupied: float | None = None,
     boundary_tolerance: float | None = None,
     multipole_boundary: bool = True,
+    prepared: PreparedEstimates | None = None,
 ) -> RadiusForBudget:
     """Return the radius at which the fitted wall energy meets its share.
 
@@ -840,6 +1032,12 @@ def radius_for_budget(
     then the wall's alone and no estimate of the omitted potential is made:
     the largest order is asked only for the tolerance of the rule, and what
     the orders make of the input's own is said by the set-up of a run.
+
+    ``prepared`` may hold estimates that were made for these atoms while the
+    SCF ran (:func:`prepare_radius_search`).  The search reads those it asks
+    for and makes the others; it is the same search, with the same result
+    and the same count of estimates.  Estimates of other positions or
+    charges are not read.
     """
 
     decay = fit.decay
@@ -852,15 +1050,11 @@ def radius_for_budget(
     elif step < -RADIUS_STEP_LIMIT * ANGSTROM:
         step, limit = -RADIUS_STEP_LIMIT * ANGSTROM, "limit"
     positions, charges = valence_point_charges(atoms, pseudopotentials, electron_count)
+    if prepared is not None and not prepared.holds(positions, charges):
+        prepared = None
     largest = float(np.linalg.norm(positions, axis=1).max())
-    floor = lattice_radius(largest + MINIMUM_VACUUM * ANGSTROM)
     stepped = lattice_radius(radius + step)
-    value = max(stepped, floor)
-    set_by = "density at the sphere" if value > floor else "minimum vacuum"
-    stencil = largest + (stencil_half_width + 1) * spacing
-    if _bohr(value) < stencil:
-        value = lattice_radius(stencil)
-        set_by = "stencil"
+    value, set_by = _start_of_search(stepped, largest, spacing, stencil_half_width)
     if value > stepped and limit == "limit":
         # The vacuum or the stencil held the radius, not the step.
         limit = ""
@@ -872,7 +1066,7 @@ def radius_for_budget(
         )
         tolerance_text = f"{boundary_tolerance:.1e} Ry"
     value, set_by, estimates = _settle_radius(
-        value, set_by, positions, charges, spacing, shift, rule_tolerance
+        value, set_by, positions, charges, spacing, shift, rule_tolerance, prepared
     )
     return RadiusForBudget(
         radius_text=f"{value} ang",
@@ -899,6 +1093,8 @@ __all__ = [
     "FIT_WINDOW",
     "FreeAtomTable",
     "MINIMUM_VACUUM",
+    "PREPARED_ESTIMATES_LIMIT",
+    "PreparedEstimates",
     "RADIUS_LATTICE",
     "RULE_VERSION",
     "RadiusForBudget",
@@ -912,6 +1108,7 @@ __all__ = [
     "fit_wall",
     "free_atom_tables",
     "lattice_radius",
+    "prepare_radius_search",
     "radius_for_budget",
     "series_bound",
     "sphere_shell_sums",

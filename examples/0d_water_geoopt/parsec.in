@@ -1,0 +1,38 @@
+# Ab-initio calculation by the finite-difference method
+
+#restart_run: .true. 
+
+Boundary_Sphere_Radius:  12
+Grid_Spacing:  0.30
+
+#Subspace_Buffer_Size 2
+
+eigensolver chebdav
+
+States_Num: 8
+ 
+Atom_Types_Num:  2
+
+#------------ new atom type ---------------- 
+Atom_Type: O 
+Local_Component: p
+
+begin Atom_Coord
+     .000000000        .000000000        .000000000
+end Atom_Coord
+
+Atom_Type: H 
+Local_Component: s
+
+begin Atom_Coord
+    1.600000000        .400000000        .000000000
+   -1.600000000        .400000000        .000000000
+end Atom_Coord
+
+#------------ end of atom type ------------- 
+
+#Output_All_States: .true.
+
+Minimization: BFGS
+Force_Min:  0.02
+

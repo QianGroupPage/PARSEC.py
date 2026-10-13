@@ -65,6 +65,14 @@ class ScipyHamiltonianBackend(HamiltonianBackend):
         self.statistics.local_updates += 1
         self.statistics.local_update_seconds += perf_counter() - started
 
+    def replace_nonlocal_operator(self, nonlocal_operator) -> None:
+        projectors = sp.csc_matrix(nonlocal_operator.projectors, dtype=np.float64)
+        projectors.sort_indices()
+        if projectors.shape[0] != self.shape[0]:
+            raise ValueError("projector row count must match the Hamiltonian")
+        self.projectors = projectors
+        self.signs = np.asarray(nonlocal_operator.signs, dtype=np.float64)
+
     @staticmethod
     def _restore_rank(result: np.ndarray, was_vector: bool) -> np.ndarray:
         return result[:, 0] if was_vector else result

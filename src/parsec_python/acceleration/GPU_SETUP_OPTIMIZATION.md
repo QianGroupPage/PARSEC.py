@@ -77,6 +77,9 @@ calculations of one structure and grid may name the exact-key cache with
 | `PARSEC_NATIVE_SECTOR_ASSEMBLY` | `1` | Build reduced CSR rows in C++ with per-thread row scratch |
 | `PARSEC_CUPY_FILTER_COLUMN_MAJOR` | `1` | Produce the layout already required by the large generalized Ritz projection |
 | `PARSEC_OVERLAP_IONIC_SETUP` | `1` (default) | Build the GPU ionic fields and the ion-ion energy on a thread beside symmetry detection and the sector operators; `0` keeps them in line |
+| `PARSEC_OVERLAP_ION_ION_SETUP` | `1` (default) | Where the GPU ionic fields are on their thread, the ion-ion energy is summed on a second thread that starts with it; `0` leaves it the last stage of the ionic thread |
+| `PARSEC_OVERLAP_SYMMETRY_SETUP` | `1` (default) | Symmetry detection and the representation phases on a thread that starts when the grid exists, beside the projectors, on a rank whose reference preparation builds no ionic field; `0` keeps them after it, in line |
+| `PARSEC_IONIC_SUM_GRID` | `auto` (default) | GPU ionic fields on their thread are summed at one point per symmetry orbit where the images of the atoms and of the grid points are exact in every bit; `full` sums every grid point |
 | `PARSEC_OVERLAP_CUDA_CONTEXTS` | `1` (default) | `benchmarks/mpi_full_scf.py` only: a rank creates its CUDA contexts on a thread beside its static preparation; `0` creates them before it |
 | `PARSEC_CUDA_CONTEXT_CREATION` | `driver` (default) | That thread creates each context through the CUDA driver library, outside Python's interpreter lock; `runtime` leaves them to CuPy's first calls on each device, which hold the lock, as before |
 | `PARSEC_SYMMETRY_FAST_MAPS` | `1` (default) | Symmetry detection and the representation phases without passes over three coordinates per grid point; `0` takes the former routes |
@@ -121,9 +124,15 @@ nothing reads them before the XC evaluator is set up. With the GPU fields the
 reference preparation therefore returns without them, and one thread
 (`parsec-ionic-setup`) builds them with the same calls while the calling
 thread detects the symmetry and builds the sector operators. The driver joins
-the thread before the XC evaluator and the Poisson graph capture. The arrays
-are the ones of the in-line stages bit for bit. The report gives the thread
-time, the wait at the join and the hidden time (`ionic_setup*`); the stage
+the thread before the XC evaluator and the Poisson graph capture. Summed on
+every grid point (`PARSEC_IONIC_SUM_GRID=full`), the arrays are the ones of
+the in-line stages bit for bit; by default the thread sums a symmetric
+structure on its wedge, which changes them by round-off, and hands the
+ion-ion energy to a second thread (both below). The report gives the time of
+the fields on their thread, from its first sum to its end, the wait at the
+join and the hidden time (`ionic_setup*`); what the thread takes before its
+first sum to choose the grid of its sums is
+`ionic_sum_grid_choice_seconds` and no part of them; the stage
 times of these fields in `preparation` are measured on the thread, and its
 `total_seconds` is the wall time of the reference preparation without them
 (`reference_preparation_seconds`), which the text report says under its setup
@@ -161,6 +170,198 @@ backend), so the saving of this overlap does not add to that of shorter
 symmetry or sector stages. The comparison to make is the time of a rank
 before its first SCF step with `PARSEC_OVERLAP_IONIC_SETUP=0` and `1`, which
 was not run apart from the two other switches.
+
+Three later switches act on the chain of stages that a rank works through
+before its first SCF step, and one record shows that chain. In first runs on
+A100 nodes with 16 GPUs the root prepared 39,368 electrons in 10.69 s and the
+three other ranks in 6.18 to 6.27 s, 29,576 electrons in 6.66 against 4.59 to
+4.68 s and 23,768 in 5.47 against 4.10 to 4.17 s: the other ranks waited
+4.42, 1.98 and 1.30 s for the root. The chain of the root was its ionic
+thread, which started after the projectors and took 7.24 s for 39,368
+electrons (3.66 s for the local potential, 2.44 s for the density, 1.14 s
+for the ion-ion energy), with 1.08 s of wait at its join; the chain of every
+other rank was its host stages, one after another.
+
+`preparation_stages` of a prepared system lists every stage of
+`prepare_single_point` with the thread that ran it and its start and end, in
+seconds from the entry of the function and in the order of the starts:
+`backend_resolution`, `reference_preparation` with `grid`,
+`finite_difference` and `projectors` inside it, `symmetry_reduction`,
+`symmetry_decomposition`, `backend_build`, `sector_eigensolver`,
+`xc_evaluator`, `hartree_solver` with `poisson_solver` and
+`resident_hartree` inside it, `hartree_boundary_setup` on its thread, and on
+the threads of the ionic fields `ionic_fields` with `ionic_symmetry_wait`,
+`ionic_sum_grid_test`, `local_ionic_potential`, `initial_density` and
+`core_density` inside it, and `ion_ion_energy`. A stage whose name ends in
+`_wait` is the wait of its thread at the join of another, and `preparation`
+is the whole call. Threads work beside each other and stages lie inside
+others, so the list is a timeline and its seconds are not to be added. The
+MPI runner writes it for every rank (`per_rank[].preparation_stages` in
+`timing.json`): the stage that ends last before a rank is ready is what the
+rank waited for. The backend report and the result archive do not hold the
+list: the archive stores every entry of the report at the width of the
+longest, and one entry with all stages would be several times as long as
+any other (1,344 against 159 characters in a small run, 0.68 MB more in its
+archive). A preparation that
+raises now waits for every thread it has started before it leaves; the
+error it raises is its own. It therefore reports the error later than it
+did, by what those threads still had to do; the ionic thread, for one,
+finishes its sums, on every grid point if it was still waiting for a
+reduction that will not come.
+
+The ion-ion energy is a loop over the atoms in NumPy whose time grows with
+the square of their number: 1.08 s for 11,021 atoms on the host of an A100
+node. It was the last stage of the ionic thread, and the wait at the join of
+that thread was never longer than it (1.08 of 1.14 s, 0.63 of 0.71 s and 0.44
+of 0.53 s for 39,368, 29,576 and 23,768 electrons on 16 GPUs). With
+`PARSEC_OVERLAP_ION_ION_SETUP` (the default) a second thread
+(`parsec-ion-ion`) sums it, started together with the ionic thread, and the
+completion of the reference system takes the value through a hook where the
+stage stands (`ion_ion_energy_builder` of `complete_single_point` in the
+reference package). It is the value of the same function of the same atoms,
+so the energy is the same in every bit; an error of the sum is raised where
+it was, at the join of the ionic thread. `0` leaves the sum to the ionic
+thread. The thread is started once the projectors are built and not before:
+on the host of an A100 node with 16 OpenMP threads (39,368 electrons, three
+runs each) the sum beside the symmetry maps took the time of the maps alone
+(1.26 s for both, where the maps take 1.26 s and the sum 1.08 s), but
+beside the loop of the projectors, which runs in the interpreter like the
+sum, both were slower (1.90 s against 1.34 s and 1.08 s alone). The report
+says where the sum ran (`ion_ion_setup`) and how long its thread took
+(`ion_ion_setup_seconds`, which is also the "ion-ion" time of the set-up
+timings).
+
+Symmetry detection and the representation phases read the grid and the
+atoms and nothing else, and the projectors do not read them. With
+`PARSEC_OVERLAP_SYMMETRY_SETUP` (the default) a thread
+(`parsec-symmetry-setup`) starts both when the grid exists, and the
+projectors are built beside it. The calling thread takes the maps where it
+used to build them, after the reference preparation, and an error of either
+is raised there as before. The thread calls the functions of the in-line
+route with its arguments, so the maps are the same arrays. It is started
+where the reference preparation of the rank builds no ionic field and no
+full-grid matrix, so that the projectors are its only host work after the
+grid: on a sector worker, and on a root whose GPU ionic fields are on their
+thread, with the sector stencils from the grid (the defaults of the launch
+profile). Everywhere else the maps stay in line: with the C++/OpenMP ionic
+builders or the GPU fields in line, in a resident process, with
+`PARSEC_SECTOR_STENCIL=csr` and no cache, with the builders of the reference
+package, and under the `auto` backend without GPU ionic fields, where the
+probe of the CUDA runtime already runs beside the reference preparation.
+Measured on the host of an A100 node with 16 OpenMP threads, three runs of
+each case: for 39,368 electrons the projectors took 1.34 s and the maps 1.26
+s alone and 1.41 s side by side (1.05 times the longer, 1.19 s less than one
+after the other); 0.37 and 0.42 s alone and 0.43 s together for 10,456
+electrons; 0.12 and 0.18 s alone and 0.19 s together for 3,480. With the
+plan of the Hartree boundary as a third stage beside them the three took
+1.18 to 1.34 times the longest, so the plan stays where it was, before the
+grid. `symmetry_setup` in the report says where the maps were built
+(`overlapped with the projectors` or `inline`), with the seconds of the
+thread and the waits at its two joins.
+
+The local ionic potential and the two atomic densities are sums of one term
+per atom, and they are totally symmetric under the group of the structure:
+the SCF loop of a symmetric structure keeps one value per symmetry orbit of
+each, the average over the orbit. With `PARSEC_IONIC_SUM_GRID=auto` (the
+default) the ionic thread sums them at the representative point of every
+orbit and gives the whole orbit that value. The arrays of the reference
+system keep the size of the full grid, so the archive, the report and every
+reader are served as before. The kernel reads the coordinates of one point
+and the atoms in their order, so the value at a representative point is the
+full-grid one in every bit. The other points of an orbit used to add the
+same terms in another order of the atoms: the fields change by the round-off
+of one sum, and the result of the SCF with them. That holds only where the
+images are exact, which `Symmetry/exact_images.py` tests before the first
+sum: every operation of the detected group must map the atoms of every
+species onto themselves in every bit (the sign of a zero aside), and every
+grid point must have the coordinates of the representative of its orbit up
+to the signs and the order of its axes. The symmetry detector itself accepts
+atoms within 1e-7 bohr of an image and a lattice shift within 1e-10 of a
+symmetric one; for such a structure the full-grid field is symmetric only to
+that tolerance, the test fails and every grid point is summed, as it is with
+`full`, without a detected operation, for fields in line (the serial
+control, `PARSEC_OVERLAP_IONIC_SETUP=0`, a resident process) and for the
+C++/OpenMP builders. A test that cannot be made, because it raises or the
+builders refuse the orbits, is one more such case and does not fail the
+preparation: every grid point is summed and the report gives the error as
+the reason. The builders sum on the orbits for the fields of that thread
+only and every point again afterwards, since the test was made for the
+atoms of the system. The rule asks nothing of the species or the shape of a
+structure, but it does ask that its coordinates are symmetric about the
+origin of the grid in every bit as the preparation places them, so the
+wedge is taken by structures that were written that way and by few others.
+Coordinates from a structural relaxation are symmetric to its convergence
+only. A structure that the recentering of the input moves is tested where
+the move has put it, and the subtraction of the centre need not leave its
+images exact. On a laptop CF4 written 0.3, 0.2 and 0.1 angstrom off the
+origin, and CF4 with one fluorine moved by 2e-8 angstrom, both kept their
+group of order 4 and were summed on every point, with the fields and the
+energies of `full` in every bit; a bent CF2 that the recentering moved by
+1.06 bohr kept exact images and took the wedge of its mirror that swaps x
+and y. A group that permutes axes passes the same test; its
+kernel adds the three squares of a distance in another order, which is
+round-off of the same size. `ionic_sum_grid` in the report says what ran:
+`symmetry wedge (n of N points)`, or `full grid` with the reason.
+
+The thread needs the reduction before its first sum. The thread of the
+symmetry maps publishes it when it is detected, so with both defaults the
+ionic thread, which starts after the projectors, usually finds it there;
+with the maps in line it waits for the detection of the calling thread
+(`ionic_symmetry_wait`). That wait and the test of the images
+(`ionic_sum_grid_test`) are `ionic_sum_grid_choice_seconds` of the report;
+`ionic_setup_seconds` and the hidden time count the fields from their first
+sum, as they did when every point was summed, so that the two compare
+between a run on the wedge and one on the full grid. Measured on one A100
+node for 39,368 electrons
+(22,640,800 grid points, 5,660,200 orbits, 11,021 atoms): the two sums took
+1.38 s on the wedge instead of 4.35 s on four devices (0.84 instead of 3.26
+s for the potential, 0.55 instead of 1.09 s for the density) and 2.49 s
+instead of 10.37 s on one; the wedge values were the full-grid values at the
+representative rows in every bit, and differed from the orbit average that
+the SCF loop used to keep by at most 4.5e-12 Ry in the potential (1.7e-15
+of its largest value) and 1.4e-16 in the density. The test of the images,
+the gather of the wedge coordinates and the three expansions are host work
+of the ionic thread that the full-grid sums did not have. Of these only the
+gather was timed on that node: 0.07 s for its 5,660,200 orbits. On a laptop
+the test took 0.03 s (0.2 s beside other jobs) and one expansion 0.01 s for
+2,482,944 grid points and 620,736 orbits; a group that permutes axes also
+sorts three values per grid point in the test, which was not timed. The
+stage `ionic_sum_grid_test` of a run holds the test with the gather. The
+wedge coordinates are a host array of 24 bytes per orbit while the thread
+sums (0.13 GiB for that grid) and the test holds their absolute values in a
+second one, where the full-grid sums uploaded slices of the grid in place.
+On a laptop GPU the
+fields of five structures (CF4, benzene with its group of order 8, and
+hydrogen-terminated carbon clusters of 71, 309 and 1,095 atoms) were
+bit-identical at the representative rows and differed on the rest of the
+grid by 1.4e-16 to 1.5e-15 of the largest value (at most 8.0e-13 Ry in the
+potential of 1,095 atoms).
+
+What has run where. The three stages were timed on A100 nodes as given
+above, each by itself. Complete runs with the switches on and off have run
+on a laptop GPU only (`README.md` gives what they compared: the former
+values restore every bit, and the defaults move the total energy of the
+small systems run there by 2e-13 to 1.5e-11 Ry, by the wedge sums alone); on
+A100 nodes they have not, so what the three
+save together before the first SCF step is not measured: the other ranks
+waited 4.42 s for the root in the run of 39,368 electrons named above, which
+bounds what the root can gain there, and the maps beside the projectors act
+on every rank. On the root the three act on one chain and their gains do
+not add up. The maps beside the projectors bring the calling thread to the
+join of the ionic thread earlier (by the 1.19 s above for 39,368 electrons),
+which it gains only where that thread ends earlier too; the thread of the
+ion-ion energy and the sums on the wedge both shorten the ionic thread, and
+once it ends before the calling thread arrives a shorter one gains nothing
+more. In the runs of the series the join had waited 1.06 to 1.08 s for
+39,368 electrons on 16 GPUs, 0.63 to 0.66 s for 29,576, up to 0.44 s for
+23,768 and 0.08 s or less in every other run (all on 8 GPUs or fewer, and
+all up to 19,392 electrons). That wait and the 1.19 s are what these records
+support for the root of the largest run: from 10.1 to 10.7 s to about 7.9
+to 8.4 s. More would need its sector set-up to run faster once the
+full-grid kernels have left its devices, which was not measured. The run
+to judge them by is the same input with the three
+switches at `0`, `0` and `full` and at their defaults in one allocation,
+read at `preparation_seconds` and `preparation_stages` of every rank.
 
 `benchmarks/mpi_full_scf.py` used to create the CUDA contexts of a rank one
 after another before its preparation: 0.7-0.9 s per rank with four devices in

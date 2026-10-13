@@ -75,16 +75,19 @@ python src\parsec_python\reference_main.py calculation\parsec.in --no-archive
 | `MLDensity/` | Load or predict optional SCDP/ChargE3Net initial densities on the exact DFT grid. |
 | `Grid/` | Build centered isolated sphere or box grids. |
 | `Laplacian/` | Generate high-order finite-difference coefficients and sparse `-nabla^2`. |
-| `Pseudopotential/` | Read Martins-new `POTRE.DAT`, integrate radial data, and reproduce PARSEC splines. |
+| `Pseudopotential/` | Read Martins-new `POTRE.DAT` and old-format `POTR.DAT`, integrate radial data, and reproduce PARSEC splines. |
 | `V_ion/` | Assemble local ionic fields, KB nonlocal factors, initial atomic density, and ion-ion energy. |
 | `Hartree/` | Construct open-boundary data and solve the finite-difference Poisson equation. |
-| `V_xc/` | Evaluate CA/PZ LDA or spin-unpolarized PBE and their energy terms. |
+| `V_xc/` | Evaluate CA/PZ LDA or PBE, without or with spin polarization, and their energy terms. |
 | `Hamiltonian/` | Apply the matrix-free Kohn--Sham operator. |
 | `Eigensolvers/` | Readable CHEBFF, CHEBDAV, subspace, filtering, orthogonalization, and Ritz primitives. |
 | `Occupations/` | Determine Fermi occupations and rebuild the density. |
 | `Mixer/` | Apply PARSEC-style potential mixing and residual tests. |
 | `Energy/` | Assemble the total-energy decomposition. |
 | `SCF/` | Orchestrate one complete self-consistent single point. |
+| `Forces/` | Evaluate ion-ion, local and nonlocal atomic forces and symmetrize them. |
+| `Relaxation/` | Move the atoms: L-BFGS-B, steepest descent, manual structures, the ionic loop and its files. |
+| `MolecularDynamics/` | Integrate the equations of motion of `moldyn.f90` and write its files. |
 | `Output/` | Write PARSEC-shaped text and machine-readable results. |
 | `acceleration/` | Implement optimized backends, GPU eigensolvers, symmetry sectors, resident execution, and the native extension. |
 | `driver.py` | Prepare and run the readable reference workflow. |
@@ -135,23 +138,37 @@ Currently supported:
 
 - isolated spherical and box domains;
 - high-order Cartesian finite differences;
-- scalar norm-conserving Martins-new pseudopotentials through `l=3`;
+- scalar norm-conserving Martins-new pseudopotentials through `l=3`, and
+  old-format Martins files (`Pseudopotential_Format: martins_old`);
+- occupations read from `occup.in` (`Fermi_Temp` negative) in place of a
+  Fermi distribution;
 - separable Kleinman--Bylander nonlocal projectors;
 - optional nonlinear core correction;
-- CA/PZ LDA and spin-unpolarized PBE;
+- CA/PZ LDA and PBE;
+- collinear spin polarization of isolated systems (`Spin_Polarization: true`)
+  with both functionals, see [Spin polarization](#spin-polarization);
+- one post-SCF evaluation of the B3LYP energy on the converged orbitals of an
+  isolated system (`Energy_Refinement: b3lyp`), see
+  [Energy refinement by a hybrid functional](#energy-refinement-by-a-hybrid-functional);
 - potential-mixed SCF with PARSEC-style occupations and eigensolver policy;
 - exact automatic reflection/signed-permutation representation reduction
   where supported;
 - core-hole species labels such as `C-1s` with an explicit
-  `Element_Symbol: C` and optional `Atomic_Energy_Correction`.
+  `Element_Symbol: C` and optional `Atomic_Energy_Correction`;
+- atomic forces, structural relaxation (`Minimization: bfgs`, `simple`,
+  `manual`) and molecular dynamics of isolated systems, on every execution
+  path including several GPU nodes, with `relax_restart.dat` exchanged with
+  PARSEC in both directions; see
+  [FORCES_AND_RELAXATION.md](FORCES_AND_RELAXATION.md).
 
 Not currently supported as production physics:
 
 - periodic boundary conditions;
-- spin polarization or spin--orbit coupling;
-- forces and geometry relaxation;
-- hybrid/meta-GGA functionals and DFT+U;
-- PARSEC restart-file compatibility;
+- spin polarization of periodic cells, spin--orbit coupling and
+  non-collinear magnetism;
+- forces, relaxation and molecular dynamics of periodic cells;
+- self-consistent hybrid functionals, meta-GGA functionals and DFT+U;
+- PARSEC restart files other than `relax_restart.dat` and `mdinit.dat`;
 - Ono--Hirose double-grid order greater than one.
 
 Unsupported requested input is rejected rather than silently approximated.
@@ -428,11 +445,120 @@ These controls alter only the nonlinear convergence path.  They do not alter
 the Kohn--Sham equations, energy functional, or convergence criterion.  Leave
 `Mixing_Safeguard` absent or false for a line-by-line PARSEC mixer comparison.
 
+### Energy refinement by a hybrid functional
+
+```text
+Energy_Refinement: b3lyp
+```
+
+(or `--energy-refinement b3lyp` on the command line, which overrules the
+input; `none` switches it off) adds one evaluation after the SCF: the
+exchange-correlation energy of the converged orbitals and density is
+computed with B3LYP and replaces the one of the self-consistent functional
+in the total energy,
+
+```text
+E_refined = E_total - E_xc[Correlation_Type] + E_xc[B3LYP].
+```
+
+This is the refinement step of Xu, Prendergast and Qian, *J. Chem. Theory
+Comput.* **18**, 5471 (2022) ("PP-PBE(B3LYP)" after a PBE SCF; `Lrefine=T`
+in ARES). It is not a B3LYP SCF: nothing of the SCF changes, and without the
+line a calculation is what it was, to the last bit. `parsec.out` gains a
+block "Energy refinement" after the SCF report with the five parts, both
+exchange-correlation energies, the refined total and, where the species
+have an `Atomic_Energy_Correction`, the refined all-electron total (the
+correction is that of the pseudopotentials of the SCF functional). The
+result archive gains `refinement_*` members.
+
+The B3LYP energy is that of Gaussian, libxc and ARES:
+`0.20 E_x(HF) + 0.08 E_x(Slater) + 0.72 E_x(B88) + 0.19 E_c(VWN-RPA)
++ 0.81 E_c(LYP)`, with the RPA parametrization of VWN. The four density
+functionals ([V_xc/b3lyp.py](V_xc/b3lyp.py)) use the gradient of the
+self-consistent PBE. The exact exchange
+([V_xc/exact_exchange.py](V_xc/exact_exchange.py)) is `-sum_ij f_i f_j
+(ij|ij)` over the occupied orbitals: one open-boundary Poisson solve per
+pair with the Hartree solver of the calculation, on the full grid, with the
+boundary values of the pair density at the order in use and without the
+atomic tail, which belongs to the total density. Its cost is
+`N (N + 1) / 2` Poisson solves for `N` occupied orbitals; with
+`PARSEC_HARTREE_LINEAR_BACKEND=cupy` they run on the GPU like those of the
+SCF.
+
+Limits, each stated in the output where it applies: isolated systems only
+(a periodic input and molecular dynamics refuse the keyword, as does the
+multi-node runner); with fractional occupations the exchange is that of
+the ensemble density matrix, of each spin channel in a spin-polarized
+calculation and spin-restricted otherwise; with a
+nonlinear core correction the density functionals see valence plus core
+density and the exact exchange the valence orbitals, a combination that no
+reference has checked. The refined energy is not variational and follows
+the error of the density to first order. Example, validation against ARES
+and timings: [`examples/0_CH4_CF4/python_pbe_b3lyp`](../../examples/0_CH4_CF4/python_pbe_b3lyp/README.md).
+
+## Spin polarization
+
+`Spin_Polarization: true` solves an isolated system with two collinear spin
+channels, as PARSEC does: one potential and one eigenproblem per channel,
+one Fermi level, and the exchange-correlation functional of the two spin
+densities. `Correlation_Type` must be given, `ca` (local spin density,
+Perdew-Zunger) or `pbe`; without the line PARSEC uses the Perdew-Wang LSDA,
+which is not implemented.
+
+```text
+Spin_Polarization: true
+Correlation_Type: pbe
+States_Num: 12                   # states of each spin channel
+
+Atom_Type: O
+Local_Component: p
+Initial_Spin_Polarization: 0.3   # of this species; default 0.1
+begin Atom_Coord
+  0.0  0.0   1.1414
+  0.0  0.0  -1.1414
+end Atom_Coord
+```
+
+`Initial_Spin_Polarization` scales the atomic starting density of a species
+by one plus it for the up channel and one minus it for the down channel. The
+SCF loop then finds the moment: `parsec.out` reports the electrons of each
+channel, the net magnetic moment, the Fermi level and the levels of each
+channel at every step, in PARSEC's layout. With `Fermi_Temp` negative,
+`occup.in` holds one section per channel, the up channel first, and an
+occupation of one is one electron. Forces, relaxation, molecular dynamics and
+`Energy_Refinement: b3lyp` work as without spin.
+
+Every execution path runs it: `reference_main.py`, and `main.py` with the
+SciPy, native and CuPy backends. The two channels are solved on the full
+grid: a GPU run does not use the symmetry representations, and the
+multi-node runner refuses a spin-polarized input unless it runs in one
+process (`--serial-control`). Periodic cells are refused.
+
+With `ca`, energies, levels and forces agree with Fortran PARSEC to the
+digits it prints. With `pbe` they differ as they do without spin, because
+this package uses the potential of the discrete energy. A state with an
+empty spin channel (a hydrogen atom, any one-electron system) is an ordinary
+calculation here; in Fortran PARSEC it does not converge with `ca` and loses
+its exchange energy with `pbe`. Two things are not unique in either program:
+the sign of the moment, and the orientation of a partly filled degenerate
+shell such as the oxygen atom at the default temperature, for which
+occupations fixed in `occup.in` give a reproducible state. Details:
+[`PYTHON_IMPLEMENTATION.md`](PYTHON_IMPLEMENTATION.md#spin-polarized-calculations)
+and [`PARSEC_ALGORITHM.md`](PARSEC_ALGORITHM.md#spin-polarized-calculations).
+
 ## Pseudopotentials
 
 The pseudopotential filename is normally `<Atom_Type>_POTRE.DAT`. A
 configuration-qualified core-hole type therefore uses, for example,
 `C-1s_POTRE.DAT` while `Element_Symbol: C` preserves chemical identity.
+
+An old-format Martins file, `<Atom_Type>_POTR.DAT`, is read with
+`Pseudopotential_Format: martins_old`. It holds potentials and radial
+functions only, so the input supplies the rest, as for Fortran PARSEC:
+`Potential_Num` (the number of channels), the block `Electron_Per_Orbital`
+(their occupations, whose sum is the ionic charge) and `Core_Cutoff_Radius`
+(the radius of the projectors). The SiNa4 relaxation test of Fortran PARSEC
+(`tests/relaxation`) uses one.
 
 Pseudopotentials and the selected XC functional must be consistent. The
 solver can read converted norm-conserving UPF data, but conversion does not by
@@ -472,6 +598,9 @@ present.
 - [PYTHON_IMPLEMENTATION.md](PYTHON_IMPLEMENTATION.md): Python mapping and
   parity status for each physical stage.
 - [ARCHITECTURE.md](ARCHITECTURE.md): package boundaries and native-port rules.
+- [FORCES_AND_RELAXATION.md](FORCES_AND_RELAXATION.md): forces, structural
+  relaxation and molecular dynamics: keywords, files, algorithm, differences
+  from PARSEC and validation.
 - [acceleration/README.md](acceleration/README.md): backend selection,
   optimized kernels, resident execution, and profiling.
 - [acceleration/ACCELERATION_AUDIT.md](acceleration/ACCELERATION_AUDIT.md):

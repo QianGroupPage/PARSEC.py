@@ -1,7 +1,9 @@
-"""Isolated, spin-unpolarized PARSEC-style SCF preparation and iteration.
+"""Isolated PARSEC-style SCF preparation and iteration.
 
 ``prepare_single_point`` constructs all density-independent objects.  The
-nonlinear work happens in ``run_scf``:
+nonlinear work happens in ``run_scf``, here for a calculation without spin
+polarization and in :mod:`parsec_python.SCF.spin_polarized` for one with two
+spin channels:
 
 ``V_in -> eigensolver -> occupations -> rho -> (V_H,V_xc) -> V_out``
 
@@ -17,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import time
-from typing import Callable
+from typing import Callable, Mapping
 
 import numpy as np
 import scipy.sparse as sp
@@ -44,7 +46,13 @@ from ..Hartree import (
 )
 from ..Laplacian import build_negative_laplacian
 from ..Mixer import AndersonMixer, potential_residual_metrics
-from ..Occupations import density_from_orbitals, fermi_occupations
+from ..Occupations import (
+    check_fixed_occupations,
+    check_spin_fixed_occupations,
+    density_from_orbitals,
+    fermi_occupations,
+    fixed_occupations,
+)
 from ..Pseudopotential import ParsecPseudopotential
 from ..V_ion import (
     NonlocalProjectorOperator,
@@ -59,13 +67,14 @@ from ..V_ion import (
 )
 from ..models import (
     GridSettings,
+    InitialDensitySettings,
     PreparationTimings,
     RunTimings,
     SCFIteration,
     SinglePointInput,
     SinglePointResult,
 )
-from ..V_xc import XCResult, ca_lda, pbe
+from ..V_xc import SpinXCResult, XCResult, ca_lda, ca_lda_spin, pbe, pbe_spin
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,10 @@ class PreparedSinglePointSystem:
     from the geometry (:mod:`parsec_python.Hartree.boundary`), and
     ``hartree_boundary_tail`` the static atomic tail where the plan has one.
     A system built without a plan has PARSEC's multipole boundary.
+
+    ``initial_spin_densities`` are the starting densities of the up and the
+    down channel of a spin-polarized calculation and ``None`` otherwise
+    (:func:`initial_spin_densities`).
     """
 
     input: SinglePointInput
@@ -100,6 +113,7 @@ class PreparedSinglePointSystem:
     timings: PreparationTimings = field(default_factory=PreparationTimings)
     hartree_boundary: HartreeBoundaryPlan | None = None
     hartree_boundary_tail: AtomicTail | None = None
+    initial_spin_densities: tuple[np.ndarray, np.ndarray] | None = None
 
     @property
     def hartree_boundary_tail_maximum(self) -> float | None:
@@ -170,6 +184,252 @@ class PreparedSinglePointSystem:
             f"unsupported XC functional {self.input.scf.xc_functional!r}"
         )
 
+    def evaluate_spin_xc(
+        self, density_up: np.ndarray, density_down: np.ndarray
+    ) -> SpinXCResult:
+        """Evaluate the selected spin-polarized XC functional.
+
+        Each channel sees its valence density plus half of the frozen NLCC
+        density (``rho_hart.F90``).
+        """
+
+        if self.input.scf.xc_functional == "ca":
+            return ca_lda_spin(
+                density_up, density_down, self.grid.volume_element, self.core_density
+            )
+        if self.input.scf.xc_functional == "pbe":
+            return pbe_spin(density_up, density_down, self.grid, self.core_density)
+        raise ValueError(
+            f"unsupported XC functional {self.input.scf.xc_functional!r}"
+        )
+
+
+@dataclass(frozen=True)
+class SCFWarmStart:
+    """What an SCF loop takes over from the loop of the previous structure.
+
+    After atoms move, ``parsec.F90`` re-enters its SCF loop without a new
+    starting density: the eigenproblem of the first iteration is posed with
+    the last mixed potential, in which the old local ionic potential has been
+    replaced by the new one, the saved wavefunctions seed a SUBSPACE filter
+    instead of a first CHEBFF/CHEBDAV solve, and the old Hartree potential is
+    the starting vector of the first Poisson solve.  The mixer and the filter
+    degree start afresh.
+
+    ``input_potential`` and ``hartree_potential`` are full-grid fields in Ry.
+    ``eigensolver_state`` is the state object of the eigensolver that will be
+    used; ``None`` asks for a first solve with the given potential.
+
+    A spin-polarized loop takes ``input_potential`` and
+    ``eigensolver_state`` as pairs, the up channel first; the Hartree
+    potential is common to both channels.
+    """
+
+    input_potential: np.ndarray
+    hartree_potential: np.ndarray
+    eigensolver_state: object | None = None
+
+
+def state_for_new_potential(state: object | None) -> object | None:
+    """Mark a saved eigensubspace as the start of a new SCF loop.
+
+    ``parsec.F90`` sets ``solver%firstfilt`` again after every SCF loop, so
+    the first SUBSPACE call for the next structure recomputes its lower
+    filter bound from the saved Ritz values.  A state object of another
+    eigensolver takes the same request through its ``for_new_scf_loop``
+    method, if it has one.
+    """
+
+    if state is None:
+        return None
+    restart = getattr(state, "for_new_scf_loop", None)
+    if callable(restart):
+        return restart()
+    if isinstance(state, EigvalState):
+        return replace(state, subspace=replace(state.subspace, first_filter=True))
+    return state
+
+
+def warm_start_for_moved_atoms(
+    previous_system: "PreparedSinglePointSystem",
+    previous_result: SinglePointResult,
+    system: "PreparedSinglePointSystem",
+) -> SCFWarmStart:
+    """Build the warm start of ``system`` from the run before the move.
+
+    ``parsec.F90`` after ``domove``: ``vnew = vnew - vion_old`` and then
+    ``vnew = vnew + vion_new``, with ``vnew`` the potential the mixer left,
+    for each spin channel where there are two.
+    """
+
+    channels = getattr(previous_result, "spin", None)
+    if channels is not None:
+        return SCFWarmStart(
+            input_potential=tuple(
+                np.asarray(channel.next_effective_potential)
+                - np.asarray(previous_system.ionic_potential)
+                + np.asarray(system.ionic_potential)
+                for channel in channels
+            ),
+            hartree_potential=np.asarray(previous_result.hartree_potential),
+            eigensolver_state=tuple(
+                state_for_new_potential(channel.eigensolver_state)
+                for channel in channels
+            ),
+        )
+    return SCFWarmStart(
+        input_potential=(
+            np.asarray(previous_result.next_effective_potential)
+            - np.asarray(previous_system.ionic_potential)
+            + np.asarray(system.ionic_potential)
+        ),
+        hartree_potential=np.asarray(previous_result.hartree_potential),
+        eigensolver_state=state_for_new_potential(previous_result.eigensolver_state),
+    )
+
+
+def _require_atoms_inside_domain(settings: GridSettings, atoms) -> None:
+    """Refuse a nucleus outside the sphere or box (``isolat.f90``)."""
+
+    for atom in atoms:
+        coordinate = np.asarray(atom.position)
+        if settings.domain_shape == "sphere":
+            inside = np.dot(coordinate, coordinate) <= settings.radius**2
+        else:
+            inside = np.all(
+                np.abs(coordinate)
+                <= 0.5 * np.asarray(settings.box_lengths) + 1.0e-14
+            )
+        if not inside:
+            raise ValueError(f"atom {atom.symbol} at {coordinate} lies outside the domain")
+
+
+def _require_spin_support(problem: SinglePointInput) -> None:
+    """Refuse what a spin-polarized calculation cannot start from."""
+
+    if problem.initial_density_settings.method != "sad":
+        raise NotImplementedError(
+            "a spin-polarized calculation starts from the superposition of "
+            "atomic densities with the Initial_Spin_Polarization of each "
+            "species; an imported or ML starting density "
+            f"(Initial_Density: {problem.initial_density_settings.method}) "
+            "holds no spin densities"
+        )
+
+
+def initial_spin_densities(
+    total: np.ndarray,
+    species_densities: Mapping[str, np.ndarray],
+    polarizations: Mapping[str, float],
+    scale: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Starting densities of the up and the down channel (``initchrg.f90``).
+
+    ``total`` is the superposition of the atomic valence densities before
+    normalization, ``species_densities`` its part from the atoms of each
+    species, ``polarizations`` the ``Initial_Spin_Polarization`` ``p`` of
+    each species and ``scale`` the factor that normalizes ``total`` to the
+    electron count.  ``initchrg.f90`` accumulates
+
+    ``rho_up = sum_species (1 + p) rho_species``,
+    ``rho_down = sum_species (1 - p) rho_species``
+
+    and scales both by the factor of the total density.  The two channels
+    therefore add up to twice the total density: the first exchange-
+    correlation potential, and it alone, is evaluated at that doubled
+    density, while the first Hartree potential is that of the total density
+    itself.  The starting magnetic moment PARSEC prints, the integral of
+    ``rho_up - rho_down``, is ``2 p N_e`` for one species.  This is kept as
+    it is in the Fortran: it changes the path of the SCF loop, not the
+    self-consistent state.
+    """
+
+    total = np.asarray(total, dtype=np.float64)
+    magnetization = np.zeros_like(total)
+    for symbol, density in species_densities.items():
+        magnetization += float(polarizations[symbol]) * np.asarray(
+            density, dtype=np.float64
+        )
+    return (scale * (total + magnetization), scale * (total - magnetization))
+
+
+def _species_densities(
+    total: np.ndarray,
+    build_atomic_density: Callable[..., np.ndarray],
+    grid: RealSpaceGrid,
+    atoms: tuple,
+    pseudopotentials: dict[str, ParsecPseudopotential],
+    specifications,
+) -> dict[str, np.ndarray]:
+    """Split the superposed atomic density into the parts of the species.
+
+    Only species with atoms are returned.  Where they all start with the
+    same polarization the split is not needed and the total stands for one
+    of them; otherwise the density of each species is superposed on its own.
+    """
+
+    symbols = list(dict.fromkeys(atom.symbol for atom in atoms))
+    polarizations = {
+        specifications[symbol].initial_spin_polarization for symbol in symbols
+    }
+    if len(polarizations) == 1:
+        return {symbols[0]: total}
+    return {
+        symbol: build_atomic_density(
+            grid,
+            tuple(atom for atom in atoms if atom.symbol == symbol),
+            pseudopotentials,
+            specifications,
+        )
+        for symbol in symbols
+    }
+
+
+def _require_core_radius_support(
+    operator: NonlocalProjectorOperator,
+    grid: RealSpaceGrid,
+    atoms,
+    pseudopotentials,
+) -> None:
+    """Check a substituted projector builder against ``Core_Cutoff_Radius``.
+
+    The projectors of an old Martins species end at the core radius of the
+    input (``ParsecPseudopotential.projector_support_radius``), in general
+    between two radial samples, and ``nonloc.F90`` keeps the grid points at
+    distances up to it.  A builder that takes the next radial sample instead,
+    the rule of a ``MARTINS_NEW`` file, adds grid points and reports nothing:
+    for a radius inside the projector the total energy of a five-atom
+    cluster moved by 2e-2 Ry.  Such an operator is refused here.
+    """
+
+    limited = {
+        index: pseudopotentials[atom.symbol].projector_support_radius
+        for index, atom in enumerate(atoms)
+        if pseudopotentials[atom.symbol].core_radius is not None
+    }
+    if not limited:
+        return
+    matrix = operator.projectors
+    for column, (atom_index, _, _) in enumerate(operator.labels):
+        radius = limited.get(atom_index)
+        if radius is None:
+            continue
+        rows = matrix.indices[matrix.indptr[column] : matrix.indptr[column + 1]]
+        if rows.size == 0:
+            continue
+        distance = np.linalg.norm(
+            grid.coordinates[rows] - np.asarray(atoms[atom_index].position),
+            axis=1,
+        )
+        if float(np.max(distance)) > radius * (1.0 + 1.0e-12):
+            raise RuntimeError(
+                f"the projector builder placed {atoms[atom_index].symbol} "
+                f"projectors up to {float(np.max(distance)):.6f} bohr, beyond the "
+                f"core radius {radius:.6f} bohr of its old Martins "
+                "pseudopotential; it must take the support radius from "
+                "ParsecPseudopotential.projector_support_radius"
+            )
+
 
 def prepare_single_point(
     problem: SinglePointInput,
@@ -221,6 +481,19 @@ def prepare_single_point(
     electron_count = ionic_charge(atoms, pseudopotentials) - problem.scf.net_charge
     if electron_count <= 0:
         raise ValueError("the requested system has no valence electrons")
+    if problem.scf.spin_polarized:
+        _require_spin_support(problem)
+    if problem.scf.fixed_occupations is not None:
+        # initial.f90 stops before any setup when the occupations of
+        # occup.in do not hold the electrons of the system.
+        if problem.scf.spin_polarized:
+            check_spin_fixed_occupations(
+                problem.scf.fixed_occupations,
+                problem.scf.fixed_occupations_down,
+                electron_count,
+            )
+        else:
+            check_fixed_occupations(problem.scf.fixed_occupations, electron_count)
     boundary_plan = plan_hartree_boundary(
         problem.hartree,
         problem.grid,
@@ -247,17 +520,7 @@ def prepare_single_point(
         problem.grid
     )
     grid_seconds = time.perf_counter() - stage_start
-    for atom in atoms:
-        coordinate = np.asarray(atom.position)
-        if problem.grid.domain_shape == "sphere":
-            inside = np.dot(coordinate, coordinate) <= problem.grid.radius**2
-        else:
-            inside = np.all(
-                np.abs(coordinate)
-                <= 0.5 * np.asarray(problem.grid.box_lengths) + 1.0e-14
-            )
-        if not inside:
-            raise ValueError(f"atom {atom.symbol} at {coordinate} lies outside the domain")
+    _require_atoms_inside_domain(problem.grid, atoms)
 
     stage_start = time.perf_counter()
     laplacian_builder = (
@@ -294,6 +557,10 @@ def prepare_single_point(
     nonlocal_operator = build_nonlocal(
         grid, atoms, pseudopotentials, problem.pseudopotentials
     )
+    if nonlocal_projector_builder is not None:
+        _require_core_radius_support(
+            nonlocal_operator, grid, atoms, pseudopotentials
+        )
     nonlocal_ionic_seconds = time.perf_counter() - stage_start
 
     if orbital_operators_only:
@@ -367,11 +634,14 @@ def _density_and_energy_stages(
     atomic_density_builder: Callable[..., np.ndarray] | None,
     boundary_plan: HartreeBoundaryPlan | None,
     build_atomic_tail: bool,
+    ion_ion_energy_builder: Callable[..., float] | None = None,
 ) -> tuple[dict[str, object], dict[str, float]]:
     """Run stages 4 to 6 of the preparation.
 
     Returns the fields of :class:`PreparedSinglePointSystem` they build and
     the seconds of each stage under its :class:`PreparationTimings` name.
+    ``ion_ion_energy_builder`` is called in place of
+    :func:`ion_ion_energy`, with its arguments.
     """
     # 4. Initial valence density and nonlinear core-correction density.  SAD
     # remains the PARSEC-compatible default.  A file/ML provider returns the
@@ -385,10 +655,34 @@ def _density_and_energy_stages(
         if atomic_density_builder is None
         else atomic_density_builder
     )
+    spin_densities = None
     if problem.initial_density_settings.method == "sad":
         initial_density = build_atomic_density(
             grid, atoms, pseudopotentials, problem.pseudopotentials
         )
+        if problem.scf.spin_polarized:
+            # initchrg.f90 scales the two channels with the factor of the
+            # total density, here also where that factor is left at one.
+            spin_densities = initial_spin_densities(
+                initial_density,
+                _species_densities(
+                    initial_density,
+                    build_atomic_density,
+                    grid,
+                    atoms,
+                    pseudopotentials,
+                    problem.pseudopotentials,
+                ),
+                {
+                    symbol: specification.initial_spin_polarization
+                    for symbol, specification in problem.pseudopotentials.items()
+                },
+                (
+                    electron_count / grid.integrate(initial_density)
+                    if problem.scf.normalize_initial_density
+                    else 1.0
+                ),
+            )
     else:
         # Imported lazily: default SAD calculations do not import or initialize
         # an ML framework.  The model itself runs in an isolated subprocess.
@@ -418,7 +712,9 @@ def _density_and_energy_stages(
 
     # 5. Geometry-only ion--ion contribution to the total energy.
     stage_start = time.perf_counter()
-    repulsion = ion_ion_energy(atoms, pseudopotentials)
+    repulsion = (
+        ion_ion_energy if ion_ion_energy_builder is None else ion_ion_energy_builder
+    )(atoms, pseudopotentials)
     atomic_reference_correction = float(
         sum(
             problem.pseudopotentials[atom.symbol].atomic_energy_correction
@@ -445,6 +741,7 @@ def _density_and_energy_stages(
             ion_ion_energy=repulsion,
             atomic_reference_correction=atomic_reference_correction,
             hartree_boundary_tail=boundary_tail,
+            initial_spin_densities=spin_densities,
         ),
         dict(
             initial_density_seconds=initial_density_seconds,
@@ -461,6 +758,7 @@ def complete_single_point(
     local_ionic_builder: Callable[..., np.ndarray] | None = None,
     atomic_density_builder: Callable[..., np.ndarray] | None = None,
     build_atomic_tail: bool = True,
+    ion_ion_energy_builder: Callable[..., float] | None = None,
 ) -> PreparedSinglePointSystem:
     """Add what ``orbital_operators_only`` left out of ``system``.
 
@@ -471,6 +769,12 @@ def complete_single_point(
     None of them reads the kinetic operator or the projectors, and nothing
     before :func:`run_scf` reads them: a caller may run this on another
     thread beside the set-up that follows the preparation.
+
+    ``ion_ion_energy_builder`` stands for :func:`ion_ion_energy` where it is
+    given: it is called with the atoms and the pseudopotentials of ``system``
+    at the place of that stage and must return its value.  A caller that has
+    the energy computed elsewhere meanwhile hands it over through this hook;
+    ``ion_ion_seconds`` is then the time the hook took, not that of the sum.
 
     The static atomic tail of the Hartree boundary is built with them where
     the plan of ``system`` has one, unless ``build_atomic_tail`` is false.
@@ -502,6 +806,7 @@ def complete_single_point(
         atomic_density_builder,
         system.hartree_boundary,
         build_atomic_tail,
+        ion_ion_energy_builder,
     )
     return replace(
         system,
@@ -512,6 +817,124 @@ def complete_single_point(
             local_ionic_seconds=local_ionic_seconds,
             **stage_seconds,
         ),
+    )
+
+
+def update_geometry(
+    system: PreparedSinglePointSystem,
+    atoms,
+    *,
+    local_ionic_builder: Callable[..., np.ndarray] | None = None,
+    nonlocal_projector_builder: Callable[..., NonlocalProjectorOperator] | None = None,
+    atomic_density_builder: Callable[..., np.ndarray] | None = None,
+    build_atomic_tail: bool = True,
+) -> PreparedSinglePointSystem:
+    """Return ``system`` with its atoms at new positions on the same grid.
+
+    This is what ``parsec.F90`` rebuilds after ``domove`` or ``moldyn``:
+    ``isolat`` (every nucleus must still be inside the domain), ``nonloc``
+    (KB projectors), ``corecd`` (frozen core density), ``ionpot`` (local
+    ionic potential) and ``forceion`` (ion-ion energy).  The grid, the
+    kinetic operator, the pseudopotentials and the electron count are shared
+    with ``system``, and the positions are taken as they are: there is no
+    second recentering.
+
+    Two things are specific to this code.  The plan of the Hartree boundary
+    keeps the order it chose for the first structure, so that the energies of
+    a relaxation do not jump when an estimate crosses a threshold; its atomic
+    tail, where it has one, is rebuilt for the new positions.  And a
+    superposed atomic starting density is built for the new positions, also
+    when the first structure started from another source: a moved structure
+    normally continues from :class:`SCFWarmStart` and reads it only when it
+    is run cold.
+
+    The optional builders are those of :func:`prepare_single_point`.
+    """
+
+    started = time.perf_counter()
+    atoms = tuple(atoms)
+    if len(atoms) != len(system.atoms) or any(
+        new.symbol != old.symbol for new, old in zip(atoms, system.atoms)
+    ):
+        raise ValueError("moved atoms must keep their number, order and species")
+    problem = replace(
+        system.input,
+        atoms=atoms,
+        recenter_geometry=False,
+        initial_density_settings=InitialDensitySettings(),
+    )
+    grid = system.grid
+    _require_atoms_inside_domain(problem.grid, atoms)
+    pseudopotentials = system.pseudopotentials
+
+    stage_start = time.perf_counter()
+    build_nonlocal = (
+        build_nonlocal_projectors
+        if nonlocal_projector_builder is None
+        else nonlocal_projector_builder
+    )
+    nonlocal_operator = build_nonlocal(
+        grid, atoms, pseudopotentials, problem.pseudopotentials
+    )
+    if nonlocal_projector_builder is not None:
+        _require_core_radius_support(
+            nonlocal_operator, grid, atoms, pseudopotentials
+        )
+    nonlocal_ionic_seconds = time.perf_counter() - stage_start
+    if system.ionic_potential is None:
+        # A system prepared with ``orbital_operators_only`` applies the
+        # Hamiltonian for an SCF loop that runs elsewhere: it has projectors
+        # to move and nothing else.
+        return replace(
+            system,
+            input=problem,
+            atoms=atoms,
+            nonlocal_operator=nonlocal_operator,
+            timings=PreparationTimings(
+                nonlocal_ionic_seconds=nonlocal_ionic_seconds,
+                total_seconds=time.perf_counter() - started,
+            ),
+        )
+
+    stage_start = time.perf_counter()
+    build_local = (
+        build_local_ionic_potential
+        if local_ionic_builder is None
+        else local_ionic_builder
+    )
+    ionic_potential = build_local(
+        grid, atoms, pseudopotentials, problem.pseudopotentials
+    )
+    local_ionic_seconds = time.perf_counter() - stage_start
+
+    boundary_plan = system.hartree_boundary
+    if boundary_plan is not None:
+        # The seconds of the plan belong to the preparation that made it.
+        boundary_plan = replace(boundary_plan, seconds=0.0)
+    fields, stage_seconds = _density_and_energy_stages(
+        problem,
+        grid,
+        atoms,
+        pseudopotentials,
+        system.electron_count,
+        atomic_density_builder,
+        boundary_plan,
+        build_atomic_tail,
+    )
+    return replace(
+        system,
+        input=problem,
+        atoms=atoms,
+        ionic_potential=ionic_potential,
+        nonlocal_operator=nonlocal_operator,
+        **fields,
+        timings=PreparationTimings(
+            local_ionic_seconds=local_ionic_seconds,
+            nonlocal_ionic_seconds=nonlocal_ionic_seconds,
+            **stage_seconds,
+            total_seconds=time.perf_counter() - started,
+        ),
+        hartree_boundary=boundary_plan,
     )
 
 
@@ -530,13 +953,65 @@ def _number_of_states(system: PreparedSinglePointSystem) -> int:
     if requested is None:
         requested = int(np.ceil(0.5 * system.electron_count)) + 6
     requested = int(requested)
-    if requested <= 0.5 * system.electron_count and system.input.scf.fermi_temperature_kelvin > 0:
+    if (
+        requested <= 0.5 * system.electron_count
+        and system.input.scf.fermi_temperature_kelvin > 0
+        and system.input.scf.fixed_occupations is None
+    ):
         raise ValueError(
             "number_of_states must leave at least one unoccupied state at finite temperature"
         )
     if requested + system.input.eigensolver.subspace_buffer >= system.grid.size:
         raise ValueError("the grid is too small for the requested states and eigensolver buffer")
     return requested
+
+
+def eigval_settings_for(eigensolver_settings, filter_degree: int) -> EigvalSettings:
+    """Assemble the eigensolver policy of one SCF iteration.
+
+    ``filter_degree`` is the present later-SCF SUBSPACE degree, which the
+    SCF loop lowers near convergence; everything else comes from the input.
+    """
+
+    return EigvalSettings(
+        safety_buffer=eigensolver_settings.subspace_buffer,
+        initial_method=eigensolver_settings.method,
+        chebff=ChebFFSettings(
+            polynomial_degree=eigensolver_settings.first_filter_degree,
+            filter_cycles=eigensolver_settings.first_filter_cycles,
+            # chebff.f90z requests ten steps; the non-BETA bound routine
+            # then applies its own PARSEC clamp to eight.
+            lanczos_steps=10,
+            block_size=eigensolver_settings.matvec_block_size,
+            reset_recurrence_per_block=False,
+            random_seed=eigensolver_settings.random_seed,
+        ),
+        chebdav=(
+            ChebDavSettings(
+                polynomial_degree=eigensolver_settings.first_filter_degree,
+                convergence_tolerance=eigensolver_settings.tolerance,
+                block_size=eigensolver_settings.matvec_block_size,
+                # create_eigen_solver fixes winsize=12 for CHEBDAV.
+                workspace_window=12,
+                lanczos_steps=5,
+                max_outer_restarts=2,
+                random_seed=eigensolver_settings.random_seed,
+            )
+            if eigensolver_settings.method == "chebdav"
+            # A CHEBFF degree of 10 is valid.  Do not feed that unrelated
+            # setting through CHEBDAV's stricter >=15 validation merely
+            # because EigvalSettings stores both explicit choices.
+            else ChebDavSettings()
+        ),
+        subspace=SubspaceSettings(
+            polynomial_degree=filter_degree,
+            degree_delta=eigensolver_settings.filter_degree_delta,
+            lanczos_steps=eigensolver_settings.lanczos_steps,
+            block_size=eigensolver_settings.matvec_block_size,
+            reset_recurrence_per_block=False,
+            random_seed=eigensolver_settings.random_seed,
+        ),
+    )
 
 
 def run_scf(
@@ -549,8 +1024,17 @@ def run_scf(
     residual_metrics_evaluator: Callable[..., object] | None = None,
     total_energy_evaluator: Callable[..., object] | None = None,
     scalar_field_adapter: object | None = None,
+    warm_start: SCFWarmStart | None = None,
 ) -> SinglePointResult:
     """Run PARSEC-style potential mixing on a prepared system.
+
+    ``warm_start`` continues from the SCF loop of a previous structure (see
+    :class:`SCFWarmStart`); without it the loop starts from the prepared
+    initial density.
+
+    A spin-polarized system (``Spin_Polarization``) is handed to
+    :func:`parsec_python.SCF.spin_polarized.run_spin_scf`, which runs the
+    same loop with one potential and one eigenproblem per spin channel.
 
     At iteration ``k`` the eigensolver sees
 
@@ -564,6 +1048,20 @@ def run_scf(
     The mixer constructs ``V_in^(k+1)`` from these two local fields.  Kinetic
     and nonlocal terms are never mixed because they are density independent.
     """
+    if getattr(system.input.scf, "spin_polarized", False):
+        from .spin_polarized import run_spin_scf
+
+        return run_spin_scf(
+            system,
+            callback=callback,
+            eigenproblem_solver=eigenproblem_solver,
+            orbital_density_builder=orbital_density_builder,
+            mixer_factory=mixer_factory,
+            residual_metrics_evaluator=residual_metrics_evaluator,
+            total_energy_evaluator=total_energy_evaluator,
+            scalar_field_adapter=scalar_field_adapter,
+            warm_start=warm_start,
+        )
     scf_start = time.perf_counter()
     # The validated reference path always selects ``solve_eigval`` here.  The
     # optional callable is a narrow execution hook used by the sibling
@@ -626,33 +1124,49 @@ def run_scf(
     # solve.  Neither selection is silently replaced by another eigensolver.
     # rho_0 is the normalized superposition of atomic valence densities built
     # during preparation.  It is only an initial SCF guess, not an eigendensity.
-    density = to_internal_scalar(system.initial_density.copy())
-    # ``-V_ion`` below is only the numerical starting vector for the first
-    # Poisson solve; it is not an identity between ionic and Hartree fields.
-    stage_start = time.perf_counter()
-    initial_hartree = system.solve_hartree(
-        density, initial_potential=-ionic_potential
-    )
-    initial_hartree_seconds = time.perf_counter() - stage_start
-    hartree_potential = initial_hartree.potential
-    # XC sees rho_valence + frozen rho_core (CA-LDA or PBE, as selected).  The
-    # Hartree solve immediately above sees rho_valence only.
-    stage_start = time.perf_counter()
-    xc = system.evaluate_xc(density)
-    initial_xc_seconds = time.perf_counter() - stage_start
-    xc_potential = xc.potential
-    # This array is the diagonal, local part of H.  V_NL is intentionally not
-    # folded into it; PreparedSinglePointSystem.hamiltonian adds V_NL as an
-    # operator when the eigensolver requests H@vector.
-    input_potential = (
-        ionic_potential + hartree_potential + xc_potential
-    )
-
-    # 2. Initialize state carried between nonlinear iterations.  eigval_state
-    # is None only for the first diagonalization: solve_eigval then runs the
-    # selected CHEBFF/CHEBDAV routine and stores its complete buffered Ritz
-    # subspace.  Later calls feed that state to one cheaper SUBSPACE filter.
+    # 2. (below) Initialize state carried between nonlinear iterations.
+    # eigval_state is None only for the first diagonalization: solve_eigval
+    # then runs the selected CHEBFF/CHEBDAV routine and stores its complete
+    # buffered Ritz subspace.  Later calls feed that state to one cheaper
+    # SUBSPACE filter.
     eigval_state: object | None = None
+    if warm_start is None:
+        density = to_internal_scalar(system.initial_density.copy())
+        # ``-V_ion`` below is only the numerical starting vector for the
+        # first Poisson solve; it is not an identity between ionic and
+        # Hartree fields.
+        stage_start = time.perf_counter()
+        initial_hartree = system.solve_hartree(
+            density, initial_potential=-ionic_potential
+        )
+        initial_hartree_seconds = time.perf_counter() - stage_start
+        hartree_potential = initial_hartree.potential
+        # XC sees rho_valence + frozen rho_core (CA-LDA or PBE, as selected).
+        # The Hartree solve immediately above sees rho_valence only.
+        stage_start = time.perf_counter()
+        xc = system.evaluate_xc(density)
+        initial_xc_seconds = time.perf_counter() - stage_start
+        xc_potential = xc.potential
+        # This array is the diagonal, local part of H.  V_NL is intentionally
+        # not folded into it; PreparedSinglePointSystem.hamiltonian adds V_NL
+        # as an operator when the eigensolver requests H@vector.
+        input_potential = (
+            ionic_potential + hartree_potential + xc_potential
+        )
+    else:
+        # The structure before the move supplies the first input potential,
+        # the starting vector of the first Poisson solve and the subspace of
+        # the first eigenproblem: no density is needed before the first
+        # eigensolve, hence no initial Hartree or XC evaluation.
+        initial_hartree_seconds = 0.0
+        initial_xc_seconds = 0.0
+        hartree_potential = to_internal_scalar(
+            np.array(warm_start.hartree_potential, dtype=np.float64)
+        )
+        input_potential = to_internal_scalar(
+            np.array(warm_start.input_potential, dtype=np.float64)
+        )
+        eigval_state = warm_start.eigensolver_state
     mixer = build_mixer(system.input.mixing)
     history: list[SCFIteration] = []
     # This is the later-SCF SUBSPACE polynomial degree.  The first-solver
@@ -691,45 +1205,7 @@ def run_scf(
         # Rebuild the small policy object so a degree reduced by the SCF logic
         # below is used by the next SUBSPACE call.  solve_eigval dispatches on
         # eigval_state, not on the nonlinear iteration number itself.
-        eigval_settings = EigvalSettings(
-            safety_buffer=eigensolver_settings.subspace_buffer,
-            initial_method=eigensolver_settings.method,
-            chebff=ChebFFSettings(
-                polynomial_degree=eigensolver_settings.first_filter_degree,
-                filter_cycles=eigensolver_settings.first_filter_cycles,
-                # chebff.f90z requests ten steps; the non-BETA bound routine
-                # then applies its own PARSEC clamp to eight.
-                lanczos_steps=10,
-                block_size=eigensolver_settings.matvec_block_size,
-                reset_recurrence_per_block=False,
-                random_seed=eigensolver_settings.random_seed,
-            ),
-            chebdav=(
-                ChebDavSettings(
-                    polynomial_degree=eigensolver_settings.first_filter_degree,
-                    convergence_tolerance=eigensolver_settings.tolerance,
-                    block_size=eigensolver_settings.matvec_block_size,
-                    # create_eigen_solver fixes winsize=12 for CHEBDAV.
-                    workspace_window=12,
-                    lanczos_steps=5,
-                    max_outer_restarts=2,
-                    random_seed=eigensolver_settings.random_seed,
-                )
-                if eigensolver_settings.method == "chebdav"
-                # A CHEBFF degree of 10 is valid.  Do not feed that unrelated
-                # setting through CHEBDAV's stricter >=15 validation merely
-                # because EigvalSettings stores both explicit choices.
-                else ChebDavSettings()
-            ),
-            subspace=SubspaceSettings(
-                polynomial_degree=filter_degree,
-                degree_delta=eigensolver_settings.filter_degree_delta,
-                lanczos_steps=eigensolver_settings.lanczos_steps,
-                block_size=eigensolver_settings.matvec_block_size,
-                reset_recurrence_per_block=False,
-                random_seed=eigensolver_settings.random_seed,
-            ),
-        )
+        eigval_settings = eigval_settings_for(eigensolver_settings, filter_degree)
         # This is the Hamiltonian assembly/handoff point.  The lightweight
         # object combines the current mixed V_in with the static kinetic and
         # KB terms; LinearOperator routes all Lanczos and Chebyshev H@Q calls
@@ -792,10 +1268,20 @@ def run_scf(
         # grid vectors q=sqrt(h^3)*psi back to a volume density:
         # rho_i = (2/h^3)*sum_n f_n*|q_i,n|^2.
         occupations_density_start = time.perf_counter()
-        occupation_result = fermi_occupations(
-            eigenvalues,
-            system.electron_count,
-            settings.fermi_temperature_kelvin,
+        # With the occupations of occup.in (a negative Fermi_Temp) the
+        # n-th lowest state takes the n-th of them and no level is searched.
+        occupation_result = (
+            fermi_occupations(
+                eigenvalues,
+                system.electron_count,
+                settings.fermi_temperature_kelvin,
+            )
+            if settings.fixed_occupations is None
+            else fixed_occupations(
+                eigenvalues,
+                system.electron_count,
+                settings.fixed_occupations,
+            )
         )
         occupations = occupation_result.occupations
         fermi_level = occupation_result.fermi_level
@@ -990,4 +1476,5 @@ def run_scf(
         timings=run_timings,
         representations=representations,
         atomic_reference_correction=system.atomic_reference_correction,
+        eigensolver_state=eigval_state,
     )

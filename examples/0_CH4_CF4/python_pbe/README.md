@@ -170,3 +170,11 @@ exact-exchange algorithm), in addition to B88 exchange and LYP/VWN
 correlation.  It is deliberately not approximated in this PBE milestone.
 Implementing it as a separate post-SCF energy module preserves both the code
 architecture and the physical meaning of the ARES result.
+
+That module now exists (`Energy_Refinement: b3lyp`).  The same four cases
+with the refinement, the comparison with the ARES `b3lyp` tree and the reason
+why the energy parts of the two codes differ are in
+[`../python_pbe_b3lyp`](../python_pbe_b3lyp/README.md).  Its tables convert
+Rydberg to eV with the CODATA constant; the tables above use the `[eV]` lines
+of `parsec.out` (13.6058 eV per Rydberg), which puts their binding energies
+2.3 to 2.4 meV higher.

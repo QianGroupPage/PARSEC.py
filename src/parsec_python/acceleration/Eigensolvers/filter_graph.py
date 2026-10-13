@@ -147,6 +147,9 @@ class BlockFilterGraphs:
         self.table = None
         self.has_upload = False
         self.has_finished = False
+        # The kernel that forms the projector coefficients in the recorded
+        # graphs (:meth:`_projection_kernel`).
+        self.projection_kernel = None
 
     @property
     def operator(self):
@@ -220,7 +223,47 @@ class BlockFilterGraphs:
             )
         return graph, views[current]
 
+    def _projection_kernel(self):
+        """The kernel with which the operator forms its projector coefficients now.
+
+        ``None`` for an operator without projectors and for a projection
+        that names no kernel.
+        """
+
+        operator = self.operator
+        if not operator.projector_count:
+            return None
+        projection = getattr(operator, "custom_projector_projection", None)
+        return getattr(projection, "kernel", None)
+
+    def _keep_one_projection_kernel(self):
+        """Forget the graphs that were recorded with another projection kernel.
+
+        A graph launches the kernels it was recorded with, whatever the
+        operator launches since.  An operator keeps the projection kernel it
+        was built with (``PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS``), so this
+        finds nothing to forget unless its projection has been replaced:
+        every graph is then recorded again, with the kernel that the
+        operator launches outside its graphs and reports.
+        """
+
+        kernel = self._projection_kernel()
+        if kernel is self.projection_kernel:
+            return
+        if self.recorded:
+            # As before any other change of the workspace: the device has
+            # done what was submitted.
+            if self.has_upload:
+                self.uploaded.synchronize()
+            if self.has_finished:
+                self.finished.synchronize()
+            self.key = None
+            self.graphs = []
+            self.shared = {}
+        self.projection_kernel = kernel
+
     def _prepare(self, matrix, blocks):
+        self._keep_one_projection_kernel()
         key = (int(matrix.shape[0]), tuple((b.start, b.stop, b.degree) for b in blocks))
         if key == self.key:
             return

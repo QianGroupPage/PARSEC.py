@@ -38,6 +38,7 @@ from parsec_python.acceleration.models import (
 )
 from parsec_python.Hartree import PeriodicHartreeResult
 from parsec_python.Input import parse_parsec_input
+from parsec_python.MolecularDynamics import MolecularDynamicsSettings
 from parsec_python.SCF import (
     PeriodicPreparedSinglePointSystem,
     prepare_periodic_single_point,
@@ -740,6 +741,56 @@ class AcceleratedCommandLineTests(unittest.TestCase):
                     f"Symmetry: mode={expected}", output.getvalue()
                 )
 
+    def test_molecular_dynamics_takes_no_symmetry_from_the_command_line(self) -> None:
+        # The atoms leave the point group of the first structure: neither
+        # --symmetry auto nor Ignore_Symmetry with --symmetry on may prepare
+        # its sectors.
+        dynamics = replace(
+            parse_parsec_input(SMOKE_INPUT),
+            molecular_dynamics=MolecularDynamicsSettings(enabled=True, step_num=2),
+            use_symmetry=False,
+            compute_forces=True,
+        )
+        for ignore_symmetry in (False, True):
+            translation = replace(dynamics, ignore_symmetry=ignore_symmetry)
+            for extra, expected in (
+                ((), "off"),
+                (("--symmetry", "auto"), "off"),
+                (("--symmetry", "off"), "off"),
+                (("--symmetry", "on"), None),
+            ):
+                with self.subTest(ignore_symmetry=ignore_symmetry, extra=extra):
+                    output = StringIO()
+                    error = StringIO()
+                    with (
+                        patch.object(
+                            cli_module,
+                            "parse_parsec_input",
+                            return_value=translation,
+                        ),
+                        redirect_stdout(output),
+                        redirect_stderr(error),
+                    ):
+                        return_code = cli_module.main(
+                            [
+                                str(SMOKE_INPUT),
+                                "--backend",
+                                "scipy",
+                                "--dry-run",
+                                *extra,
+                            ]
+                        )
+                    if expected is None:
+                        self.assertEqual(return_code, 2)
+                        self.assertIn(
+                            "molecular dynamics use no symmetry", error.getvalue()
+                        )
+                    else:
+                        self.assertEqual(return_code, 0, error.getvalue())
+                        self.assertIn(
+                            f"Symmetry: mode={expected}", output.getvalue()
+                        )
+
     def test_explicit_unavailable_dry_run_is_validation_error(self) -> None:
         output = StringIO()
         error = StringIO()
@@ -783,8 +834,11 @@ class AcceleratedCommandLineTests(unittest.TestCase):
             def write(self, message: str = "") -> None:
                 messages.append(message)
 
-        def fake_archive(path, _result, *, include_wavefunctions=False):
+        def fake_archive(path, _result, *, include_wavefunctions=False, **tables):
             del include_wavefunctions
+            # A single point hands over no forces and no trajectory: its call
+            # is the one it made before there were any.
+            self.assertEqual(tables, {})
             archive_paths.append(Path(path))
             return Path(path)
 

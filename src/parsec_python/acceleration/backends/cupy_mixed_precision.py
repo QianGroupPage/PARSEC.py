@@ -23,7 +23,12 @@ import numpy as np
 
 from .cupy_compile import compile_cupy_raw
 from .cupy_launch import kernel_parameters, launch_arguments
-from .cupy_projectors import _SOURCE as _PROJECTOR_SOURCE
+from .cupy_projectors import (
+    _SOURCE as _PROJECTOR_SOURCE,
+    projection_launches,
+    projection_reduction,
+    projector_block_columns,
+)
 from .cupy_stencil_major import _CUDA_SOURCE as _STENCIL_SOURCE
 
 
@@ -98,6 +103,7 @@ _SOURCE = _float_source(
     _PROJECTOR_SOURCE,
     (
         "sparse_projector_projection",
+        "sparse_projector_projection6",
         "sparse_projector_projection_serial",
         "sparse_projector_scatter",
     ),
@@ -107,12 +113,16 @@ _KERNEL_NAMES = (
     "stencil_major_chebyshev6_float32",
     "sparse_projector_projection_float32",
     "sparse_projector_projection_serial_float32",
+    "sparse_projector_projection6_float32",
 )
-_KERNEL_CACHE: dict[int, tuple[Any, Any, Any]] = {}
+# Where ``_KERNEL_NAMES`` holds the projection kernel of a reduction
+# (:func:`cupy_projectors.projection_reduction`).
+_PROJECTION_KERNEL = {"parallel": 1, "serial": 2, "parallel6": 3}
+_KERNEL_CACHE: dict[int, tuple[Any, Any, Any, Any]] = {}
 _KERNEL_LOCK = Lock()
 
 
-def _kernels(cp: Any) -> tuple[Any, Any, Any]:
+def _kernels(cp: Any) -> tuple[Any, Any, Any, Any]:
     """Compile the invariant FP32 recurrence kernels once per CUDA device."""
 
     device_id = int(cp.cuda.Device().id)
@@ -152,6 +162,8 @@ class CuPyMixedPrecisionRecurrence:
         host_projectors: Any,
         projector_signs: np.ndarray,
         effective_potential: np.ndarray,
+        *,
+        block_columns: int | None = None,
     ) -> None:
         if hasattr(stencil, "implicit_statistics"):
             # The FP32 kernel is compiled from the slot-major source and
@@ -206,8 +218,17 @@ class CuPyMixedPrecisionRecurrence:
             row_lengths.size and int(row_lengths.max(initial=0)) >= 256
         )
 
+        # The tree reduction of long rows carries the columns per block that
+        # the FP64 projection of the operator carries: those the caller
+        # names, else PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS.
+        if block_columns is None:
+            block_columns = projector_block_columns()
+        self.projection_reduction = projection_reduction(
+            self.parallel_projection, block_columns
+        )
+
         kernels = _kernels(cp)
-        selected = (0, 1 if self.parallel_projection else 2)
+        selected = (0, _PROJECTION_KERNEL[self.projection_reduction])
         self.recurrence_kernel, self.projection_kernel = (
             kernels[index] for index in selected
         )
@@ -252,29 +273,34 @@ class CuPyMixedPrecisionRecurrence:
         if self.projector_count == 0:
             return output
         threads = 128
-        pair_count = self.projector_count * width
-        grid = (
-            (pair_count,)
-            if self.parallel_projection
-            else ((pair_count + threads - 1) // threads,)
-        )
-        values = dict(
+        fixed = dict(
             projector_count=self.projector_count,
-            width=width,
             row_offsets=self.transpose_row_offsets,
             grid_rows=self.transpose_grid_rows,
             projector_values=self.transpose_values,
             signs=self.projector_signs,
-            vectors=vectors,
-            **_strides("vector", vectors),
-            output=output,
-            **_strides("output", output),
         )
-        self.projection_kernel(
-            grid,
-            (threads,),
-            launch_arguments(self.projection_parameters, values),
-        )
+        for blocks, start, stop in projection_launches(
+            self.projection_reduction, self.projector_count, width
+        ):
+            # As the FP64 projection: one launch takes the arrays as they
+            # are, the launches of more than six columns views of them.
+            whole = start == 0 and stop == width
+            source = vectors if whole else vectors[:, start:stop]
+            target = output if whole else output[:, start:stop]
+            values = dict(
+                fixed,
+                width=stop - start,
+                vectors=source,
+                **_strides("vector", source),
+                output=target,
+                **_strides("output", target),
+            )
+            self.projection_kernel(
+                (blocks,),
+                (threads,),
+                launch_arguments(self.projection_parameters, values),
+            )
         return output
 
     def __call__(

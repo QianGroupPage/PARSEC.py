@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 import gc
 import os
@@ -12,7 +12,7 @@ import threading
 from threading import Barrier
 from types import SimpleNamespace
 import unittest
-from unittest.mock import DEFAULT, MagicMock, patch
+from unittest.mock import ANY, DEFAULT, MagicMock, patch
 
 import numpy as np
 
@@ -53,6 +53,11 @@ def _stand_in_input():
         for name in _BOUNDARY_INPUT_SWITCHES:
             driver_module.os.environ.pop(name, None)
         yield
+
+
+# A preparation hands itself to its reference stage: the clock of its stages
+# and the threads it has to join.
+_PREPARATION = {"preparation": ANY}
 
 
 def _hybrid_selection() -> BackendSelection:
@@ -498,6 +503,39 @@ class HybridPreparationTests(unittest.TestCase):
             build_atomic_tail=False,
         )
 
+    def test_filter_plan_is_what_the_input_fixes_of_the_filter_work(self) -> None:
+        from parsec_python.models import EigensolverSettings, SCFSettings
+
+        eigensolver = EigensolverSettings(first_filter_degree=30, first_filter_cycles=4)
+
+        def plan(electrons=3480.0, **scf):
+            found = driver_module._filter_plan(
+                SimpleNamespace(
+                    input=SimpleNamespace(scf=SCFSettings(**scf), eigensolver=eigensolver),
+                    electron_count=electrons,
+                )
+            )
+            return found.states, found.buffer, found.applications
+
+        # The states of the input with the buffer of the subspace, and the
+        # applications of four first cycles of degree 30 and eight later
+        # steps at degree ten.
+        self.assertEqual(plan(number_of_states=1746, max_iterations=70), (1746, 6, 200))
+        # Without States_Num: half the electrons and six more, as the SCF
+        # resolves them; an odd count rounds up.
+        self.assertEqual(plan(max_iterations=70), (1746, 6, 200))
+        self.assertEqual(plan(electrons=5.0), (9, 6, 200))
+        # No more later steps than the input allows.
+        self.assertEqual(plan(number_of_states=12, max_iterations=1), (12, 6, 120))
+        self.assertEqual(plan(number_of_states=12, max_iterations=3), (12, 6, 140))
+        # A stand-in that carries no settings has no plan.
+        for system in (
+            SimpleNamespace(),
+            SimpleNamespace(input=SimpleNamespace(hartree=object())),
+            SimpleNamespace(input=SimpleNamespace(scf=SCFSettings())),
+        ):
+            self.assertIsNone(driver_module._filter_plan(system))
+
     def test_absent_cache_key_is_reported_as_text(self) -> None:
         from parsec_python.cli import save_result_archive
 
@@ -937,6 +975,7 @@ class MPIRolePreparationTests(unittest.TestCase):
                 _hybrid_selection(),
                 defer_native_laplacian=True,
                 deferred_laplacian_cache_directory=None,
+                **_PREPARATION,
             )
             # The shell has its switches again.
             self.assertEqual(driver_module.os.environ["PARSEC_HARTREE_BOUNDARY"], "legacy")
@@ -1009,6 +1048,7 @@ class MPIRolePreparationTests(unittest.TestCase):
                     _hybrid_selection(),
                     defer_native_laplacian=True,
                     deferred_laplacian_cache_directory=None,
+                    **_PREPARATION,
                 )
                 prepared.poisson_solver_type.assert_called_once()
                 self.assertIs(
@@ -1048,6 +1088,7 @@ class MPIRolePreparationTests(unittest.TestCase):
             defer_native_laplacian=True,
             deferred_laplacian_cache_directory=None,
             orbital_operators_only=True,
+            **_PREPARATION,
         )
         worker.poisson_solver_type.assert_not_called()
         worker.boundary_builder_type.assert_not_called()
@@ -1068,6 +1109,11 @@ class MPIRolePreparationTests(unittest.TestCase):
         self.assertEqual(len(worker_call.args), len(root_call.args))
         self.assertIs(worker_call.args[1], worker.reference.negative_laplacian)
         self.assertIs(worker_call.args[2], worker.reference.nonlocal_operator)
+        # Both are handed what the input fixes of the filter work, which
+        # the tiles of their sector stencils are decided by: nothing here,
+        # where the stand-in of the system carries no SCF settings.
+        self.assertIsNone(worker_call.kwargs["filter_plan"])
+        self.assertIsNone(root_call.kwargs["filter_plan"])
         self.assertIs(worker.system.eigenproblem_solver, worker.sector_solver)
         self.assertIs(
             worker.implementation.symmetry_eigensolver, worker.sector_solver
@@ -1094,6 +1140,25 @@ class MPIRolePreparationTests(unittest.TestCase):
         self.assertNotIn("hartree_cg_storage", details)
         self.assertNotIn("hartree_boundary_setup", details)
         self.assertEqual(details["hartree_backend"], "native")
+
+    def test_sector_solver_is_handed_the_filter_plan_of_the_prepared_input(self) -> None:
+        # What the input fixes of the filter work reaches the constructor of
+        # the sector eigensolver on the root, on a sector worker and without
+        # a sector context, made from the system the rank prepared.
+        plan = object()
+        for context in (
+            None,
+            SimpleNamespace(rank=0, root=0, size=2),
+            SimpleNamespace(rank=1, root=0, size=2),
+        ):
+            with self.subTest(context=context), patch.object(
+                driver_module, "_filter_plan", return_value=plan
+            ) as planned:
+                prepared = self.prepare(context)
+                planned.assert_called_once_with(prepared.reference)
+                self.assertIs(
+                    prepared.sector_solver_type.call_args.kwargs["filter_plan"], plan
+                )
 
     def test_gpu_cg_receives_the_packed_sector_stencil(self) -> None:
         for mpi_context in (None, SimpleNamespace(rank=0, root=0, size=2)):
@@ -1215,6 +1280,7 @@ class MPIRolePreparationTests(unittest.TestCase):
                 _hybrid_selection(),
                 defer_native_laplacian=True,
                 deferred_laplacian_cache_directory=None,
+                **_PREPARATION,
             )
             details = dict(prepared.system.backend_info.details)
             self.assertEqual(details["ionic_gpu_count_requested"], "auto")
@@ -1238,6 +1304,7 @@ class MPIRolePreparationTests(unittest.TestCase):
                             "ionic_field_overlap",
                             "ionic_report",
                             "ionic_sector_rank",
+                            "preparation",
                         ],
                     )
                     details = dict(prepared.system.backend_info.details)
@@ -1336,13 +1403,16 @@ class MPIRolePreparationTests(unittest.TestCase):
         environment = {"PARSEC_SECTOR_STENCIL": "csr"}
         root = self.prepare(None, environment=environment)
         root.prepare_reference.assert_called_once_with(
-            root.problem, _hybrid_selection()
+            root.problem, _hybrid_selection(), **_PREPARATION
         )
         worker = self.prepare(
             SimpleNamespace(rank=1, root=0, size=2), environment=environment
         )
         worker.prepare_reference.assert_called_once_with(
-            worker.problem, _hybrid_selection(), orbital_operators_only=True
+            worker.problem,
+            _hybrid_selection(),
+            orbital_operators_only=True,
+            **_PREPARATION,
         )
         with self.assertRaisesRegex(ValueError, "PARSEC_SECTOR_STENCIL"):
             self.prepare(None, environment={"PARSEC_SECTOR_STENCIL": "on"})
@@ -1521,7 +1591,13 @@ class IonicFieldOverlapTests(unittest.TestCase):
         "deferred_laplacian_cache_directory": None,
     }
     with_overlap = sorted(
-        [*deferred, "ionic_sector_rank", "ionic_report", "ionic_field_overlap"]
+        [
+            *deferred,
+            "ionic_sector_rank",
+            "ionic_report",
+            "ionic_field_overlap",
+            "preparation",
+        ]
     )
 
     def tearDown(self) -> None:
@@ -1694,6 +1770,7 @@ class IonicFieldOverlapTests(unittest.TestCase):
                         _hybrid_selection(),
                         **self.deferred,
                         **ionic_sums,
+                        **_PREPARATION,
                     )
                     self.assertIs(prepared.system.reference, prepared.reference)
                     details = dict(prepared.system.backend_info.details)
@@ -1724,6 +1801,7 @@ class IonicFieldOverlapTests(unittest.TestCase):
             orbital_operators_only=True,
             ionic_sector_rank=True,
             ionic_report={},
+            **_PREPARATION,
         )
         self.assertNotIn("ionic_setup", dict(worker.system.backend_info.details))
 
@@ -1921,6 +1999,694 @@ class IonicFieldOverlapTests(unittest.TestCase):
             overlap.start(reduced)
         self.assertEqual(self._ionic_threads(), [])
 
+    @staticmethod
+    def _ion_ion_threads():
+        return [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("parsec-ion-ion")
+        ]
+
+    def _fields_with_ion_ion(self, switch):
+        """Build the fields on their thread; say who summed the ion-ion energy, and how.
+
+        Returns the complete system, the overlap, the calls of the builders
+        with the ion-ion sums among them, and the options that the
+        completion of the reference package was given.
+        """
+
+        import parsec_python.SCF.single_point as reference_module
+
+        sums, given = [], []
+        reference_sum = reference_module.ion_ion_energy
+        complete = driver_module.complete_reference_single_point
+
+        def summed_by(who):
+            def ion_ion(atoms, pseudopotentials):
+                self._HostFields.calls.append(
+                    ("ion-ion", threading.current_thread().name)
+                )
+                sums.append((who, atoms, pseudopotentials))
+                return reference_sum(atoms, pseudopotentials)
+
+            return ion_ion
+
+        def completing(reference, **options):
+            given.append(options)
+            return complete(reference, **options)
+
+        overlap = driver_module._OverlappedIonicFields()
+        environment = dict(self.gpu_fields)
+        if switch is not None:
+            environment["PARSEC_OVERLAP_ION_ION_SETUP"] = switch
+        with (
+            patch.object(driver_module, "ion_ion_energy", summed_by("driver")),
+            patch.object(reference_module, "ion_ion_energy", summed_by("reference")),
+            patch.object(driver_module, "complete_reference_single_point", completing),
+            patch.dict(driver_module.os.environ),
+        ):
+            driver_module.os.environ.pop("PARSEC_OVERLAP_ION_ION_SETUP", None)
+            reduced, _ = self._reference_physics(
+                environment, ionic_field_overlap=overlap
+            )
+            system = overlap.result()
+        return SimpleNamespace(
+            system=system,
+            reduced=reduced,
+            overlap=overlap,
+            calls=list(self._HostFields.calls),
+            sums=sums,
+            given=given,
+        )
+
+    def test_ion_ion_energy_is_summed_on_a_thread_of_its_own_beside_the_fields(
+        self,
+    ) -> None:
+        inline, _ = self._reference_physics(self.gpu_fields)
+        for switch in (None, "1", " On "):
+            with self.subTest(switch=switch):
+                built = self._fields_with_ion_ion(switch)
+                # One sum, by the driver's thread, of the atoms of the system.
+                ((who, atoms, pseudopotentials),) = built.sums
+                self.assertEqual(who, "driver")
+                self.assertIs(atoms, built.reduced.atoms)
+                self.assertIs(pseudopotentials, built.reduced.pseudopotentials)
+                calls = dict(built.calls)
+                self.assertTrue(calls["ion-ion"].startswith("parsec-ion-ion"), calls)
+                self.assertTrue(calls["local"].startswith("parsec-ionic-setup"))
+                # It starts once the projectors are built, never beside them.
+                names = [name for name, _ in built.calls]
+                self.assertLess(names.index("projectors"), names.index("ion-ion"))
+                # The energy of the in-line stage, bit for bit, and the fields.
+                self.assertEqual(
+                    built.system.ion_ion_energy.hex(), inline.ion_ion_energy.hex()
+                )
+                self.assertGreater(built.system.ion_ion_energy, 0.0)
+                for name in ("ionic_potential", "initial_density", "core_density"):
+                    self.assertEqual(
+                        getattr(built.system, name).tobytes(),
+                        getattr(inline, name).tobytes(),
+                    )
+                # The completion took the value through its hook, after the
+                # densities; the seconds of the stage are the thread's.
+                (options,) = built.given
+                self.assertEqual(
+                    sorted(options),
+                    [
+                        "atomic_density_builder",
+                        "build_atomic_tail",
+                        "ion_ion_energy_builder",
+                        "local_ionic_builder",
+                    ],
+                )
+                details = dict(built.overlap.details())
+                self.assertEqual(
+                    details["ion_ion_setup"], "own thread beside the ionic fields"
+                )
+                self.assertGreater(built.system.timings.ion_ion_seconds, 0.0)
+                self.assertEqual(
+                    f"{built.system.timings.ion_ion_seconds:.6f}",
+                    details["ion_ion_setup_seconds"],
+                )
+                # Both threads have ended at the join.
+                self.assertEqual(self._ion_ion_threads(), [])
+                self.assertEqual(self._ionic_threads(), [])
+
+    def test_former_value_leaves_the_ion_ion_energy_to_the_thread_of_the_fields(
+        self,
+    ) -> None:
+        inline, _ = self._reference_physics(self.gpu_fields)
+        for switch in ("0", "off", "False", "no"):
+            with self.subTest(switch=switch):
+                built = self._fields_with_ion_ion(switch)
+                # The stage of the reference package, on the ionic thread and
+                # after the densities, as before the switch existed.
+                ((who, _atoms, _pseudopotentials),) = built.sums
+                self.assertEqual(who, "reference")
+                self.assertEqual(
+                    [name for name, _ in built.calls if name != "projectors"],
+                    ["current device", "local", "valence", "core", "ion-ion"],
+                )
+                self.assertTrue(
+                    dict(built.calls)["ion-ion"].startswith("parsec-ionic-setup")
+                )
+                # The completion is called as it was: no hook is handed to it.
+                (options,) = built.given
+                self.assertEqual(
+                    sorted(options),
+                    ["atomic_density_builder", "build_atomic_tail", "local_ionic_builder"],
+                )
+                self.assertEqual(
+                    built.system.ion_ion_energy.hex(), inline.ion_ion_energy.hex()
+                )
+                details = dict(built.overlap.details())
+                self.assertEqual(details["ion_ion_setup"], "last stage of the ionic thread")
+                self.assertNotIn("ion_ion_setup_seconds", details)
+                self.assertGreater(built.system.timings.ion_ion_seconds, 0.0)
+                self.assertEqual(self._ion_ion_threads(), [])
+
+    def test_switch_of_the_ion_ion_thread_is_on_unless_named_off(self) -> None:
+        for value, expected in (
+            (None, True), ("1", True), ("yes", True), ("", True),
+            ("0", False), (" OFF ", False), ("false", False), ("No", False),
+        ):
+            with self.subTest(value=value), patch.dict(driver_module.os.environ):
+                driver_module.os.environ.pop("PARSEC_OVERLAP_ION_ION_SETUP", None)
+                if value is not None:
+                    driver_module.os.environ["PARSEC_OVERLAP_ION_ION_SETUP"] = value
+                self.assertIs(driver_module._ion_ion_overlap_requested(), expected)
+
+    def test_failure_of_the_ion_ion_energy_is_raised_at_the_join_of_the_fields(
+        self,
+    ) -> None:
+        import parsec_python.SCF.single_point as reference_module
+
+        def coincident(_atoms, _pseudopotentials):
+            raise ValueError("two nuclei occupy the same position")
+
+        for switch in ("1", "0"):
+            with self.subTest(switch=switch):
+                overlap = driver_module._OverlappedIonicFields()
+                with (
+                    patch.object(driver_module, "ion_ion_energy", coincident),
+                    patch.object(reference_module, "ion_ion_energy", coincident),
+                ):
+                    self._reference_physics(
+                        {**self.gpu_fields, "PARSEC_OVERLAP_ION_ION_SETUP": switch},
+                        ionic_field_overlap=overlap,
+                    )
+                    # Where the stage stands: after the three sums, at the join.
+                    with self.assertRaisesRegex(ValueError, "two nuclei occupy"):
+                        overlap.result()
+                self.assertEqual(
+                    [name for name, _ in self._HostFields.calls if name != "projectors"],
+                    ["current device", "local", "valence", "core"],
+                )
+                self.assertEqual(self._ion_ion_threads(), [])
+                self.assertEqual(self._ionic_threads(), [])
+
+    def test_failure_of_the_fields_comes_first_and_joins_the_ion_ion_thread(
+        self,
+    ) -> None:
+        release = threading.Event()
+        ended = []
+
+        def slow(_atoms, _pseudopotentials):
+            release.wait(timeout=0.3)
+            ended.append(threading.current_thread().name)
+            raise ValueError("two nuclei occupy the same position")
+
+        def fail(_reference, **_builders):
+            raise RuntimeError("ionic kernel failed")
+
+        overlap = driver_module._OverlappedIonicFields()
+        with (
+            patch.object(driver_module, "ion_ion_energy", slow),
+            patch.object(driver_module, "complete_reference_single_point", fail),
+        ):
+            self._reference_physics(self.gpu_fields, ionic_field_overlap=overlap)
+            # The sums fail before the stage of the ion-ion energy: theirs is
+            # the error, and the second thread has ended when it is raised.
+            with self.assertRaisesRegex(RuntimeError, "ionic kernel failed"):
+                overlap.result()
+        self.assertEqual(len(ended), 1)
+        self.assertEqual(self._ion_ion_threads(), [])
+        # A preparation that never reaches the join closes both.
+        overlap = driver_module._OverlappedIonicFields()
+        del ended[:]
+        with patch.object(driver_module, "ion_ion_energy", slow):
+            self._reference_physics(self.gpu_fields, ionic_field_overlap=overlap)
+            overlap.close()
+        self.assertEqual(len(ended), 1)
+        self.assertEqual(self._ion_ion_threads(), [])
+        self.assertEqual(self._ionic_threads(), [])
+
+    def test_ion_ion_thread_sums_in_place_for_other_atoms_than_its_own(self) -> None:
+        calls = []
+
+        def energy(atoms, _pseudopotentials):
+            calls.append((atoms, threading.current_thread().name))
+            return float(len(atoms))
+
+        atoms, pseudopotentials = (object(), object()), {}
+        with patch.object(driver_module, "ion_ion_energy", energy):
+            beside = driver_module._IonIonEnergyBeside(atoms, pseudopotentials)
+            self.assertEqual(beside.energy(atoms, pseudopotentials), 2.0)
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0][1].startswith("parsec-ion-ion"))
+            # Other atoms, or other pseudopotentials: not the thread's value.
+            other = (object(),)
+            self.assertEqual(beside.energy(other, pseudopotentials), 1.0)
+            self.assertEqual(calls[1], (other, threading.current_thread().name))
+            self.assertEqual(beside.energy(atoms, {}), 2.0)
+            self.assertEqual(len(calls), 3)
+            beside.close()
+        self.assertGreaterEqual(beside.seconds, 0.0)
+        self.assertEqual(self._ion_ion_threads(), [])
+
+    class _OrbitFields(_HostFields):
+        """Host builders that can be told to sum on the orbits of a reduction."""
+
+        told: list = []
+
+        def sum_on_orbits(self, grid, reduction, coordinates=None):
+            type(self).told.append(
+                (grid, reduction, coordinates, threading.current_thread().name)
+            )
+
+    def _symmetric_reference(self, positions=((0.9, -0.4, 0.3), (-0.9, 0.4, 0.3))):
+        """A grid, two atoms that a twofold axis exchanges, and their reduction."""
+
+        from parsec_python.Grid import build_cluster_grid
+        from parsec_python.acceleration.Symmetry import SignedPermutationReduction
+
+        problem = parse_parsec_input(SMOKE_INPUT).problem
+        grid = build_cluster_grid(problem.grid)
+        atoms = tuple(
+            replace(problem.atoms[0], position=np.array(position))
+            for position in positions
+        )
+        reference = SimpleNamespace(grid=grid, atoms=atoms)
+        return reference, SignedPermutationReduction.detect(grid, atoms)
+
+    def test_thread_sums_on_the_wedge_where_the_images_are_exact(self) -> None:
+        reference, reduction = self._symmetric_reference()
+        self.assertEqual(reduction.group_order, 2)
+        builders = self._OrbitFields()
+        type(builders).told = []
+        preparation = driver_module._Preparation()
+        preparation.symmetry_reduction.publish(reduction)
+        with patch.dict(driver_module.os.environ):
+            driver_module.os.environ.pop("PARSEC_IONIC_SUM_GRID", None)
+            text = driver_module._choose_ionic_sum_grid(builders, reference, preparation)
+        self.assertEqual(
+            text,
+            f"symmetry wedge ({reduction.wedge_size} of {reference.grid.size} points)",
+        )
+        ((grid, told, coordinates, _thread),) = builders.told
+        self.assertIs(grid, reference.grid)
+        self.assertIs(told, reduction)
+        # The coordinates of the representative rows, gathered once for the
+        # test of the grid and for the sums.
+        self.assertTrue(coordinates.flags.c_contiguous)
+        np.testing.assert_array_equal(
+            coordinates, reference.grid.coordinates[reduction.representative_rows]
+        )
+        self.assertEqual(
+            [record["stage"] for record in preparation.stages.records()],
+            ["ionic_symmetry_wait", "ionic_sum_grid_test"],
+        )
+
+    def test_thread_sums_every_point_wherever_the_wedge_is_not_exact(self) -> None:
+        reference, reduction = self._symmetric_reference()
+        # Within the tolerance of the detector, not exact in every bit.
+        nearly, accepted = self._symmetric_reference(
+            ((0.9, -0.4, 0.3), (-0.9, 0.4, 0.3 + 2.0e-9))
+        )
+        self.assertEqual(accepted.group_order, 2)
+        alone, identity = self._symmetric_reference(
+            ((0.9, -0.4, 0.3), (0.2, 0.1, -0.7))
+        )
+        self.assertEqual(identity.group_order, 1)
+        for label, system, published, builders, switch, words in (
+            ("switch", reference, reduction, self._OrbitFields(), "full",
+             "full grid (PARSEC_IONIC_SUM_GRID=full)"),
+            ("builders", reference, reduction, self._HostFields(), None,
+             "full grid (these builders sum every point)"),
+            ("no reduction", reference, None, self._OrbitFields(), None,
+             "full grid (no symmetry reduction)"),
+            ("identity", alone, identity, self._OrbitFields(), None,
+             "full grid (no symmetry operation beside the identity)"),
+            ("atoms", nearly, accepted, self._OrbitFields(), None,
+             "full grid (an image of an atom is not an atom of its species in every bit)"),
+            ("stand-in", reference, SimpleNamespace(group_order=4), self._OrbitFields(), None,
+             "full grid (the operations of the symmetry reduction are not known)"),
+        ):
+            with self.subTest(case=label), patch.dict(driver_module.os.environ):
+                driver_module.os.environ.pop("PARSEC_IONIC_SUM_GRID", None)
+                if switch is not None:
+                    driver_module.os.environ["PARSEC_IONIC_SUM_GRID"] = switch
+                self._OrbitFields.told = []
+                preparation = driver_module._Preparation()
+                preparation.symmetry_reduction.publish(published)
+                self.assertEqual(
+                    driver_module._choose_ionic_sum_grid(builders, system, preparation),
+                    words,
+                )
+                self.assertEqual(self._OrbitFields.told, [])
+        # The former value does not wait for a reduction that nobody has
+        # published.  The choice is made on a thread, so that one that waits
+        # fails this test and does not stop the tests after it.
+        unpublished = driver_module._Preparation()
+        texts = []
+        with patch.dict(driver_module.os.environ, {"PARSEC_IONIC_SUM_GRID": "full"}):
+            thread = threading.Thread(
+                target=lambda: texts.append(
+                    driver_module._choose_ionic_sum_grid(
+                        self._OrbitFields(), reference, unpublished
+                    )
+                )
+            )
+            thread.start()
+            thread.join(timeout=10.0)
+            waited = thread.is_alive()
+            # A thread that waits is told that there is no reduction.
+            unpublished.close()
+            thread.join(timeout=10.0)
+        self.assertFalse(waited, "the former value waited for a reduction")
+        self.assertEqual(texts, ["full grid (PARSEC_IONIC_SUM_GRID=full)"])
+        # An unknown value is refused by its name.
+        with (
+            patch.dict(driver_module.os.environ, {"PARSEC_IONIC_SUM_GRID": "wedge"}),
+            self.assertRaisesRegex(ValueError, "PARSEC_IONIC_SUM_GRID must be auto or full"),
+        ):
+            driver_module._choose_ionic_sum_grid(
+                self._OrbitFields(), reference, driver_module._Preparation()
+            )
+
+    def test_test_of_the_images_that_fails_leaves_the_sums_on_every_point(self) -> None:
+        # The wedge is an economy.  A test that cannot be made, or builders
+        # that refuse the orbits, do not fail the preparation at the join
+        # of the fields: every point is summed, and the report says why.
+        reference, reduction = self._symmetric_reference()
+        taken_back = []
+
+        class Refusing(self._OrbitFields):
+            def sum_on_orbits(fields, grid, reduction, coordinates=None):
+                raise ValueError("the symmetry reduction does not match the grid")
+
+            def sum_on_full_grid(fields):
+                taken_back.append(threading.current_thread().name)
+
+        def no_memory(*_arguments):
+            raise MemoryError("Unable to allocate " + "the coordinates of the wedge " * 8)
+
+        exact_images = "parsec_python.acceleration.Symmetry.exact_images."
+        failed = "full grid (the test of the images failed: "
+        for label, builders, test, words in (
+            ("builders", Refusing(), None,
+             failed + "ValueError: the symmetry reduction does not match the grid)"),
+            ("test", self._OrbitFields(), no_memory,
+             failed + "MemoryError: Unable to allocate the coordinates of the wedge the"),
+        ):
+            with self.subTest(case=label), patch.dict(driver_module.os.environ):
+                driver_module.os.environ.pop("PARSEC_IONIC_SUM_GRID", None)
+                self._OrbitFields.told = []
+                del taken_back[:]
+                preparation = driver_module._Preparation()
+                preparation.symmetry_reduction.publish(reduction)
+                with (
+                    nullcontext()
+                    if test is None
+                    else patch(exact_images + "orbit_sum_points", test)
+                ):
+                    text = driver_module._choose_ionic_sum_grid(
+                        builders, reference, preparation
+                    )
+                self.assertTrue(text.startswith(words), text)
+                self.assertTrue(text.endswith(")"))
+                # An entry of the backend report: no longer than the others.
+                self.assertLess(len(text), 160)
+                self.assertEqual(self._OrbitFields.told, [])
+                # Builders that can take the orbits back were asked to.
+                self.assertEqual(
+                    taken_back,
+                    [threading.current_thread().name] if label == "builders" else [],
+                )
+                self.assertEqual(
+                    [record["stage"] for record in preparation.stages.records()],
+                    ["ionic_symmetry_wait", "ionic_sum_grid_test"],
+                )
+
+    def test_unknown_sum_grid_is_refused_by_every_preparation(self) -> None:
+        # Also by one that builds its ionic fields in line and never reads it.
+        for environment in (
+            {},
+            self.gpu_fields,
+            {**self.gpu_fields, "PARSEC_OVERLAP_IONIC_SETUP": "0"},
+        ):
+            with (
+                self.subTest(environment=environment),
+                self.assertRaisesRegex(
+                    ValueError, "PARSEC_IONIC_SUM_GRID must be auto or full"
+                ),
+            ):
+                self.prepare(
+                    None, environment={**environment, "PARSEC_IONIC_SUM_GRID": "wedge"}
+                )
+        self.assertEqual(self._ionic_threads(), [])
+
+    def test_thread_waits_for_the_reduction_and_is_released_by_a_preparation_that_leaves(
+        self,
+    ) -> None:
+        reference, reduction = self._symmetric_reference()
+        for published in (reduction, None, "left"):
+            with self.subTest(published=published), patch.dict(driver_module.os.environ):
+                driver_module.os.environ.pop("PARSEC_IONIC_SUM_GRID", None)
+                self._OrbitFields.told = []
+                preparation = driver_module._Preparation()
+                texts = []
+                thread = threading.Thread(
+                    target=lambda: texts.append(
+                        driver_module._choose_ionic_sum_grid(
+                            self._OrbitFields(), reference, preparation
+                        )
+                    )
+                )
+                thread.start()
+                thread.join(timeout=0.2)
+                # Nothing is known yet: the sums have not been chosen.
+                self.assertTrue(thread.is_alive())
+                self.assertEqual(texts, [])
+                if published == "left":
+                    # A preparation on its way out says that there is none.
+                    preparation.close()
+                else:
+                    preparation.symmetry_reduction.publish(published)
+                thread.join(timeout=10.0)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(
+                    texts[0].startswith("symmetry wedge"), published is reduction
+                )
+                self.assertEqual(len(self._OrbitFields.told), int(published is reduction))
+
+    def test_detection_in_line_publishes_the_reduction_that_the_thread_waits_for(
+        self,
+    ) -> None:
+        # The maps in line (the former value of their switch, or a reference
+        # stage that starts no thread for them) and the wedge allowed: the
+        # thread of the fields waits for the reduction that the calling
+        # thread detects, and the calling thread waits for the fields at
+        # their join.  Without the publication neither would go on.
+        points = np.zeros((8, 3))
+        for environment in ({"PARSEC_OVERLAP_SYMMETRY_SETUP": "0"}, {}):
+            with self.subTest(environment=environment):
+                self._OrbitFields.told = []
+                builders = self._OrbitFields()
+                handed, prepared, raised = [], [], []
+                resolve = driver_module._resolve_and_prepare_reference
+
+                def resolving(problem, backend, **options):
+                    selection, reference, timing = resolve(problem, backend, **options)
+                    preparation = options["preparation"]
+                    handed.append(preparation)
+                    options["ionic_field_overlap"].start(
+                        reference,
+                        stages=preparation.stages,
+                        before_sums=lambda: driver_module._choose_ionic_sum_grid(
+                            builders, reference, preparation
+                        ),
+                    )
+                    return selection, reference, timing
+
+                def prepare():
+                    try:
+                        with (
+                            patch.object(
+                                driver_module, "_resolve_and_prepare_reference", resolving
+                            ),
+                            patch.object(
+                                driver_module,
+                                "complete_reference_single_point",
+                                lambda reference, **_builders: SimpleNamespace(
+                                    **vars(reference)
+                                ),
+                            ),
+                            # The stand-in reduction of ``prepare`` has no
+                            # operations to test: its images count as exact.
+                            patch(
+                                "parsec_python.acceleration.Symmetry.exact_images."
+                                "orbit_sum_points",
+                                lambda _grid, _atoms, _reduction: (points, None),
+                            ),
+                            patch.dict(driver_module.os.environ),
+                        ):
+                            for name in (
+                                "PARSEC_IONIC_SUM_GRID", "PARSEC_OVERLAP_SYMMETRY_SETUP"
+                            ):
+                                driver_module.os.environ.pop(name, None)
+                            prepared.append(
+                                self.prepare(
+                                    None, environment={**self.gpu_fields, **environment}
+                                )
+                            )
+                    except BaseException as error:
+                        raised.append(error)
+
+                # On a thread with a time limit: a preparation that waits
+                # fails this test and does not stop the tests after it.
+                thread = threading.Thread(target=prepare)
+                thread.start()
+                thread.join(timeout=30.0)
+                waited = thread.is_alive()
+                if waited:
+                    # Release the fields, and with them the preparation.
+                    handed[0].symmetry_reduction.publish(None)
+                    thread.join(timeout=30.0)
+                self.assertFalse(
+                    waited, "the thread of the fields was not told the reduction"
+                )
+                self.assertEqual(raised, [])
+                (prepared,) = prepared
+                details = dict(prepared.system.backend_info.details)
+                self.assertEqual(details["symmetry_setup"], "inline")
+                self.assertEqual(details["ionic_sum_grid"], "symmetry wedge (8 of 32 points)")
+                # The reduction that the calling thread detected, no other.
+                ((grid, told, coordinates, told_on),) = self._OrbitFields.told
+                self.assertIs(grid, prepared.reference.grid)
+                self.assertIs(told, prepared.reduction)
+                self.assertIs(coordinates, points)
+                self.assertTrue(told_on.startswith("parsec-ionic-setup"))
+                threads = {
+                    record["stage"]: record["thread"]
+                    for record in prepared.system.preparation_stages
+                }
+                self.assertTrue(
+                    threads["ionic_symmetry_wait"].startswith("parsec-ionic-setup")
+                )
+                self.assertEqual(self._ionic_threads(), [])
+
+    def test_reference_stage_lets_the_thread_choose_the_grid_of_its_sums(self) -> None:
+        from parsec_python.acceleration.Symmetry import SignedPermutationReduction
+
+        for switch, wedge in ((None, True), ("auto", True), ("full", False)):
+            with self.subTest(switch=switch):
+                self._OrbitFields.told = []
+                overlap = driver_module._OverlappedIonicFields()
+                preparation = driver_module._Preparation()
+                environment = dict(self.gpu_fields)
+                if switch is not None:
+                    environment["PARSEC_IONIC_SUM_GRID"] = switch
+                with (
+                    patch.object(self, "_HostFields", self._OrbitFields),
+                    patch.dict(driver_module.os.environ),
+                ):
+                    driver_module.os.environ.pop("PARSEC_IONIC_SUM_GRID", None)
+                    reduced, _ = self._reference_physics(
+                        environment,
+                        ionic_field_overlap=overlap,
+                        preparation=preparation,
+                    )
+                    # The thread that prepares detects the symmetry of the
+                    # system and publishes it; the ionic thread goes on.
+                    reduction = SignedPermutationReduction.detect(
+                        reduced.grid, reduced.atoms
+                    )
+                    preparation.symmetry_reduction.publish(reduction)
+                    complete = overlap.result()
+                details = dict(overlap.details())
+                # The two atoms of this helper have no operation in common.
+                self.assertEqual(reduction.group_order, 1)
+                self.assertEqual(
+                    details["ionic_sum_grid"],
+                    "full grid (no symmetry operation beside the identity)"
+                    if wedge
+                    else "full grid (PARSEC_IONIC_SUM_GRID=full)",
+                )
+                self.assertEqual(self._OrbitFields.told, [])
+                self.assertEqual(complete.ionic_potential.shape, (reduced.grid.size,))
+        # Started without a preparation the thread is told nothing, sums
+        # every point and reports no grid.
+        overlap = driver_module._OverlappedIonicFields()
+        self._reference_physics(self.gpu_fields, ionic_field_overlap=overlap)
+        overlap.result()
+        self.assertNotIn("ionic_sum_grid", dict(overlap.details()))
+
+    def test_wedge_is_for_the_sums_of_the_thread_and_for_no_later_ones(self) -> None:
+        # The orbits were tested for the atoms of the system.  The builders
+        # stay with the preparation: once the fields of the thread are
+        # built, or have failed, they sum every point again, whatever atoms
+        # a later caller gives them.
+        order = []
+        failing = []
+
+        class Fields(self._OrbitFields):
+            def sum_on_orbits(fields, grid, reduction, coordinates=None):
+                order.append("orbits")
+
+            def sum_on_full_grid(fields):
+                order.append("every point")
+
+            def build_local_ionic_potential(fields, *arguments):
+                order.append("local")
+                return super().build_local_ionic_potential(*arguments)
+
+            def superpose_atomic_density(fields, *arguments, core=False):
+                order.append("core" if core else "valence")
+                if core and failing:
+                    raise RuntimeError("ionic kernel failed")
+                return super().superpose_atomic_density(*arguments, core=core)
+
+        points = np.zeros((2, 3))
+        for switch, fails, expected in (
+            (None, False, ["orbits", "local", "valence", "core", "every point"]),
+            (None, True, ["orbits", "local", "valence", "core", "every point"]),
+            ("full", False, ["local", "valence", "core", "every point"]),
+        ):
+            with self.subTest(switch=switch, fails=fails):
+                del order[:]
+                failing[:] = [True] if fails else []
+                overlap = driver_module._OverlappedIonicFields()
+                preparation = driver_module._Preparation()
+                environment = dict(self.gpu_fields)
+                if switch is not None:
+                    environment["PARSEC_IONIC_SUM_GRID"] = switch
+                with (
+                    patch.object(self, "_HostFields", Fields),
+                    # The stand-in reduction has no operations to test: its
+                    # images count as exact.
+                    patch(
+                        "parsec_python.acceleration.Symmetry.exact_images."
+                        "orbit_sum_points",
+                        lambda _grid, _atoms, _reduction: (points, None),
+                    ),
+                    patch.dict(driver_module.os.environ),
+                ):
+                    driver_module.os.environ.pop("PARSEC_IONIC_SUM_GRID", None)
+                    reduced, _ = self._reference_physics(
+                        environment,
+                        ionic_field_overlap=overlap,
+                        preparation=preparation,
+                    )
+                    preparation.symmetry_reduction.publish(
+                        SimpleNamespace(
+                            group_order=2, wedge_size=2, full_size=reduced.grid.size
+                        )
+                    )
+                    if fails:
+                        with self.assertRaisesRegex(RuntimeError, "ionic kernel failed"):
+                            overlap.result()
+                    else:
+                        overlap.result()
+                self.assertEqual(order, expected)
+                self.assertEqual(
+                    dict(overlap.details()).get("ionic_sum_grid", "").startswith(
+                        "symmetry wedge"
+                    ),
+                    switch is None,
+                )
+        self.assertEqual(self._ionic_threads(), [])
+
     def test_preparation_keeps_the_fields_inline_where_they_cannot_overlap(
         self,
     ) -> None:
@@ -1954,6 +2720,986 @@ class IonicFieldOverlapTests(unittest.TestCase):
                 with driver_module._REFERENCE_CACHE_LOCK:
                     driver_module._REFERENCE_CACHE.clear()
         self.assertEqual(self._ionic_threads(), [])
+
+
+class SymmetryMapsOverlapTests(unittest.TestCase):
+    """PARSEC_OVERLAP_SYMMETRY_SETUP: the symmetry maps beside the projectors."""
+
+    prepare = MPIRolePreparationTests.prepare
+    _HostFields = IonicFieldOverlapTests._HostFields
+    gpu_fields = IonicFieldOverlapTests.gpu_fields
+    overlapped = "overlapped with the projectors"
+
+    def tearDown(self) -> None:
+        with driver_module._REFERENCE_CACHE_LOCK:
+            driver_module._REFERENCE_CACHE.clear()
+
+    @staticmethod
+    def _threads():
+        return [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("parsec-symmetry-setup")
+        ]
+
+    @staticmethod
+    def _problem(atoms=((0.9, -0.4, 0.3), (-0.9, 0.4, 0.3)), shift=None):
+        """The smoke input with two atoms that a twofold axis along z exchanges.
+
+        ``shift`` replaces the shift of its grid: with none, grid points lie
+        on the symmetry planes and their orbits are smaller.
+        """
+
+        problem = parse_parsec_input(SMOKE_INPUT).problem
+        if shift is not None:
+            problem = replace(problem, grid=replace(problem.grid, shift=shift))
+        return replace(
+            problem,
+            atoms=[
+                replace(problem.atoms[0], position=np.array(position))
+                for position in atoms
+            ],
+            recenter_geometry=False,
+        )
+
+    @staticmethod
+    def _preparation(switch_on=True):
+        preparation = driver_module._Preparation()
+        if switch_on:
+            preparation.symmetry_maps = driver_module._OverlappedSymmetryMaps(
+                cache_directory=None,
+                reduction_known=preparation.symmetry_reduction,
+                stages=preparation.stages,
+            )
+            preparation.join_on_exit(preparation.symmetry_maps.close)
+        return preparation
+
+    def _reference_stage(
+        self, preparation, environment=None, problem=None, selection=None, **options
+    ):
+        """Run the reference stage of a preparation on the host.
+
+        The native builders are stood in for by those of the reference
+        package, as in ``IonicFieldOverlapTests``.  The projectors return
+        only once the detection of a symmetry thread has begun, where the
+        stage has one: the two run beside each other or the test stops.
+        Returns the reference system and what ran, with its thread, in the
+        order of the starts.
+        """
+
+        from parsec_python.Laplacian import build_negative_laplacian
+        import parsec_python.acceleration.Symmetry as symmetry
+
+        ran = []
+        detecting = threading.Event()
+        detect, decompose = (
+            symmetry.load_or_detect_reflection_reduction,
+            symmetry.load_or_build_reflection_decomposition,
+        )
+        maps = preparation.symmetry_maps
+
+        def detection(*arguments, **more):
+            ran.append(("reduction", threading.current_thread().name))
+            detecting.set()
+            return detect(*arguments, **more)
+
+        def decomposition(*arguments, **more):
+            ran.append(("decomposition", threading.current_thread().name))
+            return decompose(*arguments, **more)
+
+        class Fields(self._HostFields):
+            def build_nonlocal_projectors(fields, *arguments):
+                ran.append(("projectors", threading.current_thread().name))
+                if maps is not None and maps.started:
+                    self.assertTrue(detecting.wait(timeout=10.0))
+                return super().build_nonlocal_projectors(*arguments)
+
+        native = "parsec_python.acceleration.backends.native."
+        with (
+            patch(
+                native + "_load_native",
+                return_value=SimpleNamespace(RadialGridEvaluator=object),
+            ),
+            patch(native + "build_native_negative_laplacian", build_negative_laplacian),
+            patch("parsec_python.acceleration.V_ion.NativeIonicBuilders", Fields),
+            patch("parsec_python.acceleration.V_ion.cupy_ionic.CupyIonicBuilders", Fields),
+            patch.object(symmetry, "load_or_detect_reflection_reduction", detection),
+            patch.object(symmetry, "load_or_build_reflection_decomposition", decomposition),
+            patch.dict(
+                driver_module.os.environ,
+                {"PARSEC_ACCELERATED_RESIDENT": "0", **(environment or {})},
+            ),
+        ):
+            if "PARSEC_ORBITAL_STABILIZER_SYMMETRY" not in (environment or {}):
+                driver_module.os.environ.pop("PARSEC_ORBITAL_STABILIZER_SYMMETRY", None)
+            reference = driver_module._prepare_reference_physics(
+                self._problem() if problem is None else problem,
+                _hybrid_selection() if selection is None else selection,
+                preparation=preparation,
+                **options,
+            )
+            # The thread, if any, ends inside the doubles it was started in.
+            if maps is not None:
+                maps.close()
+        return reference, ran
+
+    def test_switch_is_on_unless_named_off(self) -> None:
+        for value, expected in (
+            (None, True), ("1", True), ("", True), ("on", True),
+            ("0", False), (" Off ", False), ("false", False), ("NO", False),
+        ):
+            with self.subTest(value=value), patch.dict(driver_module.os.environ):
+                driver_module.os.environ.pop("PARSEC_OVERLAP_SYMMETRY_SETUP", None)
+                if value is not None:
+                    driver_module.os.environ["PARSEC_OVERLAP_SYMMETRY_SETUP"] = value
+                self.assertIs(driver_module._symmetry_overlap_requested(), expected)
+
+    def test_maps_of_a_rank_without_ionic_fields_are_built_beside_its_projectors(
+        self,
+    ) -> None:
+        from parsec_python.acceleration.Symmetry import (
+            load_or_build_reflection_decomposition,
+            load_or_detect_reflection_reduction,
+        )
+
+        for role, options in (
+            ("sector worker", {"orbital_operators_only": True}),
+            ("fields on their thread", {"ionic_field_overlap": True}),
+        ):
+            with self.subTest(role=role):
+                preparation = self._preparation()
+                maps = preparation.symmetry_maps
+                self.assertFalse(maps.started)
+                self.assertEqual(maps.details(), (("symmetry_setup", "inline"),))
+                if "ionic_field_overlap" in options:
+                    overlap = driver_module._OverlappedIonicFields()
+                    preparation.join_on_exit(overlap.close)
+                    options = {"ionic_field_overlap": overlap}
+                reference, ran = self._reference_stage(
+                    preparation,
+                    self.gpu_fields,
+                    defer_native_laplacian=True,
+                    **options,
+                )
+                preparation.close()
+                self.assertTrue(maps.started)
+                threads = dict(ran)
+                self.assertEqual(threads["projectors"], "MainThread")
+                for stage in ("reduction", "decomposition"):
+                    self.assertTrue(
+                        threads[stage].startswith("parsec-symmetry-setup"), threads
+                    )
+                # Started on the grid and the atoms of the reference system.
+                self.assertTrue(maps.serves(reference.grid, reference.atoms))
+                self.assertFalse(maps.serves(replace(reference.grid), reference.atoms))
+                moved = (reference.atoms[1], reference.atoms[0])
+                self.assertFalse(maps.serves(reference.grid, moved))
+                # The maps of the functions the calling thread calls in line.
+                expected, expected_info = load_or_detect_reflection_reduction(
+                    reference.grid, reference.atoms, cache_directory=None
+                )
+                candidate, info = maps.reduction()
+                self.assertIs(type(candidate), type(expected))
+                self.assertEqual(candidate.group_order, 2)
+                for name in (
+                    "signs", "representative_rows", "full_to_wedge", "multiplicities"
+                ):
+                    left, right = getattr(candidate, name), getattr(expected, name)
+                    self.assertEqual(left.dtype, right.dtype)
+                    self.assertEqual(left.tobytes(), right.tobytes())
+                self.assertEqual((info.status, info.key), (expected_info.status, expected_info.key))
+                wanted, _ = load_or_build_reflection_decomposition(
+                    reference.grid, expected, reduction_key=expected_info.key,
+                    cache_directory=None,
+                )
+                decomposition, _ = maps.decomposition(candidate)
+                self.assertIs(decomposition.reduction, candidate)
+                self.assertEqual(decomposition.sector_sizes, wanted.sector_sizes)
+                for sector in range(wanted.representation_count):
+                    np.testing.assert_array_equal(
+                        decomposition.sector_orbit_indices(sector),
+                        wanted.sector_orbit_indices(sector),
+                    )
+                # Of another reduction it has none to give.
+                self.assertIsNone(maps.decomposition(expected))
+                # The reduction was published when it was detected.
+                self.assertIs(preparation.symmetry_reduction.wait(), candidate)
+                details = dict(maps.details())
+                self.assertEqual(details["symmetry_setup"], self.overlapped)
+                self.assertGreater(float(details["symmetry_setup_seconds"]), 0.0)
+                self.assertGreaterEqual(float(details["symmetry_setup_wait_seconds"]), 0.0)
+                stages = {
+                    record["stage"]: record["thread"]
+                    for record in preparation.stages.records()
+                }
+                self.assertEqual(stages["grid"], "MainThread")
+                self.assertEqual(stages["projectors"], "MainThread")
+                for stage in ("symmetry_reduction", "symmetry_decomposition"):
+                    self.assertTrue(stages[stage].startswith("parsec-symmetry-setup"))
+                for stage in ("symmetry_reduction_wait", "symmetry_decomposition_wait"):
+                    self.assertEqual(stages[stage], "MainThread")
+                self.assertEqual(self._threads(), [])
+
+    def test_thread_decomposes_only_what_the_calling_thread_would(self) -> None:
+        # No operation beside the identity; a backend that solves on the full
+        # grid; a stabilizer policy that keeps the orbitals off the wedge of
+        # a group that fixes grid points.
+        on_axis, unshifted = ((0.0, 0.0, 0.3), (0.0, 0.0, -0.9)), (0.0, 0.0, 0.0)
+        scipy = BackendSelection(
+            requested="native", selected="native",
+            finite_difference_builder="native", hartree_backend="native",
+        )
+        for label, problem, selection, environment, order in (
+            ("identity", self._problem(((0.9, -0.4, 0.3), (0.2, 0.1, -0.7))), None, {}, 1),
+            ("full-grid backend", None, scipy, {}, 2),
+            ("stabilizer off", self._problem(on_axis, unshifted), None,
+             {"PARSEC_ORBITAL_STABILIZER_SYMMETRY": "off"}, 4),
+            ("stabilizer unknown", self._problem(on_axis, unshifted), None,
+             {"PARSEC_ORBITAL_STABILIZER_SYMMETRY": "sometimes"}, 4),
+        ):
+            with self.subTest(case=label):
+                preparation = self._preparation()
+                maps = preparation.symmetry_maps
+                reference, ran = self._reference_stage(
+                    preparation, environment, problem=problem, selection=selection,
+                    defer_native_laplacian=True, orbital_operators_only=True,
+                )
+                self.assertEqual(
+                    [name for name, _ in ran if name != "projectors"], ["reduction"]
+                )
+                candidate, _ = maps.reduction()
+                self.assertEqual(candidate.group_order, order)
+                self.assertIsNone(maps.decomposition(candidate))
+                self.assertIs(preparation.symmetry_reduction.wait(), candidate)
+        # The same atoms with the policy at its default are decomposed.
+        preparation = self._preparation()
+        _, ran = self._reference_stage(
+            preparation, problem=self._problem(on_axis, unshifted),
+            defer_native_laplacian=True, orbital_operators_only=True,
+        )
+        self.assertIn("decomposition", dict(ran))
+        self.assertEqual(self._threads(), [])
+
+    def test_maps_stay_in_line_where_the_reference_stage_builds_more_than_projectors(
+        self,
+    ) -> None:
+        resident = {
+            "PARSEC_ACCELERATED_RESIDENT": "1",
+            "PARSEC_RESIDENT_REFERENCE_CACHE_SIZE": "1",
+        }
+        reference_builders = BackendSelection(
+            requested="cupy", selected="cupy",
+            finite_difference_builder="reference", hartree_backend="cupy",
+        )
+        overlap = driver_module._OverlappedIonicFields
+        for label, environment, selection, options in (
+            # The ionic fields in line: C++ builders, or the GPU sums.
+            ("host fields", {"PARSEC_IONIC_BACKEND": "native"}, None, {}),
+            ("fields in line", self.gpu_fields, None, {}),
+            ("resident", {**self.gpu_fields, **resident}, None, {"ionic_field_overlap": overlap}),
+            # The full-grid matrix before the projectors.
+            ("matrix", self.gpu_fields, None, {"orbital_operators_only": True, "defer": False}),
+            ("reference builders", {}, reference_builders, {"orbital_operators_only": True}),
+        ):
+            with self.subTest(case=label):
+                preparation = self._preparation()
+                options = dict(options)
+                if "ionic_field_overlap" in options:
+                    options["ionic_field_overlap"] = overlap()
+                reference, ran = self._reference_stage(
+                    preparation, environment, selection=selection,
+                    defer_native_laplacian=options.pop("defer", True), **options,
+                )
+                self.assertFalse(preparation.symmetry_maps.started)
+                self.assertEqual(
+                    preparation.symmetry_maps.details(), (("symmetry_setup", "inline"),)
+                )
+                self.assertFalse(
+                    preparation.symmetry_maps.serves(reference.grid, reference.atoms)
+                )
+                self.assertNotIn("reduction", dict(ran))
+                # The grid is a stage of the clock all the same.
+                self.assertIn(
+                    "grid", [record["stage"] for record in preparation.stages.records()]
+                )
+                with driver_module._REFERENCE_CACHE_LOCK:
+                    driver_module._REFERENCE_CACHE.clear()
+        # Without the thread of a preparation the builders are called as
+        # they were, and nobody is left waiting for a reduction.
+        preparation = self._preparation(switch_on=False)
+        reference, ran = self._reference_stage(
+            preparation, self.gpu_fields, defer_native_laplacian=True,
+            orbital_operators_only=True,
+        )
+        self.assertEqual(ran, [("projectors", "MainThread")])
+        preparation.close()
+        self.assertIsNone(preparation.symmetry_reduction.wait())
+        self.assertEqual(self._threads(), [])
+
+    def test_maps_stay_in_line_beside_the_probe_of_the_auto_backend(self) -> None:
+        # Under ``auto`` without GPU ionic fields the probe of the CUDA
+        # runtime runs beside the reference preparation, which does not
+        # know the backend yet: it is handed no thread for the maps, even
+        # as a sector worker with the sector stencils from the grid.  Where
+        # the backend is resolved first, the thread is handed on.
+        handed = []
+
+        def reference_stage(_problem, _selection, **options):
+            handed.append(
+                (options["preparation"].symmetry_maps, sorted(options))
+            )
+            return object()
+
+        worker = {"orbital_operators_only": True, "defer_native_laplacian": True}
+        for label, backend, environment, in_line in (
+            ("probe beside", "auto", {"PARSEC_IONIC_BACKEND": "native"}, True),
+            ("GPU ionic fields", "auto", {"PARSEC_IONIC_BACKEND": "cupy"}, False),
+            (
+                "probe first",
+                "auto",
+                {"PARSEC_IONIC_BACKEND": "native", "PARSEC_OVERLAP_CUDA_INITIALIZATION": "0"},
+                False,
+            ),
+            ("named backend", "cupy", {"PARSEC_IONIC_BACKEND": "native"}, False),
+        ):
+            with (
+                self.subTest(case=label),
+                patch.object(
+                    driver_module, "resolve_backend", return_value=_hybrid_selection()
+                ),
+                patch.object(
+                    driver_module, "_prepare_reference_physics", side_effect=reference_stage
+                ),
+                patch(
+                    "parsec_python.acceleration.backends.selection._native_status",
+                    return_value=(True, None),
+                ),
+                # The deferred Laplacian of a worker, whichever interpreter
+                # runs the test.
+                patch.object(driver_module, "_cupy_installed", return_value=True),
+                patch.dict(
+                    driver_module.os.environ,
+                    {"PARSEC_OVERLAP_CUDA_INITIALIZATION": "1", **environment},
+                ),
+            ):
+                preparation = self._preparation()
+                maps = preparation.symmetry_maps
+                _, _, timing = driver_module._resolve_and_prepare_reference(
+                    object(), backend, preparation=preparation, **worker
+                )
+                ((given, options),) = handed
+                del handed[:]
+                self.assertEqual(
+                    timing["cuda_initialization_overlap"],
+                    "cuda_probe_with_cpu_reference_setup" if in_line else "disabled",
+                )
+                # A worker that defers its matrix: the stage that would
+                # start the thread if it were handed one.
+                self.assertIn("orbital_operators_only", options)
+                self.assertIn("defer_native_laplacian", options)
+                if in_line:
+                    self.assertIsNone(given)
+                    self.assertIsNone(preparation.symmetry_maps)
+                else:
+                    self.assertIs(given, maps)
+                    self.assertIs(preparation.symmetry_maps, maps)
+                self.assertFalse(maps.started)
+                preparation.close()
+        self.assertEqual(self._threads(), [])
+
+    def test_errors_of_the_thread_are_raised_where_the_maps_are_taken(self) -> None:
+        import parsec_python.acceleration.Symmetry as symmetry
+
+        def refuse(*_arguments, **_options):
+            raise ValueError("no symmetric lattice")
+
+        # The detection: raised by its name at its join, and the reduction
+        # that is published says that there is none.
+        preparation = self._preparation()
+        with patch.object(symmetry, "load_or_detect_reflection_reduction", refuse):
+            maps = preparation.symmetry_maps
+            grid = SimpleNamespace()
+            maps.start(grid, (), decompose=True)
+            with self.assertRaisesRegex(ValueError, "no symmetric lattice"):
+                maps.reduction()
+            self.assertIsNone(preparation.symmetry_reduction.wait())
+            self.assertIsNone(maps.decomposition(object()))
+        with self.assertRaisesRegex(RuntimeError, "start once"):
+            maps.start(grid, (), decompose=True)
+        # The decomposition: the reduction is there, the failure at its join.
+        preparation = self._preparation()
+        reduction = SimpleNamespace(group_order=2, multiplicities=np.full(3, 2))
+        info = SimpleNamespace(key=None)
+        with (
+            patch.object(
+                symmetry, "load_or_detect_reflection_reduction",
+                lambda *_a, **_o: (reduction, info),
+            ),
+            patch.object(symmetry, "load_or_build_reflection_decomposition", refuse),
+            patch.dict(driver_module.os.environ),
+        ):
+            driver_module.os.environ.pop("PARSEC_ORBITAL_STABILIZER_SYMMETRY", None)
+            maps = preparation.symmetry_maps
+            maps.start(SimpleNamespace(), (), decompose=True)
+            self.assertEqual(maps.reduction(), (reduction, info))
+            self.assertIs(preparation.symmetry_reduction.wait(), reduction)
+            with self.assertRaisesRegex(ValueError, "no symmetric lattice"):
+                maps.decomposition(reduction)
+        self.assertEqual(self._threads(), [])
+
+    def test_failure_of_the_reference_stage_comes_first_and_joins_the_thread(
+        self,
+    ) -> None:
+        import parsec_python.acceleration.Symmetry as symmetry
+
+        ended = []
+        detect = symmetry.load_or_detect_reflection_reduction
+
+        def slow(*arguments, **options):
+            threading.Event().wait(timeout=0.3)
+            ended.append(threading.current_thread().name)
+            raise RuntimeError("detection failed")
+
+        preparation = self._preparation()
+        # The second atom lies outside the sphere: the reference preparation
+        # refuses it after the grid, where the thread has been started.
+        outside = self._problem(((0.9, -0.4, 0.3), (0.0, 0.0, 50.0)))
+        with (
+            patch.object(symmetry, "load_or_detect_reflection_reduction", slow),
+            self.assertRaisesRegex(ValueError, "lies outside the domain"),
+        ):
+            try:
+                self._reference_stage_without_join(preparation, outside)
+            finally:
+                # What prepare_single_point does on every way out.
+                preparation.close()
+        self.assertEqual(len(ended), 1)
+        self.assertTrue(ended[0].startswith("parsec-symmetry-setup"))
+        self.assertIsNone(preparation.symmetry_reduction.wait())
+        self.assertIs(symmetry.load_or_detect_reflection_reduction, detect)
+        self.assertEqual(self._threads(), [])
+
+    def _reference_stage_without_join(self, preparation, problem):
+        from parsec_python.Laplacian import build_negative_laplacian
+
+        native = "parsec_python.acceleration.backends.native."
+        with (
+            patch(
+                native + "_load_native",
+                return_value=SimpleNamespace(RadialGridEvaluator=object),
+            ),
+            patch(native + "build_native_negative_laplacian", build_negative_laplacian),
+            patch("parsec_python.acceleration.V_ion.NativeIonicBuilders", self._HostFields),
+            patch.dict(driver_module.os.environ, {"PARSEC_ACCELERATED_RESIDENT": "0"}),
+        ):
+            return driver_module._prepare_reference_physics(
+                problem, _hybrid_selection(), preparation=preparation,
+                defer_native_laplacian=True, orbital_operators_only=True,
+            )
+
+    @staticmethod
+    def _starting_the_maps():
+        """Start the maps where the reference stage does, around its double."""
+
+        resolve = driver_module._resolve_and_prepare_reference
+
+        def resolving(problem, backend, **options):
+            selection, reference, timing = resolve(problem, backend, **options)
+            maps = options["preparation"].symmetry_maps
+            if maps is not None:
+                maps.start(reference.grid, reference.atoms, decompose=True)
+            return selection, reference, timing
+
+        return patch.object(driver_module, "_resolve_and_prepare_reference", resolving)
+
+    def test_preparation_takes_the_maps_of_the_thread_and_reports_them(self) -> None:
+        root = SimpleNamespace(rank=0, root=0, size=2)
+        for mpi_context in (None, root, SimpleNamespace(rank=1, root=0, size=2)):
+            with self.subTest(mpi_context=mpi_context), self._starting_the_maps():
+                prepared = self.prepare(mpi_context)
+                details = dict(prepared.system.backend_info.details)
+                self.assertEqual(details["symmetry_setup"], self.overlapped)
+                self.assertIn("symmetry_setup_seconds", details)
+                self.assertIn("symmetry_setup_wait_seconds", details)
+                # The sector solver was given the decomposition of the thread.
+                decomposition = prepared.sector_solver_type.call_args.args[3]
+                self.assertIs(decomposition.reduction, prepared.reduction)
+                records = prepared.system.preparation_stages
+                threads = {record["stage"]: record["thread"] for record in records}
+                for stage in ("symmetry_reduction", "symmetry_decomposition"):
+                    self.assertTrue(threads[stage].startswith("parsec-symmetry-setup"))
+                for stage in ("symmetry_reduction_wait", "symmetry_decomposition_wait"):
+                    self.assertEqual(threads[stage], threading.current_thread().name)
+                # Each map was built once, by the thread.
+                names = [record["stage"] for record in records]
+                self.assertEqual(names.count("symmetry_reduction"), 1)
+                self.assertEqual(names.count("symmetry_decomposition"), 1)
+                self.assertEqual(self._threads(), [])
+
+    def test_thread_whose_maps_are_not_taken_has_ended_before_the_backend_is_built(
+        self,
+    ) -> None:
+        # A thread that was started on another grid serves nobody: the
+        # calling thread builds its maps in line and reads nothing of the
+        # thread, and still waits for it before the sector operators.
+        acceleration = "parsec_python.acceleration."
+        seen = []
+        resolve = driver_module._resolve_and_prepare_reference
+
+        def slow(*_arguments, **_options):
+            # Longer than the calling thread takes to reach the backend.
+            threading.Event().wait(timeout=0.3)
+            seen.append(
+                (threading.current_thread().name, driver_module._build_backend.called)
+            )
+            raise ValueError("another structure")
+
+        def resolving(problem, backend, **options):
+            selection, reference, timing = resolve(problem, backend, **options)
+            maps = options["preparation"].symmetry_maps
+            with patch(acceleration + "Symmetry.load_or_detect_reflection_reduction", slow):
+                maps.start(SimpleNamespace(), reference.atoms, decompose=True)
+            self.assertFalse(maps.serves(reference.grid, reference.atoms))
+            return selection, reference, timing
+
+        with patch.object(driver_module, "_resolve_and_prepare_reference", resolving):
+            prepared = self.prepare(None)
+        ((thread, backend_built),) = seen
+        self.assertTrue(thread.startswith("parsec-symmetry-setup"))
+        self.assertFalse(backend_built)
+        prepared.build_backend.assert_called_once()
+        # The maps of the calling thread, built in line: no wait for those
+        # of the thread, and the sector solver has the decomposition.
+        records = prepared.system.preparation_stages
+        main = threading.current_thread().name
+        self.assertEqual(
+            [
+                record["thread"] == main
+                for record in records
+                if record["stage"] == "symmetry_decomposition"
+            ],
+            [True],
+        )
+        self.assertNotIn(
+            "symmetry_reduction_wait", [record["stage"] for record in records]
+        )
+        decomposition = prepared.sector_solver_type.call_args.args[3]
+        self.assertIs(decomposition.reduction, prepared.reduction)
+        self.assertEqual(self._threads(), [])
+
+    def test_former_value_and_runs_without_symmetry_build_no_thread(self) -> None:
+        handed = []
+        resolve = driver_module._resolve_and_prepare_reference
+
+        def resolving(problem, backend, **options):
+            handed.append(options["preparation"].symmetry_maps)
+            return resolve(problem, backend, **options)
+
+        with patch.object(driver_module, "_resolve_and_prepare_reference", resolving):
+            for value in ("0", "off"):
+                with self.subTest(value=value):
+                    prepared = self.prepare(
+                        None, environment={"PARSEC_OVERLAP_SYMMETRY_SETUP": value}
+                    )
+                    self.assertIsNone(handed[-1])
+                    details = dict(prepared.system.backend_info.details)
+                    self.assertEqual(details["symmetry_setup"], "inline")
+                    self.assertNotIn("symmetry_setup_seconds", details)
+                    # In line, by the calling thread, after the reference stage.
+                    stages = [
+                        (record["stage"], record["thread"])
+                        for record in prepared.system.preparation_stages
+                        if record["stage"].startswith(("symmetry", "reference"))
+                    ]
+                    main = threading.current_thread().name
+                    self.assertEqual(
+                        stages,
+                        [
+                            ("reference_preparation", main),
+                            ("symmetry_reduction", main),
+                            ("symmetry_decomposition", main),
+                        ],
+                    )
+            # By default the reference stage is handed a thread to start; one
+            # that it does not start leaves the maps in line.
+            prepared = self.prepare(None)
+            self.assertIsInstance(handed[-1], driver_module._OverlappedSymmetryMaps)
+            self.assertFalse(handed[-1].started)
+            self.assertEqual(
+                dict(prepared.system.backend_info.details)["symmetry_setup"], "inline"
+            )
+        # Without symmetry nothing is detected, and no thread waits for it.
+        with patch.object(driver_module, "_resolve_and_prepare_reference", resolving):
+            system = driver_module.prepare_single_point(
+                parse_parsec_input(SMOKE_INPUT).problem, backend="scipy", symmetry="off"
+            )
+        self.assertIsNone(handed[-1])
+        self.assertEqual(
+            dict(system.backend_info.details)["symmetry_setup"], "not used"
+        )
+        self.assertNotIn(
+            "symmetry_reduction",
+            [record["stage"] for record in system.preparation_stages],
+        )
+        self.assertEqual(self._threads(), [])
+
+    def test_detection_that_fails_on_the_thread_falls_back_as_in_line(self) -> None:
+        def refuse(*_arguments, **_options):
+            raise ValueError("no symmetric lattice")
+
+        acceleration = "parsec_python.acceleration."
+        resolve = driver_module._resolve_and_prepare_reference
+
+        def resolving(problem, backend, **options):
+            selection, reference, timing = resolve(problem, backend, **options)
+            maps = options["preparation"].symmetry_maps
+            with patch(
+                acceleration + "Symmetry.load_or_detect_reflection_reduction", refuse
+            ):
+                maps.start(reference.grid, reference.atoms, decompose=True)
+                maps.close()
+            return selection, reference, timing
+
+        with (
+            patch.object(driver_module, "_resolve_and_prepare_reference", resolving),
+            patch.object(driver_module, "_hartree_boundary_tail", return_value=None),
+            patch(acceleration + "Hartree.native_poisson.NativePoissonSolver"),
+            patch(acceleration + "Hartree.native_boundary.NativeMultipoleBoundaryBuilder"),
+        ):
+            prepared = self.prepare(None)
+        details = dict(prepared.system.backend_info.details)
+        # The words of the fallback of a detection that fails in line.
+        self.assertEqual(
+            details["symmetry_detection"],
+            "automatic detection fell back to full grid: ValueError: no symmetric lattice",
+        )
+        self.assertEqual(details["symmetry_setup"], self.overlapped)
+        self.assertEqual(details["orbital_symmetry"], "full grid (no nontrivial supported symmetry)")
+        prepared.sector_solver_type.assert_not_called()
+        self.assertEqual(self._threads(), [])
+
+
+class PreparationStageTests(unittest.TestCase):
+    """The clock of a preparation, and the threads it joins on the way out."""
+
+    prepare = MPIRolePreparationTests.prepare
+    _starting_the_fields = staticmethod(IonicFieldOverlapTests._starting_the_fields)
+
+    def tearDown(self) -> None:
+        with driver_module._REFERENCE_CACHE_LOCK:
+            driver_module._REFERENCE_CACHE.clear()
+
+    @staticmethod
+    def _threads(prefix):
+        return [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith(prefix)
+        ]
+
+    def test_clock_records_the_stages_of_every_thread_from_its_origin(self) -> None:
+        stages = driver_module._PreparationStages()
+        started = driver_module.perf_counter()
+        stages.add("second", started + 2.0, started + 3.0)
+        stages.add("first", started + 1.0, started + 5.0)
+        timed = stages.timed("call", lambda value, scale=1: value * scale)
+        self.assertEqual(timed(3, scale=2), 6)
+        # A name may be read from the arguments of the call, and a call that
+        # raises is a stage up to its failure.
+        named = stages.timed(lambda *_arguments, core=False: "core" if core else "valence", dict)
+        named(core=True)
+        named()
+
+        def fail():
+            raise RuntimeError("stage failed")
+
+        with self.assertRaisesRegex(RuntimeError, "stage failed"):
+            stages.timed("failed", fail)()
+        worker = threading.Thread(
+            target=lambda: stages.add("beside", driver_module.perf_counter()),
+            name="parsec-test-stage",
+        )
+        worker.start()
+        worker.join()
+
+        records = stages.records()
+        self.assertEqual(
+            sorted(record["stage"] for record in records),
+            ["beside", "call", "core", "failed", "first", "second", "valence"],
+        )
+        self.assertEqual(
+            set(records[0]), {"stage", "thread", "start_seconds", "end_seconds"}
+        )
+        # In the order of the starts, in seconds from the origin of the clock.
+        starts = [record["start_seconds"] for record in records]
+        self.assertEqual(starts, sorted(starts))
+        by_name = {record["stage"]: record for record in records}
+        offset = started - stages.origin
+        self.assertAlmostEqual(by_name["first"]["start_seconds"], offset + 1.0, 9)
+        self.assertAlmostEqual(by_name["first"]["end_seconds"], offset + 5.0, 9)
+        self.assertEqual(by_name["first"]["thread"], threading.current_thread().name)
+        self.assertEqual(by_name["beside"]["thread"], "parsec-test-stage")
+        for record in records:
+            self.assertGreaterEqual(record["end_seconds"], record["start_seconds"])
+
+    def test_preparation_reports_when_each_of_its_stages_ran(self) -> None:
+        root = SimpleNamespace(rank=0, root=0, size=2)
+        for mpi_context in (None, root, SimpleNamespace(rank=1, root=0, size=2)):
+            with self.subTest(mpi_context=mpi_context):
+                prepared = self.prepare(mpi_context)
+                records = prepared.system.preparation_stages
+                names = [record["stage"] for record in records]
+                worker = mpi_context is not None and mpi_context.rank != 0
+                expected = {
+                    "backend_resolution",
+                    "reference_preparation",
+                    "symmetry_reduction",
+                    "symmetry_decomposition",
+                    "backend_build",
+                    "sector_eigensolver",
+                    "xc_evaluator",
+                    "hartree_solver",
+                    "preparation",
+                }
+                if not worker:
+                    expected |= {
+                        "poisson_solver",
+                        "hartree_boundary_setup",
+                        "hartree_boundary_setup_wait",
+                    }
+                self.assertEqual(set(names), expected)
+                self.assertEqual(len(names), len(expected))
+                by_name = {record["stage"]: record for record in records}
+                whole = by_name["preparation"]
+                self.assertEqual(whole["start_seconds"], 0.0)
+                for record in records:
+                    self.assertGreaterEqual(record["start_seconds"], 0.0)
+                    self.assertLessEqual(record["end_seconds"], whole["end_seconds"])
+                # The stages of the calling thread in the order it runs them.
+                main = [
+                    record["stage"]
+                    for record in records
+                    if record["thread"] == threading.current_thread().name
+                    and record["stage"] not in {"preparation", "poisson_solver", "hartree_boundary_setup_wait"}
+                ]
+                self.assertEqual(
+                    main,
+                    [
+                        "backend_resolution",
+                        "reference_preparation",
+                        "symmetry_reduction",
+                        "symmetry_decomposition",
+                        "backend_build",
+                        "sector_eigensolver",
+                        "xc_evaluator",
+                        "hartree_solver",
+                    ],
+                )
+                if not worker:
+                    # The boundary geometry on its thread, joined inside the
+                    # stage of the Hartree solver, after the Poisson solver.
+                    boundary = by_name["hartree_boundary_setup"]
+                    self.assertTrue(boundary["thread"].startswith("parsec-hartree-setup"))
+                    solver, wait = by_name["hartree_solver"], by_name["hartree_boundary_setup_wait"]
+                    self.assertGreaterEqual(wait["start_seconds"], by_name["poisson_solver"]["end_seconds"])
+                    self.assertGreaterEqual(wait["end_seconds"], boundary["end_seconds"])
+                    self.assertLessEqual(wait["end_seconds"], solver["end_seconds"])
+                    self.assertGreaterEqual(wait["start_seconds"], solver["start_seconds"])
+                # The timeline is the prepared system's and no entry of the
+                # backend report: the result archive stores every entry of
+                # the report at the width of the longest, and one line of
+                # all stages would widen each of them.
+                details = dict(prepared.system.backend_info.details)
+                self.assertNotIn("preparation_stage_seconds", details)
+                for key, value in details.items():
+                    # Nor does an entry list the stages under another name.
+                    self.assertFalse(
+                        "backend_build" in value and "sector_eigensolver" in value, key
+                    )
+                self.assertEqual(self._threads("parsec-hartree-setup"), [])
+
+    def test_ionic_thread_and_its_join_are_stages(self) -> None:
+        def complete(reference, **_builders):
+            return SimpleNamespace(**vars(reference))
+
+        overlap = driver_module._OverlappedIonicFields()
+        stages = driver_module._PreparationStages()
+        with patch.object(driver_module, "complete_reference_single_point", complete):
+            overlap.start(SimpleNamespace(), stages=stages)
+            overlap.result()
+        by_name = {record["stage"]: record for record in stages.records()}
+        self.assertEqual(set(by_name), {"ionic_fields", "ionic_fields_wait"})
+        self.assertTrue(by_name["ionic_fields"]["thread"].startswith("parsec-ionic-setup"))
+        self.assertEqual(
+            by_name["ionic_fields_wait"]["thread"], threading.current_thread().name
+        )
+        self.assertGreaterEqual(
+            by_name["ionic_fields_wait"]["end_seconds"],
+            by_name["ionic_fields"]["end_seconds"],
+        )
+        # Closing after the join, or before any start, waits for nothing.
+        overlap.close()
+        driver_module._OverlappedIonicFields().close()
+
+    def test_seconds_of_the_fields_leave_out_the_choice_of_their_grid(self) -> None:
+        # Before its first sum the thread may wait for the symmetry
+        # reduction and test the images.  The time of the fields, from which
+        # the hidden time is counted, is that of the sums as it was before
+        # the thread chose a grid; the choice has an entry of its own, and
+        # the stage of the thread spans both.  A clock that only the two
+        # doubles move makes the seconds exact.
+        now = [100.0]
+
+        def choose():
+            now[0] += 5.0
+            return "symmetry wedge (2 of 8 points)"
+
+        def complete(reference, **_builders):
+            now[0] += 2.0
+            return reference
+
+        overlap = driver_module._OverlappedIonicFields()
+        with (
+            patch.object(driver_module, "perf_counter", lambda: now[0]),
+            patch.object(driver_module, "complete_reference_single_point", complete),
+        ):
+            stages = driver_module._PreparationStages()
+            overlap.start(SimpleNamespace(), stages=stages, before_sums=choose)
+            # The join finds the thread ended: it waits for nothing.
+            for thread in self._threads("parsec-ionic-setup"):
+                thread.join(timeout=10.0)
+            overlap.result()
+        self.assertEqual(overlap.seconds, 2.0)
+        self.assertEqual(overlap.sum_grid_seconds, 5.0)
+        details = dict(overlap.details())
+        self.assertEqual(details["ionic_setup_seconds"], "2.000000")
+        self.assertEqual(details["ionic_setup_wait_seconds"], "0.000000")
+        self.assertEqual(details["ionic_setup_overlapped_seconds"], "2.000000")
+        self.assertEqual(details["ionic_sum_grid"], "symmetry wedge (2 of 8 points)")
+        self.assertEqual(details["ionic_sum_grid_choice_seconds"], "5.000000")
+        (fields,) = [
+            record for record in stages.records() if record["stage"] == "ionic_fields"
+        ]
+        self.assertEqual((fields["start_seconds"], fields["end_seconds"]), (0.0, 7.0))
+        # A thread that is told nothing about a grid reports neither entry.
+        overlap = driver_module._OverlappedIonicFields()
+        with patch.object(driver_module, "complete_reference_single_point", complete):
+            overlap.start(SimpleNamespace())
+            overlap.result()
+        details = dict(overlap.details())
+        self.assertNotIn("ionic_sum_grid", details)
+        self.assertNotIn("ionic_sum_grid_choice_seconds", details)
+
+    def test_failed_preparation_has_joined_the_thread_of_the_ionic_fields(self) -> None:
+        release = threading.Event()
+        ended = []
+
+        def complete(reference, **_builders):
+            # Longer than the rest of the preparation takes to fail.
+            release.wait(timeout=0.5)
+            ended.append(threading.current_thread().name)
+            return reference
+
+        with (
+            self._starting_the_fields(),
+            patch.object(driver_module, "complete_reference_single_point", complete),
+            self.assertRaisesRegex(ValueError, "PARSEC_ORBITAL_STABILIZER_SYMMETRY"),
+        ):
+            self.prepare(
+                None,
+                environment={
+                    **IonicFieldOverlapTests.gpu_fields,
+                    # Refused after the reference stage has started the
+                    # thread and before the join in front of the XC evaluator.
+                    "PARSEC_ORBITAL_STABILIZER_SYMMETRY": "sometimes",
+                },
+            )
+        # The error is the preparation's own, and the thread has ended.
+        self.assertEqual(len(ended), 1)
+        self.assertEqual(self._threads("parsec-ionic-setup"), [])
+
+    def test_failed_preparation_has_joined_the_thread_of_the_ion_ion_energy(
+        self,
+    ) -> None:
+        ended = []
+
+        def slow(_atoms, _pseudopotentials):
+            # Longer than the fields and the rest of the preparation take.
+            threading.Event().wait(timeout=0.5)
+            ended.append(threading.current_thread().name)
+            return 0.0
+
+        resolve = driver_module._resolve_and_prepare_reference
+
+        def resolving(problem, backend, **options):
+            selection, reference, timing = resolve(problem, backend, **options)
+            reference.pseudopotentials = {}
+            options["ionic_field_overlap"].start(reference, ion_ion_beside=True)
+            return selection, reference, timing
+
+        with (
+            patch.object(driver_module, "_resolve_and_prepare_reference", resolving),
+            patch.object(driver_module, "ion_ion_energy", slow),
+            # The fields end at once and never come to the stage of the
+            # energy: nothing but the way out waits for its thread.
+            patch.object(
+                driver_module,
+                "complete_reference_single_point",
+                lambda reference, **_builders: reference,
+            ),
+            self.assertRaisesRegex(ValueError, "PARSEC_ORBITAL_STABILIZER_SYMMETRY"),
+        ):
+            self.prepare(
+                None,
+                environment={
+                    **IonicFieldOverlapTests.gpu_fields,
+                    "PARSEC_ORBITAL_STABILIZER_SYMMETRY": "sometimes",
+                },
+            )
+        self.assertEqual(len(ended), 1)
+        self.assertTrue(ended[0].startswith("parsec-ion-ion"))
+        self.assertEqual(self._threads("parsec-ion-ion"), [])
+        self.assertEqual(self._threads("parsec-ionic-setup"), [])
+
+    def test_failed_preparation_has_joined_the_thread_of_the_boundary(self) -> None:
+        ended = []
+
+        def build(_reference, reduction, **_options):
+            threading.Event().wait(timeout=0.3)
+            ended.append(threading.current_thread().name)
+            raise RuntimeError("boundary geometry failed")
+
+        with (
+            patch.object(driver_module, "_build_native_boundary_builder", side_effect=build),
+            # The reduced Poisson solver of the GPU CG has no fallback: its
+            # failure leaves the preparation while the boundary thread works.
+            self.assertRaisesRegex(RuntimeError, "no reduced operator"),
+        ):
+            self.prepare(
+                None,
+                linear_backend="cupy",
+                poisson_failure=RuntimeError("no reduced operator"),
+            )
+        # What the thread raised is not read: the first error is reported.
+        self.assertEqual(len(ended), 1)
+        self.assertTrue(ended[0].startswith("parsec-hartree-setup"))
+        self.assertEqual(self._threads("parsec-hartree-setup"), [])
+
+    def test_closing_a_preparation_joins_the_last_thread_first_and_drops_errors(self) -> None:
+        preparation = driver_module._Preparation()
+        order = []
+
+        def failing():
+            order.append("second")
+            raise RuntimeError("join failed")
+
+        preparation.join_on_exit(lambda: order.append("first"))
+        preparation.join_on_exit(failing)
+        preparation.close()
+        self.assertEqual(order, ["second", "first"])
+        # Nothing is joined twice.
+        preparation.close()
+        self.assertEqual(order, ["second", "first"])
 
 
 class HartreeDevicePlacementTests(unittest.TestCase):
@@ -2136,8 +3882,9 @@ class HartreeDevicePlacementTests(unittest.TestCase):
     def test_the_sector_eigensolver_is_told_the_device_of_the_hartree_objects(
         self,
     ) -> None:
-        # A sector that shares its basis gives that device, the fullest of
-        # the process, no work beside its own.
+        # A sector that shares its basis gives that device work beside its
+        # own only where it has no other device and the sharing rule counts
+        # the room.
         rank_of_four = SimpleNamespace(rank=0, root=0, size=4)
         for environment, expected in (
             ({}, 3),
@@ -2420,7 +4167,10 @@ class RealHybridAccuracyTests(unittest.TestCase):
         problem = parse_parsec_input(SMOKE_INPUT).problem
         problem = replace(problem, scf=replace(problem.scf, max_iterations=3))
 
-        def run(switch):
+        def run(switch, grid="full", **more):
+            # The sums of the thread on every grid point unless a run names
+            # the default: fields summed on the symmetry wedge differ from
+            # the in-line ones by round-off (below).
             with patch.dict(
                 driver_module.os.environ,
                 {
@@ -2428,6 +4178,8 @@ class RealHybridAccuracyTests(unittest.TestCase):
                     "PARSEC_OVERLAP_IONIC_SETUP": switch,
                     "PARSEC_ACCELERATED_RESIDENT": "0",
                     "PARSEC_HARTREE_LINEAR_BACKEND": "cupy",
+                    "PARSEC_IONIC_SUM_GRID": grid,
+                    **more,
                 },
             ):
                 system = prepare_single_point(problem, backend="auto")
@@ -2447,17 +4199,87 @@ class RealHybridAccuracyTests(unittest.TestCase):
         self.assertEqual(
             details["ionic_gpu_devices"], inline_details["ionic_gpu_devices"]
         )
+        # The ion-ion energy on its own thread by default, and as the last
+        # stage of the ionic thread with the former value: the same bits.
+        self.assertEqual(details["ion_ion_setup"], "own thread beside the ionic fields")
+        self.assertNotIn("ion_ion_setup", inline_details)
+        former_system, former_details, former = run(
+            "1", PARSEC_OVERLAP_ION_ION_SETUP="0"
+        )
+        self.assertEqual(
+            former_details["ion_ion_setup"], "last stage of the ionic thread"
+        )
+        # The symmetry maps beside the projectors where the fields are left
+        # to their thread, and in line with the former value or with the
+        # fields in line: the same bits again.
+        self.assertEqual(details["symmetry_setup"], "overlapped with the projectors")
+        self.assertEqual(inline_details["symmetry_setup"], "inline")
+        maps_system, maps_details, maps_result = run(
+            "1", PARSEC_OVERLAP_SYMMETRY_SETUP="0"
+        )
+        self.assertEqual(maps_details["symmetry_setup"], "inline")
+        self.assertEqual(
+            maps_details["detected_symmetry_group_order"],
+            details["detected_symmetry_group_order"],
+        )
+        for built, result in (
+            (system, actual),
+            (former_system, former),
+            (maps_system, maps_result),
+        ):
+            for name in ("ionic_potential", "initial_density", "core_density"):
+                with self.subTest(field=name):
+                    self.assertEqual(
+                        getattr(built, name).tobytes(),
+                        getattr(inline_system, name).tobytes(),
+                    )
+            self.assertEqual(built.ion_ion_energy, inline_system.ion_ion_energy)
+            np.testing.assert_array_equal(result.eigenvalues, expected.eigenvalues)
+            np.testing.assert_array_equal(result.density, expected.density)
+            self.assertEqual(result.energies, expected.energies)
+            self.assertEqual(result.iterations, expected.iterations)
+        self.assertEqual(
+            details["ionic_sum_grid"], "full grid (PARSEC_IONIC_SUM_GRID=full)"
+        )
+        self.assertNotIn("ionic_sum_grid", inline_details)
+
+        # By default the thread sums on the symmetry wedge: one point per
+        # orbit, whose value every point of the orbit takes.
+        wedge_system, wedge_details, wedge_result = run("1", grid="auto")
+        reduction = wedge_system.scalar_field_adapter.reduction
+        rows, orbit = reduction.representative_rows, reduction.full_to_wedge
+        self.assertEqual(
+            wedge_details["ionic_sum_grid"],
+            f"symmetry wedge ({rows.size} of {orbit.size} points)",
+        )
+        self.assertLess(rows.size, orbit.size)
         for name in ("ionic_potential", "initial_density", "core_density"):
-            with self.subTest(field=name):
-                self.assertEqual(
-                    getattr(system, name).tobytes(),
-                    getattr(inline_system, name).tobytes(),
+            with self.subTest(wedge_field=name):
+                on_orbits = getattr(wedge_system, name)
+                everywhere = getattr(inline_system, name)
+                self.assertEqual(on_orbits.shape, everywhere.shape)
+                np.testing.assert_array_equal(on_orbits, on_orbits[rows][orbit])
+                if name != "initial_density":
+                    # The sum of the representative row, bit for bit; the
+                    # density is normalized by the sum of all its rows.
+                    np.testing.assert_array_equal(on_orbits[rows], everywhere[rows])
+                # Round-off of one sum over the atoms on the other rows.
+                scale = float(np.max(np.abs(everywhere)))
+                self.assertLessEqual(
+                    float(np.max(np.abs(on_orbits - everywhere))),
+                    16 * np.finfo(float).eps * scale,
                 )
-        self.assertEqual(system.ion_ion_energy, inline_system.ion_ion_energy)
-        np.testing.assert_array_equal(actual.eigenvalues, expected.eigenvalues)
-        np.testing.assert_array_equal(actual.density, expected.density)
-        self.assertEqual(actual.energies, expected.energies)
-        self.assertEqual(actual.iterations, expected.iterations)
+        self.assertEqual(wedge_system.ion_ion_energy, inline_system.ion_ion_energy)
+        self.assertEqual(wedge_result.iterations, expected.iterations)
+        np.testing.assert_allclose(
+            wedge_result.eigenvalues, expected.eigenvalues, rtol=0.0, atol=1.0e-11
+        )
+        np.testing.assert_allclose(
+            wedge_result.density, expected.density, rtol=0.0, atol=1.0e-11
+        )
+        self.assertAlmostEqual(
+            wedge_result.energies.total, expected.energies.total, delta=1.0e-11
+        )
 
     def test_gpu_cg_on_the_reused_sector_stencil_is_bitwise_the_repacked_one(
         self,
@@ -2724,6 +4546,90 @@ class RealHybridAccuracyTests(unittest.TestCase):
                 )
                 np.testing.assert_array_equal(actual.density, expected.density)
                 self.assertEqual(actual.energies, expected.energies)
+
+    def test_tiles_that_the_filter_work_chooses_leave_the_scf_bitwise_unchanged(
+        self,
+    ) -> None:
+        from parsec_python.acceleration.Eigensolvers import symmetry
+        from parsec_python.acceleration.backends import implicit_stencil
+
+        problem = parse_parsec_input(SMOKE_INPUT).problem
+        problem = replace(problem, scf=replace(problem.scf, max_iterations=3))
+        names = (
+            "PARSEC_CUPY_IMPLICIT_TILE",
+            "PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS",
+            "PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS",
+        )
+        kept = {
+            name: value
+            for name, value in driver_module.os.environ.items()
+            if name not in names
+        }
+        handed = []
+        choice = symmetry.implicit_tile_for_sector
+
+        def recorded(rows, device_count, float32_filter=False, sectors_on_device=1, work=None):
+            tile = choice(rows, device_count, float32_filter, sectors_on_device, work)
+            handed.append((work, tile))
+            return tile
+
+        def run(**settings):
+            del handed[:]
+            with patch.dict(
+                driver_module.os.environ,
+                {
+                    **kept,
+                    "PARSEC_CUPY_MIXED_FILTER": "off",
+                    "PARSEC_ACCELERATED_RESIDENT": "0",
+                    **settings,
+                },
+                clear=True,
+            ), patch.object(symmetry, "implicit_tile_for_sector", recorded):
+                system = prepare_single_point(problem, backend="auto")
+                details = dict(system.backend_info.details)
+                return run_scf(system), details
+
+        storage = "orbital_sector_finite_difference_storage"
+        # The defaults: the driver hands every sector the filter work of the
+        # input, which for a few states repays no packing.
+        expected, slot_major = run()
+        self.assertEqual(slot_major["orbital_sector_tile_pack_workers"], "no tiles packed")
+        self.assertEqual(len(handed), 8)
+        plan = driver_module._filter_plan(SimpleNamespace(input=problem, electron_count=8.0))
+        for work, tile in handed:
+            self.assertEqual(
+                (work.applications, work.devices, tile), (plan.applications, 1, 0)
+            )
+            self.assertGreaterEqual(work.columns, 1)
+            self.assertLessEqual(work.columns, plan.states // 8 + plan.buffer + 1)
+        self.assertEqual(
+            (plan.states, plan.buffer),
+            (problem.scf.number_of_states, problem.eigensolver.subspace_buffer),
+        )
+        # Packing that costs next to nothing and tiles that save at any
+        # share: the rule itself now asks for tiles, of every sector.
+        with patch.object(implicit_stencil, "PACKING_SECONDS_PER_ROW", 1.0e-18), patch.object(
+            implicit_stencil, "REGULAR_SHARE_WITHOUT_GAIN", -1.0
+        ):
+            actual, details = run()
+            self.assertEqual([tile for _work, tile in handed], [16] * 8)
+            self.assertEqual(details[storage], "implicit_affine_tile_16")
+            # The two row limits at their former values give the choice
+            # before the rule, whatever the rule would say.
+            former, former_details = run(
+                PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS="650000",
+                PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS="1100000",
+            )
+            self.assertEqual([tile for _work, tile in handed], [0] * 8)
+        self.assertEqual(former_details[storage], slot_major[storage])
+        for result in (actual, former):
+            self.assertEqual(result.iterations, expected.iterations)
+            np.testing.assert_array_equal(result.eigenvalues, expected.eigenvalues)
+            np.testing.assert_array_equal(result.density, expected.density)
+            np.testing.assert_array_equal(
+                result.hartree_potential, expected.hartree_potential
+            )
+            self.assertEqual(result.energies, expected.energies)
 
     def test_a_result_reports_the_filter_graphs_that_its_sectors_recorded(
         self,

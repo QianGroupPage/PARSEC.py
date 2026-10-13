@@ -3,8 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
+from threading import Event, Thread
+from time import perf_counter
 from typing import Callable
 
+from parsec_python.Hartree import valence_point_charges
+from parsec_python.Hartree.domain import (
+    DOMAIN_ENERGY_TOLERANCE,
+    PreparedEstimates,
+    prepare_radius_search,
+)
 from parsec_python.Output import ParsecTextReporter
 
 from ..backends.cupy_capture import capture_statistics
@@ -110,8 +119,103 @@ def domain_details(domain) -> tuple[tuple[str, str], ...]:
     return details
 
 
+def domain_report_thread_requested() -> bool:
+    """Whether the radius search of the block after the SCF is prepared beside the SCF.
+
+    ``PARSEC_DOMAIN_REPORT_THREAD`` is on by default.  The block "Density at
+    the sphere" names the radius that would meet the wall share and, for
+    that, asks at which radius the largest multipole order meets the
+    tolerance of the rule: estimates of the omitted potential at candidate
+    radii, which depend on the geometry alone and took 0.13 to 0.24 s each
+    for 14,680 to 39,368 electrons on the host of an A100 node, 1.2 s after
+    the SCF of the largest, which asked for five.  With the switch on a
+    host thread makes them while the SCF runs
+    (:class:`RadiusEstimatesThread`) and the block reads them; ``0`` makes
+    them after the SCF, as before.  The lines of the block and its record
+    are the same either way, apart from the seconds of the radius.
+    """
+
+    return os.environ.get("PARSEC_DOMAIN_REPORT_THREAD", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+class RadiusEstimatesThread:
+    """A host thread that makes, beside the SCF, the estimates of the radius search after it.
+
+    The thread calls
+    :func:`~parsec_python.Hartree.domain.prepare_radius_search` for the
+    sphere and the atoms of a prepared system and nothing else: NumPy on
+    host arrays of its own, no call on a device, no array of the solver.  It
+    ends by itself once every start of the search has been tried, usually
+    within the first SCF step, and :meth:`stop` ends it before that: the
+    estimate it is making is finished, no other is begun, and the thread is
+    joined.  What it kept is then ``estimates``; whatever it raised is kept
+    in ``failure`` and stops nothing, since the search after the SCF makes
+    for itself every estimate it does not find.
+    """
+
+    def __init__(self, system, translation) -> None:
+        settings = system.grid.settings
+        self.estimates = PreparedEstimates(
+            *valence_point_charges(
+                system.atoms, system.pseudopotentials, system.electron_count
+            )
+        )
+        self.failure: str | None = None
+        self.seconds = 0.0
+        self._ended = Event()
+        self._arguments = (float(settings.radius), float(system.electron_count))
+        self._options = dict(
+            spacing=settings.spacing,
+            shift=settings.shift[0],
+            stencil_half_width=settings.stencil_half_width,
+            budget=float(
+                getattr(translation, "domain_energy_tolerance", DOMAIN_ENERGY_TOLERANCE)
+            ),
+            proceed=lambda: not self._ended.is_set(),
+        )
+        self._thread = Thread(
+            target=self._work, name="parsec-domain-radius", daemon=True
+        )
+        self._thread.start()
+
+    def _work(self) -> None:
+        started = perf_counter()
+        try:
+            prepare_radius_search(self.estimates, *self._arguments, **self._options)
+        except Exception as error:
+            self.failure = f"{type(error).__name__}: {error}"
+        self.seconds = perf_counter() - started
+
+    def stop(self) -> PreparedEstimates:
+        """End the thread, wait for it and return the estimates it made."""
+
+        self._ended.set()
+        self._thread.join()
+        return self.estimates
+
+
 class AcceleratedTextReporter:
-    """Delegate physical reporting and append backend provenance/timings."""
+    """Delegate physical reporting and append backend provenance/timings.
+
+    For a sphere whose block after the SCF may search a radius, a host
+    thread makes the estimates of that search while the SCF runs
+    (:class:`RadiusEstimatesThread`, ``PARSEC_DOMAIN_REPORT_THREAD``).
+    :meth:`setup` starts it and :meth:`finish` ends it; a caller whose
+    calculation does not reach :meth:`finish` calls :meth:`close`.
+
+    ``radius_thread_record`` says what became of that thread once it has
+    ended: the ``estimates`` it made, the ``seconds`` it worked, and its
+    ``failure``, the text of what it raised or of what kept it from
+    starting, ``None`` where nothing did.  It is ``None`` for a
+    calculation that was to have no thread.  The record is no part of the
+    block or of ``domain``, which are the same with and without the thread;
+    the MPI runner writes it into the entry of the root in ``timing.json``.
+    """
 
     def __init__(
         self,
@@ -136,6 +240,8 @@ class AcceleratedTextReporter:
         self._captures_before = capture_statistics()
         self._prepared_filter_precision = "float64"
         self._prepared_filter_graphs = None
+        self._radius_thread: RadiusEstimatesThread | None = None
+        self.radius_thread_record: dict | None = None
 
     @property
     def domain(self) -> dict | None:
@@ -146,8 +252,64 @@ class AcceleratedTextReporter:
     def header(self) -> None:
         self.reference.header()
 
+    def _start_radius_estimates(self, system) -> None:
+        """Start the thread of the radius search where the block after the SCF can ask for estimates.
+
+        It can for a sphere whose tolerance of the Hartree boundary is the
+        rule's: a tolerance of the input, a tolerance that is off and the
+        direct Coulomb sum ask for none, and neither does a run without the
+        block (``PARSEC_DOMAIN_REPORT=0``).  Only a calculation on the CuPy
+        backend gets the thread: its SCF leaves the cores of the host idle,
+        while the host backends work on them.  The thread is part of a
+        report: nothing that goes wrong in starting it stops the
+        calculation, and ``radius_thread_record`` keeps what did.
+        """
+
+        reference = self.reference
+        if not reference._domain_report or not domain_report_thread_requested():
+            return
+        try:
+            hartree = reference.problem.hartree
+            if (
+                system.backend_info.selected != "cupy"
+                or system.grid.settings.domain_shape != "sphere"
+                or hartree.boundary_method == "direct"
+                or hartree.boundary_tolerance is None
+                or getattr(reference.translation, "boundary_tolerance_from", "default")
+                == "input"
+            ):
+                return
+            self._radius_thread = RadiusEstimatesThread(system, reference.translation)
+        except Exception as error:
+            self._radius_thread = None
+            self.radius_thread_record = dict(
+                estimates=0,
+                seconds=0.0,
+                failure=f"not started: {type(error).__name__}: {error}",
+            )
+
+    def close(self) -> None:
+        """End the thread of the radius search, if it runs, and keep what it made for the report.
+
+        :meth:`finish` calls this before it reports.  A caller calls it on
+        every way out of a calculation that :meth:`setup` was called for, so
+        that no thread of the reporter outlives it; a second call does
+        nothing.  What the thread made, how long it worked and what it
+        raised, if anything, are then in ``radius_thread_record``.
+        """
+
+        thread, self._radius_thread = self._radius_thread, None
+        if thread is not None:
+            self.reference.prepared_estimates = thread.stop()
+            self.radius_thread_record = dict(
+                estimates=len(thread.estimates),
+                seconds=float(thread.seconds),
+                failure=thread.failure,
+            )
+
     def setup(self, system) -> None:
         self.reference.setup(system)
+        self._start_radius_estimates(system)
         info = system.backend_info
         details = dict(info.details)
         self._prepared_filter_precision = details.get(
@@ -210,8 +372,11 @@ class AcceleratedTextReporter:
         self,
         result: AcceleratedSinglePointResult,
         elapsed_seconds: float,
+        *,
+        forces=None,
     ) -> None:
-        self.reference.finish(result, elapsed_seconds)
+        self.close()
+        self.reference.finish(result, elapsed_seconds, forces=forces)
         # What the reference reporter estimated of the sphere joins the
         # details of the result, where the archive and the timing files
         # keep it beside the Hartree boundary.
@@ -439,4 +604,8 @@ class AcceleratedTextReporter:
         self.write("\n".join(lines))
 
 
-__all__ = ["AcceleratedTextReporter"]
+__all__ = [
+    "AcceleratedTextReporter",
+    "RadiusEstimatesThread",
+    "domain_report_thread_requested",
+]

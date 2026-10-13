@@ -2,9 +2,10 @@
 
 ## Review scope and conventions
 
-This document describes the scalar, spin-unpolarized, nonperiodic single-point
-path in WSL PARSEC commit
-`f432777750c2efc633adeb26faff641500b39b4a`.
+This document describes the scalar, nonperiodic single-point path in WSL
+PARSEC commit `f432777750c2efc633adeb26faff641500b39b4a`: first without spin
+polarization, then what `Spin_Polarization` changes
+([Spin-polarized calculations](#spin-polarized-calculations)).
 
 PARSEC's conventions must be kept together:
 
@@ -199,6 +200,50 @@ and `u_l=r R_l`. The tabulated tail obeys `r V_l -> -2 Zion`.
 The local component is not encoded in POTRE. `Local_Component` is required per
 species (`usrinputfile.F90:1806-1827`), and the user is responsible for avoiding
 ghost states.
+
+### Old Martins layout (`_POTR.DAT`)
+
+`Pseudopotential_Format: martins_old` selects the `MARTINS_OLD` branches of
+`pseudo.f90`. The file `<Symbol>_POTR.DAT` is read with list-directed
+statements (`pseudo.f90:163-177`, `289-348`):
+
+1. `ns lll icore`: radial samples, channels, core-correction flag
+2. `nloc(1..lll)`: angular momentum + 1 of every column
+3. `ns` records `r, V(nloc(1)), ..., V(nloc(lll))`: the potentials in Rydberg
+4. `ns` records `r, u(nloc(1)), ..., u(nloc(lll))`: reduced radial functions
+5. with `icore > 0`, `ns` records `r, rho_core`; a file that ends early
+   keeps zeros
+
+The potentials are stored as `V_l`, not `r V_l`, and the core charge as a
+volume density, not as a radial charge. The file names no element and no
+functional, and holds no grid parameter, no ionic charge, no occupation, no
+valence charge and no cutoff radius. Those come from elsewhere:
+
+- `Potential_Num` must equal `lll` (`pseudo.f90:170-177`, error 202).
+- The `Electron_Per_Orbital` block gives the occupations `f_l` of the
+  channels, s first; `Zion = sum_l f_l` (`pseudo.f90:132-135`). The atomic
+  density is always `sum_l f_l u_l²/(4 pi r²)`; `Read_VCD` is refused.
+- `Core_Cutoff_Radius` is `rcore`, the radius of the nonlocal sphere, as it
+  is given (`usrinputfile.F90:1837`). `nonloc.F90:150-247` keeps the grid
+  points with `|r-R| <= rcore`. For a new file `rcore` is instead the first
+  radial sample beyond the largest channel cutoff of the file
+  (`pseudo.f90:515-522`).
+- The grid `r(i) = a exp(b(i-1)) - a` (`i=1` is the origin PARSEC inserts) is
+  fitted to the samples `i_0=101` and `j0=201` (`pseudo.f90:323-337`):
+
+```text
+a = r(i_0)² / [r(j0) - 2 r(i_0)]
+b = log[r(j0)/a + 1] / (j0 - 1)
+```
+
+Everything downstream (local potential, projectors, densities, derivative
+tables of the forces) is the code of the new format.
+
+ESDF hands out the occurrences of a label in the order of the calls
+(`esdf_mod.f90`). `Potential_Num` is read for every species, the other two
+for old-format species only. A new-format species ahead of an old-format one
+therefore takes the first `Potential_Num` of the input, and PARSEC stops
+with error 138 unless that species has a line of its own.
 
 ### Local ionic potential
 
@@ -503,6 +548,16 @@ Each `f_i` lies in `[0,1]`; the factor two for spin degeneracy is applied
 elsewhere. The bisection count tolerance is `1e-12`, maximum iterations 100,
 and exponent cutoff 35.
 
+A negative `Fermi_Temp` replaces the search by the occupations of the file
+`occup.in` (`initial.f90:461-523`). Each spin channel has a section there: a
+title line, the number of fully occupied states, the number `m` of
+occupations set by hand, and `m` records with a state index and its
+occupation. A calculation without spin polarization reads the first section
+only. `initial.f90` stops (error 233) when `2 sum_i f_i` differs from `Ne` by
+more than `1e-5`. At every SCF step `flevel.f90:172-197` gives the n-th
+occupation to the state with the n-th lowest eigenvalue, whatever its
+representation, and reports no Fermi level.
+
 For full-grid, unpolarized orbitals with Euclidean column norm one,
 `newrho.F90` builds
 
@@ -611,8 +666,139 @@ Local and nonlocal pseudopotential contributions are already in `E_band`.
 Finite-temperature occupations do not add an entropy term, so this is an
 internal energy rather than a Mermin free energy.
 
+## Spin-polarized calculations
+
+`Spin_Polarization: true` (`usrinputfile.F90`) gives the calculation two
+collinear spin channels, up and down (`nspin = 2`). Every array that holds a
+potential, a set of eigenpairs or an occupation gets a spin index; the
+density array holds the total density and the two spin densities. Only the
+differences from the unpolarized path are listed here.
+
+### Input
+
+| Keyword | Meaning | Default |
+|---|---|---|
+| `Spin_Polarization` | two spin channels | false |
+| `Initial_Spin_Polarization` | per `Atom_Type`: polarization `p` of the atomic starting density | 0.1 |
+| `Correlation_Type` | functional | `pl` (Perdew-Wang LSDA) with spin, `ca` without |
+| `Fermi_Temp` < 0 | occupations from `occup.in`, one section per channel, up first | |
+
+`States_Num` is the number of states of each channel. `initial.f90` accepts
+fixed occupations when their sum over both channels is the electron count
+(a state holds one electron), where the unpolarized rule is twice the sum.
+
+### Starting density (`initchrg.f90`)
+
+For every species with polarization `p`, the superposed atomic density
+`rho_species` enters three arrays:
+
+```text
+rho_total += rho_species
+rho_up    += (1 + p) rho_species
+rho_down  += (1 - p) rho_species
+```
+
+All three are scaled by the factor that normalizes `rho_total` to the
+electron count. The two channels therefore add up to **twice** the total
+density, and the "Initial magnetic moment" PARSEC prints is `2 p N_e` for
+one species (0.2 for a hydrogen atom with the default). The first Hartree
+potential is that of `rho_total`; the first exchange-correlation potentials
+are those of the doubled pair. This affects the first input potential only,
+hence the path of the SCF loop and not its fixed point.
+
+### One SCF step
+
+1. `eigval.F90` solves one eigenproblem per channel with
+   `H_s = -nabla^2 + V_s + V_NL`. Each channel has its own saved subspace,
+   Ritz values, filter bound and filter counter (`solver%eval_loc`,
+   `lowerb`, `firstfilt`, `ncompcnt` carry a spin index). The LAPACK random
+   stream of the first CHEBFF or CHEBDAV basis is not restarted between the
+   channels.
+2. `flevel.f90` finds **one** Fermi level for both channels by the same
+   bisection, with `sum_s sum_i f_s,i = N_e` and `f` in `[0, 1]`. It starts
+   at the highest eigenvalue with the lowest and highest as bounds, so the
+   level it reports inside a gap is a property of that bisection. The
+   electrons of a channel are `totel(s) = sum_i f_s,i`; the net magnetic
+   moment is `totel(up) - totel(down)` Bohr magnetons.
+3. `newrho.F90` builds `rho_s = h^-3 sum_i f_s,i |psi_s,i|^2` (its factor
+   `2/h^3` divided by `nspin`) and `rho = rho_up + rho_down`.
+4. `rho_hart.F90` solves the Hartree equation for `rho` and calls
+   `exc_spn.f90` with `rho_s + rho_core/2` for each channel.
+5. `V_s,out = V_ion + V_H + V_xc,s`.
+6. `totnrg.f90`:
+
+   ```text
+   E_band = sum_s sum_i f_s,i epsilon_s,i              (no factor two)
+   E = E_band - sum_s integral rho_s (V_s,in - V_ion)
+       + 1/2 integral rho V_H + E_xc + E_II
+   Integral_{Vxc*rho} = sum_s integral rho_s V_xc,s
+   ```
+
+7. `getsre.f90` evaluates both residuals per channel,
+   `sqrt(h^3 sum (V_s,out - V_s,in)^2)` and
+   `sqrt(h^3 sum rho_s (V_s,out - V_s,in)^2 / totel(s))` (zero for a channel
+   without electrons). `parsec.F90` tests the larger of the two channels,
+   for convergence and for lowering the filter degree.
+8. `spinmix.f90` copies the two input and the two output potentials into
+   vectors of twice the grid size, up first; the mixer treats them as one
+   vector; `spinunmix.f90` copies the result back.
+
+### Functionals (`exc_spn.f90`)
+
+`ca`: Dirac exchange of each channel, `e_x = -(3/4)(3/pi)^(1/3)
+(2 rho_s)^(1/3)` Hartree per electron of that channel, and Perdew-Zunger
+correlation interpolated between the unpolarized (`u`) and the fully
+polarized (`p`) gas:
+
+```text
+zeta = (rho_up - rho_down) / rho
+f(zeta) = [(1+zeta)^(4/3) + (1-zeta)^(4/3) - 2] / 0.5198421
+e_c = e_u + f (e_p - e_u)
+v_c,up/down = v_u + f (v_p - v_u) +- (e_p - e_u) (1 -+ zeta) f'(zeta)
+```
+
+with the polarized parameters (Ry) `gamma = -0.1686`, `beta1 = 1.3981`,
+`beta2 = 0.2611` for `r_s >= 1` and `A = 0.0311`, `B = -0.0538`,
+`C = 0.0014`, `D = -0.0096` below.
+
+`pb`: `spn_pbe.f90`, the PBE routines of Burke: exchange by spin scaling,
+correlation from the Perdew-Wang spin interpolation and the `phi(zeta)`
+gradient correction, with potentials from the continuum formulas that need
+the Laplacian of each spin density and gradients of `|grad rho|`.
+
+### Forces
+
+`forcloc.f90` uses the total density, the average over the two channels of
+`V_H + V_xc,s - (V_s,in - V_ion)` for the self-consistency term and the
+average of `V_xc,s` for the core-correction term. `forcnloc.f90` sums the
+nonlocal term over the states of both channels with the weight `4/nspin`.
+
+### Report
+
+`flevel.f90` prints "Electrons in up, down spins", "Net magnetic moment",
+the Fermi level and one table of states per channel (`up State ...`,
+`dn State ...`); `rho_hart.F90` the extrema of each spin density;
+`getsre.f90` one residual line per channel (`0- 12 up SRE of pot. ...`).
+
 ## Source behaviors to treat carefully
 
+- With `Spin_Polarization` the two starting spin densities add up to twice
+  the total starting density (`initchrg.f90`, above).
+- `exc_spn.f90` evaluates the `ca` functional only where **both** spin
+  densities are positive. Elsewhere it leaves its work array, which holds the
+  densities on entry, untouched: the "potential" of such a point is the
+  density, and the point adds nothing to the energy. A channel without
+  electrons (the down channel of a hydrogen atom at 80 K) is zero everywhere,
+  and that SCF loop does not converge.
+- `spn_pbe.f90` sets the exchange energy of a point to zero where either spin
+  density is below `1e-18`: the same state loses its whole exchange energy
+  with `pb`, while its potentials are still evaluated.
+- A partly filled degenerate shell (the oxygen atom at 80 K) has no unique
+  spin-polarized solution: the density breaks the symmetry and the
+  orientation of the occupied orbital depends on the first steps.
+  Fortran keeps the orbitals in the representations of its Abelian subgroup,
+  hence along the axes. The sign of the net moment of an open shell is as
+  open: both programs can end with the majority in either channel.
 - `Ignore_Symmetry` also changes the grid shift.
 - `Solver_Lpole` is read but reset to 9 later in this commit. The Python
   port accepts 0 to 60 and treats the value as the minimum order.

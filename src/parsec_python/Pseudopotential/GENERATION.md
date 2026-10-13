@@ -91,7 +91,8 @@ PYTHONPATH=src python3 -m pp_generation P \
 
 Retain `*_FHIPP.DAT` as the lossless generator-grid reference. The Python
 PARSEC implementation reads only `*_POTRE.DAT`; POTRE conversion resamples
-radial fields and must be independently converged. The converter preserves
+radial fields (cubic interpolation in log r) and must be independently
+converged. The converter preserves
 UPF `PP_NLCC` as PARSEC radial core charge and supports genuinely all-local
 H/He potentials. UPF's `total_aeenergy` field written here is useful
 provenance but is a workflow extension, not a standard UPF v2 attribute.

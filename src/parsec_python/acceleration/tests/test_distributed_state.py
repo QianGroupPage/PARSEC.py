@@ -77,6 +77,72 @@ class SharedPoolTests(unittest.TestCase):
         # follows a pass, the outgrown workspaces stay beside the larger ones.
         self.assertEqual(passes(mib, mib, mib // 2, 2 * mib, 2 * mib, 3 * mib, **{name: '1'}), [0, 0, 0, 16, 16, 40])
 
+    def test_an_exchange_buffer_that_a_pass_has_outgrown_goes_back_to_the_driver_before_the_larger_one_is_taken(self):
+        from parsec_python.acceleration.Eigensolvers.distributed_state import SectorDeviceGroup
+        cp, _ = require_cupy()
+        cp.cuda.Device(0).use()
+        pool, mib = cp.get_default_memory_pool(), 1 << 20
+        name = 'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE'
+
+        def passes(*sizes, **environment):
+            """Megabytes that the pool of the device holds while each pass has its exchange buffer of ``sizes`` elements."""
+            gc.collect()
+            pool.free_all_blocks()
+            group = SectorDeviceGroup(_hamiltonian(257), (0,))
+            held = []
+            with patch.dict(os.environ):
+                os.environ.pop(name, None)
+                os.environ.update(environment)
+                for size in sizes:
+                    (taken,) = group.map(lambda index, device: group._exchange_buffer(cp, device, size))
+                    self.assertEqual((taken.size, int(taken.device.id)), (size, 0))
+                    held.append(int(pool.total_bytes()) // mib)
+                    del taken
+                    group.map(lambda index, device: None)
+            return [later - held[0] for later in held], group.exchange_buffer_bytes
+
+        # Buffers of 8 MiB, then 9 (an eighth more, as where a later pass sends a slab that the buffer is to
+        # hold whole) and 16.  A pass that takes no more finds its block in the free list of the stream; one
+        # that takes more first returns that list to the driver, so the pool holds the larger buffer in
+        # place of the smaller.
+        sizes = (mib, mib, mib // 2, mib + mib // 8, mib + mib // 8, 2 * mib)
+        self.assertEqual(passes(*sizes), ([0, 0, 0, 1, 1, 8], 16 * mib))
+        # Where the density step empties the pools the group returns nothing: here, where no density step
+        # follows a pass, the outgrown buffers stay beside the larger ones.
+        self.assertEqual(passes(*sizes, **{name: '1'}), ([0, 0, 0, 9, 9, 25], 16 * mib))
+
+    def test_the_count_of_a_helper_holds_what_its_estimate_takes_from_the_pool(self):
+        # cuSOLVER sizes the work array of a spectrum itself, so the count that lets the device with the Hartree
+        # objects estimate a condition number is held against the device at hand: the same estimate of an
+        # overlap that the device holds, in a pool of its own.  Beside the copy that cuSOLVER overwrites, which
+        # a helper finds in what its Gram arrays have just freed, it takes no more than the count less the
+        # cuSOLVER handle, which lies outside the pool.
+        from parsec_python.acceleration.Eigensolvers.distributed_state import condition_helper_bytes
+        from parsec_python.acceleration.Eigensolvers.rayleigh_ritz import _device_overlap_condition
+        cp, _ = require_cupy()
+        cp.cuda.Device(0).use()
+        previous = cp.cuda.get_allocator()
+        for states in (100, 442, 1000):
+            basis = np.random.default_rng(states).normal(size=(2 * states, states))
+            host = basis.T @ basis / (2 * states)
+            pool = cp.cuda.MemoryPool()
+            cp.cuda.set_allocator(pool.malloc)
+            try:
+                overlap = cp.asarray(host)
+                before = pool.total_bytes()
+                number = _device_overlap_condition(overlap)
+                taken = pool.total_bytes() - before
+                del overlap
+            finally:
+                cp.cuda.set_allocator(previous)
+                pool.free_all_blocks()
+            self.assertAlmostEqual(number, np.linalg.cond(host), delta=1e-8 * number)
+            counted = condition_helper_bytes(states) - (64 << 20)
+            # The eigenvalues and what the pool rounds up are not counted: a few kilobytes.
+            self.assertLessEqual(taken - 8 * states * states, counted + 8 * states + 8192, states)
+            # The count is no loose one: four m x m arrays of work are most of what was taken.
+            self.assertGreater(taken, 8 * 4 * states * states, states)
+
 
 @unittest.skipUnless(_device_count() >= 2, 'at least two CUDA devices required')
 class DistributedStateTests(unittest.TestCase):
@@ -194,6 +260,25 @@ class DistributedStateTests(unittest.TestCase):
             for switches in ({}, former):
                 with self.subTest(chunk_bytes=size, switches=switches):
                     self._exchange_round_trip(PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(size), **switches)
+
+    def test_blocks_that_the_buffer_follows_move_every_entry_exactly(self):
+        # Written where there is one CUDA device: this test had not run when it was added.
+        # Where no chunk size is named, blocks of which up to an eighth more than a chunk leaves a device go
+        # to their rows in one chunk, through a buffer of their size, and back in the chunks of the default.
+        # The default chunk stands for 1 GiB: just below the widest block, an eighth below it, and too small.
+        import importlib
+        from parsec_python.acceleration.Eigensolvers.chebyshev import uniform_filter_blocks
+        module = importlib.import_module('parsec_python.acceleration.Eigensolvers.distributed_state')
+        ranges = self.group.column_ranges(uniform_filter_blocks(23, 6, 5))
+        edges = self.group.row_edges(self.rows)
+        away = self.rows - min(high - low for low, high in zip(edges[:-1], edges[1:]))
+        block = away * max(stop - start for start, stop in ranges)
+        for default, followed in ((block * 16 // 17, True), (block - 1, True), (block * 8 // 9 - 1, False), (block // 3, False)):
+            with self.subTest(default=default), patch.dict(os.environ), \
+                 patch.object(module, '_EXCHANGE_CHUNK_BYTES', 8 * default):
+                os.environ.pop('PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', None)
+                self.assertEqual(module.exchange_chunk_limit(block), block if followed else default)
+                self._exchange_round_trip()
 
     def _assert_one_inbound_stream_per_peer(self):
         group = self.group

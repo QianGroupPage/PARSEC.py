@@ -116,21 +116,108 @@ class IonicSlabTests(unittest.TestCase):
         cls.pots = load_pseudopotentials(cls.spec)
         cls.grid = build_cluster_grid(GridSettings(spacing=.5, radius=4., expansion_order=8))
 
-    def sums(self, sector_rank=True, **settings):
-        """Both fields as an MPI rank that solves symmetry sectors sums them, or as another process does."""
+    def sums(self, sector_rank=True, orbits=None, grid=None, **settings):
+        """Both fields as an MPI rank that solves symmetry sectors sums them, or as another process does.
+
+        ``orbits`` is a symmetry reduction, or one with the coordinates of its representative rows, that the
+        builders are told to sum on first; ``grid`` replaces the grid whose fields are then asked for.
+        """
         cp, current = _host_cupy()
         kernel = _HostKernel(current)
         module = "parsec_python.acceleration.V_ion.cupy_ionic."
+        grid = self.grid if grid is None else grid
         with patch(module+"require_cupy", return_value=(cp, None)), patch(module+"_kernel", return_value=kernel), \
              patch("parsec_python.acceleration.Eigensolvers.symmetry.cupy_device_count", return_value=4), \
              _settings(**settings):
-            builders = CupyIonicBuilders(sector_rank=sector_rank)
+            builders = self.builders = CupyIonicBuilders(sector_rank=sector_rank)
             self.assertEqual(builders.device_ids, ())
-            fields = [builders.build_local_ionic_potential(self.grid, _ATOMS, self.pots, self.spec),
-                      builders.superpose_atomic_density(self.grid, _ATOMS, self.pots, self.spec)]
+            self.assertEqual(builders.summed_points, 0)
+            if orbits is not None:
+                builders.sum_on_orbits(self.grid, *(orbits if isinstance(orbits, tuple) else (orbits,)))
+            fields = [builders.build_local_ionic_potential(grid, _ATOMS, self.pots, self.spec),
+                      builders.superpose_atomic_density(grid, _ATOMS, self.pots, self.spec)]
         # What the builders say they used is what launched.
         self.assertEqual(sorted(builders.device_ids), sorted({launch[1] for launch in kernel.launches}))
         return fields, kernel
+
+    def test_sums_on_orbits_are_the_full_grid_sums_at_the_representative_rows(self):
+        from parsec_python.acceleration.Symmetry import AxisReflectionReduction
+        # The eight images of a point under the reflections of the three axes: the grid has that symmetry
+        # whatever the atoms have, and the builders take the caller's word for the fields.
+        reduction = AxisReflectionReduction.detect(self.grid, (Atom("C", (0., 0., 0.)),))
+        self.assertEqual(reduction.group_order, 8)
+        rows, orbit = reduction.representative_rows, reduction.full_to_wedge
+        self.assertLess(rows.size, self.grid.size//7)
+        full, whole = self.sums(PARSEC_IONIC_GPU_COUNT="1")
+        self.assertEqual(self.builders.summed_points, self.grid.size)
+        for settings, devices in ((dict(PARSEC_IONIC_GPU_COUNT="1"), 1), ({}, 4), (dict(PARSEC_IONIC_GPU_COUNT="3"), 3)):
+            with self.subTest(settings=settings):
+                fields, kernel = self.sums(orbits=reduction, **settings)
+                # One launch per device and field, on the points of the wedge alone.
+                self.assertEqual(len(kernel.launches), 2*devices)
+                for launches in (kernel.launches[:devices], kernel.launches[devices:]):
+                    self.assertEqual(sum(launch[2] for launch in launches), rows.size)
+                self.assertEqual(self.builders.summed_points, rows.size)
+                for field, everywhere in zip(fields, full):
+                    self.assertEqual((field.shape, field.dtype), (everywhere.shape, everywhere.dtype))
+                    self.assertTrue(field.flags.c_contiguous)
+                    # The value of a representative row is the one the full grid gives it, in every bit, and
+                    # every row of the grid has the value of the representative of its orbit.
+                    np.testing.assert_array_equal(field[rows], everywhere[rows])
+                    np.testing.assert_array_equal(field, everywhere[rows][orbit])
+                    self.assertFalse(np.array_equal(field, everywhere))
+        # The coordinates of the representative rows may be the caller's.
+        given, _ = self.sums(orbits=(reduction, self.grid.coordinates[rows]), PARSEC_IONIC_GPU_COUNT="1")
+        for field, everywhere in zip(given, full):
+            np.testing.assert_array_equal(field, everywhere[rows][orbit])
+        # Asked for the fields of another grid, the builders sum all its points.
+        other = replace(self.grid)
+        fields, kernel = self.sums(orbits=reduction, grid=other, PARSEC_IONIC_GPU_COUNT="1")
+        self.assertEqual([launch[2] for launch in kernel.launches], [self.grid.size]*2)
+        for field, everywhere in zip(fields, full):
+            np.testing.assert_array_equal(field, everywhere)
+
+    def test_full_grid_sums_come_back_and_a_reduction_of_another_grid_is_refused(self):
+        from parsec_python.acceleration.Symmetry import AxisReflectionReduction
+        reduction = AxisReflectionReduction.detect(self.grid, (Atom("C", (0., 0., 0.)),))
+        full, _ = self.sums(PARSEC_IONIC_GPU_COUNT="1")
+        cp, current = _host_cupy()
+        kernel = _HostKernel(current)
+        module = "parsec_python.acceleration.V_ion.cupy_ionic."
+        arguments = (self.grid, _ATOMS, self.pots, self.spec)
+        with patch(module+"require_cupy", return_value=(cp, None)), patch(module+"_kernel", return_value=kernel), \
+             patch("parsec_python.acceleration.Eigensolvers.symmetry.cupy_device_count", return_value=4), \
+             _settings(PARSEC_IONIC_GPU_COUNT="1"):
+            builders = CupyIonicBuilders(sector_rank=True)
+            builders.sum_on_orbits(self.grid, reduction)
+            wedge = builders.build_local_ionic_potential(*arguments)
+            builders.sum_on_full_grid()
+            again = builders.build_local_ionic_potential(*arguments)
+            # A field without a term is zero on the whole grid either way.
+            builders.sum_on_orbits(self.grid, reduction)
+            empty = builders.superpose_atomic_density(*arguments, core=True)
+        self.assertEqual([launch[2] for launch in kernel.launches], [reduction.wedge_size, self.grid.size])
+        np.testing.assert_array_equal(again, full[0])
+        self.assertFalse(np.array_equal(wedge, again))
+        np.testing.assert_array_equal(empty, np.zeros(self.grid.size))
+        smaller = build_cluster_grid(GridSettings(spacing=.5, radius=3., expansion_order=8))
+        with self.assertRaisesRegex(ValueError, "does not match the grid"):
+            CupyIonicBuilders().sum_on_orbits(smaller, reduction)
+        with self.assertRaisesRegex(ValueError, "one coordinate triple per symmetry orbit"):
+            CupyIonicBuilders().sum_on_orbits(self.grid, reduction, self.grid.coordinates)
+
+    def test_sum_grid_switch_is_auto_or_full(self):
+        from parsec_python.acceleration.V_ion.cupy_ionic import ionic_sum_grid_setting
+        with _settings():
+            os.environ.pop("PARSEC_IONIC_SUM_GRID", None)
+            self.assertEqual(ionic_sum_grid_setting(), "auto")
+        for value, expected in (("auto", "auto"), ("", "auto"), (" AUTO ", "auto"), ("full", "full"), (" Full ", "full")):
+            with self.subTest(value=value), _settings(PARSEC_IONIC_SUM_GRID=value):
+                self.assertEqual(ionic_sum_grid_setting(), expected)
+        for value in ("wedge", "0", "off", "orbits"):
+            with self.subTest(value=value), _settings(PARSEC_IONIC_SUM_GRID=value), \
+                 self.assertRaisesRegex(ValueError, "PARSEC_IONIC_SUM_GRID must be auto or full"):
+                ionic_sum_grid_setting()
 
     def test_default_uses_every_device_of_a_sector_rank_and_one_restores_the_single_slab(self):
         single, one = self.sums(PARSEC_IONIC_GPU_COUNT="1")
@@ -276,6 +363,56 @@ class IonicSetupTests(unittest.TestCase):
                         np.testing.assert_allclose(a,b,rtol=2e-14,atol=2e-14)
         np.testing.assert_array_equal(gpu.superpose_atomic_density(self.grid,self.atoms,self.pots,self.spec,core=True),
                                       np.zeros(self.grid.size))
+
+    @unittest.skipUnless(cupy_available(), "CUDA device required")
+    def test_gpu_fields_on_the_symmetry_wedge_differ_from_the_full_grid_by_round_off(self):
+        from parsec_python.acceleration.Symmetry import SignedPermutationReduction
+        from parsec_python.acceleration.Symmetry.exact_images import orbit_sum_points
+        cp, _ = require_cupy()
+        # Synthetic NLCC, as in the partition test above.
+        pots = {"C": replace(self.pots["C"], core_marker="pcec", core_density=np.exp(-self.pots["C"].radii**2))}
+        structures = {
+            # The three twofold axes (reflections of two axes at a time) and an atom they all keep.
+            "D2": ((1.1, .6, .35), (-1.1, -.6, .35), (1.1, -.6, -.35), (-1.1, .6, -.35), (0., 0., 0.)),
+            # Mirror planes that exchange x and y: the kernel adds the squares of a distance in another order.
+            "swap": ((1.3, 2.1, 0.), (2.1, 1.3, 0.), (-1.3, -2.1, 0.), (-2.1, -1.3, 0.)),
+            # Every reflection keeps one atom at the origin: orbits of eight points.
+            "one atom": ((0., 0., 0.),),
+        }
+        for shift in ((.5, .5, .5), (0., 0., 0.)):
+            grid = build_cluster_grid(GridSettings(spacing=.5, radius=4., expansion_order=8, shift=shift))
+            for name, positions in structures.items():
+                atoms = tuple(Atom("C", position) for position in positions)
+                reduction = SignedPermutationReduction.detect(grid, atoms)
+                points, obstacle = orbit_sum_points(grid, atoms, reduction)
+                self.assertIsNone(obstacle)
+                rows, orbit = reduction.representative_rows, reduction.full_to_wedge
+                for spline in (False, True):
+                    spec = {"C": replace(self.spec["C"], use_spline=spline)}
+                    for count in sorted({1, min(4, cp.cuda.runtime.getDeviceCount())}):
+                        with self.subTest(shift=shift, structure=name, spline=spline, devices=count), \
+                             patch.dict(os.environ, PARSEC_CUPY_DEVICES="auto", PARSEC_IONIC_GPU_COUNT=str(count)):
+                            gpu = CupyIonicBuilders()
+                            full = [gpu.build_local_ionic_potential(grid, atoms, pots, spec)]
+                            full += [gpu.superpose_atomic_density(grid, atoms, pots, spec, core=core)
+                                     for core in (False, True)]
+                            self.assertEqual(gpu.summed_points, grid.size)
+                            gpu.sum_on_orbits(grid, reduction, points)
+                            wedge = [gpu.build_local_ionic_potential(grid, atoms, pots, spec)]
+                            wedge += [gpu.superpose_atomic_density(grid, atoms, pots, spec, core=core)
+                                      for core in (False, True)]
+                            self.assertEqual(gpu.summed_points, rows.size)
+                            for on_orbits, everywhere in zip(wedge, full, strict=True):
+                                self.assertEqual((on_orbits.shape, on_orbits.dtype), (everywhere.shape, everywhere.dtype))
+                                # In every bit the full-grid value at the representative rows, and that value
+                                # on the whole orbit.
+                                np.testing.assert_array_equal(on_orbits[rows], everywhere[rows])
+                                np.testing.assert_array_equal(on_orbits, everywhere[rows][orbit])
+                                # Against the full-grid sums of the other rows: the round-off of one sum
+                                # over the atoms, a few units in the last place of the largest value.
+                                scale = float(np.max(np.abs(everywhere)))
+                                self.assertGreater(scale, 0.)
+                                self.assertLessEqual(float(np.max(np.abs(on_orbits-everywhere))), 16*np.finfo(float).eps*scale)
 
     @unittest.skipUnless(cupy_available(), "CUDA device required")
     def test_radial_cutoff_and_origin(self):

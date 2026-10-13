@@ -3,7 +3,8 @@
 ## Purpose
 
 This tree is the canonical home for a native Python translation of the PARSEC
-isolated single-point calculation. Readable, concept-oriented physics modules
+isolated single-point calculation, of its forces, and of the ionic steps
+(structural relaxation and molecular dynamics) built on them. Readable, concept-oriented physics modules
 and their optimized execution backends coexist in one package. "Native
 Python" means the calculation does not invoke or bind to the PARSEC Fortran
 program; optional C++/OpenMP and CUDA kernels implement Python-owned
@@ -36,6 +37,8 @@ main.py / python -m parsec_python
                  -> Occupations
                  -> Mixer
                  -> Energy
+            -> Forces
+            -> Relaxation / MolecularDynamics (ionic loop around SCF and Forces)
             -> acceleration/backends
             -> acceleration/Symmetry
             -> acceleration/Eigensolvers
@@ -54,16 +57,19 @@ import the SCF driver. Physics components must remain independently callable.
 | `Input` | ESDF parsing and validated calculation configuration | grid construction or file output |
 | `Grid` | isolated-domain points, masks, shifts, and index maps | kinetic coefficients |
 | `Laplacian` | finite-difference coefficients and kinetic application | effective potentials |
-| `Pseudopotential` | POTRE parsing, radial data, interpolation-ready models | placement on a molecular grid |
+| `Pseudopotential` | POTRE and old-format POTR parsing, radial data, interpolation-ready models | placement on a molecular grid |
 | `V_ion` | local potential, KB projectors, atomic density, ion-ion energy | SCF state |
 | `Hartree` | isolated boundary values and Poisson solution | density mixing |
-| `V_xc` | CA/PZ-LDA and spin-unpolarized PBE potentials and energy densities | total-energy assembly |
+| `V_xc` | CA/PZ-LDA and PBE potentials and energy densities, unpolarized and spin-polarized | total-energy assembly |
 | `Hamiltonian` | composition and block matrix-vector products | choosing an eigensolver |
 | `Eigensolvers` | PARSEC-selected eigensolver control flow and reusable subspaces | occupations or SCF mixing |
-| `Occupations` | Fermi level, occupations, and density from orbitals | eigensolution |
+| `Occupations` | Fermi level, occupations (searched, or fixed by `occup.in`), and density from orbitals | eigensolution |
 | `Mixer` | explicit mixer history and PARSEC SRE metrics | convergence policy selection |
 | `Energy` | named Rydberg energy components and total energy | text formatting |
 | `SCF` | ordering the component calls and applying stopping policy | hidden algorithm substitution |
+| `Forces` | ion-ion, local, nonlocal forces, their symmetrization and net-force removal | moving atoms |
+| `Relaxation` | L-BFGS-B, steepest-descent and manual ionic steps, the ionic loop, relaxation files | electronic structure of a structure |
+| `MolecularDynamics` | the integrator of `moldyn.f90`, its input, random numbers and files | energies or forces |
 | `Output` | PARSEC-shaped reporting and optional serialization | numerical decisions |
 | `acceleration` | backend selection, symmetry sectors, GPU eigensolvers, native kernels, and timing provenance | independent physical formulas or silent accuracy changes |
 

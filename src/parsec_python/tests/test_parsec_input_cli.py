@@ -251,9 +251,10 @@ class ParsecInputTests(unittest.TestCase):
         self.assertTrue(
             any("fixed single point" in item for item in translation.warnings)
         )
-        self.assertTrue(
-            any("forces" in item for item in translation.warnings)
-        )
+        # Skip_force: false asks for the forces of the fixed structure.
+        self.assertTrue(translation.compute_forces)
+        self.assertIsNone(translation.relaxation)
+        self.assertEqual(translation.movable, (True, True))
 
     def test_periodic_flag_and_declared_atom_count_remain_strict(self) -> None:
         with self.assertRaisesRegex(ParsecInputError, "Periodic_System=true"):

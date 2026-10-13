@@ -63,12 +63,15 @@ from .Occupations import (
     OccupationResult,
     density_from_orbitals,
     fermi_occupations,
+    fixed_occupations,
+    read_occupation_file,
 )
 from .Output import ParsecTextReporter, RYDBERG_TO_EV
 from .Pseudopotential import (
     ParsecPseudopotential,
     ParsecRadialSpline,
     parsec_radial_integral,
+    read_martins_old_pseudopotential,
     read_parsec_pseudopotential,
 )
 from .V_ion import (
@@ -89,6 +92,13 @@ from .V_xc import (
     pbe,
     pbe_energy_partials,
 )
+from .Forces import ForceResult, compute_forces as compute_reference_forces
+from .Relaxation import (
+    IonicBackend,
+    IonicOutcome,
+    reference_backend as reference_ionic_backend,
+    run_relaxation,
+)
 from .flow_map import PARSEC_SINGLE_POINT_FLOW, format_flow_map
 from .models import (
     Atom,
@@ -99,6 +109,7 @@ from .models import (
     InitialDensitySettings,
     MixingSettings,
     PreparationTimings,
+    RelaxationSettings,
     RunTimings,
     SCFIteration,
     SCFSettings,
@@ -119,6 +130,8 @@ from .driver import (
 )
 from .acceleration.driver import (
     AcceleratedPreparedSinglePointSystem,
+    compute_forces,
+    ionic_backend,
     prepare_single_point,
     profile_hamiltonian_components,
     run_scf,
@@ -134,6 +147,15 @@ from .acceleration.models import (
 )
 
 __all__ = [
+    "ForceResult",
+    "IonicBackend",
+    "IonicOutcome",
+    "RelaxationSettings",
+    "compute_forces",
+    "compute_reference_forces",
+    "ionic_backend",
+    "reference_ionic_backend",
+    "run_relaxation",
     "AndersonMixer",
     "ANGSTROM_TO_BOHR",
     "AcceleratedPreparedSinglePointSystem",
@@ -202,6 +224,7 @@ __all__ = [
     "density_from_orbitals",
     "density_multipoles",
     "fermi_occupations",
+    "fixed_occupations",
     "format_flow_map",
     "ion_ion_energy",
     "load_pseudopotentials",
@@ -213,6 +236,8 @@ __all__ = [
     "prepare_single_point",
     "prepare_reference_single_point",
     "profile_hamiltonian_components",
+    "read_martins_old_pseudopotential",
+    "read_occupation_file",
     "read_parsec_pseudopotential",
     "run_scf",
     "run_reference_scf",

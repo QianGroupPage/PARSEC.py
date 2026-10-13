@@ -20,6 +20,9 @@ RUNTIME_PACKAGE_DIRECTORIES = (
     "Mixer",
     "Energy",
     "SCF",
+    "Forces",
+    "Relaxation",
+    "MolecularDynamics",
     "Output",
     "provenance",
 )

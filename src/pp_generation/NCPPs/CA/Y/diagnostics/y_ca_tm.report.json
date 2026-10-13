@@ -1,0 +1,180 @@
+{
+  "schema_version": 2,
+  "element": "Y",
+  "prefix": "y_ca_tm",
+  "backend": "pyfhi98pp",
+  "family": "ncpp",
+  "xc": "ca",
+  "scheme": "tm",
+  "relativistic": "scalar",
+  "variant": null,
+  "core_hole": null,
+  "ionic_charge": 3.0,
+  "reference_electrons": 3.0,
+  "reference_charge": 0.0,
+  "ae_energy_hartree": -3381.394958233084,
+  "pseudo_energy_hartree": -1.4187017945016915,
+  "atomic_energy_correction_rydberg": -6759.952512877164,
+  "lmax": 2,
+  "channels": [
+    {
+      "angular_momentum": 0,
+      "scheme": "t",
+      "cutoff_radius": 3.214328878693583,
+      "match_radius": 3.293722801997314,
+      "ae_eigenvalue_ev": -4.23497311245856,
+      "pseudo_eigenvalue_ev": -4.234980655851244,
+      "norm_test": 0.9999999331158218,
+      "slope_test": 1.00000022248684
+    },
+    {
+      "angular_momentum": 1,
+      "scheme": "t",
+      "cutoff_radius": 3.136848715422644,
+      "match_radius": 3.214328878693583,
+      "ae_eigenvalue_ev": 15.0,
+      "pseudo_eigenvalue_ev": 15.000059430113675,
+      "norm_test": 0.9999964427580735,
+      "slope_test": 0.9999964427580734
+    },
+    {
+      "angular_momentum": 2,
+      "scheme": "t",
+      "cutoff_radius": 2.6443346786428843,
+      "match_radius": 2.7096497452053634,
+      "ae_eigenvalue_ev": -2.646733074076702,
+      "pseudo_eigenvalue_ev": -2.6467329659973675,
+      "norm_test": 1.0000006128740484,
+      "slope_test": 0.9999911755679116
+    }
+  ],
+  "core_radius": 0.0,
+  "reference_shift_ev": 0.0,
+  "kinetic_cutoff_rydberg": {
+    "0": 12.0,
+    "2": 27.0
+  },
+  "ghost_free": true,
+  "selected_local_channel": 1,
+  "local_channel_results": [
+    {
+      "local_channel": 0,
+      "passed": true,
+      "minimum_margin_hartree": 0.014943921384568987,
+      "report_path": "y_ca_tm.local-0.test",
+      "channels": [
+        {
+          "angular_momentum": 1,
+          "label": "p",
+          "status": "pass",
+          "message": "* no ghost (ekb > 0, eloc0 < eref < eloc1)",
+          "margin_hartree": 0.014943921384568987,
+          "reference_energy_hartree": -0.05985829975959206,
+          "local_ground_energy_hartree": -0.07480222114416105,
+          "local_first_excited_energy_hartree": 0.0,
+          "projector_sign": 1
+        },
+        {
+          "angular_momentum": 2,
+          "label": "d",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.09726493162046611,
+          "reference_energy_hartree": -0.09726493162046611,
+          "local_ground_energy_hartree": 0.0,
+          "local_first_excited_energy_hartree": 0.0,
+          "projector_sign": -1
+        }
+      ]
+    },
+    {
+      "local_channel": 1,
+      "passed": true,
+      "minimum_margin_hartree": 0.029331960137461283,
+      "report_path": "y_ca_tm.local-1.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.029331960137461283,
+          "reference_energy_hartree": -0.1556314702878213,
+          "local_ground_energy_hartree": -0.12629951015036,
+          "local_first_excited_energy_hartree": -0.0010071619902453097,
+          "projector_sign": -1
+        },
+        {
+          "angular_momentum": 2,
+          "label": "d",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.09726493162046611,
+          "reference_energy_hartree": -0.09726493162046611,
+          "local_ground_energy_hartree": 0.0,
+          "local_first_excited_energy_hartree": 0.0,
+          "projector_sign": -1
+        }
+      ]
+    },
+    {
+      "local_channel": 2,
+      "passed": false,
+      "minimum_margin_hartree": null,
+      "report_path": "y_ca_tm.local-2.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "ghost",
+          "message": "* one or more ghosts (ekb > 0, eref > eloc1)",
+          "margin_hartree": null,
+          "reference_energy_hartree": -0.1556314702878213,
+          "local_ground_energy_hartree": -2.582466735398441,
+          "local_first_excited_energy_hartree": -0.34994237539811013,
+          "projector_sign": 1
+        },
+        {
+          "angular_momentum": 1,
+          "label": "p",
+          "status": "ghost",
+          "message": "* one or more ghosts (ekb > 0, eref > eloc1)",
+          "margin_hartree": null,
+          "reference_energy_hartree": -0.05985829975959206,
+          "local_ground_energy_hartree": -1.1886535270878351,
+          "local_first_excited_energy_hartree": -0.06687276368346522,
+          "projector_sign": 1
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    "Reviewed setting for Y: s radius one mesh point above the default 3.20: at the default mesh point the Troullier-Martins equations have no solution for the core-hole ions."
+  ],
+  "artifacts": {
+    "dat": {
+      "path": "y_ca_tm.dat",
+      "sha256": "f499d50c795d0d5e7eacaf7d6e4eb5d99d965722dc47e92c51fca5e85762f1a6"
+    },
+    "aep": {
+      "path": "y_ca_tm.aep",
+      "sha256": "a11a3eb5a2b62295a83aaa739918771e81726ea5c0c6bc4e7a3067cb973da1e6"
+    },
+    "test": {
+      "path": "y_ca_tm.test",
+      "sha256": "34684773a1bb0aa6d3ec3a01c0af1b3e98fe0ccd212a4217513bbfbd5b185b9e"
+    },
+    "fhi": {
+      "path": "../FHI/Y_FHIPP.DAT",
+      "sha256": "8b8cf6b0538872faefef2498e8ac47aa61340de940da4af3d1aaa839108d0264"
+    },
+    "upf": {
+      "path": "../UPF/y_ca_tm.UPF",
+      "sha256": "73f80ecacba4fd5474d7fc7a708ced5c1a97bf550678e8c4f69a0e30ace7b685"
+    },
+    "parsec": {
+      "path": "../PARSEC/Y_POTRE.DAT",
+      "sha256": "ee25abad61db1cff6cf775efbc0e848aaef058ff48732c2aefdb43525af005ae"
+    }
+  }
+}

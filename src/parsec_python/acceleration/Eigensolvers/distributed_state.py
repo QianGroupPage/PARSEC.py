@@ -82,8 +82,10 @@ from .rayleigh_ritz import (
     GeneralizedRitzStabilityError,
     _condition_policy,
     _device_overlap_condition,
+    _gram_slab_width,
     _lower_triangle_product,
     _mirrored_lower,
+    _overlap_policy,
     _rotate_in_place,
     _streaming_bytes,
     _symmetric_overlap,
@@ -117,10 +119,26 @@ _ROUND_BYTES = 8 << 30
 # The most bytes of a slab of that step on two devices where no budget is
 # set and :func:`pair_slab_bytes` names no other limit: a round of 4 GiB.
 _PAIR_SLAB_BYTES = 2 << 30
+# The columns of a slab of the overlap of a row block where neither they nor
+# a count of slabs are named (see :func:`overlap_slab_width`).
+_OVERLAP_SLAB_COLUMNS = 128
 # The three ways to split four devices into two pairs: the partner of every
 # device in each turn of an exchange that takes its copies pair by pair (see
 # :func:`paired_exchange_requested`).
 _PAIR_TURNS = ((1, 0, 3, 2), (2, 3, 0, 1), (3, 2, 1, 0))
+# The bytes of an exchange chunk where ``PARSEC_CUPY_EXCHANGE_CHUNK_BYTES``
+# names none (see :func:`exchange_chunk_bytes`).
+_EXCHANGE_CHUNK_BYTES = 1 << 30
+# The part of that chunk by which an exchange buffer may exceed it to hold
+# a block or a slab whole (see :func:`exchange_chunk_limit`): an eighth.
+_EXCHANGE_CHUNK_MARGIN = 8
+# What a rule counts for the estimate of a condition number beside the four
+# ``m x m`` arrays of its work array: doubles per state and for any size,
+# and the bytes of the cuSOLVER handle of a thread (see
+# :func:`condition_helper_bytes`).
+_SPECTRUM_WORK_PER_STATE = 128
+_SPECTRUM_WORK_DOUBLES = 1 << 18
+_CUSOLVER_HANDLE_BYTES = 64 << 20
 
 
 def distributed_state_policy() -> str:
@@ -356,9 +374,15 @@ def exchange_chunk_bytes() -> int:
     packed and shipped a chunk of columns at a time, so a device needs room
     for one chunk next to its tall blocks instead of for all of that part.
     A chunk is never narrower than one column.
+
+    Where the variable is not set, the buffer may be up to an eighth larger
+    than this for a block or a slab that is little wider than a chunk
+    (:func:`exchange_chunk_limit`).  A value that is set is the size of
+    every chunk and of the buffer as before, and ``1073741824`` the chunks
+    of the code before that rule.
     """
 
-    raw = os.environ.get("PARSEC_CUPY_EXCHANGE_CHUNK_BYTES", str(1 << 30)).strip()
+    raw = os.environ.get("PARSEC_CUPY_EXCHANGE_CHUNK_BYTES", str(_EXCHANGE_CHUNK_BYTES)).strip()
     try:
         value = int(raw)
     except ValueError as error:
@@ -366,6 +390,115 @@ def exchange_chunk_bytes() -> int:
     if value < 1:
         raise ValueError("PARSEC_CUPY_EXCHANGE_CHUNK_BYTES must be positive")
     return value
+
+
+def exchange_chunk_limit(elements: int, narrower: bool = False) -> int:
+    """Elements of a chunk on the way to the rows of blocks of which ``elements`` leave their device.
+
+    ``elements`` are those of the widest block of a conversion that lie in
+    the rows of the other devices, for the device that has the fewest rows
+    of its own.  Where ``PARSEC_CUPY_EXCHANGE_CHUNK_BYTES`` is set, a chunk
+    has the elements of that size whatever travels, as before.  Where it
+    is not, the default of 1 GiB (:func:`exchange_chunk_bytes`) is the
+    chunk unless the block is wider than that by an eighth of it or less:
+    then the chunk is the block, which travels whole, and the exchange
+    buffer of every device has that size (:meth:`SectorDeviceGroup._capacities`).
+    The buffer is therefore never more than 1,207,959,552 bytes, 128 MiB
+    above the default, and takes exactly what the block needs.  A Ritz
+    step sizes it for the slabs that most of its rounds send
+    (:func:`followed_slabs`).  With
+    ``narrower`` the result is the most that this gives any block of up to
+    ``elements``, which is what a fit rule counts for slabs as wide as their
+    budget allows (:func:`shared_block_bytes`).
+
+    Why: the slab of a round of the Ritz step with one tall block
+    (:func:`block_rounds`) can be just wider than a chunk.  On four
+    devices a slab of the budget of 2 GiB (:func:`slab_columns`) takes up
+    to 1.5 GiB outside the rows of a device, and a slab of 32 columns of a
+    sector of 5,660,200 rows takes 1.012 GiB: it travelled as a chunk of
+    31 columns and one of a single column.  Every chunk of four devices is
+    a step of its own, a pack and three turns of copies with a wait for
+    all devices behind each (:func:`paired_exchange_requested`), and the
+    second one cost what the first did in waits for next to no bytes.  On
+    the A100 of four nodes, with the size named so that the 32 columns
+    were one chunk (1,090,000,000 bytes) against the default in one
+    allocation, the way to the rows of a sector of 39,368 electrons took
+    16.04 instead of 17.41 s over the 1,014 slabs of 13 passes: 1.35 ms
+    per chunk step that was not taken.  The buffer of that sector is 12
+    MiB larger (1,086,758,400 bytes).  A fixed chunk of 1,500,000,000
+    bytes had given the same seconds and the same total energy to the last
+    bit for 408 MiB more on every device, and was not kept.
+
+    Why an eighth: what a larger buffer saves is the fixed cost of one
+    step, whatever the second chunk held, and what it costs is the bytes of
+    that chunk on every device for the whole run.  In the 1.35 ms of a step
+    the turns of four devices move 0.11 GiB per device at the 84 GiB/s
+    measured for them: a second chunk below about that size spends more of
+    its step waiting than copying, and above it the step is mostly copies,
+    which no buffer saves.  An eighth of the default, 0.125 GiB, is that
+    size.  Both figures are those of A100 and of four devices; two devices
+    are one pair and wait less, and their slabs of at most 2 GiB lie within
+    a chunk but for a few bytes.
+
+    The way back to the columns is cut by the default chunk as before
+    (:meth:`SectorDeviceGroup._to_columns`), in the first part of the same
+    buffer.  There a device fetches from all its peers at once with no
+    step in common with the others, so a second chunk costs no wait, and
+    the stage seconds of that way were higher with one chunk per slab in
+    every pair of runs: 10.65 against 10.57 s for 39,368 electrons with
+    the slab named as the chunk, and 5.84 against 5.56 s for 29,576 and
+    4.28 against 3.91 s for 23,768 with the chunk of 1,500,000,000 bytes.
+    A value that is set cuts both ways, as before.
+
+    The bytes that travel and the order in which a row block receives them
+    are the same however they are cut, so the results are the same bit for
+    bit.
+    """
+
+    limit = exchange_chunk_bytes() // 8
+    if "PARSEC_CUPY_EXCHANGE_CHUNK_BYTES" in os.environ:
+        return limit
+    elements, most = int(elements), limit + limit // _EXCHANGE_CHUNK_MARGIN
+    if narrower:
+        return max(limit, min(elements, most))
+    return elements if limit < elements <= most else limit
+
+
+def followed_slabs(away: int, widths) -> tuple[int, ...]:
+    """The columns of the pieces that the exchange buffers of a Ritz step are to hold whole.
+
+    ``widths`` lists, for every conversion to the rows that a pass of the
+    step makes, the columns of its widest piece: the widest slab of each
+    round and, in the step that sends them, the blocks.  ``away`` rows of
+    a column lie outside the device that has the fewest of its own.
+    Returned are the widths that :func:`exchange_chunk_limit` lets travel
+    whole, up to an eighth wider than a chunk, if at least half of the
+    conversions send one of them, and none otherwise.
+
+    The buffer is held by every device for the whole run, and what it
+    saves is a chunk step per conversion that it serves.  The rounds of a
+    step are nearly all alike: whole rounds give every device the same
+    slab, and what the blocks hold beyond them goes first in a round or
+    two of other slabs (:func:`block_rounds`).  A buffer for those few
+    would cost its bytes for next to nothing: at the default radius the
+    sector of 39,368 electrons on four devices sends 25 rounds of 48
+    columns, 1.44 GiB outside a device, and one of 36, 1.08 GiB, for which
+    a buffer of 83 MiB more would save two of 104 chunk steps of a pass.
+    Such a round goes in the chunks of the default, as before and in every
+    pass (:meth:`SectorDeviceGroup._to_rows`).
+
+    The half is a choice and no measured limit.  A round that is followed
+    saves its two chunk steps of a pass, 2.7 ms on four A100, whatever its
+    share of the rounds; the half only says that most conversions of a
+    step use the bytes that every device holds for them.  At worst a step
+    of two rounds, one of them within the eighth, takes up to 128 MiB on
+    every device for those two chunk steps.
+    """
+
+    widths = [int(width) for width in widths]
+    chunk = exchange_chunk_bytes() // 8
+    whole = [width for width in widths if chunk < away * width == exchange_chunk_limit(away * width)]
+    return tuple(sorted(set(whole))) if whole and 2 * len(whole) >= len(widths) else ()
 
 
 def exchange_chunks(width: int, away: int, limit: int) -> tuple[tuple[int, int], ...]:
@@ -435,12 +568,13 @@ def paired_exchange_requested() -> bool:
     :func:`block_rounds`, which are more and whose pieces are smaller.  The
     slab of a whole round can be just wider than a chunk
     (:func:`exchange_chunk_bytes`), 32 columns against 31 for 39,368
-    electrons, and then travels as a chunk and a second one of a column,
+    electrons, and then travelled as a chunk and a second one of a column,
     each in its three turns.  With those rounds the turns have run on 16
     GPUs for 3,480, 23,768 and 39,368 electrons: the way to the rows of a
     sector of 39,368 electrons took 17.4 s, against 21.6 s for equal slabs
     received at once in the same allocation and 16.5 s for equal slabs in
-    turns in another (``README.md``).
+    turns in another (``README.md``).  Such a slab has been one chunk
+    since, where no chunk size is named (:func:`exchange_chunk_limit`).
     The slabs of the step with two blocks end with their column range,
     and there up to a quarter of the bytes of such a basis travel in
     chunks of fewer senders.  Two devices are one pair already.  Sectors
@@ -461,46 +595,110 @@ def paired_exchange_requested() -> bool:
 
 
 def condition_helper_policy() -> str:
-    """``auto``, ``any`` or ``off`` from ``PARSEC_CUPY_RITZ_CONDITION_HELPER``.
+    """``any``, ``auto`` or ``off`` from ``PARSEC_CUPY_RITZ_CONDITION_HELPER``.
 
     The device small solve begins with the condition number of the overlap:
     a symmetric spectrum that is only compared with its limit and takes
     about as long as the factorization and the eigensolve that follow (0.09
     of 0.20 s at 2,978 states on an A100), while the other devices of the
-    sector wait.  ``auto``, the default, has another device of the sector
-    estimate it meanwhile (:meth:`SectorDeviceGroup._condition_helper`,
+    sector wait.  A helper, another device of the sector, estimates it
+    meanwhile (:meth:`SectorDeviceGroup._condition_helper`,
     :func:`rayleigh_ritz.solve_whitened_ritz_on_device`): the audits, their
     order and their errors stay what they were and the coefficients are
-    the same bit for bit.  The device that holds the Hartree objects of the
-    process, its fullest one, is not asked; ``any`` asks it too, where a
-    sector has no other.  ``off`` is the former route, the estimate on the
-    owner before the factorization.  A sector on one device has no helper,
-    and neither has a host solve or a run whose
-    ``PARSEC_CUPY_RITZ_CONDITION`` names the host SVD.
+    the same bit for bit.
 
-    The helper takes memory that it did not take before.  Its copy of the
-    overlap and the copy that cuSOLVER overwrites fit what its part of the
-    Gram arrays has just freed; the work array of the spectrum does not.
-    With CUDA 12.9 on a laptop cuSOLVER asks for 4.05 ``m x m`` arrays
-    (274 MiB at 2,978 states, 106 MiB at 1,842), by which the pool of the
-    helper grows once: the block stays in the free list of the stream of
-    its group for the next step, since the density step leaves the pools
-    of a shared basis as they are (:func:`shared_pool_release_requested`;
-    with ``PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE=1`` they are emptied
-    after every density and it grows in every SCF step again).  The first
-    estimate of a thread takes 64 MiB outside the pool for its cuSOLVER
-    handle.  That would be about 0.33 GiB more on the helper for 23,768
-    electrons and 0.48 for 29,576, on a device that peaked 1.2 and 1.7 GiB
-    below the owner of its sector: the largest device of a run should stay
-    what it was.  None of this is measured on an A100.  The solve with a
-    helper has run where one device stood for both, with the same bits; no
-    step of a sector on several devices has run with one yet.
+    The helper is the first device after the owner that does not hold the
+    Hartree objects of the process.  ``any``, the default, also asks the
+    device that holds them where a sector has no other, if the rule that
+    shares a basis gives it the room (below); while ``auto`` was the
+    default it asked that device whatever the room, which no value does
+    now.  ``auto``, the former default, never asks that device: such a
+    sector estimates on its owner before the factorization, as every
+    sector does with ``off``, the route before there were helpers.  A
+    sector on one device has no helper, and neither has a host solve or a
+    run whose ``PARSEC_CUPY_RITZ_CONDITION`` names the host SVD.
+
+    The sector that this is about has two devices, the second of which
+    holds the Hartree objects: on 8 GPUs the second sector of the root
+    rank, since the driver puts those objects on a device that owns no
+    sector, the last one (``driver._select_hartree_device``).  A sector on
+    three or more devices always has another one, and a device named by
+    ``PARSEC_HARTREE_DEVICE`` that owns the sector is no helper of it.
+
+    The helper takes memory that it did not take before
+    (:func:`condition_helper_bytes`), which is why the Hartree device,
+    taken to be the fullest of its process, was passed over.  On A100
+    nodes it was not the fullest.  In first runs on 8 GPUs it sampled
+    50,567 and 66,491 MiB for 23,768 and 29,576 electrons where the owner
+    of the first sector of its rank sampled 50,679 and 67,083: an owner
+    holds the work arrays of the small solve, about 15 ``m x m`` arrays
+    (1.0 and 1.5 GiB above its other device), and the device with the
+    Hartree objects held 0.9 GiB more than the other one that owns no
+    sector.  With ``any`` named beside the default in one allocation, in
+    runs that also cut the overlap into other slabs, the dense stage of
+    that sector took 1.88 instead of 3.06 s and 3.02 instead of 4.88 s,
+    what the three other sectors took (1.78 to 1.88 and 2.89 to 3.02 s);
+    its helper sampled 304 and 448 MiB more, and the fullest device of the
+    run 192 MiB more for 23,768 electrons, where the helper became it
+    (50,871 MiB), and none for 29,576.  The four sectors of such a run are
+    solved side by side, so the run gains what its slowest sector loses to
+    the next one: by the stage seconds of those runs about 0.5 and 0.2 s of
+    166.9 and 242.9 s of SCF, and at most the 1.2 and 1.9 s of the stage.
+
+    The room: the device that holds the Hartree objects is asked only
+    where the blocks that the sharing rule counts on a device
+    (:func:`shared_block_bytes`) and the bytes of the estimate together
+    stay within the share of that device which the rule allows
+    (``PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION``).  So the helper never
+    takes a device beyond what that rule lets a shared basis take, the rule
+    shares the same bases whatever this setting says, and a basis that is
+    shared by name beyond its share (``PARSEC_CUPY_DISTRIBUTED_STATE=1``)
+    keeps the estimate of such a sector on its owner.  The other devices
+    help as they did, without a count.  An error of the helper that is no
+    failed estimate, out of memory among them, ends the step as the same
+    error of the owner would: nothing falls back to the owner.
     """
 
-    value = os.environ.get("PARSEC_CUPY_RITZ_CONDITION_HELPER", "auto").strip().lower()
+    value = os.environ.get("PARSEC_CUPY_RITZ_CONDITION_HELPER", "any").strip().lower()
     if value not in {"auto", "any", "off"}:
         raise ValueError("PARSEC_CUPY_RITZ_CONDITION_HELPER must be auto, any or off")
     return value
+
+
+def condition_helper_bytes(states: int) -> int:
+    """Bytes that the estimate of the condition number takes on its helper, for a rule to count.
+
+    The helper of a sector of ``states`` columns copies the overlap and has
+    cuSOLVER compute its symmetric spectrum
+    (:func:`rayleigh_ritz._device_overlap_condition`).  Its copy and the
+    copy that cuSOLVER overwrites, two ``m x m`` arrays, fit what its part
+    of the Gram arrays has just freed.  Counted here is the rest: the work
+    array of the spectrum, the byte per entry of the test that the overlap
+    is finite, and the cuSOLVER handle of the thread.
+
+    cuSOLVER sizes the work array itself.  With CUDA 12.9 on a laptop GPU
+    it asked for
+    172,411 doubles at 100 states, 991,131 at 442, 4,159,987 at 1,000,
+    13,838,763 at 1,842, 35,885,131 at 2,978 (274 MiB), 55,381,843 at
+    3,704 (423 MiB), 97,799,555 at 4,928, 257,048,963 at 8,000 and
+    1,026,064,963 at 16,000: four ``m x m`` arrays and about 130 doubles
+    per state.  The count takes ``4 m^2 + 128 m + 262,144`` doubles, which
+    is at or above each of those and within 2 MiB of it.  The handle took
+    64 MiB outside the pool at the first estimate of a thread.  Together
+    348 MiB at 2,978 states and 501 MiB at 3,704, where a helper on an A100
+    sampled 304 and 448 MiB more (:func:`condition_helper_policy`).
+
+    The work array stays in the free list of the stream of the group for
+    the next step, since the density step leaves the pools of a shared
+    basis as they are (:func:`shared_pool_release_requested`; with
+    ``PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE=1`` it is taken again in
+    every SCF step): the helper holds these bytes from its first estimate
+    on.
+    """
+
+    states = int(states)
+    work = 4 * states * states + _SPECTRUM_WORK_PER_STATE * states + _SPECTRUM_WORK_DOUBLES
+    return 8 * work + states * states + _CUSOLVER_HANDLE_BYTES
 
 
 def tall_blocks_per_device() -> int:
@@ -612,7 +810,9 @@ def shared_pool_release_requested() -> bool:
     the cut of the slabs.  The group returns the free blocks of its stream
     on every device before it takes the larger workspace
     (:meth:`SectorDeviceGroup._slab_workspace`), which is what the release
-    after the density did for that pass.
+    after the density did for that pass.  An exchange buffer that a pass
+    takes larger than the passes before is treated alike
+    (:meth:`SectorDeviceGroup._exchange_buffer`).
 
     First runs on A100 nodes with the release switched off for the whole
     process against the default, where all sectors are shared (the limit
@@ -677,7 +877,9 @@ def pair_slab_bytes() -> int:
     any size and in every step of a run, bit for bit: the limit is then
     that of the streaming budget itself.  It is the way back of a sector
     on two devices, beside ``PARSEC_CUPY_RITZ_GRAM_MULTIPLE=1`` since the
-    rounds are cut at whole multiples of 64 columns (:func:`block_rounds`).
+    rounds are cut at whole multiples of 64 columns (:func:`block_rounds`)
+    and ``PARSEC_CUPY_RITZ_GRAM_SLABS=8`` since the overlap is cut into
+    slabs of 128 (:func:`overlap_slab_width`).
     ``PARSEC_CUPY_STREAMING_RITZ_BYTES=4294967296``, that of four devices,
     is not: a basis below 32 GiB took an eighth of itself per slab and
     takes 4 GiB with it, also one that a trim has taken below 32 GiB after
@@ -694,18 +896,90 @@ def pair_slab_bytes() -> int:
     return value
 
 
+def overlap_slab_width(columns: int) -> int | None:
+    """Columns per slab of the overlap ``X.T X`` of a row block of a shared basis.
+
+    ``PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS`` sets them; 128 is the
+    default.  They are cut down to a whole multiple like every slab
+    (:func:`rayleigh_ritz.gram_multiple`, which leaves 128), and a basis of
+    no more columns is one slab, the full product.  ``None`` where
+    ``PARSEC_CUPY_RITZ_GRAM_SLABS`` names a count of slabs: the overlap is
+    then cut by that count, as it was and as a sector on one device cuts
+    its own (:func:`rayleigh_ritz._gram_slab_width`).  ``8`` there is the
+    former cut of every step, bit for bit.
+
+    A slab is multiplied by the columns from its own first one onwards, so
+    slabs of ``w`` of ``m`` columns form about ``(1 + w / m) / 2`` of the
+    full product: what lies above the diagonal inside a slab is formed for
+    nothing, and the narrower the slabs the less of it.  A count of slabs
+    lets them widen with the basis.  Eight slabs of 4,928 states are 576
+    columns wide and form 0.557 of the full product, slabs of 128 form
+    0.513; of 2,978 states 0.553 and 0.521.  The right-hand side of such a
+    product costs in steps of 64 columns, which is why a slab is a whole
+    multiple, and of the multiples one ran slower.  In first runs on A100
+    nodes the overlap of the row blocks, by the products of its slabs and
+    the seconds it took, ran at 12.8 to 16.0 Tflop/s per device in slabs of
+    64 columns (5,264 and 7,120 electrons on 8 and 16 GPUs), at 17.0 to
+    17.6 in slabs of 128, 192 and 256 (10,456, 14,680 and 19,392) and at
+    15.8 to 16.9 in slabs of 320, 448 and 576 (23,768, 29,576 and 39,368).
+    So 128 columns: the narrowest width that ran at the rate of the best.
+
+    Measured there with the count named so that the slabs are 128 columns
+    wide, beside the eight slabs in one allocation: the overlap of a
+    sector took 26.79 instead of 31.46 s for 39,368 electrons on 16 GPUs
+    (27.81 s in slabs of 256), 11.04 instead of 12.18 s for 29,576 and
+    6.57 instead of 7.14 s for 23,768; on 8 GPUs 22.53 instead of 25.83 s
+    for 29,576 and 13.59 instead of 14.97 s for 23,768, at 16.7 to 17.3
+    Tflop/s.  The total energies moved by 2e-8 to 1.6e-7 Ry: the lower
+    triangle is summed from other pieces.  The rule makes these cuts, and
+    the same slabs as before from 1,017 to 1,528 columns, where an eighth
+    is cut to 128 as well (10,456 electrons).  Not measured: a sector of
+    1,529 to 2,552 columns, whose slabs of 192 and 256 become 128 for 3 to
+    5% fewer operations (14,680 and 19,392 electrons), and one below 1,017
+    columns, whose slabs of 64 and fewer become 128 and form 7 to 13% more
+    (3,480 to 7,120 electrons, where the overlap of a sector takes 0.04
+    to 0.47 s of a run).
+
+    The rule is that of a row block: every step of a shared basis forms
+    its overlap from the complete row block of a device.  A sector on one
+    device keeps the count.  Its overlap is the same product over all its
+    rows, but its records time it together with the projection, so no run
+    says what another width of the overlap gives there, and on a
+    workstation GPU more slabs did not always gain
+    (:func:`rayleigh_ritz.gram_multiple`).  The projection of the step
+    with three tall blocks keeps the count too.
+    """
+
+    name = "PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS"
+    raw = os.environ.get(name, str(_OVERLAP_SLAB_COLUMNS)).strip()
+    try:
+        width = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if width < 1:
+        raise ValueError(f"{name} must be positive")
+    columns = int(columns)
+    if "PARSEC_CUPY_RITZ_GRAM_SLABS" in os.environ:
+        # Read here for its form, as the product reads it.
+        _gram_slab_width(columns)
+        return None
+    return columns if width >= columns else _whole_multiple(width)
+
+
 def slab_columns(rows: int, columns: int, devices: int, wide: bool = False, blocks: int = 2) -> int:
     """The most columns of one slab of ``H X`` in a Ritz step that forms it in slabs.
 
-    A slab of all rows takes the bytes that the one-array route gives its
-    projection slab (:func:`rayleigh_ritz._streaming_bytes` of the whole
-    basis: ``PARSEC_CUPY_STREAMING_RITZ_BYTES``, or an eighth of the basis
-    but at least 1 and at most 4 GiB; at most 6 GiB if ``wide``, which
-    :func:`wider_slabs_fit` decides).  It is never wider than half of an
-    even share of the columns: a device holds two slabs at a time (see
-    :func:`slab_workspace`), which then take no more than the tall block
-    they replace.  The width does not depend on how the columns are split
-    between the devices.
+    A slab of all rows takes the bytes of the streaming budget
+    (:func:`rayleigh_ritz._streaming_bytes` of the whole basis:
+    ``PARSEC_CUPY_STREAMING_RITZ_BYTES``, or an eighth of the basis but at
+    least 1 and at most 4 GiB; at most 6 GiB if ``wide``, which
+    :func:`wider_slabs_fit` decides).  That was the slab of the one-array
+    route too, which has taken 2 GiB at most since, by a limit that no
+    step here reads (:func:`rayleigh_ritz.one_array_buffer_limit`).  A slab
+    is never wider than half of an even share of the columns: a device
+    holds two slabs at a time (see :func:`slab_workspace`), which then take
+    no more than the tall block they replace.  The width does not depend
+    on how the columns are split between the devices.
 
     In the step with one tall block (``blocks`` of 1) on four or more
     devices, a slab that no set budget sizes takes at most an even share
@@ -970,7 +1244,9 @@ def shared_basis_fits(rows: int, columns: int, devices: int) -> bool:
     and 0.75 times the basis.
     A sector basis of 84.0 GiB counts 26.0 GiB on four devices and
     47.0 on two with one tall block, where two count 51.0 and 93.0, and four
-    devices of 79.25 GiB share a basis of up to 249 GiB instead of 117.
+    devices of 79.25 GiB share a basis of up to 249 GiB instead of 117
+    (the counts with a chunk of 1 GiB; see below for the 0.125 GiB that a
+    buffer may take beyond it where no size is named).
     Balanced ranges (see :func:`keeps_column_ranges`) add headroom and one
     more block, the new columns.  The workspace counted is that of slabs as
     wide as the budget allows (:func:`slab_columns`): 4 GiB at most, and 2
@@ -982,6 +1258,22 @@ def shared_basis_fits(rows: int, columns: int, devices: int) -> bool:
     cuts fewer columns into wider slabs.  The two-block step cuts wider
     ones only where the blocks fit with those too
     (:func:`wider_slabs_fit`).
+
+    The chunk counted is the exchange buffer as the steps size it
+    (:func:`exchange_chunk_limit`).  A chunk size that is named is that
+    buffer.  Where none is, the buffer is 1 GiB or what a block or slab
+    that is up to an eighth wider needs: the rule counts the most that
+    this gives the slabs of the budget, up to 128 MiB more than before
+    wherever such a slab takes more than 1 GiB outside the rows of a
+    device (four devices: from a slab of 4/3 GiB, so for every basis of
+    10.7 GiB and more, and all 128 MiB from a slab of 1.5 GiB, a basis of
+    12 GiB; two devices: none but for a few bytes with their slabs of at
+    most 2 GiB, and up to the 128 MiB where slabs of 4 GiB are named for
+    them), and what the block itself needs where a step sends it whole.
+    The sector of 39,368 electrons on four devices counts 61,296,642,752
+    bytes, 0.7203 of a device of 85,093,777,408, where it counted
+    61,162,425,024.  ``PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=1073741824`` gives
+    the former count.
 
     They fit if they take no more of the current device's memory than
     ``PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION``, 0.85 by default.  The
@@ -1033,10 +1325,20 @@ def shared_block_bytes(rows: int, columns: int, devices: int, wide: bool = False
     even = -(-rows * int(columns) // devices)
     fixed = keeps_column_ranges()
     tall = even if fixed else even + even // 4
-    # One chunk, or all of a block outside the device's own rows if that is less.
-    away = rows - rows // devices
-    chunk = min(tall - tall // devices, max(exchange_chunk_bytes() // 8, away))
     blocks = tall_blocks_per_device()
+    # One chunk, or all of a block outside the device's own rows if that is
+    # less.  The chunk is that of the block where the step sends it whole
+    # (two and three tall blocks), and the most that any slab of the budget
+    # is given where the step sends slabs (one and two): see
+    # :func:`exchange_chunk_limit`.
+    away, whole = rows - rows // devices, tall - tall // devices
+    limit = exchange_chunk_bytes() // 8
+    if blocks != 1:
+        limit = exchange_chunk_limit(whole)
+    if blocks != 3:
+        slab = slab_columns(rows, columns, devices, wide, blocks)
+        limit = max(limit, exchange_chunk_limit(away * slab, narrower=True))
+    chunk = min(whole, max(limit, away))
     needed = 8 * ((blocks if fixed else blocks + 1) * tall + chunk)
     if blocks != 3:
         needed += 8 * slab_workspace(rows, columns, devices, blocks, wide)
@@ -1241,16 +1543,24 @@ class SectorDeviceGroup:
         # is left of that stage is the projection, whose products are as
         # wide as the rounds of a step with one tall block and as the slabs
         # of a step with two.  The widths of the two matrices are cut apart
-        # (:func:`rayleigh_ritz._gram_slab_width`, :func:`block_rounds`,
+        # (:func:`overlap_slab_width`, :func:`block_rounds`,
         # :func:`projection_slabs`) and one setting moves both
         # (:func:`rayleigh_ritz.gram_multiple`): this says which of them a
         # change of the stage comes from.  A step with three tall blocks
         # forms both matrices in one call and counts nothing here.
         self.overlap_seconds = 0.0
+        # The columns of the widest slab of the overlap of the latest Ritz
+        # step, for reports: those of :func:`overlap_slab_width`, or of the
+        # count of slabs where one is named.  None before the first step and
+        # where the overlap has no slabs (``PARSEC_CUPY_RITZ_SYRK`` on or off).
+        self.overlap_columns = None
         self._tall = self._chunk = self._work = 0
         # The devices that still hold, in the free list of their stream, a
         # slab workspace that a later pass has outgrown.
         self._outgrown = set()
+        # The elements of the largest exchange buffer that each device has
+        # taken so far (:meth:`_exchange_buffer`).
+        self._buffers = {}
         self._inbound = {}
 
     # ----- plumbing -----------------------------------------------------
@@ -1311,6 +1621,18 @@ class SectorDeviceGroup:
         """Wall time in which the operators of the other devices were built, for reports."""
 
         return float(self._worker.replica_seconds)
+
+    @property
+    def exchange_buffer_bytes(self) -> int:
+        """Bytes of the largest exchange buffer that a device of the group has taken, for reports.
+
+        1,073,741,824 for a basis whose slabs travel in chunks of the
+        default, more where the buffer follows a slab
+        (:func:`exchange_chunk_limit`), less where a whole block is less,
+        and 0 before the first Ritz step.
+        """
+
+        return 8 * max(self._buffers.values(), default=0)
 
     def _sum_on_owner(self, parts: list):
         """Sum one array per device into the owner's, in device order.
@@ -1388,7 +1710,7 @@ class SectorDeviceGroup:
         count = len(self.devices)
         return [rows * index // count for index in range(count + 1)]
 
-    def _capacities(self, layout, edges) -> tuple[int, int]:
+    def _capacities(self, layout, edges, sent=None) -> tuple[int, int]:
         """Element counts shared by all tall blocks and by all exchange buffers.
 
         A column block (all rows of some columns) and a row block (some rows
@@ -1402,7 +1724,17 @@ class SectorDeviceGroup:
         An exchange buffer holds one chunk of the columns of its device for
         the rows of the other devices: :func:`exchange_chunk_bytes` or one
         column, whichever is more, and never more than those rows of a whole
-        tall block.  The capacities only ever grow.
+        tall block.  Where no chunk size is named it also holds whole what
+        travels on the way to the rows and is up to an eighth wider than
+        that chunk (:func:`exchange_chunk_limit`).  ``sent`` names the
+        columns of the pieces that it is to hold whole where they are
+        within that eighth: by default the blocks of ``layout``
+        themselves, as in a conversion that takes its own buffers; for a
+        Ritz step that sends slabs those that most of its rounds send
+        (:func:`followed_slabs`); none where the blocks are only sized, and
+        none in a conversion through the buffers of such a step, which
+        would else size the buffers of the next pass for a piece that the
+        step does not follow.  The capacities only ever grow.
 
         The step with one tall block lays the row block of a device into
         the block of its columns, where it may end a little behind them
@@ -1420,6 +1752,7 @@ class SectorDeviceGroup:
         column_copies_requested()
         condition_helper_policy()
         gram_multiple()
+        overlap_slab_width(1)
         shared_pool_release_requested()
         blocks = tall_blocks_per_device()
         if blocks != 3:
@@ -1439,12 +1772,40 @@ class SectorDeviceGroup:
         even = -(-rows * columns // count)
         tall = max(rows * widest, max(heights) * columns, even if keeps_column_ranges() else even + even // 4)
         away = rows - min(heights)
-        chunk = min(max(away * widest, tall - tall // count), max(exchange_chunk_bytes() // 8, away))
+        # What a conversion of pieces of these widths cuts its chunks by
+        # (:meth:`_to_rows`), and never less than the chunk of the way back.
+        limit = exchange_chunk_bytes() // 8
+        for width in (widest,) if sent is None else sent:
+            limit = max(limit, exchange_chunk_limit(away * int(width)))
+        chunk = min(max(away * widest, tall - tall // count), max(limit, away))
         if blocks == 1:
             tall += count * max(heights)
         self._tall = max(self._tall, tall)
         self._chunk = max(self._chunk, chunk)
         return self._tall, self._chunk
+
+    def _exchange_buffer(self, cp, device: int, elements: int):
+        """The exchange buffer of ``device``: ``elements`` of it, none where it sends nothing.
+
+        Taken on the thread of the device, under its stream, by the step or
+        the conversion that holds it to its end.  Its capacity only grows
+        (:meth:`_capacities`), and it grows where a later pass sends a slab
+        that the buffer is to hold whole and that of the passes before did
+        not (:func:`exchange_chunk_limit`): a trim can move the cut of the
+        slabs.  The smaller buffer would then stay in the free list of the
+        stream for the rest of the run, as an outgrown workspace would
+        (:meth:`_slab_workspace`), so a device that takes a larger buffer
+        than it took before first returns the free blocks of this stream
+        to the driver, unless the density step empties the pools anyway
+        (:func:`shared_pool_release_requested`).
+        """
+
+        taken = self._buffers.get(device, 0)
+        if elements > taken:
+            if taken and not shared_pool_release_requested():
+                cp.get_default_memory_pool().free_all_blocks(stream=self._stream(device))
+            self._buffers[device] = elements
+        return cp.empty(elements, dtype=cp.float64)
 
     def _slab_capacity(self, rows: int, columns: int) -> tuple[int, int]:
         """Columns of a slab of ``H X`` and elements of every slab workspace.
@@ -1639,7 +2000,7 @@ class SectorDeviceGroup:
         cp, _ = require_cupy()
         on_device = os.environ.get("PARSEC_CUPY_DEVICE_RANDOM", "0").lower() in {"1", "true", "on"}
         layout = _as_layout(layout)
-        tall, _piece = self._capacities(layout, self.row_edges(rows))
+        tall, _piece = self._capacities(layout, self.row_edges(rows), sent=())
         blocks = []
         for device, width in zip(self.devices, layout.widths, strict=True):
             with cp.cuda.Device(device):
@@ -1672,7 +2033,7 @@ class SectorDeviceGroup:
         cp, _ = require_cupy()
         rows = basis.shape[0]
         old, old_blocks = basis.layout, basis.blocks
-        tall, _piece = self._capacities(layout, self.row_edges(rows))
+        tall, _piece = self._capacities(layout, self.row_edges(rows), sent=())
 
         def rebuild(index, device):
             block = self._block(cp, (rows, layout.widths[index]), tall)
@@ -1784,14 +2145,28 @@ class SectorDeviceGroup:
         shipped.  ``targets`` supplies row blocks to overwrite, and
         ``buffers`` the exchange buffer of every device where the caller
         holds them over several conversions.
+
+        A chunk is that of :func:`exchange_chunk_limit` for the widest
+        block and the most rows outside a device, which is how
+        :meth:`_capacities` sizes the buffers: blocks that are little wider
+        than the default chunk travel whole, every device in one chunk.
+        A caller that holds the buffers sized them for what most of its
+        conversions send (:func:`followed_slabs`): blocks that they do not
+        hold whole travel in chunks of the default.
         """
 
         cp, _ = require_cupy()
         count = len(self.devices)
         layout = _as_layout(layout)
         total, columns = edges[-1], layout.columns
-        tall, capacity = self._capacities(layout, edges)
-        limit = exchange_chunk_bytes() // 8
+        # A caller that holds the buffers has sized them: its conversions size none.
+        tall, capacity = self._capacities(layout, edges, sent=None if buffers is None else ())
+        aways = [total - (high - low) for low, high in zip(edges[:-1], edges[1:])]
+        limit = exchange_chunk_limit(max(aways) * max(layout.widths))
+        if buffers is not None and any(
+            width * away > buffer.size for width, away, buffer in zip(layout.widths, aways, buffers)
+        ):
+            limit = min(limit, exchange_chunk_bytes() // 8)
         # Read once, on the calling thread, for every chunk.
         concurrent = concurrent_exchange_requested()
         paired = concurrent and count == 4 and paired_exchange_requested()
@@ -1806,6 +2181,13 @@ class SectorDeviceGroup:
         # device has no chunk left, or where one has no rows to receive, a
         # device receives from all the others in one turn, as without pairs.
         whole = min(map(len, chunks)) if paired and all(low < high for low, high in zip(edges[:-1], edges[1:])) else 0
+        if buffers is not None:
+            # A buffer that the caller holds was sized for what it sends
+            # (:meth:`_capacities`): a chunk never lies beyond its end.
+            for index, cut in enumerate(chunks):
+                widest = max((last - first for first, last in cut), default=0)
+                if widest * (total - (edges[index + 1] - edges[index])) > buffers[index].size:
+                    raise ValueError("an exchange buffer is smaller than a chunk of its device")
 
         def prepare(index, device):
             low, high = edges[index], edges[index + 1]
@@ -1817,7 +2199,7 @@ class SectorDeviceGroup:
                 )
             if buffers is not None:
                 return target, buffers[index]
-            return target, cp.empty(capacity if chunks[index] else 0, dtype=cp.float64)
+            return target, self._exchange_buffer(cp, device, capacity if chunks[index] else 0)
 
         row_blocks, held = zip(*self.map(prepare))
 
@@ -1882,12 +2264,18 @@ class SectorDeviceGroup:
         ``targets`` supplies column blocks of ``layout`` to overwrite, and
         ``buffers`` the exchange buffer of every device where the caller
         holds them over several conversions.
+
+        A chunk is that of :func:`exchange_chunk_bytes` whatever the
+        blocks: this way has no step that all devices take together, and
+        its seconds were higher with one chunk for a slab that is little
+        wider (:func:`exchange_chunk_limit`).
         """
 
         cp, _ = require_cupy()
         total = edges[-1]
         layout = _as_layout(layout)
-        tall, capacity = self._capacities(layout, edges)
+        # As on the way to the rows: the buffers of a caller are sized by the caller.
+        tall, capacity = self._capacities(layout, edges, sent=None if buffers is None else ())
         limit = exchange_chunk_bytes() // 8
         concurrent = concurrent_exchange_requested()
         by_column = column_copies_requested()
@@ -1898,7 +2286,7 @@ class SectorDeviceGroup:
             block = self._block(cp, (total, width), tall) if targets is None else targets[index]
             chunks = exchange_chunks(width, total - (high - low), limit)
             if buffers is None:
-                buffer = cp.empty(capacity if chunks else 0, dtype=cp.float64)
+                buffer = self._exchange_buffer(cp, device, capacity if chunks else 0)
             else:
                 buffer = buffers[index]
             for column, offset, size in layout.spans(index):
@@ -1992,20 +2380,21 @@ class SectorDeviceGroup:
             packed += part
         return packed
 
-    def _condition_helper(self) -> int | None:
+    def _condition_helper(self, rows: int, states: int) -> int | None:
         """The device that estimates the condition number of the overlap beside the device small solve.
 
-        The first device after the owner, which waits during that solve,
-        that the sector operator does not name as ``hartree_device`` (the
-        driver does, through the sector eigensolver): with the Poisson and
-        boundary arrays that one is the fullest device of the process, and
+        For a ``rows x states`` basis.  The first device after the owner,
+        which waits during that solve, that the sector operator does not
+        name as ``hartree_device`` (the driver does, through the sector
+        eigensolver): that one holds the Poisson and boundary arrays, and
         the estimate takes a copy of the overlap and the work arrays of its
         eigensolver there.  A sector whose only other device is that one
-        asks it where :func:`condition_helper_policy` says ``any``.
-        ``None`` leaves the estimate to the owner, in front of its
-        factorization: for such a sector otherwise, for a sector on one
-        device, where the policy is ``off``, and where the condition number
-        is the host SVD, which needs no device.
+        asks it where :func:`condition_helper_policy` says ``any``, the
+        default, and :meth:`_helper_fits` gives it the room.  ``None``
+        leaves the estimate to the owner, in front of its factorization:
+        for such a sector otherwise, for a sector on one device, where the
+        policy is ``off``, and where the condition number is the host SVD,
+        which needs no device.
         """
 
         policy = condition_helper_policy()
@@ -2016,7 +2405,31 @@ class SectorDeviceGroup:
         free = [device for device in others if device != busy]
         if free:
             return free[0]
-        return others[0] if others and policy == "any" else None
+        if not others or policy != "any" or not self._helper_fits(others[0], rows, states):
+            return None
+        return others[0]
+
+    def _helper_fits(self, helper: int, rows: int, states: int) -> bool:
+        """Whether ``helper`` has the room to estimate a condition number, by the rule that shares a basis.
+
+        The blocks that the rule counts on a device of this group for a
+        ``rows x states`` basis (:func:`shared_block_bytes`, with the slabs
+        that the step with two tall blocks would cut on that device) and
+        the bytes of the estimate (:func:`condition_helper_bytes`) take no
+        more of the memory of ``helper`` than
+        ``PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION``, 0.85 by default.
+        Asked of the device that holds the Hartree objects only: its
+        estimate is new, and the rule had counted no room for it.  Like
+        the rule it reads the size of the device and nothing of its state.
+        """
+
+        cp, _ = require_cupy()
+        count = len(self.devices)
+        with cp.cuda.Device(helper):
+            wide = wider_slabs_fit(rows, states, count)
+            _free, total = cp.cuda.runtime.memGetInfo()
+        needed = shared_block_bytes(rows, states, count, wide) + condition_helper_bytes(states)
+        return needed <= _auto_fraction() * total
 
     def _condition_beside(self, helper: int):
         """The ``condition`` of :func:`rayleigh_ritz.solve_whitened_ritz_on_device` for an estimate on ``helper``.
@@ -2060,7 +2473,7 @@ class SectorDeviceGroup:
 
         return start
 
-    def _small_solve(self, packed, on_device: bool):
+    def _small_solve(self, packed, on_device: bool, rows: int):
         """Solve the small generalized problem of a summed Gram pair.
 
         On the owner if the pair is an array of it, else on the host.
@@ -2068,14 +2481,15 @@ class SectorDeviceGroup:
         matrix where the solve ran.  The time counts as ``dense``, also that
         of a solve that fails a stability audit.  On the owner, another
         device of the sector estimates the condition number of the overlap
-        meanwhile where :meth:`_condition_helper` names one.
+        meanwhile where :meth:`_condition_helper` names one for a basis of
+        ``rows`` rows.
         """
 
         cp, _ = require_cupy()
         started = perf_counter()
         try:
             if on_device:
-                helper = self._condition_helper()
+                helper = self._condition_helper(rows, int(packed.shape[-1]))
                 self.condition_device = self.owner if helper is None else helper
                 beside = {} if helper is None else {"condition": self._condition_beside(helper)}
                 with cp.cuda.Device(self.owner):
@@ -2088,6 +2502,27 @@ class SectorDeviceGroup:
             return solve_whitened_ritz(packed[0], packed[1])
         finally:
             self.seconds["dense"] += perf_counter() - started
+
+    def _overlap_width(self, states: int) -> int | None:
+        """The slab width that a step gives :meth:`_overlap`, noted for reports.
+
+        That of :func:`overlap_slab_width`, read once for all devices:
+        ``None`` where a count of slabs is named, which the product then
+        reads as it did.
+        """
+
+        width = overlap_slab_width(states)
+        if _overlap_policy() != "slabs":
+            self.overlap_columns = None
+        else:
+            self.overlap_columns = min(int(states), _gram_slab_width(states) if width is None else width)
+        return width
+
+    @staticmethod
+    def _overlap(block, width: int | None):
+        """The lower triangle of the overlap of a row block: in slabs of ``width`` columns, or cut by the named count."""
+
+        return _symmetric_overlap(block) if width is None else _symmetric_overlap(block, width)
 
     def ritz(self, operator: Any, filtered: DistributedBasis, *, stages: bool):
         """Generalized Rayleigh--Ritz of a filtered basis; consumes ``filtered``.
@@ -2124,10 +2559,11 @@ class SectorDeviceGroup:
             return self._ritz_two_blocks(operator, filtered, stages=stages)
         cp, _ = require_cupy()
         on_device = dense_solve_on_device()
-        rows, _columns = filtered.shape
+        rows, states = filtered.shape
         layout = filtered.layout
         edges = self.row_edges(rows)
         tall, _piece = self._capacities(layout, edges)
+        overlap_width = self._overlap_width(states)
         columns = filtered.take()
 
         def stage(name):
@@ -2151,7 +2587,7 @@ class SectorDeviceGroup:
             self.seconds["to_rows"] += perf_counter() - started
 
             def gram(index, device):
-                overlap = _symmetric_overlap(row_basis[index])
+                overlap = self._overlap(row_basis[index], overlap_width)
                 # A row block's part of X.T (H X) is not symmetric, but the
                 # parts are summed entry by entry and only the lower triangle
                 # of the sum is read: the lower triangle of each part suffices.
@@ -2166,7 +2602,7 @@ class SectorDeviceGroup:
             del parts
 
         try:
-            eigenvalues, coefficients, whitened = self._small_solve(packed, on_device)
+            eigenvalues, coefficients, whitened = self._small_solve(packed, on_device, rows)
         except GeneralizedRitzStabilityError as error:
             # The row copies go before the fallback gathers the basis on the owner.
             del row_applied, row_basis
@@ -2252,13 +2688,17 @@ class SectorDeviceGroup:
         layout = filtered.layout
         widths = layout.widths
         edges = self.row_edges(rows)
-        _tall, chunk = self._capacities(layout, edges)
         equal = equal_slabs_requested()
         if equal:
             width = slab_columns(rows, states, len(self.devices), wider_slabs_fit(rows, states, len(self.devices)))
         else:
             width, work = self._slab_capacity(rows, states)
         rounds = projection_slabs(layout, width, equal, gram_multiple())
+        # The buffers hold a chunk of the blocks, which travel first, and of
+        # the slabs of every round, and whole what most of those send.
+        away = rows - min(high - low for low, high in zip(edges[:-1], edges[1:]))
+        sent = followed_slabs(away, [max(widths)] + [max(last - first for first, last in taken) for taken in rounds])
+        _tall, chunk = self._capacities(layout, edges, sent=sent)
         self.slab_cut = "equal" if equal else "full"
         self.slab_columns = max(last - first for taken in rounds for first, last in taken)
         self.projection_columns = self.slab_columns
@@ -2278,6 +2718,7 @@ class SectorDeviceGroup:
             # the widest of them lets it be.
             width = self.slab_columns
             work = self._cut_capacity(rows, width, widest)
+        overlap_width = self._overlap_width(states)
         columns = filtered.take()
 
         def stage(name):
@@ -2294,7 +2735,7 @@ class SectorDeviceGroup:
                 # The rotation tile lies where the slab was, which is done with by then.
                 self._view(cp, backing, 0, (min(height, rows * width // states), states)),
                 # As the exchanges allocate it: no buffer where no column leaves the device.
-                cp.empty(chunk if widths[index] and rows > height else 0, dtype=cp.float64),
+                self._exchange_buffer(cp, device, chunk if widths[index] and rows > height else 0),
             )
 
         with stage("subspace_ritz_projection_seconds"):
@@ -2308,7 +2749,7 @@ class SectorDeviceGroup:
                 # the projection.  Row-major: the owner copies raw memory.
                 pair = cp.zeros((2, states, states), dtype=cp.float64)
                 if row_basis[index].shape[0]:
-                    pair[0] = _symmetric_overlap(row_basis[index])
+                    pair[0] = self._overlap(row_basis[index], overlap_width)
                 return pair
 
             before = self.seconds["gram"]
@@ -2362,7 +2803,7 @@ class SectorDeviceGroup:
             del parts, pairs
 
         try:
-            eigenvalues, coefficients, whitened = self._small_solve(packed, on_device)
+            eigenvalues, coefficients, whitened = self._small_solve(packed, on_device, rows)
         except GeneralizedRitzStabilityError as error:
             # The row blocks and the workspace go before the fallback gathers
             # the basis on the owner.  The columns are as they were filtered.
@@ -2503,9 +2944,12 @@ class SectorDeviceGroup:
         widths = layout.widths
         edges = self.row_edges(rows)
         heights = [high - low for low, high in zip(edges[:-1], edges[1:])]
-        tall, chunk = self._capacities(layout, edges)
         budget = slab_columns(rows, states, len(self.devices), blocks=1)
         rounds = block_rounds(widths, budget, gram_multiple())
+        # The buffers hold a chunk of the slabs of every round, and whole
+        # what most rounds send: only slabs travel in this step.
+        sent = followed_slabs(rows - min(heights), [max(last - first for first, last in taken) for taken in rounds])
+        tall, chunk = self._capacities(layout, edges, sent=sent)
         ends = self._row_block_ends(rounds, widths, heights, rows)
         # Where the slabs of a round lie side by side in the row layout,
         # which columns of a row block they are, and the column of the
@@ -2531,6 +2975,7 @@ class SectorDeviceGroup:
         self.slab_cut = "equal" if rounds == block_rounds(widths, budget) else "multiple"
         self.slab_columns, self.projection_columns = width, max(place[-1][1] for place in places)
         work = self._cut_capacity(rows, width, self.projection_columns, 1)
+        overlap_width = self._overlap_width(states)
         columns = filtered.take()
 
         def stage(name):
@@ -2563,7 +3008,7 @@ class SectorDeviceGroup:
                 # The rotation tile lies where H times a slab was, which is done with by then.
                 self._view(cp, backing, 0, (min(height, rows * width // states), states)),
                 # As the exchanges allocate it: no buffer where no column leaves the device.
-                cp.empty(chunk if widths[index] and rows > height else 0, dtype=cp.float64),
+                self._exchange_buffer(cp, device, chunk if widths[index] and rows > height else 0),
                 slabs, applied, leaving, arriving, resident, inside,
             )
 
@@ -2596,7 +3041,7 @@ class SectorDeviceGroup:
 
         def overlap(index, device):
             if row_basis[index].shape[0]:
-                pairs[index][0] = _symmetric_overlap(row_basis[index])
+                pairs[index][0] = self._overlap(row_basis[index], overlap_width)
 
         def lift(index, device, step):
             if resident[index][step].size:
@@ -2657,7 +3102,7 @@ class SectorDeviceGroup:
             self.seconds["gram"] += perf_counter() - started
 
         try:
-            eigenvalues, coefficients, whitened = self._small_solve(packed, on_device)
+            eigenvalues, coefficients, whitened = self._small_solve(packed, on_device, rows)
         except GeneralizedRitzStabilityError as error:
             del packed
             started = perf_counter()
@@ -2992,16 +3437,20 @@ __all__ = [
     "interleaved_layout_requested",
     "interleaved_ranges",
     "exchange_chunk_bytes",
+    "exchange_chunk_limit",
     "exchange_chunks",
+    "followed_slabs",
     "concurrent_exchange_requested",
     "paired_exchange_requested",
     "keeps_column_ranges",
     "column_copies_requested",
     "tall_blocks_per_device",
+    "condition_helper_bytes",
     "condition_helper_policy",
     "equal_slabs_requested",
     "shared_pool_release_requested",
     "pair_slab_bytes",
+    "overlap_slab_width",
     "wider_slabs_fit",
     "slab_columns",
     "slab_workspace",

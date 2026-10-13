@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from ..Eigensolvers.spill_buffers import copies_directly, spill_buffer_mode, upload
+
 
 _DENSITY_KERNEL = r"""
 extern "C" __global__
@@ -39,11 +41,30 @@ void orbital_density(
 
 
 class CuPyDeviceDensityBuilder:
-    """Build host density while retaining all orbital columns on the GPU."""
+    """Build host density while retaining all orbital columns on the GPU.
+
+    Orbitals that are handed over on the host, the columns of a sector
+    whose states are kept there, are uploaded first.  A Fortran-ordered
+    matrix of doubles goes to the device by one copy from where it lies
+    (:func:`Eigensolvers.spill_buffers.upload`) unless
+    ``PARSEC_CUPY_SPILL_BUFFERS=fresh`` names the former upload,
+    ``cupy.asarray``, which stages it in a block of CuPy's pinned pool; any
+    other host array takes that call as before.  The device array is the
+    same to the last bit.  ``host_uploads`` counts these uploads, their
+    bytes and the wall seconds of the calls; those of the former upload
+    end where ``cupy.asarray`` returns, which can be before its copy to
+    the device has completed.
+    """
 
     def __init__(self, cp: Any, timing_stats: Any | None = None) -> None:
         self.cp = cp
         self.timing_stats = timing_stats
+        # Read here, so that a value it does not know stops a run when it
+        # is prepared.
+        self.direct_host_upload = spill_buffer_mode() == "persistent"
+        self.host_uploads = dict(
+            direct=self.direct_host_upload, calls=0, bytes=0, seconds=0.0
+        )
         self.kernel = None
         if hasattr(cp, "RawKernel"):
             self.kernel = cp.RawKernel(
@@ -75,7 +96,16 @@ class CuPyDeviceDensityBuilder:
     ) -> np.ndarray:
         cp = self.cp
         started = perf_counter()
-        vectors = cp.asarray(wavefunctions, dtype=cp.float64)
+        # A device builder only: the shim of a test has no device to copy to.
+        on_host = self.kernel is not None and isinstance(wavefunctions, np.ndarray)
+        if on_host and self.direct_host_upload and copies_directly(wavefunctions):
+            vectors = upload(cp, wavefunctions)
+        else:
+            vectors = cp.asarray(wavefunctions, dtype=cp.float64)
+        if on_host:
+            self.host_uploads["calls"] += 1
+            self.host_uploads["bytes"] += int(wavefunctions.nbytes)
+            self.host_uploads["seconds"] += perf_counter() - started
         occupation_values = np.asarray(occupations, dtype=np.float64)
         if vectors.ndim != 2:
             raise ValueError("wavefunctions must have shape (grid_points, states)")

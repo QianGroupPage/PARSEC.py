@@ -1,0 +1,125 @@
+{
+  "schema_version": 2,
+  "element": "Tc",
+  "prefix": "tc_1s_hole_1_pbe_tm",
+  "backend": "pyfhi98pp",
+  "family": "ncpp",
+  "xc": "pbe",
+  "scheme": "tm",
+  "relativistic": "scalar",
+  "variant": null,
+  "core_hole": {
+    "shell": "1s",
+    "removed_electrons": 1.0
+  },
+  "ionic_charge": 8.0,
+  "reference_electrons": 7.0,
+  "reference_charge": 1.0,
+  "ae_energy_hartree": -3508.9117398039307,
+  "pseudo_energy_hartree": -15.521018982573915,
+  "atomic_energy_correction_rydberg": -6986.781441642714,
+  "lmax": 2,
+  "channels": [
+    {
+      "angular_momentum": 0,
+      "scheme": "t",
+      "cutoff_radius": 2.5804935660565302,
+      "match_radius": 2.6442317571381264,
+      "ae_eigenvalue_ev": -11.638679813401778,
+      "pseudo_eigenvalue_ev": -11.638705348508628,
+      "norm_test": 0.9999998270913205,
+      "slope_test": 1.0000239241308964
+    },
+    {
+      "angular_momentum": 1,
+      "scheme": "t",
+      "cutoff_radius": 2.6442317571381264,
+      "match_radius": 2.709544281539438,
+      "ae_eigenvalue_ev": 7.5314,
+      "pseudo_eigenvalue_ev": 7.53144153012984,
+      "norm_test": 0.9999983115691351,
+      "slope_test": 0.9999983115691352
+    },
+    {
+      "angular_momentum": 2,
+      "scheme": "t",
+      "cutoff_radius": 2.6442317571381264,
+      "match_radius": 2.709544281539438,
+      "ae_eigenvalue_ev": -15.506473198807813,
+      "pseudo_eigenvalue_ev": -15.50649693889393,
+      "norm_test": 0.9999991414880823,
+      "slope_test": 1.0000036486000659
+    }
+  ],
+  "core_radius": 0.0,
+  "reference_shift_ev": -7.468641421833117,
+  "kinetic_cutoff_rydberg": {
+    "0": 29.0,
+    "2": 55.0
+  },
+  "ghost_free": true,
+  "selected_local_channel": 1,
+  "local_channel_results": [
+    {
+      "local_channel": 1,
+      "passed": true,
+      "minimum_margin_hartree": 0.04271369509799139,
+      "report_path": "tc_1s_hole_1_pbe_tm.local-1.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.04271369509799139,
+          "reference_energy_hartree": -0.4277112990139877,
+          "local_ground_energy_hartree": -0.3849976039159963,
+          "local_first_excited_energy_hartree": -0.11005170699896409,
+          "projector_sign": -1
+        },
+        {
+          "angular_momentum": 2,
+          "label": "d",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.45980444598309134,
+          "reference_energy_hartree": -0.5698491077907155,
+          "local_ground_energy_hartree": -0.11004466180762416,
+          "local_first_excited_energy_hartree": -0.042781089256818575,
+          "projector_sign": -1
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    "Matched to the ground-state potential: lmax 2, local channel p, same cutoff radii.",
+    "Reference energies of the unbound channels (p) shifted by -7.47 eV, the shift of the highest valence level caused by the core hole.",
+    "Generating atomic reference charge +1; choose the electron count (full or neutralized core hole) explicitly in the many-electron calculation."
+  ],
+  "artifacts": {
+    "dat": {
+      "path": "tc_1s_hole_1_pbe_tm.dat",
+      "sha256": "6624901ba1d23caa302fac0d57faa7c12a353e022a244cb1d6e246d41f976cbb"
+    },
+    "aep": {
+      "path": "tc_1s_hole_1_pbe_tm.aep",
+      "sha256": "a50745e17b182bcce97ce5a30328865e44e02fc2bc9aad9164ffb2491a41f3ce"
+    },
+    "test": {
+      "path": "tc_1s_hole_1_pbe_tm.test",
+      "sha256": "c9728cfc4cc3ed7c981e0839ba07c304e28e867f59fec86eb943bcef58957309"
+    },
+    "fhi_species": {
+      "path": "../FHI/Tc-1s_FHIPP.DAT",
+      "sha256": "dfef5f49afbfe41b15ca05be6fe08092aa48a20603c9532dc2eb48a7d1033444"
+    },
+    "upf": {
+      "path": "../UPF/tc_1s_hole_1_pbe_tm.UPF",
+      "sha256": "ceaf5c7e9d0506b088b14f70934e20ff2f61314942eb7767c18cc307b2866cee"
+    },
+    "parsec_species": {
+      "path": "../PARSEC/Tc-1s_POTRE.DAT",
+      "sha256": "c91a6885ae36b2f071c7e1580d892d393616f636670f82356159a40e828473c0"
+    }
+  }
+}

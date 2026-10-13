@@ -38,6 +38,7 @@ from .orthogonalize import (
     orthonormalize_complete_appended_subspace,
 )
 from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
+from .tall_product import transposed_product
 
 
 @dataclass(frozen=True)
@@ -125,7 +126,7 @@ def _rayleigh_ritz_upper(operator: Any, basis: Any):
     cp, _ = require_cupy()
     basis = cp.asarray(basis, dtype=cp.float64)
     applied = _apply(operator, basis)
-    raw = basis.T @ applied
+    raw = transposed_product(cp, basis, applied)
     upper = cp.triu(raw)
     projected = upper + cp.triu(upper, 1).T
     eigenvalues, rotations = symmetric_eigh(projected)
@@ -509,11 +510,15 @@ def run_chebdav(
             :, locked_count : locked_count + full_active_size
         ]
         with device_stage(operator, "initial_projection_seconds"):
+            # The block has an even number of columns by default, six: it
+            # goes to cuBLAS in two pieces
+            # (:func:`tall_product.transposed_product`).
             if ritz_projection_workspace is None:
-                last_columns = active_basis.T @ applied_new
+                last_columns = transposed_product(cp, active_basis, applied_new)
             else:
-                cp.matmul(
-                    basis.T,
+                transposed_product(
+                    cp,
+                    basis,
                     applied_new,
                     out=ritz_projection_workspace,
                 )

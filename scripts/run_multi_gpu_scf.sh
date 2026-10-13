@@ -8,6 +8,14 @@
 # src/parsec_python/acceleration/MULTI_GPU.md. The runner refuses periodic
 # cells.
 #
+# An input with Minimization (bfgs, simple) runs the structural relaxation on
+# the same layout, and Skip_Force: false adds the forces to a single point;
+# OUTPUT_DIR then also receives atom.cor, relax_restart.dat, iterate.dat and
+# relaxation.xyz. The ranks divide the symmetry sectors of the structure, so
+# a structure without point-group symmetry, a manual relaxation and molecular
+# dynamics run on one node with the runner option --serial-control. See
+# src/parsec_python/FORCES_AND_RELAXATION.md.
+#
 # Call the script by its path in the checkout, from a batch script or from the
 # shell of an interactive allocation, after loading the MPI and CUDA modules
 # of the site and activating the Python environment: NumPy, SciPy, CuPy,

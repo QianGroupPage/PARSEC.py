@@ -13,18 +13,27 @@ from io import StringIO
 import os
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
 
+from parsec_python.Hartree import domain, valence_point_charges
 from parsec_python.Input import parse_parsec_input
+from parsec_python.V_ion import load_pseudopotentials
 from parsec_python.acceleration import cli as cli_module
-from parsec_python.acceleration.Output import AcceleratedTextReporter
-from parsec_python.acceleration.Output.accelerated_output import domain_details
+from parsec_python.acceleration.Output import AcceleratedTextReporter, accelerated_output
+from parsec_python.acceleration.Output.accelerated_output import (
+    RadiusEstimatesThread,
+    domain_details,
+    domain_report_thread_requested,
+)
+from parsec_python.acceleration.backends.cupy import cupy_available
 from parsec_python.acceleration.benchmarks import mpi_full_scf
 from parsec_python.acceleration.models import BackendInfo, BackendStatistics
+from parsec_python.models import Atom, GridSettings, HartreeSettings, SpeciesPotential
 from parsec_python.tests import parsed_inputs
 from parsec_python.tests.parsed_inputs import BASE_PSEUDOPOTENTIALS, NANODIAMOND
 
@@ -326,6 +335,379 @@ class DomainDetailsTests(unittest.TestCase):
         self.assertIs(untouched.backend, backend)
 
 
+def thread_setting(value: str | None):
+    """The environment with ``PARSEC_DOMAIN_REPORT_THREAD`` at ``value``, or without it."""
+
+    environment = {
+        name: item
+        for name, item in os.environ.items()
+        if name not in ("PARSEC_DOMAIN_REPORT", "PARSEC_DOMAIN_REPORT_THREAD")
+    }
+    if value is not None:
+        environment["PARSEC_DOMAIN_REPORT_THREAD"] = value
+    return patch.dict(os.environ, environment, clear=True)
+
+
+def radius_threads() -> list[threading.Thread]:
+    return [
+        thread for thread in threading.enumerate() if thread.name == "parsec-domain-radius"
+    ]
+
+
+class RadiusEstimatesThreadTests(unittest.TestCase):
+    """The estimates of the radius search after the SCF, made on a host thread beside it."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.potentials = load_pseudopotentials(
+            {"H": SpeciesPotential(BASE_PSEUDOPOTENTIALS / "H_POTRE.DAT", 0)}
+        )
+        # Two hydrogen atoms 40 ang from the centre: the largest multipole
+        # order holds the sphere of the rule, 43.9 ang, and a search after
+        # the SCF asks for estimates.
+        distance = 40.0 * domain.ANGSTROM
+        cls.atoms = (Atom("H", (0.0, 0.0, distance)), Atom("H", (0.0, 0.0, -distance)))
+        cls.radius = 43.9 * domain.ANGSTROM
+        cls.translation = SimpleNamespace(
+            domain_energy_tolerance=1.0e-3, boundary_tolerance_from="rule"
+        )
+
+    def system(self, selected="cupy", shape="sphere"):
+        return SimpleNamespace(
+            atoms=self.atoms,
+            pseudopotentials=self.potentials,
+            electron_count=2.0,
+            grid=SimpleNamespace(
+                settings=GridSettings(spacing=0.4, radius=self.radius, domain_shape=shape)
+            ),
+            backend_info=SimpleNamespace(selected=selected),
+        )
+
+    def reporter(self, hartree=None, tolerance_from="rule"):
+        """A reporter of the smoke input whose reference reads these Hartree settings."""
+
+        reporter = AcceleratedTextReporter(
+            lambda _text: None, parse_parsec_input(DATA / "H_cli_smoke.in")
+        )
+        reporter.reference.problem = SimpleNamespace(
+            hartree=HartreeSettings() if hartree is None else hartree
+        )
+        reporter.reference.translation = SimpleNamespace(
+            domain_energy_tolerance=1.0e-3, boundary_tolerance_from=tolerance_from
+        )
+        self.addCleanup(reporter.close)
+        return reporter
+
+    def in_line(self, budget=1.0e-3):
+        prepared = domain.PreparedEstimates(
+            *valence_point_charges(self.atoms, self.potentials, 2.0)
+        )
+        domain.prepare_radius_search(prepared, self.radius, 2.0, spacing=0.4, budget=budget)
+        return prepared
+
+    def test_switch_is_on_unless_named_off(self) -> None:
+        for value, expected in (
+            (None, True), ("1", True), ("on", True), ("", True),
+            ("0", False), (" OFF ", False), ("false", False), ("no", False),
+        ):
+            with self.subTest(value=value), thread_setting(value):
+                self.assertEqual(domain_report_thread_requested(), expected)
+
+    def test_thread_makes_the_estimates_of_the_preparation_in_line(self) -> None:
+        expected = self.in_line()
+        self.assertGreater(len(expected), 6)
+        before = len(radius_threads())
+        worker = RadiusEstimatesThread(self.system(), self.translation)
+        (thread,) = radius_threads()[before:]
+        self.assertTrue(thread.daemon)
+        self.assertIsNot(thread, threading.current_thread())
+        # Left alone it ends by itself; stop() then only joins it.
+        thread.join(timeout=120)
+        self.assertFalse(thread.is_alive())
+        prepared = worker.stop()
+        self.assertIs(prepared, worker.estimates)
+        self.assertIsNone(worker.failure)
+        self.assertGreater(worker.seconds, 0.0)
+        self.assertEqual(len(radius_threads()), before)
+        # The same radii with the same estimates, to the last bit: a search
+        # reads from either what it would make itself.
+        self.assertEqual(prepared._values, expected._values)
+        self.assertEqual(
+            [value.hex() for value in prepared._values.values()],
+            [value.hex() for value in expected._values.values()],
+        )
+        self.assertTrue(prepared.holds(expected.positions, expected.charges))
+        # The search of the rule after the SCF, from the estimates of the thread.
+        fit = domain.WallFit(
+            prefactor=1.8e-12, decay=0.9, energy=1.0e-12, rms=0.02, at_scan_end=False, shells=8
+        )
+        options = dict(spacing=0.4, highest_occupied=-0.5)
+        wanted = domain.radius_for_budget(
+            fit, self.radius, self.atoms, self.potentials, 2.0, **options
+        )
+        with patch.object(domain, "estimate_omitted_potential", side_effect=AssertionError):
+            read = domain.radius_for_budget(
+                fit, self.radius, self.atoms, self.potentials, 2.0, prepared=prepared, **options
+            )
+        self.assertEqual(read, wanted)
+        self.assertEqual((read.radius_text, read.estimates), ("43.9 ang", 6))
+
+    def test_thread_prepares_for_the_energy_tolerance_of_the_input(self) -> None:
+        # Domain_Energy_Tolerance of the input, here far below the default:
+        # the rule then gives the search a tighter tolerance of the
+        # boundary, which larger radii meet, and the search asks for
+        # estimates that one with the default tolerance does not.
+        budget = 2.0e-6
+        translation = SimpleNamespace(
+            domain_energy_tolerance=budget, boundary_tolerance_from="rule"
+        )
+        expected = self.in_line(budget)
+        self.assertGreater(len(set(expected._values) - set(self.in_line()._values)), 6)
+        worker = RadiusEstimatesThread(self.system(), translation)
+        worker._thread.join(timeout=120)
+        self.assertFalse(worker._thread.is_alive())
+        prepared = worker.stop()
+        self.assertIsNone(worker.failure)
+        self.assertEqual(
+            {radius: value.hex() for radius, value in prepared._values.items()},
+            {radius: value.hex() for radius, value in expected._values.items()},
+        )
+        # The search after the SCF, with that tolerance, makes none itself.
+        fit = domain.WallFit(
+            prefactor=3.6e-15, decay=0.9, energy=2.0e-15, rms=0.02, at_scan_end=False, shells=8
+        )
+        options = dict(spacing=0.4, highest_occupied=-0.5, budget=budget)
+        wanted = domain.radius_for_budget(
+            fit, self.radius, self.atoms, self.potentials, 2.0, **options
+        )
+        with patch.object(domain, "estimate_omitted_potential", side_effect=AssertionError):
+            read = domain.radius_for_budget(
+                fit, self.radius, self.atoms, self.potentials, 2.0, prepared=prepared, **options
+            )
+        self.assertEqual(read, wanted)
+        self.assertEqual(
+            (read.radius_text, read.tolerance_text, read.estimates),
+            ("45.7 ang", "5.6e-05 Ry", 7),
+        )
+        # A translation that carries no tolerance gets the default.
+        worker = RadiusEstimatesThread(self.system(), SimpleNamespace())
+        worker._thread.join(timeout=120)
+        self.assertEqual(set(worker.stop()._values), set(self.in_line()._values))
+
+    def test_stop_ends_the_thread_behind_the_estimate_it_is_making(self) -> None:
+        entered, release, made = threading.Event(), threading.Event(), []
+        estimate = domain.estimate_omitted_potential
+
+        def slow(*arguments, **options):
+            made.append(arguments[2])
+            entered.set()
+            self.assertTrue(release.wait(timeout=120))
+            return estimate(*arguments, **options)
+
+        with patch.object(domain, "estimate_omitted_potential", slow):
+            worker = RadiusEstimatesThread(self.system(), self.translation)
+            self.assertTrue(entered.wait(timeout=120))
+            stopped = []
+            stopper = threading.Thread(target=lambda: stopped.append(worker.stop()))
+            stopper.start()
+            # stop() waits for the estimate that is being made.
+            stopper.join(timeout=0.2)
+            self.assertTrue(stopper.is_alive())
+            self.assertEqual((len(made), stopped), (1, []))
+            release.set()
+            stopper.join(timeout=120)
+        self.assertFalse(stopper.is_alive())
+        # That estimate was finished and kept, and no other was begun.
+        self.assertEqual(len(made), 1)
+        self.assertEqual(list(stopped[0]._values), made)
+        self.assertEqual(radius_threads(), [])
+        self.assertIsNone(worker.failure)
+        # A second stop finds the thread ended.
+        self.assertIs(worker.stop(), stopped[0])
+
+    def test_failure_of_the_thread_is_kept_and_stops_nothing(self) -> None:
+        with patch.object(
+            accelerated_output, "prepare_radius_search", side_effect=RuntimeError("no estimate")
+        ):
+            worker = RadiusEstimatesThread(self.system(), self.translation)
+            prepared = worker.stop()
+        self.assertEqual(worker.failure, "RuntimeError: no estimate")
+        self.assertEqual(len(prepared), 0)
+        # The search after the SCF makes every estimate it does not find.
+        fit = domain.WallFit(
+            prefactor=1.8e-12, decay=0.9, energy=1.0e-12, rms=0.02, at_scan_end=False, shells=8
+        )
+        wanted = domain.radius_for_budget(
+            fit, self.radius, self.atoms, self.potentials, 2.0,
+            spacing=0.4, highest_occupied=-0.5, prepared=prepared,
+        )
+        self.assertEqual((wanted.radius_text, wanted.estimates), ("43.9 ang", 6))
+
+    def test_reporter_starts_the_thread_where_the_block_can_ask_for_estimates(self) -> None:
+        def started(reporter, system, setting=None, report=True):
+            reporter.reference._domain_report = report
+            with thread_setting(setting), patch.object(
+                accelerated_output, "RadiusEstimatesThread"
+            ) as thread:
+                reporter._start_radius_estimates(system)
+                if thread.call_count:
+                    self.assertEqual(thread.call_args.args, (system, reporter.reference.translation))
+                    self.assertIs(reporter._radius_thread, thread.return_value)
+                else:
+                    self.assertIsNone(reporter._radius_thread)
+                reporter._radius_thread = None
+                return thread.call_count
+
+        # A sphere on the CuPy backend with the tolerance of the rule, or
+        # with the default tolerance of the code beside a radius of the input.
+        self.assertEqual(started(self.reporter(), self.system()), 1)
+        self.assertEqual(started(self.reporter(tolerance_from="default"), self.system()), 1)
+        self.assertEqual(started(self.reporter(), self.system(), setting="1"), 1)
+        # The switch at its former value, and a run without the block.
+        self.assertEqual(started(self.reporter(), self.system(), setting="0"), 0)
+        self.assertEqual(started(self.reporter(), self.system(), report=False), 0)
+        # A box has no sphere; a tolerance of the input, a tolerance that is
+        # off and the direct Coulomb sum ask for no estimate.
+        self.assertEqual(started(self.reporter(), self.system(shape="box")), 0)
+        self.assertEqual(started(self.reporter(tolerance_from="input"), self.system()), 0)
+        self.assertEqual(
+            started(self.reporter(HartreeSettings(boundary_tolerance=None)), self.system()), 0
+        )
+        self.assertEqual(
+            started(self.reporter(HartreeSettings(boundary_method="direct")), self.system()), 0
+        )
+        # The host backends work on the cores the thread would take.
+        for selected in ("scipy", "native"):
+            self.assertEqual(started(self.reporter(), self.system(selected)), 0)
+        # Nothing that goes wrong in starting it stops a calculation.
+        reporter = self.reporter()
+        with thread_setting(None), patch.object(
+            accelerated_output, "RadiusEstimatesThread", side_effect=RuntimeError
+        ):
+            reporter._start_radius_estimates(self.system())
+        self.assertIsNone(reporter._radius_thread)
+        reporter._start_radius_estimates(SimpleNamespace())
+        self.assertIsNone(reporter._radius_thread)
+
+    def test_reporter_ends_the_thread_before_it_reports_and_on_every_way_out(self) -> None:
+        expected = self.in_line()
+        reporter = self.reporter()
+        with thread_setting(None):
+            reporter._start_radius_estimates(self.system())
+        worker = reporter._radius_thread
+        self.assertIsInstance(worker, RadiusEstimatesThread)
+        self.assertIsNone(reporter.reference.prepared_estimates)
+        seen = []
+
+        def reference_finish(result, elapsed, *, forces=None):
+            # The thread has ended, and the block reads what it made.
+            seen.append((len(radius_threads()), reporter.reference.prepared_estimates))
+
+        reporter.reference.finish = reference_finish
+        reporter.reference.domain = None
+        result = SimpleNamespace(
+            backend=SimpleNamespace(selected="cupy", details=()),
+            backend_statistics=BackendStatistics(),
+        )
+        self.assertIsNone(reporter.radius_thread_record)
+        reporter.finish(result, 1.0)
+        self.assertEqual(seen, [(0, worker.estimates)])
+        self.assertIsNone(reporter._radius_thread)
+        # What became of the thread stays with the reporter: the estimates
+        # it made, its seconds and no failure.
+        self.assertEqual(
+            reporter.radius_thread_record,
+            dict(estimates=len(worker.estimates), seconds=worker.seconds, failure=None),
+        )
+        self.assertGreater(worker.seconds, 0.0)
+        # stop() was called before the thread had ended by itself or after:
+        # either way what it kept are estimates of the preparation in line.
+        for radius, value in worker.estimates._values.items():
+            self.assertEqual(value.hex(), expected.get(radius).hex())
+        # close() after the report does nothing, as often as it is called.
+        reporter.close()
+        reporter.close()
+        self.assertIs(reporter.reference.prepared_estimates, worker.estimates)
+        # A calculation that does not reach its report: close() ends the thread.
+        other = self.reporter()
+        with thread_setting(None):
+            other._start_radius_estimates(self.system())
+        self.assertEqual(len(radius_threads()), 1)
+        other.close()
+        self.assertEqual(radius_threads(), [])
+        self.assertIsNotNone(other.reference.prepared_estimates)
+        self.assertEqual(
+            (other.radius_thread_record["estimates"], other.radius_thread_record["failure"]),
+            (len(other.reference.prepared_estimates), None),
+        )
+        # A reporter that started none has nothing to end, and no record.
+        idle = self.reporter()
+        idle.close()
+        self.assertIsNone(idle.reference.prepared_estimates)
+        self.assertIsNone(idle.radius_thread_record)
+        with thread_setting("0"):
+            idle._start_radius_estimates(self.system())
+        idle.close()
+        self.assertIsNone(idle.radius_thread_record)
+
+    def test_reporter_keeps_what_the_thread_raised_and_what_kept_it_from_starting(self) -> None:
+        # A thread that fails every time would return every run to the
+        # time of the search after the SCF without a sign: the reporter
+        # keeps the failure beside the estimates and the seconds.
+        failed = self.reporter()
+        with thread_setting(None), patch.object(
+            accelerated_output, "prepare_radius_search", side_effect=RuntimeError("no estimate")
+        ):
+            failed._start_radius_estimates(self.system())
+            failed.close()
+        record = failed.radius_thread_record
+        self.assertEqual(
+            (record["estimates"], record["failure"], sorted(record)),
+            (0, "RuntimeError: no estimate", ["estimates", "failure", "seconds"]),
+        )
+        self.assertGreaterEqual(record["seconds"], 0.0)
+        self.assertEqual(len(failed.reference.prepared_estimates), 0)
+        # A thread that could not be started: nothing ran, and the record says why.
+        unstarted = self.reporter()
+        with thread_setting(None), patch.object(
+            accelerated_output, "RadiusEstimatesThread", side_effect=RuntimeError("no thread")
+        ):
+            unstarted._start_radius_estimates(self.system())
+        self.assertEqual(
+            unstarted.radius_thread_record,
+            dict(estimates=0, seconds=0.0, failure="not started: RuntimeError: no thread"),
+        )
+        unstarted.close()
+        self.assertIsNone(unstarted.reference.prepared_estimates)
+        self.assertEqual(unstarted.radius_thread_record["failure"], "not started: RuntimeError: no thread")
+        # A thread that is stopped before it has made every estimate
+        # records those it made.
+        entered, release = threading.Event(), threading.Event()
+        estimate = domain.estimate_omitted_potential
+
+        def slow(*arguments, **options):
+            entered.set()
+            self.assertTrue(release.wait(timeout=120))
+            return estimate(*arguments, **options)
+
+        stopped = self.reporter()
+        with thread_setting(None), patch.object(domain, "estimate_omitted_potential", slow):
+            stopped._start_radius_estimates(self.system())
+            worker = stopped._radius_thread
+            self.assertTrue(entered.wait(timeout=120))
+            closer = threading.Thread(target=stopped.close)
+            closer.start()
+            # The estimate in flight is let go once the thread was told to end.
+            self.assertTrue(worker._ended.wait(timeout=120))
+            release.set()
+            closer.join(timeout=120)
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(
+            (stopped.radius_thread_record["estimates"], stopped.radius_thread_record["failure"]),
+            (1, None),
+        )
+
+
 class AcceleratedCommandLineTests(unittest.TestCase):
     def run_smoke(self, text, *arguments, report=None):
         environment = {
@@ -514,6 +896,98 @@ class AcceleratedCommandLineTests(unittest.TestCase):
             details["domain_radius_for_wall_share"],
             r"^none: no radius meets the Hartree boundary tolerance of ",
         )
+
+    def test_command_line_ends_the_thread_of_its_reporter_on_every_way_out(self) -> None:
+        text = parsed_inputs.two_atom_smoke()
+        closed = []
+        close = AcceleratedTextReporter.close
+
+        def counted(reporter):
+            closed.append(reporter)
+            return close(reporter)
+
+        with patch.object(AcceleratedTextReporter, "close", counted):
+            # A calculation that reports: before the report, and on the way out.
+            code, _console, _log, _details = self.run_smoke(text, "--quiet")
+            self.assertEqual((code, len(closed), len(set(map(id, closed)))), (0, 2, 1))
+            # An SCF that fails or is interrupted, and a preparation that fails.
+            for stopped, target, expected in (
+                (RuntimeError("stopped"), "run_scf", 1),
+                (KeyboardInterrupt(), "run_scf", 130),
+                (RuntimeError("stopped"), "prepare_single_point", 1),
+            ):
+                del closed[:]
+                with self.subTest(target=target, code=expected), patch.object(
+                    cli_module, target, side_effect=stopped
+                ):
+                    code, _console, _log, _details = self.run_smoke(text, "--quiet")
+                    self.assertEqual((code, len(closed)), (expected, 1))
+            # A dry run makes no reporter and has none to end.
+            del closed[:]
+            code, _console, _log, _details = self.run_smoke(text, "--dry-run")
+            self.assertEqual((code, closed), (0, []))
+        self.assertEqual(radius_threads(), [])
+
+    @unittest.skipUnless(cupy_available(), "the thread belongs to the CuPy backend")
+    def test_block_after_the_scf_is_the_same_with_and_without_the_thread(self) -> None:
+        # Two atoms on the GPU: the series bound spares their search every
+        # estimate, so the thread ends at once; the block, the archive and
+        # the details are those of the search made after the SCF.
+        text = parsed_inputs.two_atom_smoke()
+        started = []
+
+        class Recorded(RadiusEstimatesThread):
+            def __init__(self, *arguments):
+                started.append(self)
+                super().__init__(*arguments)
+
+        def run(setting):
+            del started[:]
+            with thread_setting(setting), patch.object(
+                accelerated_output, "RadiusEstimatesThread", Recorded
+            ), tempfile.TemporaryDirectory() as folder:
+                folder = Path(folder).resolve()
+                (folder / "parsec.in").write_bytes(text.encode("utf-8"))
+                (folder / "H_POTRE.DAT").write_bytes((DATA / "H_POTRE.DAT").read_bytes())
+                with redirect_stdout(StringIO()):
+                    code = cli_module.main(
+                        [str(folder / "parsec.in"), "--backend", "cupy", "--quiet"]
+                    )
+                with np.load(folder / "parsec_python_results.npz", allow_pickle=False) as data:
+                    members = {name: data[name] for name in data.files}
+                lines = (folder / "parsec.out").read_text(encoding="utf-8").split("\n")
+            first = next(
+                index for index, line in enumerate(lines)
+                if line.startswith(" Density at the sphere:")
+            )
+            last = next(index for index in range(first, len(lines)) if not lines[index])
+            return code, lines[first:last], members, list(started)
+
+        code, block, members, threads = run(None)
+        self.assertEqual(code, 0)
+        (worker,) = threads
+        self.assertEqual((worker.failure, len(worker.estimates)), (None, 0))
+        self.assertIn("   For this system the wall share would be met by:", block)
+        code, former_block, former, threads = run("0")
+        self.assertEqual((code, threads), (0, []))
+        self.assertEqual(block, former_block)
+        self.assertEqual(sorted(members), sorted(former))
+        times = ("timing", "seconds")
+        for name in members:
+            if any(word in name for word in times) or name == "backend_detail_values":
+                continue
+            with self.subTest(member=name):
+                self.assertEqual(members[name].tobytes(), former[name].tobytes())
+        details, former_details = (
+            dict(zip(item["backend_detail_keys"].tolist(), item["backend_detail_values"].tolist()))
+            for item in (members, former)
+        )
+        self.assertEqual(sorted(details), sorted(former_details))
+        for name in details:
+            if "second" not in name:
+                with self.subTest(detail=name):
+                    self.assertEqual(details[name], former_details[name])
+        self.assertEqual(radius_threads(), [])
 
     def test_dry_run_says_what_the_rule_gives(self) -> None:
         text = (DATA / "H_cli_smoke.in").read_text(encoding="utf-8")

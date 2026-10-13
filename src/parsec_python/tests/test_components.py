@@ -604,6 +604,37 @@ class IntegrationTests(unittest.TestCase):
         )
         assert_same_fields(with_builders)
 
+        # The ion-ion energy may come from a caller that computed it
+        # elsewhere: the hook is called at the place of the stage, after the
+        # densities, with the atoms and pseudopotentials of the system.
+        from parsec_python.V_ion import ion_ion_energy
+
+        del calls[:]
+
+        def repulsion(atoms, pseudopotentials):
+            calls.append(("ion-ion", get_ident()))
+            self.assertIs(atoms, reduced.atoms)
+            self.assertIs(pseudopotentials, reduced.pseudopotentials)
+            return ion_ion_energy(atoms, pseudopotentials)
+
+        handed_over = complete_single_point(
+            reduced,
+            local_ionic_builder=local,
+            atomic_density_builder=density,
+            ion_ion_energy_builder=repulsion,
+        )
+        self.assertEqual(
+            [name for name, _ in calls], ["local", "valence", "core", "ion-ion"]
+        )
+        assert_same_fields(handed_over)
+        # What the hook returns is the energy of the system, whatever it is.
+        self.assertEqual(
+            complete_single_point(
+                reduced, ion_ion_energy_builder=lambda *_arguments: 12.5
+            ).ion_ion_energy,
+            12.5,
+        )
+
         with self.assertRaisesRegex(ValueError, "already has the fields"):
             complete_single_point(complete)
 

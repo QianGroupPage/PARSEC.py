@@ -1,0 +1,104 @@
+{
+  "schema_version": 2,
+  "element": "Ge",
+  "prefix": "ge_2s_hole_1_pbe_tm",
+  "backend": "pyfhi98pp",
+  "family": "ncpp",
+  "xc": "pbe",
+  "scheme": "tm",
+  "relativistic": "scalar",
+  "variant": null,
+  "core_hole": {
+    "shell": "2s",
+    "removed_electrons": 1.0
+  },
+  "ionic_charge": 5.0,
+  "reference_electrons": 4.0,
+  "reference_charge": 1.0,
+  "ae_energy_hartree": -2047.3679001544351,
+  "pseudo_energy_hartree": -5.723411168056231,
+  "atomic_energy_correction_rydberg": -4083.288977972758,
+  "lmax": 1,
+  "channels": [
+    {
+      "angular_momentum": 0,
+      "scheme": "t",
+      "cutoff_radius": 1.9783190139497273,
+      "match_radius": 2.0271834935942854,
+      "ae_eigenvalue_ev": -22.83808083410183,
+      "pseudo_eigenvalue_ev": -22.838178178058353,
+      "norm_test": 0.9999987428528463,
+      "slope_test": 1.0000214500782767
+    },
+    {
+      "angular_momentum": 1,
+      "scheme": "t",
+      "cutoff_radius": 2.1811386316825696,
+      "match_radius": 2.235012755885129,
+      "ae_eigenvalue_ev": -13.266706022504886,
+      "pseudo_eigenvalue_ev": -13.266745477940058,
+      "norm_test": 0.9999998393753208,
+      "slope_test": 1.0000193850173478
+    }
+  ],
+  "core_radius": 0.0,
+  "reference_shift_ev": -9.371251210121425,
+  "kinetic_cutoff_rydberg": {
+    "0": 61.0,
+    "1": 35.0
+  },
+  "ghost_free": true,
+  "selected_local_channel": 1,
+  "local_channel_results": [
+    {
+      "local_channel": 1,
+      "passed": true,
+      "minimum_margin_hartree": 0.06899362500270445,
+      "report_path": "ge_2s_hole_1_pbe_tm.local-1.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "pass",
+          "message": "* no ghost (ekb > 0, eloc0 < eref < eloc1)",
+          "margin_hartree": 0.06899362500270445,
+          "reference_energy_hartree": -0.8392813448392871,
+          "local_ground_energy_hartree": -0.9082749698419915,
+          "local_first_excited_energy_hartree": -0.20356712534192123,
+          "projector_sign": 1
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    "Matched to the ground-state potential: lmax 1, local channel p, same cutoff radii.",
+    "Reference energies of the unbound channels (d) shifted by -9.37 eV, the shift of the highest valence level caused by the core hole.",
+    "Generating atomic reference charge +1; choose the electron count (full or neutralized core hole) explicitly in the many-electron calculation."
+  ],
+  "artifacts": {
+    "dat": {
+      "path": "ge_2s_hole_1_pbe_tm.dat",
+      "sha256": "e49e9d425dc041804683cd8c156b3f0176991c2f8018977ad491f4807e7438bb"
+    },
+    "aep": {
+      "path": "ge_2s_hole_1_pbe_tm.aep",
+      "sha256": "e7a29650b9f03dbb72a1412ee0f07f73d106722f52a3f20f55d734299eae919d"
+    },
+    "test": {
+      "path": "ge_2s_hole_1_pbe_tm.test",
+      "sha256": "266199d050a10de832ce6af4f159d88d8f6de6da1e1beb1df857d69e864fcbdc"
+    },
+    "fhi_species": {
+      "path": "../FHI/Ge-2s_FHIPP.DAT",
+      "sha256": "d2c48a4017dea71028c03e81315a5c4561706893a32fe63465e2afdc10966e13"
+    },
+    "upf": {
+      "path": "../UPF/ge_2s_hole_1_pbe_tm.UPF",
+      "sha256": "52012c79ccae1fb146829778190922557f68fc709a25cf2eb68a914e730e98c7"
+    },
+    "parsec_species": {
+      "path": "../PARSEC/Ge-2s_POTRE.DAT",
+      "sha256": "1a585ff940e933a3396355b570bb9fa896e72123ef94ee3b7fb10e4f2fdda1ad"
+    }
+  }
+}

@@ -51,12 +51,9 @@ def _spline_payload(
 
 
 def _projector_support_radius(potential: ParsecPseudopotential) -> float:
-    requested = max(
-        potential.channel_cutoffs.values(), default=potential.radii[0]
-    )
-    next_index = int(np.searchsorted(potential.radii, requested, side="right"))
-    next_index = min(next_index, potential.radii.size - 2)
-    return float(potential.radii[next_index])
+    # One rule for every builder: the next radial sample beyond the channel
+    # cutoffs of a MARTINS_NEW file, Core_Cutoff_Radius for a MARTINS_OLD one.
+    return potential.projector_support_radius
 
 
 def _density_table(potential, specification, *, core=False):

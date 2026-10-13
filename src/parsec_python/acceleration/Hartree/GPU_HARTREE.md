@@ -316,7 +316,12 @@ tolerance halves and order 60 misses it. For the atoms of C9449H1572 the
 whole block took 0.33 s (one estimate) to 1.2 s (six) on 22.6 million points
 on the workstation host; `result.domain.after_scf` records `estimates`,
 `shell_seconds` and `radius_seconds`. A tolerance line in the input is not
-the rule's to meet: no estimate, 0.16 s. A run that is measured for time and
+the rule's to meet: no estimate, 0.16 s. On the CuPy backend a host thread
+makes the estimates of that search while the SCF runs, for every radius the
+fit of the final density can lead the search to, and the block reads them
+(`PARSEC_DOMAIN_REPORT_THREAD`, on by default; `0` makes them after the SCF;
+`../README.md`): the lines and the record are the same, and
+`radius_seconds` then counts a search that had its estimates. A run that is measured for time and
 has its radius may set `PARSEC_DOMAIN_REPORT=0` (in the last table of
 switches in `../README.md`), which leaves out these
 reports and their work (reference `README.md`); the results are the same

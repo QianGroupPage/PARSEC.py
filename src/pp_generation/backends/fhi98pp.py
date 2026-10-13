@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 
 from ..errors import BackendError, ConfigurationError
-from ..fhi_input import ParsedInput, customize, find_template, parse
+from ..fhi_input import XC_CODES, ParsedInput, customize, find_template, parse
 from ..formats import annotate_upf_energies
 from ..models import (
     ConstructionScheme,
@@ -65,7 +65,7 @@ class Fhi98ppBackend:
             # case ``request.xc`` is recorded as ``fhi-code-N`` and the input
             # remains fully authoritative.  UPF conversion is intentionally
             # restricted below because fhi2upf requires a recognized XC label.
-            expected_xc = {"pbe": 6, "ca": 8}.get(request.xc)
+            expected_xc = XC_CODES.get(request.xc)
             expected_scheme = (
                 "t" if request.scheme is ConstructionScheme.TROULLIER_MARTINS else "h"
             )

@@ -2,7 +2,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 import gc
+from math import isqrt
 import os
+import tracemalloc
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -18,8 +20,9 @@ from parsec_python.acceleration.backends.cupy_compact import CuPyCompactFiniteDi
 from parsec_python.acceleration.backends.cupy_stencil_major import (
     _CUDA_SOURCE, CuPyStencilMajorFiniteDifference, build_stencil_major_metadata)
 from parsec_python.acceleration.backends.implicit_stencil import (
-    PackedTileHostMetadata, _pack_affine_tiles_reference, implicit_source, implicit_tile_for_group,
-    implicit_tile_for_sector, implicit_tile_setting, pack_affine_tiles, pack_worker_setting, unpack_affine_tiles)
+    FilterWork, PackedTileHostMetadata, _pack_affine_tiles_reference, counted_filter_applications, implicit_source,
+    implicit_tile_for_group, implicit_tile_for_sector, implicit_tile_setting, pack_affine_tiles, pack_worker_setting,
+    regular_tile_share, tiles_repay_packing, unpack_affine_tiles)
 from parsec_python.acceleration.tests.test_mixed_precision import _HostRawKernel, host_cupy
 
 
@@ -252,6 +255,245 @@ class ImplicitTilePolicyTests(unittest.TestCase):
                 self.assertEqual(implicit_tile_for_sector(2_000_000, 1), 16)
             with self.subTest(value=value), _settings(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS=value):
                 self.assertEqual(implicit_tile_for_sector(2_000_000, 2), 16)
+
+    def test_tiles_repay_their_packing_by_the_filter_work_of_the_sector(self):
+        saved, packing, floor = (implicit_stencil.SAVED_SECONDS_PER_UPDATE, implicit_stencil.PACKING_SECONDS_PER_ROW,
+                                 implicit_stencil.REGULAR_SHARE_WITHOUT_GAIN)
+        self.assertEqual((saved, packing, floor), (28.0e-12, 70.0e-9, 0.5))
+        # Columns and regular share of the measured sectors, with the 200 applications counted for four first
+        # cycles of degree 30: 3,480 electrons (620,736 and 677,542 rows), 5,264 and 7,120 gained on 4, 8 and 16
+        # A100 GPUs, where a process has four devices; 864 electrons (280,790 rows) is too small on any number.
+        for columns, share, tiles in ((442, 0.657, (True, True, True)), (442, 0.666, (True, True, True)),
+                                      (665, 0.705, (True, True, True)), (896, 0.711, (True, True, True)),
+                                      (157, 0.571, (False, False, False)), (37, 0.441, (False, False, False))):
+            for devices, tile in zip((1, 2, 4), tiles):
+                with self.subTest(columns=columns, devices=devices):
+                    self.assertEqual(tiles_repay_packing(columns, 200, devices, share), tile)
+        # The rows of a sector do not enter: what its filter saves and what its packing takes both grow with
+        # them.  A sector of many rows and few states pays the packing for nothing, with one device or four.
+        self.assertFalse(tiles_repay_packing(40, 200, 1, 0.80))
+        self.assertFalse(tiles_repay_packing(100, 200, 4, 0.80))
+        self.assertTrue(tiles_repay_packing(100, 200, 1, 0.80))
+        # The first column count that repays, from the three constants, over ranges of every quantity.
+        for applications in (40, 95, 120, 200, 270, 1000):
+            for devices in (1, 2, 3, 4, 8):
+                for share in (0.55, 0.6, 2.0/3.0, 0.75, 0.9, 1.0):
+                    needed = packing*devices/(saved*(share - floor)*applications)
+                    first = int(np.ceil(needed*(1.0 + 1.0e-12)))
+                    with self.subTest(applications=applications, devices=devices, share=share):
+                        self.assertTrue(tiles_repay_packing(first + 1, applications, devices, share))
+                        self.assertFalse(tiles_repay_packing(max(first - 2, 0), applications, devices, share))
+                        # More columns, applications or regular rows never take the tiles away, and more
+                        # devices never give them.
+                        self.assertTrue(tiles_repay_packing(2*first + 2, applications, devices, share))
+                        self.assertTrue(tiles_repay_packing(first + 1, 2*applications, devices, share))
+                        self.assertTrue(tiles_repay_packing(first + 1, applications, devices, min(1.0, share + 0.05)))
+                        self.assertFalse(tiles_repay_packing(max(first - 2, 0), applications, 2*devices, share))
+        # At half of the rows in regular tiles or fewer the tiles save nothing, whatever the work.
+        for share in (0.0, 0.3, 0.5):
+            self.assertFalse(tiles_repay_packing(10**6, 10**4, 1, share))
+        self.assertTrue(tiles_repay_packing(10**6, 10**4, 1, 0.5001))
+        # No columns, no applications: nothing to repay with.  A device count below one counts as one.
+        self.assertFalse(tiles_repay_packing(0, 200, 1, 1.0))
+        self.assertFalse(tiles_repay_packing(5000, 0, 1, 1.0))
+        self.assertEqual(tiles_repay_packing(442, 200, 0, 0.666), tiles_repay_packing(442, 200, 1, 0.666))
+        # The share is asked for only where the columns could repay a stencil of regular tiles alone.
+        asked = []
+
+        def share():
+            asked.append(1)
+            return 0.7
+
+        self.assertFalse(tiles_repay_packing(40, 200, 4, share))
+        self.assertEqual(asked, [])
+        self.assertTrue(tiles_repay_packing(442, 200, 4, share))
+        self.assertFalse(FilterWork(442, 200, 16, share).repays_packing())
+        self.assertEqual(len(asked), 2)
+        self.assertTrue(FilterWork(442, 200, 4, 0.666).repays_packing())
+
+    def test_applications_counted_for_a_run(self):
+        def settings(method="chebff", degree=30, cycles=4, later=15, delta=3):
+            return SimpleNamespace(method=method, first_filter_degree=degree, first_filter_cycles=cycles,
+                                   filter_degree=later, filter_degree_delta=delta)
+
+        self.assertEqual(implicit_stencil.COUNTED_LATER_STEPS, 8)
+        # The first solve as the input sets it, and eight later steps at the lowest degree the filter falls to.
+        self.assertEqual(counted_filter_applications(settings(), 70), 4*30 + 8*10)
+        self.assertEqual(counted_filter_applications(settings(degree=20, cycles=2), 50), 2*20 + 8*10)
+        self.assertEqual(counted_filter_applications(settings(cycles=9), 50), 9*30 + 8*10)
+        # No more later steps than the input allows.
+        for steps, later in ((1, 0), (2, 1), (5, 4), (9, 8), (10, 8), (500, 8)):
+            self.assertEqual(counted_filter_applications(settings(), steps), 120 + 10*later)
+        # The lowest later degree: ten, the delta and one above ten, and the degree itself below that.
+        self.assertEqual(counted_filter_applications(settings(later=30, delta=3), 50), 120 + 8*10)
+        self.assertEqual(counted_filter_applications(settings(later=30, delta=14), 50), 120 + 8*15)
+        self.assertEqual(counted_filter_applications(settings(later=8, delta=2), 50), 120 + 8*8)
+        # CHEBDAV filters until its residuals are met: one pass is counted.  ARPACK filters nothing first.
+        self.assertEqual(counted_filter_applications(settings(method="chebdav", degree=15, later=10), 50), 15 + 80)
+        self.assertEqual(counted_filter_applications(settings(method="arpack"), 50), 80)
+        # The settings of an input, with their defaults.
+        from parsec_python.models import EigensolverSettings, SCFSettings
+        self.assertEqual(counted_filter_applications(EigensolverSettings(), SCFSettings().max_iterations), 2*20 + 8*10)
+
+    def test_share_of_regular_tiles_is_that_of_the_packer(self):
+        def exact(metadata, tile):
+            statistics = pack_affine_tiles(metadata, tile)[2]
+            return statistics["regular_rows"]/statistics["rows"]
+
+        # 2,500 tiles of 16 rows with irregular ones; an unfinished last tile; a slot that is missing in whole
+        # tiles and one that is missing in part of a tile; two coefficients in one tile.
+        a = _irregular_operator(40_007).tolil()
+        a[20_000, 19_999] = .25
+        a[39_990, :] = 0
+        a[8_000:8_016, :] = 0
+        a[8_000:8_016, 8_000:8_016] = sp.eye(16)
+        a[12_010, 12_011] = 0
+        metadata = build_stencil_major_metadata(a.tocsr())
+        with _settings():
+            for tile in (16, 32, 256):
+                with self.subTest(tile=tile):
+                    # With every tile looked at: the share the packing reports, to the last bit.
+                    self.assertEqual(regular_tile_share(metadata, tile, sample=10**9), exact(metadata, tile))
+                    self.assertEqual(regular_tile_share(metadata, tile, sample=40_007//tile), exact(metadata, tile))
+            self.assertGreater(exact(metadata, 16), 0.99)
+            # A sample: the same share for every call, and near that of all tiles.
+            sampled = regular_tile_share(metadata, 16, sample=500)
+            self.assertEqual(sampled, regular_tile_share(metadata, 16, sample=500))
+            self.assertAlmostEqual(sampled, exact(metadata, 16), delta=0.01)
+            self.assertEqual(implicit_stencil.REGULAR_SHARE_SAMPLE, 1024)
+            self.assertAlmostEqual(regular_tile_share(metadata), exact(metadata, 16), delta=0.01)
+            # A stencil whose rows differ from tile to tile, and within half of the tiles.
+            rng = np.random.default_rng(11)
+            rows = 64_000
+            offsets = np.array([-3, 0, 5], dtype=np.int64)
+            neighbors = np.arange(rows, dtype=np.int64)[None, :] + offsets[:, None]
+            neighbors[(neighbors < 0) | (neighbors >= rows)] = -1
+            broken = np.flatnonzero(rng.random(rows//16) < 0.5)
+            neighbors[1, broken*16 + rng.integers(1, 16, broken.size)] = -1
+            codes = np.zeros(neighbors.shape, np.uint8)
+            mixed = SimpleNamespace(neighbors=neighbors.astype(np.int32), coefficient_codes=codes,
+                                    coefficient_palette=np.ones(1), shape=(rows, rows))
+            self.assertEqual(regular_tile_share(mixed, 16, sample=10**9), exact(mixed, 16))
+            self.assertAlmostEqual(exact(mixed, 16), 0.5, delta=0.03)
+            for sample in (256, 1024):
+                self.assertAlmostEqual(regular_tile_share(mixed, 16, sample), exact(mixed, 16),
+                                       delta=4.0*np.sqrt(0.25/sample))
+            # The tiles that are looked at are spread over all the rows.  A stencil whose first 1,024 tiles are
+            # regular and no later one, as the rows of a sector are ordered by its grid and not by their
+            # tiles, is not taken for a regular one; nor is one that is regular in its last tiles alone.
+            rows = 16*8192
+            neighbors = np.arange(rows, dtype=np.int64)[None, :] + offsets[:, None]
+            neighbors[(neighbors < 0) | (neighbors >= rows)] = -1
+            for name, broken in (("first", np.arange(1024, 8192)), ("last", np.arange(0, 8192 - 1024))):
+                with self.subTest(regular=name):
+                    partly = neighbors.copy()
+                    partly[1, broken*16 + 7] = -1
+                    partly = SimpleNamespace(neighbors=partly.astype(np.int32), shape=(rows, rows),
+                                             coefficient_codes=np.zeros(partly.shape, np.uint8),
+                                             coefficient_palette=np.ones(1))
+                    self.assertAlmostEqual(exact(partly, 16), 0.125, delta=0.001)
+                    self.assertAlmostEqual(regular_tile_share(partly), exact(partly, 16), delta=0.005)
+                    self.assertEqual(regular_tile_share(partly, 16, sample=8192), exact(partly, 16))
+            # The sample reads its tiles out of the stencil as it lies: nothing of the size of the stencil is
+            # copied, also where the rows are no whole number of tiles (every slot missing: all tiles affine).
+            rows = 2_000_003
+            large = SimpleNamespace(neighbors=np.full((3, rows), -1, np.int32),
+                                    coefficient_codes=np.zeros((3, rows), np.uint8))
+            tracemalloc.start()
+            try:
+                share = regular_tile_share(large)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            self.assertEqual(share, (rows//16)*16/rows)
+            self.assertLess(peak, large.neighbors.nbytes//8)
+            # Fewer rows than a tile: nothing is affine.  A tile size the kernels do not read is refused.
+            self.assertEqual(regular_tile_share(build_stencil_major_metadata(sp.eye(7, format="csr"))), 0.0)
+            with self.assertRaises(ValueError):
+                regular_tile_share(metadata, 8)
+
+    def test_auto_follows_the_filter_work_where_no_row_limit_is_named(self):
+        enough, few = FilterWork(442, 200, 4, 0.666), FilterWork(157, 95, 1, 0.571)
+        with _settings():
+            # Whatever the rows, the devices that filter the sector and the sectors of its device.
+            for rows in (8, 280_790, 620_736, 677_542, 3_786_832):
+                for devices in (1, 2, 4):
+                    for sectors in (1, 2, 4):
+                        with self.subTest(rows=rows, devices=devices, sectors=sectors):
+                            self.assertEqual(implicit_tile_for_sector(rows, devices, False, sectors, enough), 16)
+                            self.assertEqual(implicit_tile_for_sector(rows, devices, False, sectors, few), 0)
+                            # The FP32 recurrence reads no tiles, and its share is not asked for.
+                            self.assertEqual(implicit_tile_for_sector(rows, devices, True, sectors, FilterWork(
+                                442, 200, 4, lambda: self.fail("share asked for"))), 0)
+                self.assertEqual(implicit_tile_for_group(rows, False, enough), 16)
+                self.assertEqual(implicit_tile_for_group(rows, False, few), 0)
+                self.assertEqual(implicit_tile_for_group(rows, True, enough), 0)
+        # A named tile size or none is taken as it is.
+        for value in (0, 16, 64):
+            with _settings(PARSEC_CUPY_IMPLICIT_TILE=str(value)):
+                self.assertEqual([implicit_tile_for_sector(677_542, devices, False, 1, work)
+                                  for devices in (1, 4) for work in (enough, few)], [value]*4)
+        # A row limit that the environment names is the rule of its route, and of that route alone.
+        with _settings(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS="650000"):
+            self.assertEqual([implicit_tile_for_sector(rows, 1, False, 1, work) for rows in (620_736, 677_542)
+                              for work in (enough, few)], [0, 0, 16, 16])
+            self.assertEqual([implicit_tile_for_sector(677_542, 4, False, 1, work) for work in (enough, few)], [16, 0])
+        with _settings(PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS="1100000"):
+            self.assertEqual([implicit_tile_for_sector(rows, 2, False, 1, work) for rows in (1_094_788, 1_194_720)
+                              for work in (enough, few)], [0, 0, 16, 16])
+            self.assertEqual([implicit_tile_for_sector(280_790, 1, False, 1, work) for work in (enough, few)], [16, 0])
+        # A value that is no row count is an error of the route that reads it, with the work known too.
+        for name, devices in (("PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS", 1), ("PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS", 4)):
+            for value in ("0", "many", ""):
+                with self.subTest(name=name, value=value), _settings(**{name: value}), \
+                     self.assertRaisesRegex(ValueError, name):
+                    implicit_tile_for_sector(2_000_000, devices, False, 1, enough)
+
+    def test_the_two_row_limits_restore_the_choice_before_the_rule(self):
+        def before(rows, devices, float32, sectors):
+            # The choice of ``auto`` before the rule, as it was written then: 650,000 rows over the square root
+            # of the sectors of a device, of four at most, rounded up, for a sector that one device filters;
+            # 1,100,000 rows for a sector that several filter.
+            if devices != 1:
+                return 16 if rows >= 1_100_000 and not float32 else 0
+            limit = isqrt(-(-650_000**2//min(4, max(1, sectors))) - 1) + 1
+            return 0 if float32 or rows < limit else 16
+
+        works = (None, FilterWork(10**6, 10**4, 1, 1.0), FilterWork(1, 1, 16, 0.0),
+                 FilterWork(442, 200, 4, lambda: self.fail("share asked for")))
+        sizes = (1, 8, 105_126, 274_784, 280_790, 324_999, 325_000, 375_277, 375_278, 407_478, 459_619, 459_620,
+                 546_152, 577_426, 620_736, 649_999, 650_000, 677_542, 1_031_322, 1_094_788, 1_099_999, 1_100_000,
+                 1_194_720, 1_924_792, 2_873_400, 3_786_832, 5_660_200)
+        former = dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS="650000", PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS="1100000")
+        checked = 0
+        for settings in (former, {**former, "PARSEC_CUPY_IMPLICIT_TILE": "auto"}):
+            with _settings(**settings):
+                for rows in sizes:
+                    for devices in (1, 2, 3, 4):
+                        for sectors in (0, 1, 2, 3, 4, 5, 8):
+                            for float32 in (False, True):
+                                expected = before(rows, devices, float32, sectors)
+                                for work in works:
+                                    self.assertEqual(implicit_tile_for_sector(rows, devices, float32, sectors, work),
+                                                     expected, (rows, devices, sectors, float32, work))
+                                    checked += 1
+                    for float32 in (False, True):
+                        for work in works:
+                            self.assertEqual(implicit_tile_for_group(rows, float32, work), before(rows, 4, float32, 1))
+        self.assertEqual(checked, 2*len(sizes)*4*7*2*len(works))
+        # A caller that gives no work gets the same limits where the variables are unset.
+        with _settings():
+            for rows in sizes:
+                for devices in (1, 2, 4):
+                    for sectors in (1, 2, 4):
+                        self.assertEqual(implicit_tile_for_sector(rows, devices, False, sectors),
+                                         before(rows, devices, False, sectors))
+        # The oracle is the function of the commit before the rule for the cases its own tests named.
+        self.assertEqual([before(rows, 1, False, 1) for rows in (546_152, 649_999, 650_000, 677_542)], [0, 0, 16, 16])
+        self.assertEqual([before(rows, 1, False, sectors) for rows, sectors in
+                          ((459_620, 2), (459_619, 2), (375_278, 3), (375_277, 3), (325_000, 4), (324_999, 4),
+                           (325_000, 16), (324_999, 16))], [16, 0]*4)
+        self.assertEqual([before(rows, 2, False, 4) for rows in (1_099_999, 1_100_000)], [0, 16])
 
     def test_tile_lookup_replaces_the_slot_major_read_in_both_kernels(self):
         slot_major = "static_cast<long long>(slot) * row_count + row"
@@ -687,6 +929,30 @@ class SectorGroupTileTests(unittest.TestCase):
                                                  finite_difference_metadata=metadata, implicit_tile=0)
         self.assertEqual(worker.replicas[2].compact_finite_difference.storage_mode, self.slot_major)
         self.assertEqual(group.stencil_storage, "mixed")
+
+    def test_replicas_form_the_projector_coefficients_with_the_kernel_of_their_owner(self):
+        # The other devices of a sector are built after its owner. They are given the columns per block of its
+        # tree projection, whatever the switch says by then; an owner without a projection names none.
+        cp = _DevicesCuPy()
+        metadata = build_stencil_major_metadata(_irregular_operator(1031))
+        for held, later in ((1, "6"), (6, "1"), (None, "1")):
+            named = []
+
+            def replica(*arguments, **options):
+                named.append(options["projection_block_columns"])
+                return CuPyHamiltonian(*arguments, **options)
+
+            with self.subTest(owner=held, later=later), _settings(), _devices(cp):
+                owner = CuPyHamiltonian(None, np.zeros(1031), None, retain_generic_laplacian=False,
+                                        finite_difference_metadata=metadata, implicit_tile=0)
+                self.assertIsNone(owner.custom_projector_projection)
+                if held is not None:
+                    owner.custom_projector_projection = SimpleNamespace(block_columns=held)
+                with patch.dict(os.environ, PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS=later), \
+                     patch.object(distributed_filter, "CuPyHamiltonian", replica):
+                    worker = DistributedFilter(owner, (0, 1, 2))
+                self.assertEqual(named, [held, held])
+                self.assertEqual(sorted(worker.replicas), [1, 2])
 
     def test_the_stencil_for_the_replicas_is_downloaded_in_the_layout_of_the_owner(self):
         cp = _DevicesCuPy()

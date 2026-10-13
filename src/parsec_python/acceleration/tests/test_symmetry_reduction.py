@@ -567,6 +567,167 @@ class AxisReflectionReductionTests(unittest.TestCase):
             )
 
 
+class ExactImageTests(unittest.TestCase):
+    """Whether the images of atoms and grid points under a group are exact in every bit."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.grids = {
+            shift: build_cluster_grid(
+                GridSettings(spacing=0.4, radius=3.0, expansion_order=4, shift=shift)
+            )
+            for shift in ((0.5, 0.5, 0.5), (0.0, 0.0, 0.0), (0.5, 0.0, 0.5))
+        }
+        # Four carbons that the three twofold axes exchange, and a hydrogen
+        # at the centre, which every operation keeps.
+        cls.d2 = (
+            Atom("C", (1.0, 0.5, 0.25)),
+            Atom("C", (-1.0, -0.5, 0.25)),
+            Atom("C", (1.0, -0.5, -0.25)),
+            Atom("C", (-1.0, 0.5, -0.25)),
+            Atom("H", (0.0, 0.0, 0.0)),
+        )
+
+    def test_operations_of_both_reductions_are_read_as_sources_and_factors(self) -> None:
+        from parsec_python.acceleration.Symmetry.exact_images import group_operations
+
+        grid = self.grids[(0.5, 0.5, 0.5)]
+        axis = SignedPermutationReduction.detect(grid, self.d2)
+        self.assertIs(type(axis), AxisReflectionReduction)
+        operations = group_operations(axis)
+        self.assertEqual(len(operations), axis.group_order)
+        for (sources, factors), signs in zip(operations, axis.signs):
+            np.testing.assert_array_equal(sources, (0, 1, 2))
+            np.testing.assert_array_equal(factors, signs)
+        # A group that exchanges x and y carries matrices: component i of an
+        # image is factors[i] times component sources[i].
+        swapped = SignedPermutationReduction.detect(
+            grid, (Atom("C", (1.0, 2.0, 0.0)), Atom("C", (2.0, 1.0, 0.0)))
+        )
+        self.assertIsInstance(swapped, SignedPermutationReduction)
+        point = np.array((0.3, -1.1, 2.5))
+        operations = group_operations(swapped)
+        self.assertEqual(len(operations), swapped.group_order)
+        for (sources, factors), matrix in zip(operations, swapped.operations):
+            np.testing.assert_array_equal(point[sources] * factors, matrix @ point)
+        self.assertTrue(any(not np.array_equal(s, (0, 1, 2)) for s, _ in operations))
+        # An object that names no operations has none to test.
+        self.assertIsNone(group_operations(SimpleNamespace(group_order=4)))
+        self.assertIsNone(group_operations(SimpleNamespace(signs=np.ones((2, 2)))))
+        self.assertIsNone(group_operations(SimpleNamespace(operations=np.ones((2, 3, 3)))))
+
+    def test_atoms_within_the_tolerance_of_the_detector_are_not_exact_images(self) -> None:
+        from parsec_python.acceleration.Symmetry.exact_images import (
+            atom_images_exact,
+            group_operations,
+        )
+
+        grid = self.grids[(0.5, 0.5, 0.5)]
+        operations = group_operations(SignedPermutationReduction.detect(grid, self.d2))
+        self.assertTrue(atom_images_exact(self.d2, operations))
+        # In any order of the atoms, and with either sign of a zero.
+        self.assertTrue(atom_images_exact(self.d2[::-1], operations))
+        signed_zero = (*self.d2[:4], Atom("H", (-0.0, 0.0, -0.0)))
+        self.assertTrue(atom_images_exact(signed_zero, operations))
+        # One coordinate off by 3e-9 bohr, or by one unit in the last place:
+        # the detector accepts the group (1e-7 bohr), the test does not.
+        for moved in (0.25 + 3.0e-9, np.nextafter(0.25, 1.0)):
+            atoms = (self.d2[0], Atom("C", (-1.0, -0.5, moved)), *self.d2[2:])
+            detected = SignedPermutationReduction.detect(grid, atoms)
+            self.assertEqual(detected.group_order, 4)
+            self.assertFalse(atom_images_exact(atoms, group_operations(detected)))
+        # An image that is an atom of another species is no image.
+        mixed = (*self.d2[:3], Atom("N", self.d2[3].position), self.d2[4])
+        self.assertFalse(atom_images_exact(mixed, operations))
+        # Two atoms that a swap of x and y exchanges.
+        pair = (Atom("C", (1.0, 2.0, 0.0)), Atom("C", (2.0, 1.0, 0.0)))
+        swap = group_operations(SignedPermutationReduction.detect(grid, pair))
+        self.assertTrue(atom_images_exact(pair, swap))
+        self.assertFalse(
+            atom_images_exact((pair[0], Atom("C", (2.0, np.nextafter(1.0, 2.0), 0.0))), swap)
+        )
+
+    def test_grid_points_are_exact_images_on_shifted_and_unshifted_lattices(self) -> None:
+        from dataclasses import replace
+
+        from parsec_python.acceleration.Symmetry.exact_images import (
+            grid_images_exact,
+            group_operations,
+        )
+
+        pair = (Atom("C", (1.0, 2.0, 0.0)), Atom("C", (2.0, 1.0, 0.0)))
+        for shift, grid in self.grids.items():
+            for atoms in (self.d2, pair, (Atom("H", (0.0, 0.0, 0.0)),)):
+                with self.subTest(shift=shift, atoms=len(atoms)):
+                    reduction = SignedPermutationReduction.detect(grid, atoms)
+                    self.assertGreater(reduction.group_order, 1)
+                    operations = group_operations(reduction)
+                    self.assertTrue(grid_images_exact(grid, reduction, operations))
+                    # With the coordinates of the representative rows given.
+                    rows = grid.coordinates[reduction.representative_rows]
+                    self.assertTrue(grid_images_exact(grid, reduction, operations, rows))
+                    # One coordinate of one point of an orbit of several, one
+                    # unit in the last place away from its image.
+                    row = int(
+                        np.flatnonzero(
+                            reduction.multiplicities[reduction.full_to_wedge] > 1
+                        )[-1]
+                    )
+                    moved = grid.coordinates.copy()
+                    moved[row, 1] = np.nextafter(moved[row, 1], np.inf)
+                    self.assertFalse(
+                        grid_images_exact(
+                            replace(grid, coordinates=moved), reduction, operations
+                        )
+                    )
+        # Coordinates of another shape belong to another grid.
+        grid = self.grids[(0.5, 0.5, 0.5)]
+        reduction = SignedPermutationReduction.detect(grid, self.d2)
+        self.assertFalse(
+            grid_images_exact(
+                replace(grid, coordinates=grid.coordinates[:-1]),
+                reduction,
+                group_operations(reduction),
+            )
+        )
+
+    def test_points_of_an_orbit_sum_are_given_only_where_every_image_is_exact(self) -> None:
+        from dataclasses import replace
+
+        from parsec_python.acceleration.Symmetry.exact_images import orbit_sum_points
+
+        grid = self.grids[(0.5, 0.5, 0.5)]
+        reduction = SignedPermutationReduction.detect(grid, self.d2)
+        points, obstacle = orbit_sum_points(grid, self.d2, reduction)
+        self.assertIsNone(obstacle)
+        self.assertTrue(points.flags.c_contiguous)
+        self.assertEqual(points.dtype, np.float64)
+        self.assertEqual(
+            points.tobytes(), grid.coordinates[reduction.representative_rows].tobytes()
+        )
+        # Every reason for which the full grid has to stay, by its words.
+        identity = SignedPermutationReduction.detect(
+            grid, (self.d2[0], Atom("H", (0.3, 0.1, -0.7)))
+        )
+        self.assertEqual(identity.group_order, 1)
+        within = (self.d2[0], Atom("C", (-1.0, -0.5, 0.25 + 3.0e-9)), *self.d2[2:])
+        moved = grid.coordinates.copy()
+        moved[3, 0] = np.nextafter(moved[3, 0], np.inf)
+        for arguments, words in (
+            ((grid, self.d2, None), "no symmetry operation beside the identity"),
+            ((grid, self.d2, identity), "no symmetry operation beside the identity"),
+            ((grid, self.d2, SimpleNamespace(group_order=4)), "operations of the symmetry reduction are not known"),
+            ((grid, within, SignedPermutationReduction.detect(grid, within)), "image of an atom is not an atom of its species"),
+            ((grid, (), reduction), "image of an atom is not an atom of its species"),
+            ((replace(grid, coordinates=moved), self.d2, reduction), "image of a grid point is not a grid point"),
+            ((grid, self.d2, SimpleNamespace(group_order=4, signs=reduction.signs)), "no orbit maps"),
+        ):
+            with self.subTest(words=words):
+                points, obstacle = orbit_sum_points(*arguments)
+                self.assertIsNone(points)
+                self.assertIn(words, obstacle)
+
+
 class ReflectionRepresentationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

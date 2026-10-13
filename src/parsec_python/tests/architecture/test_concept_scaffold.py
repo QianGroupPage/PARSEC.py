@@ -20,6 +20,9 @@ CONCEPT_PACKAGES = (
     "Mixer",
     "Energy",
     "SCF",
+    "Forces",
+    "Relaxation",
+    "MolecularDynamics",
     "Output",
     "provenance",
 )

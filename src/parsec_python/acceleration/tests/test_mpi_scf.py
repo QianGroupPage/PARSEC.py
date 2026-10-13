@@ -135,7 +135,7 @@ class MPISCFTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sector_device_groups(4, 5, 0, (0,))
 
-    def construct_solver(self, context, devices='0,1,2,3', scheduler='sequential'):
+    def construct_solver(self, context, devices='0,1,2,3', scheduler='sequential', filter_plan=None):
         """Run the real constructor on one rank; unassembled sectors are None."""
         class Device:
             def __init__(self, index=0):
@@ -165,15 +165,17 @@ class MPISCFTests(unittest.TestCase):
         def to_csr():
             conversions.append(1)
             return np.eye(8)
-        metadata = SimpleNamespace(neighbors=np.zeros((1, 8), dtype=int), to_csr=to_csr,
-                                   conversions=conversions)
+        # Every sector has a stencil of its own, with the neighbours of the others.
+        neighbors = np.zeros((1, 8), dtype=int)
+        metadata = tuple(SimpleNamespace(neighbors=neighbors, to_csr=to_csr, conversions=conversions, sector=index)
+                         for index in range(4))
         requested = []
         def reduced_operators(*args, representations=None, **kwargs):
             # As the cache-free builder does: only the named sectors exist.
             requested.append(representations)
             return SimpleNamespace(cache_info=None, nonlocal_operators=(None,)*4,
                 stencil_metadata=tuple(
-                    metadata if representations is None or index in representations else None
+                    metadata[index] if representations is None or index in representations else None
                     for index in range(4)))
         built = []
         def hamiltonian(*args, **kwargs):
@@ -193,10 +195,12 @@ class MPISCFTests(unittest.TestCase):
              patch.dict('os.environ', PARSEC_CUPY_DEVICES=devices,
                         PARSEC_CUPY_SECTOR_SCHEDULER=scheduler, PARSEC_CUPY_COLLECTIVE_LANCZOS='0'):
             solver = CuPySymmetrySCFEigensolver(object(), None, None, decomposition,
-                                                timing_stats=CuPyTimingStats(), mpi_context=context)
+                                                timing_stats=CuPyTimingStats(), mpi_context=context,
+                                                **({} if filter_plan is None else {'filter_plan': filter_plan}))
         if solver._executor is not None:
             self.addCleanup(solver._executor.shutdown)
         self.assertEqual(len(requested), 1)
+        self.stencil_metadata = metadata
         # What the constructor asked of the decomposition, and what it was given.
         self.orbit_requests, self.orbit_lists, self.multiplicities = (
             orbit_requests, orbit_lists, reduction.multiplicities)
@@ -210,7 +214,8 @@ class MPISCFTests(unittest.TestCase):
         self.assertEqual([index for index, op in enumerate(solver._operators) if op is not None], [1, 3])
         self.assertEqual([op.distributed_filter_devices for op in built], [(0, 1), (2, 3)])
         # No device holds Hartree objects unless the driver names one, and then every sector operator of
-        # the rank is told: a sector that shares its basis gives that device no work beside its own.
+        # the rank is told: a sector that shares its basis gives that device work beside its own only where
+        # it has no other device and the sharing rule counts the room.
         self.assertIsNone(solver.hartree_device)
         self.assertEqual([hasattr(op, 'hartree_device') for op in built], [False, False])
         solver.hartree_device = 3
@@ -287,7 +292,7 @@ class MPISCFTests(unittest.TestCase):
                 self.assertEqual(after, f'float32 stencil/projectors/recurrence in 1 of {total} later filter passes '
                                         '(sectors 3); float64 Ritz and SCF')
 
-    def sector_tiles(self, context, devices='0,1,2,3', **settings):
+    def sector_tiles(self, context, devices='0,1,2,3', filter_plan=None, **settings):
         """Tile size the constructor names for each sector it builds, under ``settings`` alone."""
         import os
         names = ('PARSEC_CUPY_IMPLICIT_TILE', 'PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS', 'PARSEC_CUPY_MIXED_FILTER',
@@ -295,61 +300,75 @@ class MPISCFTests(unittest.TestCase):
                  'PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS')
         kept = {name: value for name, value in os.environ.items() if name not in names}
         with patch.dict('os.environ', {**kept, **settings}, clear=True):
-            solver, built, _ = self.construct_solver(context, devices)
+            solver, built, _ = self.construct_solver(context, devices, filter_plan=filter_plan)
         return [operator.implicit_tile for operator in built], solver
 
     def test_sector_stencils_pack_tiles_from_the_row_count_of_their_route(self):
+        from parsec_python.acceleration.Eigensolvers import symmetry
+        from parsec_python.acceleration.backends.implicit_stencil import FilterPlan
+
         def rank(groups):
             return SimpleNamespace(owned_sectors=tuple(groups), size=1, rank=0, root=0,
                                    configure=lambda count, devices: groups)
         one_each = rank({index: (index,) for index in range(4)})
         pairs = rank({0: (0, 1), 1: (2, 3)})
-        # The stand-in sectors have 8 rows: far below the size from which tiles pay.
-        tiles, solver = self.sector_tiles(None)
+        # The solver as the drivers construct it, with the filter work of the run: here work that repays the
+        # packing on any number of devices.  Row limits that the environment names decide without it and do
+        # not ask for the share of regular tiles; the two of this test are named at the values before the
+        # rule, 650,000 and 1,100,000 rows, wherever a call names no other.
+        plan = FilterPlan(states=20, buffer=3, applications=10**6)
+        former = dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='650000', PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='1100000')
+
+        def limited(context, devices='0,1,2,3', **settings):
+            with patch.object(symmetry, 'regular_tile_share', side_effect=AssertionError('share asked for')):
+                return self.sector_tiles(context, devices, plan, **{**former, **settings})
+
+        # The stand-in sectors have 8 rows: far below either limit.
+        tiles, solver = limited(None)
         self.assertEqual(tiles, [0, 0, 0, 0])
         self.assertEqual(solver.finite_difference_neighbors, 'shared_across_representations')
         large = dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='8')
         # One process, a sector per device: with and without a sector context.
         for context in (None, one_each):
-            tiles, solver = self.sector_tiles(context, **large)
+            tiles, solver = limited(context, **large)
             self.assertEqual(tiles, [16, 16, 16, 16])
             # Packed descriptors belong to their sector.
             self.assertEqual(solver.finite_difference_neighbors, 'private_per_representation')
         # The measured launch: one rank, its filter "distributed" over the one device of each sector.
-        self.assertEqual(self.sector_tiles(one_each, **large, PARSEC_CUPY_DISTRIBUTED_FILTER='1')[0], [16]*4)
+        self.assertEqual(limited(one_each, **large, PARSEC_CUPY_DISTRIBUTED_FILTER='1')[0], [16]*4)
         # A group of devices shares the basis or its filter and has a row count of its own, which the limit
         # of one device does not move.
-        self.assertEqual(self.sector_tiles(pairs, **large)[0], [0, 0])
-        self.assertEqual(self.sector_tiles(None, **large, PARSEC_CUPY_DISTRIBUTED_FILTER='1')[0], [0]*4)
-        self.assertEqual(self.sector_tiles(None, '2', **large, PARSEC_CUPY_DISTRIBUTED_FILTER='1')[0], [16]*4)
+        self.assertEqual(limited(pairs, **large)[0], [0, 0])
+        self.assertEqual(limited(None, **large, PARSEC_CUPY_DISTRIBUTED_FILTER='1')[0], [0]*4)
+        self.assertEqual(limited(None, '2', **large, PARSEC_CUPY_DISTRIBUTED_FILTER='1')[0], [16]*4)
         # From that row count on the owner packs the tiles, and the others read them.
         shared = dict(PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='8')
-        tiles, solver = self.sector_tiles(pairs, **shared)
+        tiles, solver = limited(pairs, **shared)
         self.assertEqual(tiles, [16, 16])
         self.assertEqual(solver.finite_difference_neighbors, 'private_per_representation')
-        self.assertEqual(self.sector_tiles(rank({2: (0, 1, 2, 3)}), **shared)[0], [16])
-        self.assertEqual(self.sector_tiles(None, **shared, PARSEC_CUPY_DISTRIBUTED_FILTER='1')[0], [16]*4)
-        self.assertEqual(self.sector_tiles(pairs, PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='9')[0], [0, 0])
-        self.assertEqual(self.sector_tiles(pairs, **shared, PARSEC_CUPY_IMPLICIT_TILE='0')[0], [0, 0])
-        self.assertEqual(self.sector_tiles(pairs, **shared, PARSEC_CUPY_MIXED_FILTER='on')[0], [0, 0])
+        self.assertEqual(limited(rank({2: (0, 1, 2, 3)}), **shared)[0], [16])
+        self.assertEqual(limited(None, **shared, PARSEC_CUPY_DISTRIBUTED_FILTER='1')[0], [16]*4)
+        self.assertEqual(limited(pairs, PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='9')[0], [0, 0])
+        self.assertEqual(limited(pairs, **shared, PARSEC_CUPY_IMPLICIT_TILE='0')[0], [0, 0])
+        self.assertEqual(limited(pairs, **shared, PARSEC_CUPY_MIXED_FILTER='on')[0], [0, 0])
         # A sector that one device filters does not read it.
-        self.assertEqual(self.sector_tiles(one_each, **shared)[0], [0]*4)
-        self.assertEqual(self.sector_tiles(None, '2', **shared, PARSEC_CUPY_DISTRIBUTED_FILTER='1')[0], [0]*4)
+        self.assertEqual(limited(one_each, **shared)[0], [0]*4)
+        self.assertEqual(limited(None, '2', **shared, PARSEC_CUPY_DISTRIBUTED_FILTER='1')[0], [0]*4)
         with self.assertRaisesRegex(ValueError, 'PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS'):
-            self.sector_tiles(pairs, PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='many')
+            limited(pairs, PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='many')
         # The opt-in FP32 filter does not read tiles and outranks the default.
-        self.assertEqual(self.sector_tiles(None, **large, PARSEC_CUPY_MIXED_FILTER='on')[0], [0]*4)
-        self.assertEqual(self.sector_tiles(None, **large, PARSEC_CUPY_MIXED_FILTER='auto')[0], [16]*4)
-        self.assertEqual(self.sector_tiles(None, **large, PARSEC_CUPY_MIXED_FILTER='auto',
-                                           PARSEC_CUPY_MIXED_FILTER_MIN_ROWS='8')[0], [0]*4)
+        self.assertEqual(limited(None, **large, PARSEC_CUPY_MIXED_FILTER='on')[0], [0]*4)
+        self.assertEqual(limited(None, **large, PARSEC_CUPY_MIXED_FILTER='auto')[0], [16]*4)
+        self.assertEqual(limited(None, **large, PARSEC_CUPY_MIXED_FILTER='auto',
+                                 PARSEC_CUPY_MIXED_FILTER_MIN_ROWS='8')[0], [0]*4)
         # An explicit value is taken as it is.
-        self.assertEqual(self.sector_tiles(pairs, PARSEC_CUPY_IMPLICIT_TILE='16')[0], [16, 16])
-        self.assertEqual(self.sector_tiles(None, PARSEC_CUPY_IMPLICIT_TILE='32', PARSEC_CUPY_MIXED_FILTER='on')[0], [32]*4)
-        tiles, solver = self.sector_tiles(None, **large, PARSEC_CUPY_IMPLICIT_TILE='0')
+        self.assertEqual(limited(pairs, PARSEC_CUPY_IMPLICIT_TILE='16')[0], [16, 16])
+        self.assertEqual(limited(None, PARSEC_CUPY_IMPLICIT_TILE='32', PARSEC_CUPY_MIXED_FILTER='on')[0], [32]*4)
+        tiles, solver = limited(None, **large, PARSEC_CUPY_IMPLICIT_TILE='0')
         self.assertEqual(tiles, [0]*4)
         self.assertEqual(solver.finite_difference_neighbors, 'shared_across_representations')
         with self.assertRaisesRegex(ValueError, 'PARSEC_CUPY_IMPLICIT_TILE'):
-            self.sector_tiles(None, PARSEC_CUPY_IMPLICIT_TILE='1')
+            limited(None, PARSEC_CUPY_IMPLICIT_TILE='1')
 
     def test_sector_stencils_pack_smaller_sectors_where_a_device_filters_several(self):
         def rank(groups):
@@ -368,36 +387,140 @@ class MPISCFTests(unittest.TestCase):
         # A rank counts its own sectors only: two of them on one device, one on the other.
         uneven = rank({0: (0,), 2: (0,), 3: (1,)})
         self.assertEqual(self.sector_tiles(uneven, '0,1', PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='11')[0], [16, 16, 0])
-        # The sectors of a device do not make up for a basis that several devices share.
+        # The sectors of a device do not make up for a basis that several devices share: its row limit is
+        # another, here at the value before the rule.
         pairs = rank({0: (0, 1), 1: (0, 1)})
-        self.assertEqual(self.sector_tiles(pairs, '0,1', PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='11')[0], [0, 0])
+        self.assertEqual(self.sector_tiles(pairs, '0,1', PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='11',
+                                           PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='1100000')[0], [0, 0])
+
+    def test_sector_stencils_follow_the_filter_work_of_the_run(self):
+        from parsec_python.acceleration.Eigensolvers import symmetry
+        from parsec_python.acceleration.backends.implicit_stencil import FilterPlan
+
+        def rank(groups):
+            return SimpleNamespace(owned_sectors=tuple(groups), size=1, rank=0, root=0,
+                                   configure=lambda count, devices: groups)
+        pairs = rank({0: (0, 1), 1: (2, 3)})
+        one_each = rank({index: (index,) for index in range(4)})
+        handed, sampled = [], []
+        choice = symmetry.implicit_tile_for_sector
+
+        def recorded(rows, device_count, float32_filter=False, sectors_on_device=1, work=None):
+            handed.append((rows, device_count, sectors_on_device, work))
+            return choice(rows, device_count, float32_filter, sectors_on_device, work)
+
+        def share(metadata):
+            sampled.append(metadata)
+            return 1.0
+
+        def tiles(context, devices, plan, **settings):
+            del handed[:], sampled[:]
+            with patch.object(symmetry, 'implicit_tile_for_sector', recorded), \
+                 patch.object(symmetry, 'regular_tile_share', share):
+                return self.sector_tiles(context, devices, plan, **settings)[0]
+
+        # The stand-in sectors have 8 rows and take 8 columns each of 20 states with a buffer of 3: with 10,000
+        # applications counted and every row in a regular tile they repay the packing on four devices, as one
+        # process with a sector each, as a rank whose pairs of devices share a sector, and on fewer devices.
+        plan = FilterPlan(states=20, buffer=3, applications=10_000)
+        for context, devices, count in ((None, '0,1,2,3', 4), (one_each, '0,1,2,3', 4), (pairs, '0,1,2,3', 2),
+                                        (None, '0,1', 4), (None, '0', 4)):
+            with self.subTest(context=context is not None, devices=devices):
+                self.assertEqual(tiles(context, devices, plan), [16]*count)
+                # What the constructor hands the rule: the columns of the first solve, the applications of
+                # the plan and the devices of the process, whatever the devices of the sector.
+                self.assertEqual([(work.columns, work.applications, work.devices) for *_, work in handed],
+                                 [(8, 10_000, len(devices.split(',')))]*count)
+                # The share was asked for, once per sector, of the stencil of that sector and of no other:
+                # the sectors of a run differ in their regular tiles.
+                self.assertEqual([item.sector for item in sampled], list(range(count)))
+                self.assertTrue(all(item is self.stencil_metadata[item.sector] for item in sampled))
+        # 1,000 applications repay the packing on one device and not beside a second one: the host packs while
+        # every device of the process waits.
+        short = FilterPlan(states=20, buffer=3, applications=1_000)
+        self.assertEqual(tiles(None, '0', short), [16]*4)
+        self.assertEqual(tiles(None, '0,1', short), [0]*4)
+        self.assertEqual(tiles(pairs, '0,1,2,3', short), [0, 0])
+        # Few states: one column a sector repays nothing, and the share is not asked for.
+        self.assertEqual(tiles(None, '0', FilterPlan(states=4, buffer=0, applications=1_000)), [0]*4)
+        self.assertEqual(([work.columns for *_, work in handed], sampled), ([1]*4, []))
+        # A sector that is to hold the FP32 recurrence reads no tiles.
+        self.assertEqual(tiles(None, '0', plan, PARSEC_CUPY_MIXED_FILTER='on'), [0]*4)
+        # Named values are taken as they are, with the plan too.
+        self.assertEqual(tiles(None, '0', plan, PARSEC_CUPY_IMPLICIT_TILE='0'), [0]*4)
+        self.assertEqual(tiles(pairs, '0,1,2,3', short, PARSEC_CUPY_IMPLICIT_TILE='32'), [32, 32])
+        # The two row limits at their former values give the choice before the rule: no tiles for 8 rows.
+        former = dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='650000', PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='1100000')
+        for context, devices in ((None, '0'), (None, '0,1,2,3'), (one_each, '0,1,2,3'), (pairs, '0,1,2,3')):
+            with self.subTest(former=True, context=context is not None, devices=devices):
+                self.assertEqual(set(tiles(context, devices, plan, **former)), {0})
+                self.assertEqual(sampled, [])
+        # Each limit is the rule of its route alone: a sector on one device (17 rows over the square root of
+        # its four sectors are more than 8), and one that devices share.
+        self.assertEqual(tiles(None, '0', short, PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='17'), [0]*4)
+        self.assertEqual(tiles(pairs, '0,1,2,3', plan, PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='17'), [16, 16])
+        self.assertEqual(tiles(pairs, '0,1,2,3', plan, PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='9'), [0, 0])
+        self.assertEqual(tiles(None, '0', plan, PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='9'), [16]*4)
+        # Without a plan the constructor hands the rule no work, and the limits decide.
+        self.assertEqual(tiles(None, '0', None), [0]*4)
+        self.assertEqual([work for *_, work in handed], [None]*4)
 
     def test_every_launch_gives_its_sectors_the_routes_of_their_devices(self):
         import os
-        from parsec_python.acceleration.backends.implicit_stencil import implicit_tile_for_sector
+        from parsec_python.acceleration.backends.implicit_stencil import FilterWork, implicit_tile_for_sector
         from parsec_python.acceleration.benchmarks import mpi_full_scf
-        # Rows of a sector of C459H204, which has not run, and of 3,480, 5,264, 7,120 and 23,768 electrons.
-        sizes = (577_426, 677_542, 1_031_322, 1_194_720, 3_786_832)
-        before = (0, 0, 0, 16, 16)
+        # Rows of a sector of C459H204, which has not run, of 3,480 electrons in the sphere of the default rule
+        # and in that of 5 ang of vacuum, and of 5,264, 7,120 and 23,768 electrons, with what the drivers hand
+        # the rule for each: the columns of the first solve (a quarter of the states, half the electrons and
+        # six, and a buffer of six), the 200 applications counted for four first cycles of degree 30, and the
+        # share of the rows in regular tiles.  For the sectors of 620,736 rows that is the share of the sample,
+        # which the rule reads (0.657 of all their tiles), for 677,542 and 1,031,322 rows that of all tiles;
+        # the others lie between the counted shares of the sectors next to them in rows (0.612 at 407,478
+        # rows, 0.755 at 1,924,792), and the rule must give the same at both ends.
+        sizes = (577_426, 620_736, 677_542, 1_031_322, 1_194_720, 3_786_832)
+        columns = tuple((electrons//2 + 6)//4 + 6 for electrons in (2_040, 3_480, 3_480, 5_264, 7_120, 23_768))
+        self.assertEqual(columns, (262, 442, 442, 665, 897, 2978))
+        shares = ((0.612, 0.666), (0.650,), (0.666,), (0.705,), (0.705, 0.755), (0.755, 1.0))
+        everywhere, nowhere = (16,)*len(sizes), (0,)*len(sizes)
+        # The row limits before the rule: 650,000 over the square root of the sectors of a device, and
+        # 1,100,000 for a sector that devices share.  And the limit of 1,100,000 rows before those.
+        limits = dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='650000', PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='1100000')
+        before = (0, 0, 0, 0, 16, 16)
         # GPUs: ranks, devices of a rank, devices that filter a sector, sectors of a device, the tiles of the
-        # default, and the setting that gives the launch the stencils it had.
+        # default, those of the two row limits, and the setting that gives the launch the stencils it had
+        # before either.  The 262 columns of C459H204 repay the packing on one and on two devices and not on
+        # four.  The sectors of 3,480 electrons in the smaller sphere get on 4 GPUs the tiles that 650,000
+        # rows withheld, and those of 3,480 and 5,264 electrons get on 8 and 16 GPUs the tiles they have on 4.
+        by_work = (0, 16, 16, 16, 16, 16)
         launches = {
-            1: (1, '0', 1, 4, (16, 16, 16, 16, 16), dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='2200000')),
-            2: (1, '0,1', 1, 2, (16, 16, 16, 16, 16), dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='1555634')),
-            4: (1, '0,1,2,3', 1, 1, (0, 16, 16, 16, 16), dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='1100000')),
-            8: (2, '0,1,2,3', 2, 1, before, dict(PARSEC_CUPY_IMPLICIT_TILE='0')),
-            16: (4, '0,1,2,3', 4, 1, before, dict(PARSEC_CUPY_IMPLICIT_TILE='0')),
+            1: (1, '0', 1, 4, everywhere, everywhere, dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='2200000')),
+            2: (1, '0,1', 1, 2, everywhere, everywhere, dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='1555634')),
+            4: (1, '0,1,2,3', 1, 1, by_work, (0, 0, 16, 16, 16, 16), dict(PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='1100000')),
+            8: (2, '0,1,2,3', 2, 1, by_work, before, dict(PARSEC_CUPY_IMPLICIT_TILE='0')),
+            16: (4, '0,1,2,3', 4, 1, by_work, before, dict(PARSEC_CUPY_IMPLICIT_TILE='0')),
         }
         names = ('PARSEC_CUPY_IMPLICIT_TILE', 'PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS', 'PARSEC_CUPY_MIXED_FILTER',
                  'PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS', 'PARSEC_CUPY_DISTRIBUTED_FILTER',
                  'PARSEC_CUPY_SECTOR_POOL_RELEASE')
         kept = {name: value for name, value in os.environ.items() if name not in names}
 
-        def tiles(filtering, sectors, **settings):
+        def tiles(filtering, sectors, process, **settings):
+            """Tiles of the six sectors as a driver asks for them: with their filter work, on ``process`` devices."""
+            chosen = []
+            with patch.dict('os.environ', {**kept, **settings}, clear=True):
+                for rows, count, ends in zip(sizes, columns, shares, strict=True):
+                    found = {implicit_tile_for_sector(rows, filtering, sectors_on_device=sectors,
+                                                      work=FilterWork(count, 200, process, share))
+                             for share in ends}
+                    self.assertEqual(len(found), 1, (rows, ends))
+                    chosen.append(found.pop())
+            return tuple(chosen)
+
+        def tiles_without_work(filtering, sectors, **settings):
             with patch.dict('os.environ', {**kept, **settings}, clear=True):
                 return tuple(implicit_tile_for_sector(rows, filtering, sectors_on_device=sectors) for rows in sizes)
 
-        for gpus, (size, devices, filtering, sectors, default, former) in launches.items():
+        for gpus, (size, devices, filtering, sectors, default, limited, former) in launches.items():
             listed = tuple(int(item) for item in devices.split(','))
             for rank in range(size):
                 with self.subTest(gpus=gpus, rank=rank), patch.dict('os.environ', kept, clear=True):
@@ -408,6 +531,7 @@ class MPISCFTests(unittest.TestCase):
                     # What the constructor hands the tile rule for every sector of the rank.
                     self.assertEqual({(solver._filter_device_count(index), solver._device_sector_count(index))
                                       for index in solver._owned_representations}, {(filtering, sectors)})
+                    self.assertEqual(len(solver.device_ids), len(listed))
                     # A finished sector returns the pool blocks of its stream on two GPUs only, where a device
                     # solves two sectors, each alone on it.  No device of a shared basis does, on whose other
                     # devices the condition number may be estimated beside the small solve of the owner.
@@ -416,24 +540,39 @@ class MPISCFTests(unittest.TestCase):
                     self.assertEqual(len(shared), 4 if gpus > 4 else 0)
                     self.assertFalse(shared & set(solver.pool_release_devices))
             with self.subTest(gpus=gpus):
-                # One device per sector: 650,000 rows over the square root of the sectors of the device.  A
-                # group: 1,100,000 rows, whatever the sectors.  0 and a tile size are taken as they are.
-                self.assertEqual(tiles(filtering, sectors), default)
-                self.assertEqual(tiles(filtering, sectors, PARSEC_CUPY_IMPLICIT_TILE='auto'), default)
-                self.assertEqual(tiles(filtering, sectors, PARSEC_CUPY_IMPLICIT_TILE='0'), (0,)*5)
-                self.assertEqual(tiles(filtering, sectors, PARSEC_CUPY_IMPLICIT_TILE='16'), (16,)*5)
-                self.assertEqual(tiles(filtering, sectors, **former), (0,)*5 if gpus > 4 else before)
-                # The limit of one device moves no group, and that of a group no single device.
-                self.assertEqual(tiles(filtering, sectors, PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='1'),
-                                 before if gpus > 4 else (16,)*5)
-                self.assertEqual(tiles(filtering, sectors, PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='1'),
-                                 (16,)*5 if gpus > 4 else default)
+                process = len(listed)
+                # The default: the filter work of a sector against the devices of its process, alike for a
+                # sector alone on a device and for one that devices share.  0 and a tile size are taken as
+                # they are.
+                self.assertEqual(tiles(filtering, sectors, process), default)
+                self.assertEqual(tiles(filtering, sectors, process, PARSEC_CUPY_IMPLICIT_TILE='auto'), default)
+                self.assertEqual(tiles(filtering, sectors, process, PARSEC_CUPY_IMPLICIT_TILE='0'), nowhere)
+                self.assertEqual(tiles(filtering, sectors, process, PARSEC_CUPY_IMPLICIT_TILE='16'), everywhere)
+                # The two row limits, which the work does not move: one device per sector, 650,000 rows over
+                # the square root of the sectors of the device; a group, 1,100,000 rows, whatever the sectors.
+                # A caller that hands the rule no work gets them unnamed.
+                self.assertEqual(tiles(filtering, sectors, process, **limits), limited)
+                self.assertEqual(tiles_without_work(filtering, sectors), limited)
+                self.assertEqual(tiles_without_work(filtering, sectors, **limits), limited)
+                self.assertEqual(tiles(filtering, sectors, process, **former), nowhere if gpus > 4 else before)
+                # The limit of one device moves no group, and that of a group no single device: the other
+                # route keeps the rule, or the limit that is named for it.
+                self.assertEqual(tiles(filtering, sectors, process, PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS='1'),
+                                 default if gpus > 4 else everywhere)
+                self.assertEqual(tiles(filtering, sectors, process, PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS='1'),
+                                 everywhere if gpus > 4 else default)
+                self.assertEqual(tiles(filtering, sectors, process, **{**limits, 'PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS': '1'}),
+                                 before if gpus > 4 else everywhere)
+                self.assertEqual(tiles(filtering, sectors, process,
+                                       **{**limits, 'PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS': '1'}),
+                                 everywhere if gpus > 4 else limited)
                 # The serial control reads the slot-major stencil on the devices of every launch.
                 control = dict(kept)
                 mpi_full_scf._keep_former_routes(control)
-                with patch.dict('os.environ', control, clear=True):
-                    self.assertEqual(tuple(implicit_tile_for_sector(rows, filtering, sectors_on_device=sectors)
-                                           for rows in sizes), (0,)*5)
+                named = {name: value for name, value in control.items() if kept.get(name) != value}
+                self.assertEqual(named['PARSEC_CUPY_IMPLICIT_TILE'], '0')
+                self.assertEqual(tiles(filtering, sectors, process, **named), nowhere)
+                self.assertEqual(tiles_without_work(filtering, sectors, **named), nowhere)
 
     def release_devices(self, context, devices, scheduler='sequential', **settings):
         """Devices on which the constructor lets a finished sector return its pool blocks, under ``settings`` alone."""
@@ -596,6 +735,18 @@ class MPISCFTests(unittest.TestCase):
                 self.assertFalse(driver._ionic_overlap_requested())
                 with patch.dict('os.environ', PARSEC_OVERLAP_IONIC_SETUP='1'):
                     self.assertTrue(driver._ionic_overlap_requested())
+                    # A control that is asked for that thread still sums the ion-ion energy as its last stage.
+                    self.assertFalse(driver._ion_ion_overlap_requested())
+                    with patch.dict('os.environ', PARSEC_OVERLAP_ION_ION_SETUP='1'):
+                        self.assertTrue(driver._ion_ion_overlap_requested())
+            # The symmetry maps after the reference system, on the thread that prepares.
+            self.assertFalse(driver._symmetry_overlap_requested())
+            with patch.dict('os.environ', PARSEC_OVERLAP_SYMMETRY_SETUP='1'):
+                self.assertTrue(driver._symmetry_overlap_requested())
+            # The ionic sums on every grid point, also where a launcher asks for their thread.
+            self.assertEqual(driver.ionic_sum_grid_setting(), 'full')
+            with patch.dict('os.environ', PARSEC_IONIC_SUM_GRID='auto'):
+                self.assertEqual(driver.ionic_sum_grid_setting(), 'auto')
             # The host solve with its SVD, a row-wise copy-back, two arrays even for a marked sector,
             # and the Hartree objects where they were.
             self.assertFalse(ritz.dense_solve_on_device())
@@ -604,13 +755,24 @@ class MPISCFTests(unittest.TestCase):
             self.assertFalse(ritz.streaming_ritz_requested(SimpleNamespace(low_memory_ritz=True)))
             self.assertIsNone(driver._hartree_device_request())
             # The slabs of its projection as wide as they were: an eighth of the columns, and the columns of
-            # the budget where its launcher asks for one array.
+            # the budget where its launcher asks for one array.  That budget is an eighth of the basis within
+            # 1 and 4 GiB, as it was: the control names the limit that a run has at 2 GiB, and not the budget
+            # itself, which would give a basis below 32 GiB the 4 GiB as well.
             self.assertEqual(ritz.gram_multiple(), 1)
+            self.assertEqual(os.environ['PARSEC_CUPY_STREAMING_RITZ_LIMIT_BYTES'], '4294967296')
             with patch.dict('os.environ'):
                 for name in ('PARSEC_CUPY_RITZ_GRAM_SLABS', 'PARSEC_CUPY_STREAMING_RITZ_BYTES'):
                     os.environ.pop(name, None)
                 sector = SimpleNamespace(shape=(2604846, 1842), nbytes=8 * 2604846 * 1842)
                 self.assertEqual((ritz._gram_slab_width(1842), ritz._streaming_shape(sector)[0]), (231, 206))
+                smaller = SimpleNamespace(shape=(1924792, 1314), nbytes=8 * 1924792 * 1314)
+                self.assertEqual(ritz._streaming_shape(smaller), (164, 240599))
+                # A run cuts the same sectors by 2 GiB and at whole multiples of 64 columns.
+                with patch.dict('os.environ'):
+                    for name in ('PARSEC_CUPY_STREAMING_RITZ_LIMIT_BYTES', 'PARSEC_CUPY_RITZ_GRAM_MULTIPLE'):
+                        os.environ.pop(name, None)
+                    self.assertEqual((ritz._streaming_shape(sector), ritz._streaming_shape(smaller)),
+                                     ((64, 145730), (128, 204288)))
             # Its overlap has no slabs for the multiple to cut: it is asked of DSYRK, for which nothing stands
             # in here, and of no slab width, while the projection of its two arrays asks for that width once.
             basis = np.asfortranarray(np.random.default_rng(5).normal(size=(9, 4)))
@@ -642,6 +804,10 @@ class MPISCFTests(unittest.TestCase):
             self.assertEqual(sector_stencil_route(), 'csr')
             self.assertFalse(_fast_maps_requested())
             self.assertFalse(graph_reuse_requested())
+            # Its projector coefficients come from one CUDA block per projector and column, so that the
+            # kernel of six columns per block is not in both sides either.
+            from parsec_python.acceleration.backends.cupy_projectors import projector_block_columns
+            self.assertEqual(projector_block_columns(), 1)
             # The full-grid kernels of the Hartree boundary, so that the wedge kernels of an engaged plan are
             # not in both sides. Which boundary values they evaluate stays the launcher's: the plan is physics.
             self.assertEqual(driver._hartree_boundary_kernel(), 'full')
@@ -657,7 +823,11 @@ class MPISCFTests(unittest.TestCase):
             self.assertFalse({'PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_RITZ_CONDITION_HELPER',
                               'PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
                               'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_EXCHANGE_PAIRS',
-                              'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE'} & set(names))
+                              'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
+                              'PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS'} & set(names))
+            # The count of the slabs of a Gram product stays the launcher's, as it was: the control cuts its
+            # projection by it, eight where none is named, and forms the overlap of no row block.
+            self.assertNotIn('PARSEC_CUPY_RITZ_GRAM_SLABS', names)
             # Never: only a sector context gives an operator the devices of a group.  The solver of a process
             # without one, as a control is, has four operators that no setting of the sharing lets share.
             from parsec_python.acceleration.Eigensolvers import distributed_state
@@ -700,7 +870,8 @@ class MPISCFTests(unittest.TestCase):
             (routes,) = mpi_full_scf._serial_control_notes(None)
             self.assertTrue(routes.startswith('Serial control routes: PARSEC_CUPY_RITZ_SYRK=on '))
             for setting in ('PARSEC_SECTOR_STENCIL=csr', 'PARSEC_SYMMETRY_FAST_MAPS=0', 'PARSEC_CUPY_FILTER_GRAPH_REUSE=0',
-                            'PARSEC_HARTREE_BOUNDARY_KERNEL=full', 'PARSEC_HARTREE_ATOMIC_TAIL_VALUES=host'):
+                            'PARSEC_HARTREE_BOUNDARY_KERNEL=full', 'PARSEC_HARTREE_ATOMIC_TAIL_VALUES=host',
+                            'PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS=1'):
                 self.assertIn(setting, routes.split())
             # An entry of a cache holds the maps and stencils of the run that wrote it, by whatever route.
             # Only a control that was given a directory reads one.
@@ -1410,33 +1581,38 @@ class FullSCFRunnerContextTests(unittest.TestCase):
         # how the devices issued the copies of the last way to their rows.
         # Of the seconds of the Gram stage it says those of the overlap, whose slabs are cut by another rule
         # than the rounds of the projection: a run and its control differ in each by what that rule gave.
+        # And the columns of the widest of those slabs, which a width of their own cuts unless a count is named.
         self.environment('0')
         seconds = dict(filter=2., gram=1.5)
         shared = SimpleNamespace(devices=(0, 1), passes=3, seconds=seconds, overlap_seconds=.5, tall_blocks=1,
                                  slab_cut='equal',
-                                 slab_columns=2, projection_columns=4, separate_row_blocks=0, condition_device=1,
-                                 condition_seconds=.25, to_rows_copies='together',
+                                 slab_columns=2, projection_columns=4, overlap_columns=10, separate_row_blocks=0,
+                                 condition_device=1, condition_seconds=.25, to_rows_copies='together',
                                  layout=SimpleNamespace(parts=(((0, 3), (6, 8)), ((3, 6), (8, 10)))))
         idle = SimpleNamespace(devices=(0, 1), passes=0, seconds={}, overlap_seconds=0., tall_blocks=None, slab_cut=None,
-                               slab_columns=None, projection_columns=None, separate_row_blocks=0, condition_device=None,
-                               condition_seconds=0., to_rows_copies=None, layout=None)
+                               slab_columns=None, projection_columns=None, overlap_columns=None, separate_row_blocks=0,
+                               condition_device=None, condition_seconds=0., to_rows_copies=None, layout=None)
         operators = (None, SimpleNamespace(_sector_device_group=shared), SimpleNamespace(),
                      SimpleNamespace(_sector_device_group=idle))
         # The layout of the stencil the devices of a group filter with, and the seconds their operators took.
         shared.stencil_storage, shared.replica_seconds = 'implicit_affine_tile_16', 0.25
         idle.stencil_storage, idle.replica_seconds = 'slot-major', 0.5
+        # The bytes of the largest exchange buffer that a device of the sector has taken: here one that
+        # follows a slab of 1,086,758,400 bytes, 12 MiB more than the chunk of 1 GiB.
+        shared.exchange_buffer_bytes, idle.exchange_buffer_bytes = 1086758400, 0
         record, _created = self.run_worker_rank(self.cupy(count=2), threading.Event(), operators)
         self.assertEqual([(entry.pop('stencil_storage'), entry.pop('replica_seconds'))
                           for entry in record['distributed_state']],
                          [('implicit_affine_tile_16', 0.25), ('slot-major', 0.5)])
+        self.assertEqual([entry.pop('exchange_buffer_bytes') for entry in record['distributed_state']], [1086758400, 0])
         self.assertEqual(record['distributed_state'], [
             dict(sector=1, devices=[0, 1], ritz_passes=3, seconds=seconds, overlap_seconds=.5, tall_blocks=1, slab_cut='equal',
-                 slab_columns=2, projection_columns=4, separate_row_blocks=0, condition_device=1, condition_seconds=.25,
-                 to_rows_copies='together', column_ranges=[[[0, 3], [6, 8]], [[3, 6], [8, 10]]]),
+                 slab_columns=2, projection_columns=4, overlap_columns=10, separate_row_blocks=0, condition_device=1,
+                 condition_seconds=.25, to_rows_copies='together', column_ranges=[[[0, 3], [6, 8]], [[3, 6], [8, 10]]]),
             # A group that has taken no Ritz step yet.
             dict(sector=3, devices=[0, 1], ritz_passes=0, seconds={}, overlap_seconds=0., tall_blocks=None, slab_cut=None,
-                 slab_columns=None, projection_columns=None, separate_row_blocks=0, condition_device=None,
-                 condition_seconds=0., to_rows_copies=None, column_ranges=None)])
+                 slab_columns=None, projection_columns=None, overlap_columns=None, separate_row_blocks=0,
+                 condition_device=None, condition_seconds=0., to_rows_copies=None, column_ranges=None)])
         # A group has what the record reads from its start, before any step.
         from parsec_python.acceleration.Eigensolvers import distributed_state
 
@@ -1448,7 +1624,7 @@ class FullSCFRunnerContextTests(unittest.TestCase):
         self.assertEqual((group.passes, group.tall_blocks, group.slab_cut, group.slab_columns, group.projection_columns,
                           group.separate_row_blocks, group.layout), (0, None, None, None, None, 0, None))
         self.assertEqual((group.condition_device, group.condition_seconds, group.to_rows_copies), (None, 0., None))
-        self.assertEqual(group.overlap_seconds, 0.)
+        self.assertEqual((group.overlap_seconds, group.overlap_columns, group.exchange_buffer_bytes), (0., None, 0))
 
     def test_rank_record_names_the_pool_releases_of_finished_sectors(self):
         # What ``sector_pool_releases`` of the rank's solver says; a solver without it released nothing.
@@ -1512,13 +1688,15 @@ class FullSCFRunnerContextTests(unittest.TestCase):
                 self.run_worker_rank(self.cupy(count=2), threading.Event(), flags=flags)
                 self.assertEqual(self.prepared_with['symmetry_cache_directory'], expected)
 
-    def run_serial_control(self, directory, flags=(), *, plan=None, details=(), scf_seconds=0., **system):
+    def run_serial_control(self, directory, flags=(), *, plan=None, details=(), scf_seconds=0., thread_record=None,
+                           **system):
         """Run ``execute`` as a serial control whose preparation and SCF are stand-ins.
 
         ``system`` names further attributes of the prepared stand-in.
         Returns its timing.json, its text log and the symmetry cache directory its preparation was given.
         ``plan`` is the Hartree boundary plan of the prepared system, ``details`` the backend details of the
-        result, and the stand-in SCF takes ``scf_seconds``.
+        result, and the stand-in SCF takes ``scf_seconds``.  ``thread_record`` is what the stand-in reporter
+        says became of its thread of the radius search.
         """
         import importlib
         import json
@@ -1568,17 +1746,79 @@ class FullSCFRunnerContextTests(unittest.TestCase):
             '--quiet', *flags])
         with patch.object(driver, 'prepare_single_point', prepare), \
                 patch.object(driver, 'run_scf', run), \
-                patch.object(output, 'AcceleratedTextReporter'), \
+                patch.object(output, 'AcceleratedTextReporter') as reporters, \
                 patch.object(reference_cli, 'save_result_archive',
                              lambda path, *_, **__: path.write_bytes(b'stand-in archive')), \
                 patch.object(self.runner, '_source_provenance', lambda: None), \
                 patch.dict('sys.modules', cupy=cp), redirect_stdout(StringIO()):
+            reporters.return_value.radius_thread_record = thread_record
             exit_code = self.runner.execute(
                 args, cp, Comm(), SimpleNamespace(Get_library_version=lambda: 'stand-in MPI '), 0.)
         self.assertEqual(exit_code, 0)
         (cache,) = given
         return (json.loads((directory / 'timing.json').read_text(encoding='utf-8')),
                 (directory / 'parsec.out').read_text(encoding='utf-8'), cache)
+
+    def test_runner_ends_the_thread_of_its_reporter_on_every_way_out(self):
+        import os
+        import shutil
+        from contextlib import ExitStack
+        from pathlib import Path
+        self.environment('0')
+        directory = Path.cwd() / '.tmp' / f'runner-reporter-close-test-{os.getpid()}'
+        registered = []
+
+        class Leaving(ExitStack):
+            def callback(self, function, *arguments, **options):
+                registered.append(function)
+                return super().callback(function, *arguments, **options)
+
+        try:
+            with patch.object(self.runner, 'ExitStack', Leaving):
+                # A run that reports: the reporter of the root is closed where the runner leaves its log, once
+                # (its own report ends the thread before; the stand-in reporter has none).
+                self.run_serial_control(directory / 'reported')
+                (close,) = registered
+                close.assert_called_once_with()
+                # An SCF that raises (the stand-in sleeps a negative time): closed on the way out as well.
+                del registered[:]
+                with self.assertRaises(ValueError):
+                    self.run_serial_control(directory / 'stopped', scf_seconds=-1.)
+                (close,) = registered
+                close.assert_called_once_with()
+                self.assertFalse((directory / 'stopped' / 'timing.json').exists())
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_rank_record_says_what_became_of_the_thread_of_the_radius_search(self):
+        import os
+        import shutil
+        from pathlib import Path
+        self.environment('0')
+        directory = Path.cwd() / '.tmp' / f'runner-radius-thread-test-{os.getpid()}'
+        made = dict(estimates=5, seconds=4.25, failure=None)
+        failed = dict(estimates=0, seconds=0.5, failure='RuntimeError: no estimate')
+        try:
+            for name, kept in (('made', made), ('failed', failed), ('none', None)):
+                with self.subTest(thread=name):
+                    record, _, _ = self.run_serial_control(directory / name, thread_record=kept)
+                    # In the entry of the root, beside its times, and not in the record of the sphere: that
+                    # one is the same with and without the thread.
+                    (rank,) = record['per_rank']
+                    self.assertIn('domain_report_thread', rank)
+                    self.assertEqual(rank['domain_report_thread'], kept)
+                    self.assertNotIn('domain_report_thread', record['result'])
+                    self.assertEqual(sum('per_rank[].domain_report_thread is what became of the host thread' in note
+                                         and 'PARSEC_DOMAIN_REPORT_THREAD' in note for note in record['notes']), 1)
+            # A reporter that says nothing a record can hold (the stand-in of the other tests) gives none.
+            record, _, _ = self.run_serial_control(directory / 'silent', thread_record=object())
+            self.assertIsNone(record['per_rank'][0]['domain_report_thread'])
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+        # A rank that does not report has no thread.
+        worker, _created = self.run_worker_rank(self.cupy(count=2), threading.Event())
+        self.assertIn('domain_report_thread', worker)
+        self.assertIsNone(worker['domain_report_thread'])
 
     def test_timing_record_and_log_say_which_symmetry_cache_the_run_had(self):
         import os
@@ -1659,7 +1899,8 @@ class FullSCFRunnerContextTests(unittest.TestCase):
         # A density builder as a run makes it, with no switch of the release named.
         with patch.dict('os.environ'):
             for name in ('PARSEC_CUPY_DENSITY_RELEASE', 'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE',
-                         'PARSEC_CUPY_DENSITY_COLLECTION', 'PARSEC_CUPY_POOL_RELEASE_ORBITAL_BYTES'):
+                         'PARSEC_CUPY_DENSITY_COLLECTION', 'PARSEC_CUPY_POOL_RELEASE_ORBITAL_BYTES',
+                         'PARSEC_CUPY_SPILL_PINNED_POOL'):
                 os.environ.pop(name, None)
             builder = CuPySymmetryDensityBuilder(lambda *args: None)
         try:
@@ -1671,8 +1912,14 @@ class FullSCFRunnerContextTests(unittest.TestCase):
         # the states and the shared sectors: what one rank and the result record of them.
         for name in ('domain_rule_seconds', 'cuda_context_driver_devices', 'cuda_context_driver_seconds',
                      'density_pool_release', 'orbital_sector_state_storage', 'orbital_memory_allocator',
-                     'sector_state_fit_bytes', 'distributed_state'):
+                     'sector_state_fit_bytes', 'distributed_state', 'spill_staging'):
             self.assertIn(name, rank)
+        # The staging of a spill: nothing for a rank whose states stay on their devices, and in the record of
+        # the release whether the pinned pool is kept where they do not.
+        self.assertIsNone(rank['spill_staging'])
+        self.assertEqual({name: rank['density_pool_release'][name] for name in ('spill_pinned_pool', 'pinned_kept',
+                                                                               'host_uploads')},
+                         dict(spill_pinned_pool='keep', pinned_kept=0, host_uploads=None))
         self.assertIn('domain', record['result'])
         # Of the release: how the pools of several devices are emptied, and whether those of a shared basis
         # are, with the densities after which they were left.
@@ -1693,9 +1940,11 @@ class FullSCFRunnerContextTests(unittest.TestCase):
         worker, _created = self.run_worker_rank(self.cupy(count=2), threading.Event(), (None, owner))
         (sector,) = worker['distributed_state']
         self.assertEqual({name: sector[name] for name in ('slab_cut', 'slab_columns', 'projection_columns',
-                                                          'overlap_seconds', 'to_rows_copies', 'tall_blocks')},
+                                                          'overlap_seconds', 'overlap_columns', 'to_rows_copies',
+                                                          'tall_blocks', 'exchange_buffer_bytes')},
                          dict(slab_cut=None, slab_columns=None, projection_columns=None, overlap_seconds=0.,
-                              to_rows_copies=None, tall_blocks=None))
+                              overlap_columns=None, to_rows_copies=None, tall_blocks=None,
+                              exchange_buffer_bytes=0))
         self.assertEqual(set(sector['seconds']), set(distributed_state.SectorDeviceGroup.STAGES))
         # One note says how each is read.  They stand on neighbouring lines of the runner, written by
         # different changes: every one of them, once.
@@ -1707,15 +1956,49 @@ class FullSCFRunnerContextTests(unittest.TestCase):
                       'sector_state_fit_bytes gives, per device', 'PARSEC_CUPY_SECTOR_STATE_AUTO_FRACTION',
                       'PARSEC_CUPY_DIRECT_ALLOCATOR_FRACTION', 'PARSEC_CUPY_SPILL_DOWNLOAD_ORDER',
                       'slab_columns is the widest slab', 'to_rows_copies is the order', 'PARSEC_CUPY_EXCHANGE_PAIRS',
+                      'exchange_buffer_bytes is the largest buffer', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
                       'slab_cut says how that step cut them', 'PARSEC_CUPY_RITZ_GRAM_MULTIPLE columns (64)',
                       'projection_columns is the widest right-hand side', 'overlap_seconds is the part of seconds.gram',
+                      'overlap_columns is the widest slab of that overlap',
+                      '128 columns (PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS)',
+                      'PARSEC_CUPY_RITZ_GRAM_SLABS names one (8 gives the former slabs',
                       'shared says whether the pools of the devices of a shared sector basis are emptied as well '
-                      '(PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE)', 'shared_kept counts the densities'):
+                      '(PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE)', 'shared_kept counts the densities',
+                      'spill_staging of a rank says how sector states that it keeps on the host went there and back',
+                      'PARSEC_CUPY_SPILL_BUFFERS', 'PARSEC_CUPY_SPILL_PINNED_BYTES', 'PARSEC_CUPY_SPILL_PINNED_POOL',
+                      'host_uploads counts the orbitals that the device builder was handed on the host',
+                      'A serial control names fresh and release where its launcher names neither'):
             with self.subTest(words=words):
                 self.assertEqual(sum(words in note for note in record['notes']), 1)
         # The slab limit of two devices is named where the slabs are and where the storage rule counts them.
         self.assertEqual(sum('PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES' in note for note in record['notes']), 2)
         self.assertEqual(len(set(record['notes'])), len(record['notes']))
+
+    def test_timing_record_holds_the_stages_of_the_preparation_of_a_rank(self):
+        import os
+        import shutil
+        from pathlib import Path
+        self.environment('0')
+        directory = Path.cwd() / '.tmp' / f'runner-stage-record-test-{os.getpid()}'
+        stages = (dict(stage='preparation', thread='MainThread', start_seconds=0., end_seconds=2.5),
+                  dict(stage='hartree_boundary_setup', thread='parsec-hartree-setup_0', start_seconds=1.25,
+                       end_seconds=2.))
+        try:
+            record, _, _ = self.run_serial_control(directory / 'staged', preparation_stages=stages)
+            # A prepared system that carries none (a stand-in, an older tree) gives an empty list.
+            plain, _, _ = self.run_serial_control(directory / 'plain')
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+        # As the preparation gave them: one entry per stage, with its thread and its two stamps.
+        self.assertEqual(record['per_rank'][0]['preparation_stages'], [dict(stage) for stage in stages])
+        self.assertEqual(plain['per_rank'][0]['preparation_stages'], [])
+        # One note says how the list is read: a timeline of threads, not a sum.
+        (note,) = [note for note in record['notes'] if note.startswith('preparation_stages of a rank')]
+        for words in ('start_seconds and end_seconds', 'must not be added up', '_wait',
+                      'the backend report and the result archive do not hold it'):
+            self.assertIn(words, note)
+        # The entry of the backend report that held the list is gone, and the note does not name it.
+        self.assertNotIn('preparation_stage_seconds', note)
 
     def test_timing_record_says_what_the_bytes_counted_on_a_device_are(self):
         import os
@@ -1731,7 +2014,11 @@ class FullSCFRunnerContextTests(unittest.TestCase):
         # for a basis on one device only. Devices that shared a basis have sampled less than their count
         # outside their context.
         (note,) = [note for note in record['notes'] if 'sector_state_fit_bytes' in note]
-        self.assertIn('PARSEC_CUPY_SECTOR_STATE_AUTO_FRACTION (0.978) of the memory of the device', note)
+        self.assertIn('PARSEC_CUPY_SECTOR_STATE_AUTO_FRACTION (0.974) of the memory of the device', note)
+        # The buffer in that count is the one the Ritz step takes, and both former values are named.
+        self.assertIn('with one buffer of the Ritz step (at most 2 GiB, or 64 columns of all rows where 2 GiB hold '
+                      'fewer, where neither PARSEC_CUPY_STREAMING_RITZ_BYTES nor PARSEC_CUPY_STREAMING_RITZ_LIMIT_BYTES '
+                      'is set; 4294967296 for the limit and 0.978 for the share give the former count and decision)', note)
         self.assertIn('For a basis on one device it is a lower limit of what the device must hold', note)
         self.assertIn('For a shared basis it is what the rule that shares it counts', note)
         self.assertIn('a device can hold less outside its context', note)
@@ -1747,6 +2034,11 @@ class FullSCFRunnerContextTests(unittest.TestCase):
         self.runner._keep_former_routes(control)
         names = ('PARSEC_CUPY_DIRECT_ALLOCATOR_FRACTION', 'PARSEC_CUPY_SPILL_DOWNLOAD_ORDER')
         self.assertEqual([control[name] for name in names], ['0.5', 'C'])
+        # The staging of such a spill is the former one as well, which another note says.
+        names = ('PARSEC_CUPY_SPILL_BUFFERS', 'PARSEC_CUPY_SPILL_PINNED_POOL')
+        self.assertEqual([control[name] for name in names], ['fresh', 'release'])
+        (note,) = [note for note in record['notes'] if 'spill_staging' in note]
+        self.assertIn('A serial control names fresh and release where its launcher names neither', note)
 
 
 class DriverContextTests(unittest.TestCase):

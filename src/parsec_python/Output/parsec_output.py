@@ -34,6 +34,7 @@ from ..Hartree.domain import (
     sphere_shell_sums,
     wall_energy,
 )
+from .force_output import force_report_lines
 from ..models import MAXIMUM_MULTIPOLE_ORDER, SCFIteration, SinglePointResult
 from ..V_ion import center_cluster_geometry, ionic_charge
 
@@ -584,7 +585,7 @@ def _radius_comment(wanted) -> str:
 
 
 def domain_finish_lines(
-    result, translation, hartree=None
+    result, translation, hartree=None, prepared=None
 ) -> tuple[list[str], dict | None]:
     """Estimate from the final density what the sphere adds to the energy.
 
@@ -601,6 +602,11 @@ def domain_finish_lines(
     which takes estimates of the omitted potential (several for clusters of
     20,000 electrons and more): the line then says so, and the record keeps
     their number and the seconds of the shells and of the radius apart.
+    ``prepared`` may hold such estimates, made for the atoms of the result
+    before this is called
+    (:func:`~parsec_python.Hartree.domain.prepare_radius_search`): the lines
+    and the record are the same with and without them, apart from the
+    seconds of the radius, which then count a search that had its estimates.
     """
 
     settings = getattr(getattr(result, "grid", None), "settings", None)
@@ -669,6 +675,7 @@ def domain_finish_lines(
                     else None
                 ),
                 multipole_boundary=multipole,
+                prepared=prepared,
             ),
             None,
         )
@@ -776,6 +783,11 @@ class ParsecTextReporter:
     from the density under ``after_scf``.  With ``PARSEC_DOMAIN_REPORT=0``
     (:func:`domain_report_requested`) it stays ``None`` for an input that
     gives its radius, and nothing is estimated after the SCF.
+
+    ``prepared_estimates`` is ``None`` unless a caller sets it before
+    :meth:`finish`: estimates of the omitted potential that the block after
+    the SCF may read in place of making them (:func:`domain_finish_lines`).
+    This reporter prepares none.
     """
 
     def __init__(
@@ -794,9 +806,12 @@ class ParsecTextReporter:
         self._xc_total = 0.0
         self._mixing_energy_total = 0.0
         self.domain: dict | None = None
+        self.prepared_estimates = None
         self._domain_report = domain_report_requested()
         # The lines of the Hartree boundary are those of an isolated domain.
         self._periodic = getattr(self.problem, "periodic_cell", None) is not None
+        # Two spin channels change the header and the report of every step.
+        self._spin = bool(getattr(self.problem.scf, "spin_polarized", False))
 
     def header(self) -> None:
         grid = self.problem.grid
@@ -876,7 +891,11 @@ class ParsecTextReporter:
             " ----------------",
             f" Number of states: {scf.number_of_states:12d}",
             f" Net cluster charge = {scf.net_charge:8.3f}      [e]",
-            f" Fermi temperature = {scf.fermi_temperature_kelvin:9.2f} [K]",
+            (
+                f" Fermi temperature = {scf.fermi_temperature_kelvin:9.2f} [K]"
+                if scf.fixed_occupations is None
+                else " WARNING: reading occupations from occup.in file"
+            ),
             "",
             " Self-consistency data:",
             " ----------------------",
@@ -968,11 +987,34 @@ class ParsecTextReporter:
                 if xc_name == "ca"
                 else " GGA, Perdew-Burke-Ernzerhof parametrization"
             ),
+            # Only where Energy_Refinement asks for it.
+            *(
+                ()
+                if getattr(self.translation, "energy_refinement", None) is None
+                else (
+                    " Post-SCF energy refinement: "
+                    f"{self.translation.energy_refinement.upper()} "
+                    "exchange-correlation energy of the converged orbitals "
+                    "(one non-self-consistent evaluation)",
+                )
+            ),
             "",
             " Other input data:",
             " -----------------",
             f" output level [1 - 6] = {self.translation.output_level:2d}",
-            " No spin effects!",
+            *(
+                (
+                    " Spin-polarized computation!",
+                    "",
+                    " Initial spin polarization: ",
+                    *(
+                        f"  {symbol:<2s}     {potential.initial_spin_polarization:11.4f}"
+                        for symbol, potential in self.problem.pseudopotentials.items()
+                    ),
+                )
+                if self._spin
+                else (" No spin effects!",)
+            ),
             " No minimization!",
             "",
         ]
@@ -1007,8 +1049,12 @@ class ParsecTextReporter:
                         " Physical element : "
                         f"{specification.element_symbol or potential.symbol}"
                     ),
-                    " martins_new",
-                    "  pseudopotential format : new Martins",
+                    f" {potential.file_format}",
+                    (
+                        "  pseudopotential format : old Martins"
+                        if potential.file_format == "martins_old"
+                        else "  pseudopotential format : new Martins"
+                    ),
                     f"  pseudopotential file   : {potential.source}",
                     (
                         f"  radial points/channels : {potential.radii.size}"
@@ -1052,6 +1098,7 @@ class ParsecTextReporter:
                     " Initial density integral = "
                     f"{system.grid.integrate(system.initial_density):14.8f}"
                 ),
+                *self._initial_moment_lines(system),
                 *hartree_boundary_lines(system, self.problem.hartree),
                 *domain_lines,
                 "",
@@ -1098,6 +1145,81 @@ class ParsecTextReporter:
             )
         self.write("\n".join(lines))
 
+    def _initial_moment_lines(self, system) -> list[str]:
+        """The starting magnetic moment, as ``initchrg.f90`` prints it."""
+
+        channels = getattr(system, "initial_spin_densities", None)
+        if channels is None:
+            return []
+        moment = system.grid.integrate(channels[0]) - system.grid.integrate(channels[1])
+        return [f" Initial magnetic moment [Bohr magnetons] = {moment:12.5f}"]
+
+    @staticmethod
+    def _state_lines(eigenvalues, occupations, representations) -> list[str]:
+        """One line per state, in the format of ``flevel.f90``."""
+
+        return [
+            f"{index:5d}   {eigenvalue:18.10f}"
+            f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
+            f" {occupation:9.4f}   {representation:6d}"
+            for index, (eigenvalue, occupation, representation) in enumerate(
+                zip(eigenvalues, occupations, representations), start=1
+            )
+        ]
+
+    def _spin_level_lines(self, step: SCFIteration) -> list[str]:
+        """Electrons, moment, Fermi level and the levels of both channels."""
+
+        count = len(step.eigenvalues) // 2
+        representations = (
+            step.representations
+            if len(step.representations) == len(step.eigenvalues)
+            else (1,) * len(step.eigenvalues)
+        )
+        lines = [
+            (
+                " Electrons in up, down spins: "
+                f"{step.spin_electrons[0]:7.2f} {step.spin_electrons[1]:7.2f}"
+            ),
+            (
+                " Net magnetic moment (in Bohr magnetons): "
+                f"{step.net_magnetic_moment:7.2f}"
+            ),
+            "",
+            # No Fermi level is searched with the occupations of occup.in.
+            *(
+                (f" Fermi level at {step.fermi_level:10.4f} [Ry]", "")
+                if self.problem.scf.fixed_occupations is None
+                else ()
+            ),
+        ]
+        for label, channel in (("up", slice(0, count)), ("dn", slice(count, None))):
+            lines.extend(
+                [
+                    f"{label} State   Eigenvalue [Ry]      Eigenvalue [eV]"
+                    "    Occup.     Repr.",
+                    "",
+                    *self._state_lines(
+                        step.eigenvalues[channel],
+                        step.occupations[channel],
+                        representations[channel],
+                    ),
+                    "",
+                    "",
+                ]
+            )
+        for label, maximum, minimum in zip(
+            ("up", "dn"), step.spin_density_maximum, step.spin_density_minimum
+        ):
+            lines.extend(
+                [
+                    " Max and min values of charge density [e/bohr^3]:"
+                    f" {maximum:12.4E} {minimum:12.4E}   {label}",
+                    "",
+                ]
+            )
+        return lines
+
     def iteration(self, step: SCFIteration) -> None:
         self._diagonalization_total += step.diagonalization_seconds
         self._hartree_total += step.hartree_seconds
@@ -1123,34 +1245,43 @@ class ParsecTextReporter:
                 f"      tdiag_sum = {self._diagonalization_total:11.2f}"
             ),
             "",
-            f" Fermi level at {step.fermi_level:10.4f} [Ry]",
-            "",
-            "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.     Repr.",
-            "",
         ]
-        representations = (
-            step.representations
-            if len(step.representations) == len(step.eigenvalues)
-            else (1,) * len(step.eigenvalues)
-        )
-        for index, (eigenvalue, occupation, representation) in enumerate(
-            zip(step.eigenvalues, step.occupations, representations),
-            start=1,
-        ):
-            lines.append(
-                f"{index:5d}   {eigenvalue:18.10f}"
-                f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
-                f" {occupation:9.4f}   {representation:6d}"
+        if getattr(step, "spin_polarized", False):
+            # flevel.f90 and rho_hart.F90 report each channel.
+            lines.extend(self._spin_level_lines(step))
+        else:
+            lines.extend(
+                [
+                    # flevel.f90 reports no Fermi level with the occupations
+                    # of occup.in: none is searched.
+                    *(
+                        (f" Fermi level at {step.fermi_level:10.4f} [Ry]", "")
+                        if self.problem.scf.fixed_occupations is None
+                        else ()
+                    ),
+                    "   State   Eigenvalue [Ry]      Eigenvalue [eV]"
+                    "    Occup.     Repr.",
+                    "",
+                    *self._state_lines(
+                        step.eigenvalues,
+                        step.occupations,
+                        (
+                            step.representations
+                            if len(step.representations) == len(step.eigenvalues)
+                            else (1,) * len(step.eigenvalues)
+                        ),
+                    ),
+                    "",
+                    (
+                        " Max and min values of charge density [e/bohr^3]:"
+                        f" {step.density_maximum:12.4E}"
+                        f" {step.density_minimum:12.4E}"
+                    ),
+                    "",
+                ]
             )
         lines.extend(
             [
-                "",
-                (
-                    " Max and min values of charge density [e/bohr^3]:"
-                    f" {step.density_maximum:12.4E}"
-                    f" {step.density_minimum:12.4E}"
-                ),
-                "",
                 f" Hartree potential time [sec]: {step.hartree_seconds:10.2f}",
                 "",
                 f"   Eigenvalue Energy             = {energies.eigenvalue:20.8f} [Ry]",
@@ -1189,19 +1320,51 @@ class ParsecTextReporter:
                 f"   Total Energy = {energies.total:22.8f} [Ry]",
                 f"   Energy/atom  = {energy_per_atom_ev:22.8f} [eV]",
                 "",
-                (
-                    f"  0-{step.iteration:3d}    "
-                    "SRE of pot. & charge weighted pot = "
-                    f"{step.plain_residual:14.10f}"
-                    f" {step.weighted_residual:14.10f}"
-                ),
-                "",
             ]
         )
+        if getattr(step, "spin_polarized", False):
+            # getsre.f90 prints the residuals of each channel.
+            for label, plain, weighted in zip(
+                ("up", "dn"), step.spin_plain_residuals, step.spin_weighted_residuals
+            ):
+                lines.extend(
+                    [
+                        (
+                            f"  0-{step.iteration:3d} {label} "
+                            "SRE of pot. & charge weighted pot = "
+                            f"{plain:14.10f} {weighted:14.10f}"
+                        ),
+                        "",
+                    ]
+                )
+        else:
+            lines.extend(
+                [
+                    (
+                        f"  0-{step.iteration:3d}    "
+                        "SRE of pot. & charge weighted pot = "
+                        f"{step.plain_residual:14.10f}"
+                        f" {step.weighted_residual:14.10f}"
+                    ),
+                    "",
+                ]
+            )
         self._previous_total = energies.total
         self.write("\n".join(lines))
 
-    def finish(self, result: SinglePointResult, elapsed_seconds: float) -> None:
+    def finish(
+        self,
+        result: SinglePointResult,
+        elapsed_seconds: float,
+        *,
+        forces=None,
+    ) -> None:
+        """Report the end of one SCF loop.
+
+        ``forces`` is the :class:`parsec_python.Forces.ForceResult` of the
+        structure, where one was evaluated; its tables then take the place
+        of the statement that forces are not calculated.
+        """
         status = (
             "Self-consistency convergence achieved."
             if result.converged
@@ -1224,6 +1387,7 @@ class ParsecTextReporter:
                 result,
                 self.translation,
                 self.problem.hartree,
+                self.prepared_estimates,
             )
             if self._domain_report
             else ([], None)
@@ -1311,15 +1475,28 @@ class ParsecTextReporter:
                     " --------------------------------------------------",
                 ]
             )
-        lines.extend(
-            [
-                "",
-                "Forces, dipoles, and MPI statistics",
-                "are not calculated by this Python single-point implementation.",
-                "",
-                " =================================================================",
-            ]
-        )
+        if forces is None:
+            lines.extend(
+                [
+                    "",
+                    "Forces, dipoles, and MPI statistics",
+                    "are not calculated by this Python single-point implementation.",
+                    "",
+                    " =================================================================",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    *force_report_lines(forces, self.translation.output_level),
+                    f"Time for forces [sec] : {forces.seconds:11.2f}",
+                    "",
+                    "Dipoles and MPI statistics",
+                    "are not calculated by this Python implementation.",
+                    "",
+                    " =================================================================",
+                ]
+            )
         self.write("\n".join(lines))
 
 

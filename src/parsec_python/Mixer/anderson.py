@@ -86,6 +86,74 @@ def potential_residual_metrics(
     return ResidualMetrics(weighted=weighted, plain=plain, residual=residual)
 
 
+@dataclass(frozen=True)
+class SpinResidualMetrics:
+    """SCF residual norms of the two spin channels, up first.
+
+    PARSEC tests the larger of the two channels (``maxval`` in
+    ``parsec.F90``); ``weighted`` and ``plain`` are those maxima.
+    """
+
+    weighted_by_spin: tuple[float, float]
+    plain_by_spin: tuple[float, float]
+
+    @property
+    def weighted(self) -> float:
+        return max(self.weighted_by_spin)
+
+    @property
+    def plain(self) -> float:
+        return max(self.plain_by_spin)
+
+
+def spin_potential_residual_metrics(
+    input_potentials: tuple[np.ndarray, np.ndarray],
+    output_potentials: tuple[np.ndarray, np.ndarray],
+    densities: tuple[np.ndarray, np.ndarray],
+    volume_element: float,
+    electrons: tuple[float, float],
+) -> SpinResidualMetrics:
+    """Evaluate PARSEC's residual norms for each spin channel (``getsre.f90``).
+
+    With ``R_s = V_out,s - V_in,s`` the plain norm of a channel is
+    ``sqrt(h^3 sum R_s^2)`` and the weighted one
+    ``sqrt(h^3 sum rho_s R_s^2 / N_s)``, with the density and the electrons
+    ``N_s`` of that channel.  A channel without electrons has a weighted
+    norm of zero.
+    """
+
+    if volume_element <= 0:
+        raise ValueError("volume element must be positive")
+    weighted: list[float] = []
+    plain: list[float] = []
+    for input_potential, output_potential, density, count in zip(
+        input_potentials, output_potentials, densities, electrons
+    ):
+        input_potential = np.asarray(input_potential, dtype=float)
+        output_potential = np.asarray(output_potential, dtype=float)
+        density = np.asarray(density, dtype=float)
+        if (
+            input_potential.shape != output_potential.shape
+            or density.shape != input_potential.shape
+        ):
+            raise ValueError("potential and density arrays must have identical shapes")
+        residual = output_potential - input_potential
+        plain.append(float(np.sqrt(volume_element * np.dot(residual, residual))))
+        weighted.append(
+            0.0
+            if count == 0.0
+            else float(
+                np.sqrt(
+                    volume_element * np.dot(density, residual * residual) / count
+                )
+            )
+        )
+    return SpinResidualMetrics(
+        weighted_by_spin=(weighted[0], weighted[1]),
+        plain_by_spin=(plain[0], plain[1]),
+    )
+
+
 @dataclass
 class AndersonMixer:
     """Potential mixer matching ``anderson.f90`` for a scalar calculation."""
@@ -190,6 +258,8 @@ class AndersonMixer:
 __all__ = [
     "AndersonMixer",
     "ResidualMetrics",
+    "SpinResidualMetrics",
     "potential_residual_metrics",
     "safeguard_anderson_candidate",
+    "spin_potential_residual_metrics",
 ]

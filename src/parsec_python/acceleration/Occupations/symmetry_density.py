@@ -13,6 +13,7 @@ import numpy as np
 
 from ..Eigensolvers.distributed_filter import _pool
 from ..Eigensolvers.distributed_state import DistributedBasis, shared_pool_release_requested
+from ..Eigensolvers.spill_buffers import spill_pinned_pool
 from ..Eigensolvers.symmetry import (
     CuPySymmetryOrbitals,
     _pool_release_orbital_bytes,
@@ -57,7 +58,8 @@ def density_release() -> str:
     """Return the pool release selected by ``PARSEC_CUPY_DENSITY_RELEASE``.
 
     After a density the unused pool blocks of the devices of the sector
-    vectors go back to the driver, and the pinned pool with them
+    vectors go back to the driver, and the pinned pool with them unless
+    sector states are kept on the host
     (:meth:`CuPySymmetryDensityBuilder._release_large_unused_pool`).
     ``serial`` empties one device after another and then the pinned pool, in
     the thread that built the density and before it goes on, as before.
@@ -138,6 +140,7 @@ class CuPySymmetryDensityBuilder:
         self.collection = density_collection()
         self.release = density_release()
         self.shared_release = shared_pool_release_requested()
+        self.spill_pinned_pool = spill_pinned_pool()
         _pool_release_orbital_bytes()
         # Of this builder: pool releases, their collections by kind, the
         # unreachable objects those found, and the wall seconds of the
@@ -149,12 +152,19 @@ class CuPySymmetryDensityBuilder:
         # whether the pools of the devices of a shared basis are emptied as
         # well, ``release`` or ``keep``, and ``shared_kept`` counts the
         # densities after which they were left; ``calls`` are the releases
-        # of a pool.
+        # of a pool.  ``spill_pinned_pool`` says whether the pinned pool is
+        # emptied where sector states are kept on the host, ``release`` or
+        # ``keep``, and ``pinned_kept`` counts the densities after which it
+        # was left.  ``host_uploads`` is the record that the device builder
+        # keeps of the orbitals it was handed on the host (their uploads,
+        # bytes and seconds), ``None`` for a builder that keeps none.
         self.pool_release = dict(
             collection=self.collection,
             release=self.release,
             shared="release" if self.shared_release else "keep",
             shared_kept=0,
+            spill_pinned_pool=self.spill_pinned_pool,
+            pinned_kept=0,
             calls=0,
             full_collections=0,
             young_collections=0,
@@ -163,6 +173,7 @@ class CuPySymmetryDensityBuilder:
             release_seconds=0.0,
             device_release_seconds=0.0,
             sector_density_seconds=0.0,
+            host_uploads=getattr(device_builder, "host_uploads", None),
         )
         # Devices and their pool bytes in use after the last full collection.
         self._collected_use = None
@@ -312,6 +323,14 @@ class CuPySymmetryDensityBuilder:
         included: its cyclic garbage waits for the collector of the
         interpreter and the pinned pool keeps its blocks, 0.3 to 1.1 GiB
         of host memory more on the root rank of the runs on A100 nodes.
+
+        A density that was handed a sector whose states are kept on the
+        host leaves the pinned pool as it is
+        (:func:`spill_buffers.spill_pinned_pool`, which also names the
+        setting that empties it as before): under the former staging the
+        pool holds the block through which a whole basis goes to its
+        device, and the next step takes it again.  Its collection and the
+        pools of the devices are as they were.
         """
 
         # A release that no caller has waited for is complete before the next.
@@ -345,6 +364,13 @@ class CuPySymmetryDensityBuilder:
             record["shared_kept"] += 1
             if len(kept) == len(held):
                 return
+        # Sector states on the host: the pinned pool keeps its blocks unless
+        # their release is named.
+        keep_pinned = self.spill_pinned_pool == "keep" and any(
+            isinstance(item, np.ndarray) for item in held
+        )
+        if keep_pinned:
+            record["pinned_kept"] += 1
         # Device arrays created by the density-builder calls above are out of
         # scope before collection.  Release each participating device pool in
         # deterministic device order; pinned host staging uses one global pool.
@@ -393,7 +419,8 @@ class CuPySymmetryDensityBuilder:
             for device_id in device_ids:
                 with cp.cuda.Device(device_id):
                     pool.free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
+            if not keep_pinned:
+                cp.get_default_pinned_memory_pool().free_all_blocks()
         else:
 
             def empty(device_id: int) -> float:
@@ -408,7 +435,8 @@ class CuPySymmetryDensityBuilder:
                 _pool(device_id).submit(empty, device_id)
                 for device_id in device_ids
             )
-            cp.get_default_pinned_memory_pool().free_all_blocks()
+            if not keep_pinned:
+                cp.get_default_pinned_memory_pool().free_all_blocks()
             if not self.caller_joins_release:
                 self._join_release()
         record["release_seconds"] += perf_counter() - collected

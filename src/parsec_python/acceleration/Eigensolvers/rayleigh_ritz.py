@@ -11,11 +11,21 @@ from scipy.linalg import solve_triangular
 
 from ..backends.cupy import device_stage, require_cupy
 from .small_dense import symmetric_eigh
+from .tall_product import transposed_product
 
 
 _DEFAULT_GENERALIZED_RITZ_WORK_THRESHOLD = 100_000_000
 # Rows mirrored at a time when a small host matrix is made symmetric.
 _MIRROR_BLOCK = 64
+# The columns in whose multiples the right-hand side of a tall product costs
+# on an A100: the default of :func:`gram_multiple`.
+_GRAM_MULTIPLE = 64
+# The most bytes of the slab buffer of a sector on one device where neither a
+# budget nor a limit is named (:func:`one_array_buffer_limit`), and the most
+# that such a buffer took before, from which the steps of a shared basis
+# still start (:func:`_streaming_bytes`).
+_ONE_ARRAY_BUFFER_BYTES = 2 << 30
+_FORMER_BUFFER_BYTES = 4 << 30
 
 
 class GeneralizedRitzStabilityError(np.linalg.LinAlgError):
@@ -205,10 +215,13 @@ def gram_multiple() -> int:
     fit rule counts for the workspace is what it counted.  The sums of the
     lower triangles are cut into other pieces, so the results differ by
     round-off from those of the former widths.  ``1`` selects those, bit
-    for bit, on every route.
+    for bit, on every route.  The overlap of a shared basis has been cut
+    by a width of its own since, a whole multiple as well
+    (:func:`distributed_state.overlap_slab_width`): its former widths take
+    ``PARSEC_CUPY_RITZ_GRAM_SLABS=8`` beside the ``1``.
     """
 
-    raw = os.environ.get("PARSEC_CUPY_RITZ_GRAM_MULTIPLE", "64").strip()
+    raw = os.environ.get("PARSEC_CUPY_RITZ_GRAM_MULTIPLE", str(_GRAM_MULTIPLE)).strip()
     try:
         multiple = int(raw)
     except ValueError as error:
@@ -249,6 +262,12 @@ def _gram_slab_width(columns: int) -> int:
     (:func:`gram_multiple`), which makes more of them: 1,842 columns in
     slabs of 231 become nine of 192 and one of 114.  The narrower last slab
     is multiplied by its own columns only, the smallest product of all.
+
+    That is the cut of a sector on one device, of both Gram matrices where
+    it keeps two arrays, and of the projection of a shared basis with three
+    tall blocks.  The overlap of a shared basis is cut by a width of its
+    own, 128 columns, unless the count is named here: a named count is the
+    cut of every route (:func:`distributed_state.overlap_slab_width`).
     """
 
     raw = os.environ.get("PARSEC_CUPY_RITZ_GRAM_SLABS", "8").strip()
@@ -264,7 +283,7 @@ def _gram_slab_width(columns: int) -> int:
     return width if width >= int(columns) else _whole_multiple(width)
 
 
-def _lower_triangle_product(left: Any, right: Any):
+def _lower_triangle_product(left: Any, right: Any, width: int | None = None):
     """Return the lower triangle of ``left.T @ right`` from column slabs.
 
     The small solve, :func:`solve_whitened_ritz` on the host and
@@ -272,30 +291,38 @@ def _lower_triangle_product(left: Any, right: Any):
     triangles of ``X.T X`` and ``X.T (H X)`` only, so each slab of columns of
     ``right`` is multiplied by the columns of ``left`` from its own first one
     onwards.  Entries above the diagonal slabs stay zero.
+
+    A slab of an even number of columns below 64 is multiplied in two
+    pieces (:func:`tall_product.transposed_product`), as is every other
+    product of two tall arrays in this module.
+
+    ``width`` is the columns of a slab where the caller cuts by a rule of
+    its own (:func:`distributed_state.overlap_slab_width`); without one the
+    slabs are those of :func:`_gram_slab_width`.
     """
 
     cp, _ = require_cupy()
     columns = int(left.shape[1])
-    width = _gram_slab_width(columns)
+    width = _gram_slab_width(columns) if width is None else max(1, int(width))
     if width >= columns:
-        return left.T @ right
+        return transposed_product(cp, left, right)
     product = cp.zeros((columns, columns), dtype=cp.float64, order="F")
     for start in range(0, columns, width):
         stop = min(columns, start + width)
-        product[start:, start:stop] = left[:, start:].T @ right[:, start:stop]
+        product[start:, start:stop] = transposed_product(
+            cp, left[:, start:], right[:, start:stop]
+        )
     return product
 
 
-def _symmetric_overlap(matrix: Any):
-    """Form the lower triangle of ``X.T X``.
+def _overlap_policy() -> str:
+    """How ``PARSEC_CUPY_RITZ_SYRK`` has the overlap formed: ``slabs``, ``syrk`` or ``full``.
 
-    ``PARSEC_CUPY_RITZ_SYRK`` selects how.  ``auto``, the default, and
-    ``slabs`` form it from GEMMs on trailing columns (see
-    :func:`_lower_triangle_product`), ``on`` with FP64 DSYRK and ``off`` from
-    one full GEMM.
+    ``auto``, the default, and ``slabs`` are the slabs of
+    :func:`_lower_triangle_product`, ``on`` is FP64 DSYRK and ``off`` one
+    full GEMM.
     """
 
-    cp, _ = require_cupy()
     policy = os.environ.get(
         "PARSEC_CUPY_RITZ_SYRK", "auto"
     ).strip().lower()
@@ -304,12 +331,30 @@ def _symmetric_overlap(matrix: Any):
             "PARSEC_CUPY_RITZ_SYRK must be auto, on, off, or slabs"
         )
     if policy in {"off", "0", "false"}:
-        return matrix.T @ matrix
-    if policy in {"auto", "slabs"}:
+        return "full"
+    return "slabs" if policy in {"auto", "slabs"} else "syrk"
+
+
+def _symmetric_overlap(matrix: Any, width: int | None = None):
+    """Form the lower triangle of ``X.T X``.
+
+    ``PARSEC_CUPY_RITZ_SYRK`` selects how (:func:`_overlap_policy`): from
+    GEMMs on trailing columns (see :func:`_lower_triangle_product`), with
+    FP64 DSYRK or from one full GEMM.  ``width`` is the columns of a slab
+    where the caller has a rule for them; only the slabs read it.
+    """
+
+    cp, _ = require_cupy()
+    policy = _overlap_policy()
+    if policy == "full":
+        return transposed_product(cp, matrix, matrix)
+    if policy == "slabs":
         # DSYRK does half the operations of the full product but stays below
         # the GEMM rate (8 to 9 against 13 to 17 Tflop/s on an A100); the
         # slabs do little more than half at that rate.
-        return _lower_triangle_product(matrix, matrix)
+        if width is None:
+            return _lower_triangle_product(matrix, matrix)
+        return _lower_triangle_product(matrix, matrix, width)
     # cuBLAS is column-major.  ``matrix`` is made Fortran-contiguous by the
     # caller, so op(A)=A.T with n=states and k=grid points computes exactly
     # the lower triangle consumed by the generalized Ritz solve.
@@ -375,14 +420,17 @@ def _column_copy_requested() -> bool:
     return value in {"1", "on", "true"}
 
 
-def _streaming_bytes(basis_bytes: int, most: int = 4 << 30) -> int:
+def _streaming_bytes(basis_bytes: int, most: int = _FORMER_BUFFER_BYTES) -> int:
     """Bytes of one projection slab or rotation tile.
 
     ``PARSEC_CUPY_STREAMING_RITZ_BYTES`` sets it.  Otherwise it is an eighth
-    of the basis, at least 1 GiB and at most 4 GiB: narrow slabs make the
-    tall products inefficient and pass over the basis more often.  A
-    caller that has made sure of the memory names another upper limit as
-    ``most`` (see :func:`distributed_state.wider_slabs_fit`).
+    of the basis, at least 1 GiB and at most ``most``: narrow slabs make
+    the tall products inefficient and pass over the basis more often.
+    ``most`` is 4 GiB where the caller names nothing, as the steps of a
+    shared basis start from it (:func:`distributed_state.slab_columns`).
+    A sector on one device names its own limit
+    (:func:`one_array_buffer_limit`), and a caller that has made sure of
+    the memory a higher one (see :func:`distributed_state.wider_slabs_fit`).
     """
 
     raw = os.environ.get("PARSEC_CUPY_STREAMING_RITZ_BYTES", "").strip()
@@ -399,30 +447,138 @@ def _streaming_bytes(basis_bytes: int, most: int = 4 << 30) -> int:
     return value
 
 
-def _streaming_shape(matrix: Any) -> tuple[int, int]:
-    """Columns of one projection slab and rows of one rotation tile.
+def one_array_buffer_limit(rows: int) -> int:
+    """The most bytes of the slab buffer of a sector on one device where no budget is set.
 
-    Each as many as the bytes of :func:`_streaming_bytes` hold.  A slab of
-    64 columns and more that is not the whole basis is then cut down to a
-    whole multiple of 64 (:func:`gram_multiple`), since every slab is the
-    right-hand side of a tall product: the 206 columns of 4 GiB at
-    2,604,846 rows become 192.  The tile is the left-hand side of its
-    product and keeps its rows, so the rotation is cut as it was.
+    ``PARSEC_CUPY_STREAMING_RITZ_LIMIT_BYTES`` names it.  Unset, it is 2
+    GiB, or 64 columns of all ``rows`` where 2 GiB hold fewer, up to the 4
+    GiB that it was.  The buffer is an eighth of the basis within it and
+    at least 1 GiB (:func:`_streaming_bytes`), so a basis of up to 16 GiB
+    keeps the buffer it had, one of 16 to 32 GiB took that eighth and
+    takes 2 GiB, and a larger one took 4.  The limit acts where
+    ``PARSEC_CUPY_STREAMING_RITZ_BYTES`` is not set and on nothing else:
+    a budget that is set is the buffer as before, and no step of a shared
+    basis reads the limit.
+
+    First runs on A100 nodes with the budget set to 2 GiB against the
+    default of 4 in one allocation: 14,680 electrons on 2 GPUs peaked at
+    78,109 instead of 80,157 MiB on the fullest device in 231.4 against
+    231.6 s, and on 4 GPUs at 41,049 instead of 43,141 MiB in 123.9
+    against 124.5 s; 19,392 electrons on 4 GPUs at 58,155 instead of
+    60,251 MiB in 180.7 against 180.5 s.  Their slabs are 64 columns wide
+    where they were 192 and 128, and the total energies moved by 5e-9 to
+    5e-8 Ry: the projection is summed from other slabs, and the rows are
+    rotated in tiles of half the height.  With 3 GiB the slabs of 19,392
+    electrons stay 128 columns and only the tile is lower: 59,227 MiB,
+    180.4 s and the total energy to the last bit.
+
+    The slabs of those runs are one whole multiple
+    (:func:`gram_multiple`).  A narrower one pays for 64 columns in every
+    product, and none has been timed alone.  A sector of more than
+    4,194,304 rows, of which 2 GiB hold fewer than 64 columns, therefore
+    keeps slabs of 64 columns, 2 to 4 GiB of buffer, and from 8,388,608
+    rows the 4 GiB and the narrower slab that it had.  No such sector on
+    one device has run.
+
+    ``4294967296`` selects the former buffer, at most 4 GiB, for a basis
+    of any size, bit for bit.  ``PARSEC_CUPY_STREAMING_RITZ_BYTES`` at
+    that value does not: a basis below 32 GiB took an eighth of itself
+    and takes 4 GiB with it.
     """
 
+    name = "PARSEC_CUPY_STREAMING_RITZ_LIMIT_BYTES"
+    raw = os.environ.get(name)
+    if raw is None:
+        whole = 8 * int(rows) * _GRAM_MULTIPLE
+        return max(_ONE_ARRAY_BUFFER_BYTES, min(whole, _FORMER_BUFFER_BYTES))
+    try:
+        value = int(raw.strip())
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if value < 1:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _tile_follows_slab() -> bool:
+    """Whether the rotation tile of a sector on one device takes the bytes of the slab that is cut.
+
+    ``PARSEC_CUPY_STREAMING_RITZ_TILE=slab``.  With ``budget``, the
+    default, the tile takes the bytes of the budget whatever the slab is
+    cut to: where the multiple of 64 columns cuts the slab down, the tile
+    is the larger view and the buffer is that of the budget
+    (:func:`_streaming_workspace`).  With ``slab`` the tile is as tall as
+    the slab lets it be, as it is in the steps of a shared basis, and the
+    buffer is the slab: 1.24 instead of 2.00 GiB for a sector of 14,680
+    electrons and 1.37 for one of 19,392, whose slabs are 64 of the 103
+    and 93 columns of 2 GiB, 1.84 for one of 10,456 (128 of 139) and 0.57
+    instead of 1.00 GiB for one of 7,120 (64 of 112).  Those figures follow
+    from the cut; no run on an A100 has had it.
+
+    It is offered and not the default because the results are not the
+    same to the last bit under it.  The Gram matrices are, since no slab
+    moves, but the rows are rotated in tiles of another height, and
+    cuBLAS does not form the product of a tile by the same sums at every
+    height.  On a workstation GPU (RTX 5070, CUDA 12.9) one random basis,
+    rotated with tiles of 12 to 17 heights up to all of its rows, from one
+    row for the smaller shapes and from 64 for the larger, came out with
+    other bits at some heights for every one of eight shapes from 257 x
+    17 to 400,000 x 442 and 120,000 x 1,314: in a few hundred entries at
+    some heights and in nearly all at others, by 8e-13 at most where the
+    entries are of the order of 30.  On A100 nodes one
+    pair of heights ran: a budget of 3 instead of 4 GiB, which left the
+    slabs of 19,392 electrons on 4 GPUs as they were and made the tile a
+    quarter lower, gave the total energy to the last bit and peaked 1.0
+    GiB lower in the same time.
+    """
+
+    name = "PARSEC_CUPY_STREAMING_RITZ_TILE"
+    value = os.environ.get(name, "budget").strip().lower()
+    if value not in {"budget", "slab"}:
+        raise ValueError(f"{name} must be budget or slab")
+    return value == "slab"
+
+
+def _streaming_views(rows: int, columns: int, basis_bytes: int) -> tuple[int, int, int]:
+    """Columns of the slab of the budget and of the slab that is cut from it, and rows of the tile.
+
+    For a ``rows x columns`` basis of these bytes on one device.  The slab
+    and the tile are as many columns and rows as the bytes of the budget
+    hold (:func:`_streaming_cut`).  A slab of 64 columns and more that is
+    not the whole basis is then cut down to a whole multiple of 64
+    (:func:`gram_multiple`), since every slab is the right-hand side of a
+    tall product: the 103 columns of 2 GiB at 2,604,846 rows become 64, as
+    the 206 of 4 GiB became 192.  The tile is the left-hand side of its
+    product and keeps its rows, so the rotation is cut as it was, unless
+    the tile is to follow the slab (:func:`_tile_follows_slab`): it is
+    then no taller than the bytes of the slab that was cut hold.
+    """
+
+    budget_width, tile = _streaming_cut(rows, columns, basis_bytes)
+    width = budget_width if budget_width >= columns else _whole_multiple(budget_width)
+    if _tile_follows_slab():
+        tile = max(1, min(tile, rows * width // columns))
+    return budget_width, width, tile
+
+
+def _streaming_shape(matrix: Any) -> tuple[int, int]:
+    """Columns of one projection slab and rows of one rotation tile (:func:`_streaming_views`)."""
+
     rows, columns = map(int, matrix.shape)
-    width, tile = _streaming_cut(rows, columns, matrix.nbytes)
-    return (width if width >= columns else _whole_multiple(width), tile)
+    _budget_width, width, tile = _streaming_views(rows, columns, matrix.nbytes)
+    return width, tile
 
 
 def _streaming_cut(rows: int, columns: int, basis_bytes: int) -> tuple[int, int]:
-    """Slab columns and tile rows that the bytes of :func:`_streaming_bytes` hold.
+    """Slab columns and tile rows that the budget of a sector on one device holds.
 
     For a ``rows x columns`` basis of these bytes, before
-    :func:`_streaming_shape` cuts the slab down to a whole multiple.
+    :func:`_streaming_views` cuts the slab down to a whole multiple.  The
+    budget is that of :func:`_streaming_bytes` within the limit of one
+    array (:func:`one_array_buffer_limit`).
     """
 
-    budget = _streaming_bytes(basis_bytes)
+    budget = _streaming_bytes(basis_bytes, one_array_buffer_limit(rows))
     return (
         max(1, min(columns, budget // (8 * rows))),
         max(1, min(rows, budget // (8 * columns))),
@@ -443,22 +599,28 @@ def streaming_workspace_bytes(rows: int, columns: int) -> int:
     every multiple.  The buffer itself is the count with a multiple of 1
     and never more: a slab cut down to a whole multiple leaves the tile as
     the larger view, which is within ``8 * columns`` bytes of the budget.
+
+    Where the tile follows the slab (:func:`_tile_follows_slab`) the
+    buffer is the slab that is cut, and that is counted: the bytes that
+    the step takes at the multiple in force, which then moves the count.
     """
 
     rows, columns = int(rows), int(columns)
-    width, tile = _streaming_cut(rows, columns, 8 * rows * columns)
-    return 8 * max(rows * width, tile * columns)
+    budget_width, width, tile = _streaming_views(rows, columns, 8 * rows * columns)
+    counted = width if _tile_follows_slab() else budget_width
+    return 8 * max(rows * counted, tile * columns)
 
 
 def _streaming_workspace(matrix: Any):
     """Return the projection slab and the rotation tile as views of one buffer.
 
     The slab receives ``H`` times some columns (all rows), the tile the
-    rotated basis for some rows (all columns).  Both get the bytes of
-    :func:`_streaming_bytes`, but whole columns and whole rows round them
+    rotated basis for some rows (all columns).  Both get the bytes of the
+    budget (:func:`_streaming_cut`), but whole columns and whole rows round them
     differently, so the two differ by a few megabytes, and by more where
     the slab was cut down to a multiple of 64 columns
-    (:func:`_streaming_shape`).  A memory-pool block
+    (:func:`_streaming_views`; a tile that follows the slab is the smaller
+    view by less than a row).  A memory-pool block
     released by the smaller cannot serve the larger: two separate buffers
     would both stay in the pool until it is emptied after the SCF step.  The
     slab and the tile are never in use together, so one buffer of the larger
@@ -515,7 +677,9 @@ def _streamed_projection(operator: Any, matrix: Any, slab: Any | None = None):
             else:
                 applied[...] = operator @ block
         with device_stage(operator, "subspace_ritz_projection_seconds"):
-            projection[start:, start:stop] = matrix[:, start:].T @ applied
+            projection[start:, start:stop] = transposed_product(
+                cp, matrix[:, start:], applied
+            )
     return projection
 
 
@@ -1035,7 +1199,7 @@ def rayleigh_ritz(
     applied_basis = operator @ basis
     if applied_basis.shape != basis.shape:
         raise ValueError("operator must preserve the basis shape")
-    raw_projection = basis.T @ applied_basis
+    raw_projection = transposed_product(cp, basis, applied_basis)
     lower = cp.tril(raw_projection)
     projected = lower + cp.tril(lower, -1).T
     eigenvalues, rotations = symmetric_eigh(projected)
@@ -1064,6 +1228,7 @@ __all__ = [
     "generalized_rayleigh_ritz",
     "generalized_ritz_requested",
     "gram_multiple",
+    "one_array_buffer_limit",
     "rayleigh_ritz",
     "solve_whitened_ritz",
     "solve_whitened_ritz_on_device",

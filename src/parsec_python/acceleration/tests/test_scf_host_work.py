@@ -19,6 +19,7 @@ from parsec_python.acceleration.Eigensolvers.distributed_state import (
     DistributedBasis,
     shared_pool_release_requested,
 )
+from parsec_python.acceleration.Eigensolvers.spill_buffers import spill_buffer_mode, spill_pinned_pool
 from parsec_python.acceleration.Eigensolvers.symmetry import CuPySymmetryOrbitals
 from parsec_python.acceleration.Occupations import symmetry_density
 from parsec_python.acceleration.Occupations.symmetry_density import (
@@ -483,11 +484,13 @@ class DensityCollectionTests(unittest.TestCase):
             for _ in range(times):
                 builder._release_large_unused_pool(self.orbitals)
 
-    def builder(self, collection=None):
+    def builder(self, collection=None, pinned=None):
         with patch.dict(os.environ):
-            os.environ.pop("PARSEC_CUPY_DENSITY_COLLECTION", None)
-            if collection is not None:
-                os.environ["PARSEC_CUPY_DENSITY_COLLECTION"] = collection
+            for name, value in (("PARSEC_CUPY_DENSITY_COLLECTION", collection),
+                                ("PARSEC_CUPY_SPILL_PINNED_POOL", pinned)):
+                os.environ.pop(name, None)
+                if value is not None:
+                    os.environ[name] = value
             return CuPySymmetryDensityBuilder(lambda *args: None)
 
     def test_switch_names_two_collections_and_refuses_others(self) -> None:
@@ -590,23 +593,33 @@ class DensityCollectionTests(unittest.TestCase):
     def test_host_kept_sector_states_are_collected_in_full(self) -> None:
         # Sector states kept on the host name no device: no pool is released
         # or read, so nothing would show a cycle that holds device memory.
-        builder = self.builder()
-        self.orbitals.sector_vectors = (np.zeros((40, 5)), np.zeros((40, 5)))
-        for _ in range(5):
-            self.pool.used[0] += 512
-            self.release(builder)
-        self.assertEqual(self.collections, [None] * 5)
-        self.assertEqual((self.pool.read, self.pool.released), ([], []))
-        self.assertEqual(self.pinned.released, [None] * 5)
-        record = builder.pool_release
-        self.assertEqual(
-            (record["calls"], record["full_collections"], record["young_collections"]),
-            (5, 5, 0),
-        )
-        # Back on a device, the level is not known yet.
-        self.orbitals.sector_vectors = (_FakeArray(self.cuda, 0, 400),)
-        self.release(builder, times=2)
-        self.assertEqual(self.collections[5:], [1, None, 1])
+        # The pinned pool is emptied as it was where its release is named,
+        # and left by default; the collections are the same either way.
+        for pinned, emptied in (("release", 5), (None, 0), (" Keep ", 0)):
+            with self.subTest(pinned=pinned):
+                del self.collections[:], self.pool.read[:], self.pool.released[:], self.pinned.released[:]
+                builder = self.builder(pinned=pinned)
+                self.orbitals.sector_vectors = (np.zeros((40, 5)), np.zeros((40, 5)))
+                for _ in range(5):
+                    self.pool.used[0] += 512
+                    self.release(builder)
+                self.assertEqual(self.collections, [None] * 5)
+                self.assertEqual((self.pool.read, self.pool.released), ([], []))
+                self.assertEqual(self.pinned.released, [None] * emptied)
+                record = builder.pool_release
+                self.assertEqual(
+                    (record["calls"], record["full_collections"], record["young_collections"]),
+                    (5, 5, 0),
+                )
+                self.assertEqual((record["spill_pinned_pool"], record["pinned_kept"]),
+                                 ("release", 0) if emptied else ("keep", 5))
+                # Back on a device, the level is not known yet, and the pinned
+                # pool goes with the pool of the device under either value.
+                self.orbitals.sector_vectors = (_FakeArray(self.cuda, 0, 400),)
+                self.release(builder, times=2)
+                self.assertEqual(self.collections[5:], [1, None, 1])
+                self.assertEqual(self.pinned.released, [None] * (emptied + 2))
+                self.assertEqual(record["pinned_kept"], 0 if emptied else 5)
 
     def test_small_bases_release_nothing(self) -> None:
         builder = self.builder()
@@ -691,10 +704,11 @@ class DensityReleaseTests(unittest.TestCase):
             for _ in range(times):
                 builder._release_large_unused_pool(self.orbitals if orbitals is None else orbitals)
 
-    def builder(self, release=None, shared=None):
+    def builder(self, release=None, shared=None, pinned=None):
         with patch.dict(os.environ):
             for name, value in (("PARSEC_CUPY_DENSITY_RELEASE", release),
-                                ("PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE", shared)):
+                                ("PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE", shared),
+                                ("PARSEC_CUPY_SPILL_PINNED_POOL", pinned)):
                 os.environ.pop(name, None)
                 if value is not None:
                     os.environ[name] = value
@@ -777,13 +791,15 @@ class DensityReleaseTests(unittest.TestCase):
         both = SimpleNamespace(sector_vectors=(self.shared(0, 1), _FakeArray(self.cuda, 1, 400)))
         self.release(self.builder(), orbitals=both)
         self.assertEqual(self.pool.released, [1])
-        # Sector states that a process keeps on the host beside a shared basis are collected for in full and
-        # empty the pinned pool, as they do alone.
-        del self.emptied[:], self.pool.released[:], self.pinned.released[:]
-        builder = self.builder()
-        self.release(builder, orbitals=SimpleNamespace(sector_vectors=(self.shared(0, 1), None, np.zeros((40, 5)))))
-        self.assertEqual((self.pool.released, self.pinned.released, len(self.emptied)), ([], [None], 1))
-        self.assertEqual((builder.pool_release["shared_kept"], builder.pool_release["full_collections"]), (1, 1))
+        # Sector states that a process keeps on the host beside a shared basis are collected for in full, as
+        # they are alone, and like those leave the pinned pool unless its release is named.
+        for pinned, emptied in ((None, []), ("release", [None])):
+            del self.emptied[:], self.pool.released[:], self.pinned.released[:]
+            builder = self.builder(pinned=pinned)
+            self.release(builder, orbitals=SimpleNamespace(sector_vectors=(self.shared(0, 1), None, np.zeros((40, 5)))))
+            self.assertEqual((self.pool.released, self.pinned.released, len(self.emptied)), ([], emptied, 1))
+            self.assertEqual((builder.pool_release["shared_kept"], builder.pool_release["full_collections"]), (1, 1))
+            self.assertEqual(builder.pool_release["pinned_kept"], 0 if emptied else 1)
         # Below the limit of the release nothing is counted either: the rule is asked of what would be released.
         builder = self.builder()
         with patch.dict(os.environ, PARSEC_CUPY_POOL_RELEASE_ORBITAL_BYTES="1601"), \
@@ -847,6 +863,28 @@ class DensityReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "PARSEC_CUPY_DENSITY_RELEASE"):
                     CuPySymmetryDensityBuilder(lambda *args: None)
 
+    def test_the_pinned_pool_of_host_kept_states_has_two_settings_and_refuses_others(self) -> None:
+        name = "PARSEC_CUPY_SPILL_PINNED_POOL"
+        with patch.dict(os.environ):
+            os.environ.pop(name, None)
+            self.assertEqual(spill_pinned_pool(), "keep")
+            for raw, expected in ((" Release ", "release"), ("keep", "keep")):
+                os.environ[name] = raw
+                self.assertEqual(spill_pinned_pool(), expected)
+                self.assertEqual(CuPySymmetryDensityBuilder(lambda *args: None).spill_pinned_pool, expected)
+            for unknown in ("0", "1", "empty", ""):
+                os.environ[name] = unknown
+                with self.assertRaisesRegex(ValueError, f"{name} must be keep or release"):
+                    spill_pinned_pool()
+                # A builder refuses it before any density is built.
+                with self.assertRaisesRegex(ValueError, name):
+                    CuPySymmetryDensityBuilder(lambda *args: None)
+        # A builder says in its record what it holds of the orbitals it was handed on the host: the record
+        # of a device builder that keeps one, and nothing for another callable.
+        counted = SimpleNamespace(host_uploads=dict(direct=True, calls=0, bytes=0, seconds=0.0))
+        self.assertIs(CuPySymmetryDensityBuilder(counted).pool_release["host_uploads"], counted.host_uploads)
+        self.assertIsNone(self.builder().pool_release["host_uploads"])
+
     def test_every_device_is_emptied_by_its_thread_beside_the_others_and_the_pinned_pool(self) -> None:
         builder = self.builder()
         self.assertEqual((builder.release, builder.pool_release["release"]), ("threads", "threads"))
@@ -899,9 +937,23 @@ class DensityReleaseTests(unittest.TestCase):
             self.assertEqual(builder.pool_release["device_release_seconds"], 0.0)
         self.assertEqual((self.pool.released, self.pool.threads), ([1, 1], [self.here] * 2))
         self.assertEqual((self.pinned.released, self.pinned.threads), ([None] * 2, [self.here] * 2))
-        # So are host-kept sector states, which name no device: the pinned pool alone.
-        self.release(self.builder(), orbitals=SimpleNamespace(sector_vectors=(np.zeros((40, 5)),)))
+        # Host-kept sector states name no device.  They empty no pool by default, and the pinned pool alone,
+        # in the same thread, where its release is named.
+        hosted = SimpleNamespace(sector_vectors=(np.zeros((40, 5)),))
+        self.release(self.builder(), orbitals=hosted)
+        self.assertEqual((self.pool.released, self.pinned.threads), ([1, 1], [self.here] * 2))
+        self.release(self.builder(pinned="release"), orbitals=hosted)
         self.assertEqual((self.pool.released, self.pinned.threads), ([1, 1], [self.here] * 3))
+        # Beside sectors on two devices, whose pools their threads empty, host-kept states keep the pinned
+        # pool as well, and with the release named it is emptied meanwhile as before.
+        both = SimpleNamespace(sector_vectors=(_FakeArray(self.cuda, 0, 400), np.zeros((40, 5)),
+                                               _FakeArray(self.cuda, 1, 400)))
+        for pinned, emptied in ((None, 0), ("release", 1)):
+            del self.pool.released[:], self.pool.threads[:], self.pinned.released[:]
+            builder = self.builder(pinned=pinned)
+            self.release(builder, orbitals=both)
+            self.assertEqual(sorted(zip(self.pool.released, self.pool.threads)), list(zip((0, 1), self.device_threads)))
+            self.assertEqual((self.pinned.released, builder.pool_release["pinned_kept"]), ([None] * emptied, 1 - emptied))
 
     def test_a_caller_that_waits_itself_has_the_density_first_and_empty_pools_when_it_has_waited(self) -> None:
         builder = self.builder()
@@ -1044,6 +1096,10 @@ class RunnerRecordTests(unittest.TestCase):
             self.assertEqual(density_collection(), "full")
             self.assertEqual(density_release(), "serial")
             self.assertFalse(scf_buffers_requested())
+            # Sector states that a control keeps on the host are staged by the former calls, and the pinned
+            # pool through which they go to a device is emptied after every density.
+            self.assertEqual((spill_buffer_mode(), spill_pinned_pool()), ("fresh", "release"))
+            self.assertEqual(CuPySymmetryDensityBuilder(lambda *args: None).pool_release["spill_pinned_pool"], "release")
             # The release of a shared basis is not the control's to name: it shares none, and its density
             # step empties the pool of every device that holds a sector whatever that switch says.
             self.assertNotIn("PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE", mpi_full_scf._SERIAL_CONTROL_SETTINGS)

@@ -301,7 +301,7 @@ def main() -> int:
     parser.add_argument(
         "--pp-source",
         type=Path,
-        default=repository / "src" / "pp_generation" / "NCPPs",
+        default=repository / "src" / "pp_generation" / "NCPPs" / "PBE",
     )
     arguments = parser.parse_args()
     prepare(

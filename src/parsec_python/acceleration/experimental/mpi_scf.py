@@ -136,6 +136,10 @@ class MPISectorContext:
                 value = np.ascontiguousarray(value, dtype=np.float64)
                 if value.shape != (solver.decomposition.wedge_size,) or not np.all(np.isfinite(value)):
                     raise ValueError('local density must be a finite physical wedge field')
+            elif command == 'forces':
+                value = np.ascontiguousarray(value, dtype=np.float64)
+                if value.ndim != 2 or value.shape[1] != 3 or not np.all(np.isfinite(value)):
+                    raise ValueError('local force terms must be finite, three per projector')
         except Exception as exc:
             error = f'{type(exc).__name__}: {exc}'
         errors = self.comm.allgather(error)
@@ -168,6 +172,11 @@ class MPISectorContext:
             # The pools that the builder left to their device threads (_apply) are empty before this
             # rank goes on: the root to its Hartree solve, a worker to the next command.
             self._release_joined(density_builder)
+            return total
+        if command == 'forces':
+            # One row per projector on every rank: the ranks hold the same atoms.
+            total = np.empty_like(value)
+            self.comm.Allreduce(value, total)
             return total
         return value
 
@@ -234,6 +243,20 @@ class MPISectorContext:
                       else solver.decomposition.invariant_wedge_values(local_density))
             solver._mpi_latest_results.clear()
             return values
+        elif command == 'new_scf_loop':
+            # The SCF loop of the next structure continues from the saved subspaces.
+            solver._start_new_scf_loop_local()
+        elif command == 'geometry':
+            # Every rank rebuilds what it holds for the moved atoms: all of them the projectors of
+            # their sectors, the root also the fields of the SCF loop.
+            handler = getattr(solver, 'geometry_handler', None)
+            if handler is None:
+                raise RuntimeError('this rank was prepared without a geometry handler')
+            handler(np.asarray(payload, dtype=np.float64))
+        elif command == 'forces':
+            # Nonlocal force terms of the sectors of this rank, from the states its solvers hold.
+            representations, columns, occupations = payload
+            return solver._projector_force_terms_local(representations, columns, occupations)
         else:
             raise ValueError(f'unknown MPI SCF command: {command}')
 

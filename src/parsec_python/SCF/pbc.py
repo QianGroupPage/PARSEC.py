@@ -119,6 +119,11 @@ def prepare_periodic_single_point(
     """
     if problem.periodic_cell is None:
         raise ValueError("prepare_periodic_single_point requires problem.periodic_cell")
+    if problem.scf.spin_polarized:
+        raise NotImplementedError(
+            "spin-polarized calculations are implemented for isolated systems "
+            "only, not for a periodic cell"
+        )
 
     preparation_start = time.perf_counter()
     # 1. Geometry, pseudopotentials, and electron count.

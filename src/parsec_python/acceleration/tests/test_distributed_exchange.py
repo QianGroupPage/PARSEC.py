@@ -543,6 +543,206 @@ class ExchangePlanTests(unittest.TestCase):
                 with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES='8', PARSEC_CUPY_DISTRIBUTED_STATE_RANGES='fixed'):
                     self.assertEqual(group._capacities(ranges, edges), (tall, 193 * 6), blocks)
 
+    def test_a_chunk_follows_a_block_that_is_up_to_an_eighth_wider_unless_a_size_is_named(self):
+        limit, gib = distributed_state.exchange_chunk_limit, 1 << 30
+        chunk = gib // 8
+        with patch.dict(os.environ):
+            os.environ.pop('PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', None)
+            self.assertEqual((distributed_state._EXCHANGE_CHUNK_BYTES, distributed_state._EXCHANGE_CHUNK_MARGIN), (gib, 8))
+            # Elements of the widest block outside its device -> elements of a chunk on the way to the rows.
+            # Up to the default the chunk is the default; up to an eighth more it is the block, which then
+            # travels whole; beyond that the default again.
+            for elements, expected in ((0, chunk), (1, chunk), (chunk, chunk), (chunk + 1, chunk + 1),
+                                       (chunk + chunk // 8, chunk + chunk // 8), (chunk + chunk // 8 + 1, chunk),
+                                       (2 * chunk, chunk), (100 * chunk, chunk)):
+                self.assertEqual(limit(elements), expected, elements)
+            # So no buffer is more than 1,207,959,552 bytes, 128 MiB above the default, whatever travels.
+            self.assertEqual(8 * (chunk + chunk // 8), 1207959552)
+            self.assertEqual(max(limit(chunk * share // 64) for share in range(1, 257)), chunk + chunk // 8)
+            # A sector of 5,660,200 rows on four devices sends 4,245,150 rows of every column: its slabs of 32
+            # columns are 1,086,758,400 bytes and one chunk, where a chunk of 1 GiB held 31 of them.  Slabs
+            # of 48 columns of 4,130,510 rows (1,189,587,072 bytes) are one chunk too, and those of 64 of
+            # 3,786,832 rows (1,454,143,488 bytes) travel as 47 and 17 columns as before.
+            for rows, slab, bytes_away, columns in ((5660200, 32, 1086758400, [32]), (4130510, 48, 1189587072, [48]),
+                                                   (3786832, 64, 1454143488, [47, 17])):
+                away = rows - rows // 4
+                self.assertEqual(8 * away * slab, bytes_away)
+                cut = distributed_state.exchange_chunks(slab, away, limit(away * slab))
+                self.assertEqual([last - first for first, last in cut], columns)
+                self.assertEqual(8 * limit(away * slab), bytes_away if len(columns) == 1 else gib)
+            # What a fit rule counts for slabs of up to so many elements: the most that any of them is given.
+            for elements, most in ((0, chunk), (chunk, chunk), (chunk + 5, chunk + 5), (chunk + chunk // 8, chunk + chunk // 8),
+                                   (chunk + chunk // 8 + 1, chunk + chunk // 8), (100 * chunk, chunk + chunk // 8)):
+                self.assertEqual(limit(elements, narrower=True), most, elements)
+            # A size that is named is the chunk whatever travels, as before, also where it is the default:
+            # 1073741824 gives the chunks that the code cut before the buffer followed anything.
+            for named in (gib, 1090000000, 1500000000, 8 * 400):
+                os.environ['PARSEC_CUPY_EXCHANGE_CHUNK_BYTES'] = str(named)
+                for elements in (0, 1, named // 8, named // 8 + 1, named // 8 + named // 64, 10 * named):
+                    self.assertEqual((limit(elements), limit(elements, narrower=True)), (named // 8,) * 2, (named, elements))
+            # A value that is no size is refused here as there.
+            os.environ['PARSEC_CUPY_EXCHANGE_CHUNK_BYTES'] = 'auto'
+            with self.assertRaises(ValueError):
+                limit(1)
+
+    def test_one_chunk_holds_every_device_part_of_a_block_within_the_margin_for_any_shape(self):
+        # The rule over shapes: rows, devices, a block of some columns on every device and a default chunk
+        # around what the block takes outside the device that has the fewest rows.  Within the margin every
+        # device sends its block in one chunk of at most the chunk and an eighth; elsewhere, and with the
+        # size named, the cut is that of the default.
+        limit, cut = distributed_state.exchange_chunk_limit, distributed_state.exchange_chunks
+        followed = 0
+        with patch.dict(os.environ):
+            os.environ.pop('PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', None)
+            for rows in (5, 61, 257, 1000, 4097, 65537, 5660200):
+                for devices in (2, 3, 4, 8):
+                    edges = [rows * index // devices for index in range(devices + 1)]
+                    heights = [high - low for low, high in zip(edges[:-1], edges[1:])]
+                    away = rows - min(heights)
+                    for width in (1, 2, 5, 32, 48, 96):
+                        block = away * width
+                        for default in sorted({max(1, block * share // 16) for share in (4, 13, 14, 15, 16, 17, 18, 40)}
+                                              | {block - 1, block, max(1, block * 8 // 9), max(1, block * 8 // 9 - 1)}):
+                            if default < 1:
+                                continue
+                            with patch.object(distributed_state, '_EXCHANGE_CHUNK_BYTES', 8 * default):
+                                chunk = limit(block)
+                                within = default < block <= default + default // 8
+                                self.assertEqual(chunk, block if within else default, (rows, devices, width, default))
+                                self.assertLessEqual(chunk, default + default // 8)
+                                for height in heights:
+                                    pieces = cut(width, rows - height, chunk)
+                                    if rows == height:
+                                        self.assertEqual(pieces, ())
+                                    elif within:
+                                        self.assertEqual(pieces, ((0, width),))
+                                    else:
+                                        self.assertEqual(pieces, cut(width, rows - height, default))
+                                    # A chunk never holds more than the buffer does: the limit, or one column.
+                                    self.assertLessEqual(max((last - first for first, last in pieces), default=0)
+                                                         * (rows - height), max(chunk, rows - height))
+                                followed += within
+                                with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * default)):
+                                    self.assertEqual(limit(block), default)
+        self.assertGreater(followed, 100)
+
+    def test_the_buffer_holds_the_slabs_that_a_step_names_and_the_rule_counts_no_less(self):
+        cp, _runtime = _stand_in()
+        devices = (0, 1, 2, 3)
+        ranges, edges = _columns((13, 12, 12, 12)), [0, 64, 128, 192, 257]
+        # At most 193 rows of a column lie outside a device.  A default chunk of 700 elements holds three
+        # columns; slabs of four take 772, within an eighth of it, and slabs of five 965, beyond.
+        room, most = 4 * 65, 193 * 13
+        with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)), patch.dict(os.environ), \
+             patch.object(distributed_state, '_EXCHANGE_CHUNK_BYTES', 8 * 700):
+            for name in ('PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS'):
+                os.environ.pop(name, None)
+            os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_RANGES'] = 'fixed'
+
+            def capacities(*arguments, **named):
+                group = distributed_state.SectorDeviceGroup(_Owner(cp, devices), devices)
+                return group, group._capacities(ranges, edges, *arguments, **named)
+
+            tall = 257 * 13 + room
+            # A basis that is only sized, and slabs that a chunk holds or that are too wide: the chunk.
+            for sent in ((), (1,), (3,), (5,), (3, 5, 13)):
+                self.assertEqual(capacities(sent=sent)[1], (tall, 700), sent)
+            # Slabs of four columns: the buffer is what they take outside a device, whatever else travels,
+            # and stays that for a later step that sends narrower or wider ones.
+            for sent in ((4,), (1, 4), (4, 5), (3, 4, 13)):
+                group, sizes = capacities(sent=sent)
+                self.assertEqual(sizes, (tall, 772), sent)
+                self.assertEqual(group._capacities(ranges, edges, sent=(3,)), (tall, 772))
+                self.assertEqual(group._capacities(ranges, edges, sent=(5,)), (tall, 772))
+            # Without names the blocks themselves travel, as in a conversion of them: thirteen columns are
+            # many chunks, and blocks of four columns one, which are only a chunk where they are only sized.
+            self.assertEqual(capacities()[1], (tall, 700))
+            for sent, chunk in ((None, 772), ((), 700)):
+                group = distributed_state.SectorDeviceGroup(_Owner(cp, devices), devices)
+                self.assertEqual(group._capacities(_columns((4, 4, 4, 4)), edges, sent=sent)[1], chunk)
+            # Never more than all of a block outside its device, as before: blocks of two columns, whose tall
+            # capacity of 520 elements leaves 390 for the rows of the three others.
+            group = distributed_state.SectorDeviceGroup(_Owner(cp, devices), devices)
+            self.assertEqual(group._capacities(_columns((2, 2, 2, 2)), edges, sent=(4,))[1], 390)
+            # With the size named, the chunk of before whatever the step sends.
+            with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * 700)):
+                for sent in (None, (), (4,), (1, 4), (3, 4, 13)):
+                    self.assertEqual(capacities(sent=sent)[1], (tall, 700), sent)
+            self.assertLess(772, most)
+
+    def test_the_fit_rule_counts_the_buffer_of_every_cut_of_the_slabs_of_its_budget(self):
+        # Over shapes: rows, columns, devices, a slab budget and a default chunk around the slab.  The rule
+        # that shares a basis counts a workspace of slabs as wide as the budget allows, and beside it the most
+        # that the buffer of any cut of narrower slabs takes.  The group of a step that cuts its rounds from
+        # that budget, at a multiple of 1 or of 8, never sizes a larger buffer, and where its widest slab is
+        # the one of the budget and lies within the margin it sizes exactly what is counted.
+        cp, _runtime = _stand_in()
+        exact = larger = 0
+        with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)), patch.dict(os.environ):
+            for name in ('PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES'):
+                os.environ.pop(name, None)
+            os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_RANGES'] = 'fixed'
+            for rows, columns, count in ((257, 96, 4), (257, 96, 2), (1000, 200, 4), (4097, 131, 4), (4097, 131, 2),
+                                         (1000, 203, 3)):
+                edges = [rows * index // count for index in range(count + 1)]
+                away = rows - min(high - low for low, high in zip(edges[:-1], edges[1:]))
+                widths = [columns * (index + 1) // count - columns * index // count for index in range(count)]
+                for slab in (2, 3, 5, 8, 9):
+                    os.environ['PARSEC_CUPY_STREAMING_RITZ_BYTES'] = str(8 * rows * slab)
+                    self.assertEqual(distributed_state.slab_columns(rows, columns, count, blocks=1), slab)
+                    for share in (10, 14, 15, 16, 17, 18, 19, 30):
+                        default = away * slab * 16 // share
+                        with patch.object(distributed_state, '_EXCHANGE_CHUNK_BYTES', 8 * default):
+                            counted = distributed_state.shared_block_bytes(rows, columns, count)
+                            with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * default)):
+                                named = distributed_state.shared_block_bytes(rows, columns, count)
+                            # What the rule counts beyond the chunk: nothing, or up to an eighth of it.
+                            more = (counted - named) // 8
+                            self.assertEqual(more, min(max(away * slab - default, 0), default // 8))
+                            for multiple in (1, 8):
+                                rounds = distributed_state.block_rounds(widths, slab, multiple)
+                                widest = [max(last - first for first, last in taken) for taken in rounds]
+                                # As the step with one tall block sizes its buffers: for the slabs that most of
+                                # its rounds send, and for every one of them alike to see the most of any cut.
+                                for sent in (distributed_state.followed_slabs(away, widest), sorted(set(widest))):
+                                    group = distributed_state.SectorDeviceGroup(_Owner(cp, tuple(range(count))),
+                                                                                tuple(range(count)))
+                                    _tall, chunk = group._capacities(_columns(widths), edges, sent=sent)
+                                    self.assertLessEqual(chunk, default + more, (rows, columns, count, slab, share, multiple))
+                                    self.assertGreaterEqual(chunk, default)
+                                larger += chunk > default
+                                if widest[-1] == slab and default < away * slab <= default + default // 8:
+                                    self.assertEqual(chunk, away * slab)
+                                    exact += 1
+                                # The step follows a slab only where at least half of its rounds send one.
+                                held = [width for width in widest if default < away * width <= default + default // 8]
+                                self.assertEqual(distributed_state.followed_slabs(away, widest),
+                                                 tuple(sorted(set(held))) if 2 * len(held) >= len(widest) and held else ())
+            # In bytes of basis, with the chunk of 1 GiB and the slab budgets of the default, for 1,000,000 rows.
+            # Four devices count more from a slab of 4/3 GiB, an eighth of a basis of 10.67 GiB (1,432
+            # columns), and all 128 MiB from a slab of 1.5 GiB, a basis of 12 GiB (1,616 columns with the
+            # slab in whole columns).  Two devices count nothing more with their slabs of at most 2 GiB, and
+            # the 128 MiB where their former slabs of 4 GiB are named.
+            del os.environ['PARSEC_CUPY_STREAMING_RITZ_BYTES']
+            gib, rows = 1 << 30, 1000000
+
+            def more(columns, count, **named):
+                with patch.dict(os.environ, named):
+                    counted = distributed_state.shared_block_bytes(rows, columns, count)
+                    with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib)):
+                        return counted - distributed_state.shared_block_bytes(rows, columns, count)
+
+            self.assertEqual([more(columns, 4) for columns in (500, 1431)], [0, 0])
+            rising = [more(columns, 4) for columns in (1432, 1500, 1615)]
+            self.assertEqual(rising, sorted(rising))
+            self.assertTrue(0 < rising[0] and rising[-1] < 1 << 27, rising)
+            self.assertEqual([more(columns, 4) for columns in (1616, 2000, 5000, 10000)], [1 << 27] * 4)
+            self.assertEqual([more(columns, 2) for columns in (500, 1432, 1616, 5000, 10000)], [0] * 5)
+            former = dict(PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(4 * gib))
+            self.assertEqual([more(columns, 2, **former) for columns in (5000, 10000)], [1 << 27] * 2)
+        self.assertGreater(min(exact, larger), 20)
+
     def test_column_copies_are_on_unless_switched_off(self):
         with patch.dict(os.environ):
             os.environ.pop('PARSEC_CUPY_EXCHANGE_COLUMN_COPIES', None)
@@ -561,31 +761,66 @@ class ExchangePlanTests(unittest.TestCase):
                 group._capacities(_columns((3, 2)), [0, 4, 9])
 
     def test_the_condition_number_has_a_helper_unless_none_is_free_or_it_is_switched_off(self):
-        cp, _runtime = _stand_in()
+        # Devices of 80 GiB and a sector of 2,000,000 rows and 1,000 columns, 14.9 GiB of basis: the device
+        # with the Hartree objects has the room for an estimate wherever it is asked here.
+        cp, _runtime = _stand_in(total_bytes=80 << 30)
 
         def helper(devices, hartree_device=None):
             owner = _Owner(cp, devices)
             if hartree_device is not None:
                 owner.hartree_device = hartree_device
-            return distributed_state.SectorDeviceGroup(owner, devices)._condition_helper()
+            return distributed_state.SectorDeviceGroup(owner, devices)._condition_helper(2 * 10**6, 1000)
 
-        with patch.dict(os.environ):
-            for name in ('PARSEC_CUPY_RITZ_CONDITION_HELPER', 'PARSEC_CUPY_RITZ_CONDITION'):
+        with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)), patch.dict(os.environ):
+            for name in ('PARSEC_CUPY_RITZ_CONDITION_HELPER', 'PARSEC_CUPY_RITZ_CONDITION',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_RANGES', 'PARSEC_CUPY_STREAMING_RITZ_BYTES',
+                         'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES'):
                 os.environ.pop(name, None)
-            self.assertEqual(distributed_state.condition_helper_policy(), 'auto')
+            self.assertEqual(distributed_state.condition_helper_policy(), 'any')
             # The first device after the owner, which never helps itself ...
             self.assertEqual([helper(devices) for devices in ((0, 1, 2, 3), (2, 3), (3, 1, 0), (1,))], [1, 3, 1, None])
             # ... unless it holds the Hartree objects of the process: the root's sector on 16 GPUs and its
-            # two on 8, of which the second has no other device.  Elsewhere the owner holds them.
+            # two on 8, of which the second has no other device and asks that one.  Elsewhere the owner
+            # holds them.
             self.assertEqual([helper((0, 1, 2, 3), device) for device in (3, 1, 0)], [1, 2, 1])
-            self.assertEqual((helper((0, 1), 3), helper((2, 3), 3)), (1, None))
-            # ``any`` asks that device where the sector has no other, and only there.
+            self.assertEqual((helper((0, 1), 3), helper((2, 3), 3)), (1, 3))
+            # ``any``, the default, asks that device where the sector has no other, and only there; ``auto``,
+            # the default before, never asks it; ``off`` asks no device.
             for raw, expected in ((' Any ', (2, 3)), ('auto', (2, None)), ('OFF', (None, None))):
                 os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = raw
                 self.assertEqual(distributed_state.condition_helper_policy(), raw.strip().lower())
                 self.assertEqual((helper((0, 1, 2, 3), 1), helper((2, 3), 3)), expected)
             os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = 'any'
             self.assertEqual([helper(devices, 1) for devices in ((0, 1), (0, 1, 2), (1,))], [1, 2, None])
+            # Every layout of a rank that the runner plans (experimental.mpi_scf.sector_device_groups) with
+            # the device that the driver gives the Hartree objects (driver._select_hartree_device): sectors,
+            # ranks and devices of a rank.  By default every shared sector has a helper, which is never its
+            # owner; with ``auto`` the sectors of two devices whose second one holds those objects have none,
+            # one sector of the root rank wherever its sectors have two devices each.
+            from parsec_python.acceleration import driver
+            from parsec_python.acceleration.experimental.mpi_scf import sector_device_groups
+            without = {}
+            for sectors, ranks, count in ((4, 4, 4), (4, 2, 4), (4, 1, 8), (4, 4, 2), (4, 2, 3), (8, 4, 4), (8, 2, 8),
+                                          (2, 1, 4), (2, 2, 2), (2, 2, 3), (4, 1, 4), (8, 1, 4), (1, 1, 4)):
+                groups = sector_device_groups(sectors, ranks, 0, tuple(range(count)))
+                busy = driver._select_hartree_device('auto', tuple(range(count)), groups)
+                shared = [devices for devices in groups.values() if len(devices) > 1]
+                for policy in ('any', 'auto'):
+                    os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = policy
+                    found = [helper(devices, busy) for devices in shared]
+                    self.assertFalse(any(device == devices[0] for device, devices in zip(found, shared)))
+                    self.assertTrue(all(device is None or device in devices[1:] for device, devices in zip(found, shared)))
+                    if policy == 'any':
+                        self.assertNotIn(None, found, (sectors, ranks, count))
+                    else:
+                        without[sectors, ranks, count] = [devices for device, devices in zip(found, shared) if device is None]
+                        self.assertEqual(without[sectors, ranks, count],
+                                         [devices for devices in shared if devices[1:] == (busy,)])
+            self.assertEqual({layout: sectors for layout, sectors in without.items() if sectors},
+                             {(4, 2, 4): [(2, 3)], (4, 1, 8): [(6, 7)], (4, 4, 2): [(0, 1)], (4, 2, 3): [(0, 1)],
+                              (8, 4, 4): [(2, 3)], (8, 2, 8): [(6, 7)], (2, 1, 4): [(2, 3)], (2, 2, 2): [(0, 1)]})
+            os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = 'any'
             # The Ritz step on real devices (test_ritz_dense) expects these devices, of a group of two, three
             # and four: a node gives it as many as it has, up to four.
             from parsec_python.acceleration.tests.test_ritz_dense import _helper_cases
@@ -608,6 +843,107 @@ class ExchangePlanTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'PARSEC_CUPY_RITZ_CONDITION_HELPER'):
                 group._capacities(_columns((3, 2)), [0, 4, 9])
             self.assertEqual((group.condition_device, group.condition_seconds), (None, 0.))
+
+    def test_the_estimate_of_a_helper_is_counted_by_the_work_array_of_its_spectrum(self):
+        count = distributed_state.condition_helper_bytes
+        # States -> doubles of the work array that cuSOLVER of CUDA 12.9 asked for the symmetric spectrum on a
+        # laptop GPU (dsyevd, values only; what cupy.linalg.eigvalsh allocates beside its copy of the matrix).
+        asked = {100: 172411, 442: 991131, 1000: 4159987, 1842: 13838763, 2978: 35885131, 3704: 55381843,
+                 4928: 97799555, 8000: 257048963, 16000: 1026064963}
+        for states, work in asked.items():
+            counted = count(states) - (64 << 20) - states * states
+            # The count holds the work array, within 2 MiB, beside the byte per entry of the finiteness test
+            # and the 64 MiB of the cuSOLVER handle of the thread.
+            self.assertEqual(counted, 8 * (4 * states * states + 128 * states + (1 << 18)))
+            self.assertGreaterEqual(counted, 8 * work, states)
+            self.assertLess(counted - 8 * work, 2 << 20, states)
+        # 348 and 501 MiB for the sectors of 23,768 and 29,576 electrons, whose helpers sampled 304 and 448 MiB
+        # more on an A100; four m x m arrays and a little for any size, and never less for more states.
+        self.assertEqual([round(count(states) / 2**20) for states in (2978, 3704)], [348, 501])
+        for states, sampled in ((2978, 304 << 20), (3704, 448 << 20)):
+            self.assertGreater(count(states), sampled)
+            self.assertGreater(sampled, .85 * count(states))
+        sizes = [count(states) for states in (0, 1, 2, 64, 442, 4928, 20000)]
+        self.assertEqual(sizes, sorted(sizes))
+        self.assertEqual(sizes[0], (64 << 20) + (2 << 20))
+
+    def test_the_device_with_the_hartree_objects_helps_only_where_the_sharing_rule_counts_the_room(self):
+        gib = 1 << 30
+        # The sector of 29,576 electrons on two devices, the second of which holds the Hartree objects (the
+        # root rank of 8 GPUs): the rule that shares the basis counts 66,534,064,304 bytes of blocks on a
+        # device, and the estimate 525,746,240.
+        rows, states = 4130510, 3704
+        blocks, estimate = 66534064304, 525746240
+        names = ('PARSEC_CUPY_RITZ_CONDITION_HELPER', 'PARSEC_CUPY_RITZ_CONDITION',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE_RANGES', 'PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_SLABS',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE')
+
+        def helper(total, devices=(2, 3), hartree_device=3, shape=(rows, states)):
+            cp, _runtime = _stand_in(total_bytes=total)
+            with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)):
+                owner = _Owner(cp, devices)
+                if hartree_device is not None:
+                    owner.hartree_device = hartree_device
+                return distributed_state.SectorDeviceGroup(owner, devices)._condition_helper(*shape)
+
+        with patch.dict(os.environ):
+            for name in names:
+                os.environ.pop(name, None)
+            self.assertEqual((distributed_state.shared_block_bytes(rows, states, 2), distributed_state.condition_helper_bytes(states)),
+                             (blocks, estimate))
+            # 0.85 of a device is the share: the device helps from 78,893,894,758 bytes on (73.5 GiB) and not
+            # one MiB below, and a device of an A100 node, 85,093,777,408 bytes, helps.
+            least = -(-(blocks + estimate) * 20 // 17)
+            self.assertEqual(least, 78893894758)
+            self.assertEqual([helper(total) for total in (least + (1 << 20), least, least - (1 << 20), 85093777408)],
+                             [3, 3, None, 3])
+            # Without the estimate the blocks alone would fit a device that is too small for both: the rule
+            # shares that basis as before, and its sector estimates on its owner as before.
+            between = least - (1 << 20)
+            self.assertGreater(.85 * between, blocks)
+            cp, _runtime = _stand_in(total_bytes=between)
+            with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)):
+                self.assertTrue(distributed_state.shared_basis_fits(rows, states, 2))
+            # Another share moves the limit with that of the rule.
+            for fraction, found in (('0.9', 3), ('0.84', None)):
+                with patch.dict(os.environ, PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION=fraction):
+                    self.assertEqual(helper(least - gib), found, fraction)
+            # A basis that is shared by name beyond its share has no room either: 0.85 of 70 GiB are less
+            # than the blocks alone.
+            self.assertEqual(helper(70 * gib), None)
+            # ``any`` named is the default, the room included: no value asks that device whatever the room,
+            # as ``any`` did while ``auto`` was the default.
+            with patch.dict(os.environ, PARSEC_CUPY_RITZ_CONDITION_HELPER='any'):
+                self.assertEqual([helper(total) for total in (least, least - (1 << 20), 70 * gib)], [3, None, None])
+            # The count is that of the step in force: two tall blocks count 123 GiB on such a device.
+            with patch.dict(os.environ, PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS='2'):
+                self.assertEqual([helper(total) for total in (85093777408, 200 * gib)], [None, 3])
+            # A device that does not hold those objects is asked without a count, as before, and the other
+            # settings ask the device that holds them on no device size.
+            self.assertEqual([helper(1, hartree_device=None), helper(1, devices=(0, 1, 2, 3)), helper(1, hartree_device=2)],
+                             [3, 1, 3])
+            for policy in ('auto', 'off'):
+                with patch.dict(os.environ, PARSEC_CUPY_RITZ_CONDITION_HELPER=policy):
+                    self.assertEqual(helper(1 << 50), None, policy)
+            # The rule that shares a basis reads none of this: it counts the same bytes under every setting.
+            counted = []
+            for policy in ('any', 'auto', 'off'):
+                with patch.dict(os.environ, PARSEC_CUPY_RITZ_CONDITION_HELPER=policy):
+                    counted.append([distributed_state.shared_block_bytes(rows, states, devices) for devices in (2, 4)])
+            self.assertEqual(counted, [counted[0]] * 3)
+            # Every size of sector, on the device of an A100 node: the device helps wherever the blocks
+            # leave it the bytes of the estimate, and nowhere else.
+            asked = 0
+            for sector_rows in (10**5, 10**6, 4130510, 6 * 10**6):
+                for columns in (64, 442, 2978, 3704, 4928, 9000):
+                    needed = distributed_state.shared_block_bytes(sector_rows, columns, 2) \
+                        + distributed_state.condition_helper_bytes(columns)
+                    found = helper(85093777408, shape=(sector_rows, columns))
+                    self.assertEqual(found, 3 if needed <= .85 * 85093777408 else None, (sector_rows, columns))
+                    asked += found == 3
+            self.assertTrue(0 < asked < 24)
 
     @patch.dict(os.environ, PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS='3')
     def test_fit_counts_three_tall_blocks_and_one_chunk_where_three_are_named(self):
@@ -796,12 +1132,22 @@ class ExchangePlanTests(unittest.TestCase):
             with patch.dict(os.environ, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(4 * gib)):
                 self.assertEqual((fits(6157900, 4928, 4), fits(6417000, 4928, 4)), (True, False))
             # Four devices share a basis of up to 249 GiB instead of 233, two of up to 125 instead of 117.
+            # The exchange buffer may follow a slab that is up to an eighth wider than a chunk, and the rule
+            # counts the 128 MiB wherever a slab of the budget is wider than a chunk outside a device: on four
+            # devices (5,570 columns fit where 5,581 did), and on two with slabs of 4 GiB (2,605 for 2,610).
+            # With the chunk named, 1 GiB as before, the rule shares what it shared.
             rows = 6 * 10**6
-            self.assertEqual([fits(rows, columns, 4) for columns in (5580, 5590)], [True, False])
+            self.assertEqual([fits(rows, columns, 4) for columns in (5570, 5580)], [True, False])
             self.assertEqual([fits(rows, columns, 2) for columns in (2790, 2800)], [True, False])
             with patch.dict(os.environ, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(4 * gib)):
-                self.assertEqual([fits(rows, columns, 4) for columns in (5220, 5230)], [True, False])
-                self.assertEqual([fits(rows, columns, 2) for columns in (2610, 2620)], [True, False])
+                self.assertEqual([fits(rows, columns, 4) for columns in (5210, 5220)], [True, False])
+                self.assertEqual([fits(rows, columns, 2) for columns in (2600, 2610)], [True, False])
+            with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib)):
+                self.assertEqual([fits(rows, columns, 4) for columns in (5580, 5590)], [True, False])
+                self.assertEqual([fits(rows, columns, 2) for columns in (2790, 2800)], [True, False])
+                with patch.dict(os.environ, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(4 * gib)):
+                    self.assertEqual([fits(rows, columns, 4) for columns in (5220, 5230)], [True, False])
+                    self.assertEqual([fits(rows, columns, 2) for columns in (2610, 2620)], [True, False])
 
     def test_slabs_of_the_step_with_one_tall_block_on_two_devices_take_2_gib_at_most(self):
         gib = 1 << 30
@@ -1352,13 +1698,26 @@ class ExchangePlanTests(unittest.TestCase):
         # chunk steps of a pass (the slab and H times it), those of them that all four devices send and those
         # of at most 8 columns, for the equal cut and for the whole rounds; then the columns of a chunk of
         # 1,500,000,000 bytes and the steps of the whole rounds with it.  The slabs of 96, 48 and 32 columns
-        # are just wider than a chunk of 1 GiB and travel as a chunk and one of 4, 5 and 1 columns; the larger
-        # chunk holds each of them.
-        def steps(rows, widths, rounds, limit):
+        # are just wider than a chunk of 1 GiB and travelled as a chunk and one of 4, 5 and 1 columns; the larger
+        # chunk holds each of them.  Last, what the way to the rows takes where no size is named: the steps
+        # of the whole rounds, and the bytes of the buffer beyond 1 GiB.  The slabs of 96, 48 and 32 columns
+        # are within an eighth of a chunk and travel whole, for 35, 116 and 13 MB more in the buffer; those
+        # of 80, 80 and 64 are 0.18, 0.31 and 0.38 GB wider and travel as before.
+        def steps(rows, widths, rounds, limit=None, buffer=None):
             edges = [rows * index // len(widths) for index in range(len(widths) + 1)]
             count = turns = small = 0
             for taken in rounds:
-                chunks = [distributed_state.exchange_chunks(last - first, rows - (edges[index + 1] - edges[index]), limit)
+                if limit is None:
+                    # The chunk of the conversion of a round, as SectorDeviceGroup._to_rows takes it: that of
+                    # its widest slab where the buffer of the step holds it, else that of the default.
+                    away = rows - min(high - low for low, high in zip(edges[:-1], edges[1:]))
+                    limit_of_round = distributed_state.exchange_chunk_limit(away * max(last - first for first, last in taken))
+                    if limit_of_round > buffer:
+                        limit_of_round = distributed_state.exchange_chunk_bytes() // 8
+                else:
+                    limit_of_round = limit
+                chunks = [distributed_state.exchange_chunks(last - first, rows - (edges[index + 1] - edges[index]),
+                                                            limit_of_round)
                           for index, (first, last) in enumerate(taken)]
                 count += 2 * max(map(len, chunks))
                 turns += 2 * min(map(len, chunks))
@@ -1372,13 +1731,14 @@ class ExchangePlanTests(unittest.TestCase):
                          'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS', 'PARSEC_CUPY_DISTRIBUTED_STATE_RANGES'):
                 os.environ.pop(name, None)
             self.assertEqual(distributed_state.exchange_chunk_bytes(), 1 << 30)
-            for rows, widths, chunk, slab, equal, whole, larger, held in (
-                    (1924792, (330, 330, 324, 330), 92, 96, (12, 12, 0), (14, 14, 6), 129, (8, 8, 0)),
-                    (2604846, (462, 462, 456, 462), 68, 80, (20, 20, 0), (22, 22, 0), 95, (12, 12, 0)),
-                    (2873400, (606, 612, 612, 601), 62, 80, (28, 28, 0), (30, 30, 0), 87, (16, 16, 0)),
-                    (3786832, (750, 744, 744, 740), 47, 64, (44, 44, 0), (46, 46, 0), 66, (24, 24, 0)),
-                    (4130510, (930, 924, 924, 926), 43, 48, (60, 60, 0), (78, 78, 38), 60, (40, 40, 0)),
-                    (5660200, (1230, 1236, 1236, 1226), 31, 32, (108, 108, 0), (154, 154, 76), 44, (78, 78, 0))):
+            for rows, widths, chunk, slab, equal, whole, larger, held, followed, beyond in (
+                    (1924792, (330, 330, 324, 330), 92, 96, (12, 12, 0), (14, 14, 6), 129, (8, 8, 0), (8, 8, 0), 34938368),
+                    (2604846, (462, 462, 456, 462), 68, 80, (20, 20, 0), (22, 22, 0), 95, (12, 12, 0), (22, 22, 0), 0),
+                    (2873400, (606, 612, 612, 601), 62, 80, (28, 28, 0), (30, 30, 0), 87, (16, 16, 0), (30, 30, 0), 0),
+                    (3786832, (750, 744, 744, 740), 47, 64, (44, 44, 0), (46, 46, 0), 66, (24, 24, 0), (46, 46, 0), 0),
+                    (4130510, (930, 924, 924, 926), 43, 48, (60, 60, 0), (78, 78, 38), 60, (40, 40, 0), (40, 40, 0), 115845248),
+                    (5660200, (1230, 1236, 1236, 1226), 31, 32, (108, 108, 0), (154, 154, 76), 44, (78, 78, 0), (78, 78, 0),
+                     13016576)):
                 away = rows - rows // 4
                 width = distributed_state.slab_columns(rows, sum(widths), 4, blocks=1)
                 former, rounds = (distributed_state.block_rounds(widths, width, multiple) for multiple in (1, 64))
@@ -1387,6 +1747,51 @@ class ExchangePlanTests(unittest.TestCase):
                 self.assertEqual((steps(rows, widths, former, (1 << 30) // 8), steps(rows, widths, rounds, (1 << 30) // 8)),
                                  (equal, whole))
                 self.assertEqual((1500000000 // 8 // away, steps(rows, widths, rounds, 1500000000 // 8)), (larger, held))
+                # No size named: one chunk per slab that is within an eighth of the default, in a buffer of
+                # its size, which the group of the step takes for the slabs that most of its rounds send.
+                def buffer_of_step():
+                    cp, _runtime = _stand_in()
+                    with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)):
+                        group = distributed_state.SectorDeviceGroup(_Owner(cp, (0, 1, 2, 3)), (0, 1, 2, 3))
+                        sent = distributed_state.followed_slabs(away, [max(last - first for first, last in taken)
+                                                                       for taken in rounds])
+                        return sent, group._capacities(_columns(widths), [rows * index // 4 for index in range(5)], sent=sent)[1]
+
+                sent, buffer = buffer_of_step()
+                self.assertEqual(sent, (slab,) if followed != whole else ())
+                self.assertEqual(steps(rows, widths, rounds, buffer=buffer), followed)
+                self.assertEqual(8 * buffer - (1 << 30), beyond)
+                self.assertEqual(beyond, 8 * away * slab - (1 << 30) if followed != whole else 0)
+                self.assertLessEqual(beyond, 1 << 27)
+                # With 1 GiB named, the steps and the buffer of before.
+                with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(1 << 30)):
+                    self.assertEqual(buffer_of_step(), ((), 1 << 27))
+                    self.assertEqual(steps(rows, widths, rounds, buffer=1 << 27), whole)
+            # The buffer follows what most rounds of a step send, not a round or two that go first.  At the
+            # default radius the sector of 39,368 electrons has 5,374,994 rows: 25 whole rounds of 48 columns,
+            # 1.44 GiB outside a device, and before them one round of 30, 36, 36 and 26, whose 36 columns are
+            # 1.08 GiB.  A buffer for that round alone would hold 83 MiB more to save two of the 104 chunk
+            # steps of a pass: it stays the chunk, and the round travels as before.
+            rows, widths = 5374994, (1230, 1236, 1236, 1226)
+            away = rows - rows // 4
+            rounds = distributed_state.block_rounds(widths, distributed_state.slab_columns(rows, sum(widths), 4, blocks=1), 64)
+            widest = [max(last - first for first, last in taken) for taken in rounds]
+            self.assertEqual((widest, 8 * away * 36 - (1 << 30)), ([36] + [48] * 25, 87257024))
+            self.assertEqual(distributed_state.exchange_chunk_limit(away * 36), away * 36)
+            self.assertEqual(distributed_state.followed_slabs(away, widest), ())
+            self.assertEqual(steps(rows, widths, rounds, buffer=1 << 27), steps(rows, widths, rounds, (1 << 30) // 8))
+            self.assertEqual((steps(rows, widths, rounds, buffer=1 << 27)[0], steps(rows, widths, rounds, buffer=away * 36)[0]),
+                             (104, 102))
+            # Half of the conversions are enough, and fewer are not; widths beyond the eighth and within a
+            # chunk count as conversions that the buffer does not serve.
+            chunk = (1 << 30) // 8
+            within, wider, narrow = chunk // away + 1, 2 * (chunk // away), 3
+            for sent, expected in (([within], (within,)), ([within, wider], (within,)), ([within, wider, wider], ()),
+                                   ([within, within + 1, narrow, wider], (within, within + 1)), ([narrow, wider], ()),
+                                   ([], ()), ([narrow, narrow, within, within, within + 1], (within, within + 1))):
+                self.assertEqual(distributed_state.followed_slabs(away, sent), expected, sent)
+            with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(1 << 30)):
+                self.assertEqual(distributed_state.followed_slabs(away, [within] * 3), ())
             # The larger chunk is 426,258,176 bytes more in the exchange buffer of a device, which the rule that
             # shares a basis counts: 0.7238 instead of 0.7188 of a device of 85,093,777,408 bytes for the basis
             # of 39,368 electrons, of which it allows 0.85.
@@ -1450,6 +1855,71 @@ class ExchangePlanTests(unittest.TestCase):
                                     self.assertEqual(mine, [whole] * ((stop - start) // whole)
                                                      + [(stop - start) % whole] * bool((stop - start) % whole))
                                 self.assertLessEqual(max(mine), max(theirs))
+
+    def test_the_overlap_of_a_row_block_takes_slabs_of_128_columns_unless_a_count_of_slabs_is_named(self):
+        width_of = distributed_state.overlap_slab_width
+        name, count, multiple = ('PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS', 'PARSEC_CUPY_RITZ_GRAM_SLABS',
+                                 'PARSEC_CUPY_RITZ_GRAM_MULTIPLE')
+
+        def pairs(columns, width):
+            # The column pairs that slabs of this width multiply: each slab by the columns from its first one on.
+            return sum((columns - start) * (min(columns, start + width) - start) for start in range(0, columns, width))
+
+        with patch.dict(os.environ):
+            for unset in (name, count, multiple):
+                os.environ.pop(unset, None)
+            # The rule reads the columns of a sector and nothing else of it: one slab up to 128 columns and slabs
+            # of 128 beyond, so that no slab but the last one of a basis is narrower.
+            same = []
+            for columns in range(1, 6001):
+                width = width_of(columns)
+                self.assertEqual(width, min(columns, 128))
+                slabs = [min(columns, start + width) - start for start in range(0, columns, width)]
+                self.assertEqual((len(slabs), set(slabs[:-1]) <= {128}, sum(slabs)), (-(-columns // 128), True, columns))
+                if width == rayleigh_ritz._gram_slab_width(columns):
+                    same.append(columns)
+            # An eighth of the columns, the former slab, is cut to 128 columns as well from 1,017 to 1,528: such
+            # a sector keeps its slabs, and with them its bits.  Below, the slabs were narrower; beyond, wider.
+            self.assertEqual(same, [1] + list(range(1017, 1529)))
+            # The sectors of the measured series, 3,480 to 39,368 electrons: their former slabs, and what the
+            # slabs of the rule and the former ones multiply of the full product.
+            series = (442, 665, 897, 1314, 1842, 2431, 2978, 3704, 4928)
+            former = [rayleigh_ritz._gram_slab_width(columns) for columns in series]
+            self.assertEqual(former, [56, 64, 64, 128, 192, 256, 320, 448, 576])
+            self.assertEqual([(round(pairs(columns, 128) / columns ** 2, 3), round(pairs(columns, width) / columns ** 2, 3))
+                              for columns, width in zip(series, former)],
+                             [(.634, .563), (.593, .547), (.571, .536), (.548, .548), (.534, .551), (.526, .551),
+                              (.521, .553), (.517, .559), (.513, .557)])
+            # (1 + width / columns) / 2 of it where the width divides the columns and less with a short last
+            # slab, so narrower slabs multiply less.
+            for columns in (1314, 2978, 4928):
+                shares = [pairs(columns, width) / columns ** 2 for width in (64, 128, 192, 256, 576)]
+                self.assertEqual(shares, sorted(shares))
+                for width, share in zip((64, 128, 192, 256, 576), shares):
+                    self.assertTrue(.5 < share <= (1 + width / columns) / 2)
+            self.assertEqual(pairs(4096, 128) / 4096 ** 2, (1 + 128 / 4096) / 2)
+            # A slab is a whole multiple like every other, and its columns can be named: narrower than 128 only so.
+            for value, widths in (('1', (128, 300)), ('64', (128, 256)), ('100', (100, 300)), ('256', (128, 256)),
+                                  ('48', (96, 288))):
+                with patch.dict(os.environ, {multiple: value}):
+                    self.assertEqual(width_of(5000), widths[0])
+                    with patch.dict(os.environ, {name: '300'}):
+                        self.assertEqual((width_of(5000), width_of(300), width_of(299)), (widths[1], 300, 299))
+            with patch.dict(os.environ, {name: '64'}):
+                self.assertEqual((width_of(5000), width_of(64), width_of(65)), (64, 64, 64))
+            # A count of slabs that is named is the cut of every route: the rule steps back whatever the columns
+            # and the width say, and the product reads the count as it did.  Eight is the cut that was.
+            for slabs in ('8', '1', '32'):
+                with patch.dict(os.environ, {count: slabs, name: '64'}):
+                    self.assertEqual({width_of(columns) for columns in (1, 100, 129, 1314, 4928)}, {None})
+            with patch.dict(os.environ, {count: '8'}):
+                self.assertEqual([rayleigh_ritz._gram_slab_width(columns) for columns in series], former)
+            # Neither is taken as it comes.
+            for bad in ('0', '-128', 'wide', '', '12.8'):
+                with patch.dict(os.environ, {name: bad}), self.assertRaisesRegex(ValueError, name):
+                    width_of(500)
+                with patch.dict(os.environ, {count: bad}), self.assertRaisesRegex(ValueError, count):
+                    width_of(500)
 
     def test_a_row_block_ends_where_no_round_writes_rows_over_columns_that_are_still_to_go(self):
         ends_of = distributed_state.SectorDeviceGroup._row_block_ends
@@ -1540,10 +2010,16 @@ class ExchangePlanTests(unittest.TestCase):
         # with two and with three.  The larger basis, 84 GiB, is shared by two devices with one block only,
         # and so by default.  The workspace of one block is 4 GiB less than that of two, on two devices as
         # on four: with slabs of 4 GiB one block counted 35.08 and 51.01 GiB on two.
+        # Those are the counts with the chunk named, 1 GiB.  Where none is named the exchange buffer may
+        # follow a slab that is up to an eighth wider than a chunk, and the rule counts 128 MiB more wherever
+        # a slab of the budget takes more than a chunk outside a device: with one block on four devices
+        # (slabs of 2 GiB, 1.5 GiB of them outside) but not on two (1 GiB outside), with two blocks on both
+        # (slabs of 4 GiB), and never with three, which send whole blocks of many chunks.
         a100, limit = 85093777408, .85 * 85093777408 / gib
         measured, _runtime = _stand_in(total_bytes=a100)
         counted = {(2873400, 2438): {2: (31.10, 61.16, 79.29), 4: (18.05, 35.06, 40.15)},
                    (3786832, 2979): {2: (47.00, 93.01, 127.07), 4: (25.99, 50.98, 64.04)}}
+        follows = {2: (0, 1, 0), 4: (1, 1, 0)}
         with patch.dict(os.environ):
             for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
                          'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES'):
@@ -1551,8 +2027,15 @@ class ExchangePlanTests(unittest.TestCase):
             os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_RANGES'] = 'fixed'
             for sector, by_devices in counted.items():
                 for devices, sizes in by_devices.items():
-                    for blocks, size in zip((None, '1', '2', '3'), (sizes[0], *sizes)):
+                    for blocks, size, more in zip((None, '1', '2', '3'), (sizes[0], *sizes),
+                                                  (follows[devices][0], *follows[devices])):
                         select(blocks)
+                        with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib)):
+                            named = distributed_state.shared_block_bytes(*sector, devices)
+                        self.assertAlmostEqual(named / gib, size, delta=.005)
+                        self.assertEqual(distributed_state.shared_block_bytes(*sector, devices) - named, more * gib // 8,
+                                         (sector, devices, blocks))
+                        size += more / 8
                         # The bytes by their name, as the rule of the state storage reads them, ...
                         self.assertAlmostEqual(distributed_state.shared_block_bytes(*sector, devices) / gib, size,
                                                delta=.005)
@@ -2301,6 +2784,108 @@ class ExchangeStandInTests(unittest.TestCase):
                     self.assertEqual(sorted(size for owner, size in asked.allocated if owner == device and size), [chunk, tall])
                     self.assertEqual(sum(owner == device for owner, _source, _stream in asked.copies), 3 * rounds)
 
+    def test_blocks_within_an_eighth_of_a_chunk_travel_whole_to_their_rows_unless_a_size_is_named(self):
+        # Where no chunk size is named, the default chunk stands for 1 GiB here.  Blocks of which up to an
+        # eighth more than a chunk leaves a device go to the rows in one chunk each, through a buffer of
+        # their size; blocks that a chunk holds, and wider ones, go as before.  The way back is cut by the
+        # default whatever the blocks are.  With the size named, both ways and the buffer are those of before.
+        rows = 257
+        for widths in ((4, 4, 4, 4), (4, 4, 4, 3), (7, 7), (5, 5, 4), (9, 0, 9, 8)):
+            count = len(widths)
+            edges = [rows * index // count for index in range(count + 1)]
+            heights = [high - low for low, high in zip(edges[:-1], edges[1:])]
+            block = (rows - min(heights)) * max(widths)
+            # The tall capacity before the room of the step with one block, and what of it lies outside a device.
+            tall = max(rows * max(widths), max(heights) * sum(widths), -(-rows * sum(widths) // count))
+            most = max(block, tall - tall // count)
+            # The least default chunk that an eighth more than which holds the block, and one element less.
+            edge = next(size for size in range(block * 8 // 9 - 2, block) if size + size // 8 >= block)
+            for default, within in ((block * 16 // 17, True), (edge, True), (edge - 1, False), (block * 16 // 19, False),
+                                    (block, False), (block * 4 // 3, False)):
+                self.assertEqual(default < block <= default + default // 8, within, (widths, default))
+
+                def chunks(limit):
+                    return [len(distributed_state.exchange_chunks(width, rows - height, limit))
+                            for width, height in zip(widths, heights)]
+
+                def sent(asked):
+                    return [sum(source == index for _device, source, _stream in asked.copies) // (count - 1)
+                            for index in range(count)]
+
+                with self.subTest(widths=widths, default=default), patch.dict(os.environ), \
+                     patch.object(distributed_state, '_EXCHANGE_CHUNK_BYTES', 8 * default):
+                    os.environ.pop('PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', None)
+                    group, to_rows, to_columns = self._round_trip(rows, widths)
+                    named, rows_named, columns_named = self._round_trip(
+                        rows, widths, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * default))
+                    # Chunks of every device on the way to the rows: one where the blocks are within the
+                    # margin, and those of the default elsewhere and with the size named.
+                    self.assertEqual(sent(rows_named), chunks(default))
+                    self.assertEqual(sent(to_rows), [int(width > 0) for width in widths] if within else chunks(default))
+                    self.assertEqual(max(chunks(default)), 1 if default >= block else 2)
+                    # The way back: the chunks of the default, with the same copies as with the size named.
+                    fetched = [sorted((device, source) for device, source, _stream in asked.copies)
+                               for asked in (to_columns, columns_named)]
+                    self.assertEqual(fetched[0], fetched[1])
+                    self.assertEqual([sum(device == index for device, _source in fetched[0]) // (count - 1)
+                                      for index in range(count)], chunks(default))
+                    # The buffer: the blocks where they travel whole, else the chunk, and never more than all
+                    # of a block outside its device.
+                    self.assertEqual(named._chunk, min(default, most))
+                    self.assertEqual(group._chunk, block if within else min(default, most))
+                    self.assertLessEqual(group._chunk, default + default // 8)
+                    self.assertEqual((group.exchange_buffer_bytes, named.exchange_buffer_bytes),
+                                     (8 * group._chunk, 8 * named._chunk))
+                    for asked, made in ((to_rows, group), (to_columns, group), (rows_named, named), (columns_named, named)):
+                        buffers = [size for device, size in asked.allocated if size == made._chunk]
+                        self.assertEqual(len(buffers), sum(width > 0 for width in widths))
+
+    def test_a_conversion_through_the_buffers_of_its_caller_sizes_none(self):
+        # A step that holds the exchange buffers over its conversions has sized them, and what they do not
+        # hold whole travels in chunks of the default.  Such a conversion sizes no buffer, on either way: the
+        # capacity of the group stays what the step made it, which is what its next pass takes.  Blocks of 4
+        # columns leave 772 elements outside a device, within an eighth of a default chunk of 700.  Through
+        # held buffers of 700 they go to the rows and back in two chunks each and the capacity stays 700; a
+        # conversion of its own sizes its buffer for them, 772, and sends them to the rows whole.
+        rows, widths, default = 257, (4, 4, 4, 4), 700
+        devices, ranges = (0, 1, 2, 3), _columns(widths)
+        host = np.random.default_rng(59).normal(size=(rows, sum(widths)))
+        cp, runtime = _stand_in()
+        with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)), patch.dict(os.environ), \
+             patch.object(distributed_state, '_EXCHANGE_CHUNK_BYTES', 8 * default):
+            os.environ.pop('PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', None)
+            group = distributed_state.SectorDeviceGroup(_Owner(cp, devices), devices)
+            edges = group.row_edges(rows)
+
+            def place(index, device):
+                block = cp.empty((rows, widths[index]), order='F')
+                np.asarray(block)[...] = host[:, ranges[index][0]:ranges[index][1]]
+                return block
+
+            def copies():
+                made = len(runtime.copies)
+                del runtime.copies[:]
+                return made
+
+            blocks = group.map(place)
+            # As a step sizes them that follows no piece.
+            self.assertEqual(group._capacities(ranges, edges, sent=())[1], default)
+            buffers = group.map(lambda index, device: group._exchange_buffer(cp, device, default))
+            row_blocks = group._to_rows(blocks, ranges, edges, keep=True, buffers=buffers)
+            # Two chunks of every device, each copied out by its three peers.
+            self.assertEqual((group._chunk, copies()), (default, 12 * 2))
+            back = group._to_columns(row_blocks, ranges, edges, buffers=buffers)
+            self.assertEqual((group._chunk, copies(), group.exchange_buffer_bytes), (default, 12 * 2, 8 * default))
+            for index in range(len(devices)):
+                np.testing.assert_array_equal(np.asarray(row_blocks[index]), host[edges[index]:edges[index + 1], :])
+                np.testing.assert_array_equal(np.asarray(back[index]), host[:, ranges[index][0]:ranges[index][1]])
+            del buffers, back
+            # Without buffers of a caller the conversion takes its own, sized for the blocks that it sends.
+            again = group._to_rows(blocks, ranges, edges, keep=True)
+            self.assertEqual((group._chunk, copies(), group.exchange_buffer_bytes), (772, 12, 8 * 772))
+            for index in range(len(devices)):
+                np.testing.assert_array_equal(np.asarray(again[index]), np.asarray(row_blocks[index]))
+
     def test_no_buffer_outlives_its_conversion_to_rows(self):
         # When map() returns, the thread of a device still refers to the function it ran last and to all that
         # this function can reach.  A buffer held that way would be missing from the pool when the next
@@ -2375,20 +2960,23 @@ class RitzStandInTests(unittest.TestCase):
              'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', 'PARSEC_CUPY_EXCHANGE_CONCURRENT', 'PARSEC_CUPY_EXCHANGE_COLUMN_COPIES',
              'PARSEC_CUPY_EXCHANGE_PAIRS', 'PARSEC_CUPY_DISTRIBUTED_STATE_SLABS', 'PARSEC_CUPY_RITZ_CONDITION_HELPER',
              'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_RITZ_GRAM_MULTIPLE',
-             'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE')
+             'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE', 'PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS')
 
     def _step(self, rows, widths, blocks, *, eager=False, unstable=False, roomy=False, hartree_device=None,
-              **environment):
+              device_bytes=0, **environment):
         """One Ritz step of a filtered basis: what went in, what came out and what the stand-in was asked.
 
         ``widths`` are those of column blocks that follow each other, or a layout.  ``blocks`` names the tall
         blocks per device; ``None`` leaves that to the default.  ``roomy`` column blocks have the capacity that
         the group gives the blocks of a trial basis; the others are as large as their columns.  The small
         problem is solved on the host unless ``environment`` names the device for it.  ``hartree_device`` is
-        the device that the sector operator names as the holder of the Hartree objects.
+        the device that the sector operator names as the holder of the Hartree objects, and ``device_bytes``
+        the memory of every device: none unless it is named, so that no rule finds room on one.  A value of
+        ``None`` in ``environment`` removes a setting of the class: the count of the slabs of a Gram product,
+        which the class names, is then left to the step.
         """
 
-        cp, runtime = _stand_in(eager)
+        cp, runtime = _stand_in(eager, device_bytes)
         layout = _layout(widths)
         devices = tuple(range(len(layout.parts)))
         states = layout.columns
@@ -2452,14 +3040,18 @@ class RitzStandInTests(unittest.TestCase):
              patch.object(distributed_state, '_device_overlap_condition', estimate), patch.dict(os.environ):
             for name in self.unset + ('PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',):
                 os.environ.pop(name, None)
-            os.environ.update(self.settings, **environment)
+            os.environ.update(self.settings, **{name: value for name, value in environment.items() if value is not None})
+            for name, value in environment.items():
+                if value is None:
+                    os.environ.pop(name, None)
             if blocks is not None:
                 os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS'] = str(blocks)
             run.sector = _Sector(cp, runtime, devices, hamiltonian)
             if hartree_device is not None:
                 run.sector.hartree_device = hartree_device
             run.group = group = distributed_state.SectorDeviceGroup(run.sector, devices)
-            run.capacity = group._capacities(layout, group.row_edges(rows))[0]
+            # Sized as a trial basis is: the blocks get their capacity and no exchange buffer is sized for them.
+            run.capacity = group._capacities(layout, group.row_edges(rows), sent=())[0]
             run.given = group.map(place)
             del runtime.allocated[:]
             runtime.peak.update(runtime.live)
@@ -2866,6 +3458,87 @@ class RitzStandInTests(unittest.TestCase):
                 with patch.dict(os.environ, PARSEC_CUPY_RITZ_GRAM_MULTIPLE=bad, PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS=blocks):
                     with self.assertRaisesRegex(ValueError, 'PARSEC_CUPY_RITZ_GRAM_MULTIPLE'):
                         group._capacities(_columns((3, 2)), [0, 4, 9])
+
+    def test_every_step_forms_its_overlap_in_slabs_of_128_columns_unless_a_count_of_slabs_is_named(self):
+        # Two devices with 157 columns: the rule cuts the overlap of a row block into a slab of 128 columns and
+        # one of 29, where an eighth of the columns, the former slab, is 20.
+        rows, widths = 257, (80, 77)
+        lower = rayleigh_ritz._lower_triangle_product
+        for blocks in (1, 2, 3):
+            with self.subTest(blocks=blocks):
+                asked = []
+
+                def recorded(left, right, *width):
+                    asked.append((left is right, int(left.shape[1]), width))
+                    return lower(left, right, *width)
+
+                # The overlap reaches the product inside its own module, the projection of three tall blocks
+                # from the step.
+                with patch.object(rayleigh_ritz, '_lower_triangle_product', recorded), \
+                     patch.object(distributed_state, '_lower_triangle_product', recorded):
+                    rule = self._step(rows, widths, blocks, PARSEC_CUPY_RITZ_GRAM_SLABS=None)
+                    overlaps = [call for call in asked if call[0]]
+                    self.assertEqual(len(asked) - len(overlaps), 2 * (blocks == 3))
+                    del asked[:]
+                    named = self._step(rows, widths, blocks)
+                # The rule names the width to the product of every row block.  With the count named, as this
+                # class names it, the product is given nothing and reads the count itself: the call that was.
+                # The projection of the step with three tall blocks is such a product too and keeps the count.
+                self.assertEqual(overlaps, [(True, 157, (128,))] * 2)
+                self.assertEqual([call for call in asked if call[0]], [(True, 157, ())] * 2)
+                self.assertEqual([call for call in asked if not call[0]], [(False, 157, ())] * 2 if blocks == 3 else [])
+                self.assertEqual((rule.group.overlap_columns, named.group.overlap_columns), (128, 20))
+                for run in (rule, named):
+                    self._assert_ritz_pairs(run)
+                # Another cut of the same lower triangle: the Ritz values agree at round-off.
+                np.testing.assert_allclose(rule.values, named.values, rtol=0, atol=1e-11)
+                if blocks != 1:
+                    # In the order of the basis: all of the first slab and nothing above the second.
+                    self.assertTrue(rule.gram[0][:128, :128].all())
+                    self.assertFalse(rule.gram[0][:128, 128:].any())
+                    self.assertFalse(named.gram[0][:20, 20:].any())
+        # Where the rule and the count cut the same slabs the two are one computation.  47 columns in slabs of
+        # 6, an eighth of them, give the Gram pair, the Ritz values and the rotated basis of the named count
+        # to the last bit: so does, by default, every sector of 1,017 to 1,528 columns, whose eighth is cut to
+        # 128.  Another width leaves the projection its bits and forms the overlap from other slabs.
+        four = (12, 12, 12, 11)
+        for blocks in (1, 2, 3):
+            with self.subTest(blocks=blocks, widths=four):
+                named = self._step(rows, four, blocks)
+                rule = self._step(rows, four, blocks, PARSEC_CUPY_RITZ_GRAM_SLABS=None,
+                                  PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS='6')
+                other = self._step(rows, four, blocks, PARSEC_CUPY_RITZ_GRAM_SLABS=None,
+                                   PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS='7')
+                self.assertEqual([run.group.overlap_columns for run in (named, rule, other)], [6, 6, 7])
+                for mine, theirs in zip((*rule.gram, rule.values, rule.rotated), (*named.gram, named.values, named.rotated)):
+                    np.testing.assert_array_equal(mine, theirs)
+                np.testing.assert_array_equal(other.gram[1], named.gram[1])
+                np.testing.assert_allclose(np.tril(other.gram[0]), np.tril(named.gram[0]), rtol=0, atol=1e-13)
+                if blocks != 1:
+                    # In the order of the basis: the seventh column lies in the first slab of 7 and above the
+                    # second slab of 6.
+                    self.assertTrue(other.gram[0][0, 6] != 0. and named.gram[0][0, 6] == 0.)
+                self._assert_ritz_pairs(other)
+        # A basis of no more columns than a slab is one slab, the full product of the row block, where the
+        # count cut eight.
+        small = self._step(rows, four, 1, PARSEC_CUPY_RITZ_GRAM_SLABS=None)
+        self._assert_ritz_pairs(small)
+        self.assertEqual(small.group.overlap_columns, 47)
+        # An overlap that is formed without slabs has none to report.
+        full = self._step(rows, widths, 1, PARSEC_CUPY_RITZ_GRAM_SLABS=None, PARSEC_CUPY_RITZ_SYRK='off')
+        self._assert_ritz_pairs(full)
+        self.assertIsNone(full.group.overlap_columns)
+        # A width that is no count of columns, and a count of slabs that is none, stop the run where the trial
+        # basis is sized, before the first filter, whichever step is named.
+        cp, _runtime = _stand_in()
+        group = distributed_state.SectorDeviceGroup(_Owner(cp, (0, 1)), (0, 1))
+        self.assertIsNone(group.overlap_columns)
+        for name in ('PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS', 'PARSEC_CUPY_RITZ_GRAM_SLABS'):
+            for bad in ('0', '-128', 'wide', ''):
+                for blocks in ('1', '2', '3'):
+                    with patch.dict(os.environ, {name: bad, 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS': blocks}):
+                        with self.assertRaisesRegex(ValueError, name):
+                            group._capacities(_columns((3, 2)), [0, 4, 9])
 
     def test_a_workspace_that_a_pass_has_outgrown_goes_back_before_the_larger_one_is_taken(self):
         # The density step leaves the pools of a shared basis as they are, so the group itself returns the
@@ -3297,6 +3970,223 @@ class RitzStandInTests(unittest.TestCase):
                                       run.gram + (run.values, run.rotated)):
                     np.testing.assert_array_equal(one, other)
 
+    def test_a_slab_within_an_eighth_of_the_default_chunk_takes_the_turns_once_and_moves_no_bit(self):
+        # The same blocks and rounds as in the test before: one column of the first device and then three
+        # rounds of four columns of each.  Where no chunk size is named, the default chunk stands for 1 GiB:
+        # 700 elements hold three columns, and the 772 of a slab of four are within an eighth of it.  The
+        # exchange buffer then has the size of the slab and every slab goes to the rows in one chunk; the way
+        # back is cut by the default as before.  With the size named, 700 elements, and with a default that
+        # the slab exceeds by more than an eighth (600), the slab is two chunks both ways and the buffer the
+        # chunk.  No bit moves, with one tall block or with two.
+        rows, widths = 257, (13, 12, 12, 12)
+        cut = dict(PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8 * rows * 5), PARSEC_CUPY_RITZ_GRAM_MULTIPLE='16')
+        away = rows - rows // 4
+        self.assertEqual((away, 4 * away, 700 + 700 // 8, 600 + 600 // 8), (193, 772, 787, 675))
+
+        def step(blocks, eager, default, **named):
+            with patch.object(distributed_state, '_EXCHANGE_CHUNK_BYTES', 8 * default):
+                return self._step(rows, widths, blocks, eager=eager, roomy=blocks == 1, **named, **cut)
+
+        def in_turns(run):
+            own = {run.group._stream(device) for device in range(4)}
+            return sum(stream in own for _device, _source, stream in run.copies)
+
+        def buffers(run):
+            return sorted((device, size) for device, size in run.allocated if size in (600, 700, 772))
+
+        for eager in (False, True):
+            with self.subTest(eager=eager):
+                followed = step(1, eager, 700)
+                named = step(1, eager, 700, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * 700))
+                wider = step(1, eager, 600)
+                whole = step(1, eager, 1 << 27)
+                self._assert_ritz_pairs(followed)
+                for run in (followed, named, wider, whole):
+                    self.assertEqual((run.group.slab_cut, run.group.slab_columns, run.group.projection_columns,
+                                      run.group.to_rows_copies, run.group.separate_row_blocks),
+                                     ('multiple', 4, 16, 'pairs', 0))
+                # Twelve copies in turns per chunk of a slab and of H times it, in the three whole rounds.
+                self.assertEqual([in_turns(run) for run in (followed, named, wider, whole)],
+                                 [12 * 2 * 3 * chunks for chunks in (1, 2, 2, 1)])
+                # All other copies: the column that goes first, which has one sender, and the way back, where
+                # every device fetches a slab from its three peers a chunk at a time.  That way is cut by the
+                # default: two chunks per slab, as with the size named.
+                self.assertEqual([len(run.copies) - in_turns(run) for run in (followed, named, wider, whole)],
+                                 [2 * 3 + 3 + 12 * 3 * chunks for chunks in (2, 2, 2, 1)])
+                # One buffer per device: the slab where it is followed, else the chunk.
+                self.assertEqual([buffers(run) for run in (followed, named, wider)],
+                                 [[(device, size) for device in range(4)] for size in (772, 700, 600)])
+                self.assertEqual([run.group.exchange_buffer_bytes for run in (followed, named, wider)],
+                                 [8 * 772, 8 * 700, 8 * 600])
+                # Nothing else differs in what a device takes or holds at most.
+                rest = [sorted(made for made in run.allocated if made[1] not in (700, 772)) for run in (followed, named)]
+                self.assertEqual(rest[0], rest[1])
+                self.assertEqual([followed.peak[device] - named.peak[device] for device in range(4)], [72] * 4)
+                # The Gram pair that the small solve was given, the Ritz values and the rotated basis: the
+                # same bits however the slabs were cut into chunks.
+                for run in (named, wider, whole):
+                    for one, other in zip(followed.gram + (followed.values, followed.rotated),
+                                          run.gram + (run.values, run.rotated)):
+                        np.testing.assert_array_equal(one, other)
+                # Two tall blocks send the blocks themselves first, 13 columns in chunks of 3, and then
+                # slabs of 4, 4 and 5 or 4 columns of H times them: the buffer follows the slabs of four.
+                two, two_named = step(2, eager, 700), step(2, eager, 700, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * 700))
+                self._assert_ritz_pairs(two)
+                self.assertEqual((two.group.slab_columns, two.group.exchange_buffer_bytes, two_named.group.exchange_buffer_bytes),
+                                 (5, 8 * 772, 8 * 700))
+                self.assertLess(len(two.copies), len(two_named.copies))
+                for one, other in zip(two.gram + (two.values, two.rotated), two_named.gram + (two_named.values, two_named.rotated)):
+                    np.testing.assert_array_equal(one, other)
+        # The buffer follows what most rounds of a step send, not a round that goes first.  Four blocks of 28
+        # columns with a multiple of 8 and slabs of at most 7: one round of 4 columns of each device, then
+        # four whole rounds of 6.  With a default chunk of 700 elements only the round of 4 (772 elements) is
+        # within an eighth: one round in five, for which the buffer stays the chunk, and every slab travels
+        # in two chunks as with the size named.  With a default of 1,100 the four rounds of 6 (1,158) are:
+        # the buffer follows them, and the round of 4 is one chunk either way.
+        widths = (28, 28, 28, 28)
+        cut = dict(PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8 * rows * 7), PARSEC_CUPY_RITZ_GRAM_MULTIPLE='8')
+        self.assertEqual([max(last - first for first, last in taken) for taken in distributed_state.block_rounds(widths, 7, 8)],
+                         [4, 6, 6, 6, 6])
+        for default, chunks, buffer in ((700, (2 + 4 * 2, 2 + 4 * 2), 700), (1100, (1 + 4, 1 + 4 * 2), 6 * away)):
+            with self.subTest(default=default):
+                followed = step(1, False, default)
+                named = step(1, False, default, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * default))
+                self._assert_ritz_pairs(followed)
+                self.assertEqual([in_turns(run) for run in (followed, named)], [12 * 2 * steps for steps in chunks])
+                self.assertEqual([run.group.exchange_buffer_bytes for run in (followed, named)], [8 * buffer, 8 * default])
+                # What the next pass takes: the same buffer.
+                self.assertEqual((followed.group._chunk, named.group._chunk), (buffer, default))
+                for one, other in zip(followed.gram + (followed.values, followed.rotated),
+                                      named.gram + (named.values, named.rotated)):
+                    np.testing.assert_array_equal(one, other)
+
+    def test_a_piece_that_the_buffer_does_not_follow_travels_in_chunks_of_the_default_in_every_pass(self):
+        # A step holds its exchange buffers over its conversions and has sized them for what most of those
+        # send: the conversions size none.  So a round, or a block, that is within an eighth of the default
+        # chunk and that the step does not follow leaves the buffer what it was for the passes after it too,
+        # where it once grew to that piece from the second pass on.  One tall block: four blocks of 28 columns
+        # in a round of 4 columns of each device (772 elements outside one) and four rounds of 6, with a
+        # default chunk of 700 elements.  Two tall blocks: blocks of 4 columns, which travel first, and their
+        # two slabs of 2.  In every one of three passes on one group each device takes one buffer of the
+        # chunk and returns nothing to the driver, and the piece of 772 elements goes in two chunks, as with
+        # the size named: the same copies and the same bits.
+        rows = 257
+        cases = (
+            # Twelve copies in turns per chunk: two chunks for the slab and for H times it of every round.
+            (1, (28, 28, 28, 28), dict(PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8 * rows * 7), PARSEC_CUPY_RITZ_GRAM_MULTIPLE='8'),
+             12 * 2 * (2 + 4 * 2)),
+            # Two chunks for the blocks and one for H times each of the two slabs.
+            (2, (4, 4, 4, 4), dict(PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8 * rows * 2)), 12 * (2 + 2)),
+        )
+        step = distributed_state.SectorDeviceGroup.ritz
+
+        def three_passes(blocks, widths, **environment):
+            """The step and two more on the basis that it returned, on one group, as the steps of an SCF make them.
+
+            Returned with the run of the last pass: per pass the Ritz values, the rotated basis, what the
+            devices took, their copies, what they returned to the driver and the record of the buffer.
+            """
+            passes = []
+
+            def ritz(group, operator, filtered, **options):
+                runtime = filtered.blocks[0].runtime
+                for _number in range(3):
+                    marks = len(runtime.allocated), len(runtime.copies), len(runtime.returned)
+                    values, filtered, whitened = step(group, operator, filtered, **options)
+                    columns = np.empty(filtered.shape)
+                    for index, block in enumerate(filtered.blocks):
+                        columns[:, _held(filtered.layout, index)] = np.asarray(block)
+                    passes.append(SimpleNamespace(
+                        values=np.array(values), rotated=columns, allocated=runtime.allocated[marks[0]:],
+                        copies=runtime.copies[marks[1]:], returned=runtime.returned[marks[2]:],
+                        buffer=group.exchange_buffer_bytes))
+                return values, filtered, whitened
+
+            with patch.object(distributed_state.SectorDeviceGroup, 'ritz', ritz), \
+                 patch.object(distributed_state, '_EXCHANGE_CHUNK_BYTES', 8 * 700):
+                return self._step(rows, widths, blocks, roomy=blocks == 1, **environment), passes
+
+        for blocks, widths, cut, in_turns in cases:
+            with self.subTest(blocks=blocks):
+                default, passes = three_passes(blocks, widths, **cut)
+                named, passes_named = three_passes(blocks, widths, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * 700), **cut)
+                for run, made in ((default, passes), (named, passes_named)):
+                    own = {run.group._stream(device) for device in range(4)}
+                    self.assertEqual((len(made), run.group.passes, run.group._chunk), (3, 3, 700))
+                    for taken in made:
+                        self.assertEqual(sorted(entry for entry in taken.allocated if entry[1] in (700, 772)),
+                                         [(device, 700) for device in range(4)])
+                        self.assertEqual((taken.returned, taken.buffer), ([], 8 * 700))
+                        self.assertEqual(sum(stream in own for _device, _source, stream in taken.copies), in_turns)
+                for one, other in zip(passes, passes_named):
+                    self.assertEqual(len(one.copies), len(other.copies))
+                    np.testing.assert_array_equal(one.values, other.values)
+                    np.testing.assert_array_equal(one.rotated, other.rotated)
+                for one, other in zip(default.gram, named.gram):
+                    np.testing.assert_array_equal(one, other)
+
+    def test_an_exchange_buffer_that_a_pass_has_outgrown_goes_back_before_the_larger_one_is_taken(self):
+        # A trim can move the cut of the slabs, and a later pass can then send a slab that the buffer is to
+        # hold whole where the passes before sent none.  The density step leaves the pools of a shared basis
+        # as they are, so a device that takes a larger buffer than it took before first returns the free
+        # blocks of the stream of its group, the smaller buffer among them, as it does for a workspace.
+        name = 'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE'
+        devices = (0, 1, 2)
+
+        def passes(*sizes, **environment):
+            """Passes whose exchange buffers have these elements: the group and what the devices returned."""
+            cp, runtime = _stand_in()
+            with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)), patch.dict(os.environ):
+                os.environ.pop(name, None)
+                os.environ.update(environment)
+                group = distributed_state.SectorDeviceGroup(_Owner(cp, devices), devices)
+                self.assertEqual(group.exchange_buffer_bytes, 0)
+                for size in sizes:
+                    taken = group.map(lambda index, device: group._exchange_buffer(cp, device, size))
+                    self.assertEqual([(array.device_id, array.size) for array in taken], [(device, size) for device in devices])
+                    # A pass gives its buffers back before the next one asks.
+                    del taken
+                return group, runtime
+
+        # A first pass, one that takes as much and one that takes less: no device returns anything.
+        group, runtime = passes(700, 700, 650)
+        self.assertEqual((runtime.returned, group.exchange_buffer_bytes), ([], 8 * 700))
+        # A pass that takes more: every device returns the free blocks of the stream of its group, once, on
+        # its own thread and before it takes the larger buffer, and the passes after it return nothing.
+        group, runtime = passes(700, 772, 772, 700)
+        self.assertEqual(sorted((device, stream is group._stream(device)) for device, stream, _taken in runtime.returned),
+                         [(device, True) for device in devices])
+        for device, _stream, taken in runtime.returned:
+            self.assertEqual(taken, [700], device)
+        self.assertEqual(group.exchange_buffer_bytes, 8 * 772)
+        # Twice outgrown, twice returned.
+        group, runtime = passes(700, 772, 780)
+        self.assertEqual([len([entry for entry in runtime.returned if entry[0] == device]) for device in devices], [2] * 3)
+        # A device that sent nothing before has no buffer to return.
+        group, runtime = passes(0, 700, 0, 700)
+        self.assertEqual(runtime.returned, [])
+        # Where the density step empties the pools as before, the group returns nothing.
+        group, runtime = passes(700, 772, 780, **{name: '1'})
+        self.assertEqual((runtime.returned, group.exchange_buffer_bytes), ([], 8 * 780))
+        # Every step takes its buffers that way: one per device with one and with two tall blocks, held
+        # over the conversions of the step, and one per device and conversion with three.  A group that has
+        # taken buffers of one size returns nothing.
+        taken = []
+        buffer = distributed_state.SectorDeviceGroup._exchange_buffer
+
+        def recorded(group, cp, device, elements):
+            taken.append((device, elements))
+            return buffer(group, cp, device, elements)
+
+        with patch.object(distributed_state.SectorDeviceGroup, '_exchange_buffer', recorded):
+            for blocks, conversions in ((1, 1), (2, 1), (3, 3)):
+                del taken[:]
+                run = self._step(257, (12, 11), blocks, roomy=blocks == 1)
+                self._assert_ritz_pairs(run)
+                self.assertEqual(sorted(taken), sorted([(0, run.group._chunk), (1, run.group._chunk)] * conversions))
+                self.assertEqual(run.runtime.returned, [])
+                self.assertEqual(run.group.exchange_buffer_bytes, 8 * run.group._chunk)
+
     def test_one_tall_block_and_the_slab_workspace_are_the_peak(self):
         rows, widths = 4097, (8, 8, 8, 8)
         # Slabs of one column and exchange chunks of at most 3073 elements, the rows of one column outside a
@@ -3546,17 +4436,26 @@ class RitzStandInTests(unittest.TestCase):
                     # Nothing of the step depends on where the number was estimated.
                     np.testing.assert_array_equal(beside.values, off.values)
                     np.testing.assert_array_equal(beside.rotated, off.rotated)
-            # The device that holds the Hartree objects is passed over.  A sector that has no other keeps the
-            # estimate on its owner, unless the setting says that this device may be asked too.
+            # The device that holds the Hartree objects is passed over where the sector has another.  A sector
+            # that has no other asks it, by default and where the setting says ``any``, if the rule that
+            # shares a basis counts the room for the estimate on it; with ``auto``, the default before, and on
+            # a device without that room the estimate stays on the owner.  No bit depends on it.
             with self.subTest(rows=rows, layout=layout.parts, hartree_device=1):
-                passed = self._step(rows, widths, 1, roomy=True, hartree_device=1, **device)
+                room = dict(device_bytes=1 << 30)
+                passed = self._step(rows, widths, 1, roomy=True, hartree_device=1, **device, **room,
+                                    PARSEC_CUPY_RITZ_CONDITION_HELPER='auto')
                 self.assertEqual(passed.group.condition_device, 2 if count > 2 else 0)
                 self.assertEqual([estimate[0] for estimate in passed.estimates], [2] if count > 2 else [])
-                asked = self._step(rows, widths, 1, roomy=True, hartree_device=1, **device,
-                                   PARSEC_CUPY_RITZ_CONDITION_HELPER='any')
-                self.assertEqual((asked.group.condition_device, [estimate[0] for estimate in asked.estimates]),
-                                 (2, [2]) if count > 2 else (1, [1]))
-                np.testing.assert_array_equal(asked.rotated, passed.rotated)
+                for named in ({}, dict(PARSEC_CUPY_RITZ_CONDITION_HELPER='any')):
+                    asked = self._step(rows, widths, 1, roomy=True, hartree_device=1, **device, **room, **named)
+                    self.assertEqual((asked.group.condition_device, [estimate[0] for estimate in asked.estimates]),
+                                     (2, [2]) if count > 2 else (1, [1]))
+                    np.testing.assert_array_equal(asked.rotated, passed.rotated)
+                    np.testing.assert_array_equal(asked.values, passed.values)
+                    full = self._step(rows, widths, 1, roomy=True, hartree_device=1, **device, **named)
+                    self.assertEqual((full.group.condition_device, [estimate[0] for estimate in full.estimates]),
+                                     (2, [2]) if count > 2 else (0, []))
+                    np.testing.assert_array_equal(full.rotated, passed.rotated)
             # A solve that fails its audit has waited for the helper, which holds nothing afterwards.
             with self.subTest(rows=rows, layout=layout.parts, unstable=True):
                 run = self._step(rows, widths, 1, unstable=True, roomy=True, **device)

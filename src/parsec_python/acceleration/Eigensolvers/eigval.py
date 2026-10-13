@@ -33,6 +33,7 @@ from .subspace import (
     run_subspace_filter,
 )
 from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
+from .spill_buffers import SpillBuffer, copies_directly
 
 
 SolverPath = Literal["chebff", "chebdav", "subspace"]
@@ -175,7 +176,25 @@ class CuPyEigvalSolver:
 
         self._state = None
 
-    def offload_state_to_host(self) -> CuPyEigvalDeviceState | None:
+    def start_new_scf_loop(self) -> CuPyEigvalDeviceState | None:
+        """Mark the saved subspace as the start of another SCF loop.
+
+        ``parsec.F90`` sets ``solver%firstfilt`` again after every SCF loop,
+        so that the first SUBSPACE pass for the next structure takes its
+        lower filter bound from the saved Ritz values.  The subspace itself
+        is kept.  Returns the state to hand to that loop.
+        """
+
+        state = self._state
+        if state is not None and not state.subspace.first_filter:
+            self._state = replace(
+                state, subspace=replace(state.subspace, first_filter=True)
+            )
+        return self._state
+
+    def offload_state_to_host(
+        self, buffer: SpillBuffer | None = None
+    ) -> CuPyEigvalDeviceState | None:
         """Move the persistent Ritz state to exact FP64 host storage.
 
         This is a memory-capacity policy used by the symmetry scheduler for
@@ -186,6 +205,16 @@ class CuPyEigvalSolver:
         several devices share stays on them.  The vectors are downloaded in
         the order they have on the device (:func:`spill_download_order`),
         so that the download takes no second array there.
+
+        With ``buffer``, the host buffer that the sector keeps
+        (:class:`spill_buffers.SpillBuffer`), the host array of the state
+        is a view of it, which holds the vectors until the next download
+        of this solver.  A Fortran-ordered matrix of doubles is written
+        into it by one copy.  Vectors of another layout, as the Ritz step
+        of a small sector leaves them, are downloaded by the former call,
+        which may copy them on their device first, and laid into the
+        buffer in Fortran order.  Without a buffer the download is the
+        former one, into new arrays.
         """
 
         state = self._state
@@ -195,22 +224,36 @@ class CuPyEigvalSolver:
         saved = state.subspace
         if not isinstance(saved.vectors, cp.ndarray):
             return state
+        eigenvalues = np.ascontiguousarray(
+            cp.asnumpy(saved.eigenvalues), dtype=np.float64
+        )
+        if buffer is not None and copies_directly(saved.vectors):
+            vectors = buffer.download(cp, saved.vectors)
+        else:
+            downloaded = cp.asnumpy(saved.vectors, order=spill_download_order())
+            if buffer is not None and downloaded.ndim == 2 and downloaded.size:
+                vectors = buffer.store(cp, downloaded)
+            else:
+                vectors = np.asfortranarray(downloaded, dtype=np.float64)
         host_subspace = replace(
             saved,
-            eigenvalues=np.ascontiguousarray(
-                cp.asnumpy(saved.eigenvalues), dtype=np.float64
-            ),
-            vectors=np.asfortranarray(
-                cp.asnumpy(saved.vectors, order=spill_download_order()),
-                dtype=np.float64,
-            ),
+            eigenvalues=eigenvalues,
+            vectors=vectors,
             ritz_workspace=None,
         )
         self._state = replace(state, subspace=host_subspace)
         return self._state
 
-    def restore_state_to_device(self) -> CuPyEigvalDeviceState | None:
-        """Upload a previously host-spilled Ritz state to the active CUDA device."""
+    def restore_state_to_device(
+        self, buffer: SpillBuffer | None = None
+    ) -> CuPyEigvalDeviceState | None:
+        """Upload a previously host-spilled Ritz state to the active CUDA device.
+
+        With ``buffer`` the vectors go to the device by one copy from where
+        they lie (:func:`spill_buffers.upload`); without one, and for
+        vectors that are no Fortran-ordered matrix of doubles, through a
+        staging block of CuPy's pinned pool, as before.
+        """
 
         state = self._state
         if state is None:
@@ -221,12 +264,15 @@ class CuPyEigvalSolver:
         # moves a single device array only.
         if isinstance(saved.vectors, (cp.ndarray, DistributedBasis)):
             return state
+        eigenvalues = cp.asarray(saved.eigenvalues, dtype=cp.float64)
+        if buffer is not None and copies_directly(saved.vectors):
+            vectors = buffer.upload(cp, saved.vectors)
+        else:
+            vectors = cp.asarray(saved.vectors, dtype=cp.float64, order="F")
         device_subspace = replace(
             saved,
-            eigenvalues=cp.asarray(saved.eigenvalues, dtype=cp.float64),
-            vectors=cp.asarray(
-                saved.vectors, dtype=cp.float64, order="F"
-            ),
+            eigenvalues=eigenvalues,
+            vectors=vectors,
             ritz_workspace=None,
         )
         self._state = replace(state, subspace=device_subspace)

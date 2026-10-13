@@ -2,23 +2,48 @@
 
 Regular tiles store one neighbor offset/code per slot. Other tiles retain
 every original index/code. Slot order, FP64 coefficients and fused operations
-are inherited unchanged from the production stencil. By default a symmetry
-sector that one device filters is packed from the size where complete
-calculations ran faster (see :func:`implicit_tile_for_sector`).  A sector
-that several devices filter is packed once, by its owner: the others upload
-the arrays the owner holds (:class:`PackedTileHostMetadata`).
+are inherited unchanged from the production stencil. By default the stencil
+of a symmetry sector is packed where the filter work of the run repays the
+packing (see :func:`tiles_repay_packing` and
+:func:`implicit_tile_for_sector`).  A sector that several devices filter is
+packed once, by its owner: the others upload the arrays the owner holds
+(:class:`PackedTileHostMetadata`).
 """
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from math import isqrt
 import os
 from threading import Lock
+from typing import Callable
 import numpy as np
 
 _CACHE = {}
 _LOCK = Lock()
 _MISSING = np.iinfo(np.int32).min
 _TILES = (16, 32, 64, 128, 256)
+# What ``auto`` weighs for a sector (:func:`tiles_repay_packing`), measured in
+# first calculations on A100 nodes with four packing threads.  Seconds of the
+# host per row of a stencil it packs: the set-up of the sector operators of a
+# rank grew by 63 to 67 ns per row where it packed two or four stencils of
+# 620,736 and 1,031,322 rows, and by less elsewhere.  That timer does not
+# hold all the tiles cost before the SCF: the wall time there grew by 46 ns
+# per row of the four stencils of a rank on 4 GPUs and by 118 to 131 ns per
+# row of the two of a rank on 8, two runs of each.  The constant is that of
+# a sector alone on its device; for the shared sectors of 8 GPUs it is 53 to
+# 59% of what was measured (``GPU_COMPACT_OPTIMIZATION.md``, where the
+# counted saving is low as well and the two are set against each other).
+# Seconds a device saves
+# per row, column and Hamiltonian application of its filter, for every unit of
+# the share of the rows that lie in regular tiles above the share at which
+# the tiles save nothing: 4.7, 5.9 and 7.1 ps at shares of 0.666, 0.705 and
+# 0.755 (677,542, 1,031,322 and 1,924,792 rows) lie on that line to 0.15 ps.
+PACKING_SECONDS_PER_ROW = 70.0e-9
+SAVED_SECONDS_PER_UPDATE = 28.0e-12
+REGULAR_SHARE_WITHOUT_GAIN = 0.50
+# SCF steps after the first whose filter is counted for a run, and the tiles
+# from which the share of regular ones is taken.
+COUNTED_LATER_STEPS = 8
+REGULAR_SHARE_SAMPLE = 1024
 
 
 def implicit_tile_setting():
@@ -42,51 +67,201 @@ def implicit_tile_setting():
     return tile
 
 
-def implicit_tile_for_sector(rows, device_count, float32_filter=False, sectors_on_device=1):
+def counted_filter_applications(eigensolver, max_iterations):
+    """Return the Hamiltonian applications per column that a run is counted to filter with.
+
+    ``eigensolver`` holds the eigensolver settings of the input and
+    ``max_iterations`` the SCF steps it allows.  What the input fixes is
+    counted in full: the first solve of CHEBFF filters every column
+    ``first_filter_cycles`` times at ``first_filter_degree``.  CHEBDAV, which
+    filters until its residuals are met, counts as one pass at that degree and
+    a first solve without a filter as none.  How many steps follow is not
+    known before they are made.  ``COUNTED_LATER_STEPS`` of them are counted,
+    or as many as the input allows if it allows fewer, each at the lowest
+    degree the later filter falls to (``max(10, filter_degree_delta + 1)``,
+    or ``filter_degree`` below that).  No first calculation on record
+    converged in fewer than ten steps (hydrogen-terminated clusters of 3,480
+    to 39,368 electrons: 10 or 11; ten systems of other species: 15 or 16),
+    and the later filters of the clusters ran at degrees of 10 to 15.
+    """
+    method = getattr(eigensolver, "method", "chebff")
+    degree = int(eigensolver.first_filter_degree)
+    first = (
+        int(eigensolver.first_filter_cycles) * degree
+        if method == "chebff"
+        else degree if method == "chebdav" else 0
+    )
+    lowest = min(
+        int(eigensolver.filter_degree),
+        max(10, int(eigensolver.filter_degree_delta) + 1),
+    )
+    later = min(COUNTED_LATER_STEPS, max(0, int(max_iterations) - 1))
+    return first + later * lowest
+
+
+def regular_tile_share(metadata, tile=16, sample=REGULAR_SHARE_SAMPLE):
+    """Return the share of the rows of a slot-major stencil that affine tiles would hold.
+
+    A tile is affine where :func:`pack_affine_tiles` finds it so: every slot
+    has its neighbour in all rows of the tile or in none, at one offset from
+    the row and with one coefficient.  Up to ``sample`` tiles, spread evenly
+    over the rows, are looked at; a stencil with no more tiles than that
+    gets the share its packing reports (``regular_rows`` over ``rows``).  The
+    tiles are the same for every run of a stencil, so the share is too.
+    1,024 of them took 3 to 7 ms on the host of a laptop for stencils of
+    105,126 to 5.66 million rows, and gave the share of all tiles to 0.01
+    for the four sectors that were compared, all of one family of grids:
+    0.443, 0.564, 0.650 and 0.672 against 0.441, 0.571, 0.657 and 0.666 at
+    105,126, 280,790, 620,736 and 677,542 rows.  That is no bound.  Where
+    the tiles are regular or not independently of one another the sample has
+    the error of its size, 0.015 at a share of two thirds (0.014 to 0.016
+    in the root mean square over 40 such stencils at each of five sizes,
+    0.041 at most): a rule whose two sides lie within about a tenth of each
+    other is decided by the sample.
+    """
+    if tile not in _TILES:
+        raise ValueError("implicit tile must be 16, 32, 64, 128, or 256")
+    neighbors, codes = metadata.neighbors, metadata.coefficient_codes
+    slots, rows = neighbors.shape
+    # A last tile that is not full is never affine.
+    whole = rows // tile
+    if not whole:
+        return 0.0
+    if whole <= int(sample):
+        picked = np.arange(whole, dtype=np.int64)
+    else:
+        picked = np.unique(
+            np.rint(np.linspace(0, whole - 1, int(sample))).astype(np.int64)
+        )
+    # The rows of the tiles that are looked at, read out of the arrays as
+    # they are: nothing of the size of the stencil is copied.
+    at = (picked[:, None] * tile + np.arange(tile, dtype=np.int64)).ravel()
+    nn = neighbors[:, at].reshape(slots, -1, tile)
+    cc = codes[:, at].reshape(slots, -1, tile)
+    there = nn >= 0
+    delta = nn - at.astype(np.int32).reshape(1, -1, tile)
+    same = (delta == delta[:, :, :1]) & (cc == cc[:, :, :1])
+    same |= ~there
+    same &= there == there[:, :, :1]
+    regular = int(np.count_nonzero(same.all(axis=(0, 2))))
+    # In integers, so that the share of all tiles is the quotient of the
+    # packer's own counts.
+    return regular * whole * tile / (int(picked.size) * int(rows))
+
+
+def tiles_repay_packing(columns, applications, devices, regular_share):
+    """Whether the tiles of a sector save a run more seconds than their packing takes.
+
+    The host packs a stencil once, in seconds proportional to its rows.  A
+    device saves with the tiles, in every row, column and Hamiltonian
+    application of its filter, the index reads of the rows that lie in
+    regular tiles and pays a descriptor read in all of them: the saving is
+    proportional to the share of regular rows above the share at which the
+    two cancel.  The devices of a process work side by side while its host
+    packs one stencil after another, so a second saved on a device is a
+    second of the run only if every one of them saves it: the packing of a
+    row is held against the saving of that row on all ``devices``.  The rows
+    cancel:
+
+    ``SAVED_SECONDS_PER_UPDATE * (regular_share - REGULAR_SHARE_WITHOUT_GAIN)
+    * columns * applications >= PACKING_SECONDS_PER_ROW * devices``
+
+    ``columns`` are the vectors of the basis of the sector, ``applications``
+    those of :func:`counted_filter_applications`, ``devices`` the devices of
+    the process, and ``regular_share`` the share of
+    :func:`regular_tile_share` or a callable that returns it; it is asked
+    for only where the columns could repay a stencil of regular tiles alone.
+
+    A sector with few states gets no tiles at any number of rows, and one
+    of many states gets none either where half of its rows or more lie in
+    tiles that are not regular, as in a sector of few rows.  The three
+    constants were measured on A100 nodes and on no other device or host;
+    ``PARSEC_CUPY_IMPLICIT_TILE=0`` is the setting for a device whose tile
+    kernels do not gain.
+    """
+    work = int(columns) * int(applications)
+    cost = PACKING_SECONDS_PER_ROW * max(1, int(devices))
+    if SAVED_SECONDS_PER_UPDATE * (1.0 - REGULAR_SHARE_WITHOUT_GAIN) * work < cost:
+        return False
+    share = float(regular_share() if callable(regular_share) else regular_share)
+    return (
+        SAVED_SECONDS_PER_UPDATE * (share - REGULAR_SHARE_WITHOUT_GAIN) * work >= cost
+    )
+
+
+@dataclass(frozen=True)
+class FilterPlan:
+    """What an input fixes of the filter work of a run, before its sectors are known.
+
+    ``states`` are the eigenpairs the SCF asks for, ``buffer`` the working
+    vectors of a subspace beside its share of them, and ``applications``
+    those of :func:`counted_filter_applications`.
+    """
+
+    states: int
+    buffer: int
+    applications: int
+
+
+@dataclass(frozen=True)
+class FilterWork:
+    """The filter work of a run in one sector, as :func:`tiles_repay_packing` reads it."""
+
+    columns: int
+    applications: int
+    devices: int
+    regular_share: "float | Callable[[], float]"
+
+    def repays_packing(self) -> bool:
+        return tiles_repay_packing(
+            self.columns, self.applications, self.devices, self.regular_share
+        )
+
+
+def implicit_tile_for_sector(
+    rows, device_count, float32_filter=False, sectors_on_device=1, work=None
+):
     """Return the tile size for the stencil of one symmetry sector; 0 packs none.
 
     An explicit ``PARSEC_CUPY_IMPLICIT_TILE`` is returned as it is.  ``auto``
-    packs tiles of 16 rows where they were measured to pay and are supported:
+    packs tiles of 16 rows where ``float32_filter`` is false (the opt-in FP32
+    recurrence does not read tiles, and an explicit request for it outranks
+    this default) and
 
-    * ``device_count``, the devices that filter the basis of the sector, is
-      one.  A basis shared among devices, and a filter spread over them, have
-      a row count of their own (:func:`implicit_tile_for_group`).
-    * The sector has at least ``PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS`` rows,
-      650,000 by default.  With four sectors on four A100 the program
-      took 22.0 s slot-major and 21.4 s with tiles at 1,031,322 rows, and
-      12.6 against 12.2 s at 677,542, the smallest sector that was run:
-      the filter took 8.6% and 6.7% fewer seconds, the host packing 0.1
-      to 0.3 s before the SCF.  See ``GPU_COMPACT_OPTIMIZATION.md``.
-    * That limit is for a device that filters this sector alone.  Where it
-      filters ``sectors_on_device`` of them one after another, the limit is
-      divided by the square root of that number: 459,620 rows for two
-      sectors, 325,000 for four.  The stencils are packed once, on the
-      host, while the filter seconds that a device saves add up over its
-      sectors (64.1 to 60.0 s and 29.8 to 28.4 s for the same two sizes
-      with four sectors on one device); a smaller sector saves less than
-      in proportion (fewer states, and 61.2% of its rows in regular tiles
-      at 407,478 rows against 66.6% at 677,542), so the limit falls more
-      slowly than the number of sectors grows.  No sector below 677,542
-      rows was run with tiles: the two lower limits are derived.  More than
-      four sectors count as four: a process that solves more of them packs
-      more stencils as well, and none was run.
-    * ``float32_filter`` is false: the opt-in FP32 recurrence does not read
-      tiles, and an explicit request for it outranks this default.
+    * ``work``, the filter work of the run in this sector
+      (:class:`FilterWork`), repays the packing
+      (:func:`tiles_repay_packing`).  That is the rule of every sector,
+      whatever the number of devices that filter its basis, where the
+      environment names no row limit for it.
+    * ``PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS`` is set and the sector, whose
+      basis one device filters (``device_count`` of one), has at least that
+      many rows.  The limit is for a device that filters this sector alone.
+      Where it filters ``sectors_on_device`` of them one after another, the
+      limit is divided by the square root of that number, of four at most.
+      ``650000`` is the limit that was the default before the rule: 459,620
+      rows for two sectors on a device, 325,000 for four.
+    * ``PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS`` is set and the sector,
+      whose basis or filter several devices share, has at least that many
+      rows (:func:`implicit_tile_for_group`); ``1100000`` was the default.
 
-    The limits were measured on A100 alone, with one device for the basis
-    of a sector.  A device whose tile kernels do not gain pays the packing
-    for nothing (an RTX 5070 Laptop gained nothing from 274,784 to
-    1,031,322 rows); ``PARSEC_CUPY_IMPLICIT_TILE=0`` keeps the slot-major
-    stencil there.
+    The two variables at those values give every sector the choice it had
+    before the rule.  A caller that gives no ``work`` gets the limits too,
+    at those values where the variables are unset; the solver of the drivers
+    gives it.  See ``GPU_COMPACT_OPTIMIZATION.md`` for the runs behind the
+    rule and behind the limits.
     """
     if int(device_count) != 1:
-        return implicit_tile_for_group(rows, float32_filter)
+        return implicit_tile_for_group(rows, float32_filter, work)
     tile = implicit_tile_setting()
     if tile is not None:
         return tile
-    raw = os.environ.get("PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS", "650000").strip()
+    raw = os.environ.get("PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS")
+    if raw is None:
+        if work is not None:
+            return 16 if not float32_filter and work.repays_packing() else 0
+        raw = "650000"
     try:
-        minimum_rows = int(raw)
+        minimum_rows = int(raw.strip())
     except ValueError as error:
         raise ValueError(
             "PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS must be an integer"
@@ -102,40 +277,41 @@ def implicit_tile_for_sector(rows, device_count, float32_filter=False, sectors_o
     return 16
 
 
-def implicit_tile_for_group(rows, float32_filter=False):
+def implicit_tile_for_group(rows, float32_filter=False, work=None):
     """Return the tile size for a sector whose basis or filter several devices share.
 
     The owner of the sector packs, and the other devices read the arrays it
     packed (:class:`PackedTileHostMetadata`): the group has one layout.  An
     explicit ``PARSEC_CUPY_IMPLICIT_TILE`` is returned as it is.  ``auto``
-    packs tiles of 16 rows for a sector of at least
-    ``PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS`` rows, 1,100,000 by default,
-    that is not to hold the FP32 recurrence.
+    packs tiles of 16 rows for a sector that is not to hold the FP32
+    recurrence and whose filter work repays the packing (``work``, see
+    :func:`implicit_tile_for_sector`), or, where
+    ``PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS`` is set, that has at least
+    that many rows.
 
-    That row count is assumed, not measured against others; complete
-    calculations with a tiled group have run on 8 and 16 A100 GPUs since.
-    It was the limit of a sector on one device until the runs on
-    one, two and four devices lowered that
-    (:func:`implicit_tile_for_sector`), and it has a setting of its own so
-    that the limit of one device, ``PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS``,
-    moves without it: the sectors of 677,542 and 1,031,322 rows, which one
-    device now reads in tiles, were run slot-major only where a group
-    shares them.  On one device per sector the tiles saved 6.6% of the filter
-    seconds at 677,542 rows, 8.6% at 1,031,322, 10.6% at 1,924,792 and 11.5%
-    at 2,873,400, and packing took 0.02 to 0.07 s per sector.  A group of
-    ``d`` devices filters a sector in a ``d``-th of the time and packs it
-    once, so those shares of its slot-major filter seconds would be 0.4 s at
-    1,194,720 rows on 16 GPUs and 0.1 to 0.5 s at the two sizes below the
-    row count, on 16 and 8 GPUs.  A run with a lower setting, or with a
-    named tile size, against the default shows whether a group gains there.
-    See ``GPU_COMPACT_OPTIMIZATION.md``.
+    ``1100000`` was the default of that variable before the rule, a row
+    count that had been assumed and not measured against others.  Shared
+    sectors below it have run with tiles on A100 nodes since: at 677,542,
+    1,031,322 and 1,094,788 rows the filter of a sector took 7 to 10% fewer
+    seconds on 8 and on 16 GPUs (2.66 to 2.47 s and 1.40 to 1.31 s, 5.83 to
+    5.32 and 2.97 to 2.71, 8.38 to 7.65 and 4.29 to 3.92), the set-up of the
+    sector operators of a rank at most 0.15 s more, and the total energies
+    were the same to the last bit.  The wall time before the SCF grew by
+    more than that set-up shows, 0.18 to 0.26 s on 8 GPUs, which leaves the
+    677,542-row sectors next to no gain there; on 16 GPUs it could not be
+    read.  See ``GPU_COMPACT_OPTIMIZATION.md``.
     """
     tile = implicit_tile_setting()
     if tile is not None:
         return tile
     name = "PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS"
+    raw = os.environ.get(name)
+    if raw is None:
+        if work is not None:
+            return 16 if not float32_filter and work.repays_packing() else 0
+        raw = "1100000"
     try:
-        minimum_rows = int(os.environ.get(name, "1100000").strip())
+        minimum_rows = int(raw.strip())
     except ValueError as error:
         raise ValueError(f"{name} must be an integer") from error
     if minimum_rows < 1:

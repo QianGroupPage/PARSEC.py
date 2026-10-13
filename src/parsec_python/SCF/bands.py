@@ -40,6 +40,7 @@ from ..Eigensolvers import solve_eigval
 from ..Grid import band_path_kpoints, explicit_kpoints
 from ..Hamiltonian.kpoint_operator import KPointKohnShamHamiltonian
 from ..models import BandStructureResult, BandStructureSettings
+from ..Parallel import make_pool
 from .kpoints_soc import _eigval_settings, _k_point_operators, _spinor_hamiltonian
 
 MODES = ("scalar", "spin_polarized", "soc", "soc_spin_polarized", "noncollinear")
@@ -161,18 +162,33 @@ def run_band_structure(
     potentials: dict[str, np.ndarray],
     fermi_level: float,
     number_of_states: int,
-    callback: Callable[[int, int, np.ndarray, float], None] | None = None,
+    callback: Callable[[int, int, np.ndarray, float, int], None] | None = None,
     residual_tolerance: float = 2.0e-2,
     max_attempts: int = 5,
+    workers: int | str | None = None,
+    pool_kind: str | None = None,
+    backend: str | None = None,
 ) -> BandStructureResult:
     """Diagonalize the SCF Hamiltonian along ``settings``' path.
 
     ``potentials`` are the converged local potentials (:func:`band_potentials`),
     ``number_of_states`` the number of bands reported per k-point (and per
-    spin channel).  ``callback(k_index, n_kpoints, eigenvalues, residual)`` is
-    called after each k-point.  ``residual_tolerance`` [Ry] and ``max_attempts``
+    spin channel).  ``callback(k_index, n_kpoints, eigenvalues, residual,
+    attempts)`` is called as each k-point finishes (in completion order when
+    several workers run).  ``residual_tolerance`` [Ry] and ``max_attempts``
     control the CHEBDAV re-solve described in the module docstring (a CHEBFF
     first solver is never retried).
+
+    The k-points of the path are independent, so they are spread over
+    ``workers`` worker processes (``None``: ``PARSEC_KPOINT_WORKERS``, default
+    automatic; see :mod:`parsec_python.Parallel`).  ``pool_kind`` is
+    ``"process"`` (default, or ``PARSEC_KPOINT_POOL``) or ``"thread"``.
+    ``backend`` (or ``PARSEC_KPOINT_BACKEND``) selects ``cpu`` (default),
+    ``cupy`` (one worker thread per CUDA device; the Hamiltonian and the
+    Chebyshev filter run on the GPU), ``auto`` or ``numpy-device`` (the device
+    code on the host).
+    Each k-point is the same computation whatever the worker count, so the
+    bands do not depend on it.
     """
 
     if mode not in MODES:
@@ -254,25 +270,80 @@ def run_band_structure(
         return values, vectors, float(np.max(np.linalg.norm(residual, axis=0)))
 
     can_retry = eigval_settings.initial_method == "chebdav"
-    for index, k_point in enumerate(k_points):
-        worst = 0.0
+
+    def solve_point(k_point, converter=None):
+        """Bands of one k-point (all channels) with the CHEBDAV re-solve."""
+        point_values = np.zeros((len(channels), number_of_states))
+        point_residuals = np.zeros(len(channels))
+        point_attempts = np.ones(len(channels), dtype=int)
+        point_sigma = np.zeros((number_of_states, 3)) if spinor else None
         for channel, hamiltonian in enumerate(hamiltonians(k_point)):
-            operator = hamiltonian.as_linear_operator()
+            operator = (
+                converter.operator(hamiltonian).as_linear_operator()
+                if converter is not None
+                else hamiltonian.as_linear_operator()
+            )
             best = None
             for attempt in range(max_attempts if can_retry else 1):
                 trial = solve(operator, attempt)
-                attempts[channel, index] = attempt + 1
+                point_attempts[channel] = attempt + 1
                 if best is None or trial[2] < best[2]:
                     best = trial
                 if trial[2] <= residual_tolerance:
                     break
-            values, vectors, residuals[channel, index] = best
-            eigenvalues[channel, index] = values
+            values, vectors, point_residuals[channel] = best
+            point_values[channel] = values
             if spinor:
-                sigma[0, index] = spin_expectation(vectors)
-            worst = max(worst, residuals[channel, index])
-        if callback is not None:
-            callback(index, n_k, eigenvalues[:, index], worst)
+                point_sigma = spin_expectation(vectors)
+        return point_values, point_residuals, point_attempts, point_sigma
+
+    import os
+
+    from ..Parallel import WORKERS_ENV
+    from .kpoint_parallel import device_worker_count, resolve_backend
+
+    plan = resolve_backend(backend)
+
+    class _BandWorker:
+        def __init__(self, tasks, index):
+            self.tasks = tasks
+            # Built in the worker (thread) so the device is current for it.
+            self.converter = plan.converter(index) if plan is not None else None
+
+        def solve_k(self):
+            for k_index in self.tasks:
+                yield k_index, solve_point(k_points[k_index], self.converter)
+
+    kind = pool_kind or os.environ.get("PARSEC_KPOINT_POOL", "process")
+    if plan is not None:
+        kind = plan.pool_kind
+        workers = device_worker_count(plan, n_k)
+    if kind == "thread" and not isinstance(workers, int):
+        requested = os.environ.get(WORKERS_ENV, "1")
+        workers = int(requested) if requested.strip().isdigit() else 1
+    with make_pool(
+        range(n_k),
+        _BandWorker,
+        workers=workers,
+        kind=kind,
+        problem_size=system.grid.size,
+    ) as pool:
+        for k_index, (values, point_residuals, point_attempts, point_sigma) in pool.stream(
+            "solve_k"
+        ):
+            eigenvalues[:, k_index] = values
+            residuals[:, k_index] = point_residuals
+            attempts[:, k_index] = point_attempts
+            if spinor:
+                sigma[0, k_index] = point_sigma
+            if callback is not None:
+                callback(
+                    k_index,
+                    n_k,
+                    values,
+                    float(point_residuals.max()),
+                    int(point_attempts.max()),
+                )
 
     return BandStructureResult(
         mode=mode,

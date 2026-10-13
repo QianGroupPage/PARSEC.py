@@ -47,6 +47,7 @@ from ..Eigensolvers.perturbative_soc import build_spin_orbit_projectors
 from ..Energy import total_energy_no_degeneracy, total_energy_no_degeneracy_spin_polarized
 from ..Hamiltonian.kpoint_operator import KPointKohnShamHamiltonian
 from ..Hamiltonian.kpoint_spinor_operator import KPointSpinorKohnShamHamiltonian
+from .kpoint_parallel import KPointJob, KPointSolver, split_pooled
 from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
 from ..SCF.pbc import PeriodicPreparedSinglePointSystem
@@ -203,6 +204,50 @@ def _spinor_hamiltonian(
     )
 
 
+def _spinor_solver(
+    system: PeriodicPreparedSinglePointSystem,
+    k_points: np.ndarray,
+    number_of_states: int,
+    accumulate,
+    *,
+    tasks: int | None = None,
+) -> KPointSolver:
+    """Parallel solver of the spinor Bloch problems, one task per k-point.
+
+    The Bloch-phase nonlocal and spin-orbit projectors of a k-point are built
+    once, by the worker that owns it.  ``potentials`` carries ``V`` (the local
+    potential) and optionally ``delta`` (collinear ``(V_up - V_down)/2``) or
+    ``field`` (non-collinear ``B_xc``).
+    """
+    cache: dict[int, tuple] = {}
+
+    def make_hamiltonian(task, potentials):
+        if task not in cache:
+            cache[task] = _k_point_operators(system, k_points[task : task + 1])[0]
+        nonlocal_operator_k, soc_projectors_k = cache[task]
+        return _spinor_hamiltonian(
+            system,
+            k_points[task],
+            nonlocal_operator_k,
+            soc_projectors_k,
+            potentials["V"],
+            xc_delta=potentials.get("delta"),
+            xc_field=potentials.get("field"),
+        )
+
+    return KPointSolver(
+        KPointJob(
+            k_points.shape[0] if tasks is None else tasks,
+            number_of_states,
+            lambda degree: _eigval_settings(system, degree),
+            make_hamiltonian,
+            accumulate,
+            extras=lambda task, vectors: _state_sz([vectors]),
+        ),
+        problem_size=system.grid.size,
+    )
+
+
 def run_self_consistent_soc_kpoints(
     system: PeriodicPreparedSinglePointSystem,
     k_points: np.ndarray,
@@ -228,7 +273,6 @@ def run_self_consistent_soc_kpoints(
 
     number_of_states = _number_of_states(system)
     ionic_potential = system.ionic_potential
-    k_operators = _k_point_operators(system, k_points)
 
     density = system.initial_density
     initial_hartree = system.solve_hartree(density, initial_potential=-ionic_potential)
@@ -236,7 +280,15 @@ def run_self_consistent_soc_kpoints(
     xc = system.evaluate_xc(density)
     input_potential = ionic_potential + hartree_potential + xc.potential
 
-    eigval_states: list[EigvalState | None] = [None] * n_kpoints
+    dV = system.grid.volume_element
+    n_grid = system.grid.size
+
+    def accumulate(task, vectors, occupations):
+        # rho(r) = sum_k w_k*(1/dV)*sum_n f_nk*(|u_up,nk|**2+|u_down,nk|**2).
+        weighted = (np.abs(vectors) ** 2) @ occupations
+        return {"density": (weight / dV) * (weighted[:n_grid] + weighted[n_grid:])}
+
+    solver = _spinor_solver(system, k_points, number_of_states, accumulate)
     mixer = AndersonMixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
@@ -249,139 +301,108 @@ def run_self_consistent_soc_kpoints(
     # SelfConsistentSOCResult.spinors keeps only k_points[0]'s converged
     # spinors (storing all k-points would multiply the memory); the
     # per-state <S_z> of every k-point is stored separately (state_moments).
-    spinors_first_k = np.empty((2 * system.grid.size, 0), dtype=complex)
+    with solver:
+        for iteration in range(1, settings.max_iterations + 1):
+            eigval_settings = _eigval_settings(system, filter_degree)
 
-    for iteration in range(1, settings.max_iterations + 1):
-        eigval_settings = _eigval_settings(system, filter_degree)
+            eigenvalues_by_k = solver.solve({"V": input_potential}, filter_degree)
 
-        eigenvalues_by_k: list[np.ndarray] = []
-        spinors_by_k: list[np.ndarray] = []
-        for k_index, k_point in enumerate(k_points):
-            nonlocal_operator_k, soc_projectors_k = k_operators[k_index]
-            hamiltonian_k = _spinor_hamiltonian(
-                system,
-                k_point,
-                nonlocal_operator_k,
-                soc_projectors_k,
+            # Pool every k-point's already-SOC-split spinor eigenvalues into one
+            # shared Fermi-level bisection.  degeneracy=weight (not 2*weight,
+            # unlike the non-SOC kpoints.py): spin is already folded into each
+            # 2-component eigenvector, so each pooled entry holds at most one
+            # electron per full Brillouin-zone sum, matching
+            # self_consistent_soc.py's degeneracy=1 at a single k-point.
+            stacked = np.concatenate(eigenvalues_by_k)
+            order = np.argsort(stacked, kind="stable")
+            occupation_result = fermi_occupations(
+                stacked[order],
+                system.electron_count,
+                settings.fermi_temperature_kelvin,
+                degeneracy=weight,
+            )
+            stacked_occupations = np.empty_like(stacked)
+            stacked_occupations[order] = occupation_result.occupations
+            fermi_level = occupation_result.fermi_level
+            pooled_eigenvalues = stacked
+            pooled_occupations = stacked_occupations
+
+            density = solver.accumulate(split_pooled(stacked_occupations, eigenvalues_by_k))[
+                "density"
+            ]
+
+            hartree = system.solve_hartree(density, initial_potential=hartree_potential)
+            hartree_potential = hartree.potential
+            xc = system.evaluate_xc(density)
+            output_potential = ionic_potential + hartree_potential + xc.potential
+
+            metrics = potential_residual_metrics(
                 input_potential,
+                output_potential,
+                density,
+                system.grid.volume_element,
+                system.electron_count,
             )
-            solution = solve_eigval(
-                hamiltonian_k.as_linear_operator(),
-                number_of_states,
-                settings=eigval_settings,
-                state=eigval_states[k_index],
+            energies = total_energy_no_degeneracy(
+                pooled_eigenvalues,
+                pooled_occupations,
+                density,
+                input_potential,
+                ionic_potential,
+                hartree_potential,
+                xc.potential,
+                xc.total_energy,
+                system.ion_ion_energy,
+                system.grid.volume_element,
+                alpha_z_energy=system.alpha_z_energy,
+                band_energy_weight=weight,
             )
-            eigval_states[k_index] = solution.state
-            eigenvalues_by_k.append(np.asarray(solution.eigenvalues, dtype=float))
-            spinors_by_k.append(np.asarray(solution.vectors))
-            if k_index == 0:
-                spinors_first_k = spinors_by_k[0]
 
-        # Pool every k-point's already-SOC-split spinor eigenvalues into one
-        # shared Fermi-level bisection.  degeneracy=weight (not 2*weight,
-        # unlike the non-SOC kpoints.py): spin is already folded into each
-        # 2-component eigenvector, so each pooled entry holds at most one
-        # electron per full Brillouin-zone sum, matching
-        # self_consistent_soc.py's degeneracy=1 at a single k-point.
-        stacked = np.concatenate(eigenvalues_by_k)
-        order = np.argsort(stacked, kind="stable")
-        occupation_result = fermi_occupations(
-            stacked[order],
-            system.electron_count,
-            settings.fermi_temperature_kelvin,
-            degeneracy=weight,
-        )
-        stacked_occupations = np.empty_like(stacked)
-        stacked_occupations[order] = occupation_result.occupations
-        fermi_level = occupation_result.fermi_level
-        pooled_eigenvalues = stacked
-        pooled_occupations = stacked_occupations
-
-        # rho(r) = sum_k w_k*(1/dV)*sum_n f_nk*(|u_up,nk|**2+|u_down,nk|**2).
-        n_grid = system.grid.size
-        density = np.zeros(n_grid)
-        offset = 0
-        for k_index in range(n_kpoints):
-            count = eigenvalues_by_k[k_index].size
-            occ_k = stacked_occupations[offset : offset + count]
-            offset += count
-            spinor_k = spinors_by_k[k_index]
-            weighted_density = (np.abs(spinor_k) ** 2) @ occ_k
-            density_k = weighted_density[:n_grid] + weighted_density[n_grid:]
-            density += (weight / system.grid.volume_element) * density_k
-
-        hartree = system.solve_hartree(density, initial_potential=hartree_potential)
-        hartree_potential = hartree.potential
-        xc = system.evaluate_xc(density)
-        output_potential = ionic_potential + hartree_potential + xc.potential
-
-        metrics = potential_residual_metrics(
-            input_potential,
-            output_potential,
-            density,
-            system.grid.volume_element,
-            system.electron_count,
-        )
-        energies = total_energy_no_degeneracy(
-            pooled_eigenvalues,
-            pooled_occupations,
-            density,
-            input_potential,
-            ionic_potential,
-            hartree_potential,
-            xc.potential,
-            xc.total_energy,
-            system.ion_ion_energy,
-            system.grid.volume_element,
-            alpha_z_energy=system.alpha_z_energy,
-            band_energy_weight=weight,
-        )
-
-        mixed_potential = mixer.mix(input_potential, output_potential, iteration=iteration)
-        selected_residual = (
-            metrics.plain if settings.use_plain_residual else metrics.weighted
-        )
-        if callback is not None:
-            callback(
-                SelfConsistentSOCIteration(
-                    iteration=iteration,
-                    weighted_residual=metrics.weighted,
-                    plain_residual=metrics.plain,
-                    energies=energies,
-                    eigenvalues=tuple(float(value) for value in eigenvalues_by_k[0]),
-                    occupations=tuple(
-                        float(value) for value in stacked_occupations[: eigenvalues_by_k[0].size]
-                    ),
-                    fermi_level=float(fermi_level),
+            mixed_potential = mixer.mix(input_potential, output_potential, iteration=iteration)
+            selected_residual = (
+                metrics.plain if settings.use_plain_residual else metrics.weighted
+            )
+            if callback is not None:
+                callback(
+                    SelfConsistentSOCIteration(
+                        iteration=iteration,
+                        weighted_residual=metrics.weighted,
+                        plain_residual=metrics.plain,
+                        energies=energies,
+                        eigenvalues=tuple(float(value) for value in eigenvalues_by_k[0]),
+                        occupations=tuple(
+                            float(value) for value in stacked_occupations[: eigenvalues_by_k[0].size]
+                        ),
+                        fermi_level=float(fermi_level),
+                    )
                 )
-            )
-        input_potential = mixed_potential
-        if (
-            iteration > 5
-            and metrics.weighted < 100.0 * settings.convergence_criterion
-            and filter_degree > minimum_filter_degree
-        ):
-            filter_degree -= 1
-        if selected_residual < settings.convergence_criterion:
-            converged = True
-            break
+            input_potential = mixed_potential
+            if (
+                iteration > 5
+                and metrics.weighted < 100.0 * settings.convergence_criterion
+                and filter_degree > minimum_filter_degree
+            ):
+                filter_degree -= 1
+            if selected_residual < settings.convergence_criterion:
+                converged = True
+                break
 
-    return SelfConsistentSOCResult(
-        converged=converged,
-        iterations=iteration,
-        atoms=system.atoms,
-        electron_count=system.electron_count,
-        eigenvalues=pooled_eigenvalues,
-        occupations=pooled_occupations,
-        spinors=spinors_first_k,
-        fermi_level=fermi_level,
-        density=density,
-        energies=energies,
-        k_points=k_points,
-        k_weights=np.full(n_kpoints, weight),
-        state_moments=_state_sz(spinors_by_k),
-        scf_potentials={"effective_potential": output_potential},
-    )
+        return SelfConsistentSOCResult(
+            converged=converged,
+            iterations=iteration,
+            atoms=system.atoms,
+            electron_count=system.electron_count,
+            eigenvalues=pooled_eigenvalues,
+            occupations=pooled_occupations,
+            spinors=solver.vectors(0),
+            fermi_level=fermi_level,
+            density=density,
+            energies=energies,
+            k_points=k_points,
+            k_weights=np.full(n_kpoints, weight),
+            state_moments=np.concatenate(solver.extras()),
+            scf_potentials={"effective_potential": output_potential},
+        )
 
 
 def run_self_consistent_soc_kpoints_spin_polarized(
@@ -429,7 +450,6 @@ def run_self_consistent_soc_kpoints_spin_polarized(
 
     number_of_states = _number_of_states(system)
     ionic_potential = system.ionic_potential
-    k_operators = _k_point_operators(system, k_points)
 
     polarization = _weighted_initial_polarization(system)
     density_up = 0.5 * (1.0 + polarization) * system.initial_density
@@ -442,7 +462,16 @@ def run_self_consistent_soc_kpoints_spin_polarized(
     input_potential_up = ionic_potential + hartree_potential + xc.potential_up
     input_potential_down = ionic_potential + hartree_potential + xc.potential_down
 
-    eigval_states: list[EigvalState | None] = [None] * n_kpoints
+    dV = system.grid.volume_element
+
+    def accumulate(task, vectors, occupations):
+        weighted = (np.abs(vectors) ** 2) @ occupations
+        return {
+            "up": (weight / dV) * weighted[:n_grid],
+            "down": (weight / dV) * weighted[n_grid:],
+        }
+
+    solver = _spinor_solver(system, k_points, number_of_states, accumulate)
     mixer = AndersonMixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
@@ -452,153 +481,126 @@ def run_self_consistent_soc_kpoints_spin_polarized(
     fermi_level = float("nan")
     energies = None
     converged = False
-    spinors_first_k = np.empty((2 * n_grid, 0), dtype=complex)
     density_up_out = density_up
     density_down_out = density_down
 
-    for iteration in range(1, settings.max_iterations + 1):
-        eigval_settings = _eigval_settings(system, filter_degree)
-        effective_potential_avg = 0.5 * (input_potential_up + input_potential_down)
-        xc_delta = 0.5 * (input_potential_up - input_potential_down)
+    with solver:
+        for iteration in range(1, settings.max_iterations + 1):
+            eigval_settings = _eigval_settings(system, filter_degree)
+            effective_potential_avg = 0.5 * (input_potential_up + input_potential_down)
+            xc_delta = 0.5 * (input_potential_up - input_potential_down)
 
-        eigenvalues_by_k: list[np.ndarray] = []
-        spinors_by_k: list[np.ndarray] = []
-        for k_index, k_point in enumerate(k_points):
-            nonlocal_operator_k, soc_projectors_k = k_operators[k_index]
-            hamiltonian_k = _spinor_hamiltonian(
-                system,
-                k_point,
-                nonlocal_operator_k,
-                soc_projectors_k,
-                effective_potential_avg,
-                xc_delta=xc_delta,
+            eigenvalues_by_k = solver.solve(
+                {"V": effective_potential_avg, "delta": xc_delta}, filter_degree
             )
-            solution = solve_eigval(
-                hamiltonian_k.as_linear_operator(),
-                number_of_states,
-                settings=eigval_settings,
-                state=eigval_states[k_index],
+
+            # One Fermi level over every (k, spinor-state) eigenvalue; each holds
+            # at most one electron per full-BZ sum, so degeneracy = weight.
+            stacked = np.concatenate(eigenvalues_by_k)
+            order = np.argsort(stacked, kind="stable")
+            occupation_result = fermi_occupations(
+                stacked[order],
+                system.electron_count,
+                settings.fermi_temperature_kelvin,
+                degeneracy=weight,
             )
-            eigval_states[k_index] = solution.state
-            eigenvalues_by_k.append(np.asarray(solution.eigenvalues, dtype=float))
-            spinors_by_k.append(np.asarray(solution.vectors))
-            if k_index == 0:
-                spinors_first_k = spinors_by_k[0]
+            stacked_occupations = np.empty_like(stacked)
+            stacked_occupations[order] = occupation_result.occupations
+            fermi_level = occupation_result.fermi_level
+            pooled_eigenvalues = stacked
+            pooled_occupations = stacked_occupations
 
-        # One Fermi level over every (k, spinor-state) eigenvalue; each holds
-        # at most one electron per full-BZ sum, so degeneracy = weight.
-        stacked = np.concatenate(eigenvalues_by_k)
-        order = np.argsort(stacked, kind="stable")
-        occupation_result = fermi_occupations(
-            stacked[order],
-            system.electron_count,
-            settings.fermi_temperature_kelvin,
-            degeneracy=weight,
-        )
-        stacked_occupations = np.empty_like(stacked)
-        stacked_occupations[order] = occupation_result.occupations
-        fermi_level = occupation_result.fermi_level
-        pooled_eigenvalues = stacked
-        pooled_occupations = stacked_occupations
+            parts = solver.accumulate(split_pooled(stacked_occupations, eigenvalues_by_k))
+            density_up_out = parts["up"]
+            density_down_out = parts["down"]
+            density = density_up_out + density_down_out
 
-        density_up_out = np.zeros(n_grid)
-        density_down_out = np.zeros(n_grid)
-        offset = 0
-        for k_index in range(n_kpoints):
-            count = eigenvalues_by_k[k_index].size
-            occ_k = stacked_occupations[offset : offset + count]
-            offset += count
-            weighted = (np.abs(spinors_by_k[k_index]) ** 2) @ occ_k
-            density_up_out += (weight / system.grid.volume_element) * weighted[:n_grid]
-            density_down_out += (weight / system.grid.volume_element) * weighted[n_grid:]
-        density = density_up_out + density_down_out
+            hartree = system.solve_hartree(density, initial_potential=hartree_potential)
+            hartree_potential = hartree.potential
+            xc = system.evaluate_xc_spin_polarized(density_up_out, density_down_out)
+            output_potential_up = ionic_potential + hartree_potential + xc.potential_up
+            output_potential_down = ionic_potential + hartree_potential + xc.potential_down
 
-        hartree = system.solve_hartree(density, initial_potential=hartree_potential)
-        hartree_potential = hartree.potential
-        xc = system.evaluate_xc_spin_polarized(density_up_out, density_down_out)
-        output_potential_up = ionic_potential + hartree_potential + xc.potential_up
-        output_potential_down = ionic_potential + hartree_potential + xc.potential_down
+            input_combined = np.concatenate([input_potential_up, input_potential_down])
+            output_combined = np.concatenate([output_potential_up, output_potential_down])
+            density_combined = np.concatenate([density_up_out, density_down_out])
+            metrics = potential_residual_metrics(
+                input_combined,
+                output_combined,
+                density_combined,
+                system.grid.volume_element,
+                system.electron_count,
+            )
+            energies = total_energy_no_degeneracy_spin_polarized(
+                pooled_eigenvalues,
+                pooled_occupations,
+                density_up_out,
+                density_down_out,
+                input_potential_up,
+                input_potential_down,
+                ionic_potential,
+                hartree_potential,
+                xc.potential_up,
+                xc.potential_down,
+                xc.total_energy,
+                system.ion_ion_energy,
+                system.grid.volume_element,
+                alpha_z_energy=system.alpha_z_energy,
+                band_energy_weight=weight,
+            )
 
-        input_combined = np.concatenate([input_potential_up, input_potential_down])
-        output_combined = np.concatenate([output_potential_up, output_potential_down])
-        density_combined = np.concatenate([density_up_out, density_down_out])
-        metrics = potential_residual_metrics(
-            input_combined,
-            output_combined,
-            density_combined,
-            system.grid.volume_element,
-            system.electron_count,
-        )
-        energies = total_energy_no_degeneracy_spin_polarized(
-            pooled_eigenvalues,
-            pooled_occupations,
-            density_up_out,
-            density_down_out,
-            input_potential_up,
-            input_potential_down,
-            ionic_potential,
-            hartree_potential,
-            xc.potential_up,
-            xc.potential_down,
-            xc.total_energy,
-            system.ion_ion_energy,
-            system.grid.volume_element,
-            alpha_z_energy=system.alpha_z_energy,
-            band_energy_weight=weight,
-        )
-
-        mixed_combined = mixer.mix(input_combined, output_combined, iteration=iteration)
-        selected_residual = (
-            metrics.plain if settings.use_plain_residual else metrics.weighted
-        )
-        if callback is not None:
-            callback(
-                SelfConsistentSOCIteration(
-                    iteration=iteration,
-                    weighted_residual=metrics.weighted,
-                    plain_residual=metrics.plain,
-                    energies=energies,
-                    eigenvalues=tuple(float(value) for value in eigenvalues_by_k[0]),
-                    occupations=tuple(
-                        float(value) for value in stacked_occupations[: eigenvalues_by_k[0].size]
-                    ),
-                    fermi_level=float(fermi_level),
+            mixed_combined = mixer.mix(input_combined, output_combined, iteration=iteration)
+            selected_residual = (
+                metrics.plain if settings.use_plain_residual else metrics.weighted
+            )
+            if callback is not None:
+                callback(
+                    SelfConsistentSOCIteration(
+                        iteration=iteration,
+                        weighted_residual=metrics.weighted,
+                        plain_residual=metrics.plain,
+                        energies=energies,
+                        eigenvalues=tuple(float(value) for value in eigenvalues_by_k[0]),
+                        occupations=tuple(
+                            float(value) for value in stacked_occupations[: eigenvalues_by_k[0].size]
+                        ),
+                        fermi_level=float(fermi_level),
+                    )
                 )
-            )
-        input_potential_up = mixed_combined[:n_grid]
-        input_potential_down = mixed_combined[n_grid:]
-        if (
-            iteration > 5
-            and metrics.weighted < 100.0 * settings.convergence_criterion
-            and filter_degree > minimum_filter_degree
-        ):
-            filter_degree -= 1
-        if selected_residual < settings.convergence_criterion:
-            converged = True
-            break
+            input_potential_up = mixed_combined[:n_grid]
+            input_potential_down = mixed_combined[n_grid:]
+            if (
+                iteration > 5
+                and metrics.weighted < 100.0 * settings.convergence_criterion
+                and filter_degree > minimum_filter_degree
+            ):
+                filter_degree -= 1
+            if selected_residual < settings.convergence_criterion:
+                converged = True
+                break
 
-    return SelfConsistentSOCResult(
-        converged=converged,
-        iterations=iteration,
-        atoms=system.atoms,
-        electron_count=system.electron_count,
-        eigenvalues=pooled_eigenvalues,
-        occupations=pooled_occupations,
-        spinors=spinors_first_k,
-        fermi_level=fermi_level,
-        density=density_up_out + density_down_out,
-        energies=energies,
-        magnetic_moment=float(
-            system.grid.volume_element * np.sum(density_up_out - density_down_out)
-        ),
-        k_points=k_points,
-        k_weights=np.full(n_kpoints, weight),
-        state_moments=_state_sz(spinors_by_k),
-        scf_potentials={
-            "effective_potential": 0.5 * (output_potential_up + output_potential_down),
-            "xc_delta": 0.5 * (output_potential_up - output_potential_down),
-        },
-    )
+        return SelfConsistentSOCResult(
+            converged=converged,
+            iterations=iteration,
+            atoms=system.atoms,
+            electron_count=system.electron_count,
+            eigenvalues=pooled_eigenvalues,
+            occupations=pooled_occupations,
+            spinors=solver.vectors(0),
+            fermi_level=fermi_level,
+            density=density_up_out + density_down_out,
+            energies=energies,
+            magnetic_moment=float(
+                system.grid.volume_element * np.sum(density_up_out - density_down_out)
+            ),
+            k_points=k_points,
+            k_weights=np.full(n_kpoints, weight),
+            state_moments=np.concatenate(solver.extras()),
+            scf_potentials={
+                "effective_potential": 0.5 * (output_potential_up + output_potential_down),
+                "xc_delta": 0.5 * (output_potential_up - output_potential_down),
+            },
+        )
 
 
 __all__ = [

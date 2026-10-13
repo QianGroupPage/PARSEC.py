@@ -337,6 +337,46 @@ The Hamiltonian and nonlocal potential remain matrix-free during iterative
 eigensolution. Static terms are prepared once; only density-dependent local
 fields change during SCF.
 
+## Parallel k-points, band paths and GPUs (periodic systems)
+
+The eigenproblems of different k-points (and spin channels) are independent: only the Fermi
+level and the density couple them. A periodic SCF with k-points, and every point of a band path,
+is therefore spread over workers that each keep the Bloch projectors, eigenvectors and Ritz
+subspaces of their own k-points; only potentials, eigenvalues and summed densities cross between
+them. This covers the scalar, spin-polarized, spin-orbit, spin-orbit + collinear-spin and
+non-collinear drivers and the `bandstruc` calculation. The results are the serial ones up to
+round-off (the eigenvalues of a k-point are the same computation; densities differ only by the
+order of the sum over k-points).
+
+```bash
+python -m parsec_python.main parsec.in --kpoint-workers 8          # CPU worker processes
+python -m parsec_python.main parsec.in --kpoint-workers auto       # default: half the CPUs
+python -m parsec_python.main parsec.in --kpoint-backend cupy       # GPUs, see below
+```
+
+or the environment variables `PARSEC_KPOINT_WORKERS` (`auto` or a number; `auto` stays serial for a
+single k-point, for small grids, and without `fork`) and `PARSEC_KPOINT_BACKEND`.
+The workers are forked processes (Linux/macOS), each given `cpus / workers` BLAS threads. The sparse
+Bloch operators are memory-bandwidth bound, so the gain depends on the machine: about 1.8x for 8
+workers on a 4-P-core + 8-E-core laptop (4-atom Co, 28^3 grid, 44 spinor states, 8 k-points),
+more on a server with more memory channels. Memory grows with the number of workers only through
+each worker's own k-points.
+
+**GPUs.** `--kpoint-backend cupy` (or `PARSEC_KPOINT_BACKEND=cupy`; `auto` uses CuPy when it works,
+else the CPU) puts the Bloch Hamiltonian, including the spin-orbit and Zeeman terms, and the whole
+Chebyshev filter on the GPU, which is where almost all the matrix-vector products are. One worker
+thread drives each CUDA device (`PARSEC_CUPY_DEVICES=auto|current|0,1,...` as in the multi-GPU
+solver), the k-points are dealt out round-robin, and the eigensolver itself (CHEBFF, CHEBDAV,
+SUBSPACE: orthonormalization, Rayleigh-Ritz) is the unchanged CPU code, so a filter call costs one
+upload and one download of a block of vectors. Static matrices (Laplacian, projectors) are uploaded
+once per device; an SCF step uploads only the local potential and fields. Give the host BLAS a few
+threads per device (`OPENBLAS_NUM_THREADS`, the thread pool shares them out by default).
+`python -m parsec_python.acceleration.benchmarks.check_gpu_kpoints` compares the device operator, the filter, a short non-collinear
+spin-orbit SCF and a short band path against the CPU and times them; run it first on a GPU node.
+It needs `cupy`; `--backend numpy-device` runs the same device code on the host. This is a first
+version of the GPU path: it has been checked on the host with NumPy standing in for CuPy, not yet on
+a CUDA device.
+
 ## Band structures (periodic systems)
 
 A `bandstruc` block adds a non-self-consistent band structure after the SCF, as in

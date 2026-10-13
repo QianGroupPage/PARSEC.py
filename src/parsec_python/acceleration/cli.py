@@ -153,6 +153,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="text log path; defaults to parsec.out beside parsec.in",
     )
     parser.add_argument(
+        "--kpoint-workers",
+        default=None,
+        metavar="N|auto",
+        help=(
+            "worker processes for the k-points of a periodic SCF and for the band path "
+            "(reference solver; default PARSEC_KPOINT_WORKERS, else auto)"
+        ),
+    )
+    parser.add_argument(
+        "--kpoint-backend",
+        choices=("cpu", "cupy", "auto", "numpy-device"),
+        default=None,
+        help="where the k-point Hamiltonians are applied: cpu (default), cupy, auto (reference solver)",
+    )
+    parser.add_argument(
         "--bands-from",
         type=Path,
         default=None,
@@ -332,6 +347,8 @@ def _reference_argv(arguments: argparse.Namespace) -> list[str]:
         ("--output", arguments.output),
         ("--log", arguments.log),
         ("--bands-from", arguments.bands_from),
+        ("--kpoint-workers", arguments.kpoint_workers),
+        ("--kpoint-backend", arguments.kpoint_backend),
     ):
         if value is not None:
             argv += [flag, str(value)]

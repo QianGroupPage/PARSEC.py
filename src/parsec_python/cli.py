@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import asdict
 from pathlib import Path
 import sys
@@ -422,6 +423,22 @@ def save_self_consistent_soc_result_archive(
     return output
 
 
+def _band_progress(reporter):
+    """One log line per finished k-point of the (slow) band calculation."""
+    started = time.perf_counter()
+    done = [0]
+
+    def report(index: int, count: int, _eigenvalues, residual: float, attempts: int) -> None:
+        done[0] += 1
+        note = f", {attempts} CHEBDAV attempts" if attempts > 1 else ""
+        reporter.write(
+            f" band k-point {index + 1:4d} done ({done[0]:4d}/{count:<4d}) after "
+            f"{time.perf_counter() - started:8.1f} s, max residual {residual:9.2e} Ry{note}"
+        )
+
+    return report
+
+
 def _write_band_outputs(band_result, reporter, directory: Path, start: float) -> None:
     files = list(write_bands_files(directory, band_result))
     files.append(
@@ -453,6 +470,7 @@ def _run_band_structure(system, translation, result, reporter, directory: Path) 
         potentials=band_potentials(result, mode),
         fermi_level=result.fermi_level,
         number_of_states=np.asarray(eigenvalues).size // k_count,
+        callback=_band_progress(reporter),
     )
     _write_band_outputs(band_result, reporter, directory, start)
 
@@ -472,6 +490,7 @@ def _run_bands_from_archive(system, translation, archive, reporter, directory: P
         potentials=potentials,
         fermi_level=fermi_level,
         number_of_states=number_of_states,
+        callback=_band_progress(reporter),
     )
     _write_band_outputs(band_result, reporter, directory, start)
 
@@ -517,6 +536,26 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--kpoint-workers",
+        default=None,
+        metavar="N|auto",
+        help=(
+            "worker processes for the k-points of a periodic SCF and for the band path "
+            "(default: PARSEC_KPOINT_WORKERS, else auto = half the CPUs, serial for small "
+            "problems)"
+        ),
+    )
+    parser.add_argument(
+        "--kpoint-backend",
+        choices=("cpu", "cupy", "auto", "numpy-device"),
+        default=None,
+        help=(
+            "where the k-point Hamiltonians are applied: cpu (default), cupy (one worker "
+            "thread per CUDA device, PARSEC_CUPY_DEVICES selects them), auto (cupy if it "
+            "works) or numpy-device (the GPU code on the host, for tests)"
+        ),
+    )
+    parser.add_argument(
         "--bands-from",
         type=Path,
         default=None,
@@ -548,6 +587,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     arguments = parser.parse_args(argv)
+    if arguments.kpoint_workers is not None:
+        os.environ["PARSEC_KPOINT_WORKERS"] = str(arguments.kpoint_workers)
+    if arguments.kpoint_backend is not None:
+        os.environ["PARSEC_KPOINT_BACKEND"] = arguments.kpoint_backend
     try:
         translation = parse_parsec_input(
             arguments.input,

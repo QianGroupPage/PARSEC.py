@@ -41,6 +41,7 @@ from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
 from ..V_ion import superpose_atomic_density
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
+from .kpoint_parallel import KPointJob, KPointSolver, split_pooled
 from .kpoints_soc import (
     _eigval_settings,
     _k_point_operators,
@@ -145,7 +146,25 @@ def _run_noncollinear(
     input_potential = ionic_potential + hartree_potential + xc.potential
     input_field = xc.field
 
-    eigval_states: list[EigvalState | None] = [None] * n_kpoints
+    def accumulate(task, vectors, occupations):
+        density_k, magnetization_k = spinor_density_and_magnetization(
+            vectors, occupations, volume_element, weight
+        )
+        return {"density": density_k, "magnetization": magnetization_k}
+
+    solver = KPointSolver(
+        KPointJob(
+            n_kpoints,
+            number_of_states,
+            lambda degree: _eigval_settings(system, degree),
+            lambda task, potentials: hamiltonian_for_k(
+                task, potentials["V"], potentials["field"]
+            ),
+            accumulate,
+            extras=lambda task, vectors: _state_sz([vectors]),
+        ),
+        problem_size=system.grid.size,
+    )
     mixer = AndersonMixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
@@ -155,141 +174,115 @@ def _run_noncollinear(
     fermi_level = float("nan")
     energies = None
     converged = False
-    spinors_first_k = np.empty((2 * n_grid, 0), dtype=complex)
+    with solver:
+        for iteration in range(1, settings.max_iterations + 1):
+            eigval_settings = _eigval_settings(system, filter_degree)
 
-    for iteration in range(1, settings.max_iterations + 1):
-        eigval_settings = _eigval_settings(system, filter_degree)
+            eigenvalues_by_k = solver.solve({"V": input_potential, "field": input_field}, filter_degree)
 
-        eigenvalues_by_k: list[np.ndarray] = []
-        spinors_by_k: list[np.ndarray] = []
-        for k_index in range(n_kpoints):
-            hamiltonian = hamiltonian_for_k(k_index, input_potential, input_field)
-            solution = solve_eigval(
-                hamiltonian.as_linear_operator(),
-                number_of_states,
-                settings=eigval_settings,
-                state=eigval_states[k_index],
+            stacked = np.concatenate(eigenvalues_by_k)
+            order = np.argsort(stacked, kind="stable")
+            occupation_result = fermi_occupations(
+                stacked[order],
+                system.electron_count,
+                settings.fermi_temperature_kelvin,
+                degeneracy=weight,
             )
-            eigval_states[k_index] = solution.state
-            eigenvalues_by_k.append(np.asarray(solution.eigenvalues, dtype=float))
-            spinors_by_k.append(np.asarray(solution.vectors))
-            if k_index == 0:
-                spinors_first_k = spinors_by_k[0]
+            stacked_occupations = np.empty_like(stacked)
+            stacked_occupations[order] = occupation_result.occupations
+            fermi_level = occupation_result.fermi_level
+            pooled_eigenvalues = stacked
+            pooled_occupations = stacked_occupations
 
-        stacked = np.concatenate(eigenvalues_by_k)
-        order = np.argsort(stacked, kind="stable")
-        occupation_result = fermi_occupations(
-            stacked[order],
-            system.electron_count,
-            settings.fermi_temperature_kelvin,
-            degeneracy=weight,
-        )
-        stacked_occupations = np.empty_like(stacked)
-        stacked_occupations[order] = occupation_result.occupations
-        fermi_level = occupation_result.fermi_level
-        pooled_eigenvalues = stacked
-        pooled_occupations = stacked_occupations
+            parts = solver.accumulate(split_pooled(stacked_occupations, eigenvalues_by_k))
+            density = parts["density"]
+            magnetization = parts["magnetization"]
 
-        density = np.zeros(n_grid)
-        magnetization = np.zeros((3, n_grid))
-        offset = 0
-        for k_index in range(n_kpoints):
-            count = eigenvalues_by_k[k_index].size
-            n_k, m_k = spinor_density_and_magnetization(
-                spinors_by_k[k_index],
-                stacked_occupations[offset : offset + count],
+            hartree = system.solve_hartree(density, initial_potential=hartree_potential)
+            hartree_potential = hartree.potential
+            xc = system.evaluate_xc_noncollinear(density, magnetization)
+            output_potential = ionic_potential + hartree_potential + xc.potential
+            output_field = xc.field
+
+            input_combined = np.concatenate([input_potential, input_field.reshape(-1)])
+            output_combined = np.concatenate([output_potential, output_field.reshape(-1)])
+            metrics = potential_residual_metrics(
+                input_combined,
+                output_combined,
+                np.tile(density, 4),
                 volume_element,
-                weight,
+                system.electron_count,
             )
-            offset += count
-            density += n_k
-            magnetization += m_k
+            energies = total_energy_noncollinear(
+                pooled_eigenvalues,
+                pooled_occupations,
+                density,
+                magnetization,
+                input_potential,
+                input_field,
+                ionic_potential,
+                hartree_potential,
+                xc.potential,
+                xc.field,
+                xc.total_energy,
+                system.ion_ion_energy,
+                volume_element,
+                alpha_z_energy=system.alpha_z_energy,
+                band_energy_weight=weight,
+            )
 
-        hartree = system.solve_hartree(density, initial_potential=hartree_potential)
-        hartree_potential = hartree.potential
-        xc = system.evaluate_xc_noncollinear(density, magnetization)
-        output_potential = ionic_potential + hartree_potential + xc.potential
-        output_field = xc.field
-
-        input_combined = np.concatenate([input_potential, input_field.reshape(-1)])
-        output_combined = np.concatenate([output_potential, output_field.reshape(-1)])
-        metrics = potential_residual_metrics(
-            input_combined,
-            output_combined,
-            np.tile(density, 4),
-            volume_element,
-            system.electron_count,
-        )
-        energies = total_energy_noncollinear(
-            pooled_eigenvalues,
-            pooled_occupations,
-            density,
-            magnetization,
-            input_potential,
-            input_field,
-            ionic_potential,
-            hartree_potential,
-            xc.potential,
-            xc.field,
-            xc.total_energy,
-            system.ion_ion_energy,
-            volume_element,
-            alpha_z_energy=system.alpha_z_energy,
-            band_energy_weight=weight,
-        )
-
-        mixed = mixer.mix(input_combined, output_combined, iteration=iteration)
-        selected_residual = (
-            metrics.plain if settings.use_plain_residual else metrics.weighted
-        )
-        if callback is not None:
-            first_k = eigenvalues_by_k[0].size
-            callback(
-                SelfConsistentSOCIteration(
-                    iteration=iteration,
-                    weighted_residual=metrics.weighted,
-                    plain_residual=metrics.plain,
-                    energies=energies,
-                    eigenvalues=tuple(float(v) for v in eigenvalues_by_k[0]),
-                    occupations=tuple(float(v) for v in stacked_occupations[:first_k]),
-                    fermi_level=float(fermi_level),
+            mixed = mixer.mix(input_combined, output_combined, iteration=iteration)
+            selected_residual = (
+                metrics.plain if settings.use_plain_residual else metrics.weighted
+            )
+            if callback is not None:
+                first_k = eigenvalues_by_k[0].size
+                callback(
+                    SelfConsistentSOCIteration(
+                        iteration=iteration,
+                        weighted_residual=metrics.weighted,
+                        plain_residual=metrics.plain,
+                        energies=energies,
+                        eigenvalues=tuple(float(v) for v in eigenvalues_by_k[0]),
+                        occupations=tuple(float(v) for v in stacked_occupations[:first_k]),
+                        fermi_level=float(fermi_level),
+                    )
                 )
-            )
-        input_potential = mixed[:n_grid]
-        input_field = mixed[n_grid:].reshape(3, n_grid)
-        if (
-            iteration > 5
-            and metrics.weighted < 100.0 * settings.convergence_criterion
-            and filter_degree > minimum_filter_degree
-        ):
-            filter_degree -= 1
-        if selected_residual < settings.convergence_criterion:
-            converged = True
-            break
+            input_potential = mixed[:n_grid]
+            input_field = mixed[n_grid:].reshape(3, n_grid)
+            if (
+                iteration > 5
+                and metrics.weighted < 100.0 * settings.convergence_criterion
+                and filter_degree > minimum_filter_degree
+            ):
+                filter_degree -= 1
+            if selected_residual < settings.convergence_criterion:
+                converged = True
+                break
 
-    moment_vector = volume_element * np.sum(magnetization, axis=1)
-    return SelfConsistentSOCResult(
-        converged=converged,
-        iterations=iteration,
-        atoms=system.atoms,
-        electron_count=system.electron_count,
-        eigenvalues=pooled_eigenvalues,
-        occupations=pooled_occupations,
-        spinors=spinors_first_k,
-        fermi_level=fermi_level,
-        density=density,
-        energies=energies,
-        magnetic_moment=float(np.linalg.norm(moment_vector)),
-        magnetic_moment_vector=moment_vector,
-        magnetization=magnetization,
-        k_points=k_points,
-        k_weights=None if k_points is None else np.full(n_kpoints, weight),
-        state_moments=None if k_points is None else _state_sz(spinors_by_k),
-        scf_potentials={
-            "effective_potential": output_potential,
-            "xc_field": output_field,
-        },
-    )
+        moment_vector = volume_element * np.sum(magnetization, axis=1)
+        return SelfConsistentSOCResult(
+            converged=converged,
+            iterations=iteration,
+            atoms=system.atoms,
+            electron_count=system.electron_count,
+            eigenvalues=pooled_eigenvalues,
+            occupations=pooled_occupations,
+            spinors=solver.vectors(0),
+            fermi_level=fermi_level,
+            density=density,
+            energies=energies,
+            magnetic_moment=float(np.linalg.norm(moment_vector)),
+            magnetic_moment_vector=moment_vector,
+            magnetization=magnetization,
+            k_points=k_points,
+            k_weights=None if k_points is None else np.full(n_kpoints, weight),
+            state_moments=None if k_points is None else np.concatenate(solver.extras()),
+            scf_potentials={
+                "effective_potential": output_potential,
+                "xc_field": output_field,
+            },
+        )
 
 
 def run_self_consistent_noncollinear(
@@ -345,10 +338,14 @@ def run_self_consistent_noncollinear_kpoints(
     k_points, weight = _validated_k_points(
         k_points, weights, "run_self_consistent_noncollinear_kpoints"
     )
-    k_operators = _k_point_operators(system, k_points)
+    operator_cache: dict[int, tuple] = {}
 
     def hamiltonian_for_k(k_index, potential, field):
-        nonlocal_operator_k, soc_projectors_k = k_operators[k_index]
+        if k_index not in operator_cache:
+            operator_cache[k_index] = _k_point_operators(
+                system, k_points[k_index : k_index + 1]
+            )[0]
+        nonlocal_operator_k, soc_projectors_k = operator_cache[k_index]
         return _spinor_hamiltonian(
             system,
             k_points[k_index],

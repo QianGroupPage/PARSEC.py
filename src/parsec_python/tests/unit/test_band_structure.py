@@ -395,6 +395,71 @@ class BandRetryTests(unittest.TestCase):
             self.assertTrue(np.all(reference.attempts == 1))
 
 
+class ParallelBandTests(unittest.TestCase):
+    """Band k-points are independent: workers must not change the bands."""
+
+    def test_workers_reproduce_serial_bands_and_report_every_k_point(self) -> None:
+        from parsec_python.driver import prepare_periodic_single_point
+        from parsec_python.Grid import kpoint_sampling
+        from parsec_python.SCF import bands as bands_module
+        from parsec_python.SCF.kpoints import run_scf_kpoints
+
+        longer_path = (
+            "begin bandstruc\n1 -0.25 0.0 0.0  0.25 0.0 0.0  left-right\nend bandstruc\n"
+            "bandstruc_points 6\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            shutil.copy(_AU_POTRE, directory / "Au_POTRE.DAT")
+            (directory / "parsec.in").write_text(
+                _INPUT.format(
+                    states=12, so_psp="false", extra="", kpoints=_MP, bands=longer_path
+                ),
+                encoding="utf-8",
+            )
+            problem = parse_parsec_input(directory / "parsec.in").problem
+            system = prepare_periodic_single_point(problem)
+            k_points, weights = kpoint_sampling(problem)
+            scf = run_scf_kpoints(system, k_points, weights)
+            potentials = bands_module.band_potentials(scf, "scalar")
+
+            def bands(**options):
+                seen = []
+                result = bands_module.run_band_structure(
+                    system,
+                    problem.bands,
+                    mode="scalar",
+                    potentials=potentials,
+                    fermi_level=scf.fermi_level,
+                    number_of_states=12,
+                    callback=lambda index, count, values, residual, attempts: seen.append(
+                        (index, count, attempts)
+                    ),
+                    **options,
+                )
+                return result, seen
+
+            serial, seen_serial = bands(workers=1)
+            self.assertEqual(serial.k_points.shape[0], 7)
+            for options in (
+                dict(workers=3),
+                dict(workers=2, pool_kind="thread"),
+                dict(backend="numpy-device"),  # the GPU code path, on the host
+            ):
+                with self.subTest(**options):
+                    parallel, seen = bands(**options)
+                    np.testing.assert_allclose(
+                        parallel.eigenvalues, serial.eigenvalues, atol=1e-9
+                    )
+                    np.testing.assert_allclose(parallel.k_points, serial.k_points)
+                    np.testing.assert_allclose(
+                        parallel.residual_norms, serial.residual_norms, atol=1e-9
+                    )
+                    self.assertEqual(sorted(index for index, _, _ in seen), list(range(7)))
+                    self.assertTrue(all(count == 7 for _, count, _ in seen))
+            self.assertEqual([index for index, _, _ in seen_serial], list(range(7)))
+
+
 class BandFileTests(unittest.TestCase):
     def test_write_read_roundtrip_with_two_segments(self) -> None:
         from parsec_python.models import BandStructureResult

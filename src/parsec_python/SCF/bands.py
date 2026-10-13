@@ -14,6 +14,15 @@ diagonalization in the converged self-consistent potential:
   has no convergence test; raise ``FF_MaxIter`` for tighter bands.  The largest
   residual ``|H v - e v|`` is reported for every k-point as a diagnostic.
 
+Extension beyond Fortran: CHEBDAV adds ``Matvec_Blocksize`` vectors per Davidson
+step, and at a highly symmetric k-point whose degenerate multiplet is larger than
+the block (an 8-fold level in a folded cubic cell, 16-fold with spin-orbit) it can
+leave reported bands unconverged, at a block size that is not predictable.  When a
+reported band's residual exceeds ``residual_tolerance`` the k-point is re-solved
+with a larger block and a new random start (up to ``max_attempts`` in total) and
+the attempt with the smallest residual is kept; the number of attempts per k-point
+is recorded in ``BandStructureResult.attempts``.
+
 The Hamiltonian follows the SCF mode, so the same ``bandstruc`` block gives
 scalar, collinear spin-polarized (up/down), spin-orbit, spin-orbit +
 collinear-spin and non-collinear bands.  Comparing runs with and without
@@ -22,6 +31,7 @@ collinear-spin and non-collinear bands.  Comparing runs with and without
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Callable
 
 import numpy as np
@@ -90,6 +100,45 @@ def band_path_cartesian(
     return segments, tuple(segment.name for segment in settings.segments)
 
 
+def load_scf_for_bands(archive_path, problem, system, mode: str):
+    """Converged potentials, Fermi level and state count from an SCF result archive.
+
+    Lets a band structure be recomputed (another path, solver settings, ...) without
+    repeating the SCF.  The archive must come from the same input: the grid size and
+    atom positions are checked.
+    """
+    archive = np.load(archive_path)
+    files = set(archive.files)
+    if "atom_coordinates_bohr" in files:
+        stored = np.asarray(archive["atom_coordinates_bohr"], dtype=float)
+        current = np.asarray([atom.position for atom in system.atoms], dtype=float)
+        if stored.shape != current.shape or not np.allclose(stored, current, atol=1e-6):
+            raise ValueError(f"{archive_path} was written for different atom positions")
+    if mode == "scalar":
+        keys = {"effective_potential": "output_effective_potential_ry"}
+    else:
+        keys = {
+            name: f"scf_potential_{name}" for name in _REQUIRED[mode]
+        }
+    missing = [key for key in keys.values() if key not in files]
+    if missing:
+        raise ValueError(
+            f"{archive_path} lacks {missing}; rerun the SCF with this version "
+            f"to store the converged potentials needed for mode {mode!r}"
+        )
+    potentials = {name: np.asarray(archive[key]) for name, key in keys.items()}
+    for name, value in potentials.items():
+        if value.shape[-1] != system.grid.size:
+            raise ValueError(
+                f"{archive_path}: potential {name!r} has {value.shape[-1]} grid points, "
+                f"the input's grid has {system.grid.size}"
+            )
+    eigenvalue_key = "eigenvalues_up_ry" if mode == "spin_polarized" else "eigenvalues_ry"
+    k_count = int(archive["n_kpoints"]) if "n_kpoints" in files else 1
+    number_of_states = int(np.asarray(archive[eigenvalue_key]).size // k_count)
+    return potentials, float(archive["fermi_level_ry"]), number_of_states
+
+
 def spin_expectation(spinors: np.ndarray) -> np.ndarray:
     """``<sigma_x>, <sigma_y>, <sigma_z>`` of every spinor column, shape ``(n, 3)``."""
     n_grid = spinors.shape[0] // 2
@@ -113,13 +162,17 @@ def run_band_structure(
     fermi_level: float,
     number_of_states: int,
     callback: Callable[[int, int, np.ndarray, float], None] | None = None,
+    residual_tolerance: float = 2.0e-2,
+    max_attempts: int = 5,
 ) -> BandStructureResult:
     """Diagonalize the SCF Hamiltonian along ``settings``' path.
 
     ``potentials`` are the converged local potentials (:func:`band_potentials`),
     ``number_of_states`` the number of bands reported per k-point (and per
     spin channel).  ``callback(k_index, n_kpoints, eigenvalues, residual)`` is
-    called after each k-point.
+    called after each k-point.  ``residual_tolerance`` [Ry] and ``max_attempts``
+    control the CHEBDAV re-solve described in the module docstring (a CHEBFF
+    first solver is never retried).
     """
 
     if mode not in MODES:
@@ -138,6 +191,7 @@ def run_band_structure(
     n_k = k_points.shape[0]
     eigenvalues = np.zeros((len(channels), n_k, number_of_states))
     residuals = np.zeros((len(channels), n_k))
+    attempts = np.ones((len(channels), n_k), dtype=int)
     sigma = np.zeros((1, n_k, number_of_states, 3)) if spinor else None
 
     def hamiltonians(k_point):
@@ -180,17 +234,39 @@ def run_band_structure(
             )
         ]
 
+    def solve(operator, attempt: int):
+        """One diagonalization; later attempts use a larger CHEBDAV block and a new seed."""
+        settings_now = eigval_settings
+        if attempt and eigval_settings.initial_method == "chebdav":
+            base = eigval_settings.chebdav
+            settings_now = dataclasses.replace(
+                eigval_settings,
+                chebdav=dataclasses.replace(
+                    base,
+                    block_size=base.block_size + 2 * attempt,
+                    random_seed=base.random_seed + attempt,
+                ),
+            )
+        solution = solve_eigval(operator, number_of_states, settings=settings_now, state=None)
+        values = np.asarray(solution.eigenvalues, dtype=float)
+        vectors = np.asarray(solution.vectors)
+        residual = np.asarray(operator @ vectors) - vectors * values[None, :]
+        return values, vectors, float(np.max(np.linalg.norm(residual, axis=0)))
+
+    can_retry = eigval_settings.initial_method == "chebdav"
     for index, k_point in enumerate(k_points):
         worst = 0.0
         for channel, hamiltonian in enumerate(hamiltonians(k_point)):
             operator = hamiltonian.as_linear_operator()
-            solution = solve_eigval(
-                operator, number_of_states, settings=eigval_settings, state=None
-            )
-            values = np.asarray(solution.eigenvalues, dtype=float)
-            vectors = np.asarray(solution.vectors)
-            residual = np.asarray(operator @ vectors) - vectors * values[None, :]
-            residuals[channel, index] = float(np.max(np.linalg.norm(residual, axis=0)))
+            best = None
+            for attempt in range(max_attempts if can_retry else 1):
+                trial = solve(operator, attempt)
+                attempts[channel, index] = attempt + 1
+                if best is None or trial[2] < best[2]:
+                    best = trial
+                if trial[2] <= residual_tolerance:
+                    break
+            values, vectors, residuals[channel, index] = best
             eigenvalues[channel, index] = values
             if spinor:
                 sigma[0, index] = spin_expectation(vectors)
@@ -208,6 +284,7 @@ def run_band_structure(
         residual_norms=residuals,
         fermi_level=float(fermi_level),
         spin_expectation=sigma,
+        attempts=attempts,
     )
 
 
@@ -216,6 +293,7 @@ __all__ = [
     "band_mode",
     "band_path_cartesian",
     "band_potentials",
+    "load_scf_for_bands",
     "run_band_structure",
     "spin_expectation",
 ]

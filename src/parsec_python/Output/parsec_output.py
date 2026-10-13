@@ -898,13 +898,26 @@ class ParsecTextReporter:
                 f" Largest eigenpair residual |H v - e v| : {worst:12.4E} [Ry]",
             ]
         )
+        attempts = getattr(result, "attempts", None)
+        if attempts is not None and int(attempts.max()) > 1:
+            retried = int(np.count_nonzero(attempts > 1))
+            lines.append(
+                f" CHEBDAV re-solved {retried} k-point(s) with a larger block "
+                f"(up to {int(attempts.max())} attempts) to converge degenerate levels."
+            )
         if worst > 1.0e-2:
-            lines.append(
-                " WARNING: the bands are poorly converged (CHEBFF has no convergence test);"
-            )
-            lines.append(
-                "          increase FF_MaxIter and/or Chebdav_Degree to tighten them."
-            )
+            if self.problem.eigensolver.method == "chebff":
+                advice = (
+                    "CHEBFF has no convergence test: increase FF_MaxIter and/or "
+                    "Chebdav_Degree, or use Eigensolver: chebdav."
+                )
+            else:
+                advice = (
+                    "the unconverged ones are usually the highest reported bands: raise "
+                    "States_Num or Subspace_Buffer_Size."
+                )
+            lines.append(" WARNING: some bands have a residual above 1e-2 Ry;")
+            lines.append(f"          {advice}")
         if elapsed_seconds:
             lines.append(f" Time for band structure [sec] : {elapsed_seconds:10.2f}")
         for path in files:

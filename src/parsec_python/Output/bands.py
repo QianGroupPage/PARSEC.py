@@ -121,6 +121,8 @@ def save_band_structure_archive(path: str | Path, result: BandStructureResult) -
     }
     if result.spin_expectation is not None:
         payload["spin_expectation"] = result.spin_expectation
+    if result.attempts is not None:
+        payload["solver_attempts"] = result.attempts
     np.savez_compressed(path, **payload)
     return path
 
@@ -137,6 +139,7 @@ def load_band_structure_archive(path: str | Path) -> BandStructureResult:
         residual_norms=archive["residual_norms"],
         fermi_level=float(archive["fermi_level_ry"]),
         spin_expectation=archive["spin_expectation"] if "spin_expectation" in archive.files else None,
+        attempts=archive["solver_attempts"] if "solver_attempts" in archive.files else None,
     )
 
 

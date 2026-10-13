@@ -153,6 +153,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="text log path; defaults to parsec.out beside parsec.in",
     )
     parser.add_argument(
+        "--bands-from",
+        type=Path,
+        default=None,
+        metavar="ARCHIVE.npz",
+        help=(
+            "skip the SCF and compute the bandstruc bands from the converged potential in a "
+            "previous run's result archive (reference solver; log: parsec_bands.out)"
+        ),
+    )
+    parser.add_argument(
         "--no-archive",
         action="store_true",
         help="do not write parsec_python_results.npz",
@@ -321,6 +331,7 @@ def _reference_argv(arguments: argparse.Namespace) -> list[str]:
         ("--pp-dir", arguments.pp_dir),
         ("--output", arguments.output),
         ("--log", arguments.log),
+        ("--bands-from", arguments.bands_from),
     ):
         if value is not None:
             argv += [flag, str(value)]
@@ -341,6 +352,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.profile_repeats < 1:
         print("Input error: --profile-repeats must be positive", file=sys.stderr)
         return 2
+    if arguments.bands_from is not None:
+        # Bands from a stored SCF potential only exist in the reference solver.
+        return reference_main(_reference_argv(arguments))
     try:
         translation = parse_parsec_input(
             arguments.input,

@@ -714,6 +714,9 @@ class BandStructureResult:
     residual_norms: np.ndarray
     fermi_level: float
     spin_expectation: np.ndarray | None = None
+    attempts: np.ndarray | None = None
+    """Diagonalization attempts per ``(channel, k-point)``: 1 unless the CHEBDAV
+    re-solve with a larger block was needed (see :mod:`parsec_python.SCF.bands`)."""
 
     @property
     def segment_index(self) -> np.ndarray:

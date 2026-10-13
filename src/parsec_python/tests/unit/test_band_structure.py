@@ -9,6 +9,7 @@ levels come in Kramers pairs, and spin-polarized runs return two channels.
 
 from __future__ import annotations
 
+import dataclasses
 import shutil
 import tempfile
 import unittest
@@ -263,6 +264,135 @@ class BandStructureRunTests(unittest.TestCase):
             )
             self.assertEqual(cli_main([str(directory / "parsec.in"), "--quiet"]), 2)
             self.assertFalse((directory / "bands.dat").exists())
+
+
+class BandsFromArchiveTests(unittest.TestCase):
+    """``--bands-from``: bands from the converged potential of a previous run."""
+
+    def _setup(
+        self, directory: Path, extra: str = "", states: int = 12, bands: str = _PATH, so_psp: str = "false"
+    ) -> Path:
+        shutil.copy(_AU_POTRE, directory / "Au_POTRE.DAT")
+        (directory / "parsec.in").write_text(
+            _INPUT.format(states=states, so_psp=so_psp, extra=extra, kpoints=_MP, bands=bands),
+            encoding="utf-8",
+        )
+        return directory / "parsec.in"
+
+    def test_reproduces_the_bands_of_the_scf_run_without_touching_its_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            parsec_in = self._setup(directory)
+            self.assertEqual(cli_main([str(parsec_in), "--quiet"]), 0)
+            first = load_band_structure_archive(directory / "parsec_python_bands.npz")
+            scf_log = (directory / "parsec.out").read_text(encoding="utf-8")
+            archive = np.load(directory / "parsec_python_results.npz")
+            self.assertIn("output_effective_potential_ry", archive.files)
+
+            (directory / "parsec_python_bands.npz").unlink()
+            code = cli_main(
+                [str(parsec_in), "--bands-from", str(directory / "parsec_python_results.npz"), "--quiet"]
+            )
+            self.assertEqual(code, 0)
+            second = load_band_structure_archive(directory / "parsec_python_bands.npz")
+            np.testing.assert_allclose(second.eigenvalues, first.eigenvalues, atol=1e-8)
+            self.assertAlmostEqual(second.fermi_level, first.fermi_level, places=10)
+            self.assertEqual((directory / "parsec.out").read_text(encoding="utf-8"), scf_log)
+            self.assertIn(
+                "no SCF", (directory / "parsec_bands.out").read_text(encoding="utf-8")
+            )
+
+    def test_spin_orbit_archive_stores_the_potentials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            parsec_in = self._setup(
+                directory, extra="\nSO_from_scratch: .true.\n", states=20, so_psp="true"
+            )
+            # Write the SCF archive without computing bands first (bandstruc removed).
+            no_bands = directory / "scf_only.in"
+            no_bands.write_text(
+                parsec_in.read_text(encoding="utf-8").replace(_PATH, ""), encoding="utf-8"
+            )
+            self.assertEqual(cli_main([str(no_bands), "--quiet", "--output", "scf.npz"]), 0)
+            archive = np.load(directory / "scf.npz")
+            self.assertIn("scf_potential_effective_potential", archive.files)
+            self.assertEqual(
+                archive["scf_potential_effective_potential"].shape[0], archive["density_e_per_bohr3"].shape[0]
+            )
+            code = cli_main([str(parsec_in), "--bands-from", str(directory / "scf.npz"), "--quiet"])
+            self.assertEqual(code, 0)
+            bands = load_band_structure_archive(directory / "parsec_python_bands.npz")
+            self.assertEqual(bands.mode, "soc")
+            e = bands.eigenvalues[0]
+            np.testing.assert_allclose(e[0], e[2], atol=5e-3)  # time reversal
+
+    def test_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            parsec_in = self._setup(directory)
+            self.assertEqual(
+                cli_main([str(parsec_in), "--bands-from", str(directory / "missing.npz"), "--quiet"]), 2
+            )
+            no_bands = self._setup(directory, bands="")
+            self.assertEqual(
+                cli_main([str(no_bands), "--bands-from", str(directory / "missing.npz"), "--quiet"]), 2
+            )
+
+
+class BandRetryTests(unittest.TestCase):
+    """A CHEBDAV result with a large residual is re-solved with a larger block."""
+
+    def test_scrambled_first_attempt_is_retried_and_recorded(self) -> None:
+        from unittest import mock
+
+        from parsec_python.Eigensolvers import solve_eigval as real_solve
+        from parsec_python.driver import prepare_periodic_single_point
+        from parsec_python.Grid import kpoint_sampling
+        from parsec_python.SCF import bands as bands_module
+        from parsec_python.SCF.kpoints import run_scf_kpoints
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            shutil.copy(_AU_POTRE, directory / "Au_POTRE.DAT")
+            (directory / "parsec.in").write_text(
+                _INPUT.format(states=12, so_psp="false", extra="", kpoints=_MP, bands=_PATH),
+                encoding="utf-8",
+            )
+            problem = parse_parsec_input(directory / "parsec.in").problem
+            system = prepare_periodic_single_point(problem)
+            k_points, weights = kpoint_sampling(problem)
+            scf = run_scf_kpoints(system, k_points, weights)
+            potentials = bands_module.band_potentials(scf, "scalar")
+
+            blocks_used: list[int] = []
+
+            def flaky(operator, requested, *, settings, state):
+                blocks_used.append(settings.chebdav.block_size)
+                solution = real_solve(operator, requested, settings=settings, state=state)
+                if len(blocks_used) % 2 == 1:  # every first attempt returns garbage vectors
+                    rng = np.random.default_rng(len(blocks_used))
+                    garbage = rng.normal(size=solution.vectors.shape) + 0j
+                    garbage /= np.linalg.norm(garbage, axis=0)
+                    solution = dataclasses.replace(solution, vectors=garbage)
+                return solution
+
+            with mock.patch.object(bands_module, "solve_eigval", flaky):
+                result = bands_module.run_band_structure(
+                    system,
+                    problem.bands,
+                    mode="scalar",
+                    potentials=potentials,
+                    fermi_level=scf.fermi_level,
+                    number_of_states=12,
+                )
+            self.assertTrue(np.all(result.attempts == 2))
+            self.assertEqual(blocks_used[:2], [6, 8])  # first the configured block, then block + 2
+            self.assertLess(result.residual_norms.max(), 2e-2)
+            reference = bands_module.run_band_structure(
+                system, problem.bands, mode="scalar", potentials=potentials,
+                fermi_level=scf.fermi_level, number_of_states=12,
+            )
+            self.assertTrue(np.all(reference.attempts == 1))
 
 
 class BandFileTests(unittest.TestCase):

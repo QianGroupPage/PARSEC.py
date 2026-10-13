@@ -30,7 +30,12 @@ from .models import (
 from .Grid import kpoint_sampling
 from .Output import ParsecTextReporter
 from .Output.bands import save_band_structure_archive, write_bands_files
-from .SCF.bands import band_mode, band_potentials, run_band_structure
+from .SCF.bands import (
+    band_mode,
+    band_potentials,
+    load_scf_for_bands,
+    run_band_structure,
+)
 from .SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_polarized
 from .SCF.noncollinear import (
     run_self_consistent_noncollinear,
@@ -130,6 +135,12 @@ def _k_point_payload(result) -> dict[str, np.ndarray]:
             np.asarray(eigenvalues).size // k_points.shape[0]
         ),
     }
+
+
+def _scf_potential_payload(result) -> dict[str, np.ndarray]:
+    """Converged local potentials of a periodic run (inputs of a band calculation)."""
+    potentials = getattr(result, "scf_potentials", None) or {}
+    return {f"scf_potential_{name}": np.asarray(value) for name, value in potentials.items()}
 
 
 def save_result_archive(
@@ -311,6 +322,7 @@ def save_result_archive(
     if include_wavefunctions:
         payload["wavefunctions"] = result.wavefunctions
     payload.update(_k_point_payload(result))
+    payload.update(_scf_potential_payload(result))
     np.savez_compressed(output, **payload)
     return output
 
@@ -365,6 +377,7 @@ def save_spin_polarized_result_archive(
                 soc_result.spinor_coefficients_down
             )
     payload.update(_k_point_payload(result))
+    payload.update(_scf_potential_payload(result))
     np.savez_compressed(output, **payload)
     return output
 
@@ -404,8 +417,17 @@ def save_self_consistent_soc_result_archive(
     if include_wavefunctions:
         payload["spinors"] = result.spinors
     payload.update(_k_point_payload(result))
+    payload.update(_scf_potential_payload(result))
     np.savez_compressed(output, **payload)
     return output
+
+
+def _write_band_outputs(band_result, reporter, directory: Path, start: float) -> None:
+    files = list(write_bands_files(directory, band_result))
+    files.append(
+        save_band_structure_archive(directory / "parsec_python_bands.npz", band_result)
+    )
+    reporter.band_structure(band_result, files, time.perf_counter() - start)
 
 
 def _run_band_structure(system, translation, result, reporter, directory: Path) -> None:
@@ -432,9 +454,26 @@ def _run_band_structure(system, translation, result, reporter, directory: Path) 
         fermi_level=result.fermi_level,
         number_of_states=np.asarray(eigenvalues).size // k_count,
     )
-    files = list(write_bands_files(directory, band_result))
-    files.append(save_band_structure_archive(directory / "parsec_python_bands.npz", band_result))
-    reporter.band_structure(band_result, files, time.perf_counter() - start)
+    _write_band_outputs(band_result, reporter, directory, start)
+
+
+def _run_bands_from_archive(system, translation, archive, reporter, directory: Path) -> None:
+    """Bands from the potentials stored in a previous run's archive (no SCF)."""
+    mode = band_mode(translation.problem)
+    potentials, fermi_level, number_of_states = load_scf_for_bands(
+        archive, translation.problem, system, mode
+    )
+    reporter.write(f" Band structure from the converged potential in {archive} (no SCF).")
+    start = time.perf_counter()
+    band_result = run_band_structure(
+        system,
+        translation.problem.bands,
+        mode=mode,
+        potentials=potentials,
+        fermi_level=fermi_level,
+        number_of_states=number_of_states,
+    )
+    _write_band_outputs(band_result, reporter, directory, start)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -475,6 +514,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "include wavefunctions even when Output_All_States is false "
             "(they can make the archive large)"
+        ),
+    )
+    parser.add_argument(
+        "--bands-from",
+        type=Path,
+        default=None,
+        metavar="ARCHIVE.npz",
+        help=(
+            "skip the SCF and compute the bandstruc bands from the converged potential "
+            "stored in a previous run's result archive (written next to parsec.in as "
+            "parsec_bands.out unless --log is given)"
         ),
     )
     parser.add_argument(
@@ -526,7 +576,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     input_directory = translation.source.parent
-    log_path = _resolve_output(arguments.log, input_directory, "parsec.out")
+    if arguments.bands_from is not None:
+        if translation.problem.bands is None:
+            print("Input error: --bands-from needs a bandstruc block in the input", file=sys.stderr)
+            return 2
+        if not arguments.bands_from.exists():
+            print(f"Input error: {arguments.bands_from} does not exist", file=sys.stderr)
+            return 2
+    log_path = _resolve_output(
+        arguments.log,
+        input_directory,
+        "parsec.out" if arguments.bands_from is None else "parsec_bands.out",
+    )
     archive_path = _resolve_output(
         arguments.output, input_directory, "parsec_python_results.npz"
     )
@@ -598,6 +659,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 system = prepare_single_point(translation.problem)
             reporter.setup(system)
 
+            if arguments.bands_from is not None:
+                _run_bands_from_archive(
+                    system, translation, arguments.bands_from, reporter, input_directory
+                )
+                log.write(f"Text log: {log_path}")
+                return 0
+
             scf_start = time.perf_counter()
             if self_consistent_spin_orbit or noncollinear:
                 if is_periodic:
@@ -654,13 +722,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                 scf_elapsed = time.perf_counter() - scf_start
                 reporter.finish_self_consistent_soc(result, scf_elapsed)
-                _run_band_structure(
-                    system, translation, result, reporter, input_directory
-                )
-
-                total_elapsed = time.perf_counter() - start
-                log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
-
                 if not arguments.no_archive:
                     saved = save_self_consistent_soc_result_archive(
                         archive_path,
@@ -671,6 +732,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ),
                     )
                     log.write(f"Result archive: {saved}")
+                # The SCF archive is written first: the band calculation can take a long time
+                # and a crash there must not lose the converged SCF.
+                _run_band_structure(
+                    system, translation, result, reporter, input_directory
+                )
+                total_elapsed = time.perf_counter() - start
+                log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
                 log.write(f"Text log: {log_path}")
                 return 0 if result.converged else 3
 
@@ -700,13 +768,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                         translation.problem.pseudopotentials,
                     )
                     reporter.spin_orbit_correction(soc_result)
-                _run_band_structure(
-                    system, translation, result, reporter, input_directory
-                )
-
-                total_elapsed = time.perf_counter() - start
-                log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
-
                 if not arguments.no_archive:
                     saved = save_spin_polarized_result_archive(
                         archive_path,
@@ -718,6 +779,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ),
                     )
                     log.write(f"Result archive: {saved}")
+                # The SCF archive is written first: the band calculation can take a long time
+                # and a crash there must not lose the converged SCF.
+                _run_band_structure(
+                    system, translation, result, reporter, input_directory
+                )
+                total_elapsed = time.perf_counter() - start
+                log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
                 log.write(f"Text log: {log_path}")
                 return 0 if result.converged else 3
 
@@ -730,10 +798,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = run_scf(system, callback=reporter.iteration)
             scf_elapsed = time.perf_counter() - scf_start
             reporter.finish(result, scf_elapsed)
-            _run_band_structure(system, translation, result, reporter, input_directory)
-            total_elapsed = time.perf_counter() - start
-            log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
-
             if not arguments.no_archive:
                 saved = save_result_archive(
                     archive_path,
@@ -744,6 +808,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ),
                 )
                 log.write(f"Result archive: {saved}")
+            # The SCF archive is written first so a long band calculation cannot lose it.
+            _run_band_structure(system, translation, result, reporter, input_directory)
+            total_elapsed = time.perf_counter() - start
+            log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
             log.write(f"Text log: {log_path}")
             return 0 if result.converged else 3
     except KeyboardInterrupt:

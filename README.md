@@ -367,6 +367,21 @@ scratch by the SCF's first eigensolver (`Eigensolver`, default `chebdav`, which 
 poorly converged). The log reports the largest residual `|Hv - ev|` and warns when the bands are
 not converged.
 
+CHEBDAV adds `Matvec_Blocksize` vectors per step and, at a highly symmetric k-point whose
+degenerate level is larger than that block (an 8-fold level in a folded cubic cell, 16-fold with
+spin-orbit), can leave reported bands unconverged. This is an extension beyond Fortran: such a
+k-point is re-solved with a larger block and a new random start (up to five attempts, keeping the
+smallest residual), and the log and archive record how many k-points needed it.
+
+The converged SCF potentials are stored in the SCF archive (`parsec_python_results.npz`), which is
+written before the band step. To recompute bands (another path, `States_Num`, solver settings)
+without repeating the SCF, pass the archive back with `--bands-from` (the log goes to
+`parsec_bands.out`, so the SCF log is kept):
+
+```bash
+python -m parsec_python.main parsec.in --bands-from parsec_python_results.npz
+```
+
 Outputs (written next to `parsec.in`):
 
 * `bands.dat` and `bands_plot.dat` in Fortran's formats (eigenvalues in Ry / eV, not shifted by

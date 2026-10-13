@@ -32,14 +32,16 @@ export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export PARSEC_CUPY_DEVICES=auto
 export PARSEC_CUPY_MIXED_FILTER=off
 export PARSEC_CUPY_STAGE_TIMING=1
-python /path/to/parsec_python/src/parsec_python/main.py parsec.in --backend auto
+python /path/to/parsec_python/src/parsec_python/main.py parsec.in --device gpu
 ```
 
 Set the account and QoS from `sacctmgr show assoc user=$USER`. Follow the
 [site's current examples](https://scienceit-docs.lbl.gov/hpc/running/script-examples/)
 for CPU/GPU ratios and memory limits. Keep Slurm's `CUDA_VISIBLE_DEVICES`
 unchanged. `PARSEC_CUPY_DEVICES=0`, `0,1`, or `0,1,2,3` selects a subset of
-the GPUs allocated to this process. Use one Python task, not one driver per GPU.
+the GPUs allocated to this process, as `--gpu-ids 0,1` or `--gpus 2` does on
+the command line; `--device gpu` makes the run stop, instead of taking the
+CPU, where no GPU is usable. Use one Python task, not one driver per GPU.
 
 The example holds native CPU work at 14 threads for comparable 1/2/4-GPU
 tests. Additional CPUs allocated by Slurm are not automatically additional

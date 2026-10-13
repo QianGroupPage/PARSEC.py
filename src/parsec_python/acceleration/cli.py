@@ -37,6 +37,7 @@ from .Output import AcceleratedTextReporter
 from .backends.selection import resolve_backend
 from .SCF.single_point import materialize_wavefunctions
 from .driver import (
+    _cupy_installed,
     hartree_boundary_check_seconds,
     ionic_backend,
     prepare_single_point,
@@ -44,6 +45,7 @@ from .driver import (
     run_scf,
 )
 from .models import BackendUnavailableError
+from .resources import Resources, native_thread_information, resolve_resources
 
 
 class _RunLog:
@@ -118,10 +120,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
         description=(
-            "Run the modular isolated real-space DFT solver. By default, auto uses "
-            "an accuracy-preserving hybrid when available: native C++ for "
-            "finite-difference construction and Hartree, with CuPy for the "
-            "Hamiltonian and eigensolver."
+            "Run the modular isolated real-space DFT solver. By default it runs "
+            "on the GPU where one is usable and on the CPU otherwise (--device "
+            "auto), on every GPU the process can see and with the CPUs it may "
+            "use less four; --device, --gpus and --threads name them explicitly. "
+            "On the GPU the Hamiltonian and the eigensolver run in CuPy and, "
+            "with the native extension, finite-difference construction and "
+            "Hartree in C++; results are in double precision either way."
         ),
     )
     parser.add_argument("input", type=Path, help="PARSEC input file, usually parsec.in")
@@ -137,14 +142,62 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--device",
+        choices=("auto", "gpu", "cpu"),
+        default=None,
+        help=(
+            "where the calculation runs: auto (default) takes the GPU if CuPy "
+            "finds a usable one and the CPU otherwise; gpu requires a GPU and "
+            "stops where there is none; cpu never touches a GPU. The variable "
+            "PARSEC_DEVICE gives the same choice to a job script; parsec.out "
+            "says what ran"
+        ),
+    )
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument(
+        "--gpus",
+        default=None,
+        metavar="N|all",
+        help=(
+            "how many GPUs of this node to use: all (default) is every GPU the "
+            "process can see, which in a scheduler job is what the job was "
+            "given; N takes the first N of them. Naming a number asks for a "
+            "GPU run"
+        ),
+    )
+    gpu_group.add_argument(
+        "--gpu-ids",
+        default=None,
+        metavar="LIST",
+        help=(
+            "the GPUs to use by index, such as 0,2: indices count the GPUs the "
+            "process can see (inside CUDA_VISIBLE_DEVICES, which is left alone)"
+        ),
+    )
+    parser.add_argument(
+        "--threads",
+        default=None,
+        metavar="N|all|auto",
+        help=(
+            "CPU threads of the C++/OpenMP kernels: auto (default) follows "
+            "OMP_NUM_THREADS and otherwise takes the CPUs the process may use "
+            "less four, all takes every one of them, N names the number. The "
+            "CPUs are those of the allocation in a scheduler job, not those of "
+            "the machine"
+        ),
+    )
+    parser.add_argument(
         "--backend",
         choices=("auto", "scipy", "native", "cupy"),
         default="auto",
         help=(
-            "execution policy; auto may combine native setup/Hartree with "
-            "CuPy Hamiltonian/eigensolver work and may fall back, while "
-            "explicit scipy, native, and cupy are clean comparison modes; "
-            "every selected component and fallback is recorded"
+            "which implementation executes, for controlled comparisons; "
+            "--device is the usual choice. auto (default) follows --device: on "
+            "the GPU it combines native setup/Hartree with the CuPy "
+            "Hamiltonian/eigensolver, on the CPU it takes native C++ or, "
+            "without the extension, SciPy. Explicit scipy and native (CPU) and "
+            "cupy (GPU) never fall back; every selected component and fallback "
+            "is recorded"
         ),
     )
     parser.add_argument(
@@ -261,8 +314,62 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _visible_gpus(resources: Resources) -> int:
+    """Count the GPUs of this process and hold a named number or list against them."""
+
+    from .backends.cupy import CuPyUnavailableError, cupy_device_count
+
+    try:
+        visible = cupy_device_count()
+    except CuPyUnavailableError as error:
+        raise BackendUnavailableError(
+            f"a GPU run was requested ({resources.device_source}) but no GPU is usable: {error}"
+        ) from error
+    resources.check_gpus(visible)
+    return visible
+
+
+def _resource_report(resources: Resources, system) -> list[str]:
+    """The lines of ``parsec.out`` that say what the calculation runs on."""
+
+    info = system.backend_info
+    gpus = visible = None
+    if info.selected == "cupy":
+        from .Eigensolvers.symmetry import selected_device_ids
+        from .backends.cupy import cupy_device_count, require_cupy
+
+        cp, _ = require_cupy()
+        visible = cupy_device_count()
+        gpus = selected_device_ids(int(cp.cuda.Device().id))
+    return resources.report_lines(
+        info.selected,
+        fallback_reasons=tuple(info.fallback_reasons),
+        gpus=gpus,
+        visible_gpus=visible,
+        native=native_thread_information(),
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
+    try:
+        resources = resolve_resources(
+            device=arguments.device,
+            gpus=arguments.gpus,
+            gpu_ids=arguments.gpu_ids,
+            threads=arguments.threads,
+            backend=arguments.backend,
+        )
+    except ValueError as error:
+        print(f"Input error: {error}", file=sys.stderr)
+        return 2
+    # The request reaches the solver through its variables, for this
+    # calculation only: a process that runs several keeps none of them.
+    with resources.applied():
+        return _run(arguments, resources)
+
+
+def _run(arguments: argparse.Namespace, resources: Resources) -> int:
     if arguments.profile_repeats < 1:
         print("Input error: --profile-repeats must be positive", file=sys.stderr)
         return 2
@@ -335,6 +442,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             domain_lines = domain_dry_run_lines(translation, pseudopotentials)
             selection = resolve_backend(arguments.backend, translation.problem)
+            visible_gpus = _visible_gpus(resources) if selection.selected == "cupy" else None
         except (OSError, ValueError, BackendUnavailableError, NotImplementedError) as error:
             print(f"Validation error: {error}", file=sys.stderr)
             return 2
@@ -347,6 +455,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Backend: requested={selection.requested}, "
             f"selected={selection.selected}"
         )
+        for line in resources.dry_run_lines(selection.selected, visible_gpus):
+            print(line)
         print(
             "Finite-difference builder: "
             f"{selection.finite_difference_builder}"
@@ -360,6 +470,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"BACKEND FALLBACK: {reason}")
         print("Dry run successful; no grid or SCF calculation was started.")
         return 0
+
+    if resources.device == "gpu":
+        # A request for GPUs is held against what is there before any file
+        # of the calculation is written: a number or a list against the GPUs
+        # the process sees, and a plain request against the installation.
+        # Whether a device answers is left to the preparation, which asks
+        # the CUDA runtime beside its other work.
+        try:
+            if resources.names_gpus:
+                _visible_gpus(resources)
+            elif not _cupy_installed():
+                raise BackendUnavailableError(
+                    f"a GPU run was requested ({resources.device_source}) but CuPy is not "
+                    "installed in this Python environment: install the CuPy build of your "
+                    "CUDA version (python -m pip install cupy-cuda12x for CUDA 12), or run "
+                    "with --device cpu"
+                )
+        except (ValueError, BackendUnavailableError) as error:
+            print(f"Input error: {error}", file=sys.stderr)
+            return 2
 
     input_directory = translation.source.parent
     symmetry_cache_directory = _symmetry_cache_directory(arguments)
@@ -439,6 +569,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             system.materialize_final_wavefunctions = wavefunctions_wanted and not moving
             reporter.setup(system)
+            log.write("\n".join(_resource_report(resources, system)))
             if arguments.profile_operator:
                 component_times = profile_hamiltonian_components(
                     system,

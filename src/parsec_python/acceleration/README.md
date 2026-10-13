@@ -52,6 +52,9 @@ The canonical launcher accepts the same supported `parsec.in` and adjacent
 
 ```powershell
 python src\parsec_python\main.py INPUT
+python src\parsec_python\main.py INPUT --device gpu
+python src\parsec_python\main.py INPUT --device cpu --threads 16
+python src\parsec_python\main.py INPUT --device gpu --gpus 2
 python src\parsec_python\main.py INPUT --backend auto
 python src\parsec_python\main.py INPUT --backend scipy
 python src\parsec_python\main.py INPUT --backend native
@@ -71,11 +74,32 @@ The complete selection/profile form is:
 
 ```text
 python src\parsec_python\main.py INPUT \
+  --device {auto,gpu,cpu} [--gpus N|all | --gpu-ids LIST] [--threads N|all|auto] \
   --backend {auto,scipy,native,cupy} \
   --symmetry {auto,on,off} \
   [--symmetry-cache DIRECTORY | --no-symmetry-cache] \
   [--profile-operator]
 ```
+
+`--device` says where a calculation runs: `auto` (the default) takes the GPU
+if CuPy finds a usable one and the CPU otherwise, `gpu` stops where none is
+usable, and `cpu` neither imports CuPy nor creates a CUDA context. Under
+`--backend auto` a GPU run is the hybrid described below and a CPU run takes
+the native backend, or SciPy without the extension; `scipy` and `native`
+are CPU backends and `cupy` a GPU backend, and a backend that contradicts the
+device is refused. `--gpus N` takes the first `N` GPUs the process sees,
+`--gpu-ids` names them, and both ask for a GPU run; the default is every
+visible GPU. `--threads` names the OpenMP team of the native kernels (`all`
+for every CPU the process may use; the default keeps four of them free). The
+options are carried by `PARSEC_DEVICE`, `PARSEC_CUPY_DEVICES` and
+`OMP_NUM_THREADS`, which a job script can set instead; an option outranks its
+variable, and the launcher sets them for its calculation only. The CPUs
+counted are those of the affinity of the process, or fewer where
+`SLURM_CPUS_PER_TASK`, `PBS_NP`, `NCPUS`, `NSLOTS` or `LSB_DJOB_NUMPROC` says
+so, and in that last case the default thread count is taken from the variable
+instead of the count of the extension. `parsec.out` reports the device, the
+GPUs and the threads that ran under "Execution resources", and `--dry-run`
+prints the plan. The module is `acceleration/resources.py`.
 
 The symmetry mode defaults to `auto`: detect exact supported operations,
 apply every reduction supported by the selected backend, and safely retain

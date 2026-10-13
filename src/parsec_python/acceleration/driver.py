@@ -2133,8 +2133,16 @@ def _resolve_and_prepare_reference(
     clock records the backend resolution and the reference preparation.
     """
 
+    from .resources import device_policy
+
     normalized = str(backend).strip().lower()
     gpu_ionic = os.environ.get("PARSEC_IONIC_BACKEND", "native").lower() == "cupy"
+    cpu_only = device_policy() == "cpu"
+    if gpu_ionic and cpu_only:
+        raise ValueError(
+            "PARSEC_IONIC_BACKEND=cupy puts the ionic sums on the GPU, but a CPU "
+            "run was requested (--device cpu or PARSEC_DEVICE=cpu)"
+        )
     ionic_report: dict = {}
 
     def record(name, started):
@@ -2211,7 +2219,10 @@ def _resolve_and_prepare_reference(
     # The probe decides whether CuPy executes.  Defer for it only where CuPy
     # is installed at all, so that a host without it prepares the matrix
     # inside the overlap exactly as before.
-    defer_provisionally = defer_native_laplacian and _cupy_installed()
+    # Nor in a CPU run, where CuPy will not execute whether installed or not.
+    defer_provisionally = (
+        defer_native_laplacian and _cupy_installed() and not cpu_only
+    )
     if preparation is not None:
         # The probe already runs beside this reference preparation, and the
         # backend is not known to it: the symmetry maps stay in line.

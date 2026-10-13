@@ -34,7 +34,12 @@ $env:PYTHONPATH = (Resolve-Path src).Path
 python -m parsec_python calculation\parsec.in --no-archive
 ```
 
-All three commands select the optimized workflow. `--backend auto` combines
+All three commands select the optimized workflow. By default a calculation
+runs on the GPU where one is usable and on the CPU otherwise; `--device gpu`
+or `--device cpu` names the device, `--gpus N` (or `--gpu-ids`) the GPUs and
+`--threads N` the CPU threads, and `parsec.out` reports them under
+"Execution resources" (see "CPU or GPU, and how much of each" in the
+repository README). `--backend auto` combines
 the fastest compatible SciPy, native C++/OpenMP, and CuPy components.
 `--symmetry auto` detects exact supported operations and applies
 representation decomposition when profitable. Missing optional acceleration

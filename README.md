@@ -20,6 +20,7 @@ branch.
 **Getting started**
 
 - [Quick start](#quick-start)
+  - [CPU or GPU, and how much of each](#cpu-or-gpu-and-how-much-of-each)
 - [Linux installation](#linux-installation)
   - [1. Create a Python environment (CPU-only is sufficient)](#1-create-a-python-environment-cpu-only-is-sufficient)
   - [2. Add the C++/OpenMP CPU kernels (recommended)](#2-add-the-copenmp-cpu-kernels-recommended)
@@ -134,17 +135,90 @@ python src\parsec_python\main.py `
   --no-archive
 ```
 
-The launcher uses `--backend auto` and `--symmetry auto` by default. On a
-configured workstation this normally combines C++/OpenMP preparation and
-Hartree kernels with a CuPy Hamiltonian/eigensolver. It falls back to an exact
-supported backend when an optional accelerator is unavailable, and records
-every selection in `parsec.out`.
+### CPU or GPU, and how much of each
 
-Useful options include:
+The same command runs on a CPU and on a GPU. By default (`--device auto`) it
+takes the GPU when CuPy is installed and finds a usable NVIDIA GPU, and the
+CPU otherwise. Name the device to be sure of it:
+
+```powershell
+python src\parsec_python\main.py parsec.in                 # GPU if one is usable, otherwise CPU
+python src\parsec_python\main.py parsec.in --device gpu    # GPU; stops with a message if none is usable
+python src\parsec_python\main.py parsec.in --device cpu    # CPU only; no GPU is touched
+```
+
+How many GPUs and CPU threads it takes can be named as well. Each choice has
+a default and a variable that a job script can set instead of the option; an
+option outranks its variable:
+
+| Choice | Option | Default | Variable |
+|---|---|---|---|
+| Device | `--device auto\|gpu\|cpu` | `auto` | `PARSEC_DEVICE` |
+| GPUs | `--gpus N\|all`, or `--gpu-ids 0,2` for particular ones | `all`: every GPU the process can see | `PARSEC_CUPY_DEVICES` |
+| CPU threads | `--threads N\|all\|auto` | `auto`: the CPUs the process may use, less four kept free for Python and the GPU driver | `OMP_NUM_THREADS` |
+
+```powershell
+python src\parsec_python\main.py parsec.in --device gpu --gpus 2 --threads 16
+python src\parsec_python\main.py parsec.in --device cpu --threads all
+```
+
+`--gpus` or `--gpu-ids` alone asks for a GPU run. `--threads` sets the team
+of the C++/OpenMP kernels (setup and Hartree on a GPU run, the whole solver
+on a CPU run with the native extension); the BLAS of NumPy keeps its own
+variables (`OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`).
+
+What ran is at the top of `parsec.out`, and `--dry-run` prints the same plan
+without starting a calculation:
+
+```text
+ Execution resources:
+ --------------------
+ Device            = GPU (auto, the default: a usable GPU was found)
+ GPUs              = 2 of 2 visible, index 0,1; all visible, the default
+ CPU threads       = 28 of 32 CPUs allowed (affinity of the process); the default: allowed CPUs less 4
+```
+
+A GPU run needs an NVIDIA GPU with its driver and CuPy
+(`python -m pip install cupy-cuda12x`; see
+[step 3 of the Linux installation](#3-add-nvidia-gpu-acceleration-optional),
+the same command serves Windows), and is fastest with the
+[native extension](#optional-native-extension) beside it. A CPU run needs
+neither; with the extension it uses the C++/OpenMP solver, without it SciPy.
+Results are in double precision on either device.
+
+On a cluster, ask the scheduler for the CPUs and GPUs and start the same
+command inside the job. The defaults count what the job was given, not what
+the node has: the GPUs are those the scheduler made visible
+(`CUDA_VISIBLE_DEVICES`, which the code never changes; `--gpu-ids` counts
+inside it), and the CPUs are those the process is bound to, or fewer where
+`SLURM_CPUS_PER_TASK` (or `PBS_NP`, `NCPUS`, `NSLOTS`, `LSB_DJOB_NUMPROC`)
+says so. For example with Slurm:
+
+```bash
+#!/bin/bash
+#SBATCH --nodes=1 --ntasks=1 --cpus-per-task=16 --gpus=2
+source .venv/bin/activate
+python src/parsec_python/main.py path/to/calculation/parsec.in --device gpu
+```
+
+One command is one process on one node: it divides the symmetry sectors of
+the system among its GPUs. Do not start it with `mpirun` or several `srun`
+tasks, which would run the same calculation several times. For several nodes,
+and for the settings the multi-GPU solver was measured with, use
+`scripts/run_multi_gpu_scf.sh`
+([section 5](#5-several-gpus-and-several-nodes)).
+
+### Other options
+
+`--symmetry auto` is the default as well. On the GPU the Hamiltonian and
+the eigensolver run in CuPy and, with the native extension, preparation and
+Hartree in C++/OpenMP; every selection and every fallback is recorded in
+`parsec.out` under "Acceleration backend".
 
 | Option | Meaning |
 |---|---|
-| `--backend auto|scipy|native|cupy` | Select automatic hybrid execution or a controlled comparison backend. |
+| `--device auto\|gpu\|cpu`, `--gpus`, `--gpu-ids`, `--threads` | What the calculation runs on (above). |
+| `--backend auto\|scipy\|native\|cupy` | Which implementation executes, for controlled comparisons: `scipy` and `native` are CPU backends, `cupy` is the pure GPU backend, and none of the three falls back. `auto` follows `--device`. |
 | `--symmetry auto|on|off` | Detect exact supported symmetries, require them, or force the full grid. |
 | `--symmetry-cache DIR` | Keep exact-key symmetry maps and operators in `DIR`. No cache is the default (`--no-symmetry-cache` says so explicitly): a first calculation is fastest without one. |
 | `--pp-dir DIR` | Search an additional directory for `*_POTRE.DAT`. |
@@ -257,17 +331,20 @@ Check device access and a small FP64 calculation:
 python -c "import cupy as cp; print(cp.__version__); print('devices:', cp.cuda.runtime.getDeviceCount()); x = cp.arange(10, dtype=cp.float64); print('sum:', x.sum().item())"
 ```
 
-With both CuPy and the native extension installed, use the default **hybrid**
-execution policy:
+With CuPy installed the default (`--device auto`) already takes the GPU.
+Ask for it by name to have the run stop, instead of falling back to the CPU,
+if the GPU cannot be used:
 
 ```bash
 python src/parsec_python/main.py examples/h2_canonical_nodg/parsec.in \
-  --backend auto --no-archive
+  --device gpu --no-archive
 ```
 
-Inspect `Acceleration backend:` in `parsec.out`: a typical hybrid run reports
-`Selected backend = cupy` and `hartree_backend = native`. Explicit
-`--backend cupy` is a different comparison policy, not a synonym for hybrid.
+`Execution resources:` in `parsec.out` names the device, the GPUs and the CPU
+threads. With the native extension installed as well this is the **hybrid**
+policy: `Acceleration backend:` reports `Selected backend = cupy` and
+`hartree_backend = native`. Explicit `--backend cupy` is a different
+comparison policy (everything in CuPy), not a synonym for a GPU run.
 Set `Output_Level: 2` in `parsec.in` for full backend diagnostics; SCF output
 and final timing tables remain available at the default level `1`.
 
@@ -288,20 +365,24 @@ Linux uses `.venv/bin/activate`, not Windows `Scripts/Activate.ps1`; the launche
 uses the active Linux interpreter. Do not share a Windows virtual environment
 with Linux/WSL.
 
-The native default is the processor count detected by OpenMP minus four, with
-a minimum of one thread; individual small kernels may use fewer workers. Override
-it explicitly when needed, especially in a scheduler allocation:
+The native default is the number of CPUs the process may use minus four, with
+a minimum of one thread; individual small kernels may use fewer workers. Name
+the number when needed (`--threads all` takes every allowed CPU):
 
 ```bash
-export OMP_NUM_THREADS=8  # Example: replace with your allocated CPU count.
-python src/parsec_python/main.py path/to/calculation/parsec.in --no-archive
+python src/parsec_python/main.py path/to/calculation/parsec.in --threads 8 --no-archive
+export OMP_NUM_THREADS=8  # the same from the environment; --threads outranks it
 ```
 
 On a cluster, request CPU/GPU resources with the site's scheduler before running
-jobs. Do not assume the machine-wide detected CPU count equals your allocation;
-respect the site's GPU visibility settings. Do not use `mpirun` to launch this
-single-process command: that would start independent calculations, potentially
-writing to the same files, rather than distribute one SCF calculation.
+jobs; ["CPU or GPU, and how much of each"](#cpu-or-gpu-and-how-much-of-each)
+has a job script. The defaults follow the allocation: the CPUs the process is
+bound to (or `SLURM_CPUS_PER_TASK` and its like where a site does not bind
+its jobs) and the GPUs the scheduler made visible; the "Execution resources"
+lines of `parsec.out`, or of `--dry-run` inside the job, say what was found.
+Do not use `mpirun` to launch this single-process command: that would start
+independent calculations, potentially writing to the same files, rather than
+distribute one SCF calculation.
 
 For a new-system timing comparison, run without `--resident` and without
 `--symmetry-cache`: no symmetry cache is read or written unless that option
@@ -341,10 +422,14 @@ settings and says which ones the solver chooses for itself.
 - **CuPy import/NVRTC/CUDA library errors:** check the active environment, driver,
   CuPy distribution and CUDA library paths. On clusters, load the appropriate
   CUDA module; `nvidia-smi` succeeding is not a complete kernel test.
+- **The run used the CPU although the machine has a GPU:** `Execution
+  resources` in `parsec.out` gives the reason (CuPy missing, no visible
+  device). `--device gpu` makes such a run stop with that reason instead.
 - **Unexpected SciPy fallback:** examine the printed fallback reason and verify
-  the native and CuPy imports separately. `auto` can fall back; an explicit
-  `native` or `cupy` request fails if that backend is unavailable.
-- **Out of GPU memory:** try the CPU/native backend or a machine with more memory.
+  the native and CuPy imports separately. `auto` can fall back; `--device gpu`
+  and an explicit `native` or `cupy` backend fail if what they name is
+  unavailable.
+- **Out of GPU memory:** try `--device cpu` or a machine with more memory.
   Do not silently coarsen the grid or loosen convergence to make a job fit.
 
 ## Optional native extension
@@ -364,8 +449,8 @@ Verify the loaded binary:
 python -c "import parsec_accelerated_native as n; print(n.__file__); print(n.build_info())"
 ```
 
-The OpenMP default uses detected logical processors minus four unless
-`OMP_NUM_THREADS` explicitly overrides it.
+The OpenMP default uses the logical processors the process may use minus four
+unless `--threads` or `OMP_NUM_THREADS` names the number.
 
 ## Pseudopotentials
 

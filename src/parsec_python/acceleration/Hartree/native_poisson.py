@@ -81,9 +81,11 @@ class NativePoissonSolver:
         once, so subsequent density/SCF solves transfer vectors only.
     """
 
-    def __init__(self, negative_laplacian: sp.spmatrix) -> None:
-        self.backend = NativeConjugateGradientBackend(negative_laplacian)
-        self.negative_laplacian = self.backend.operator
+    def __init__(self, negative_laplacian: sp.spmatrix, *, backend_factory=None) -> None:
+        # The prepared GPU solver reuses this exact warm-start policy and
+        # result contract; its optional factory changes only linear algebra.
+        factory = NativeConjugateGradientBackend if backend_factory is None else backend_factory
+        self.backend = factory(negative_laplacian)
         self.shape = self.backend.shape
         self.storage_mode = self.backend.storage_mode
         self.worker_count = self.backend.worker_count
@@ -94,6 +96,15 @@ class NativePoissonSolver:
         self._previous_previous_solution: np.ndarray | None = None
         self.chronological_prediction_calls = 0
         self.last_chronological_alpha: float | None = None
+
+    @property
+    def negative_laplacian(self) -> sp.csr_matrix:
+        """Canonical CSR operator of the backend.
+
+        Read on demand: a prepared GPU backend that was handed a packed
+        stencil forms this matrix only when it is first asked for.
+        """
+        return self.backend.operator
 
     def solve(
         self,

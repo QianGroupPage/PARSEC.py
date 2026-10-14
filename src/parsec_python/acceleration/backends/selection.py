@@ -69,13 +69,59 @@ def resolve_backend(
     its complete supported path is used; SciPy is the final fallback.  The
     selected CHEBFF or CHEBDAV policy is preserved throughout: component
     selection never substitutes one eigensolver for the other.
+
+    ``PARSEC_DEVICE`` (``--device`` of the command line) narrows ``auto``:
+    ``cpu`` never probes or uses a GPU and takes the native path, or SciPy
+    without the extension; ``gpu`` requires CuPy with a usable device and
+    raises where there is none instead of running on the CPU.  An explicit
+    backend that contradicts the device is refused.
     """
+
+    from ..resources import device_policy
 
     normalized = str(requested).strip().lower()
     if normalized not in {"auto", "scipy", "native", "cupy"}:
         raise ValueError(
             "backend must be one of 'auto', 'scipy', 'native', or 'cupy'"
         )
+    device = device_policy()
+    if device == "gpu" and normalized in {"scipy", "native"}:
+        raise ValueError(
+            f"backend {normalized!r} runs on the CPU, but a GPU run was requested "
+            "(PARSEC_DEVICE=gpu or --device gpu)"
+        )
+    if device == "cpu" and normalized == "cupy":
+        raise ValueError(
+            "backend 'cupy' runs on the GPU, but a CPU run was requested "
+            "(PARSEC_DEVICE=cpu or --device cpu)"
+        )
+
+    if normalized == "auto" and device == "cpu":
+        # The GPU is left alone: CuPy is not imported and no CUDA context is
+        # created.
+        native_available, native_reason = _native_status()
+        if native_available:
+            return BackendSelection(
+                requested="auto",
+                selected="native",
+                finite_difference_builder="native",
+                hartree_backend="native",
+            )
+        return BackendSelection(
+            requested="auto",
+            selected="scipy",
+            finite_difference_builder="reference",
+            hartree_backend="scipy",
+            fallback_reasons=(f"native skipped: {native_reason}",),
+        )
+
+    if normalized == "auto" and device == "gpu":
+        cupy_available, cupy_reason = _cupy_status()
+        if not cupy_available:
+            raise BackendUnavailableError(
+                "a GPU run was requested (--device gpu or PARSEC_DEVICE=gpu) "
+                f"but no GPU is usable: {cupy_reason}"
+            )
 
     if normalized == "scipy":
         return BackendSelection(

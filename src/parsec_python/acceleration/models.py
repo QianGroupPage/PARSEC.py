@@ -87,6 +87,7 @@ class BackendStatistics:
     eigensolver_download_seconds: float = 0.0
     eigensolver_scheduler_batches: int = 0
     eigensolver_scheduler_wall_seconds: float = 0.0
+    eigensolver_bound_prepare_wall_seconds: float = 0.0
     density_calls: int = 0
     density_seconds: float = 0.0
     final_wavefunction_download_seconds: float = 0.0
@@ -144,6 +145,9 @@ class BackendStatistics:
             eigensolver_scheduler_batches=int(self.eigensolver_scheduler_batches),
             eigensolver_scheduler_wall_seconds=float(
                 self.eigensolver_scheduler_wall_seconds
+            ),
+            eigensolver_bound_prepare_wall_seconds=float(
+                self.eigensolver_bound_prepare_wall_seconds
             ),
             density_calls=int(self.density_calls),
             density_seconds=float(self.density_seconds),

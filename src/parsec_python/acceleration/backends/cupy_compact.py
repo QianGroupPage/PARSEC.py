@@ -112,14 +112,27 @@ def _coefficient_palette(values: np.ndarray) -> tuple[np.ndarray, np.ndarray] | 
 
     data = np.ascontiguousarray(values, dtype=np.float64)
     # Operate on IEEE-754 bits so +0/-0 and any other bit-distinct float64
-    # values remain distinct.  np.unique performs the 18-million-entry
-    # naphthalene encoding in compiled code; a Python dictionary loop made
-    # one-time backend preparation more expensive than several SCF steps.
-    unique_bits, inverse = np.unique(data.view(np.uint64), return_inverse=True)
-    if unique_bits.size > 256:
-        return None
-    palette = unique_bits.view(np.float64)
-    return palette, inverse.astype(np.uint8, copy=False)
+    # values remain distinct.
+    bits = data.view(np.uint64).ravel()
+    if bits.size == 0:
+        return bits.view(np.float64), np.empty(data.shape, dtype=np.uint8)
+    # A stencil has at most a few dozen distinct coefficients among tens of
+    # millions of entries.  Sorting every entry (np.unique) took seconds per
+    # symmetry sector.  Instead grow the sorted palette from the entries it
+    # does not yet contain and encode by binary search; the result equals
+    # np.unique(bits, return_inverse=True) exactly.
+    stride = max(1, bits.size // 1_000_000)
+    palette = np.unique(bits[::stride])
+    while True:
+        if palette.size > 256:
+            return None
+        codes = np.searchsorted(palette, bits)
+        np.minimum(codes, palette.size - 1, out=codes)
+        missing = np.flatnonzero(palette[codes] != bits)
+        if missing.size == 0:
+            break
+        palette = np.union1d(palette, bits[missing[:1_000_000]])
+    return palette.view(np.float64), codes.astype(np.uint8, copy=False).reshape(data.shape)
 
 
 class CuPyCompactFiniteDifference:

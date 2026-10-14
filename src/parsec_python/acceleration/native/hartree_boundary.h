@@ -56,6 +56,7 @@ public:
     );
     py::dict build_reduced(const FloatArray& wedge_density) const;
     py::dict export_symmetry_cache() const;
+    py::dict export_full_geometry() const;
 
     std::size_t size() const noexcept;
     std::size_t boundary_term_count() const noexcept;
@@ -65,6 +66,9 @@ public:
 private:
     std::size_t point_count_ = 0;
     int multipole_order_ = 0;
+    // Arrays over (l, m) hold stride_*stride_ entries, stride_ = order+1.
+    int stride_ = 1;
+    std::size_t storage_ = 1;
     double volume_element_ = 0.0;
 
     // Angular coordinates of the active source points.  Caching these avoids
@@ -85,7 +89,8 @@ private:
     std::vector<double> boundary_phase_real_;
     std::vector<double> boundary_phase_imag_;
 
-    // Normalized complex Y_lm prefactors, stored at l*10+m for 0<=m<=l<=9.
+    // Normalized complex Y_lm prefactors, stored at l*stride_+m for
+    // 0<=m<=l<=order.
     std::vector<double> normalization_;
 
     // Optional exact-orbit data.  Coefficient (w,lm) is the full sum of

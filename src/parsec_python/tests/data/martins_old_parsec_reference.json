@@ -1,0 +1,1741 @@
+{
+ "comment": "Fortran PARSEC (development version 1.4.x, gfortran 13.3) for inputs with an old Martins pseudopotential (Pseudopotential_Format: martins_old, *_POTR.DAT, with Potential_Num, Electron_Per_Orbital and Core_Cutoff_Radius) and, for SiNa4, occupations read from occup.in.  Numbers are read from parsec.out with Output_Level 2, in bohr, Ry and Ry/bohr with the digits Fortran prints; every SCF loop is converged to 1e-8 Ry.  'eigenvalues', 'occupations' and 'energies' are those of the last SCF step.  A Python run needs Hartree_Boundary_Tolerance: off to use PARSEC's Hartree boundary values.  A file entry {'martins_old_from': name} is the new-format file 'name' rewritten by tests/martins_old_reference.py.",
+ "cases": {
+  "sina4": {
+   "comment": "Input structure of the Fortran example examples/tests/relaxation, its input without the Minimization lines: Si from an old Martins file, Na from a new one, occupations from occup.in (Fermi_Temp: -1).",
+   "input": [
+    "# Cluster SiNa4 with structural relaxation (BFGS),",
+    "# manual input of level occupancy.",
+    "",
+    "Boundary_Sphere_Radius:  4.0 ang",
+    "Grid_Spacing:  0.8",
+    "",
+    "States_Num:  8",
+    "Fermi_Temp:  -1",
+    "Max_Iter:  200",
+    "Eigensolver: chebff   #arpack",
+    "",
+    "Coordinate_Unit: Cartesian_Ang",
+    "",
+    "Mixing_Method: Anderson",
+    "Mixing_Param:  0.28",
+    "Memory_Param:  3",
+    "",
+    "Correlation_Type: CA",
+    "",
+    "",
+    "Atom_Types_Num:  2",
+    "",
+    "#------------ new atom type ---------------- ",
+    "Atom_Type: Si",
+    "",
+    "Pseudopotential_Format: martins_old",
+    "Core_Cutoff_Radius:  2.5",
+    "Local_Component: p",
+    "Potential_Num:  2",
+    "",
+    "begin Electron_Per_Orbital",
+    "# S P D F",
+    "2 2 0",
+    "end Electron_Per_Orbital",
+    "",
+    "Move_Flag:  0",
+    "begin Atom_Coord",
+    "       0.000000    0.000000    0.000000",
+    "end Atom_Coord",
+    "",
+    "#------------ end of atom type ------------- ",
+    "",
+    "#------------ new atom type ----------------",
+    "Atom_Type: Na",
+    "",
+    "Pseudopotential_Format: martins_new",
+    "Local_Component: p",
+    "",
+    "begin Atom_Coord",
+    "     1.014049     1.014953     1.013144",
+    "    -1.014049    -1.014953     1.013144",
+    "    -1.014049     1.014953    -1.013144",
+    "     1.014049    -1.014953    -1.013144",
+    "end Atom_Coord",
+    "",
+    "#------------ end of atom type -------------",
+    "",
+    "Output_Level: 2",
+    "Convergence_Criterion: 1.0e-8"
+   ],
+   "files": {
+    "Si_POTR.DAT": "Si_POTR.DAT",
+    "Na_POTRE.DAT": "Na_POTRE.DAT",
+    "occup.in": "sina4_occup.in"
+   },
+   "pseudopotentials": {
+    "Si": {
+     "format": "martins_old",
+     "radial_parameter_a": 0.000177054,
+     "radial_parameter_b": 0.01,
+     "core_correction": false,
+     "occupancy": [
+      2.0,
+      2.0
+     ],
+     "components": 2,
+     "local_angular_momentum": 1,
+     "core_radius": 2.5,
+     "normalization": [
+      1.00001667,
+      1.00001667
+     ],
+     "kb_integral": [
+      0.21548354,
+      0.0
+     ]
+    },
+    "Na": {
+     "format": "martins_new",
+     "radial_parameter_a": 0.000225341,
+     "radial_parameter_b": 0.01,
+     "core_correction": false,
+     "occupancy": [
+      1.0,
+      0.0,
+      0.0
+     ],
+     "components": 3,
+     "local_angular_momentum": 1,
+     "core_radius": 3.1,
+     "normalization": [
+      1.00001667,
+      1.00001667,
+      1.00767879
+     ],
+     "kb_integral": [
+      0.01247387,
+      0.0,
+      -0.0
+     ]
+    }
+   },
+   "hamiltonian_size": 3544,
+   "nonlocal_block_sizes": [
+    136,
+    245,
+    245,
+    245,
+    245
+   ],
+   "atomic_density_charge": 7.5117,
+   "scf_steps": 16,
+   "eigenvalues": [
+    -0.5447301198,
+    -0.1356593208,
+    -0.1356515331,
+    -0.1356434887,
+    0.0929339765,
+    0.1971616319,
+    0.1973988024,
+    0.2462602819
+   ],
+   "occupations": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "representations": [
+    1,
+    3,
+    2,
+    4,
+    1,
+    1,
+    1,
+    3
+   ],
+   "energies": {
+    "eigenvalue": -1.90336892,
+    "hartree": 19.80648146,
+    "integral_vxc_rho": -5.31536039,
+    "exchange_correlation": -4.07853461,
+    "electron_ion": -41.30371766,
+    "ion_ion": 11.85521069,
+    "total": -8.6178139
+   },
+   "energy": -8.6178139,
+   "positions": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     1.916276,
+     1.917984,
+     1.914565
+    ],
+    [
+     -1.916276,
+     -1.917984,
+     1.914565
+    ],
+    [
+     -1.916276,
+     1.917984,
+     -1.914565
+    ],
+    [
+     1.916276,
+     -1.917984,
+     -1.914565
+    ]
+   ],
+   "ion_ion": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.515549,
+     0.515944,
+     0.515153
+    ],
+    [
+     -0.515549,
+     -0.515944,
+     0.515153
+    ],
+    [
+     -0.515549,
+     0.515944,
+     -0.515153
+    ],
+    [
+     0.515549,
+     -0.515944,
+     -0.515153
+    ]
+   ],
+   "ionic": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     -0.346079,
+     -0.346389,
+     -0.345769
+    ],
+    [
+     0.346079,
+     0.346389,
+     -0.345769
+    ],
+    [
+     0.346079,
+     -0.346389,
+     0.345769
+    ],
+    [
+     -0.346079,
+     0.346389,
+     0.345769
+    ]
+   ],
+   "sc": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     -0.0,
+     -0.0,
+     -0.0
+    ],
+    [
+     0.0,
+     0.0,
+     -0.0
+    ],
+    [
+     0.0,
+     -0.0,
+     0.0
+    ],
+    [
+     -0.0,
+     0.0,
+     0.0
+    ]
+   ],
+   "core": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ]
+   ],
+   "nonlocal": [
+    [
+     0.0,
+     0.0,
+     -0.0
+    ],
+    [
+     0.047724,
+     0.0478,
+     0.047652
+    ],
+    [
+     -0.047724,
+     -0.0478,
+     0.047652
+    ],
+    [
+     -0.047724,
+     0.0478,
+     -0.047652
+    ],
+    [
+     0.047724,
+     -0.0478,
+     -0.047652
+    ]
+   ],
+   "total": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.217195,
+     0.217355,
+     0.217036
+    ],
+    [
+     -0.217195,
+     -0.217355,
+     0.217036
+    ],
+    [
+     -0.217195,
+     0.217355,
+     -0.217036
+    ],
+    [
+     0.217195,
+     -0.217355,
+     -0.217036
+    ]
+   ],
+   "net": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  "sina4_shifted": {
+   "comment": "SiNa4 with Si and one Na displaced: no symmetry.  Four grid points lie between Core_Cutoff_Radius = 2.5 bohr and the next radial sample of Si; the Si projector is zero there.",
+   "input": [
+    "# Cluster SiNa4 with structural relaxation (BFGS),",
+    "# manual input of level occupancy.",
+    "",
+    "Boundary_Sphere_Radius:  4.0 ang",
+    "Grid_Spacing:  0.8",
+    "",
+    "States_Num:  8",
+    "Fermi_Temp:  -1",
+    "Max_Iter:  200",
+    "Eigensolver: chebff   #arpack",
+    "",
+    "Coordinate_Unit: Cartesian_Ang",
+    "",
+    "Mixing_Method: Anderson",
+    "Mixing_Param:  0.28",
+    "Memory_Param:  3",
+    "",
+    "Correlation_Type: CA",
+    "",
+    "",
+    "Atom_Types_Num:  2",
+    "",
+    "#------------ new atom type ---------------- ",
+    "Atom_Type: Si",
+    "",
+    "Pseudopotential_Format: martins_old",
+    "Core_Cutoff_Radius:  2.5",
+    "Local_Component: p",
+    "Potential_Num:  2",
+    "",
+    "begin Electron_Per_Orbital",
+    "# S P D F",
+    "2 2 0",
+    "end Electron_Per_Orbital",
+    "",
+    "Move_Flag:  0",
+    "begin Atom_Coord",
+    "       0.110000    0.070000   -0.020000",
+    "end Atom_Coord",
+    "",
+    "#------------ end of atom type ------------- ",
+    "",
+    "#------------ new atom type ----------------",
+    "Atom_Type: Na",
+    "",
+    "Pseudopotential_Format: martins_new",
+    "Local_Component: p",
+    "",
+    "begin Atom_Coord",
+    "     1.064049     0.984953     1.033144",
+    "    -1.014049    -1.014953     1.013144",
+    "    -1.014049     1.014953    -1.013144",
+    "     1.014049    -1.014953    -1.013144",
+    "end Atom_Coord",
+    "",
+    "#------------ end of atom type -------------",
+    "",
+    "Output_Level: 2",
+    "Convergence_Criterion: 1.0e-8"
+   ],
+   "files": {
+    "Si_POTR.DAT": "Si_POTR.DAT",
+    "Na_POTRE.DAT": "Na_POTRE.DAT",
+    "occup.in": "sina4_occup.in"
+   },
+   "pseudopotentials": {
+    "Si": {
+     "format": "martins_old",
+     "radial_parameter_a": 0.000177054,
+     "radial_parameter_b": 0.01,
+     "core_correction": false,
+     "occupancy": [
+      2.0,
+      2.0
+     ],
+     "components": 2,
+     "local_angular_momentum": 1,
+     "core_radius": 2.5,
+     "normalization": [
+      1.00001667,
+      1.00001667
+     ],
+     "kb_integral": [
+      0.21548354,
+      0.0
+     ]
+    },
+    "Na": {
+     "format": "martins_new",
+     "radial_parameter_a": 0.000225341,
+     "radial_parameter_b": 0.01,
+     "core_correction": false,
+     "occupancy": [
+      1.0,
+      0.0,
+      0.0
+     ],
+     "components": 3,
+     "local_angular_momentum": 1,
+     "core_radius": 3.1,
+     "normalization": [
+      1.00001667,
+      1.00001667,
+      1.00767879
+     ],
+     "kb_integral": [
+      0.01247387,
+      0.0,
+      -0.0
+     ]
+    }
+   },
+   "hamiltonian_size": 3544,
+   "nonlocal_block_sizes": [
+    129,
+    246,
+    245,
+    245,
+    245
+   ],
+   "atomic_density_charge": 7.509,
+   "scf_steps": 18,
+   "eigenvalues": [
+    -0.5476137452,
+    -0.1444020593,
+    -0.13356034,
+    -0.1263702473,
+    0.0916383968,
+    0.1936166961,
+    0.1973977465,
+    0.2380267526
+   ],
+   "occupations": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "representations": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "energies": {
+    "eigenvalue": -1.90389278,
+    "hartree": 19.77755345,
+    "integral_vxc_rho": -5.30818292,
+    "exchange_correlation": -4.07305811,
+    "electron_ion": -41.23430522,
+    "ion_ion": 11.81179695,
+    "total": -8.63452445
+   },
+   "energy": -8.63452445,
+   "positions": [
+    [
+     0.20787,
+     0.132281,
+     -0.037795
+    ],
+    [
+     2.010762,
+     1.861292,
+     1.95236
+    ],
+    [
+     -1.916276,
+     -1.917984,
+     1.914565
+    ],
+    [
+     -1.916276,
+     1.917984,
+     -1.914565
+    ],
+    [
+     1.916276,
+     -1.917984,
+     -1.914565
+    ]
+   ],
+   "ion_ion": [
+    [
+     -0.001027,
+     0.037692,
+     -0.009292
+    ],
+    [
+     0.539325,
+     0.518369,
+     0.584253
+    ],
+    [
+     -0.47997,
+     -0.464793,
+     0.448053
+    ],
+    [
+     -0.546956,
+     0.476938,
+     -0.493624
+    ],
+    [
+     0.488629,
+     -0.568205,
+     -0.529391
+    ]
+   ],
+   "ionic": [
+    [
+     -0.066626,
+     -0.055347,
+     0.013793
+    ],
+    [
+     -0.347523,
+     -0.330445,
+     -0.369221
+    ],
+    [
+     0.352679,
+     0.342282,
+     -0.331038
+    ],
+    [
+     0.369615,
+     -0.32706,
+     0.337159
+    ],
+    [
+     -0.322524,
+     0.36819,
+     0.346056
+    ]
+   ],
+   "sc": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     -0.0,
+     0.0,
+     0.0
+    ],
+    [
+     -0.0,
+     0.0,
+     -0.0
+    ],
+    [
+     0.0,
+     -0.0,
+     -0.0
+    ]
+   ],
+   "core": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ]
+   ],
+   "nonlocal": [
+    [
+     0.025451,
+     0.024498,
+     -0.005899
+    ],
+    [
+     0.064007,
+     0.055781,
+     0.062985
+    ],
+    [
+     -0.032371,
+     -0.032004,
+     0.031441
+    ],
+    [
+     -0.047089,
+     0.044114,
+     -0.043816
+    ],
+    [
+     0.049277,
+     -0.055191,
+     -0.052005
+    ]
+   ],
+   "total": [
+    [
+     -0.051182,
+     -0.000121,
+     0.000711
+    ],
+    [
+     0.246829,
+     0.236741,
+     0.280126
+    ],
+    [
+     -0.168641,
+     -0.161479,
+     0.150565
+    ],
+    [
+     -0.233409,
+     0.187029,
+     -0.198172
+    ],
+    [
+     0.206403,
+     -0.26217,
+     -0.23323
+    ]
+   ],
+   "net": [
+    0.044896,
+    0.034818,
+    -0.010546
+   ]
+  },
+  "sina4_shifted_core_1.9": {
+   "comment": "The displaced SiNa4 with Core_Cutoff_Radius: 1.9, inside the Si projector: the four grid points between 1.9 bohr and the next radial sample change the total energy by 2e-2 Ry, so this case tells the two support rules apart.",
+   "input": [
+    "# Cluster SiNa4 with structural relaxation (BFGS),",
+    "# manual input of level occupancy.",
+    "",
+    "Boundary_Sphere_Radius:  4.0 ang",
+    "Grid_Spacing:  0.8",
+    "",
+    "States_Num:  8",
+    "Fermi_Temp:  -1",
+    "Max_Iter:  200",
+    "Eigensolver: chebff   #arpack",
+    "",
+    "Coordinate_Unit: Cartesian_Ang",
+    "",
+    "Mixing_Method: Anderson",
+    "Mixing_Param:  0.28",
+    "Memory_Param:  3",
+    "",
+    "Correlation_Type: CA",
+    "",
+    "",
+    "Atom_Types_Num:  2",
+    "",
+    "#------------ new atom type ---------------- ",
+    "Atom_Type: Si",
+    "",
+    "Pseudopotential_Format: martins_old",
+    "Core_Cutoff_Radius:  1.9",
+    "Local_Component: p",
+    "Potential_Num:  2",
+    "",
+    "begin Electron_Per_Orbital",
+    "# S P D F",
+    "2 2 0",
+    "end Electron_Per_Orbital",
+    "",
+    "Move_Flag:  0",
+    "begin Atom_Coord",
+    "       0.110000    0.070000   -0.020000",
+    "end Atom_Coord",
+    "",
+    "#------------ end of atom type ------------- ",
+    "",
+    "#------------ new atom type ----------------",
+    "Atom_Type: Na",
+    "",
+    "Pseudopotential_Format: martins_new",
+    "Local_Component: p",
+    "",
+    "begin Atom_Coord",
+    "     1.064049     0.984953     1.033144",
+    "    -1.014049    -1.014953     1.013144",
+    "    -1.014049     1.014953    -1.013144",
+    "     1.014049    -1.014953    -1.013144",
+    "end Atom_Coord",
+    "",
+    "#------------ end of atom type -------------",
+    "",
+    "Output_Level: 2",
+    "Convergence_Criterion: 1.0e-8"
+   ],
+   "files": {
+    "Si_POTR.DAT": "Si_POTR.DAT",
+    "Na_POTRE.DAT": "Na_POTRE.DAT",
+    "occup.in": "sina4_occup.in"
+   },
+   "pseudopotentials": {
+    "Si": {
+     "format": "martins_old",
+     "radial_parameter_a": 0.000177054,
+     "radial_parameter_b": 0.01,
+     "core_correction": false,
+     "occupancy": [
+      2.0,
+      2.0
+     ],
+     "components": 2,
+     "local_angular_momentum": 1,
+     "core_radius": 1.9,
+     "normalization": [
+      1.00001667,
+      1.00001667
+     ],
+     "kb_integral": [
+      0.21548354,
+      0.0
+     ]
+    },
+    "Na": {
+     "format": "martins_new",
+     "radial_parameter_a": 0.000225341,
+     "radial_parameter_b": 0.01,
+     "core_correction": false,
+     "occupancy": [
+      1.0,
+      0.0,
+      0.0
+     ],
+     "components": 3,
+     "local_angular_momentum": 1,
+     "core_radius": 3.1,
+     "normalization": [
+      1.00001667,
+      1.00001667,
+      1.00767879
+     ],
+     "kb_integral": [
+      0.01247387,
+      0.0,
+      -0.0
+     ]
+    }
+   },
+   "hamiltonian_size": 3544,
+   "nonlocal_block_sizes": [
+    54,
+    246,
+    245,
+    245,
+    245
+   ],
+   "atomic_density_charge": 7.509,
+   "scf_steps": 18,
+   "eigenvalues": [
+    -0.4926170928,
+    -0.1483079301,
+    -0.1374205506,
+    -0.1306855818,
+    0.1052351146,
+    0.1935017203,
+    0.1971833654,
+    0.2377476788
+   ],
+   "occupations": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "representations": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "energies": {
+    "eigenvalue": -1.81806231,
+    "hartree": 19.73395206,
+    "integral_vxc_rho": -5.3019831,
+    "exchange_correlation": -4.06836113,
+    "electron_ion": -41.14595226,
+    "ion_ion": 11.81179695,
+    "total": -8.50659547
+   },
+   "energy": -8.50659547,
+   "positions": [
+    [
+     0.20787,
+     0.132281,
+     -0.037795
+    ],
+    [
+     2.010762,
+     1.861292,
+     1.95236
+    ],
+    [
+     -1.916276,
+     -1.917984,
+     1.914565
+    ],
+    [
+     -1.916276,
+     1.917984,
+     -1.914565
+    ],
+    [
+     1.916276,
+     -1.917984,
+     -1.914565
+    ]
+   ],
+   "ion_ion": [
+    [
+     -0.001027,
+     0.037692,
+     -0.009292
+    ],
+    [
+     0.539325,
+     0.518369,
+     0.584253
+    ],
+    [
+     -0.47997,
+     -0.464793,
+     0.448053
+    ],
+    [
+     -0.546956,
+     0.476938,
+     -0.493624
+    ],
+    [
+     0.488629,
+     -0.568205,
+     -0.529391
+    ]
+   ],
+   "ionic": [
+    [
+     -0.069139,
+     -0.058292,
+     0.013276
+    ],
+    [
+     -0.346039,
+     -0.32918,
+     -0.368296
+    ],
+    [
+     0.351892,
+     0.341654,
+     -0.330106
+    ],
+    [
+     0.36906,
+     -0.325862,
+     0.336228
+    ],
+    [
+     -0.320994,
+     0.367639,
+     0.344988
+    ]
+   ],
+   "sc": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     -0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     -0.0
+    ]
+   ],
+   "core": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ]
+   ],
+   "nonlocal": [
+    [
+     0.004482,
+     0.009895,
+     0.002275
+    ],
+    [
+     0.065041,
+     0.056924,
+     0.064402
+    ],
+    [
+     -0.033853,
+     -0.033462,
+     0.032743
+    ],
+    [
+     -0.050083,
+     0.046345,
+     -0.046291
+    ],
+    [
+     0.050957,
+     -0.057524,
+     -0.053987
+    ]
+   ],
+   "total": [
+    [
+     -0.069949,
+     -0.014333,
+     0.007213
+    ],
+    [
+     0.254062,
+     0.242486,
+     0.281314
+    ],
+    [
+     -0.166196,
+     -0.160229,
+     0.151644
+    ],
+    [
+     -0.232245,
+     0.193793,
+     -0.202734
+    ],
+    [
+     0.214327,
+     -0.261717,
+     -0.237437
+    ]
+   ],
+   "net": [
+    0.021324,
+    0.018137,
+    -0.004769
+   ]
+  },
+  "sina4_cation_fractional": {
+   "comment": "The displaced SiNa4 with Core_Cutoff_Radius: 1.9 as a cation (Net_Charges: 1) whose hole is spread by hand over the levels 2 to 4 (occupations 5/6 in occup.in).  The three levels are 0.02 Ry apart, so a Fermi level at 80 K would leave the hole in level 4.",
+   "input": [
+    "# Cluster SiNa4 with structural relaxation (BFGS),",
+    "# manual input of level occupancy.",
+    "",
+    "Boundary_Sphere_Radius:  4.0 ang",
+    "Grid_Spacing:  0.8",
+    "",
+    "States_Num:  8",
+    "Net_Charges: 1",
+    "Fermi_Temp:  -1",
+    "Max_Iter:  200",
+    "Eigensolver: chebff   #arpack",
+    "",
+    "Coordinate_Unit: Cartesian_Ang",
+    "",
+    "Mixing_Method: Anderson",
+    "Mixing_Param:  0.28",
+    "Memory_Param:  3",
+    "",
+    "Correlation_Type: CA",
+    "",
+    "",
+    "Atom_Types_Num:  2",
+    "",
+    "#------------ new atom type ---------------- ",
+    "Atom_Type: Si",
+    "",
+    "Pseudopotential_Format: martins_old",
+    "Core_Cutoff_Radius:  1.9",
+    "Local_Component: p",
+    "Potential_Num:  2",
+    "",
+    "begin Electron_Per_Orbital",
+    "# S P D F",
+    "2 2 0",
+    "end Electron_Per_Orbital",
+    "",
+    "Move_Flag:  0",
+    "begin Atom_Coord",
+    "       0.110000    0.070000   -0.020000",
+    "end Atom_Coord",
+    "",
+    "#------------ end of atom type ------------- ",
+    "",
+    "#------------ new atom type ----------------",
+    "Atom_Type: Na",
+    "",
+    "Pseudopotential_Format: martins_new",
+    "Local_Component: p",
+    "",
+    "begin Atom_Coord",
+    "     1.064049     0.984953     1.033144",
+    "    -1.014049    -1.014953     1.013144",
+    "    -1.014049     1.014953    -1.013144",
+    "     1.014049    -1.014953    -1.013144",
+    "end Atom_Coord",
+    "",
+    "#------------ end of atom type -------------",
+    "",
+    "Output_Level: 2",
+    "Convergence_Criterion: 1.0e-8"
+   ],
+   "files": {
+    "Si_POTR.DAT": "Si_POTR.DAT",
+    "Na_POTRE.DAT": "Na_POTRE.DAT",
+    "occup.in": "sina4_cation_occup.in"
+   },
+   "pseudopotentials": {
+    "Si": {
+     "format": "martins_old",
+     "radial_parameter_a": 0.000177054,
+     "radial_parameter_b": 0.01,
+     "core_correction": false,
+     "occupancy": [
+      2.0,
+      2.0
+     ],
+     "components": 2,
+     "local_angular_momentum": 1,
+     "core_radius": 1.9,
+     "normalization": [
+      1.00001667,
+      1.00001667
+     ],
+     "kb_integral": [
+      0.21548354,
+      0.0
+     ]
+    },
+    "Na": {
+     "format": "martins_new",
+     "radial_parameter_a": 0.000225341,
+     "radial_parameter_b": 0.01,
+     "core_correction": false,
+     "occupancy": [
+      1.0,
+      0.0,
+      0.0
+     ],
+     "components": 3,
+     "local_angular_momentum": 1,
+     "core_radius": 3.1,
+     "normalization": [
+      1.00001667,
+      1.00001667,
+      1.00767879
+     ],
+     "kb_integral": [
+      0.01247387,
+      0.0,
+      -0.0
+     ]
+    }
+   },
+   "hamiltonian_size": 3544,
+   "nonlocal_block_sizes": [
+    54,
+    246,
+    245,
+    245,
+    245
+   ],
+   "atomic_density_charge": 7.509,
+   "scf_steps": 19,
+   "eigenvalues": [
+    -0.9414769886,
+    -0.5777165312,
+    -0.5647571293,
+    -0.5566468444,
+    -0.2490429681,
+    -0.1780680216,
+    -0.1749115906,
+    -0.1047864685
+   ],
+   "occupations": [
+    1.0,
+    0.8333,
+    0.8333,
+    0.8333,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "representations": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "energies": {
+    "eigenvalue": -4.71482149,
+    "hartree": 16.372439,
+    "integral_vxc_rho": -4.80073439,
+    "exchange_correlation": -3.68315458,
+    "electron_ion": -37.65490073,
+    "ion_ion": 11.81179695,
+    "total": -8.15788377
+   },
+   "energy": -8.15788377,
+   "positions": [
+    [
+     0.20787,
+     0.132281,
+     -0.037795
+    ],
+    [
+     2.010762,
+     1.861292,
+     1.95236
+    ],
+    [
+     -1.916276,
+     -1.917984,
+     1.914565
+    ],
+    [
+     -1.916276,
+     1.917984,
+     -1.914565
+    ],
+    [
+     1.916276,
+     -1.917984,
+     -1.914565
+    ]
+   ],
+   "ion_ion": [
+    [
+     -0.001027,
+     0.037692,
+     -0.009292
+    ],
+    [
+     0.539325,
+     0.518369,
+     0.584253
+    ],
+    [
+     -0.47997,
+     -0.464793,
+     0.448053
+    ],
+    [
+     -0.546956,
+     0.476938,
+     -0.493624
+    ],
+    [
+     0.488629,
+     -0.568205,
+     -0.529391
+    ]
+   ],
+   "ionic": [
+    [
+     -0.074119,
+     -0.062182,
+     0.014167
+    ],
+    [
+     -0.328769,
+     -0.312683,
+     -0.350925
+    ],
+    [
+     0.334314,
+     0.324325,
+     -0.31287
+    ],
+    [
+     0.35156,
+     -0.30884,
+     0.319288
+    ],
+    [
+     -0.304446,
+     0.350356,
+     0.32801
+    ]
+   ],
+   "sc": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     -0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     -0.0
+    ],
+    [
+     0.0,
+     -0.0,
+     0.0
+    ],
+    [
+     -0.0,
+     0.0,
+     0.0
+    ]
+   ],
+   "core": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ]
+   ],
+   "nonlocal": [
+    [
+     0.010096,
+     0.015189,
+     0.00035
+    ],
+    [
+     0.06375,
+     0.056021,
+     0.06317
+    ],
+    [
+     -0.031133,
+     -0.030794,
+     0.030151
+    ],
+    [
+     -0.047963,
+     0.0445,
+     -0.044377
+    ],
+    [
+     0.049783,
+     -0.055941,
+     -0.052532
+    ]
+   ],
+   "total": [
+    [
+     -0.069665,
+     -0.013291,
+     0.006338
+    ],
+    [
+     0.269691,
+     0.257716,
+     0.297612
+    ],
+    [
+     -0.181404,
+     -0.175253,
+     0.166447
+    ],
+    [
+     -0.247974,
+     0.208608,
+     -0.217599
+    ],
+    [
+     0.229352,
+     -0.27778,
+     -0.252799
+    ]
+   ],
+   "net": [
+    0.023073,
+    0.019952,
+    -0.005568
+   ]
+  },
+  "ge2h2_old_format": {
+   "comment": "Ge2H2 of forces_parsec_reference.json (ge2h2_nlcc_tiny) with the Ge file rewritten in the old Martins layout (three channels, core charge) and Core_Cutoff_Radius set to the radius PARSEC derives for the new file.  Fortran gives the energy and the forces of the new-format run.",
+   "input": [
+    "Boundary_Sphere_Radius: 6.5",
+    "Grid_Spacing: 0.5",
+    "Eigensolver: chebdav",
+    "Max_Iter: 200",
+    "Convergence_Criterion: 1.0e-8",
+    "Output_Level: 2",
+    "States_Num: 10",
+    "Atom_Types_Num: 2",
+    "Atom_Type: Ge",
+    "Pseudopotential_Format: martins_old",
+    "Core_Cutoff_Radius: 2.812957892140",
+    "Potential_Num: 3",
+    "begin Electron_Per_Orbital",
+    "2  2  0",
+    "end Electron_Per_Orbital",
+    "Local_Component: p",
+    "begin Atom_Coord",
+    "      2.050000     0.150000    -0.100000",
+    "     -2.200000    -0.250000     0.200000",
+    "end Atom_Coord",
+    "Atom_Type: H",
+    "Local_Component: s",
+    "begin Atom_Coord",
+    "      3.100000     2.600000     0.400000",
+    "     -3.400000    -2.300000    -0.900000",
+    "end Atom_Coord"
+   ],
+   "files": {
+    "Ge_POTR.DAT": {
+     "martins_old_from": "Ge_POTRE.DAT"
+    },
+    "H_POTRE.DAT": "water_H_POTRE.DAT"
+   },
+   "pseudopotentials": {
+    "Ge": {
+     "format": "martins_old",
+     "radial_parameter_a": 7.7461e-05,
+     "radial_parameter_b": 0.01,
+     "core_correction": true,
+     "occupancy": [
+      2.0,
+      2.0,
+      0.0
+     ],
+     "components": 3,
+     "local_angular_momentum": 1,
+     "core_radius": 2.81,
+     "normalization": [
+      1.00001355,
+      1.00001054,
+      0.9912569
+     ],
+     "kb_integral": [
+      0.09254037,
+      0.0,
+      0.0
+     ]
+    },
+    "H": {
+     "format": "martins_new",
+     "radial_parameter_a": 0.00247875,
+     "radial_parameter_b": 0.0125,
+     "core_correction": false,
+     "occupancy": [
+      1.0
+     ],
+     "components": 1,
+     "local_angular_momentum": 0,
+     "core_radius": 1.31,
+     "normalization": [
+      1.00002608
+     ],
+     "kb_integral": [
+      0.0
+     ]
+    }
+   },
+   "hamiltonian_size": 9328,
+   "nonlocal_block_sizes": [
+    746,
+    738,
+    78,
+    78
+   ],
+   "atomic_density_charge": 9.7717,
+   "scf_steps": 19,
+   "eigenvalues": [
+    -0.9768378873,
+    -0.8303779349,
+    -0.5037324396,
+    -0.3994830312,
+    -0.2676353847,
+    -0.2107350706,
+    -0.0777679456,
+    0.1438475487,
+    0.2674222741,
+    0.2831093947
+   ],
+   "occupations": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "representations": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "energies": {
+    "eigenvalue": -5.95613336,
+    "hartree": 29.90958644,
+    "integral_vxc_rho": -8.8996687,
+    "exchange_correlation": -44.25309766,
+    "electron_ion": -65.16196332,
+    "ion_ion": 16.38206308,
+    "total": -54.83708561
+   },
+   "energy": -54.83708561,
+   "positions": [
+    [
+     2.2,
+     -0.0,
+     0.15
+    ],
+    [
+     -2.05,
+     -0.4,
+     0.45
+    ],
+    [
+     3.25,
+     2.45,
+     0.65
+    ],
+    [
+     -3.25,
+     -2.45,
+     -0.65
+    ]
+   ],
+   "ion_ion": [
+    [
+     1.513337,
+     -0.729822,
+     -0.293828
+    ],
+    [
+     -1.394543,
+     0.646468,
+     0.605753
+    ],
+    [
+     0.638578,
+     1.104563,
+     0.212505
+    ],
+    [
+     -0.757371,
+     -1.021209,
+     -0.52443
+    ]
+   ],
+   "ionic": [
+    [
+     -1.633871,
+     0.595092,
+     0.25787
+    ],
+    [
+     1.543775,
+     -0.467971,
+     -0.534234
+    ],
+    [
+     -0.647603,
+     -1.114681,
+     -0.202666
+    ],
+    [
+     0.737842,
+     0.990776,
+     0.482539
+    ]
+   ],
+   "sc": [
+    [
+     0.0,
+     0.0,
+     -0.0
+    ],
+    [
+     -0.0,
+     0.0,
+     -0.0
+    ],
+    [
+     0.0,
+     0.0,
+     -0.0
+    ],
+    [
+     -0.0,
+     -0.0,
+     -0.0
+    ]
+   ],
+   "core": [
+    [
+     -0.001879,
+     0.018658,
+     0.022906
+    ],
+    [
+     -0.002388,
+     -0.01564,
+     -0.022631
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ]
+   ],
+   "nonlocal": [
+    [
+     -0.030917,
+     0.061431,
+     0.014494
+    ],
+    [
+     0.024623,
+     -0.047048,
+     -0.038111
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ]
+   ],
+   "total": [
+    [
+     -0.150726,
+     -0.059795,
+     0.0064
+    ],
+    [
+     0.174071,
+     0.110654,
+     0.015735
+    ],
+    [
+     -0.006421,
+     -0.015272,
+     0.014797
+    ],
+    [
+     -0.016925,
+     -0.035587,
+     -0.036932
+    ]
+   ],
+   "net": [
+    -0.010418,
+    0.020617,
+    -0.019832
+   ]
+  }
+ }
+}

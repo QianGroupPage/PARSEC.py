@@ -36,7 +36,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import LinearOperator
 
-BACKEND_ENV = "PARSEC_KPOINT_BACKEND"  # cpu (default) | cupy | auto | numpy-device
+BACKEND_ENV = "PARSEC_KPOINT_BACKEND"  # explicit override: cpu | cupy | auto | numpy-device
 DEVICES_ENV = "PARSEC_CUPY_DEVICES"  # auto | current | 0,1,...
 
 

@@ -1,62 +1,95 @@
-# Periods 1–4 norm-conserving pseudopotentials
+# Ground-state norm-conserving pseudopotentials, H to No
 
-This collection contains FHI98PP norm-conserving pseudopotentials for H
-through Kr in FHI, UPF v2, and PARSEC Martins-new formats. The baseline
-settings are PBE exchange-correlation and the Troullier–Martins construction,
-using the distributed FHI98PP element templates. Every available
-Kleinman–Bylander local channel was checked using FHI98PP `pswatch`; the
-published local channel is recorded in `manifest.csv` and in each
-`diagnostics/*.report.json`.
+Troullier–Martins pseudopotentials for the ground state of each element, for
+two functionals, in three formats. Generated in the scheme of FHI98PP and
+regenerated with that program for comparison (`../README.md`, which also
+lists what to cite); this README describes the build of 12 October 2026.
 
-## Results
+| folder | functional | solver setting | elements |
+|---|---|---|---|
+| `PBE/` | Perdew–Burke–Ernzerhof GGA | `Correlation_Type: pbe` | 102: H–No |
+| `CA/` | LDA, Ceperley–Alder / Perdew–Zunger | `Correlation_Type: ca` | 101: H–No without Ho |
 
-- 36/36 final element directories have an accepted ghost-free representation.
-- 32 elements use the distributed default template with only XC changed to
-  the package default, PBE.
-- H, K, Ga, and Ge failed the strict first default pass. Their complete
-  original diagnostics are retained under `default_rejected/`.
-- For those four elements, the reviewed input omits only artificial,
-  unoccupied high-angular-momentum channels: H uses `lmax=0`; K, Ga, and Ge
-  use `lmax=1`. Occupations, PBE, Troullier–Martins construction, NLCC choice,
-  and remaining default channel parameters are unchanged. The reviewed
-  inputs are stored under `reviewed_inputs/`.
+Not provided: Lr (no ghost-free form with either functional) and Ho with CA
+(the atom does not converge). The matching potentials with a core hole are in
+`../CoreHole_NCPPs`.
 
-The default H failure was indeterminate in its unused p/d channels. K had
-indeterminate d channels and a ghosted d-local representation. Ga and Ge had
-indeterminate d projectors and a ghosted p projector for d-local. None of
-these rejected default products is published as `Element_FHIPP.DAT` in the
-final element directories.
+## Layout
 
-## Layout and which file PARSEC uses
+```text
+<XC>/<Element>/
+    PARSEC/<Element>_POTRE.DAT     read by the Python solver (--pp-dir)
+    PARSEC/parsec_atom_type.in     the Atom_Type lines for parsec.in
+    UPF/<prefix>.UPF               UPF v2 (Quantum ESPRESSO, ARES)
+    FHI/<Element>_FHIPP.DAT        FHI98PP table on the generation mesh
+    diagnostics/                   input (.ini), log (.dat), test reports, report.json
+manifest.csv                       one row per potential
+```
 
-Each element directory contains four subdirectories:
+`parsec_atom_type.in` holds the two values a calculation needs besides the
+file: `Local_Component`, the channel that passed the ghost test, and
+`Atomic_Energy_Correction`, the all-electron minus pseudo energy of the atom.
+Do not use another local component than the listed one without testing it; for
+many elements the other channels have ghost states.
 
-- `FHI/Element_FHIPP.DAT`: lossless FHI98PP source/archive table;
-- `UPF/*_pbe_tm.UPF`: semilocal norm-conserving UPF v2 interchange file;
-- `PARSEC/Element_POTRE.DAT`: Martins-new file read directly by the Python
-  PARSEC implementation;
-- `diagnostics/`: exact input, JSON report, all local-channel ghost reports,
-  raw converter output, radial data, wavefunctions, and logarithmic
-  derivatives.
+The `.ini` file in a `diagnostics` folder is the FHI98PP input of that
+potential; FHI98PP regenerates the potential from it.
 
-The `.DAT` suffix alone does not identify a format. The Python solver supports
-only the Martins-new `Element_POTRE.DAT` file. Point its `--pp-dir` option at a
-directory containing the required POTRE files, and set `Local_Component` for
-each species to the value in `manifest.csv`. `Correlation_Type` is `pb`.
+## What was chosen
 
-The UPF-to-POTRE step resamples the FHI/UPF exponential radial grid onto
-PARSEC's shifted-log grid. It preserves UPF nonlinear core correction as
-`4*pi*r**2*rho_core`. H and He are all-local potentials with no KB projector.
+The rules are in `../README.md`. In this build (the same for PBE and CA unless
+noted):
 
-`manifest.csv` is the collection-level index. A blank minimum margin for H or
-He means there is no nonlocal projector; the local representation is
-vacuously free of Kleinman–Bylander projector ghosts.
+| `lmax` | local | elements |
+|---|---|---|
+| 0 | s (purely local) | H, He, Fr |
+| 1 | p | K, Ga, Ge, Rb, In, Sn, Sb, I, Xe, Tl, Pb, Bi, Po |
+| 2 | d | Li–Ne, Na–Ar, As, Se, Br, Kr, Te, At, Rn |
+| 2 | p | Sc–Cr, Sr–Cd, Cs, Ba, La, Hf–Hg, Ra, Ac |
+| 2 | s | Ca, Mn–Zn |
+| 3 | p | Ce–Lu, Th–Bk (CA: also Cf) |
+| 3 | s | Cf (PBE), Es, Fm, Md, No |
 
-## Scope of validation
+- Elements with `lmax` below that of the FHI98PP element database (K, Ga, Ge, Rb,
+  In, Sn, Sb, I, Xe, Tl, Pb, Bi, Po from 2 to 1; La, Ac from 3 to 2): with that `lmax`
+  no local channel is ghost-free. The dropped channel holds no valence
+  electrons.
+- H is purely local by review. Fr is purely local because neither its p nor its
+  d channel gives a ghost-free form: a weak potential for an element with
+  low-lying p and d states.
+- Nonlinear core correction, as in the element database: Li, B, Na, Mg, K, Ca, Rb, Sr,
+  In, Cs, Ba, Tl–Rn, Fr, Ra, Ac–No.
+- A radius differs from the element database by one or two mesh points (2.5 %
+  each), because a member of the family (ground state or a core hole) cannot be
+  constructed at the database value: K and Y (s radius);
+  La, Gd, Cm, Es, Fm with both functionals; Md, No with PBE; Ac, Th with CA.
+  The `note` column of the manifest gives the channel and the step.
+- Smallest ghost-free margins: Li 0.0031 Ha (PBE), 0.0033 (CA); Cu 0.0045,
+  0.0050; K 0.0060, 0.0063. All others are above 0.006 Ha.
 
-The spectral ghost check is necessary but not sufficient for production use.
-Before treating this collection as a production-quality library, perform
-logarithmic-derivative inspection, excited/ionized atomic transferability,
-real-space grid convergence, and representative molecule/solid benchmarks.
-In particular, transition-metal semicore and NLCC choices require application-
-specific validation.
+The PBE potentials of H–Kr replace the earlier library of this repository
+(made with the FHI98PP program). They have the same `lmax` and local channel
+for all 36 elements, and for 35 of them the same tables (FHI files to 4e-10,
+PARSEC files to 1e-12); K differs in the s radius as stated above.
+
+## Checks
+
+- Every potential was regenerated with the FHI98PP program from the input in
+  its `diagnostics` folder: 203 of 203 reproduced; tables agree to 4e-9, total
+  energies to the five decimals the FHI98PP log prints, and the ghost verdicts
+  of the selected local channel agree in all cases. (For Z > 80 a copy of the
+  program with one array bound corrected was used; the original writes
+  outside its table of default radii there.)
+- `ecut_1meV_Ry` in the manifest is the plane-wave cutoff at which the kinetic
+  energy of the pseudo wave functions is converged to 1 meV per state, from the
+  momentum-space test of the generation. It ranges from 7 Ry (Cs) to 169 Ry (Ne) and
+  is a guide for the grid spacing (pi/sqrt(Ecut) bohr), not a convergence test
+  of a molecule.
+
+What has not been checked: the potentials in molecules or solids, apart from
+H, C and F in a CH4/CF4 test, where C 1s binding energies agree with
+all-electron calculations to 0.08 eV (`examples/0_CH4_CF4/python_library_pps`).
+The potentials
+of Z = 57–71 and 81–102 come from inputs written for this library
+(`../README.md`); those with an f shell in the valence (Ce–Lu, Pa–No)
+are hard, and none of them has been used in a calculation here.

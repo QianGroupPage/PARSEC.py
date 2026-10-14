@@ -253,6 +253,33 @@ class NativeHamiltonianBackend(HamiltonianBackend):
         )
         self.statistics.initialization_seconds = perf_counter() - started
 
+    def replace_nonlocal_operator(self, nonlocal_operator) -> None:
+        """Give the C++ operator the projectors of moved atoms.
+
+        The extension owns copies of its buffers, so a new fused operator is
+        made from the retained kinetic CSR, the new projectors and the
+        current local potential.
+        """
+
+        native = _load_native()
+        kinetic = self.negative_laplacian
+        projectors = _canonical_csc(nonlocal_operator.projectors, kinetic.shape[0])
+        signs = _values64(nonlocal_operator.signs)
+        if signs.shape != (projectors.shape[1],):
+            raise ValueError("one nonlocal sign is required per projector column")
+        self.projectors = projectors
+        self.signs = signs
+        self._native_operator = native.FusedHamiltonian(
+            _indices64(kinetic.indptr),
+            _indices64(kinetic.indices),
+            _values64(kinetic.data),
+            _indices64(projectors.indptr),
+            _indices64(projectors.indices),
+            _values64(projectors.data),
+            signs,
+            self.local_potential,
+        )
+
     @staticmethod
     def _restore_rank(result: np.ndarray, was_vector: bool) -> np.ndarray:
         return result[:, 0] if was_vector else result

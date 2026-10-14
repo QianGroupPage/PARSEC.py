@@ -6,6 +6,7 @@ import unittest
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import scipy.sparse as sp
@@ -51,6 +52,30 @@ class AxisReflectionReductionTests(unittest.TestCase):
         cls.reduction = AxisReflectionReduction.detect(
             cls.grid, (Atom("H", (0.0, 0.0, 0.0)),)
         )
+
+    def test_large_species_groups_match_on_the_same_threshold_graph(self) -> None:
+        from parsec_python.acceleration.Symmetry import axis_reflection
+
+        generator = np.random.default_rng(5)
+        for count, tolerance in ((700, 1.0e-6), (900, 0.3)):
+            candidates = generator.uniform(-6.0, 6.0, size=(count, 3))
+            transformed = candidates[generator.permutation(count)] + generator.normal(
+                scale=tolerance / 2, size=(count, 3)
+            )
+            # Pairs at the threshold and one ulp either side of it.
+            for row, scale in enumerate((1.0, np.nextafter(1.0, 2.0), np.nextafter(1.0, 0.0))):
+                transformed[row] = candidates[row] + (tolerance * scale, 0.0, 0.0)
+            distances = np.linalg.norm(transformed[:, None, :] - candidates[None, :, :], axis=2)
+            dense = [np.flatnonzero(row <= tolerance).tolist() for row in distances]
+            self.assertEqual(axis_reflection._threshold_neighbours(transformed, candidates, tolerance), dense)
+        # An atom-centred cubic lattice has the three twofold axes; moving one atom removes them.
+        axis = np.arange(-4, 5, dtype=np.float64)
+        lattice = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
+        self.assertGreater(len(lattice), axis_reflection._DENSE_MATCHING_LIMIT)
+        signs = np.array((1.0, -1.0, -1.0))
+        self.assertTrue(axis_reflection._has_tolerance_perfect_matching(lattice * signs, lattice, 1.0e-6))
+        lattice[7] += 1.0e-3
+        self.assertFalse(axis_reflection._has_tolerance_perfect_matching(lattice * signs, lattice, 1.0e-6))
 
     def test_half_shifted_sphere_has_eight_equal_images(self) -> None:
         reduction = self.reduction
@@ -390,28 +415,84 @@ class AxisReflectionReductionTests(unittest.TestCase):
                 getattr(full_energy, field), getattr(wedge_energy, field), 12
             )
 
-        # The SCF loop always passes alpha_z_energy by keyword, so the
-        # reducer must accept it and apply it exactly like total_energy.
-        energy_arguments = (
-            eigenvalues,
-            occupations,
-            density,
-            input_potential,
-            ionic,
-            hartree,
-            xc,
+    def test_wedge_energy_takes_what_the_scf_loop_gives_the_reference_energy(self) -> None:
+        import inspect
+
+        # The reference SCF loop calls whichever evaluator it has with the
+        # same arguments, the alpha_Z term of a periodic cell among them.
+        self.assertEqual(
+            list(inspect.signature(SymmetrySCFReducer.total_energy).parameters)[1:],
+            list(inspect.signature(total_energy).parameters),
+        )
+        reducer = SymmetrySCFReducer(self.reduction)
+        generator = np.random.default_rng(37)
+
+        def invariant() -> np.ndarray:
+            return reducer.expand_values(
+                generator.standard_normal(self.reduction.wedge_size)
+            )
+
+        arguments = (
+            np.sort(generator.standard_normal(5)),
+            generator.random(5),
+            np.abs(invariant()) + 0.1,
+            invariant(),
+            invariant(),
+            invariant(),
+            invariant(),
             -3.2,
             4.1,
             0.125,
         )
-        full_energy = total_energy(*energy_arguments, alpha_z_energy=0.37)
-        wedge_energy = reducer.total_energy(
-            *energy_arguments, alpha_z_energy=0.37
-        )
-        for field in full_energy.__dataclass_fields__:
+        shifted_full = total_energy(*arguments, alpha_z_energy=0.75)
+        shifted_wedge = reducer.total_energy(*arguments, alpha_z_energy=0.75)
+        for field in shifted_full.__dataclass_fields__:
             self.assertAlmostEqual(
-                getattr(full_energy, field), getattr(wedge_energy, field), 12
+                getattr(shifted_full, field), getattr(shifted_wedge, field), 12
             )
+        # The term is in the band energy and so in the sums above it.
+        plain = reducer.total_energy(*arguments)
+        self.assertEqual(shifted_wedge.eigenvalue, plain.eigenvalue + 0.75)
+        self.assertAlmostEqual(shifted_wedge.total, plain.total + 0.75, 12)
+        self.assertEqual(shifted_wedge.hartree, plain.hartree)
+        # Zero, the value of every cluster, leaves each number as it was.
+        self.assertEqual(reducer.total_energy(*arguments, alpha_z_energy=0.0), plain)
+
+    def test_full_grid_residual_is_expanded_only_when_it_is_read(self) -> None:
+        reducer = SymmetrySCFReducer(self.reduction)
+        generator = np.random.default_rng(43)
+        wedge_size = self.reduction.wedge_size
+        input_potential = reducer.field(generator.standard_normal(wedge_size))
+        output_potential = reducer.field(generator.standard_normal(wedge_size))
+        density = reducer.field(np.abs(generator.standard_normal(wedge_size)) + 0.2)
+        # The SCF loop asks for the two norms only; that must not touch the
+        # full grid.
+        with patch.object(
+            SymmetrySCFReducer,
+            "expand_values",
+            side_effect=AssertionError("the residual was expanded before a read"),
+        ):
+            metrics = reducer.potential_residual_metrics(
+                input_potential, output_potential, density, 0.125, 10.0
+            )
+            norms = (metrics.weighted, metrics.plain)
+        full_metrics = potential_residual_metrics(
+            reducer.to_full(input_potential),
+            reducer.to_full(output_potential),
+            reducer.to_full(density),
+            0.125,
+            10.0,
+        )
+        self.assertAlmostEqual(norms[0], full_metrics.weighted, 13)
+        self.assertAlmostEqual(norms[1], full_metrics.plain, 13)
+        np.testing.assert_array_equal(
+            metrics.wedge_residual, output_potential.values - input_potential.values
+        )
+        # Reading the attribute gives the reference full-grid residual.
+        residual = metrics.residual
+        self.assertEqual(residual.shape, (self.reduction.full_size,))
+        self.assertTrue(residual.flags.c_contiguous)
+        np.testing.assert_array_equal(residual, full_metrics.residual)
 
     def test_compact_scalar_fields_stay_compact_and_match_full_algebra(self) -> None:
         reducer = SymmetrySCFReducer(self.reduction)
@@ -486,6 +567,167 @@ class AxisReflectionReductionTests(unittest.TestCase):
             )
 
 
+class ExactImageTests(unittest.TestCase):
+    """Whether the images of atoms and grid points under a group are exact in every bit."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.grids = {
+            shift: build_cluster_grid(
+                GridSettings(spacing=0.4, radius=3.0, expansion_order=4, shift=shift)
+            )
+            for shift in ((0.5, 0.5, 0.5), (0.0, 0.0, 0.0), (0.5, 0.0, 0.5))
+        }
+        # Four carbons that the three twofold axes exchange, and a hydrogen
+        # at the centre, which every operation keeps.
+        cls.d2 = (
+            Atom("C", (1.0, 0.5, 0.25)),
+            Atom("C", (-1.0, -0.5, 0.25)),
+            Atom("C", (1.0, -0.5, -0.25)),
+            Atom("C", (-1.0, 0.5, -0.25)),
+            Atom("H", (0.0, 0.0, 0.0)),
+        )
+
+    def test_operations_of_both_reductions_are_read_as_sources_and_factors(self) -> None:
+        from parsec_python.acceleration.Symmetry.exact_images import group_operations
+
+        grid = self.grids[(0.5, 0.5, 0.5)]
+        axis = SignedPermutationReduction.detect(grid, self.d2)
+        self.assertIs(type(axis), AxisReflectionReduction)
+        operations = group_operations(axis)
+        self.assertEqual(len(operations), axis.group_order)
+        for (sources, factors), signs in zip(operations, axis.signs):
+            np.testing.assert_array_equal(sources, (0, 1, 2))
+            np.testing.assert_array_equal(factors, signs)
+        # A group that exchanges x and y carries matrices: component i of an
+        # image is factors[i] times component sources[i].
+        swapped = SignedPermutationReduction.detect(
+            grid, (Atom("C", (1.0, 2.0, 0.0)), Atom("C", (2.0, 1.0, 0.0)))
+        )
+        self.assertIsInstance(swapped, SignedPermutationReduction)
+        point = np.array((0.3, -1.1, 2.5))
+        operations = group_operations(swapped)
+        self.assertEqual(len(operations), swapped.group_order)
+        for (sources, factors), matrix in zip(operations, swapped.operations):
+            np.testing.assert_array_equal(point[sources] * factors, matrix @ point)
+        self.assertTrue(any(not np.array_equal(s, (0, 1, 2)) for s, _ in operations))
+        # An object that names no operations has none to test.
+        self.assertIsNone(group_operations(SimpleNamespace(group_order=4)))
+        self.assertIsNone(group_operations(SimpleNamespace(signs=np.ones((2, 2)))))
+        self.assertIsNone(group_operations(SimpleNamespace(operations=np.ones((2, 3, 3)))))
+
+    def test_atoms_within_the_tolerance_of_the_detector_are_not_exact_images(self) -> None:
+        from parsec_python.acceleration.Symmetry.exact_images import (
+            atom_images_exact,
+            group_operations,
+        )
+
+        grid = self.grids[(0.5, 0.5, 0.5)]
+        operations = group_operations(SignedPermutationReduction.detect(grid, self.d2))
+        self.assertTrue(atom_images_exact(self.d2, operations))
+        # In any order of the atoms, and with either sign of a zero.
+        self.assertTrue(atom_images_exact(self.d2[::-1], operations))
+        signed_zero = (*self.d2[:4], Atom("H", (-0.0, 0.0, -0.0)))
+        self.assertTrue(atom_images_exact(signed_zero, operations))
+        # One coordinate off by 3e-9 bohr, or by one unit in the last place:
+        # the detector accepts the group (1e-7 bohr), the test does not.
+        for moved in (0.25 + 3.0e-9, np.nextafter(0.25, 1.0)):
+            atoms = (self.d2[0], Atom("C", (-1.0, -0.5, moved)), *self.d2[2:])
+            detected = SignedPermutationReduction.detect(grid, atoms)
+            self.assertEqual(detected.group_order, 4)
+            self.assertFalse(atom_images_exact(atoms, group_operations(detected)))
+        # An image that is an atom of another species is no image.
+        mixed = (*self.d2[:3], Atom("N", self.d2[3].position), self.d2[4])
+        self.assertFalse(atom_images_exact(mixed, operations))
+        # Two atoms that a swap of x and y exchanges.
+        pair = (Atom("C", (1.0, 2.0, 0.0)), Atom("C", (2.0, 1.0, 0.0)))
+        swap = group_operations(SignedPermutationReduction.detect(grid, pair))
+        self.assertTrue(atom_images_exact(pair, swap))
+        self.assertFalse(
+            atom_images_exact((pair[0], Atom("C", (2.0, np.nextafter(1.0, 2.0), 0.0))), swap)
+        )
+
+    def test_grid_points_are_exact_images_on_shifted_and_unshifted_lattices(self) -> None:
+        from dataclasses import replace
+
+        from parsec_python.acceleration.Symmetry.exact_images import (
+            grid_images_exact,
+            group_operations,
+        )
+
+        pair = (Atom("C", (1.0, 2.0, 0.0)), Atom("C", (2.0, 1.0, 0.0)))
+        for shift, grid in self.grids.items():
+            for atoms in (self.d2, pair, (Atom("H", (0.0, 0.0, 0.0)),)):
+                with self.subTest(shift=shift, atoms=len(atoms)):
+                    reduction = SignedPermutationReduction.detect(grid, atoms)
+                    self.assertGreater(reduction.group_order, 1)
+                    operations = group_operations(reduction)
+                    self.assertTrue(grid_images_exact(grid, reduction, operations))
+                    # With the coordinates of the representative rows given.
+                    rows = grid.coordinates[reduction.representative_rows]
+                    self.assertTrue(grid_images_exact(grid, reduction, operations, rows))
+                    # One coordinate of one point of an orbit of several, one
+                    # unit in the last place away from its image.
+                    row = int(
+                        np.flatnonzero(
+                            reduction.multiplicities[reduction.full_to_wedge] > 1
+                        )[-1]
+                    )
+                    moved = grid.coordinates.copy()
+                    moved[row, 1] = np.nextafter(moved[row, 1], np.inf)
+                    self.assertFalse(
+                        grid_images_exact(
+                            replace(grid, coordinates=moved), reduction, operations
+                        )
+                    )
+        # Coordinates of another shape belong to another grid.
+        grid = self.grids[(0.5, 0.5, 0.5)]
+        reduction = SignedPermutationReduction.detect(grid, self.d2)
+        self.assertFalse(
+            grid_images_exact(
+                replace(grid, coordinates=grid.coordinates[:-1]),
+                reduction,
+                group_operations(reduction),
+            )
+        )
+
+    def test_points_of_an_orbit_sum_are_given_only_where_every_image_is_exact(self) -> None:
+        from dataclasses import replace
+
+        from parsec_python.acceleration.Symmetry.exact_images import orbit_sum_points
+
+        grid = self.grids[(0.5, 0.5, 0.5)]
+        reduction = SignedPermutationReduction.detect(grid, self.d2)
+        points, obstacle = orbit_sum_points(grid, self.d2, reduction)
+        self.assertIsNone(obstacle)
+        self.assertTrue(points.flags.c_contiguous)
+        self.assertEqual(points.dtype, np.float64)
+        self.assertEqual(
+            points.tobytes(), grid.coordinates[reduction.representative_rows].tobytes()
+        )
+        # Every reason for which the full grid has to stay, by its words.
+        identity = SignedPermutationReduction.detect(
+            grid, (self.d2[0], Atom("H", (0.3, 0.1, -0.7)))
+        )
+        self.assertEqual(identity.group_order, 1)
+        within = (self.d2[0], Atom("C", (-1.0, -0.5, 0.25 + 3.0e-9)), *self.d2[2:])
+        moved = grid.coordinates.copy()
+        moved[3, 0] = np.nextafter(moved[3, 0], np.inf)
+        for arguments, words in (
+            ((grid, self.d2, None), "no symmetry operation beside the identity"),
+            ((grid, self.d2, identity), "no symmetry operation beside the identity"),
+            ((grid, self.d2, SimpleNamespace(group_order=4)), "operations of the symmetry reduction are not known"),
+            ((grid, within, SignedPermutationReduction.detect(grid, within)), "image of an atom is not an atom of its species"),
+            ((grid, (), reduction), "image of an atom is not an atom of its species"),
+            ((replace(grid, coordinates=moved), self.d2, reduction), "image of a grid point is not a grid point"),
+            ((grid, self.d2, SimpleNamespace(group_order=4, signs=reduction.signs)), "no orbit maps"),
+        ):
+            with self.subTest(words=words):
+                points, obstacle = orbit_sum_points(*arguments)
+                self.assertIsNone(points)
+                self.assertIn(words, obstacle)
+
+
 class ReflectionRepresentationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -510,6 +752,67 @@ class ReflectionRepresentationTests(unittest.TestCase):
         self.assertEqual(decomposition.representation_count, 8)
         gram = decomposition.characters @ decomposition.characters.T
         np.testing.assert_array_equal(gram, 8 * np.eye(8, dtype=np.int8))
+
+    def test_sector_orbit_lists_are_built_once_and_match_the_sector_map(self) -> None:
+        # A zero-shift grid has stabilizers, hence sectors of different size.
+        grid = build_cluster_grid(
+            GridSettings(
+                spacing=1.0,
+                radius=2.2,
+                expansion_order=2,
+                shift=(0.0, 0.0, 0.0),
+            )
+        )
+        reduction = AxisReflectionReduction.detect(
+            grid, (Atom("H", (0.0, 0.0, 0.0)),)
+        )
+        decomposition = ReflectionRepresentationDecomposition.build(grid, reduction)
+        self.assertGreater(
+            max(decomposition.sector_sizes), min(decomposition.sector_sizes)
+        )
+        for representation in range(decomposition.representation_count):
+            with self.subTest(representation=representation):
+                orbits = decomposition.sector_orbit_indices(representation)
+                # Sector column j is the orbit that the sector map sends to j.
+                mapping = decomposition.orbit_to_sector[representation]
+                expected = np.full(
+                    decomposition.sector_size(representation), -1, dtype=np.int64
+                )
+                expected[mapping[mapping >= 0]] = np.flatnonzero(mapping >= 0)
+                np.testing.assert_array_equal(orbits, expected)
+                self.assertEqual(orbits.dtype, np.int64)
+                self.assertTrue(orbits.flags.c_contiguous)
+                # Later requests return the same array, which callers share.
+                self.assertIs(
+                    decomposition.sector_orbit_indices(representation), orbits
+                )
+                self.assertFalse(orbits.flags.writeable)
+        # The lists belong to one decomposition and are not part of its value.
+        other = ReflectionRepresentationDecomposition.build(grid, reduction)
+        self.assertIsNot(
+            other.sector_orbit_indices(0), decomposition.sector_orbit_indices(0)
+        )
+        with self.assertRaises(IndexError):
+            decomposition.sector_orbit_indices(decomposition.representation_count)
+        # The batched Python assembly reads the sector map itself: reducing a
+        # sector there asks for no orbit list, and gives the operator of the
+        # single-sector route, which selects its rows through the list.
+        operator = build_negative_laplacian(grid)
+        with (
+            patch.dict(os.environ, PARSEC_NATIVE_SECTOR_ASSEMBLY="0"),
+            patch.object(
+                ReflectionRepresentationDecomposition,
+                "sector_orbit_indices",
+                side_effect=AssertionError("the batched assembly built an orbit list"),
+            ),
+        ):
+            batched = other.reduce_operators(operator)
+        for representation, reduced in enumerate(batched):
+            with self.subTest(representation=representation):
+                single = decomposition.reduce_operator(operator, representation)
+                np.testing.assert_array_equal(reduced.indptr, single.indptr)
+                np.testing.assert_array_equal(reduced.indices, single.indices)
+                np.testing.assert_array_equal(reduced.data, single.data)
 
     def test_cold_operator_worker_policy_is_size_adaptive(self) -> None:
         original = os.environ.pop("PARSEC_SYMMETRY_OPERATOR_WORKERS", None)
@@ -603,6 +906,51 @@ class ReflectionRepresentationTests(unittest.TestCase):
                 np.testing.assert_allclose(
                     reduced.apply(wedge), expected, atol=3.0e-13
                 )
+
+    def test_partial_build_matches_selected_sectors_of_the_full_build(self) -> None:
+        generator = np.random.default_rng(57)
+        nonlocal_operator = NonlocalProjectorOperator(
+            projectors=sp.csc_matrix(generator.standard_normal((self.grid.size, 3))),
+            signs=np.asarray((1.0, -1.0, 1.0)),
+            labels=tuple((0, 0, index) for index in range(3)),
+        )
+        wanted = (5, 0, 5)
+        full = load_or_build_reduced_operators(
+            self.decomposition, self.operator, nonlocal_operator, cache_directory=None
+        )
+        partial = load_or_build_reduced_operators(
+            self.decomposition, self.operator, nonlocal_operator,
+            cache_directory=None, representations=wanted,
+        )
+        self.assertEqual(partial.cache_info.status, "disabled-partial")
+        for representation in range(self.decomposition.representation_count):
+            with self.subTest(representation=representation):
+                stencil = partial.stencil_metadata[representation]
+                projector = partial.nonlocal_operators[representation]
+                if representation not in wanted:
+                    self.assertIsNone(stencil)
+                    self.assertIsNone(projector)
+                    continue
+                expected = full.stencil_metadata[representation]
+                np.testing.assert_array_equal(stencil.neighbors, expected.neighbors)
+                np.testing.assert_array_equal(
+                    stencil.coefficient_codes, expected.coefficient_codes
+                )
+                np.testing.assert_array_equal(
+                    stencil.coefficient_palette, expected.coefficient_palette
+                )
+                reference = full.nonlocal_operators[representation].projectors
+                np.testing.assert_array_equal(projector.projectors.indptr, reference.indptr)
+                np.testing.assert_array_equal(projector.projectors.indices, reference.indices)
+                np.testing.assert_array_equal(projector.projectors.data, reference.data)
+        # Naming every sector is the ordinary complete build.
+        complete = load_or_build_reduced_operators(
+            self.decomposition, self.operator, nonlocal_operator, cache_directory=None,
+            representations=tuple(range(self.decomposition.representation_count)),
+        )
+        self.assertEqual(complete.cache_info.status, "disabled")
+        with self.assertRaises(IndexError):
+            self.decomposition.reduce_operators(self.operator, (8,))
 
     def test_reduced_operator_cache_is_exact_and_content_addressed(self) -> None:
         generator = np.random.default_rng(59)

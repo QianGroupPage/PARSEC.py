@@ -32,7 +32,7 @@ from parsec_python.SCF.spin_polarized import run_scf_spin_polarized
 from parsec_python.V_xc import (
     pbe,
     pbe_energy_partials,
-    pbe_spin_energy_partials,
+    pbe_spin_polarized_partials,
     pbe_spin_polarized,
 )
 from parsec_python.V_xc.pbe import _pbe_spin_energy_density
@@ -87,7 +87,7 @@ class SpinPolarizedPBEKernelTests(unittest.TestCase):
 
     def test_partials_match_finite_differences(self) -> None:
         args = [self.n_up, self.n_down, self.s_uu, self.s_ud, self.s_dd]
-        partials = pbe_spin_energy_partials(*args)[1:]
+        partials = pbe_spin_polarized_partials(*args)[1:]
         for index, analytic in enumerate(partials):
             step = 1.0e-4 * np.maximum(np.abs(args[index]), 1.0e-12)
             plus = [a.copy() for a in args]
@@ -105,7 +105,7 @@ class SpinPolarizedPBEKernelTests(unittest.TestCase):
         gradient_sq = self.s_uu + 2.0 * self.s_ud + self.s_dd
         half = total / 2.0
         quarter = gradient_sq / 4.0
-        f, f_up, f_down, f_uu, f_ud, f_dd = pbe_spin_energy_partials(
+        f, f_up, f_down, f_uu, f_ud, f_dd = pbe_spin_polarized_partials(
             half, half, quarter, quarter, quarter
         )
         energy, derivative_n, derivative_sigma = pbe_energy_partials(
@@ -120,10 +120,10 @@ class SpinPolarizedPBEKernelTests(unittest.TestCase):
         )
 
     def test_spin_flip_symmetry(self) -> None:
-        up_first = pbe_spin_energy_partials(
+        up_first = pbe_spin_polarized_partials(
             self.n_up, self.n_down, self.s_uu, self.s_ud, self.s_dd
         )
-        down_first = pbe_spin_energy_partials(
+        down_first = pbe_spin_polarized_partials(
             self.n_down, self.n_up, self.s_dd, self.s_ud, self.s_uu
         )
         np.testing.assert_allclose(up_first[0], down_first[0], rtol=1e-12)

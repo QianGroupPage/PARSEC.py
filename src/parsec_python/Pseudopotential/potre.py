@@ -18,13 +18,23 @@ from .radial_quadrature import parsec_radial_integral
 from .radial_spline import ParsecRadialSpline
 
 
+# Fortran drops the exponent letter when the exponent needs three digits:
+# ``.699054148690-131`` is 0.699e-131.  The second alternative of the exponent
+# accepts that form.
 _FLOAT_RE = re.compile(
-    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?"
+    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+|[-+]\d{3}(?!\d))?"
 )
+_BARE_EXPONENT_RE = re.compile(r"(?<=[\d.])([-+]\d{3})$")
 
 
 def _numbers(text: str) -> list[float]:
-    return [float(value.replace("D", "E").replace("d", "e")) for value in _FLOAT_RE.findall(text)]
+    values = []
+    for token in _FLOAT_RE.findall(text):
+        token = token.replace("D", "E").replace("d", "e")
+        if "e" not in token.lower():
+            token = _BARE_EXPONENT_RE.sub(r"E\g<1>", token)
+        values.append(float(token))
+    return values
 
 
 def _read_values(lines: list[str], start: int, count: int) -> tuple[np.ndarray, int]:
@@ -67,10 +77,35 @@ class ParsecPseudopotential:
     channel_cutoffs: dict[int, float]
     source: Path
     spin_orbit_channel_potentials: dict[int, np.ndarray] = field(default_factory=dict)
+    # ``p_pot%rcore`` of a species whose file holds no cutoff radius: the
+    # ``Core_Cutoff_Radius`` of a ``MARTINS_OLD`` species.  ``None`` for a
+    # ``MARTINS_NEW`` file, whose radius follows from ``channel_cutoffs``.
+    core_radius: float | None = None
+    # ``Pseudopotential_Format`` the tables were read with.
+    file_format: str = "martins_new"
 
     @property
     def has_nonlinear_core_correction(self) -> bool:
         return self.core_marker.strip().lower() not in {"nc", "none", "no"}
+
+    @property
+    def projector_support_radius(self) -> float:
+        """``rc`` of ``nonloc.F90``: radius of the Kleinman-Bylander sphere.
+
+        Grid points at distances up to this radius, inclusive, carry the
+        nonlocal projectors of an atom.  It is ``p_pot%rcore`` capped at the
+        penultimate radial sample.  ``pseudo.f90`` sets ``rcore`` for a
+        ``MARTINS_NEW`` file to the first tabulated radius beyond the largest
+        channel cutoff of the file; for a ``MARTINS_OLD`` file it is the
+        ``Core_Cutoff_Radius`` of the input as given, which is in general
+        not a tabulated radius.
+        """
+        if self.core_radius is not None:
+            return float(min(self.core_radius, self.interpolation_cutoff))
+        requested = max(self.channel_cutoffs.values(), default=self.radii[0])
+        next_index = int(np.searchsorted(self.radii, requested, side="right"))
+        next_index = min(next_index, self.radii.size - 2)
+        return float(self.radii[next_index])
 
     @property
     def interpolation_cutoff(self) -> float:

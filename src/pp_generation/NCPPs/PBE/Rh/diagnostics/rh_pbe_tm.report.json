@@ -1,0 +1,178 @@
+{
+  "schema_version": 2,
+  "element": "Rh",
+  "prefix": "rh_pbe_tm",
+  "backend": "pyfhi98pp",
+  "family": "ncpp",
+  "xc": "pbe",
+  "scheme": "tm",
+  "relativistic": "scalar",
+  "variant": null,
+  "core_hole": null,
+  "ionic_charge": 9.0,
+  "reference_electrons": 9.0,
+  "reference_charge": 0.0,
+  "ae_energy_hartree": -4784.114305905717,
+  "pseudo_energy_hartree": -21.6778540427449,
+  "atomic_energy_correction_rydberg": -9524.872903725944,
+  "lmax": 2,
+  "channels": [
+    {
+      "angular_momentum": 0,
+      "scheme": "t",
+      "cutoff_radius": 2.465804963120685,
+      "match_radius": 2.5267103457097657,
+      "ae_eigenvalue_ev": -4.300402284032944,
+      "pseudo_eigenvalue_ev": -4.300416234713566,
+      "norm_test": 0.99999977041166,
+      "slope_test": 0.9999952317459212
+    },
+    {
+      "angular_momentum": 1,
+      "scheme": "t",
+      "cutoff_radius": 2.589120091248797,
+      "match_radius": 2.653071357502642,
+      "ae_eigenvalue_ev": 15.0,
+      "pseudo_eigenvalue_ev": 15.000038624186084,
+      "norm_test": 0.9999987101958618,
+      "slope_test": 0.9999987101958625
+    },
+    {
+      "angular_momentum": 2,
+      "scheme": "t",
+      "cutoff_radius": 2.3483631125113145,
+      "match_radius": 2.4063676813903436,
+      "ae_eigenvalue_ev": -5.940362643802243,
+      "pseudo_eigenvalue_ev": -5.94038761684341,
+      "norm_test": 0.9999994680845609,
+      "slope_test": 1.000004149858286
+    }
+  ],
+  "core_radius": 0.0,
+  "reference_shift_ev": 0.0,
+  "kinetic_cutoff_rydberg": {
+    "0": 28.0,
+    "2": 64.0
+  },
+  "ghost_free": true,
+  "selected_local_channel": 1,
+  "local_channel_results": [
+    {
+      "local_channel": 0,
+      "passed": true,
+      "minimum_margin_hartree": 0.01300301316929793,
+      "report_path": "rh_pbe_tm.local-0.test",
+      "channels": [
+        {
+          "angular_momentum": 1,
+          "label": "p",
+          "status": "pass",
+          "message": "* no ghost (ekb > 0, eloc0 < eref < eloc1)",
+          "margin_hartree": 0.01300301316929793,
+          "reference_energy_hartree": -0.03258027396685476,
+          "local_ground_energy_hartree": -0.04558328713615269,
+          "local_first_excited_energy_hartree": 0.0,
+          "projector_sign": 1
+        },
+        {
+          "angular_momentum": 2,
+          "label": "d",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.21830383317426208,
+          "reference_energy_hartree": -0.21830383317426208,
+          "local_ground_energy_hartree": 0.0,
+          "local_first_excited_energy_hartree": 0.0,
+          "projector_sign": -1
+        }
+      ]
+    },
+    {
+      "local_channel": 1,
+      "passed": true,
+      "minimum_margin_hartree": 0.033441038109106605,
+      "report_path": "rh_pbe_tm.local-1.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.033441038109106605,
+          "reference_energy_hartree": -0.15803620706598528,
+          "local_ground_energy_hartree": -0.12459516895687868,
+          "local_first_excited_energy_hartree": -5.5375609742608974e-05,
+          "projector_sign": -1
+        },
+        {
+          "angular_momentum": 2,
+          "label": "d",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.21830383317426208,
+          "reference_energy_hartree": -0.21830383317426208,
+          "local_ground_energy_hartree": 0.0,
+          "local_first_excited_energy_hartree": 0.0,
+          "projector_sign": -1
+        }
+      ]
+    },
+    {
+      "local_channel": 2,
+      "passed": false,
+      "minimum_margin_hartree": null,
+      "report_path": "rh_pbe_tm.local-2.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "ghost",
+          "message": "* one or more ghosts (ekb > 0, eref > eloc1)",
+          "margin_hartree": null,
+          "reference_energy_hartree": -0.15803620706598528,
+          "local_ground_energy_hartree": -4.626547623390186,
+          "local_first_excited_energy_hartree": -0.5460225520084548,
+          "projector_sign": 1
+        },
+        {
+          "angular_momentum": 1,
+          "label": "p",
+          "status": "ghost",
+          "message": "* one or more ghosts (ekb > 0, eref > eloc1)",
+          "margin_hartree": null,
+          "reference_energy_hartree": -0.03258027396685476,
+          "local_ground_energy_hartree": -2.283092987786095,
+          "local_first_excited_energy_hartree": -0.0397802610161729,
+          "projector_sign": 1
+        }
+      ]
+    }
+  ],
+  "warnings": [],
+  "artifacts": {
+    "dat": {
+      "path": "rh_pbe_tm.dat",
+      "sha256": "1003d73b425190775796b2e9709650319257d99e777865ee04c03a1f594c3a14"
+    },
+    "aep": {
+      "path": "rh_pbe_tm.aep",
+      "sha256": "9416a7a45da12764b22054fdd74bda9b4d86b4cc9f123fcf0da68a31ffa84566"
+    },
+    "test": {
+      "path": "rh_pbe_tm.test",
+      "sha256": "3f2139938ec181bc734eac9fc14db2c4ad99e5c4fcb9b383ffec527f567890f8"
+    },
+    "fhi": {
+      "path": "../FHI/Rh_FHIPP.DAT",
+      "sha256": "20c8715db8509f6a3afccee714ab9461d719d8ecf902d5330c796ff28294d941"
+    },
+    "upf": {
+      "path": "../UPF/rh_pbe_tm.UPF",
+      "sha256": "681e4d1cb5385a6d0d3b99ee4a1faf8f428e47b905c8d6c534e7ced847ed3ae5"
+    },
+    "parsec": {
+      "path": "../PARSEC/Rh_POTRE.DAT",
+      "sha256": "3a68a07102187822a23c43098b30aeae2c901a544afeeacbe77b4cd007b5013a"
+    }
+  }
+}

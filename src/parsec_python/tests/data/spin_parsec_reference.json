@@ -1,0 +1,1908 @@
+{
+ "comment": "Fortran PARSEC (development version 1.4.x, gfortran 13.3) for small spin-polarized isolated systems (Spin_Polarization: .true.), read from parsec.out with Output_Level 2 in bohr, Ry and Ry/bohr with the digits Fortran prints. Every SCF loop is converged to 1e-8 Ry; 'iterations' is the number of SCF steps it took. 'eigenvalues', 'occupations', 'electrons' and 'energies' are those of the last step, per spin channel where there are two. 'initial_magnetic_moment' is what initchrg.f90 prints. 'forces' holds the tables of the structure: 'local' is \"local force components\" (ion-ion plus the local pseudopotential terms), 'ionic', 'sc' and 'core' its three pseudopotential terms. Pseudopotential files are named as tests/data/<file>: the spin_*_POTRE.DAT files are the potentials of the library under src/pp_generation as these runs read them, written by the converter while it resampled linearly (until October 2026). One case is a structural relaxation, with the steps of its atom.cor. A Python run needs Hartree_Boundary_Tolerance: off to use PARSEC's Hartree boundary values. With PBE the two programs differ beyond round-off: this package uses the potential of the discrete energy and Fortran the continuum expression (V_xc/pbe.py).",
+ "cases": {
+  "h_fixed_ca": {
+   "comment": "Hydrogen atom with 0.7 electrons up and 0.3 down from occup.in (Fermi_Temp: -1), CA.",
+   "input": [
+    "# H atom, occupations 0.7 up and 0.3 down from occup.in",
+    "Boundary_Sphere_Radius: 5.5",
+    "Grid_Spacing: 0.55",
+    "States_Num: 4",
+    "Fermi_Temp: -1",
+    "Max_Iter: 300",
+    "Convergence_Criterion: 1.0e-8",
+    "Eigensolver: chebff",
+    "Correlation_Type: ca",
+    "Spin_Polarization: .true.",
+    "Atom_Types_Num: 1",
+    "Atom_Type: H",
+    "Local_Component: s",
+    "begin Atom_Coord",
+    "   0.000000   0.000000   0.000000",
+    "end Atom_Coord",
+    "Output_Level: 2"
+   ],
+   "pseudopotentials": {
+    "H_POTRE.DAT": "tests/data/spin_ca_H_POTRE.DAT"
+   },
+   "occup": [
+    "spin up",
+    "0",
+    "1",
+    "1 0.7",
+    "spin down",
+    "0",
+    "1",
+    "1 0.3"
+   ],
+   "iterations": 14,
+   "initial_magnetic_moment": 0.2,
+   "energy": -0.9019874,
+   "energies": {
+    "eigenvalue": -0.46103637,
+    "hartree": 0.59241113,
+    "integral_vxc_rho": -0.64649493,
+    "exchange_correlation": -0.49503482,
+    "electron_ion": -1.89720555,
+    "ion_ion": 0.0
+   },
+   "electrons": [
+    0.7,
+    0.3
+   ],
+   "net_magnetic_moment": 0.4,
+   "eigenvalues": {
+    "up": [
+     -0.490912359,
+     0.3360326049,
+     0.3360326049,
+     0.3360326049
+    ],
+    "down": [
+     -0.3913257359,
+     0.3624308056,
+     0.3624308056,
+     0.3624308057
+    ]
+   },
+   "occupations": {
+    "up": [
+     0.7,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "down": [
+     0.3,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "forces": {
+    "positions": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "ionic": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "sc": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "core": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "local": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "nonlocal": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "symmetrized": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "net": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "total": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ]
+   }
+  },
+  "h_fixed_pbe": {
+   "comment": "The same atom with PBE.",
+   "input": [
+    "# H atom, occupations 0.7 up and 0.3 down from occup.in",
+    "Boundary_Sphere_Radius: 5.5",
+    "Grid_Spacing: 0.55",
+    "States_Num: 4",
+    "Fermi_Temp: -1",
+    "Max_Iter: 300",
+    "Convergence_Criterion: 1.0e-8",
+    "Eigensolver: chebff",
+    "Correlation_Type: pbe",
+    "Spin_Polarization: .true.",
+    "Atom_Types_Num: 1",
+    "Atom_Type: H",
+    "Local_Component: s",
+    "begin Atom_Coord",
+    "   0.000000   0.000000   0.000000",
+    "end Atom_Coord",
+    "Output_Level: 2"
+   ],
+   "pseudopotentials": {
+    "H_POTRE.DAT": "tests/data/spin_pbe_H_POTRE.DAT"
+   },
+   "occup": [
+    "spin up",
+    "0",
+    "1",
+    "1 0.7",
+    "spin down",
+    "0",
+    "1",
+    "1 0.3"
+   ],
+   "iterations": 14,
+   "initial_magnetic_moment": 0.2,
+   "energy": -0.92989119,
+   "energies": {
+    "eigenvalue": -0.466488,
+    "hartree": 0.60353144,
+    "integral_vxc_rho": -0.67373646,
+    "exchange_correlation": -0.53360821,
+    "electron_ion": -1.93338897,
+    "ion_ion": 0.0
+   },
+   "electrons": [
+    0.7,
+    0.3
+   ],
+   "net_magnetic_moment": 0.4,
+   "eigenvalues": {
+    "up": [
+     -0.5020304797,
+     0.3372120826,
+     0.3372120826,
+     0.3372120826
+    ],
+    "down": [
+     -0.3835555505,
+     0.3796877375,
+     0.3796877375,
+     0.3796877375
+    ]
+   },
+   "occupations": {
+    "up": [
+     0.7,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "down": [
+     0.3,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "forces": {
+    "positions": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "ionic": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "sc": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "core": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "local": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "nonlocal": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "symmetrized": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "net": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "total": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ]
+   }
+  },
+  "n_ca": {
+   "comment": "Nitrogen atom: the Fermi level puts four electrons up and one down (4S), CA.",
+   "input": [
+    "# N atom, spin polarized (quartet)",
+    "Boundary_Sphere_Radius: 5.5",
+    "Grid_Spacing: 0.55",
+    "States_Num: 8",
+    "Max_Iter: 300",
+    "Convergence_Criterion: 1.0e-8",
+    "Eigensolver: chebff",
+    "Correlation_Type: ca",
+    "Spin_Polarization: .true.",
+    "Atom_Types_Num: 1",
+    "Atom_Type: N",
+    "Local_Component: p",
+    "begin Atom_Coord",
+    "   0.000000   0.000000   0.000000",
+    "end Atom_Coord",
+    "Output_Level: 2"
+   ],
+   "pseudopotentials": {
+    "N_POTRE.DAT": "tests/data/spin_ca_N_POTRE.DAT"
+   },
+   "iterations": 13,
+   "initial_magnetic_moment": 1.0,
+   "energy": -19.8296173,
+   "energies": {
+    "eigenvalue": -4.33199474,
+    "hartree": 16.98271217,
+    "integral_vxc_rho": -6.22199617,
+    "exchange_correlation": -4.73690656,
+    "electron_ion": -49.02929597,
+    "ion_ion": 0.0
+   },
+   "fermi_level": -0.3856,
+   "electrons": [
+    4.0,
+    1.0
+   ],
+   "net_magnetic_moment": 3.0,
+   "eigenvalues": {
+    "up": [
+     -1.4379732858,
+     -0.6001602286,
+     -0.6001602286,
+     -0.6001602286,
+     0.3267568658,
+     0.5477391593,
+     0.5477391593,
+     0.5477391593
+    ],
+    "down": [
+     -1.09354077,
+     -0.268478112,
+     -0.268478112,
+     -0.268478112,
+     0.4159760111,
+     0.6668519501,
+     0.6668519501,
+     0.6668519501
+    ]
+   },
+   "occupations": {
+    "up": [
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "down": [
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "forces": {
+    "positions": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "ionic": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "sc": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "core": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "local": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "nonlocal": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "symmetrized": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "net": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "total": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ]
+   }
+  },
+  "o_spherical_ca": {
+   "comment": "Oxygen atom, triplet, with the down p electron spread over the p shell by occup.in, so that the atom keeps the symmetry of the grid, CA.",
+   "input": [
+    "# O atom, triplet, down p electron spread over the shell (occup.in)",
+    "Boundary_Sphere_Radius: 5.5",
+    "Grid_Spacing: 0.55",
+    "States_Num: 8",
+    "Fermi_Temp: -1",
+    "Max_Iter: 300",
+    "Convergence_Criterion: 1.0e-8",
+    "Eigensolver: chebff",
+    "Correlation_Type: ca",
+    "Spin_Polarization: .true.",
+    "Atom_Types_Num: 1",
+    "Atom_Type: O",
+    "Local_Component: p",
+    "begin Atom_Coord",
+    "   0.000000   0.000000   0.000000",
+    "end Atom_Coord",
+    "Output_Level: 2"
+   ],
+   "pseudopotentials": {
+    "O_POTRE.DAT": "tests/data/spin_ca_O_POTRE.DAT"
+   },
+   "occup": [
+    "spin up",
+    "4",
+    "0",
+    "spin down",
+    "1",
+    "3",
+    "2 0.3333333333333333",
+    "3 0.3333333333333333",
+    "4 0.3333333333333334"
+   ],
+   "iterations": 14,
+   "initial_magnetic_moment": 1.2,
+   "energy": -32.42952145,
+   "energies": {
+    "eigenvalue": -6.0225487,
+    "hartree": 28.49986821,
+    "integral_vxc_rho": -8.79011953,
+    "exchange_correlation": -6.69722408,
+    "electron_ion": -82.77433009,
+    "ion_ion": 0.0
+   },
+   "electrons": [
+    4.0,
+    2.0
+   ],
+   "net_magnetic_moment": 2.0,
+   "eigenvalues": {
+    "up": [
+     -1.679077824,
+     -0.7898620352,
+     -0.7898620352,
+     -0.7898620352,
+     0.311547301,
+     0.5120273053,
+     0.5120273053,
+     0.5120273053
+    ],
+    "down": [
+     -1.4400911056,
+     -0.5337936621,
+     -0.5337936621,
+     -0.5337936621,
+     0.3497359961,
+     0.5646419459,
+     0.5646419459,
+     0.5646419459
+    ]
+   },
+   "occupations": {
+    "up": [
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "down": [
+     1.0,
+     0.3333,
+     0.3333,
+     0.3333,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "forces": {
+    "positions": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "ionic": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "sc": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "core": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "local": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "nonlocal": [
+     [
+      0.0,
+      -0.0,
+      0.0
+     ]
+    ],
+    "symmetrized": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "net": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "total": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ]
+   }
+  },
+  "o2_ca": {
+   "comment": "O2 molecule, triplet, CA.",
+   "input": [
+    "# O2 molecule, spin polarized (triplet)",
+    "Boundary_Sphere_Radius: 5.5",
+    "Grid_Spacing: 0.55",
+    "States_Num: 12",
+    "Max_Iter: 300",
+    "Convergence_Criterion: 1.0e-8",
+    "Eigensolver: chebff",
+    "Correlation_Type: ca",
+    "Spin_Polarization: .true.",
+    "Atom_Types_Num: 1",
+    "Atom_Type: O",
+    "Local_Component: p",
+    "begin Atom_Coord",
+    "   0.000000   0.000000   1.141400",
+    "   0.000000   0.000000  -1.141400",
+    "end Atom_Coord",
+    "Output_Level: 2"
+   ],
+   "pseudopotentials": {
+    "O_POTRE.DAT": "tests/data/spin_ca_O_POTRE.DAT"
+   },
+   "iterations": 18,
+   "initial_magnetic_moment": 2.4,
+   "energy": -65.34339648,
+   "energies": {
+    "eigenvalue": -13.80389573,
+    "hartree": 87.37188245,
+    "integral_vxc_rho": -18.06362741,
+    "exchange_correlation": -13.77145947,
+    "electron_ion": -228.07181491,
+    "ion_ion": 31.54021377
+   },
+   "fermi_level": -0.4187,
+   "electrons": [
+    7.0,
+    5.0
+   ],
+   "net_magnetic_moment": 2.0,
+   "eigenvalues": {
+    "up": [
+     -2.274660213,
+     -1.3495713008,
+     -1.0227129126,
+     -1.0227129126,
+     -0.9979949765,
+     -0.553166339,
+     -0.553166339,
+     0.1652996608,
+     0.3419618645,
+     0.5099128569,
+     0.5099128569,
+     0.6819922581
+    ],
+    "down": [
+     -2.166145108,
+     -1.2158860011,
+     -0.8850430446,
+     -0.8850430446,
+     -0.8777935426,
+     -0.3879237319,
+     -0.3879237319,
+     0.3073520616,
+     0.3607415506,
+     0.5374332986,
+     0.5374332986,
+     0.6949483369
+    ]
+   },
+   "occupations": {
+    "up": [
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "down": [
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "forces": {
+    "positions": [
+     [
+      0.0,
+      0.0,
+      1.1414
+     ],
+     [
+      0.0,
+      0.0,
+      -1.1414
+     ]
+    ],
+    "ionic": [
+     [
+      0.0,
+      0.0,
+      -11.162059
+     ],
+     [
+      -0.0,
+      0.0,
+      11.162059
+     ]
+    ],
+    "sc": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      -0.0,
+      0.0,
+      -0.0
+     ]
+    ],
+    "core": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "local": [
+     [
+      0.0,
+      0.0,
+      2.654401
+     ],
+     [
+      -0.0,
+      0.0,
+      -2.654401
+     ]
+    ],
+    "nonlocal": [
+     [
+      -0.0,
+      -0.0,
+      -3.489658
+     ],
+     [
+      0.0,
+      0.0,
+      3.489658
+     ]
+    ],
+    "symmetrized": [
+     [
+      0.0,
+      0.0,
+      -0.835258
+     ],
+     [
+      0.0,
+      0.0,
+      0.835258
+     ]
+    ],
+    "net": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "total": [
+     [
+      0.0,
+      0.0,
+      -0.835258
+     ],
+     [
+      0.0,
+      -0.0,
+      0.835258
+     ]
+    ]
+   }
+  },
+  "ch3_ca": {
+   "comment": "Methyl radical without any symmetry, doublet, CA.",
+   "input": [
+    "# CH3 radical without symmetry, spin polarized (doublet)",
+    "Boundary_Sphere_Radius: 5.5",
+    "Grid_Spacing: 0.55",
+    "States_Num: 8",
+    "Max_Iter: 300",
+    "Convergence_Criterion: 1.0e-8",
+    "Eigensolver: chebff",
+    "Correlation_Type: ca",
+    "Spin_Polarization: .true.",
+    "Atom_Types_Num: 2",
+    "Atom_Type: C",
+    "Local_Component: p",
+    "begin Atom_Coord",
+    "   0.050000  -0.020000   0.100000",
+    "end Atom_Coord",
+    "Atom_Type: H",
+    "Local_Component: s",
+    "begin Atom_Coord",
+    "   2.000000   0.100000  -0.100000",
+    "  -1.050000   1.800000   0.050000",
+    "  -0.950000  -1.700000  -0.200000",
+    "end Atom_Coord",
+    "Output_Level: 2"
+   ],
+   "pseudopotentials": {
+    "C_POTRE.DAT": "tests/data/spin_ca_C_POTRE.DAT",
+    "H_POTRE.DAT": "tests/data/spin_ca_H_POTRE.DAT"
+   },
+   "iterations": 19,
+   "initial_magnetic_moment": 1.4,
+   "energy": -14.74463999,
+   "energies": {
+    "eigenvalue": -5.53495355,
+    "hartree": 24.49059798,
+    "integral_vxc_rho": -7.14886377,
+    "exchange_correlation": -5.46734745,
+    "electron_ion": -60.52644717,
+    "ion_ion": 13.59939525
+   },
+   "fermi_level": -0.3239,
+   "electrons": [
+    4.0,
+    3.0
+   ],
+   "net_magnetic_moment": 1.0,
+   "eigenvalues": {
+    "up": [
+     -1.2024740773,
+     -0.7469316089,
+     -0.700406272,
+     -0.3623054688,
+     0.2960163441,
+     0.3727524588,
+     0.4212554323,
+     0.5049514092
+    ],
+    "down": [
+     -1.138505597,
+     -0.7149910612,
+     -0.6693394683,
+     -0.2118284016,
+     0.3289970117,
+     0.3901662015,
+     0.4359489501,
+     0.5546781136
+    ]
+   },
+   "occupations": {
+    "up": [
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "down": [
+     1.0,
+     1.0,
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "forces": {
+    "positions": [
+     [
+      -0.425,
+      -0.07,
+      0.15
+     ],
+     [
+      1.525,
+      0.05,
+      -0.05
+     ],
+     [
+      -1.525,
+      1.75,
+      0.1
+     ],
+     [
+      -1.425,
+      -1.75,
+      -0.15
+     ]
+    ],
+    "ionic": [
+     [
+      0.233135,
+      -0.212278,
+      -0.505685
+     ],
+     [
+      -2.358032,
+      -0.16632,
+      0.23666
+     ],
+     [
+      1.079626,
+      -1.779007,
+      -0.008186
+     ],
+     [
+      1.188765,
+      1.890347,
+      0.361164
+     ]
+    ],
+    "sc": [
+     [
+      0.0,
+      -0.0,
+      -0.0
+     ],
+     [
+      -0.0,
+      -0.0,
+      -0.0
+     ],
+     [
+      -0.0,
+      0.0,
+      -0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "core": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "local": [
+     [
+      0.121642,
+      -0.114962,
+      0.057237
+     ],
+     [
+      -0.012843,
+      -0.032102,
+      0.02324
+     ],
+     [
+      0.017858,
+      -0.024856,
+      -0.031157
+     ],
+     [
+      0.016837,
+      -0.095337,
+      0.034633
+     ]
+    ],
+    "nonlocal": [
+     [
+      -0.255794,
+      0.218752,
+      -0.128621
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "symmetrized": [
+     [
+      -0.134152,
+      0.10379,
+      -0.071383
+     ],
+     [
+      -0.012843,
+      -0.032102,
+      0.02324
+     ],
+     [
+      0.017858,
+      -0.024856,
+      -0.031157
+     ],
+     [
+      0.016837,
+      -0.095337,
+      0.034633
+     ]
+    ],
+    "net": [
+     -0.112299,
+     -0.048505,
+     -0.044668
+    ],
+    "total": [
+     [
+      -0.106077,
+      0.115916,
+      -0.060217
+     ],
+     [
+      0.015232,
+      -0.019976,
+      0.034407
+     ],
+     [
+      0.045933,
+      -0.01273,
+      -0.019991
+     ],
+     [
+      0.044912,
+      -0.083211,
+      0.0458
+     ]
+    ]
+   }
+  },
+  "h2o_spin_ca": {
+   "comment": "Water, a closed shell, with Spin_Polarization on and the default starting polarization, CA.",
+   "input": [
+    "# H2O, closed shell, spin polarization on",
+    "Boundary_Sphere_Radius: 5.5",
+    "Grid_Spacing: 0.55",
+    "States_Num: 8",
+    "Max_Iter: 300",
+    "Convergence_Criterion: 1.0e-8",
+    "Eigensolver: chebff",
+    "Correlation_Type: ca",
+    "Spin_Polarization: .true.",
+    "Atom_Types_Num: 2",
+    "Atom_Type: O",
+    "Local_Component: p",
+    "begin Atom_Coord",
+    "   0.000000   0.000000   0.000000",
+    "end Atom_Coord",
+    "Atom_Type: H",
+    "Local_Component: s",
+    "begin Atom_Coord",
+    "   1.430400   0.000000   1.107100",
+    "  -1.430400   0.000000   1.107100",
+    "end Atom_Coord",
+    "Output_Level: 2"
+   ],
+   "pseudopotentials": {
+    "O_POTRE.DAT": "tests/data/spin_ca_O_POTRE.DAT",
+    "H_POTRE.DAT": "tests/data/spin_ca_H_POTRE.DAT"
+   },
+   "iterations": 20,
+   "initial_magnetic_moment": 1.6,
+   "energy": -35.18731576,
+   "energies": {
+    "eigenvalue": -7.65033868,
+    "hartree": 44.1393891,
+    "integral_vxc_rho": -11.11830291,
+    "exchange_correlation": -8.48354824,
+    "electron_ion": -116.50005057,
+    "ion_ion": 13.96765736
+   },
+   "fermi_level": -0.0503,
+   "electrons": [
+    4.0,
+    4.0
+   ],
+   "net_magnetic_moment": 0.0,
+   "eigenvalues": {
+    "up": [
+     -1.7142239972,
+     -0.9304210456,
+     -0.6456347238,
+     -0.5348895751,
+     0.1104237191,
+     0.2667157813,
+     0.4896616166,
+     0.5042955788
+    ],
+    "down": [
+     -1.7142239965,
+     -0.9304210453,
+     -0.6456347235,
+     -0.5348895743,
+     0.1104237191,
+     0.2667157811,
+     0.4896616167,
+     0.5042955786
+    ]
+   },
+   "occupations": {
+    "up": [
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "down": [
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "forces": {
+    "positions": [
+     [
+      0.0,
+      0.0,
+      -0.55355
+     ],
+     [
+      1.4304,
+      0.0,
+      0.55355
+     ],
+     [
+      -1.4304,
+      0.0,
+      0.55355
+     ]
+    ],
+    "ionic": [
+     [
+      0.0,
+      0.0,
+      1.68986
+     ],
+     [
+      -3.192845,
+      0.0,
+      -2.16229
+     ],
+     [
+      3.192845,
+      -0.0,
+      -2.16229
+     ]
+    ],
+    "sc": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      -0.0,
+      0.0,
+      -0.0
+     ],
+     [
+      0.0,
+      0.0,
+      -0.0
+     ]
+    ],
+    "core": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "local": [
+     [
+      0.0,
+      0.0,
+      -2.800022
+     ],
+     [
+      -0.047953,
+      0.0,
+      0.082651
+     ],
+     [
+      0.047953,
+      -0.0,
+      0.082651
+     ]
+    ],
+    "nonlocal": [
+     [
+      0.0,
+      -0.0,
+      2.6952
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "symmetrized": [
+     [
+      0.0,
+      0.0,
+      -0.104822
+     ],
+     [
+      -0.047953,
+      -0.0,
+      0.082651
+     ],
+     [
+      0.047953,
+      0.0,
+      0.082651
+     ]
+    ],
+    "net": [
+     0.0,
+     -0.0,
+     0.06048
+    ],
+    "total": [
+     [
+      0.0,
+      0.0,
+      -0.124982
+     ],
+     [
+      -0.047953,
+      -0.0,
+      0.062491
+     ],
+     [
+      0.047953,
+      0.0,
+      0.062491
+     ]
+    ]
+   }
+  },
+  "h2o_nospin_ca": {
+   "comment": "The same water molecule without spin polarization.",
+   "input": [
+    "# H2O, closed shell, no spin polarization",
+    "Boundary_Sphere_Radius: 5.5",
+    "Grid_Spacing: 0.55",
+    "States_Num: 8",
+    "Max_Iter: 300",
+    "Convergence_Criterion: 1.0e-8",
+    "Eigensolver: chebff",
+    "Correlation_Type: ca",
+    "Spin_Polarization: .false.",
+    "Atom_Types_Num: 2",
+    "Atom_Type: O",
+    "Local_Component: p",
+    "begin Atom_Coord",
+    "   0.000000   0.000000   0.000000",
+    "end Atom_Coord",
+    "Atom_Type: H",
+    "Local_Component: s",
+    "begin Atom_Coord",
+    "   1.430400   0.000000   1.107100",
+    "  -1.430400   0.000000   1.107100",
+    "end Atom_Coord",
+    "Output_Level: 2"
+   ],
+   "pseudopotentials": {
+    "O_POTRE.DAT": "tests/data/spin_ca_O_POTRE.DAT",
+    "H_POTRE.DAT": "tests/data/spin_ca_H_POTRE.DAT"
+   },
+   "iterations": 16,
+   "energy": -35.18731576,
+   "energies": {
+    "eigenvalue": -7.65033867,
+    "hartree": 44.13938909,
+    "integral_vxc_rho": -11.11830291,
+    "exchange_correlation": -8.48354824,
+    "electron_ion": -116.50005056,
+    "ion_ion": 13.96765736
+   },
+   "fermi_level": -0.0503,
+   "eigenvalues": [
+    -1.7142239957,
+    -0.9304210429,
+    -0.6456347212,
+    -0.5348895753,
+    0.1104237191,
+    0.2667157818,
+    0.4896616174,
+    0.5042955795
+   ],
+   "occupations": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "forces": {
+    "positions": [
+     [
+      0.0,
+      0.0,
+      -0.55355
+     ],
+     [
+      1.4304,
+      0.0,
+      0.55355
+     ],
+     [
+      -1.4304,
+      0.0,
+      0.55355
+     ]
+    ],
+    "ionic": [
+     [
+      0.0,
+      0.0,
+      1.68986
+     ],
+     [
+      -3.192845,
+      0.0,
+      -2.16229
+     ],
+     [
+      3.192845,
+      0.0,
+      -2.16229
+     ]
+    ],
+    "sc": [
+     [
+      0.0,
+      0.0,
+      -0.0
+     ],
+     [
+      -0.0,
+      0.0,
+      -0.0
+     ],
+     [
+      0.0,
+      -0.0,
+      -0.0
+     ]
+    ],
+    "core": [
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "local": [
+     [
+      0.0,
+      0.0,
+      -2.800022
+     ],
+     [
+      -0.047953,
+      0.0,
+      0.082651
+     ],
+     [
+      0.047953,
+      0.0,
+      0.082651
+     ]
+    ],
+    "nonlocal": [
+     [
+      -0.0,
+      0.0,
+      2.6952
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "symmetrized": [
+     [
+      0.0,
+      0.0,
+      -0.104822
+     ],
+     [
+      -0.047953,
+      -0.0,
+      0.082651
+     ],
+     [
+      0.047953,
+      0.0,
+      0.082651
+     ]
+    ],
+    "net": [
+     0.0,
+     -0.0,
+     0.06048
+    ],
+    "total": [
+     [
+      0.0,
+      0.0,
+      -0.124982
+     ],
+     [
+      -0.047953,
+      -0.0,
+      0.062491
+     ],
+     [
+      0.047953,
+      0.0,
+      0.062491
+     ]
+    ]
+   }
+  },
+  "geh3_nlcc_ca": {
+   "comment": "GeH3 radical without any symmetry, doublet, CA, with the nonlinear core correction of the Ge pseudopotential: half of the core density enters each spin channel, and the core-correction force reads the average of the two exchange-correlation potentials.",
+   "input": [
+    "# GeH3 radical without symmetry, core-corrected Ge, spin polarized (doublet)",
+    "Boundary_Sphere_Radius: 7.0",
+    "Grid_Spacing: 0.5",
+    "States_Num: 8",
+    "Max_Iter: 300",
+    "Convergence_Criterion: 1.0e-8",
+    "Eigensolver: chebff",
+    "Correlation_Type: ca",
+    "Spin_Polarization: .true.",
+    "Atom_Types_Num: 2",
+    "Atom_Type: Ge",
+    "Local_Component: p",
+    "begin Atom_Coord",
+    "   0.050000  -0.020000   0.100000",
+    "end Atom_Coord",
+    "Atom_Type: H",
+    "Local_Component: s",
+    "begin Atom_Coord",
+    "   2.900000   0.100000  -0.100000",
+    "  -1.500000   2.500000   0.050000",
+    "  -1.400000  -2.500000  -0.200000",
+    "end Atom_Coord",
+    "Output_Level: 2"
+   ],
+   "pseudopotentials": {
+    "Ge_POTRE.DAT": "tests/data/Ge_POTRE.DAT",
+    "H_POTRE.DAT": "tests/data/water_H_POTRE.DAT"
+   },
+   "iterations": 21,
+   "initial_magnetic_moment": 1.4,
+   "energy": -29.76962086,
+   "energies": {
+    "eigenvalue": -4.80729964,
+    "hartree": 17.13541499,
+    "integral_vxc_rho": -6.03093677,
+    "exchange_correlation": -23.32508117,
+    "electron_ion": -38.95782215,
+    "ion_ion": 9.46723819
+   },
+   "fermi_level": -0.2686,
+   "electrons": [
+    4.0,
+    3.0
+   ],
+   "net_magnetic_moment": 1.0,
+   "eigenvalues": {
+    "up": [
+     -1.0166214108,
+     -0.6398579796,
+     -0.6217471379,
+     -0.3032119155,
+     -0.0423337045,
+     0.071709655,
+     0.0966977613,
+     0.2024659607
+    ],
+    "down": [
+     -0.9867513868,
+     -0.6284408114,
+     -0.6106690026,
+     -0.2261268543,
+     -0.0186566707,
+     0.0868800467,
+     0.1119027956,
+     0.2432753662
+    ]
+   },
+   "occupations": {
+    "up": [
+     1.0,
+     1.0,
+     1.0,
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "down": [
+     1.0,
+     1.0,
+     1.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "forces": {
+    "positions": [
+     [
+      -0.65,
+      -0.02,
+      0.15
+     ],
+     [
+      2.2,
+      0.1,
+      -0.05
+     ],
+     [
+      -2.2,
+      2.5,
+      0.1
+     ],
+     [
+      -2.1,
+      -2.5,
+      -0.15
+     ]
+    ],
+    "ionic": [
+     [
+      -0.011871,
+      0.019163,
+      -0.156582
+     ],
+     [
+      -1.1075,
+      -0.044215,
+      0.060003
+     ],
+     [
+      0.575619,
+      -0.943838,
+      0.005761
+     ],
+     [
+      0.559762,
+      0.971873,
+      0.106226
+     ]
+    ],
+    "sc": [
+     [
+      -0.0,
+      -0.0,
+      0.0
+     ],
+     [
+      0.0,
+      -0.0,
+      0.0
+     ],
+     [
+      -0.0,
+      -0.0,
+      0.0
+     ],
+     [
+      -0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "core": [
+     [
+      -0.01045,
+      -0.008058,
+      0.013372
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "local": [
+     [
+      -0.037415,
+      0.015189,
+      0.040252
+     ],
+     [
+      0.005149,
+      -0.000273,
+      -0.00923
+     ],
+     [
+      0.025585,
+      -0.047937,
+      -0.003316
+     ],
+     [
+      0.01224,
+      0.027945,
+      0.001073
+     ]
+    ],
+    "nonlocal": [
+     [
+      -0.004081,
+      0.000907,
+      -0.013258
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0
+     ]
+    ],
+    "symmetrized": [
+     [
+      -0.041496,
+      0.016096,
+      0.026994
+     ],
+     [
+      0.005149,
+      -0.000273,
+      -0.00923
+     ],
+     [
+      0.025585,
+      -0.047937,
+      -0.003316
+     ],
+     [
+      0.01224,
+      0.027945,
+      0.001073
+     ]
+    ],
+    "net": [
+     0.001478,
+     -0.004169,
+     0.015521
+    ],
+    "total": [
+     [
+      -0.041866,
+      0.017138,
+      0.023114
+     ],
+     [
+      0.004779,
+      0.00077,
+      -0.01311
+     ],
+     [
+      0.025216,
+      -0.046895,
+      -0.007197
+     ],
+     [
+      0.011871,
+      0.028987,
+      -0.002807
+     ]
+    ]
+   }
+  },
+  "o2_bfgs_ca": {
+   "comment": "Structural relaxation (BFGS) of the O2 triplet, CA. 'structures' are the steps of atom.cor: coordinates in bohr with six decimals, the energy per atom in eV with five and the largest force in Ry/bohr with five; 'energy' is the total energy of the step in parsec.out.",
+   "input": [
+    "# O2 molecule, spin polarized (triplet)",
+    "Boundary_Sphere_Radius: 5.5",
+    "Grid_Spacing: 0.55",
+    "States_Num: 12",
+    "Max_Iter: 300",
+    "Convergence_Criterion: 1.0e-8",
+    "Eigensolver: chebff",
+    "Correlation_Type: ca",
+    "Spin_Polarization: .true.",
+    "Atom_Types_Num: 1",
+    "Atom_Type: O",
+    "Local_Component: p",
+    "begin Atom_Coord",
+    "   0.000000   0.000000   1.141400",
+    "   0.000000   0.000000  -1.141400",
+    "end Atom_Coord",
+    "Minimization: BFGS",
+    "Force_Min: 0.01",
+    "Movement_Num: 12",
+    "Output_Level: 2"
+   ],
+   "pseudopotentials": {
+    "O_POTRE.DAT": "tests/data/spin_ca_O_POTRE.DAT"
+   },
+   "structures": [
+    {
+     "positions": [
+      [
+       0.0,
+       0.0,
+       1.1414
+      ],
+      [
+       0.0,
+       0.0,
+       -1.1414
+      ]
+     ],
+     "energy_per_atom_ev": -444.52459,
+     "maximum_force": 0.83526,
+     "energy": -65.34339648
+    },
+    {
+     "positions": [
+      [
+       0.0,
+       0.0,
+       0.434293
+      ],
+      [
+       0.0,
+       0.0,
+       -0.434293
+      ]
+     ],
+     "energy_per_atom_ev": -348.59954,
+     "maximum_force": 54.71299,
+     "energy": -51.24278488
+    },
+    {
+     "positions": [
+      [
+       0.0,
+       0.0,
+       0.960937
+      ],
+      [
+       0.0,
+       0.0,
+       -0.960937
+      ]
+     ],
+     "energy_per_atom_ev": -442.34715,
+     "maximum_force": 2.51851,
+     "energy": -65.02332076
+    },
+    {
+     "positions": [
+      [
+       0.0,
+       0.0,
+       1.099075
+      ],
+      [
+       0.0,
+       0.0,
+       -1.099075
+      ]
+     ],
+     "energy_per_atom_ev": -444.77997,
+     "maximum_force": 0.02734,
+     "energy": -65.38093578
+    },
+    {
+     "positions": [
+      [
+       0.0,
+       0.0,
+       1.097643
+      ],
+      [
+       0.0,
+       0.0,
+       -1.097643
+      ]
+     ],
+     "energy_per_atom_ev": -444.77618,
+     "maximum_force": 0.00141,
+     "energy": -65.38037879
+    }
+   ]
+  }
+ }
+}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import asdict
+import os
 from pathlib import Path
 import sys
 import time
@@ -17,6 +18,18 @@ from .Eigensolvers.perturbative_soc import (
     PerturbativeSpinOrbitResult,
     build_spin_orbit_projectors,
     perturbative_spin_orbit_correction,
+)
+from .MolecularDynamics.run import (
+    restart_structure as dynamics_restart_structure,
+    run_recorded_molecular_dynamics,
+)
+from .Relaxation.backend import reference_backend
+from .Relaxation.run import (
+    relaxation_header_lines,
+    restart_structure,
+    run_recorded_relaxation,
+    run_single_point_with_forces,
+    symmetry_decision,
 )
 from .Input import (
     ParsecInputError,
@@ -51,7 +64,36 @@ from .SCF.self_consistent_soc_spin_polarized import (
     run_self_consistent_soc_spin_polarized,
 )
 from .SCF.spin_polarized import run_scf_spin_polarized
+from .Output.parsec_output import domain_dry_run_lines
 from .V_ion import load_pseudopotentials
+
+
+# Switches of the Hartree boundary values that only the accelerated driver
+# reads.  This driver takes the values from the input keywords.
+_ACCELERATED_BOUNDARY_SWITCHES = (
+    "PARSEC_HARTREE_BOUNDARY",
+    "PARSEC_HARTREE_BOUNDARY_TOLERANCE",
+    "PARSEC_HARTREE_ATOMIC_TAIL",
+    "PARSEC_HARTREE_LPOLE",
+)
+
+
+def ignored_boundary_switch_warnings() -> list[str]:
+    """Name the boundary switches that are set and that this driver ignores.
+
+    A run of the accelerated driver under one of them has another Hartree
+    boundary than a reference run of the same input, which a comparison of
+    the two would take for an error of either.
+    """
+
+    return [
+        f"{name}={os.environ[name].strip()} is a switch of the accelerated "
+        "driver and is ignored by the reference driver: the Hartree boundary "
+        "of this run follows the input keywords Solver_Lpole, "
+        "Hartree_Boundary_Tolerance and Hartree_Atomic_Tail"
+        for name in _ACCELERATED_BOUNDARY_SWITCHES
+        if os.environ.get(name, "").strip()
+    ]
 
 
 class _RunLog:
@@ -149,8 +191,25 @@ def save_result_archive(
     result: SinglePointResult,
     *,
     include_wavefunctions: bool = False,
+    forces=None,
+    relaxation=None,
+    dynamics=None,
+    refinement=None,
 ) -> Path:
-    """Save a portable NumPy result archive without wavefunctions by default."""
+    """Save a portable NumPy result archive without wavefunctions by default.
+
+    The members are stored uncompressed.  ``np.load`` reads the archive like
+    a compressed one.  ``forces`` (a :class:`parsec_python.Forces.ForceResult`)
+    adds the force tables of the structure under ``forces_*`` and
+    ``relaxation`` (an :class:`parsec_python.Relaxation.IonicOutcome`) the
+    positions, energies and forces of every structure under ``relaxation_*``;
+    ``dynamics`` (a
+    :class:`parsec_python.MolecularDynamics.run.MolecularDynamicsOutcome`)
+    the structures, energies and temperatures of a molecular dynamics run
+    under ``dynamics_*``; ``refinement`` (an
+    :class:`parsec_python.Energy.refinement.EnergyRefinement`) the energies
+    of a post-SCF refinement under ``refinement_*``.
+    """
     output = _npz_path(Path(path).expanduser().resolve())
     output.parent.mkdir(parents=True, exist_ok=True)
     energy = asdict(result.energies)
@@ -246,6 +305,54 @@ def save_result_archive(
     }
     for name, value in energy.items():
         payload[f"energy_{name}_ry"] = np.asarray(value)
+    # A spin-polarized result adds its two channels, up first.  The members
+    # above then describe both together (SinglePointResult): the total
+    # density, the averages of the potentials, and the states of the up
+    # channel followed by those of the down channel.  Other archives keep
+    # the members they had.
+    channels = getattr(result, "spin", None)
+    if channels is not None:
+        payload["spin_polarized"] = np.asarray(True)
+        payload["spin_electrons"] = np.asarray(
+            [channel.electron_count for channel in channels]
+        )
+        payload["net_magnetic_moment"] = np.asarray(result.net_magnetic_moment)
+        for name, member in (
+            ("eigenvalues", "spin_eigenvalues_ry"),
+            ("occupations", "spin_occupations"),
+            ("representations", "spin_representations"),
+            ("density", "spin_density_e_per_bohr3"),
+            ("xc_potential", "spin_xc_potential_ry"),
+            ("input_effective_potential", "spin_input_effective_potential_ry"),
+            ("output_effective_potential", "spin_output_effective_potential_ry"),
+            ("next_effective_potential", "spin_next_effective_potential_ry"),
+        ):
+            payload[member] = np.asarray(
+                [getattr(channel, name) for channel in channels]
+            )
+        payload["scf_spin_history"] = np.asarray(
+            [
+                [
+                    item.iteration,
+                    *item.spin_weighted_residuals,
+                    *item.spin_plain_residuals,
+                    *item.spin_electrons,
+                ]
+                for item in result.history
+            ],
+            dtype=float,
+        ).reshape(-1, 7)
+        payload["scf_spin_history_columns"] = np.asarray(
+            [
+                "iteration",
+                "weighted_sre_up_ry",
+                "weighted_sre_down_ry",
+                "plain_sre_up",
+                "plain_sre_down",
+                "electrons_up",
+                "electrons_down",
+            ]
+        )
     # Timing metadata is additive: archives from result-like objects created by
     # older callers still save successfully, while native results expose both
     # aggregate SCF and preparation values as named scalar keys.
@@ -322,10 +429,114 @@ def save_result_archive(
                 payload[f"backend_statistic_{name}"] = np.asarray(value)
     if include_wavefunctions:
         payload["wavefunctions"] = result.wavefunctions
+    if forces is not None:
+        payload["forces_positions"] = np.asarray(forces.positions)
+        payload["forces_total"] = np.asarray(forces.total)
+        payload["forces_ion_ion"] = np.asarray(forces.ion_ion)
+        payload["forces_local_ionic"] = np.asarray(forces.local.ionic)
+        payload["forces_self_consistency"] = np.asarray(forces.local.self_consistency)
+        payload["forces_core_correction"] = np.asarray(forces.local.core_correction)
+        payload["forces_nonlocal"] = np.asarray(forces.nonlocal_pseudopotential)
+        payload["forces_net"] = np.asarray(forces.net_force)
+        payload["forces_torque"] = np.asarray(forces.torque)
+    if relaxation is not None and relaxation.records:
+        records = relaxation.records
+        payload["relaxation_positions"] = np.asarray([item.positions for item in records])
+        payload["relaxation_energies"] = np.asarray([item.energy for item in records])
+        payload["relaxation_forces"] = np.asarray([item.forces.total for item in records])
+        payload["relaxation_maximum_forces"] = np.asarray(
+            [item.maximum_force for item in records]
+        )
+        payload["relaxation_scf_iterations"] = np.asarray(
+            [item.scf_iterations for item in records]
+        )
+        payload["relaxation_final_positions"] = np.asarray(relaxation.positions)
+        payload["relaxation_minimum_force_found"] = np.asarray(
+            relaxation.minimum_force_found
+        )
+    if dynamics is not None and dynamics.records:
+        records = dynamics.records
+        payload["dynamics_positions"] = np.asarray([item.positions for item in records])
+        payload["dynamics_energies"] = np.asarray([item.energy for item in records])
+        steps = [item.step for item in records if item.step is not None]
+        payload["dynamics_temperatures"] = np.asarray([item.temperature for item in steps])
+        payload["dynamics_kinetic_energies"] = np.asarray(
+            [item.kinetic_energy for item in steps]
+        )
+        payload["dynamics_conserved_energies"] = np.asarray(
+            [item.conserved_energy for item in steps]
+        )
+        payload["dynamics_next_positions"] = np.asarray(dynamics.positions)
+    if refinement is not None:
+        payload["refinement_functional"] = np.asarray(refinement.functional)
+        for name in (
+            "exact_exchange",
+            "slater_exchange",
+            "b88_exchange",
+            "vwn_correlation",
+            "lyp_correlation",
+            "exchange_correlation",
+            "scf_exchange_correlation",
+            "scf_total",
+            "total",
+            "all_electron_total",
+        ):
+            payload[f"refinement_{name}_ry"] = np.asarray(getattr(refinement, name))
+        payload["refinement_pair_solves"] = np.asarray(refinement.exchange.pair_solves)
+        payload["refinement_seconds"] = np.asarray(refinement.seconds)
     payload.update(_k_point_payload(result))
     payload.update(_scf_potential_payload(result))
-    np.savez_compressed(output, **payload)
+    # Almost all bytes are full-grid coordinates and scalar fields.  Deflating
+    # them runs zlib on one core (about 30 s for a 1.3 GB archive), so the
+    # members are written as they are.
+    np.savez(output, **payload)
     return output
+
+
+def relaxation_exit_code(result, outcome, *, manual: bool = False) -> int:
+    """Exit status of a run: 0 done, 3 an SCF loop did not converge, 4 not relaxed.
+
+    A relaxation counts as done when the largest force fell below
+    ``Force_Min``; a run of manual movements when every structure was
+    computed.  ``outcome`` is ``None`` for a single point.
+    """
+
+    if outcome is None:
+        return 0 if result.converged else 3
+    if outcome.scf_failed:
+        return 3
+    if outcome.error:
+        return 4
+    return 0 if (manual or outcome.minimum_force_found) else 4
+
+
+def refinement_progress(write, functional: str, interval: float = 60.0):
+    """Return ``(announce, progress)`` for a post-SCF energy refinement.
+
+    ``announce()`` writes that the refinement started; ``progress`` is the
+    callback of :func:`parsec_python.Energy.refinement.refine_energy` and
+    writes one line per ``interval`` seconds of pair-density Poisson solves,
+    so that a long refinement is seen to advance and a short one adds none.
+    """
+
+    name = functional.upper()
+    last = [0.0]
+
+    def announce() -> None:
+        write(
+            f" Energy refinement: evaluating the {name} exchange-correlation "
+            "energy of the converged orbitals"
+        )
+
+    def progress(done: int, total: int, seconds: float) -> None:
+        if done < total and seconds - last[0] >= interval:
+            last[0] = seconds
+            write(
+                f" Energy refinement: {done} of {total} pair-density Poisson "
+                f"solves done after {seconds:.1f} s"
+            )
+
+    return announce, progress
 
 
 def save_spin_polarized_result_archive(
@@ -495,6 +706,178 @@ def _run_bands_from_archive(system, translation, archive, reporter, directory: P
     _write_band_outputs(band_result, reporter, directory, start)
 
 
+def _run_extended_drivers(
+    system,
+    translation,
+    reporter,
+    log,
+    arguments,
+    *,
+    start: float,
+    archive_path: Path,
+    log_path: Path,
+    input_directory: Path,
+    k_sampling,
+    is_periodic: bool,
+    has_soc_species: bool,
+) -> int:
+    """SCF and bands of the drivers that main's ``run_scf`` does not cover.
+
+    Periodic k-point sampling (scalar, collinear spin, spin-orbit, spin-orbit
+    with collinear spin, non-collinear), the isolated and periodic
+    spin-orbit/non-collinear drivers, the perturbative spin-orbit correction on
+    a spin-polarized ground state, and periodic spin-polarized cells.  Returns
+    the exit status.
+    """
+
+    spin_polarized = translation.problem.scf.spin_polarized
+    self_consistent_spin_orbit = translation.problem.scf.self_consistent_spin_orbit
+    noncollinear = translation.problem.scf.noncollinear
+    scf_start = time.perf_counter()
+    if self_consistent_spin_orbit or noncollinear:
+        if is_periodic:
+            if k_sampling is not None:
+                k_points, k_weights = k_sampling
+            else:
+                k_points = np.zeros((1, 3))
+                k_weights = np.ones(1)
+            if noncollinear:
+                result = run_self_consistent_noncollinear_kpoints(
+                    system,
+                    k_points,
+                    k_weights,
+                    callback=reporter.iteration_self_consistent_soc,
+                )
+            else:
+                periodic_soc_driver = (
+                    run_self_consistent_soc_kpoints_spin_polarized
+                    if spin_polarized
+                    else run_self_consistent_soc_kpoints
+                )
+                result = periodic_soc_driver(
+                    system,
+                    k_points,
+                    k_weights,
+                    callback=reporter.iteration_self_consistent_soc,
+                )
+        else:
+            soc_projectors = tuple(
+                build_spin_orbit_projectors(
+                    system.grid,
+                    system.atoms,
+                    system.pseudopotentials,
+                    translation.problem.pseudopotentials,
+                )
+            )
+            if noncollinear:
+                result = run_self_consistent_noncollinear(
+                    system,
+                    soc_projectors,
+                    callback=reporter.iteration_self_consistent_soc,
+                )
+            elif spin_polarized:
+                result = run_self_consistent_soc_spin_polarized(
+                    system,
+                    soc_projectors,
+                    callback=reporter.iteration_self_consistent_soc,
+                )
+            else:
+                result = run_self_consistent_soc(
+                    system,
+                    soc_projectors,
+                    callback=reporter.iteration_self_consistent_soc,
+                )
+        scf_elapsed = time.perf_counter() - scf_start
+        reporter.finish_self_consistent_soc(result, scf_elapsed)
+        if not arguments.no_archive:
+            saved = save_self_consistent_soc_result_archive(
+                archive_path,
+                result,
+                include_wavefunctions=(
+                    arguments.save_wavefunctions
+                    or translation.output_all_states
+                ),
+            )
+            log.write(f"Result archive: {saved}")
+        # The SCF archive is written first: the band calculation can take a long time
+        # and a crash there must not lose the converged SCF.
+        _run_band_structure(
+            system, translation, result, reporter, input_directory
+        )
+        total_elapsed = time.perf_counter() - start
+        log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
+        log.write(f"Text log: {log_path}")
+        return 0 if result.converged else 3
+
+    if spin_polarized:  # periodic or with spin-orbit (isolated and plain: main's run_spin_scf)
+        if k_sampling is not None:
+            k_points, k_weights = k_sampling
+            result = run_scf_kpoints_spin_polarized(
+                system,
+                k_points,
+                k_weights,
+                callback=reporter.iteration_spin_polarized,
+            )
+        else:
+            result = run_scf_spin_polarized(
+                system, callback=reporter.iteration_spin_polarized
+            )
+        scf_elapsed = time.perf_counter() - scf_start
+        reporter.finish_spin_polarized(result, scf_elapsed)
+
+        soc_result = None
+        if has_soc_species:
+            soc_result = perturbative_spin_orbit_correction(
+                system.grid,
+                result,
+                system.atoms,
+                system.pseudopotentials,
+                translation.problem.pseudopotentials,
+            )
+            reporter.spin_orbit_correction(soc_result)
+        if not arguments.no_archive:
+            saved = save_spin_polarized_result_archive(
+                archive_path,
+                result,
+                soc_result,
+                include_wavefunctions=(
+                    arguments.save_wavefunctions
+                    or translation.output_all_states
+                ),
+            )
+            log.write(f"Result archive: {saved}")
+        # The SCF archive is written first: the band calculation can take a long time
+        # and a crash there must not lose the converged SCF.
+        _run_band_structure(
+            system, translation, result, reporter, input_directory
+        )
+        total_elapsed = time.perf_counter() - start
+        log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
+        log.write(f"Text log: {log_path}")
+        return 0 if result.converged else 3
+
+
+    # Scalar (spin-unpolarized, no spin-orbit) k-point sampling.
+    k_points, k_weights = k_sampling
+    result = run_scf_kpoints(system, k_points, k_weights, callback=reporter.iteration)
+    reporter.finish(result, time.perf_counter() - scf_start)
+    if not arguments.no_archive:
+        saved = save_result_archive(
+            archive_path,
+            result,
+            include_wavefunctions=(
+                arguments.save_wavefunctions or translation.output_all_states
+            ),
+        )
+        log.write(f"Result archive: {saved}")
+    # The SCF archive is written first so a long band calculation cannot lose it.
+    _run_band_structure(system, translation, result, reporter, input_directory)
+    total_elapsed = time.perf_counter() - start
+    log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
+    log.write(f"Text log: {log_path}")
+    return 0 if result.converged else 3
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
@@ -546,16 +929,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--kpoint-backend",
-        choices=("cpu", "cupy", "auto", "numpy-device"),
-        default=None,
-        help=(
-            "where the k-point Hamiltonians are applied: cpu (default), cupy (one worker "
-            "thread per CUDA device, PARSEC_CUPY_DEVICES selects them), auto (cupy if it "
-            "works) or numpy-device (the GPU code on the host, for tests)"
-        ),
-    )
-    parser.add_argument(
         "--bands-from",
         type=Path,
         default=None,
@@ -564,6 +937,29 @@ def _build_parser() -> argparse.ArgumentParser:
             "skip the SCF and compute the bandstruc bands from the converged potential "
             "stored in a previous run's result archive (written next to parsec.in as "
             "parsec_bands.out unless --log is given)"
+        ),
+    )
+    parser.add_argument(
+        "--restart-from",
+        type=Path,
+        default=None,
+        help=(
+            "take the atom coordinates from this file instead of the input: a "
+            "relax_restart.dat (its BFGS state continues a BFGS relaxation) or "
+            "an .xyz file (last frame); Relax_Restart in the input reads "
+            "relax_restart.dat beside it"
+        ),
+    )
+    parser.add_argument(
+        "--energy-refinement",
+        choices=("b3lyp", "none"),
+        default=None,
+        help=(
+            "after the SCF, evaluate the exchange-correlation energy of this "
+            "hybrid functional once on the converged orbitals and report the "
+            "refined total energy (PP-PBE(B3LYP) with a PBE input; ARES "
+            "Lrefine); overrules Energy_Refinement of the input, none "
+            "switches it off"
         ),
     )
     parser.add_argument(
@@ -589,8 +985,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.kpoint_workers is not None:
         os.environ["PARSEC_KPOINT_WORKERS"] = str(arguments.kpoint_workers)
-    if arguments.kpoint_backend is not None:
-        os.environ["PARSEC_KPOINT_BACKEND"] = arguments.kpoint_backend
     try:
         translation = parse_parsec_input(
             arguments.input,
@@ -599,26 +993,55 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ParsecInputError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
+    if arguments.energy_refinement is not None:
+        from .Energy.refinement import apply_refinement_option
+
+        try:
+            translation = apply_refinement_option(
+                translation, arguments.energy_refinement
+            )
+        except ValueError as error:
+            print(f"Input error: {error}", file=sys.stderr)
+            return 2
 
     is_periodic = translation.problem.periodic_cell is not None
 
     summary = summarize_translation(translation)
     if arguments.dry_run:
         try:
-            load_pseudopotentials(
+            pseudopotentials = load_pseudopotentials(
                 translation.problem.pseudopotentials,
                 xc_functional=translation.problem.scf.xc_functional,
             )
+            domain_lines = domain_dry_run_lines(translation, pseudopotentials)
         except (OSError, ValueError) as error:
             print(f"Input error: {error}", file=sys.stderr)
             return 2
         print(summary)
+        for line in domain_lines:
+            print(line)
         for warning in translation.warnings:
             print(f"WARNING: {warning}")
         print("Dry run successful; no grid or SCF calculation was started.")
         return 0
 
     input_directory = translation.source.parent
+    try:
+        translation, relax_restart, restart_notes = restart_structure(
+            translation,
+            input_directory,
+            None
+            if arguments.restart_from is None
+            else _resolve_output(arguments.restart_from, input_directory, ""),
+        )
+        translation, dynamics_restart, dynamics_notes = dynamics_restart_structure(
+            translation, input_directory
+        )
+        restart_notes = [*restart_notes, *dynamics_notes]
+        use_symmetry, symmetry_note = symmetry_decision(translation)
+    except (OSError, ValueError) as error:
+        print(f"Input error: {error}", file=sys.stderr)
+        return 2
     if arguments.bands_from is not None:
         if translation.problem.bands is None:
             print("Input error: --bands-from needs a bandstruc block in the input", file=sys.stderr)
@@ -687,15 +1110,52 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Input error: {error}", file=sys.stderr)
             return 2
 
-    start = time.perf_counter()
+    # Periodic spin polarization or k-points, spin-orbit coupling and non-collinear
+    # magnetism run the drivers of parsec_python.SCF (k-point solver, spin-orbit,
+    # non-collinear).  An isolated spin-polarized input without spin-orbit coupling
+    # runs run_scf -> run_spin_scf, like every other isolated input, so it keeps
+    # forces, relaxation, molecular dynamics and energy refinement.
+    uses_extended_drivers = bool(
+        self_consistent_spin_orbit
+        or noncollinear
+        or k_sampling is not None
+        or (spin_polarized and (is_periodic or has_soc_species))
+    )
+    if uses_extended_drivers and (
+        translation.relaxation is not None
+        or translation.molecular_dynamics is not None
+        or translation.compute_forces
+        or getattr(translation, "energy_refinement", None) is not None
+    ):
+        print(
+            "Input error: Minimization, Molecular_Dynamics, Skip_Force: false and "
+            "Energy_Refinement are not implemented together with k-point sampling, "
+            "spin-orbit coupling, non-collinear magnetism or a periodic or "
+            "spin-orbit spin-polarized calculation",
+            file=sys.stderr,
+        )
+        return 2
+
+    # The default rule of the sphere ran in the parser, before this clock:
+    # its seconds belong to the calculation.  None for an input with a radius.
+    start = time.perf_counter() - translation.domain_rule_seconds
     run_log = _RunLog(log_path, quiet=arguments.quiet)
     try:
         with run_log as log:
             reporter = ParsecTextReporter(log.write, translation)
             reporter.header()
-            for warning in translation.warnings:
+            # A periodic cell has no Hartree boundary values for a switch of
+            # the accelerated driver to change.
+            switch_warnings = () if is_periodic else ignored_boundary_switch_warnings()
+            for warning in (*translation.warnings, *switch_warnings):
                 log.write(f"WARNING: {warning}")
+            if symmetry_note is not None:
+                log.write(f"WARNING: {symmetry_note}")
+            for note in restart_notes:
+                log.write(note)
             log.write()
+            if translation.relaxation is not None:
+                log.write("\n".join(relaxation_header_lines(translation)))
             if is_periodic:
                 system = prepare_periodic_single_point(translation.problem)
             else:
@@ -709,138 +1169,79 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.write(f"Text log: {log_path}")
                 return 0
 
-            scf_start = time.perf_counter()
-            if self_consistent_spin_orbit or noncollinear:
-                if is_periodic:
-                    if k_sampling is not None:
-                        k_points, k_weights = k_sampling
-                    else:
-                        k_points = np.zeros((1, 3))
-                        k_weights = np.ones(1)
-                    if noncollinear:
-                        result = run_self_consistent_noncollinear_kpoints(
-                            system,
-                            k_points,
-                            k_weights,
-                            callback=reporter.iteration_self_consistent_soc,
-                        )
-                    else:
-                        periodic_soc_driver = (
-                            run_self_consistent_soc_kpoints_spin_polarized
-                            if spin_polarized
-                            else run_self_consistent_soc_kpoints
-                        )
-                        result = periodic_soc_driver(
-                            system,
-                            k_points,
-                            k_weights,
-                            callback=reporter.iteration_self_consistent_soc,
-                        )
-                else:
-                    soc_projectors = tuple(
-                        build_spin_orbit_projectors(
-                            system.grid,
-                            system.atoms,
-                            system.pseudopotentials,
-                            translation.problem.pseudopotentials,
-                        )
-                    )
-                    if noncollinear:
-                        result = run_self_consistent_noncollinear(
-                            system,
-                            soc_projectors,
-                            callback=reporter.iteration_self_consistent_soc,
-                        )
-                    elif spin_polarized:
-                        result = run_self_consistent_soc_spin_polarized(
-                            system,
-                            soc_projectors,
-                            callback=reporter.iteration_self_consistent_soc,
-                        )
-                    else:
-                        result = run_self_consistent_soc(
-                            system,
-                            soc_projectors,
-                            callback=reporter.iteration_self_consistent_soc,
-                        )
-                scf_elapsed = time.perf_counter() - scf_start
-                reporter.finish_self_consistent_soc(result, scf_elapsed)
-                if not arguments.no_archive:
-                    saved = save_self_consistent_soc_result_archive(
-                        archive_path,
-                        result,
-                        include_wavefunctions=(
-                            arguments.save_wavefunctions
-                            or translation.output_all_states
-                        ),
-                    )
-                    log.write(f"Result archive: {saved}")
-                # The SCF archive is written first: the band calculation can take a long time
-                # and a crash there must not lose the converged SCF.
-                _run_band_structure(
-                    system, translation, result, reporter, input_directory
+            if uses_extended_drivers:
+                return _run_extended_drivers(
+                    system,
+                    translation,
+                    reporter,
+                    log,
+                    arguments,
+                    start=start,
+                    archive_path=archive_path,
+                    log_path=log_path,
+                    input_directory=input_directory,
+                    k_sampling=k_sampling,
+                    is_periodic=is_periodic,
+                    has_soc_species=has_soc_species,
                 )
-                total_elapsed = time.perf_counter() - start
-                log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
-                log.write(f"Text log: {log_path}")
-                return 0 if result.converged else 3
 
-            if spin_polarized:
-                if k_sampling is not None:
-                    k_points, k_weights = k_sampling
-                    result = run_scf_kpoints_spin_polarized(
-                        system,
-                        k_points,
-                        k_weights,
-                        callback=reporter.iteration_spin_polarized,
-                    )
-                else:
-                    result = run_scf_spin_polarized(
-                        system, callback=reporter.iteration_spin_polarized
-                    )
-                scf_elapsed = time.perf_counter() - scf_start
-                reporter.finish_spin_polarized(result, scf_elapsed)
-
-                soc_result = None
-                if has_soc_species:
-                    soc_result = perturbative_spin_orbit_correction(
-                        system.grid,
-                        result,
-                        system.atoms,
-                        system.pseudopotentials,
-                        translation.problem.pseudopotentials,
-                    )
-                    reporter.spin_orbit_correction(soc_result)
-                if not arguments.no_archive:
-                    saved = save_spin_polarized_result_archive(
-                        archive_path,
-                        result,
-                        soc_result,
-                        include_wavefunctions=(
-                            arguments.save_wavefunctions
-                            or translation.output_all_states
-                        ),
-                    )
-                    log.write(f"Result archive: {saved}")
-                # The SCF archive is written first: the band calculation can take a long time
-                # and a crash there must not lose the converged SCF.
-                _run_band_structure(
-                    system, translation, result, reporter, input_directory
+            forces = None
+            outcome = None
+            dynamics = None
+            if translation.relaxation is not None:
+                outcome = run_recorded_relaxation(
+                    translation,
+                    system,
+                    reference_backend(),
+                    reporter,
+                    log.write,
+                    directory=input_directory,
+                    restart=relax_restart,
+                    symmetrize=use_symmetry,
                 )
-                total_elapsed = time.perf_counter() - start
-                log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
-                log.write(f"Text log: {log_path}")
-                return 0 if result.converged else 3
-
-            if k_sampling is not None:
-                k_points, k_weights = k_sampling
-                result = run_scf_kpoints(
-                    system, k_points, k_weights, callback=reporter.iteration
+                result = outcome.result
+                forces = outcome.records[-1].forces
+            elif translation.molecular_dynamics is not None:
+                dynamics = run_recorded_molecular_dynamics(
+                    translation,
+                    system,
+                    reference_backend(),
+                    reporter,
+                    log.write,
+                    directory=input_directory,
+                    restart=dynamics_restart,
+                )
+                result, forces = dynamics.result, dynamics.forces
+            elif translation.compute_forces:
+                result, forces = run_single_point_with_forces(
+                    system, reference_backend(), reporter, symmetrize=use_symmetry
                 )
             else:
+                scf_start = time.perf_counter()
                 result = run_scf(system, callback=reporter.iteration)
-            scf_elapsed = time.perf_counter() - scf_start
-            reporter.finish(result, scf_elapsed)
+                scf_elapsed = time.perf_counter() - scf_start
+                reporter.finish(result, scf_elapsed)
+            refinement = None
+            if getattr(translation, "energy_refinement", None) is not None:
+                # One non-self-consistent evaluation on the converged
+                # orbitals, after everything the SCF reports; of the last
+                # structure where the atoms moved.
+                from .Energy.refinement import refine_energy, refinement_report_lines
+                from .Output import RYDBERG_TO_EV
+
+                announce, progress = refinement_progress(
+                    log.write, translation.energy_refinement
+                )
+                announce()
+                refinement = refine_energy(
+                    system if outcome is None else outcome.system,
+                    result,
+                    translation.energy_refinement,
+                    progress=progress,
+                )
+                log.write(
+                    "\n".join(refinement_report_lines(refinement, RYDBERG_TO_EV))
+                )
             if not arguments.no_archive:
                 saved = save_result_archive(
                     archive_path,
@@ -849,6 +1250,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                         arguments.save_wavefunctions
                         or translation.output_all_states
                     ),
+                    # A plain single point keeps the call it always made.
+                    **{
+                        name: value
+                        for name, value in (
+                            ("forces", forces),
+                            ("relaxation", outcome),
+                            ("dynamics", dynamics),
+                            ("refinement", refinement),
+                        )
+                        if value is not None
+                    },
                 )
                 log.write(f"Result archive: {saved}")
             # The SCF archive is written first so a long band calculation cannot lose it.
@@ -856,7 +1268,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             total_elapsed = time.perf_counter() - start
             log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
             log.write(f"Text log: {log_path}")
-            return 0 if result.converged else 3
+            if dynamics is not None:
+                return 3 if dynamics.scf_failed else 0
+            return relaxation_exit_code(
+                result,
+                outcome,
+                manual=(
+                    translation.relaxation is not None
+                    and translation.relaxation.method == "manual"
+                ),
+            )
     except KeyboardInterrupt:
         if not getattr(run_log, "failure_reported", False) and not arguments.quiet:
             print("Calculation interrupted by user.", file=sys.stderr)
@@ -870,4 +1291,4 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
-__all__ = ["main", "save_result_archive"]
+__all__ = ["main", "refinement_progress", "save_result_archive"]

@@ -5,7 +5,9 @@ few vector columns per Chebyshev block.  Dispatching a general cuSPARSE SpMM
 for every ``B.T @ X`` therefore spends more time in library setup than in the
 dot products.  Short projector rows use one canonical-order CUDA thread per
 projector/vector pair; genuinely long rows use one 128-thread reduction
-block.  The large ``B @ coeff`` scatter remains fused into the stencil kernel.
+block per projector, which carries up to six vector columns
+(:func:`projector_block_columns`).  The large ``B @ coeff`` scatter remains
+fused into the stencil kernel.
 """
 
 from __future__ import annotations
@@ -67,6 +69,76 @@ void sparse_projector_projection(
             static_cast<long long>(projector) * output_row_stride +
             static_cast<long long>(column) * output_column_stride
         ] = signs[projector] * sums[0];
+    }
+}
+
+extern "C" __global__
+void sparse_projector_projection6(
+    const int projector_count,
+    const int width,
+    const int* __restrict__ row_offsets,
+    const int* __restrict__ grid_rows,
+    const double* __restrict__ projector_values,
+    const double* __restrict__ signs,
+    const double* __restrict__ vectors,
+    const long long vector_row_stride,
+    const long long vector_column_stride,
+    double* __restrict__ output,
+    const long long output_row_stride,
+    const long long output_column_stride
+) {
+    // One block per projector for up to six columns.  A thread keeps, for
+    // every column, the strided partial sum that the kernel above forms in
+    // the block of that column, and every column is reduced by the same
+    // tree: the coefficients are those of that kernel to the last bit.  The
+    // index and the value of an entry are read once for the six columns.
+    const int projector = blockIdx.x;
+    if (projector >= projector_count) {
+        return;
+    }
+    double partial[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    for (
+        int position = row_offsets[projector] + threadIdx.x;
+        position < row_offsets[projector + 1];
+        position += blockDim.x
+    ) {
+        const double value = projector_values[position];
+        const long long base =
+            static_cast<long long>(grid_rows[position]) * vector_row_stride;
+#pragma unroll
+        for (int column = 0; column < 6; ++column) {
+            if (column < width) {
+                partial[column] += value * vectors[
+                    base + static_cast<long long>(column) * vector_column_stride
+                ];
+            }
+        }
+    }
+    __shared__ double sums[6][128];
+#pragma unroll
+    for (int column = 0; column < 6; ++column) {
+        sums[column][threadIdx.x] = partial[column];
+    }
+    __syncthreads();
+    for (int offset = 64; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset) {
+#pragma unroll
+            for (int column = 0; column < 6; ++column) {
+                sums[column][threadIdx.x] += sums[column][threadIdx.x + offset];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int column = 0; column < 6; ++column) {
+            if (column < width) {
+                output[
+                    static_cast<long long>(projector) * output_row_stride +
+                    static_cast<long long>(column) * output_column_stride
+                ] = signs[projector] * sums[column][0];
+            }
+        }
     }
 }
 
@@ -150,12 +222,98 @@ void sparse_projector_scatter(
 """
 
 
-_KERNEL_CACHE: dict[int, tuple[Any, Any, Any]] = {}
+_KERNEL_CACHE: dict[int, tuple[Any, Any, Any, Any]] = {}
 _KERNEL_LOCK = Lock()
 
+# Threads of a CUDA block of the projection kernels, and the vector columns
+# that one block of ``sparse_projector_projection6`` carries: both are sizes
+# of that kernel's arrays.
+_THREADS = 128
+_BLOCK_COLUMNS = 6
 
-def _kernels(cp: Any) -> tuple[Any, Any, Any]:
-    """Compile both factor kernels once per CUDA device."""
+
+def projector_block_columns() -> int:
+    """Return ``PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS``: 6, the default, or 1.
+
+    The vector columns that one CUDA block of the tree reduction carries, the
+    reduction of projector rows of at least 256 entries
+    (``PARSEC_CUPY_PROJECTOR_REDUCTION``).  With 6 a block serves one
+    projector and up to six columns: it reads the index and the value of an
+    entry once and reduces six partial sums behind the same barriers.  With
+    1, the former kernel, a block serves one projector and one column.  Both
+    form, for every column, the same strided partial sums and reduce them by
+    the same tree, so the coefficients agree to the last bit.
+
+    On an A100 one projection of six columns of a synthetic factor took
+    0.066 against 0.097 ms with 4,601 projectors of 324 entries on 2,873,400
+    rows and 0.133 against 0.193 ms with 9,449 of 311 on 5,660,200, 1.47 and
+    1.45 times as fast, with identical coefficients for every width from one
+    to six columns.
+
+    The canonical-order kernel of short rows is one thread per projector and
+    column under either value.  An operator reads the switch when it is
+    built and keeps its kernel, also in the filter graphs it records.
+    """
+
+    raw = os.environ.get("PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS", "").strip()
+    if raw in ("", str(_BLOCK_COLUMNS)):
+        return _BLOCK_COLUMNS
+    if raw == "1":
+        return 1
+    raise ValueError("PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS must be 6 or 1")
+
+
+def projection_reduction(parallel: bool, block_columns: int) -> str:
+    """What an operator reports for its projection kernel.
+
+    ``serial`` is the canonical-order kernel, which ``block_columns`` does
+    not reach, ``parallel`` the tree reduction with a block per projector
+    and column and ``parallel6`` the one with a block per projector and six
+    columns.
+    """
+
+    if int(block_columns) not in (1, _BLOCK_COLUMNS):
+        raise ValueError("a block of the projection carries 6 columns or 1")
+    if not parallel:
+        return "serial"
+    return "parallel" if int(block_columns) == 1 else "parallel6"
+
+
+def projection_launches(
+    reduction: str, projector_count: int, width: int
+) -> tuple[tuple[int, int, int], ...]:
+    """Return ``(blocks, first column, last column)`` of every projection launch.
+
+    The launches that form the coefficients of ``width`` vector columns with
+    the kernel of ``reduction`` (:func:`projection_reduction`), each with
+    blocks of 128 threads.  ``serial`` and ``parallel`` take all columns in
+    one launch, of a thread or of a block per projector and column.
+    ``parallel6`` takes six columns per launch, the narrower rest in the
+    last, with a block per projector: a block of more than six columns is
+    launched as the stencil kernels take it.
+    """
+
+    projector_count, width = int(projector_count), int(width)
+    if reduction == "parallel6":
+        return tuple(
+            (projector_count, start, min(start + _BLOCK_COLUMNS, width))
+            for start in range(0, width, _BLOCK_COLUMNS)
+        )
+    pair_count = projector_count * width
+    if reduction == "parallel":
+        return ((pair_count, 0, width),)
+    if reduction == "serial":
+        return (((pair_count + _THREADS - 1) // _THREADS, 0, width),)
+    raise ValueError(f"unknown projection reduction {reduction!r}")
+
+
+def _kernels(cp: Any) -> tuple[Any, Any, Any, Any]:
+    """Compile the factor kernels once per CUDA device.
+
+    In this order: the tree projection of one column per block, the scatter,
+    the canonical-order projection and the tree projection of six columns
+    per block.
+    """
 
     device_id = int(cp.cuda.Device().id)
     with _KERNEL_LOCK:
@@ -166,6 +324,7 @@ def _kernels(cp: Any) -> tuple[Any, Any, Any]:
                 options=("--std=c++11",),
                 name_expressions=(
                     "sparse_projector_projection",
+                    "sparse_projector_projection6",
                     "sparse_projector_projection_serial",
                     "sparse_projector_scatter",
                 ),
@@ -175,9 +334,14 @@ def _kernels(cp: Any) -> tuple[Any, Any, Any]:
                 module.get_function("sparse_projector_projection"),
                 module.get_function("sparse_projector_scatter"),
                 module.get_function("sparse_projector_projection_serial"),
+                module.get_function("sparse_projector_projection6"),
             )
             _KERNEL_CACHE[device_id] = selected
     return selected
+
+
+# Where :func:`_kernels` holds the projection kernel of a reduction.
+_PROJECTION_KERNEL = {"parallel": 0, "serial": 2, "parallel6": 3}
 
 
 class CuPySparseProjectorProjection:
@@ -190,6 +354,7 @@ class CuPySparseProjectorProjection:
         signs: Any,
         *,
         max_row_entries: int | None = None,
+        block_columns: int | None = None,
     ) -> None:
         if isinstance(projector_transpose, tuple):
             row_offsets, grid_rows, values, shape = projector_transpose
@@ -225,13 +390,22 @@ class CuPySparseProjectorProjection:
             policy == "parallel"
             or (policy == "auto" and self.max_row_entries >= 256)
         )
-        self.reduction_mode = (
-            "parallel" if self.parallel_reduction else "serial"
+        # The columns that a block of the tree reduction carries: those the
+        # caller names, else PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS.  The
+        # canonical-order kernel has a thread per projector and column.
+        if block_columns is None:
+            block_columns = projector_block_columns()
+        self.reduction_mode = projection_reduction(
+            self.parallel_reduction, block_columns
         )
-        kernels = _kernels(cp)
-        self.kernel = kernels[0] if self.parallel_reduction else kernels[2]
+        self.block_columns = (
+            _BLOCK_COLUMNS if self.reduction_mode == "parallel6" else 1
+        )
+        # The operator launches this kernel for as long as it lives, in the
+        # filter graphs it records as well as outside them.
+        self.kernel = _kernels(cp)[_PROJECTION_KERNEL[self.reduction_mode]]
 
-    def __call__(self, vectors: Any):
+    def __call__(self, vectors: Any, *, output: Any | None = None):
         cp = self.cp
         # Chebyshev recurrences pass an already validated float64 CuPy view.
         # Avoid routing that hot path through ``cp.asarray`` thousands of
@@ -248,33 +422,39 @@ class CuPySparseProjectorProjection:
         if block.ndim != 2:
             raise ValueError("projector input must be a vector or column block")
         width = int(block.shape[1])
-        output = cp.empty(
-            (self.projector_count, width), dtype=cp.float64, order="F"
-        )
-        threads = 128
-        pair_count = self.projector_count * width
+        if output is None:
+            output = cp.empty(
+                (self.projector_count, width), dtype=cp.float64, order="F"
+            )
+        elif output.shape != (self.projector_count, width) or output.dtype != cp.dtype(cp.float64):
+            raise ValueError("projector output must match the float64 coefficients")
         itemsize = int(block.dtype.itemsize)
-        grid = (pair_count,) if self.parallel_reduction else (
-            (pair_count + threads - 1) // threads,
-        )
-        self.kernel(
-            grid,
-            (threads,),
-            (
-                np.int32(self.projector_count),
-                np.int32(width),
-                self.row_offsets,
-                self.grid_rows,
-                self.values,
-                self.signs,
-                block,
-                np.int64(block.strides[0] // itemsize),
-                np.int64(block.strides[1] // itemsize),
-                output,
-                np.int64(output.strides[0] // itemsize),
-                np.int64(output.strides[1] // itemsize),
-            ),
-        )
+        for blocks, start, stop in projection_launches(
+            self.reduction_mode, self.projector_count, width
+        ):
+            # One launch takes the arrays as they are; the launches of a
+            # block of more than six columns take views of its columns.
+            whole = start == 0 and stop == width
+            source = block if whole else block[:, start:stop]
+            target = output if whole else output[:, start:stop]
+            self.kernel(
+                (blocks,),
+                (_THREADS,),
+                (
+                    np.int32(self.projector_count),
+                    np.int32(stop - start),
+                    self.row_offsets,
+                    self.grid_rows,
+                    self.values,
+                    self.signs,
+                    source,
+                    np.int64(source.strides[0] // itemsize),
+                    np.int64(source.strides[1] // itemsize),
+                    target,
+                    np.int64(target.strides[0] // itemsize),
+                    np.int64(target.strides[1] // itemsize),
+                ),
+            )
         return output[:, 0] if was_vector else output
 
 
@@ -291,7 +471,14 @@ class CuPySparseProjectorFactors:
     the same factorization and canonical CSR row traversal.
     """
 
-    def __init__(self, cp: Any, host_projectors: Any, signs: Any) -> None:
+    def __init__(
+        self,
+        cp: Any,
+        host_projectors: Any,
+        signs: Any,
+        *,
+        block_columns: int | None = None,
+    ) -> None:
         host = host_projectors.tocsr(copy=True)
         host.sum_duplicates()
         host.sort_indices()
@@ -325,6 +512,7 @@ class CuPySparseProjectorFactors:
             transpose,
             self.signs,
             max_row_entries=int(row_lengths.max(initial=0)),
+            block_columns=block_columns,
         )
         self.scatter_kernel = _kernels(cp)[1]
 
@@ -378,4 +566,7 @@ class CuPySparseProjectorFactors:
 __all__ = [
     "CuPySparseProjectorFactors",
     "CuPySparseProjectorProjection",
+    "projection_launches",
+    "projection_reduction",
+    "projector_block_columns",
 ]

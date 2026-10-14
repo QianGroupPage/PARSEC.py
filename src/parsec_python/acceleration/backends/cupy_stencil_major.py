@@ -163,14 +163,21 @@ void stencil_major_chebyshev6(
     const long long previous_column_stride,
     const int add_previous,
     const int width,
-    const double center,
-    const double scale,
-    const double sigma,
-    const double sigma_next,
+    const double center_argument,
+    const double scale_argument,
+    const double sigma_argument,
+    const double sigma_next_argument,
+    const double* __restrict__ recurrence_parameters,
+    const int parameter_step,
+    const int use_parameters,
     double* __restrict__ output,
     const long long output_row_stride,
     const long long output_column_stride
 ) {
+    const double center = use_parameters ? recurrence_parameters[4 * parameter_step] : center_argument;
+    const double scale = use_parameters ? recurrence_parameters[4 * parameter_step + 1] : scale_argument;
+    const double sigma = use_parameters ? recurrence_parameters[4 * parameter_step + 2] : sigma_argument;
+    const double sigma_next = use_parameters ? recurrence_parameters[4 * parameter_step + 3] : sigma_next_argument;
     const long long row =
         static_cast<long long>(blockDim.x) * blockIdx.x + threadIdx.x;
     if (row >= row_count) {
@@ -403,6 +410,7 @@ class CuPyStencilMajorFiniteDifference:
         *,
         metadata: StencilMajorHostMetadata | None = None,
         device_neighbors: Any | None = None,
+        implicit_tile: int | None = None,
     ) -> None:
         if metadata is None:
             if matrix is None:
@@ -415,6 +423,17 @@ class CuPyStencilMajorFiniteDifference:
         self.shape = metadata.shape
         self.slot_count = int(neighbors.shape[0])
         self.palette_size = int(palette.size)
+        if implicit_tile is None:
+            # The symmetry eigensolver names the tile of a sector.  Any
+            # other stencil is packed by an explicit size alone.
+            from .implicit_stencil import implicit_tile_setting
+            implicit_tile = implicit_tile_setting() or 0
+        if implicit_tile:
+            from .implicit_stencil import initialize_implicit
+            initialize_implicit(self, cp, metadata, implicit_tile)
+            return
+        if neighbors.ndim != 2:
+            raise ValueError("a stencil packed into tiles has no slot-major layout")
         if device_neighbors is None:
             self.neighbors = cp.asarray(neighbors)
         else:
@@ -429,6 +448,8 @@ class CuPyStencilMajorFiniteDifference:
 
     @property
     def storage_mode(self) -> str:
+        if hasattr(self, "implicit_statistics"):
+            return f"implicit_affine_tile_{self.implicit_statistics['tile']}"
         return "stencil_major_int32_neighbors_uint8_coefficient_palette"
 
     def _columns(self, vectors: Any) -> tuple[Any, bool]:
@@ -556,6 +577,9 @@ class CuPyStencilMajorFiniteDifference:
         sigma: float = 0.0,
         projector_data: tuple[Any, Any, Any] | None = None,
         projector_coefficients: Any | None = None,
+        output: Any | None = None,
+        recurrence_parameters: Any | None = None,
+        parameter_step: int = 0,
     ):
         """Fuse one normalized Chebyshev step with the local Hamiltonian."""
 
@@ -599,7 +623,10 @@ class CuPyStencilMajorFiniteDifference:
                 raise ValueError("projector coefficients do not match the current block")
             add_nonlocal = 1
 
-        output = cp.empty(block.shape, dtype=cp.float64, order="F")
+        if output is None:
+            output = cp.empty(block.shape, dtype=cp.float64, order="F")
+        elif output.shape != block.shape or output.dtype != cp.dtype(cp.float64):
+            raise ValueError("recurrence output must match the float64 block")
         threads = 256
         grid = ((self.shape[0] + threads - 1) // threads,)
         itemsize = int(block.dtype.itemsize)
@@ -638,6 +665,9 @@ class CuPyStencilMajorFiniteDifference:
                     np.float64(scale),
                     np.float64(sigma),
                     np.float64(sigma_next),
+                    self.coefficient_palette if recurrence_parameters is None else recurrence_parameters,
+                    np.int32(parameter_step),
+                    np.int32(recurrence_parameters is not None),
                     target,
                     np.int64(target.strides[0] // itemsize),
                     np.int64(target.strides[1] // itemsize),

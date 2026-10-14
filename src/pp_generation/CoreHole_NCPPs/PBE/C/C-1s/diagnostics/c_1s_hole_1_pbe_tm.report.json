@@ -1,0 +1,124 @@
+{
+  "schema_version": 2,
+  "element": "C",
+  "prefix": "c_1s_hole_1_pbe_tm",
+  "backend": "pyfhi98pp",
+  "family": "ncpp",
+  "xc": "pbe",
+  "scheme": "tm",
+  "relativistic": "scalar",
+  "variant": null,
+  "core_hole": {
+    "shell": "1s",
+    "removed_electrons": 1.0
+  },
+  "ionic_charge": 5.0,
+  "reference_electrons": 4.0,
+  "reference_charge": 1.0,
+  "ae_energy_hartree": -26.57908981306031,
+  "pseudo_energy_hartree": -8.846493244323396,
+  "atomic_energy_correction_rydberg": -35.46519313747383,
+  "lmax": 2,
+  "channels": [
+    {
+      "angular_momentum": 0,
+      "scheme": "t",
+      "cutoff_radius": 1.4981529593858622,
+      "match_radius": 1.535157337482693,
+      "ae_eigenvalue_ev": -29.90744604687604,
+      "pseudo_eigenvalue_ev": -29.907573284273628,
+      "norm_test": 0.9999978739024008,
+      "slope_test": 1.0000165500813574
+    },
+    {
+      "angular_momentum": 1,
+      "scheme": "t",
+      "cutoff_radius": 1.4981529593858622,
+      "match_radius": 1.535157337482693,
+      "ae_eigenvalue_ev": -21.3338742755479,
+      "pseudo_eigenvalue_ev": -21.333958218003698,
+      "norm_test": 0.9999983440723371,
+      "slope_test": 1.0000040450090881
+    },
+    {
+      "angular_momentum": 2,
+      "scheme": "t",
+      "cutoff_radius": 1.4981529593858622,
+      "match_radius": 1.535157337482693,
+      "ae_eigenvalue_ev": -21.3338742755479,
+      "pseudo_eigenvalue_ev": -21.333816597822025,
+      "norm_test": 0.9999997043751916,
+      "slope_test": 0.9999997043751914
+    }
+  ],
+  "core_radius": 0.0,
+  "reference_shift_ev": 0.0,
+  "kinetic_cutoff_rydberg": {
+    "0": 74.0,
+    "1": 100.0
+  },
+  "ghost_free": true,
+  "selected_local_channel": 2,
+  "local_channel_results": [
+    {
+      "local_channel": 2,
+      "passed": true,
+      "minimum_margin_hartree": 0.20747284043748326,
+      "report_path": "c_1s_hole_1_pbe_tm.local-2.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "pass",
+          "message": "* no ghost (ekb > 0, eloc0 < eref < eloc1)",
+          "margin_hartree": 0.776694154967066,
+          "reference_energy_hartree": -1.0990757376706493,
+          "local_ground_energy_hartree": -2.332993100920991,
+          "local_first_excited_energy_hartree": -0.3223815827035833,
+          "projector_sign": 1
+        },
+        {
+          "angular_momentum": 1,
+          "label": "p",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.20747284043748326,
+          "reference_energy_hartree": -0.7840037831882589,
+          "local_ground_energy_hartree": -0.5765309427507757,
+          "local_first_excited_energy_hartree": -0.11527132066097244,
+          "projector_sign": -1
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    "Matched to the ground-state potential: lmax 2, local channel d, same cutoff radii.",
+    "Generating atomic reference charge +1; choose the electron count (full or neutralized core hole) explicitly in the many-electron calculation."
+  ],
+  "artifacts": {
+    "dat": {
+      "path": "c_1s_hole_1_pbe_tm.dat",
+      "sha256": "f3bc5f753d8a98dc740a531a4aa4e24f19ac0d0b082d40dfa7d05d805181dace"
+    },
+    "aep": {
+      "path": "c_1s_hole_1_pbe_tm.aep",
+      "sha256": "9d1a676d3869e01db2f13f978753eac394552e7c2e3a887eeb049118bd40dfac"
+    },
+    "test": {
+      "path": "c_1s_hole_1_pbe_tm.test",
+      "sha256": "c2413adb056647de667738ce88727ddfff0aaab60b0479e839884f63c0366c03"
+    },
+    "fhi_species": {
+      "path": "../FHI/C-1s_FHIPP.DAT",
+      "sha256": "c9783a2415f2ad920ee86b52c72c794e6f62586d5572d82ec49ce18c115d2613"
+    },
+    "upf": {
+      "path": "../UPF/c_1s_hole_1_pbe_tm.UPF",
+      "sha256": "1c54ca8568340eb08f3a511c62eefacc9f5080f8d056154a15eb387c7688da80"
+    },
+    "parsec_species": {
+      "path": "../PARSEC/C-1s_POTRE.DAT",
+      "sha256": "22268ede09b9af6bccb81277ef2aba8a3098ef569ebaace2798c65a9333269e1"
+    }
+  }
+}

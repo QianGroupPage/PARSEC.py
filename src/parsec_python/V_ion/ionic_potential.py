@@ -39,6 +39,7 @@ from ..models import Atom, SpeciesPotential
 from ..Pseudopotential import (
     ParsecPseudopotential,
     ParsecRadialSpline,
+    read_martins_old_pseudopotential,
     read_parsec_pseudopotential,
 )
 
@@ -56,7 +57,8 @@ def load_pseudopotentials(
     * the species' physical element agrees with the symbol stored in the file;
     * the user-selected local angular-momentum channel exists;
     * a species requesting ``SO_PSP`` has a relativistic POTRE file carrying
-      the matching p/d spin-orbit channels; and
+      the matching p/d spin-orbit channels (without ``SO_PSP`` only the scalar
+      components of a relativistic file are used); and
     * the pseudopotential was generated for the selected XC family.
 
     A file's spin-orbit channels (if present) are always parsed into
@@ -82,9 +84,24 @@ def load_pseudopotentials(
     if requested not in compatible:
         raise ValueError(f"unsupported XC functional {xc_functional!r}")
     for symbol, specification in specifications.items():
+        physical_element = specification.element_symbol or symbol
+        if specification.pseudopotential_format == "martins_old":
+            # An old Martins file names neither its element nor its
+            # functional, so there is nothing to check them against, as in
+            # pseudo.f90.  Its occupations and core radius come from the
+            # input of the species.
+            potential = read_martins_old_pseudopotential(
+                specification.path,
+                symbol=physical_element,
+                number_of_channels=specification.number_of_channels,
+                electrons_per_orbital=specification.electrons_per_orbital,
+                core_cutoff_radius=specification.core_cutoff_radius,
+            )
+            potential.validate_local_channel(specification.local_angular_momentum)
+            result[symbol] = potential
+            continue
         # Files are loaded once per species, not once per atom.
         potential = read_parsec_pseudopotential(specification.path)
-        physical_element = specification.element_symbol or symbol
         if potential.symbol.lower() != physical_element.lower():
             raise ValueError(
                 f"species {symbol!r} represents element {physical_element!r}, but "
@@ -92,6 +109,9 @@ def load_pseudopotentials(
                 f"in {specification.path}"
             )
         potential.validate_local_channel(specification.local_angular_momentum)
+        # A relativistic file also carries the minor (spin-orbit) components
+        # of its p and d channels.  Without SO_PSP, pseudo.f90 reads only the
+        # scalar components, which are what the scalar solvers use.
         if specification.spin_orbit and not potential.has_spin_orbit_channels:
             raise ValueError(
                 f"species {symbol!r} requests SO_PSP, but {specification.path} "
@@ -314,15 +334,29 @@ def ion_ion_energy(
     This is the nonperiodic molecular expression; no Ewald or minimum-image
     sum is performed.
     """
+    if len(atoms) < 2:
+        return 0.0
+    positions = np.array(
+        [atom.position for atom in atoms], dtype=np.float64
+    ).reshape(len(atoms), 3)
+    charges = np.array(
+        [potentials[atom.symbol].ionic_charge for atom in atoms],
+        dtype=np.float64,
+    )
+    # One vectorized row per atom replaces the O(N^2) Python pair loop, which
+    # took seconds beyond a few thousand atoms.  ``cumsum`` accumulates
+    # strictly left to right, so pairs enter the sum in the original order.
     energy = 0.0
-    for left, atom_i in enumerate(atoms):
-        charge_i = potentials[atom_i.symbol].ionic_charge
-        for atom_j in atoms[left + 1 :]:
-            distance = float(np.linalg.norm(atom_i.position - atom_j.position))
-            if distance <= 0:
-                raise ValueError("two nuclei occupy the same position")
-            charge_j = potentials[atom_j.symbol].ionic_charge
-            energy += 2.0 * charge_i * charge_j / distance
+    for left in range(len(atoms) - 1):
+        delta = positions[left] - positions[left + 1 :]
+        distance = np.sqrt(
+            (delta[:, 0] * delta[:, 0] + delta[:, 1] * delta[:, 1])
+            + delta[:, 2] * delta[:, 2]
+        )
+        if np.any(distance <= 0):
+            raise ValueError("two nuclei occupy the same position")
+        terms = 2.0 * charges[left] * charges[left + 1 :] / distance
+        energy = float(np.cumsum(np.concatenate(((energy,), terms)))[-1])
     return float(energy)
 
 
@@ -473,11 +507,12 @@ def _projector_support_radius(potential: ParsecPseudopotential) -> float:
     samples while still excluding its zero tail.  This matches PARSEC's
     default ``Double_grid_order=1`` support construction; the fallback used
     when a file declares no channel cutoffs is a defensive Python path.
+
+    A ``MARTINS_OLD`` file declares no cutoff: its support radius is the
+    ``Core_Cutoff_Radius`` of the input, capped in the same way.  Both rules
+    live in :attr:`ParsecPseudopotential.projector_support_radius`.
     """
-    requested = max(potential.channel_cutoffs.values(), default=potential.radii[0])
-    next_index = int(np.searchsorted(potential.radii, requested, side="right"))
-    next_index = min(next_index, potential.radii.size - 2)
-    return float(potential.radii[next_index])
+    return potential.projector_support_radius
 
 
 def _periodic_image_translations(

@@ -77,13 +77,22 @@ def first_derivative_coefficients(expansion_order: int) -> np.ndarray:
     return weights
 
 
-def _pw92_unpolarized(rs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return PW92 ``epsilon_c`` and ``d epsilon_c/d r_s`` in Hartree."""
+def _pw92_g(
+    rs: np.ndarray,
+    a: float,
+    alpha1: float,
+    betas: tuple[float, float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the Perdew-Wang function ``G(r_s)`` and ``dG/dr_s`` in Hartree.
 
-    # Perdew-Wang 1992 unpolarized parameters (their compact Eq. 10 form).
-    a = _GAMMA
-    alpha1 = 0.21370
-    beta1, beta2, beta3, beta4 = 7.5957, 3.5876, 1.6382, 0.49294
+    ``G = -2a (1 + alpha1 r_s) ln[1 + 1/(2a (beta1 r_s**(1/2) + beta2 r_s
+    + beta3 r_s**(3/2) + beta4 r_s**2))]`` (their Eq. 10 with ``p = 1``) is
+    the correlation energy per electron of the unpolarized gas, that of the
+    fully polarized gas, or minus the spin stiffness, depending on the
+    parameters.
+    """
+
+    beta1, beta2, beta3, beta4 = betas
     sqrt_rs = np.sqrt(rs)
     polynomial = (
         beta1 * sqrt_rs
@@ -107,6 +116,40 @@ def _pw92_unpolarized(rs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         alpha1 * log_term + (1.0 + alpha1 * rs) * log_prime
     )
     return epsilon, derivative
+
+
+def _pw92_unpolarized(rs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return PW92 ``epsilon_c`` and ``d epsilon_c/d r_s`` in Hartree."""
+
+    # Perdew-Wang 1992 unpolarized parameters (their compact Eq. 10 form).
+    return _pw92_g(rs, _GAMMA, 0.21370, (7.5957, 3.5876, 1.6382, 0.49294))
+
+
+def _exchange_partials(
+    n: np.ndarray, sig: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """PBE exchange energy per volume of an unpolarized density, in Hartree.
+
+    ``f_x = -C_x*n^(4/3)*F_x(s)`` with ``s^2 = sigma/[4*k_F^2*n^2]``, and its
+    derivatives with respect to ``n`` and ``sigma``.  ``n`` must be
+    positive and ``sig`` nonnegative.
+    """
+
+    n13 = np.cbrt(n)
+    n43 = n * n13
+    kf = _KF_COEFFICIENT * n13
+    s2 = sig / (4.0 * kf * kf * n * n)
+    exchange_denominator = 1.0 + (_MU / _KAPPA) * s2
+    enhancement = 1.0 + _KAPPA - _KAPPA / exchange_denominator
+    enhancement_prime = _MU / (exchange_denominator * exchange_denominator)
+    exchange_energy = -_CX * n43 * enhancement
+    exchange_dn = -_CX * n13 * (
+        (4.0 / 3.0) * enhancement
+        - (8.0 / 3.0) * s2 * enhancement_prime
+    )
+    ds2_dsigma = 1.0 / (4.0 * kf * kf * n * n)
+    exchange_dsigma = -_CX * n43 * enhancement_prime * ds2_dsigma
+    return exchange_energy, exchange_dn, exchange_dsigma
 
 
 def pbe_energy_partials(
@@ -140,22 +183,11 @@ def pbe_energy_partials(
     n = density[positive]
     sig = np.maximum(sigma[positive], 0.0)
     n13 = np.cbrt(n)
-    n43 = n * n13
     kf = _KF_COEFFICIENT * n13
 
     # Exchange: f_x = -C_x*n^(4/3)*F_x(s), with
     # s^2 = sigma/[4*k_F^2*n^2].
-    s2 = sig / (4.0 * kf * kf * n * n)
-    exchange_denominator = 1.0 + (_MU / _KAPPA) * s2
-    enhancement = 1.0 + _KAPPA - _KAPPA / exchange_denominator
-    enhancement_prime = _MU / (exchange_denominator * exchange_denominator)
-    exchange_energy = -_CX * n43 * enhancement
-    exchange_dn = -_CX * n13 * (
-        (4.0 / 3.0) * enhancement
-        - (8.0 / 3.0) * s2 * enhancement_prime
-    )
-    ds2_dsigma = 1.0 / (4.0 * kf * kf * n * n)
-    exchange_dsigma = -_CX * n43 * enhancement_prime * ds2_dsigma
+    exchange_energy, exchange_dn, exchange_dsigma = _exchange_partials(n, sig)
 
     # Correlation: PW92 LDA plus the PBE gradient correction H.
     rs = np.cbrt(3.0 / (4.0 * np.pi * n))
@@ -350,7 +382,7 @@ _COMPLEX_STEP = 1.0e-30
 _SPIN_DENSITY_FLOOR = 1.0e-16
 
 
-def _pw92_g(rs, parameters):
+def _pw92_g_complex(rs, parameters):
     """PW92 ``G(rs)`` (their Eq. 10); safe for complex-step arguments."""
 
     a, alpha1, beta1, beta2, beta3, beta4 = parameters
@@ -389,9 +421,9 @@ def _pbe_spin_energy_density(n_up, n_down, s_uu, s_ud, s_dd):
         (1.0 + zeta) ** (4.0 / 3.0) + (1.0 - zeta) ** (4.0 / 3.0) - 2.0
     ) / _FZ_DENOMINATOR
     zeta4 = zeta ** 4
-    epsilon_0 = _pw92_g(rs, _PW92_SETS["unpolarized"])
-    epsilon_1 = _pw92_g(rs, _PW92_SETS["polarized"])
-    alpha_c = -_pw92_g(rs, _PW92_SETS["stiffness"])
+    epsilon_0 = _pw92_g_complex(rs, _PW92_SETS["unpolarized"])
+    epsilon_1 = _pw92_g_complex(rs, _PW92_SETS["polarized"])
+    alpha_c = -_pw92_g_complex(rs, _PW92_SETS["stiffness"])
     epsilon_lda = (
         epsilon_0
         + alpha_c * f_zeta / _FZ_SECOND_DERIVATIVE * (1.0 - zeta4)
@@ -412,7 +444,7 @@ def _pbe_spin_energy_density(n_up, n_down, s_uu, s_ud, s_dd):
     return exchange + total * (epsilon_lda + h)
 
 
-def pbe_spin_energy_partials(n_up, n_down, s_uu, s_ud, s_dd):
+def pbe_spin_polarized_partials(n_up, n_down, s_uu, s_ud, s_dd):
     """Spin-polarized PBE ``f`` and its five partial derivatives (Hartree).
 
     Returns ``(f, df/dn_up, df/dn_down, df/ds_uu, df/ds_ud, df/ds_dd)`` with
@@ -510,7 +542,7 @@ def pbe_spin_polarized(
     s_dd = sum(g * g for g in grad_down)
     s_ud = sum(a * b for a, b in zip(grad_up, grad_down))
 
-    f, f_up, f_down, f_uu, f_ud, f_dd = pbe_spin_energy_partials(
+    f, f_up, f_down, f_uu, f_ud, f_dd = pbe_spin_polarized_partials(
         up, down, s_uu, s_ud, s_dd
     )
 
@@ -547,6 +579,6 @@ __all__ = [
     "first_derivative_coefficients",
     "pbe",
     "pbe_energy_partials",
-    "pbe_spin_energy_partials",
+    "pbe_spin_polarized_partials",
     "pbe_spin_polarized",
 ]

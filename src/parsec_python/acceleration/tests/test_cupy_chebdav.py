@@ -9,6 +9,7 @@ CuPy reports a usable CUDA device.
 from __future__ import annotations
 
 from dataclasses import replace
+import gc
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -392,6 +393,12 @@ class CuPyChebDavSelectionTests(unittest.TestCase):
 
 @unittest.skipUnless(GPU_AVAILABLE, "CuPy/CUDA are not available")
 class CuPyChebDavRealCudaTests(unittest.TestCase):
+    def tearDown(self):
+        # Solvers and prepared systems that a test left in a reference cycle are
+        # destroyed here, between the tests, and not by a collection inside the
+        # next one.
+        gc.collect()
+
     def _assert_policy_state_equal(self, actual, expected):
         fields = (
             "operator_dimension",

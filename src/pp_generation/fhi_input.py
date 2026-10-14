@@ -8,7 +8,9 @@ from pathlib import Path
 from .errors import ConfigurationError
 from .models import ConstructionScheme, CoreHole
 
-XC_CODES = {"pbe": 6, "ca": 8}
+# FHI98PP iexc: 6 is PBE; 3 is the LDA of Ceperley and Alder as parametrized by Perdew
+# and Zunger, the "ca" of the solver.  Until October 2026 "ca" was 8 here (Perdew-Wang).
+XC_CODES = {"pbe": 6, "ca": 3}
 L_LABELS = "spdfgh"
 ORBITAL_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s+([-+0-9.eEdD]+)")
 

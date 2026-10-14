@@ -2,18 +2,36 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 
 from parsec_python.Eigensolvers.chebff import ChebFFCycle, ChebFFSettings
-from ..backends.cupy import require_cupy
+from ..backends.cupy import device_stage, require_cupy
 from .chebyshev import chebff_filter
 from .lapack_random import LapackRandom
 from .orthogonalize import orthonormalize_complete_subspace
-from .rayleigh_ritz import DeviceRayleighRitzResult, rayleigh_ritz
+from .rayleigh_ritz import (
+    DeviceRayleighRitzResult,
+    GeneralizedRitzStabilityError,
+    generalized_rayleigh_ritz,
+    generalized_ritz_requested,
+    rayleigh_ritz,
+    streaming_ritz_requested,
+)
 from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
+
+
+def _generalized_cycles_requested() -> bool:
+    """Whether CHEBFF cycles may use the audited non-orthogonal Ritz solve."""
+
+    value = os.environ.get("PARSEC_CUPY_CHEBFF_GENERALIZED_RITZ", "0").strip().lower()
+    if value not in {"0", "1", "on", "off", "true", "false"}:
+        raise ValueError("PARSEC_CUPY_CHEBFF_GENERALIZED_RITZ must be on or off")
+    return value in {"1", "on", "true"}
 
 
 @dataclass(frozen=True)
@@ -69,9 +87,9 @@ def run_chebff(
 ) -> DeviceChebFFResult:
     """Build the initial buffered eigensubspace without host round trips.
 
-    The one intentional host-to-device transfer is the initial trial basis:
-    it is generated with the reference :class:`LapackRandom`, preserving the
-    PARSEC-compatible DLARNV stream, and then uploaded as float64.
+    The initial trial basis retains PARSEC's DLARNV stream. With
+    ``PARSEC_CUPY_DEVICE_RANDOM=1`` the identical sequence is generated directly
+    on the GPU; otherwise it is generated on the host and uploaded as float64.
     """
 
     cp, _ = require_cupy()
@@ -83,13 +101,19 @@ def run_chebff(
         raise ValueError("wanted_states is outside the operator dimension")
 
     basis_generator = LapackRandom()
-    host_trial = basis_generator.uniform_minus_1_1(
-        (dimension, wanted_states), column_major=True
-    )
-    vectors = cp.asarray(host_trial, dtype=cp.float64, order="F")
-    # The persistent copy is the device basis.  Do not retain a second
-    # N-by-state host allocation through all filter cycles.
-    del host_trial
+    if os.environ.get("PARSEC_CUPY_DEVICE_RANDOM", "0").lower() in {"1", "true", "on"}:
+        vectors = basis_generator.device_uniform_minus_1_1(
+            (dimension, wanted_states), column_major=True
+        )
+        stats = getattr(operator, "timing_stats", None)
+        if stats is not None:
+            stats.initial_random_device_values += dimension * wanted_states
+    else:
+        host_trial = basis_generator.uniform_minus_1_1(
+            (dimension, wanted_states), column_major=True
+        )
+        vectors = cp.asarray(host_trial, dtype=cp.float64, order="F")
+        del host_trial
 
     if spectral_bound is None:
         bound_generator = np.random.default_rng(settings.random_seed)
@@ -103,32 +127,64 @@ def run_chebff(
     lower_bound = _initial_filter_lower_bound(smallest_ritz, upper_bound)
     records: list[ChebFFCycle] = []
     last_ritz: DeviceRayleighRitzResult | None = None
+    generalized = _generalized_cycles_requested()
 
     for cycle_number in range(1, settings.filter_cycles + 1):
         lower_in = lower_bound
         upper_in = upper_bound
-        vectors = chebff_filter(
-            operator,
-            vectors,
-            degree=settings.polynomial_degree,
-            lower_bound=lower_bound,
-            upper_bound=upper_bound,
-            reference_eigenvalue=smallest_ritz,
-            block_size=settings.block_size,
-            reset_recurrence_per_block=settings.reset_recurrence_per_block,
-        )
-        # CHEBFF orthogonalizes the complete filtered trial space.  Route it
-        # through the same size-adaptive implementation as later SUBSPACE
-        # iterations: small problems retain PARSEC's selective MGS, moderate
-        # GPU problems use one blocked QR, and multi-gigabyte tall bases use
-        # memory-bounded TSQR.  All three construct the same FP64 column span.
-        vectors = orthonormalize_complete_subspace(
-            vectors, rng=basis_generator
-        ).basis
-        # CHEBFF uses only eigenvalues and rotated vectors.  Forming
-        # ``(H Q) C - (Q C) Lambda`` here is both absent from PARSEC's CHEBFF
-        # control flow and an unnecessary grid-by-state GPU operation.
-        last_ritz = rayleigh_ritz(operator, vectors, compute_residuals=False)
+        last_ritz = None
+        with device_stage(operator, "initial_filter_seconds"):
+            vectors = chebff_filter(
+                operator,
+                vectors,
+                degree=settings.polynomial_degree,
+                lower_bound=lower_bound,
+                upper_bound=upper_bound,
+                reference_eigenvalue=smallest_ritz,
+                block_size=settings.block_size,
+                reset_recurrence_per_block=settings.reset_recurrence_per_block,
+                # This loop owns ``vectors``; filter it in place when asked
+                # to keep a single tall array.
+                out=vectors if streaming_ritz_requested(operator) else None,
+            )
+        if generalized and generalized_ritz_requested(*map(int, vectors.shape)):
+            # Opt-in: solve Rayleigh--Ritz directly in the filtered basis, as
+            # later SUBSPACE passes do.  For large sectors the tall QR below
+            # is about two thirds of the whole first solve, while the Gram
+            # products run at GEMM speed.  The overlap-condition, Cholesky
+            # and coefficient audits are unchanged.  A failed audit leaves the
+            # filtered basis intact and this cycle uses QR; the filtered
+            # random start is the worst-conditioned basis, so later cycles
+            # may try again.
+            try:
+                with device_stage(operator, "initial_projection_seconds"):
+                    last_ritz = generalized_rayleigh_ritz(
+                        operator,
+                        vectors,
+                        compute_residuals=False,
+                        consume_basis=True,
+                    )
+                # Do not hold a second tall buffer through the next filter.
+                last_ritz = replace(last_ritz, workspace=None)
+            except GeneralizedRitzStabilityError:
+                last_ritz = None
+        if last_ritz is None:
+            # CHEBFF orthogonalizes the complete filtered trial space.  Route
+            # it through the same size-adaptive implementation as later
+            # SUBSPACE iterations: small problems retain PARSEC's selective
+            # MGS, moderate GPU problems use one blocked QR, and
+            # multi-gigabyte tall bases use memory-bounded TSQR.  All three
+            # construct the same FP64 column span.
+            with device_stage(operator, "initial_orthogonalization_seconds"):
+                vectors = orthonormalize_complete_subspace(
+                    vectors, rng=basis_generator
+                ).basis
+            # CHEBFF uses only eigenvalues and rotated vectors.  Forming
+            # ``(H Q) C - (Q C) Lambda`` here is both absent from PARSEC's
+            # CHEBFF control flow and an unnecessary grid-by-state GPU
+            # operation.
+            with device_stage(operator, "initial_projection_seconds"):
+                last_ritz = rayleigh_ritz(operator, vectors, compute_residuals=False)
         eigenvalues = last_ritz.eigenvalues
         vectors = last_ritz.wavefunctions
         if eigenvalues.shape != (wanted_states,):

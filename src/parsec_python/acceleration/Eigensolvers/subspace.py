@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import os
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,7 @@ from .rayleigh_ritz import (
     generalized_rayleigh_ritz,
     generalized_ritz_requested,
     rayleigh_ritz,
+    streaming_ritz_requested,
 )
 from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
 
@@ -89,6 +91,24 @@ def adapt_polynomial_degree(
     return requested_degree
 
 
+def filter_degree(
+    settings: SubspaceSettings,
+    state: DeviceSubspaceState,
+    lower_bound: float,
+    upper_bound: float,
+) -> int:
+    """Polynomial degree of this pass, including PARSEC's spectral-width floor."""
+
+    requested_degree=settings.polynomial_degree
+    experimental_cap=int(os.environ.get("PARSEC_CUPY_FILTER_DEGREE_CAP", "0"))
+    if experimental_cap:
+        if experimental_cap<=settings.degree_delta:
+            raise ValueError("experimental filter cap must exceed degree_delta")
+        if state.filters_completed>=5:
+            requested_degree=min(requested_degree,experimental_cap)
+    return adapt_polynomial_degree(requested_degree, lower_bound, upper_bound)
+
+
 def run_subspace_filter(
     operator: Any,
     state: DeviceSubspaceState,
@@ -96,6 +116,7 @@ def run_subspace_filter(
     settings: SubspaceSettings = SubspaceSettings(),
     compute_residuals: bool = True,
     spectral_bound: LanczosBoundResult | None = None,
+    consume_state: bool = False,
 ) -> DeviceSubspaceResult:
     """Perform one filter/orthogonalization/Ritz pass on the GPU.
 
@@ -103,6 +124,10 @@ def run_subspace_filter(
     them to accept eigenpairs or to control SCF convergence.  Diagnostic
     callers retain the default; the production accelerated SCF disables the
     extra ``(H Q) C - (Q C) Lambda`` grid-by-state work.
+
+    ``consume_state`` explicitly transfers ownership of the old vectors.
+    After filtering they may be overwritten by HX and the rotated result.
+    Callers must not retain snapshots/views of the input state when enabled.
     """
 
     _validate_state(operator, state)
@@ -119,14 +144,19 @@ def run_subspace_filter(
             else spectral_bound
         )
     upper_bound = float(bound.upper_bound)
-    degree = adapt_polynomial_degree(
-        settings.polynomial_degree, lower_bound, upper_bound
-    )
+    degree = filter_degree(settings, state, lower_bound, upper_bound)
     blocks = subspace_filter_blocks(
         state.working_states,
         settings.block_size,
         degree,
         settings.degree_delta,
+    )
+    # A consumed state may be filtered in place when the following Ritz solve
+    # needs no second tall array either (see ``streaming_ritz_requested``).
+    filter_in_place = bool(
+        consume_state
+        and not compute_residuals
+        and streaming_ritz_requested(operator)
     )
     with device_stage(operator, "subspace_filter_seconds"):
         filtered = subspace_filter(
@@ -138,6 +168,7 @@ def run_subspace_filter(
             upper_bound=upper_bound,
             block_size=settings.block_size,
             reset_recurrence_per_block=settings.reset_recurrence_per_block,
+            out=state.vectors if filter_in_place else None,
         )
     use_generalized_ritz = bool(
         not state.generalized_ritz_failed
@@ -150,8 +181,10 @@ def run_subspace_filter(
                 ritz = generalized_rayleigh_ritz(
                     operator,
                     filtered,
-                    workspace=state.ritz_workspace,
+                    workspace=(state.vectors if consume_state and not compute_residuals
+                               else state.ritz_workspace),
                     compute_residuals=bool(compute_residuals),
+                    consume_basis=True,
                 )
         except GeneralizedRitzStabilityError:
             # An ill-conditioned overlap is not an SCF failure.  Householder
@@ -185,6 +218,10 @@ def run_subspace_filter(
     ):
         raise RuntimeError("Rayleigh--Ritz changed the saved vector shape")
 
+    if consume_state and not compute_residuals:
+        # The consumed old input supplies next iteration's scratch. Retaining
+        # a second persistent tall workspace defeats the ownership transfer.
+        ritz = replace(ritz, workspace=None)
     next_state = DeviceSubspaceState(
         operator_dimension=state.operator_dimension,
         working_states=state.working_states,
@@ -213,5 +250,6 @@ __all__ = [
     "DeviceSubspaceState",
     "SubspaceSettings",
     "adapt_polynomial_degree",
+    "filter_degree",
     "run_subspace_filter",
 ]

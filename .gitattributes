@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Shell scripts keep LF in every checkout: with CRLF they do not start.
+*.sh text eol=lf
+# Generated pseudopotential files are compared byte for byte (hashes in
+# report.json): no line-ending conversion.
+src/pp_generation/NCPPs/*/** -text
+src/pp_generation/CoreHole_NCPPs/*/** -text

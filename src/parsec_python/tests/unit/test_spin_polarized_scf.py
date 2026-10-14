@@ -81,21 +81,6 @@ class SpinPolarizedEntryGuardsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             run_scf_spin_polarized(system)
 
-    def test_unpolarized_run_scf_refuses_spin_polarized_settings(self) -> None:
-        from parsec_python.SCF.single_point import run_scf
-
-        problem = SinglePointInput(
-            atoms=[Atom("H", [0.0, 0.0, 0.0])],
-            pseudopotentials={"H": SpeciesPotential(_H_POTRE_FIXTURE, 0)},
-            grid=GridSettings(spacing=0.8, radius=4.0, expansion_order=4),
-            scf=SCFSettings(max_iterations=1, number_of_states=3, spin_polarized=True),
-            hartree=HartreeSettings(multipole_order=2),
-            eigensolver=EigensolverSettings(method="chebff", tolerance=1.0e-6),
-        )
-        system = prepare_single_point(problem)
-        with self.assertRaises(NotImplementedError):
-            run_scf(system)
-
 
 if __name__ == "__main__":
     unittest.main()

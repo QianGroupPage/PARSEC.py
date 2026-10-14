@@ -51,14 +51,23 @@ class KPointJob:
 
 
 def resolve_backend(requested: str | None = None):
-    """The device backend plan, or ``None`` for the CPU (the default).
+    """The device backend plan, or ``None`` for the CPU.
 
-    ``requested`` or ``PARSEC_KPOINT_BACKEND``: ``cpu``, ``cupy`` (one worker
-    thread per CUDA device, ``PARSEC_CUPY_DEVICES`` selects them), ``auto``
-    (CuPy if it works) or ``numpy-device`` (the device code on the host, for
-    tests).  Importing the acceleration package is skipped for ``cpu``.
+    The device follows ``PARSEC_DEVICE`` (what ``--device`` sets, default
+    ``auto``): ``gpu`` and ``auto`` use the GPU path (one worker thread per
+    CUDA device, ``PARSEC_CUPY_DEVICES`` selects them) when CuPy and a device
+    work, ``auto`` falling back to the CPU and ``gpu`` raising without one;
+    ``cpu`` never uses it.  ``requested`` or ``PARSEC_KPOINT_BACKEND``
+    (``cpu``, ``cupy``, ``auto`` or ``numpy-device``, the device code on the
+    host, for tests) overrides that.  The acceleration package is only
+    imported when a device could be used.
     """
-    name = (requested or os.environ.get("PARSEC_KPOINT_BACKEND", "cpu")).strip().lower()
+    name = (requested or os.environ.get("PARSEC_KPOINT_BACKEND", "")).strip().lower()
+    if not name:
+        device = os.environ.get("PARSEC_DEVICE", "auto").strip().lower() or "auto"
+        name = {"cpu": "cpu", "gpu": "cupy", "auto": "auto"}.get(device)
+        if name is None:
+            raise ValueError(f"PARSEC_DEVICE must be auto, gpu or cpu, not {device!r}")
     if name == "cpu":
         return None
     from ..acceleration.Hamiltonian.device_bloch import resolve_kpoint_backend

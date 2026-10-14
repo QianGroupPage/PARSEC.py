@@ -1,0 +1,126 @@
+{
+  "schema_version": 2,
+  "element": "Y",
+  "prefix": "y_2s_hole_1_pbe_tm",
+  "backend": "pyfhi98pp",
+  "family": "ncpp",
+  "xc": "pbe",
+  "scheme": "tm",
+  "relativistic": "scalar",
+  "variant": null,
+  "core_hole": {
+    "shell": "2s",
+    "removed_electrons": 1.0
+  },
+  "ionic_charge": 4.0,
+  "reference_electrons": 3.0,
+  "reference_charge": 1.0,
+  "ae_energy_hartree": -3298.7832706883137,
+  "pseudo_energy_hartree": -2.4831856327520483,
+  "atomic_energy_correction_rydberg": -6592.600170111124,
+  "lmax": 2,
+  "channels": [
+    {
+      "angular_momentum": 0,
+      "scheme": "t",
+      "cutoff_radius": 3.214328878693583,
+      "match_radius": 3.293722801997314,
+      "ae_eigenvalue_ev": -10.916087576702155,
+      "pseudo_eigenvalue_ev": -10.916096885918915,
+      "norm_test": 0.999999758440998,
+      "slope_test": 0.9999879754924402
+    },
+    {
+      "angular_momentum": 1,
+      "scheme": "t",
+      "cutoff_radius": 3.136848715422644,
+      "match_radius": 3.214328878693583,
+      "ae_eigenvalue_ev": 6.5997,
+      "pseudo_eigenvalue_ev": 6.599769277945758,
+      "norm_test": 0.9999985298958335,
+      "slope_test": 0.9999985298963804
+    },
+    {
+      "angular_momentum": 2,
+      "scheme": "t",
+      "cutoff_radius": 2.6443346786428843,
+      "match_radius": 2.7096497452053634,
+      "ae_eigenvalue_ev": -12.49880100934403,
+      "pseudo_eigenvalue_ev": -12.498826950858877,
+      "norm_test": 0.9999999200140917,
+      "slope_test": 1.000004141712749
+    }
+  ],
+  "core_radius": 0.0,
+  "reference_shift_ev": -8.400291064186245,
+  "kinetic_cutoff_rydberg": {
+    "0": 19.0,
+    "2": 32.0
+  },
+  "ghost_free": true,
+  "selected_local_channel": 1,
+  "local_channel_results": [
+    {
+      "local_channel": 1,
+      "passed": true,
+      "minimum_margin_hartree": 0.04093460846130709,
+      "report_path": "y_2s_hole_1_pbe_tm.local-1.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.04093460846130709,
+          "reference_energy_hartree": -0.40115617349006943,
+          "local_ground_energy_hartree": -0.36022156502876235,
+          "local_first_excited_energy_hartree": -0.10757436862840085,
+          "projector_sign": -1
+        },
+        {
+          "angular_momentum": 2,
+          "label": "d",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.32790566053373205,
+          "reference_energy_hartree": -0.45932011666722755,
+          "local_ground_energy_hartree": -0.1314144561334955,
+          "local_first_excited_energy_hartree": -0.04541299213174094,
+          "projector_sign": -1
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    "Matched to the ground-state potential: lmax 2, local channel p, same cutoff radii.",
+    "Reviewed setting for Y: s radius one mesh point above the default 3.20: at the default mesh point the Troullier-Martins equations have no solution for the core-hole ions.",
+    "Reference energies of the unbound channels (p) shifted by -8.40 eV, the shift of the highest valence level caused by the core hole.",
+    "Generating atomic reference charge +1; choose the electron count (full or neutralized core hole) explicitly in the many-electron calculation."
+  ],
+  "artifacts": {
+    "dat": {
+      "path": "y_2s_hole_1_pbe_tm.dat",
+      "sha256": "024f2733365f80dbfaa37290a74f2e5216427ce7184aa1fc6d60edc4038998a9"
+    },
+    "aep": {
+      "path": "y_2s_hole_1_pbe_tm.aep",
+      "sha256": "e5b1e9a1008545c57976e204202f1fb8b37cfef2524b444b7d77d5e91d766e06"
+    },
+    "test": {
+      "path": "y_2s_hole_1_pbe_tm.test",
+      "sha256": "10b521db5944d954ef7ead1dc03a10e5ffdb45c68324725d7b88015ad1b01036"
+    },
+    "fhi_species": {
+      "path": "../FHI/Y-2s_FHIPP.DAT",
+      "sha256": "2093bced15a8d360443eb2cfd167c21869fa3bef3d4d4d60afe1bbeeb34047d2"
+    },
+    "upf": {
+      "path": "../UPF/y_2s_hole_1_pbe_tm.UPF",
+      "sha256": "89f8a2bb23c08e1f2ef7cf2eab3d57a1d3174dafd58ae77164cdc4fab3df6fbd"
+    },
+    "parsec_species": {
+      "path": "../PARSEC/Y-2s_POTRE.DAT",
+      "sha256": "bb48444d6256268148ca451a07aa37b795f2731bd5e34a21dd2b6b436a8a405d"
+    }
+  }
+}

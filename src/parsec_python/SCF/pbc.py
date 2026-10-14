@@ -156,7 +156,6 @@ def prepare_periodic_single_point(
     """
     if problem.periodic_cell is None:
         raise ValueError("prepare_periodic_single_point requires problem.periodic_cell")
-
     preparation_start = time.perf_counter()
     # 1. Geometry, pseudopotentials, and electron count.
     atoms = tuple(problem.atoms)

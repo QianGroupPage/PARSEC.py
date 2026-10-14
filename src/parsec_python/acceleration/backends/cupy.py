@@ -32,10 +32,21 @@ from .cupy_stencil_major import (
     CuPyStencilMajorFiniteDifference,
     StencilMajorHostMetadata,
 )
-from .cupy_mixed_precision import CuPyMixedPrecisionRecurrence
+from .cupy_mixed_precision import (
+    CuPyMixedPrecisionRecurrence,
+    float32_filter_requested,
+    mixed_filter_policy,
+)
 from .cupy_projectors import (
     CuPySparseProjectorFactors,
     CuPySparseProjectorProjection,
+    projection_reduction,
+    projector_block_columns,
+)
+from .implicit_stencil import (
+    PackedTileHostMetadata,
+    implicit_tile_setting,
+    pack_worker_setting,
 )
 
 
@@ -166,9 +177,16 @@ class CuPyTimingStats:
     solve_calls: int = 0
     first_solve_calls: int = 0
     subspace_solve_calls: int = 0
+    # Later filter passes that ran the FP32 recurrence, an opt-in.
+    subspace_filter_float32_passes: int = 0
     density_calls: int = 0
     hamiltonian_applications: int = 0
     orbital_vectors_applied: int = 0
+    filter_graph_launches: int = 0
+    filter_graph_builds: int = 0
+    filter_graph_buffer_bytes: int = 0
+    initial_random_device_values: int = 0
+    eigensolver_bound_prepare_wall_seconds: float = 0.0
     _pending_stage_events: list[tuple[str, Any, Any]] = field(
         default_factory=list,
         init=False,
@@ -280,9 +298,13 @@ class CuPyHamiltonian:
         retain_generic_laplacian: bool = True,
         prefer_stencil_major: bool = True,
         use_compact_finite_difference: bool = True,
-        finite_difference_metadata: StencilMajorHostMetadata | None = None,
+        finite_difference_metadata: (
+            StencilMajorHostMetadata | PackedTileHostMetadata | None
+        ) = None,
         shared_stencil_neighbors: Any | None = None,
         shared_effective_potential: Any | None = None,
+        implicit_tile: int | None = None,
+        projection_block_columns: int | None = None,
     ) -> None:
         self.timing_stats = timing_stats or CuPyTimingStats()
 
@@ -346,20 +368,49 @@ class CuPyHamiltonian:
                     prefer_stencil_major
                 )
                 if stencil_requested:
-                    try:
-                        self.compact_finite_difference = (
-                            CuPyStencilMajorFiniteDifference(
-                                cp,
-                                host_a,
-                                metadata=finite_difference_metadata,
-                                device_neighbors=shared_stencil_neighbors,
+                    # Affine tiles are a layout of the stencil-major kernels.
+                    # A size that the environment names is built or is an
+                    # error; one that the default chose for a sector gives
+                    # way to the slot-major layout, which every route reads,
+                    # and never to the CSR-order kernel below.
+                    named_tile = implicit_tile_setting()
+                    tile = (
+                        (named_tile or 0)
+                        if implicit_tile is None
+                        else int(implicit_tile)
+                    )
+                    if tile:
+                        # A setting of the packer that is no thread count is
+                        # an error as well, whoever chose the tiles.
+                        pack_worker_setting()
+                    # A stencil that arrives packed, the tiles of a sector
+                    # for another of its devices, has that layout alone.
+                    packed = isinstance(
+                        finite_difference_metadata, PackedTileHostMetadata
+                    )
+                    for layout in dict.fromkeys((tile, 0)):
+                        try:
+                            self.compact_finite_difference = (
+                                CuPyStencilMajorFiniteDifference(
+                                    cp,
+                                    host_a,
+                                    metadata=finite_difference_metadata,
+                                    device_neighbors=shared_stencil_neighbors,
+                                    implicit_tile=layout,
+                                )
                             )
-                        )
-                    except Exception as error:
-                        failures.append(
-                            "stencil-major "
-                            f"{type(error).__name__}: {error}"
-                        )
+                            break
+                        except Exception as error:
+                            if packed or (layout and named_tile is not None):
+                                raise
+                            failures.append(
+                                (
+                                    f"affine tiles of {layout} "
+                                    if layout
+                                    else "stencil-major "
+                                )
+                                + f"{type(error).__name__}: {error}"
+                            )
                 else:
                     failures.append(
                         "stencil-major disabled by operator policy/environment"
@@ -399,170 +450,9 @@ class CuPyHamiltonian:
                 or self.compact_finite_difference is None
                 else None
             )
-            self.projector_signs = cp.asarray(host_signs, dtype=cp.float64)
-            fused_projectors_requested = os.environ.get(
-                "PARSEC_CUPY_FUSED_PROJECTORS", "1"
-            ).strip().lower() not in {"0", "false", "no", "off"}
-            fused_projectors_eligible = bool(
-                fused_projectors_requested
-                and projector_count
-                and getattr(
-                    self.compact_finite_difference,
-                    "supports_fused_projector_scatter",
-                    False,
-                )
-                and host_b.indptr.dtype == np.int32
-                and host_b.indices.dtype == np.int32
-            )
-            custom_projection_requested = os.environ.get(
-                "PARSEC_CUPY_CUSTOM_PROJECTOR_DOT", "1"
-            ).strip().lower() not in {"0", "false", "no", "off"}
-            self._projector_count = projector_count
-            self.raw_projector_factors = None
-            self.projectors = None
-            self.projectors_transpose = None
-            self.custom_projector_projection = None
-            # Representation operators omit the generic Laplacian and never
-            # need a cuSPARSE projector object in production.  Upload raw CSR
-            # factors directly, avoiding both duplicate storage and cold
-            # cuSPARSE dynamic-library initialization.  The generic/full-grid
-            # backend keeps its public sparse matrices for modular inspection.
-            raw_factor_path = bool(
-                not retain_generic_laplacian
-                and fused_projectors_eligible
-                and custom_projection_requested
-            )
-            if raw_factor_path:
-                try:
-                    self.raw_projector_factors = CuPySparseProjectorFactors(
-                        cp, host_b, self.projector_signs
-                    )
-                    self.custom_projector_projection = (
-                        self.raw_projector_factors.projection
-                    )
-                except Exception:
-                    # NVRTC/cache failures are optimization failures only.
-                    # Construct the exact cuSPARSE fallback below.
-                    self.raw_projector_factors = None
-                    self.custom_projector_projection = None
-
-            if projector_count == 0:
-                # Do not initialize cuSPARSE merely to own an empty factor.
-                # asarray also supports the small NumPy-backed CuPy shim used
-                # to validate the optional-runtime Poisson path.
-                empty_offsets = cp.asarray(
-                    np.zeros(dimension + 1, dtype=np.int32)
-                )
-                self.projector_csr_data = (
-                    empty_offsets,
-                    cp.asarray(np.empty(0, dtype=np.int32)),
-                    cp.asarray(np.empty(0, dtype=np.float64)),
-                )
-            elif self.raw_projector_factors is None:
-                self.projectors = cpsparse.csr_matrix(host_b)
-                # Cache CSR B.T explicitly. Rebuilding/converting it in every
-                # Hamiltonian application would defeat the low-rank factors.
-                host_b_transpose = host_b.T.tocsr(copy=True)
-                host_b_transpose.sum_duplicates()
-                host_b_transpose.sort_indices()
-                projector_row_lengths = np.diff(host_b_transpose.indptr)
-                max_projector_entries = int(
-                    projector_row_lengths.max(initial=0)
-                )
-                self.projectors_transpose = cpsparse.csr_matrix(
-                    host_b_transpose
-                )
-                if custom_projection_requested and projector_count:
-                    try:
-                        self.custom_projector_projection = (
-                            CuPySparseProjectorProjection(
-                                cp,
-                                self.projectors_transpose,
-                                self.projector_signs,
-                                max_row_entries=max_projector_entries,
-                            )
-                        )
-                    except Exception:
-                        self.custom_projector_projection = None
-                self.projector_csr_data = (
-                    self.projectors.indptr,
-                    self.projectors.indices,
-                    self.projectors.data,
-                )
-            else:
-                self.projector_csr_data = self.raw_projector_factors.csr_data
-            self.fused_projector_scatter = bool(
-                fused_projectors_eligible
-                and (
-                    self.raw_projector_factors is not None
-                    or (
-                        self.projectors is not None
-                        and self.projectors.indptr.dtype == cp.dtype(cp.int32)
-                        and self.projectors.indices.dtype == cp.dtype(cp.int32)
-                    )
-                )
-            )
-            mixed_filter_policy = os.environ.get(
-                "PARSEC_CUPY_MIXED_FILTER", "auto"
-            ).strip().lower()
-            if mixed_filter_policy not in {
-                "auto", "on", "off", "1", "0", "true", "false"
-            }:
-                raise ValueError(
-                    "PARSEC_CUPY_MIXED_FILTER must be auto, on, or off"
-                )
-            raw_mixed_minimum = os.environ.get(
-                "PARSEC_CUPY_MIXED_FILTER_MIN_ROWS", "100000"
-            ).strip()
-            try:
-                mixed_minimum_rows = int(raw_mixed_minimum)
-            except ValueError as error:
-                raise ValueError(
-                    "PARSEC_CUPY_MIXED_FILTER_MIN_ROWS must be an integer"
-                ) from error
-            if mixed_minimum_rows < 1:
-                raise ValueError(
-                    "PARSEC_CUPY_MIXED_FILTER_MIN_ROWS must be positive"
-                )
-            mixed_filter_requested = bool(
-                mixed_filter_policy in {"on", "1", "true"}
-                or (
-                    mixed_filter_policy == "auto"
-                    and dimension >= mixed_minimum_rows
-                )
-            )
-            self.mixed_precision_recurrence = None
-            self.mixed_precision_filter_reason = (
-                "below automatic row threshold"
-                if mixed_filter_policy == "auto"
-                and dimension < mixed_minimum_rows
-                else "disabled by policy"
-            )
-            if mixed_filter_requested and isinstance(
-                self.compact_finite_difference,
-                CuPyStencilMajorFiniteDifference,
-            ):
-                try:
-                    self.mixed_precision_recurrence = (
-                        CuPyMixedPrecisionRecurrence(
-                            cp,
-                            self.compact_finite_difference,
-                            host_b,
-                            host_signs,
-                            host_potential,
-                        )
-                    )
-                    self.mixed_precision_filter_reason = None
-                except Exception as error:
-                    self.mixed_precision_filter_reason = (
-                        f"{type(error).__name__}: {error}"
-                    )
-                    if mixed_filter_policy in {"on", "1", "true"}:
-                        raise
-            elif mixed_filter_requested:
-                self.mixed_precision_filter_reason = (
-                    "stencil-major CUDA kernel unavailable"
-                )
+            self._retain_generic_laplacian = bool(retain_generic_laplacian)
+            self._projection_block_columns = projection_block_columns
+            self._install_projectors(host_b, host_signs, host_potential)
             if shared_effective_potential is None:
                 self.effective_potential = cp.asarray(
                     host_potential, dtype=cp.float64
@@ -581,6 +471,215 @@ class CuPyHamiltonian:
             self.dtype = cp.dtype(cp.float64)
 
         _, elapsed = synchronized_call(initialize)
+        self.timing_stats.initialization_seconds += elapsed
+
+    def _install_projectors(self, host_b, host_signs, host_potential) -> None:
+        """Upload the KB projector factors in the form this operator applies.
+
+        ``host_b`` is the canonical float64 CSR of ``B`` with one row per
+        grid point of the operator, ``host_signs`` its signs and
+        ``host_potential`` the local potential the FP32 shadow of an opt-in
+        mixed-precision filter starts from.  Called by the constructor and by
+        :meth:`replace_projectors`; the stencil is read, not changed.
+        """
+
+        cp, cpsparse = require_cupy()
+        dimension = int(host_b.shape[0])
+        projector_count = int(host_b.shape[1])
+        retain_generic_laplacian = self._retain_generic_laplacian
+        self.projector_signs = cp.asarray(host_signs, dtype=cp.float64)
+        fused_projectors_requested = os.environ.get(
+            "PARSEC_CUPY_FUSED_PROJECTORS", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        fused_projectors_eligible = bool(
+            fused_projectors_requested
+            and projector_count
+            and getattr(
+                self.compact_finite_difference,
+                "supports_fused_projector_scatter",
+                False,
+            )
+            and host_b.indptr.dtype == np.int32
+            and host_b.indices.dtype == np.int32
+        )
+        custom_projection_requested = os.environ.get(
+            "PARSEC_CUPY_CUSTOM_PROJECTOR_DOT", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        # The columns that a block of the tree projection carries: those
+        # the caller names, as a sector group names those of its owner
+        # for the other devices, else the switch.  Read and checked
+        # here, outside the fallbacks below: a value that is neither 6
+        # nor 1 is an error of the operator and no reason to give the
+        # projection to cuSPARSE.
+        block_columns = (
+            projector_block_columns()
+            if self._projection_block_columns is None
+            else int(self._projection_block_columns)
+        )
+        projection_reduction(True, block_columns)
+        self._projector_count = projector_count
+        self.raw_projector_factors = None
+        self.projectors = None
+        self.projectors_transpose = None
+        self.custom_projector_projection = None
+        # Representation operators omit the generic Laplacian and never
+        # need a cuSPARSE projector object in production.  Upload raw CSR
+        # factors directly, avoiding both duplicate storage and cold
+        # cuSPARSE dynamic-library initialization.  The generic/full-grid
+        # backend keeps its public sparse matrices for modular inspection.
+        raw_factor_path = bool(
+            not retain_generic_laplacian
+            and fused_projectors_eligible
+            and custom_projection_requested
+        )
+        if raw_factor_path:
+            try:
+                self.raw_projector_factors = CuPySparseProjectorFactors(
+                    cp,
+                    host_b,
+                    self.projector_signs,
+                    block_columns=block_columns,
+                )
+                self.custom_projector_projection = (
+                    self.raw_projector_factors.projection
+                )
+            except Exception:
+                # NVRTC/cache failures are optimization failures only.
+                # Construct the exact cuSPARSE fallback below.
+                self.raw_projector_factors = None
+                self.custom_projector_projection = None
+
+        if projector_count == 0:
+            # Do not initialize cuSPARSE merely to own an empty factor.
+            # asarray also supports the small NumPy-backed CuPy shim used
+            # to validate the optional-runtime Poisson path.
+            empty_offsets = cp.asarray(
+                np.zeros(dimension + 1, dtype=np.int32)
+            )
+            self.projector_csr_data = (
+                empty_offsets,
+                cp.asarray(np.empty(0, dtype=np.int32)),
+                cp.asarray(np.empty(0, dtype=np.float64)),
+            )
+        elif self.raw_projector_factors is None:
+            self.projectors = cpsparse.csr_matrix(host_b)
+            # Cache CSR B.T explicitly. Rebuilding/converting it in every
+            # Hamiltonian application would defeat the low-rank factors.
+            host_b_transpose = host_b.T.tocsr(copy=True)
+            host_b_transpose.sum_duplicates()
+            host_b_transpose.sort_indices()
+            projector_row_lengths = np.diff(host_b_transpose.indptr)
+            max_projector_entries = int(
+                projector_row_lengths.max(initial=0)
+            )
+            self.projectors_transpose = cpsparse.csr_matrix(
+                host_b_transpose
+            )
+            if custom_projection_requested and projector_count:
+                try:
+                    self.custom_projector_projection = (
+                        CuPySparseProjectorProjection(
+                            cp,
+                            self.projectors_transpose,
+                            self.projector_signs,
+                            max_row_entries=max_projector_entries,
+                            block_columns=block_columns,
+                        )
+                    )
+                except Exception:
+                    self.custom_projector_projection = None
+            self.projector_csr_data = (
+                self.projectors.indptr,
+                self.projectors.indices,
+                self.projectors.data,
+            )
+        else:
+            self.projector_csr_data = self.raw_projector_factors.csr_data
+        self.fused_projector_scatter = bool(
+            fused_projectors_eligible
+            and (
+                self.raw_projector_factors is not None
+                or (
+                    self.projectors is not None
+                    and self.projectors.indptr.dtype == cp.dtype(cp.int32)
+                    and self.projectors.indices.dtype == cp.dtype(cp.int32)
+                )
+            )
+        )
+        # FP64 unless PARSEC_CUPY_MIXED_FILTER asks for the FP32 filter.
+        mixed_filter = mixed_filter_policy()
+        mixed_filter_requested = float32_filter_requested(dimension)
+        self.mixed_precision_recurrence = None
+        self.mixed_precision_filter_reason = (
+            "below automatic row threshold"
+            if mixed_filter == "auto" and not mixed_filter_requested
+            else "disabled by policy"
+        )
+        if mixed_filter_requested and isinstance(
+            self.compact_finite_difference,
+            CuPyStencilMajorFiniteDifference,
+        ):
+            try:
+                self.mixed_precision_recurrence = (
+                    CuPyMixedPrecisionRecurrence(
+                        cp,
+                        self.compact_finite_difference,
+                        host_b,
+                        host_signs,
+                        host_potential,
+                        block_columns=block_columns,
+                    )
+                )
+                self.mixed_precision_filter_reason = None
+            except Exception as error:
+                self.mixed_precision_filter_reason = (
+                    f"{type(error).__name__}: {error}"
+                )
+                if mixed_filter == "on":
+                    raise
+        elif mixed_filter_requested:
+            self.mixed_precision_filter_reason = (
+                "stencil-major CUDA kernel unavailable"
+            )
+
+    def replace_projectors(self, nonlocal_operator: Any) -> None:
+        """Replace the KB projectors of moved atoms; keep everything else.
+
+        The stencil, the device buffer of the local potential (and with it
+        every object that shares it) and the identity of this operator stay,
+        so an eigensolver keeps the subspace it saved for it.  The projector
+        arrays are new allocations: CUDA graphs recorded for this operator
+        hold the old ones and must be dropped by their owner.
+
+        ``nonlocal_operator`` exposes ``projectors`` and ``signs`` or is a
+        ``(projectors, signs)`` pair, as for the constructor.
+        """
+
+        cp, _ = require_cupy()
+
+        def replace() -> None:
+            if isinstance(nonlocal_operator, tuple) and len(nonlocal_operator) == 2:
+                supplied_projectors, supplied_signs = nonlocal_operator
+            else:
+                supplied_projectors = getattr(nonlocal_operator, "projectors", None)
+                supplied_signs = getattr(nonlocal_operator, "signs", None)
+                if supplied_projectors is None or supplied_signs is None:
+                    raise TypeError(
+                        "nonlocal_operator must expose projectors and signs"
+                    )
+            dimension = int(self.shape[0])
+            host_b = _host_csr(supplied_projectors, (dimension, 0))
+            if host_b.shape[0] != dimension:
+                raise ValueError("projector rows must match the Hamiltonian dimension")
+            host_signs = np.asarray(supplied_signs, dtype=np.float64)
+            if host_signs.shape != (int(host_b.shape[1]),):
+                raise ValueError("projector_signs must have one entry per projector")
+            host_potential = np.asarray(
+                cp.asnumpy(self.effective_potential), dtype=np.float64
+            )
+            self._install_projectors(host_b, host_signs, host_potential)
+
+        _, elapsed = synchronized_call(replace)
         self.timing_stats.initialization_seconds += elapsed
 
     @property

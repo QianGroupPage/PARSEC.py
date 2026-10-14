@@ -1,0 +1,124 @@
+{
+  "schema_version": 2,
+  "element": "B",
+  "prefix": "b_1s_hole_1_pbe_tm",
+  "backend": "pyfhi98pp",
+  "family": "ncpp",
+  "xc": "pbe",
+  "scheme": "tm",
+  "relativistic": "scalar",
+  "variant": null,
+  "core_hole": {
+    "shell": "1s",
+    "removed_electrons": 1.0
+  },
+  "ionic_charge": 4.0,
+  "reference_electrons": 3.0,
+  "reference_charge": 1.0,
+  "ae_energy_hartree": -16.99324464659181,
+  "pseudo_energy_hartree": -4.7373332134327555,
+  "atomic_energy_correction_rydberg": -24.511822866318106,
+  "lmax": 2,
+  "channels": [
+    {
+      "angular_momentum": 0,
+      "scheme": "t",
+      "cutoff_radius": 1.6708874379820364,
+      "match_radius": 1.7121583577001926,
+      "ae_eigenvalue_ev": -23.742398846107328,
+      "pseudo_eigenvalue_ev": -23.742494391248652,
+      "norm_test": 0.9999984807386044,
+      "slope_test": 1.000018141415822
+    },
+    {
+      "angular_momentum": 1,
+      "scheme": "t",
+      "cutoff_radius": 1.6708874379820364,
+      "match_radius": 1.7121583577001926,
+      "ae_eigenvalue_ev": -17.676579075145543,
+      "pseudo_eigenvalue_ev": -17.67663490925116,
+      "norm_test": 0.9999989503748749,
+      "slope_test": 1.0000029480269883
+    },
+    {
+      "angular_momentum": 2,
+      "scheme": "t",
+      "cutoff_radius": 1.6708874379820364,
+      "match_radius": 1.7121583577001926,
+      "ae_eigenvalue_ev": -17.676579075145543,
+      "pseudo_eigenvalue_ev": -17.676536173568277,
+      "norm_test": 0.9999997325803367,
+      "slope_test": 0.9999997325803368
+    }
+  ],
+  "core_radius": 1.3745903929284453,
+  "reference_shift_ev": 0.0,
+  "kinetic_cutoff_rydberg": {
+    "0": 59.0,
+    "1": 74.0
+  },
+  "ghost_free": true,
+  "selected_local_channel": 2,
+  "local_channel_results": [
+    {
+      "local_channel": 2,
+      "passed": true,
+      "minimum_margin_hartree": 0.13045273043497285,
+      "report_path": "b_1s_hole_1_pbe_tm.local-2.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "pass",
+          "message": "* no ghost (ekb > 0, eloc0 < eref < eloc1)",
+          "margin_hartree": 0.5743281988987722,
+          "reference_energy_hartree": -0.8725143987701812,
+          "local_ground_energy_hartree": -1.8574250497166744,
+          "local_first_excited_energy_hartree": -0.29818619987140904,
+          "projector_sign": 1
+        },
+        {
+          "angular_momentum": 1,
+          "label": "p",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.13045273043497285,
+          "reference_energy_hartree": -0.6495999812263787,
+          "local_ground_energy_hartree": -0.5191472507914059,
+          "local_first_excited_energy_hartree": -0.11296651024527932,
+          "projector_sign": -1
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    "Matched to the ground-state potential: lmax 2, local channel d, same cutoff radii.",
+    "Generating atomic reference charge +1; choose the electron count (full or neutralized core hole) explicitly in the many-electron calculation."
+  ],
+  "artifacts": {
+    "dat": {
+      "path": "b_1s_hole_1_pbe_tm.dat",
+      "sha256": "4a89d64aa4edb0270c4503817e52d2bd563d9db5495781803e9d042fcbd29654"
+    },
+    "aep": {
+      "path": "b_1s_hole_1_pbe_tm.aep",
+      "sha256": "b97b44c0aa8d5a8cd2ea6b81670c9796ebeb89bd15595182e44194efdb1a8148"
+    },
+    "test": {
+      "path": "b_1s_hole_1_pbe_tm.test",
+      "sha256": "222f01f60b13029d85d52566c551d49c3a84c9f79e47ff4922ad4b02d102c7cf"
+    },
+    "fhi_species": {
+      "path": "../FHI/B-1s_FHIPP.DAT",
+      "sha256": "da204ab0916a8afecf00d8ad1d1885beda069d52639a8b6476ce4f25cf4f8787"
+    },
+    "upf": {
+      "path": "../UPF/b_1s_hole_1_pbe_tm.UPF",
+      "sha256": "def49aa158004b0931316acabfa402abe7348011ed9e1c35803f10109dfbef33"
+    },
+    "parsec_species": {
+      "path": "../PARSEC/B-1s_POTRE.DAT",
+      "sha256": "abc2d520c0f5f696dda3fe9e4028902c66f39bc88583e022b19320c15d5e5c01"
+    }
+  }
+}

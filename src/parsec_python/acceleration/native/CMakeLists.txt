@@ -21,6 +21,8 @@ pybind11_add_module(
     fused_hamiltonian.cpp
     hartree_boundary.cpp
     radial_grid.cpp
+    sector_operator.cpp
+    sector_stencil.cpp
 )
 
 target_link_libraries(parsec_accelerated_native PRIVATE OpenMP::OpenMP_CXX)

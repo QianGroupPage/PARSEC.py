@@ -10,6 +10,7 @@ import numpy as np
 
 from ..backends.cupy import require_cupy
 from ..backends.cupy_orthogonalize import subtract_active_prefix
+from .tall_product import transposed_product
 
 
 _EPS = 2.22044605e-16
@@ -398,15 +399,13 @@ def orthonormalize_appended_block(
     def project_prefix(target: Any):
         if not existing_columns:
             return cp.empty((0, target.shape[1]), dtype=cp.float64)
+        # The block is often six columns wide: an even width goes to cuBLAS
+        # in two pieces (:func:`tall_product.transposed_product`).
         if not full_workspace_projection:
-            coefficients = prefix.T @ target
+            coefficients = transposed_product(cp, prefix, target)
             target -= prefix @ coefficients
             return coefficients
-        cp.matmul(
-            basis.T,
-            target,
-            out=projection_coefficients,
-        )
+        transposed_product(cp, basis, target, out=projection_coefficients)
         if fused_prefix_update:
             subtract_active_prefix(
                 cp,
@@ -437,7 +436,7 @@ def orthonormalize_appended_block(
         diagonal: np.ndarray,
         prefix_coefficients: Any,
     ) -> bool:
-        internal = candidate_basis.T @ candidate_basis
+        internal = transposed_product(cp, candidate_basis, candidate_basis)
         if prefix_coefficients.size:
             audit_values = cp.concatenate(
                 (
@@ -673,7 +672,9 @@ def _tsqr_in_place(matrix: Any) -> Any:
         del updated
     del top_q
 
-    gram = np.asarray(cp.asnumpy(matrix.T @ matrix), dtype=np.float64)
+    gram = np.asarray(
+        cp.asnumpy(transposed_product(cp, matrix, matrix)), dtype=np.float64
+    )
     error = float(
         np.max(
             np.abs(gram - np.eye(columns, dtype=np.float64)), initial=0.0
@@ -747,7 +748,7 @@ def orthonormalize_complete_appended_subspace(
     def project_locked_prefix() -> None:
         if not existing_columns:
             return
-        coefficients = prefix.T @ active
+        coefficients = transposed_product(cp, prefix, active)
         for start in range(0, rows, tile_rows):
             stop = min(rows, start + tile_rows)
             update = prefix[start:stop, :] @ coefficients
@@ -765,7 +766,9 @@ def orthonormalize_complete_appended_subspace(
         active[:, :] = complete.basis
         algorithm = "complete_appended_" + complete.algorithm
 
-        gram = np.asarray(cp.asnumpy(active.T @ active), dtype=np.float64)
+        gram = np.asarray(
+            cp.asnumpy(transposed_product(cp, active, active)), dtype=np.float64
+        )
         last_internal_error = float(
             np.max(
                 np.abs(gram - np.eye(suffix_columns, dtype=np.float64)),
@@ -773,7 +776,10 @@ def orthonormalize_complete_appended_subspace(
             )
         )
         if existing_columns:
-            cross = np.asarray(cp.asnumpy(prefix.T @ active), dtype=np.float64)
+            cross = np.asarray(
+                cp.asnumpy(transposed_product(cp, prefix, active)),
+                dtype=np.float64,
+            )
             last_cross_error = float(np.max(np.abs(cross), initial=0.0))
         else:
             last_cross_error = 0.0
@@ -830,7 +836,10 @@ def orthonormalize_complete_subspace(
         basis = matrix
         try:
             for _ in range(2):
-                gram = np.asarray(cp.asnumpy(basis.T @ basis), dtype=np.float64)
+                gram = np.asarray(
+                    cp.asnumpy(transposed_product(cp, basis, basis)),
+                    dtype=np.float64,
+                )
                 gram = np.tril(gram) + np.tril(gram, -1).T
                 cholesky = np.linalg.cholesky(gram)
                 inverse_transpose = np.linalg.solve(
@@ -839,7 +848,10 @@ def orthonormalize_complete_subspace(
                 basis = basis @ cp.asarray(
                     inverse_transpose, dtype=cp.float64
                 )
-            audit = np.asarray(cp.asnumpy(basis.T @ basis), dtype=np.float64)
+            audit = np.asarray(
+                cp.asnumpy(transposed_product(cp, basis, basis)),
+                dtype=np.float64,
+            )
             error = float(
                 np.max(
                     np.abs(audit - np.eye(audit.shape[0], dtype=np.float64)),

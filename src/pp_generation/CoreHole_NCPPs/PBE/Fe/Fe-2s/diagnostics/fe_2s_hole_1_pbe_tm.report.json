@@ -1,0 +1,125 @@
+{
+  "schema_version": 2,
+  "element": "Fe",
+  "prefix": "fe_2s_hole_1_pbe_tm",
+  "backend": "pyfhi98pp",
+  "family": "ncpp",
+  "xc": "pbe",
+  "scheme": "tm",
+  "relativistic": "scalar",
+  "variant": null,
+  "core_hole": {
+    "shell": "2s",
+    "removed_electrons": 1.0
+  },
+  "ionic_charge": 9.0,
+  "reference_electrons": 8.0,
+  "reference_charge": 1.0,
+  "ae_energy_hartree": -1241.488309143348,
+  "pseudo_energy_hartree": -26.048728301827023,
+  "atomic_energy_correction_rydberg": -2430.879161683042,
+  "lmax": 2,
+  "channels": [
+    {
+      "angular_momentum": 0,
+      "scheme": "t",
+      "cutoff_radius": 2.318886450905482,
+      "match_radius": 2.376162946242847,
+      "ae_eigenvalue_ev": -14.14398149395515,
+      "pseudo_eigenvalue_ev": -14.14402136214674,
+      "norm_test": 0.9999996454361475,
+      "slope_test": 1.0000310471950546
+    },
+    {
+      "angular_momentum": 1,
+      "scheme": "t",
+      "cutoff_radius": 2.4348541710150453,
+      "match_radius": 2.494995069039117,
+      "ae_eigenvalue_ev": -3.8518000000000003,
+      "pseudo_eigenvalue_ev": -3.851778531032461,
+      "norm_test": 1.0000000239049773,
+      "slope_test": 1.0000000239049767
+    },
+    {
+      "angular_momentum": 2,
+      "scheme": "t",
+      "cutoff_radius": 2.2084420645000487,
+      "match_radius": 2.2629905834932,
+      "ae_eigenvalue_ev": -24.02944996566563,
+      "pseudo_eigenvalue_ev": -24.029498412504555,
+      "norm_test": 0.999999604974444,
+      "slope_test": 1.0000038769281845
+    }
+  ],
+  "core_radius": 0.0,
+  "reference_shift_ev": -8.851807294339753,
+  "kinetic_cutoff_rydberg": {
+    "0": 39.0,
+    "2": 111.0
+  },
+  "ghost_free": true,
+  "selected_local_channel": 0,
+  "local_channel_results": [
+    {
+      "local_channel": 0,
+      "passed": true,
+      "minimum_margin_hartree": 0.011105061328704535,
+      "report_path": "fe_2s_hole_1_pbe_tm.local-0.test",
+      "channels": [
+        {
+          "angular_momentum": 1,
+          "label": "p",
+          "status": "pass",
+          "message": "* no ghost (ekb > 0, eloc0 < eref < eloc1)",
+          "margin_hartree": 0.011105061328704535,
+          "reference_energy_hartree": -0.31502988047182184,
+          "local_ground_energy_hartree": -0.3261349418005264,
+          "local_first_excited_energy_hartree": -0.08855080813784702,
+          "projector_sign": 1
+        },
+        {
+          "angular_momentum": 2,
+          "label": "d",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.7692281687422386,
+          "reference_energy_hartree": -0.8830610893716216,
+          "local_ground_energy_hartree": -0.11383292062938301,
+          "local_first_excited_energy_hartree": -0.04376427008193356,
+          "projector_sign": -1
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    "Matched to the ground-state potential: lmax 2, local channel s, same cutoff radii.",
+    "Reference energies of the unbound channels (p) shifted by -8.85 eV, the shift of the highest valence level caused by the core hole.",
+    "Generating atomic reference charge +1; choose the electron count (full or neutralized core hole) explicitly in the many-electron calculation."
+  ],
+  "artifacts": {
+    "dat": {
+      "path": "fe_2s_hole_1_pbe_tm.dat",
+      "sha256": "169a7829e6228ffea79300926c356bc1131ab6165e8e1ddaf716bdb2caad5e19"
+    },
+    "aep": {
+      "path": "fe_2s_hole_1_pbe_tm.aep",
+      "sha256": "1dec16fa6e9b833f4afc60e626c6dc55e14c31662f247525aa574fcd0ce20839"
+    },
+    "test": {
+      "path": "fe_2s_hole_1_pbe_tm.test",
+      "sha256": "ffef66dd46775a48da4ef5ee172d393895f5ca087fb9da3e9a05d4fe6bc67292"
+    },
+    "fhi_species": {
+      "path": "../FHI/Fe-2s_FHIPP.DAT",
+      "sha256": "4669deef1d0fdef1f0be3ea487390ee72da09b600cfda5a08682875659862244"
+    },
+    "upf": {
+      "path": "../UPF/fe_2s_hole_1_pbe_tm.UPF",
+      "sha256": "0970231147ff77723b5e40366547bf9a4d5f70ed48f437022f5e19a08a773ab7"
+    },
+    "parsec_species": {
+      "path": "../PARSEC/Fe-2s_POTRE.DAT",
+      "sha256": "1e6d59ec540d5c10c9f0cc3608d13dba796b6881dc3459537516e76c676f1aae"
+    }
+  }
+}

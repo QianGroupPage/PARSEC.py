@@ -9,6 +9,7 @@ from unittest.mock import patch
 from parsec_python import parse_parsec_input
 
 from parsec_python.acceleration.Output import AcceleratedTextReporter
+from parsec_python.acceleration.Output import accelerated_output
 from parsec_python.acceleration.driver import (
     prepare_single_point,
     profile_hamiltonian_components,
@@ -25,6 +26,24 @@ SMOKE_INPUT = REFERENCE_DATA / "H_cli_smoke.in"
 
 
 class AcceleratedTimingOutputTests(unittest.TestCase):
+    def test_capture_repetitions_are_reported_for_the_calculation_only(self) -> None:
+        # The process has captured and repeated before this calculation begins.
+        counts = {"captures": 7, "repetitions": 2}
+        with patch.object(accelerated_output, "capture_statistics", lambda: dict(counts)):
+            system, reporter, messages = self._prepared_reporter()
+            result = run_scf(system, callback=reporter.iteration)
+            reporter.finish(result, result.timings.total_seconds)
+            self.assertNotIn("CUDA graph capture", "\n".join(messages))
+            # A second calculation of the process, in which three graphs are
+            # captured and one capture is recorded again.
+            system, reporter, messages = self._prepared_reporter()
+            result = run_scf(system, callback=reporter.iteration)
+            counts.update(captures=10, repetitions=3)
+            reporter.finish(result, result.timings.total_seconds)
+        report = "\n".join(messages)
+        self.assertIn(" CUDA graph capture repetitions (this process) =            1", report)
+        self.assertIn(" CUDA graphs captured (this process) =            3", report)
+
     def _prepared_reporter(self):
         translation = parse_parsec_input(SMOKE_INPUT)
         messages: list[str] = []

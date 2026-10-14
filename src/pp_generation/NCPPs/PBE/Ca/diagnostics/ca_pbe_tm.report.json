@@ -1,0 +1,177 @@
+{
+  "schema_version": 2,
+  "element": "Ca",
+  "prefix": "ca_pbe_tm",
+  "backend": "pyfhi98pp",
+  "family": "ncpp",
+  "xc": "pbe",
+  "scheme": "tm",
+  "relativistic": "scalar",
+  "variant": null,
+  "core_hole": null,
+  "ionic_charge": 2.0,
+  "reference_electrons": 2.0,
+  "reference_charge": 0.0,
+  "ae_energy_hartree": -680.3247957602506,
+  "pseudo_energy_hartree": -1.4709841316600212,
+  "atomic_energy_correction_rydberg": -1357.7076232571812,
+  "lmax": 2,
+  "channels": [
+    {
+      "angular_momentum": 0,
+      "scheme": "t",
+      "cutoff_radius": 2.734235328967232,
+      "match_radius": 2.8017709415927228,
+      "ae_eigenvalue_ev": -3.7664194392925916,
+      "pseudo_eigenvalue_ev": -3.766416332281879,
+      "norm_test": 1.0000014631808873,
+      "slope_test": 1.0000281528411126
+    },
+    {
+      "angular_momentum": 1,
+      "scheme": "t",
+      "cutoff_radius": 2.941887758541159,
+      "match_radius": 3.0145523861771255,
+      "ae_eigenvalue_ev": 5.0,
+      "pseudo_eigenvalue_ev": 4.999921490232866,
+      "norm_test": 0.9999964617196845,
+      "slope_test": 0.9999964617196823
+    },
+    {
+      "angular_momentum": 2,
+      "scheme": "t",
+      "cutoff_radius": 2.5412399954646174,
+      "match_radius": 2.6040086233525934,
+      "ae_eigenvalue_ev": -1.9466134990025807,
+      "pseudo_eigenvalue_ev": -1.9466638631316562,
+      "norm_test": 0.9999955639904294,
+      "slope_test": 0.999995563990433
+    }
+  ],
+  "core_radius": 2.5412399954646174,
+  "reference_shift_ev": 0.0,
+  "kinetic_cutoff_rydberg": {
+    "0": 19.0
+  },
+  "ghost_free": true,
+  "selected_local_channel": 0,
+  "local_channel_results": [
+    {
+      "local_channel": 0,
+      "passed": true,
+      "minimum_margin_hartree": 0.008408716961059957,
+      "report_path": "ca_pbe_tm.local-0.test",
+      "channels": [
+        {
+          "angular_momentum": 1,
+          "label": "p",
+          "status": "pass",
+          "message": "* no ghost (ekb > 0, eloc0 < eref < eloc1)",
+          "margin_hartree": 0.008408716961059957,
+          "reference_energy_hartree": -0.05246100358467254,
+          "local_ground_energy_hartree": -0.060869720545732496,
+          "local_first_excited_energy_hartree": 0.0,
+          "projector_sign": 1
+        },
+        {
+          "angular_momentum": 2,
+          "label": "d",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.07153665954892319,
+          "reference_energy_hartree": -0.07153665954892319,
+          "local_ground_energy_hartree": 0.0,
+          "local_first_excited_energy_hartree": 0.0,
+          "projector_sign": -1
+        }
+      ]
+    },
+    {
+      "local_channel": 1,
+      "passed": false,
+      "minimum_margin_hartree": 0.07153665954892319,
+      "report_path": "ca_pbe_tm.local-1.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "ghost",
+          "message": "* one or more ghosts (ekb < 0, eref > eloc0)",
+          "margin_hartree": null,
+          "reference_energy_hartree": -0.13841231431811737,
+          "local_ground_energy_hartree": -0.14043071957900197,
+          "local_first_excited_energy_hartree": -0.0060349691638879165,
+          "projector_sign": -1
+        },
+        {
+          "angular_momentum": 2,
+          "label": "d",
+          "status": "pass",
+          "message": "* no ghost (ekb < 0, eref < eloc0)",
+          "margin_hartree": 0.07153665954892319,
+          "reference_energy_hartree": -0.07153665954892319,
+          "local_ground_energy_hartree": 0.0,
+          "local_first_excited_energy_hartree": 0.0,
+          "projector_sign": -1
+        }
+      ]
+    },
+    {
+      "local_channel": 2,
+      "passed": false,
+      "minimum_margin_hartree": null,
+      "report_path": "ca_pbe_tm.local-2.test",
+      "channels": [
+        {
+          "angular_momentum": 0,
+          "label": "s",
+          "status": "ghost",
+          "message": "* one or more ghosts (ekb > 0, eref > eloc1)",
+          "margin_hartree": null,
+          "reference_energy_hartree": -0.13841231431811737,
+          "local_ground_energy_hartree": -3.900056824651012,
+          "local_first_excited_energy_hartree": -0.39086695392078435,
+          "projector_sign": 1
+        },
+        {
+          "angular_momentum": 1,
+          "label": "p",
+          "status": "ghost",
+          "message": "* one or more ghosts (ekb > 0, eref > eloc1)",
+          "margin_hartree": null,
+          "reference_energy_hartree": -0.05246100358467254,
+          "local_ground_energy_hartree": -1.8189778346004315,
+          "local_first_excited_energy_hartree": -0.06708252931372109,
+          "projector_sign": 1
+        }
+      ]
+    }
+  ],
+  "warnings": [],
+  "artifacts": {
+    "dat": {
+      "path": "ca_pbe_tm.dat",
+      "sha256": "995fb537fc973f6a74b2b311d85808d5e9c70bee3a4aa1dc693903d63ffb752c"
+    },
+    "aep": {
+      "path": "ca_pbe_tm.aep",
+      "sha256": "f1714943de85e9d6d321bf30276e35c01bcc169dbeb79198410d29073331cc76"
+    },
+    "test": {
+      "path": "ca_pbe_tm.test",
+      "sha256": "2264b88dc5f43947ded3f6c7bd5c9d19cbe5f34c5abf8dbbce2a264190fa812f"
+    },
+    "fhi": {
+      "path": "../FHI/Ca_FHIPP.DAT",
+      "sha256": "242d5fbb840fefb29d247291ddb95bf50119b733ba78414943921053d4429a80"
+    },
+    "upf": {
+      "path": "../UPF/ca_pbe_tm.UPF",
+      "sha256": "abceebf641085d8cda5a86feb87395d4aa3f6e116aa52bf1f83e25a6f6a8104e"
+    },
+    "parsec": {
+      "path": "../PARSEC/Ca_POTRE.DAT",
+      "sha256": "45dc6e348a52db1b14b8590be79805412979107773906560d066b2ed7fe0248c"
+    }
+  }
+}

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations, permutations, product
+import os
 from typing import Sequence
 
 import numpy as np
@@ -27,6 +28,92 @@ import scipy.sparse as sp
 
 from parsec_python.Grid import RealSpaceGrid
 from parsec_python.models import Atom
+
+
+# Species groups up to this size build their threshold graph from the dense distance matrix.
+_DENSE_MATCHING_LIMIT = 512
+
+
+def _fast_maps_requested() -> bool:
+    """``PARSEC_SYMMETRY_FAST_MAPS``: on unless 0, false, no or off.
+
+    On, the detector and the representation build decide a species whose
+    atoms have one partner each without a loop over the atoms, read a
+    whole-grid row map out of the lookup table in the order of the rows,
+    number the orbits by a scatter and write the phases from one operation
+    label per row.  Off, they take their former routes.  Every Boolean, map
+    and phase is the same either way.
+    """
+
+    return os.environ.get("PARSEC_SYMMETRY_FAST_MAPS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _threshold_neighbours(
+    transformed: np.ndarray,
+    candidates: np.ndarray,
+    tolerance: float,
+) -> list[list[int]]:
+    """Rows of the distance-threshold graph without the dense distance matrix.
+
+    A k-d tree proposes the pairs inside a slightly larger radius.  The same
+    norm and comparison as the dense construction then decide every proposed
+    pair, so the graph, and with it the matching, is the same.  The dense
+    matrix of a few thousand atoms of one species costs a quarter of a second
+    per symmetry operation; this costs a few milliseconds.
+    """
+
+    from scipy.spatial import cKDTree
+
+    radius = tolerance * (1.0 + 1.0e-9) + 1.0e-12
+    proposals = cKDTree(candidates).query_ball_point(transformed, radius)
+    adjacency = []
+    for row, proposed in enumerate(proposals):
+        columns = np.sort(np.asarray(proposed, dtype=np.int64))
+        distances = np.linalg.norm(
+            transformed[row][None, :] - candidates[columns], axis=1
+        )
+        adjacency.append(columns[distances <= tolerance].tolist())
+    return adjacency
+
+
+def _single_partner_matching(
+    transformed: np.ndarray,
+    candidates: np.ndarray,
+    tolerance: float,
+) -> bool | None:
+    """Decide the matching of a species whose atoms have at most one proposal.
+
+    In a rigid symmetric cluster a transformed atom has one candidate inside
+    the slightly larger radius of :func:`_threshold_neighbours`, and every
+    other candidate is then outside the tolerance.  The norm and the
+    comparison of the dense construction decide that one pair, and a graph
+    whose rows have one column each has a perfect matching exactly where the
+    columns differ.  ``None`` when an atom has a second candidate inside the
+    radius: the augmenting paths decide such a graph.
+    """
+
+    from scipy.spatial import cKDTree
+
+    count = int(transformed.shape[0])
+    radius = tolerance * (1.0 + 1.0e-9) + 1.0e-12
+    # A neighbour that does not exist inside the radius has infinite distance.
+    proposed, nearest = cKDTree(candidates).query(
+        transformed, k=2, distance_upper_bound=radius
+    )
+    if np.any(np.isfinite(proposed[:, 1])):
+        return None
+    if not np.all(np.isfinite(proposed[:, 0])):
+        return False
+    columns = nearest[:, 0]
+    distances = np.linalg.norm(transformed - candidates[columns], axis=1)
+    if not np.all(distances <= tolerance):
+        return False
+    return bool(np.all(np.bincount(columns, minlength=count) == 1))
 
 
 def _has_tolerance_perfect_matching(
@@ -41,9 +128,9 @@ def _has_tolerance_perfect_matching(
     than this Boolean condition requires and can theoretically reject a
     feasible threshold matching when another assignment has a smaller total
     but one edge just outside the threshold.  Deterministic augmenting paths
-    solve the intended bipartite feasibility problem directly.  Species
-    groups in finite systems are small, so the cubic worst case is negligible
-    and avoids importing the large ``scipy.optimize`` package at startup.
+    solve the intended bipartite feasibility problem directly, and avoid
+    importing the large ``scipy.optimize`` package at startup.  Large species
+    groups take their threshold graph from :func:`_threshold_neighbours`.
     """
 
     transformed = np.asarray(transformed, dtype=np.float64)
@@ -55,13 +142,20 @@ def _has_tolerance_perfect_matching(
     count = int(transformed.shape[0])
     if count == 0:
         return True
-    distances = np.linalg.norm(
-        transformed[:, None, :] - candidates[None, :, :], axis=2
-    )
-    adjacency = [
-        np.flatnonzero(distances[row] <= tolerance).tolist()
-        for row in range(count)
-    ]
+    if count > _DENSE_MATCHING_LIMIT:
+        if _fast_maps_requested():
+            decided = _single_partner_matching(transformed, candidates, tolerance)
+            if decided is not None:
+                return decided
+        adjacency = _threshold_neighbours(transformed, candidates, tolerance)
+    else:
+        distances = np.linalg.norm(
+            transformed[:, None, :] - candidates[None, :, :], axis=2
+        )
+        adjacency = [
+            np.flatnonzero(distances[row] <= tolerance).tolist()
+            for row in range(count)
+        ]
     if any(not columns for columns in adjacency):
         return False
 
@@ -87,11 +181,35 @@ def _has_tolerance_perfect_matching(
     return True
 
 
-def _atoms_are_invariant(
-    atoms: Sequence[Atom], signs: np.ndarray, tolerance: float
-) -> bool:
-    """Return whether one diagonal sign operation preserves labeled atoms."""
+def _positions_by_species(atoms: Sequence[Atom]) -> dict[str, np.ndarray]:
+    """Group the atom positions by species, once for every operation tested."""
 
+    grouped: dict[str, list] = {}
+    for atom in atoms:
+        grouped.setdefault(atom.symbol, []).append(atom.position)
+    return {
+        symbol: np.asarray(positions, dtype=np.float64)
+        for symbol, positions in grouped.items()
+    }
+
+
+def _atoms_are_invariant(
+    atoms: Sequence[Atom] | dict[str, np.ndarray],
+    signs: np.ndarray,
+    tolerance: float,
+) -> bool:
+    """Return whether one diagonal sign operation preserves labeled atoms.
+
+    ``atoms`` may be the positions already grouped by
+    :func:`_positions_by_species`; the sign products are then formed for a
+    whole species at once and are the per-atom products.
+    """
+
+    if isinstance(atoms, dict):
+        return all(
+            _has_tolerance_perfect_matching(candidates * signs, candidates, tolerance)
+            for candidates in atoms.values()
+        )
     by_species: dict[str, np.ndarray] = {}
     for symbol in {atom.symbol for atom in atoms}:
         by_species[symbol] = np.asarray(
@@ -113,27 +231,129 @@ def _atoms_are_invariant(
     return True
 
 
+class _RowOrderTable:
+    """The lookup table of a grid, read in the order of the rows.
+
+    ``build_cluster_grid`` numbers the rows along its table traversed from the
+    largest to the smallest index of every axis.  A signed permutation of the
+    lattice is a transposed, mirrored and shifted window of that table, so
+    the image of every row is read off the window at the active points in
+    one pass.  The coordinates of the points are not read, and the only
+    array of their number is the map itself.
+
+    The table is examined before the first map.  ``in_row_order`` is false
+    for a grid whose rows are numbered otherwise; such a grid keeps the
+    gather through the coordinates.
+    """
+
+    def __init__(self, grid: RealSpaceGrid) -> None:
+        self._grid = grid
+        self._examined = False
+        self._in_row_order = False
+
+    def _examine(self) -> None:
+        self._examined = True
+        grid = self._grid
+        lookup = np.asarray(grid.lookup)
+        if lookup.ndim != 3 or len(grid.integer_coordinates) == 0:
+            return
+        traversal = lookup[::-1, ::-1, ::-1]
+        active = traversal >= 0
+        rows = traversal[active]
+        size = int(rows.size)
+        if size != len(grid.integer_coordinates) or rows[0] != 0 or rows[-1] != size - 1:
+            return
+        # Strictly increasing from 0 to size - 1: the rows in their own order.
+        if not np.all(rows[1:] > rows[:-1]):
+            return
+        self._lookup = lookup
+        self._active = active
+        self._index_min = np.asarray(grid.index_min, dtype=np.int64)
+        # First and last position of an active point along every axis of the
+        # traversal: a window that holds them holds every active point.
+        extents = []
+        for axis in range(3):
+            occupied = np.flatnonzero(
+                active.any(axis=tuple(other for other in range(3) if other != axis))
+            )
+            extents.append((int(occupied[0]), int(occupied[-1])))
+        self._extents = tuple(extents)
+        self._in_row_order = True
+
+    @property
+    def in_row_order(self) -> bool:
+        if not self._examined:
+            self._examine()
+        return self._in_row_order
+
+    def row_mapping(
+        self,
+        sources: np.ndarray,
+        factors: np.ndarray,
+        offset: np.ndarray,
+    ) -> np.ndarray | None:
+        """Map every row under the lattice action, or reject the action.
+
+        The action sends the integer point ``n`` to
+        ``factors*n[sources] + offset``.  ``None`` when the image of an
+        active point is outside the table or is not an active point.
+        """
+
+        lookup = self._lookup
+        shape = lookup.shape
+        # Per table axis: the window of image indices.  Per source axis: its
+        # positions in the traversal and the table axis it is read from.
+        window: list[slice] = []
+        positions = [slice(None)] * 3
+        axes = [0, 0, 0]
+        for axis in range(3):
+            source = int(sources[axis])
+            axes[source] = axis
+            extent, source_extent = int(shape[axis]), int(shape[source])
+            low = int(self._index_min[axis])
+            source_low = int(self._index_min[source])
+            # Table index of the image along ``axis`` of the point with table
+            # index ``i`` along ``source``: ``i + shift`` or ``shift - i``.
+            if factors[axis] > 0:
+                shift = source_low + int(offset[axis]) - low
+                first, last = max(0, -shift), min(source_extent - 1, extent - 1 - shift)
+            else:
+                shift = -source_low + int(offset[axis]) - low
+                first, last = max(0, shift - extent + 1), min(source_extent - 1, shift)
+            # The traversal runs ``i`` downwards: positions of ``last..first``.
+            start, stop = source_extent - 1 - last, source_extent - 1 - first
+            occupied_first, occupied_last = self._extents[source]
+            if first > last or occupied_first < start or occupied_last > stop:
+                return None
+            positions[source] = slice(start, stop + 1)
+            if factors[axis] > 0:
+                image_stop = first + shift - 1
+                window.append(
+                    slice(last + shift, None if image_stop < 0 else image_stop, -1)
+                )
+            else:
+                window.append(slice(shift - last, shift - first + 1))
+        images = lookup[tuple(window)].transpose(axes)
+        rows = images[self._active[tuple(positions)]]
+        if rows.min() < 0:
+            return None
+        return rows.astype(np.int64, copy=False)
+
+
 def _grid_row_mapping(
     grid: RealSpaceGrid,
     signs: np.ndarray,
     lattice_tolerance: float,
+    table: _RowOrderTable | None = None,
 ) -> np.ndarray | None:
     """Map all rows under one sign operation, or reject the operation."""
 
-    operation = np.diag(np.asarray(signs, dtype=np.int8))
-    parameters = _integer_signed_permutation_parameters(
-        grid, operation, lattice_tolerance
+    return _grid_row_mapping_operation(
+        grid,
+        np.diag(np.asarray(signs, dtype=np.int8)),
+        lattice_tolerance,
+        table=table,
     )
-    if parameters is None:
-        return None
-    sources, factors, offset = parameters
-    transformed = (
-        grid.integer_coordinates[:, sources] * factors + offset
-    )
-    rows = grid.rows_for_integer_coordinates(transformed)
-    if np.any(rows < 0):
-        return None
-    return rows
 
 
 def _integer_signed_permutation_parameters(
@@ -174,11 +394,19 @@ def _integer_signed_permutation_parameters(
 
 
 def _atoms_are_invariant_operation(
-    atoms: Sequence[Atom], operation: np.ndarray, tolerance: float
+    atoms: Sequence[Atom] | dict[str, np.ndarray],
+    operation: np.ndarray,
+    tolerance: float,
 ) -> bool:
-    """Return whether an orthogonal signed permutation preserves the atoms."""
+    """Return whether an orthogonal signed permutation preserves the atoms.
+
+    ``atoms`` may be the positions already grouped by
+    :func:`_positions_by_species`.
+    """
 
     by_species: dict[str, np.ndarray] = {}
+    if isinstance(atoms, dict):
+        by_species, atoms = atoms, ()
     for symbol in {atom.symbol for atom in atoms}:
         by_species[symbol] = np.asarray(
             [atom.position for atom in atoms if atom.symbol == symbol],
@@ -198,18 +426,39 @@ def _grid_row_mapping_operation(
     grid: RealSpaceGrid,
     operation: np.ndarray,
     lattice_tolerance: float,
+    selected_rows: np.ndarray | None = None,
+    table: _RowOrderTable | None = None,
 ) -> np.ndarray | None:
-    """Map rows under one signed permutation, using exact lattice rounding."""
+    """Map rows under one signed permutation, using exact lattice rounding.
+
+    ``selected_rows`` restricts the map to those rows.  The result then holds
+    the same entries of the whole-grid map without its grid-sized temporaries,
+    and only an image of a selected row outside the active grid rejects the
+    operation.
+
+    ``table`` reads a whole-grid map out of the lookup table in the order of
+    the rows where the grid allows it; the map is the same.
+    """
 
     parameters = _integer_signed_permutation_parameters(
         grid, operation, lattice_tolerance
     )
     if parameters is None:
         return None
+    if np.array_equal(operation, np.eye(3)):
+        # The identity keeps every row.  ``build_cluster_grid`` stores each
+        # row in the lookup table at its own point, so the gather would
+        # return the rows unchanged.
+        if selected_rows is None:
+            return np.arange(len(grid.integer_coordinates), dtype=np.int64)
+        return np.array(selected_rows, dtype=np.int64)
     sources, factors, offset = parameters
-    transformed = (
-        grid.integer_coordinates[:, sources] * factors + offset
-    )
+    if table is not None and selected_rows is None and table.in_row_order:
+        return table.row_mapping(sources, factors, offset)
+    points = grid.integer_coordinates
+    if selected_rows is not None:
+        points = points[selected_rows]
+    transformed = points[:, sources] * factors + offset
     rows = grid.rows_for_integer_coordinates(transformed)
     return None if np.any(rows < 0) else rows
 
@@ -225,6 +474,54 @@ def _signed_permutation_operations() -> tuple[np.ndarray, ...]:
                 matrix[row, column] = signs[row]
             operations.append(matrix)
     return tuple(operations)
+
+
+def _orbit_labels(
+    mappings: Sequence[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return representative rows, the row-to-orbit map and the orbit sizes.
+
+    The minimum row in each orbit is a deterministic representative.  Under
+    a group of row maps the smallest image of a row is the smallest row of
+    its orbit, which is its own smallest image.  The representatives are
+    then the rows that are their own smallest image, already in ascending
+    order, and the orbit number of a row is the count of representatives
+    below its smallest image.  That is what sorting the smallest images
+    returns, without a sort and a binary search over every row.
+    """
+
+    fast = _fast_maps_requested()
+    if fast and len(mappings) > 1:
+        # The same minimum without stacking the maps into one array first.
+        canonical_rows = np.minimum(mappings[0], mappings[1])
+        for mapping in mappings[2:]:
+            np.minimum(canonical_rows, mapping, out=canonical_rows)
+    else:
+        canonical_rows = np.minimum.reduce(mappings)
+    is_representative = canonical_rows == np.arange(canonical_rows.size)
+    if np.all(is_representative[canonical_rows]):
+        representative_rows = np.flatnonzero(is_representative)
+        if fast:
+            # Every smallest image is a representative here, so the count of
+            # representatives up to it is its own number among them.
+            orbit_of_row = np.empty(canonical_rows.size, dtype=np.int64)
+            orbit_of_row[representative_rows] = np.arange(
+                representative_rows.size, dtype=np.int64
+            )
+            full_to_wedge = orbit_of_row[canonical_rows]
+        else:
+            full_to_wedge = (
+                np.cumsum(is_representative, dtype=np.int64) - 1
+            )[canonical_rows]
+    else:
+        # Not a group: the atom tolerance can accept two operations and
+        # refuse their product.  Only the sort labels such maps.
+        representative_rows = np.unique(canonical_rows)
+        full_to_wedge = np.searchsorted(representative_rows, canonical_rows)
+    multiplicities = np.bincount(
+        full_to_wedge, minlength=representative_rows.size
+    ).astype(np.int64, copy=False)
+    return representative_rows, full_to_wedge, multiplicities
 
 
 @dataclass(frozen=True)
@@ -277,13 +574,16 @@ class AxisReflectionReduction:
 
         if not atoms:
             raise ValueError("axis-reflection detection requires at least one atom")
+        fast = _fast_maps_requested()
+        species = _positions_by_species(atoms) if fast else atoms
+        table = _RowOrderTable(grid) if fast else None
         valid_signs: list[np.ndarray] = []
         mappings: list[np.ndarray] = []
         for values in product((-1, 1), repeat=3):
             signs = np.asarray(values, dtype=np.int8)
-            if not _atoms_are_invariant(atoms, signs, atom_tolerance):
+            if not _atoms_are_invariant(species, signs, atom_tolerance):
                 continue
-            mapping = _grid_row_mapping(grid, signs, lattice_tolerance)
+            mapping = _grid_row_mapping(grid, signs, lattice_tolerance, table)
             if mapping is None:
                 continue
             valid_signs.append(signs)
@@ -294,13 +594,9 @@ class AxisReflectionReduction:
             # both atoms and lattice exactly, but keep the failure explicit.
             raise ValueError("the identity operation did not preserve the active grid")
 
-        # The minimum row in each orbit is a deterministic representative.
-        canonical_rows = np.minimum.reduce(mappings)
-        representative_rows = np.unique(canonical_rows)
-        full_to_wedge = np.searchsorted(representative_rows, canonical_rows)
-        multiplicities = np.bincount(
-            full_to_wedge, minlength=representative_rows.size
-        ).astype(np.int64, copy=False)
+        representative_rows, full_to_wedge, multiplicities = _orbit_labels(
+            mappings
+        )
         if np.any(multiplicities <= 0):
             raise RuntimeError("invalid empty symmetry orbit")
 
@@ -414,6 +710,12 @@ class SignedPermutationReduction(AxisReflectionReduction):
         calculations therefore retain their representation order and random
         streams; a broader operation is adopted only when it strictly grows
         the usable exact group.
+
+        Whether an atom-preserving involution also maps the active grid onto
+        itself takes a grid-sized row map.  The 3x3 matrices alone decide
+        whether a commuting group would be larger than the diagonal one, so
+        maps are built only for the operations of such a group; when the
+        atoms admit none, no map is built here.
         """
 
         axis = AxisReflectionReduction.detect(
@@ -422,27 +724,43 @@ class SignedPermutationReduction(AxisReflectionReduction):
             atom_tolerance=atom_tolerance,
             lattice_tolerance=lattice_tolerance,
         )
-        valid: dict[bytes, tuple[np.ndarray, np.ndarray]] = {}
+        # The diagonal detection has decided the eight diagonal operations:
+        # their atom images differ from the sign products it matched at most
+        # in the sign of a zero, and their row maps are the ones it built.
+        diagonal = {signs.tobytes() for signs in axis.signs}
+        fast = _fast_maps_requested()
+        species = _positions_by_species(atoms) if fast else atoms
+        table = _RowOrderTable(grid) if fast else None
+        preserving: dict[bytes, np.ndarray] = {}
         identity = np.eye(3, dtype=np.int8)
         for operation in _signed_permutation_operations():
             if not np.array_equal(operation @ operation, identity):
                 continue
-            if not _atoms_are_invariant_operation(
-                atoms, operation, atom_tolerance
+            if np.array_equal(np.abs(operation), identity):
+                if np.diag(operation).tobytes() not in diagonal:
+                    continue
+            elif not _atoms_are_invariant_operation(
+                species, operation, atom_tolerance
             ):
                 continue
-            mapping = _grid_row_mapping_operation(
-                grid, operation, lattice_tolerance
-            )
-            if mapping is not None:
-                valid[operation.tobytes()] = (operation, mapping)
+            preserving[operation.tobytes()] = operation
+        mappings: dict[bytes, np.ndarray | None] = {}
 
+        def row_mapping(operation: np.ndarray) -> np.ndarray | None:
+            key = operation.tobytes()
+            if key not in mappings:
+                mappings[key] = _grid_row_mapping_operation(
+                    grid, operation, lattice_tolerance, table=table
+                )
+            return mappings[key]
+
+        # Candidates are not screened on the grid first: one that fails there
+        # only adds combinations that are rejected below, and the accepted
+        # combinations keep their order.
         candidates = [
-            item[0]
-            for key, item in sorted(
-                valid.items(), key=lambda pair: pair[0]
-            )
-            if not np.array_equal(item[0], identity)
+            preserving[key]
+            for key in sorted(preserving)
+            if not np.array_equal(preserving[key], identity)
         ]
         best: tuple[list[np.ndarray], np.ndarray] | None = None
         # An elementary Abelian subgroup of O(3) has rank at most three.
@@ -463,13 +781,20 @@ class SignedPermutationReduction(AxisReflectionReduction):
                         if enabled:
                             operation = operation @ generator
                     key = operation.astype(np.int8, copy=False).tobytes()
-                    if key in seen or key not in valid:
+                    if key in seen or key not in preserving:
                         usable = False
                         break
                     seen.add(key)
-                    operations.append(valid[key][0])
+                    operations.append(preserving[key])
                     bits.append(exponents)
-                if usable and len(operations) > axis.group_order:
+                if (
+                    usable
+                    and len(operations) > axis.group_order
+                    and all(
+                        row_mapping(operation) is not None
+                        for operation in operations
+                    )
+                ):
                     best = (
                         operations,
                         np.asarray(bits, dtype=np.int8),
@@ -481,13 +806,9 @@ class SignedPermutationReduction(AxisReflectionReduction):
             return axis
 
         operations, generator_bits = best
-        mappings = [valid[operation.tobytes()][1] for operation in operations]
-        canonical_rows = np.minimum.reduce(mappings)
-        representative_rows = np.unique(canonical_rows)
-        full_to_wedge = np.searchsorted(representative_rows, canonical_rows)
-        multiplicities = np.bincount(
-            full_to_wedge, minlength=representative_rows.size
-        ).astype(np.int64, copy=False)
+        representative_rows, full_to_wedge, multiplicities = _orbit_labels(
+            [row_mapping(operation) for operation in operations]
+        )
         return cls(
             # Retained solely for inherited group-order compatibility.  The
             # generalized representation builder uses operations/bits below.
@@ -505,5 +826,7 @@ class SignedPermutationReduction(AxisReflectionReduction):
 __all__ = [
     "AxisReflectionReduction",
     "SignedPermutationReduction",
+    "_RowOrderTable",
+    "_fast_maps_requested",
     "_grid_row_mapping_operation",
 ]

@@ -25,10 +25,13 @@ parsec_python/
 ├── Laplacian/finite_difference.py
 │                              Fornberg weights and sparse -∇²
 ├── Pseudopotential/potre.py   Martins-new POTRE reader/radial data
+├── Pseudopotential/potr.py    old Martins POTR reader
 ├── V_ion/ionic_potential.py   local Vion, SAD/NLCC, KB projectors, EII
 ├── Hartree/poisson.py         boundary multipoles and Poisson CG
 ├── V_xc/ca_lda.py             unpolarized CA/PZ LDA
 ├── V_xc/pbe.py                unpolarized discrete-variational PBE GGA
+├── V_xc/ca_lda_spin.py        CA/PZ local spin density
+├── V_xc/pbe_spin.py           spin-polarized discrete-variational PBE
 ├── Hamiltonian/operator.py    kinetic/local/nonlocal matvec composition
 ├── Eigensolvers/
 │   ├── spectral_bounds.py     non-BETA short Lanczos bound
@@ -41,9 +44,12 @@ parsec_python/
 │   ├── subspace.py            one later-SCF saved-subspace filter
 │   └── eigval.py              selected first solver/SUBSPACE dispatch
 ├── Occupations/fermi_dirac.py Fermi level and 2/h³ density
+├── Occupations/fixed.py       occupations of occup.in
+├── Occupations/spin.py        one Fermi level for two spin channels
 ├── Mixer/anderson.py          SRE metrics and Anderson mixing
 ├── Energy/total_energy.py     PARSEC totnrg expression
 ├── SCF/single_point.py        static preparation and SCF loop
+├── SCF/spin_polarized.py      SCF loop of two spin channels
 ├── Output/parsec_output.py    PARSEC-style report formatter
 ├── driver.py                  short two-stage public workflow
 ├── models.py                  typed inputs, settings, and results
@@ -309,6 +315,21 @@ PARSEC's `Full_Hartree` sum and is much more expensive. An origin-centered
 multipole series is deliberately rejected at general box faces because charge
 near a corner can lie outside its convergence radius.
 
+`solve_hartree` called with `HartreeSettings` alone builds PARSEC's boundary.
+A prepared system (`prepare_single_point`) first makes a plan of the boundary
+from the geometry (`Hartree/boundary.py`, `system.hartree_boundary`): the
+estimate `e(L)` of the potential the order-`L` expansion omits for the
+valence point charges at the nuclei. Where `e(Solver_Lpole)` exceeds a tenth
+of `boundary_tolerance`, the order becomes the smallest `L >= Solver_Lpole`
+with `e(L) <= boundary_tolerance` (60 with a warning if there is none), is
+written into `system.input.hartree.multipole_order`, and the static atomic
+tail `C_L(P) = 2 sum_a q_a/|P-R_a| - M_L[q](P)` at the exterior stencil
+points is added by `system.solve_hartree` to the right-hand side as the rows
+`-A_IB C_L`. `boundary_tolerance=None` with `atomic_tail="auto"` is PARSEC's
+boundary, bitwise. The reference path evaluates SciPy harmonics, which is
+slow at the orders large clusters get; those are runs for the accelerated
+path.
+
 ### CA-LDA and PBE
 
 ```python
@@ -344,7 +365,11 @@ well-defined:
 |---|---:|
 | `GridSettings.expansion_order` | 12 |
 | `GridSettings.shift` | `(0.5,0.5,0.5)` |
-| Hartree multipole order | 9 |
+| sphere radius (`Boundary_Sphere_Radius`) in an input | chosen by the default rule of `Hartree/domain.py`; `GridSettings.radius` itself has no default |
+| `Domain_Energy_Tolerance` of that rule | `1e-3 Ry` |
+| Hartree multipole order (`Solver_Lpole`, 0 to 60) | 9 |
+| Hartree boundary tolerance (`Hartree_Boundary_Tolerance`) | `1e-3 Ry`; with the radius left to the rule, at most that and tightened with the electron count (`README.md`) |
+| Hartree atomic tail (`Hartree_Atomic_Tail`) | `auto` |
 | Hartree boundary method | `auto` |
 | Hartree relative/absolute tolerance | `1e-7` / `1e-13` |
 | Hartree max matrix-vector products | 1600 |
@@ -364,6 +389,20 @@ state counts are preferable for reproducible comparisons.
 `Read_VCD` default. In that mode the atomic starting density is reconstructed
 from POTRE occupations and pseudo-wavefunctions. Set it true to use the
 tabulated valence charge, as the H2 reference input does.
+
+`SpeciesPotential.pseudopotential_format="martins_old"` reads an old Martins
+file (`<Symbol>_POTR.DAT`, `Pseudopotential_Format: martins_old`). Such a file
+holds neither occupations, nor an ionic charge, nor a cutoff radius, so the
+species must give `number_of_channels` (`Potential_Num`),
+`electrons_per_orbital` (the `Electron_Per_Orbital` block, whose sum is the
+ionic charge) and `core_cutoff_radius` (`Core_Cutoff_Radius`, the radius of
+its nonlocal projectors). Old and new files can be mixed in one input.
+
+`SCFSettings.fixed_occupations` holds one occupation per state in ascending
+order of energy; no Fermi level is then searched. The input translator fills
+it from the file `occup.in` beside the input when `Fermi_Temp` is negative.
+Without spin polarization only the first section of that file is read, as in
+PARSEC.
 
 `recenter_geometry=True` applies PARSEC's bounding-box-midpoint recentering.
 Set it false when coordinates are already deliberately placed relative to the
@@ -443,17 +482,80 @@ than substituted.
 - periodic, slab, and wire boundary conditions
 - point-group reduction and MPI distribution
 - ellipsoid and cylinder masks in the Python builder
-- spin polarization and spin-orbit channels
-- spin-polarized GGA, meta-GGA, and hybrid functionals
+- spin-orbit channels and non-collinear magnetism
+- spin polarization of periodic cells, and the Perdew-Wang LSDA (`pl`) that
+  PARSEC uses for a spin-polarized run without `Correlation_Type`
+- meta-GGA and self-consistent hybrid functionals
 - Ono-Hirose `Double_grid_order > 1`
 - forces, stress, geometry optimization, and molecular dynamics
 - DFT+U, external fields, k-points, and complex orbitals
-- old Martins, Wang, and FHI pseudopotential formats
+- Martins-Wang and FHI pseudopotential formats
 - PARSEC binary restart/checkpoint compatibility
 
 Sphere and box domains are implemented. POTRE files with spin-orbit channels
 or an XC label inconsistent with the selected CA/PZ-LDA or PBE family are
 rejected rather than silently misused.
+
+## Spin-polarized calculations
+
+`Spin_Polarization: true` in `parsec.in`, or
+`SCFSettings(spin_polarized=True)`, runs the loop of
+`SCF/spin_polarized.py`: the algorithm of
+[`PARSEC_ALGORITHM.md`](PARSEC_ALGORITHM.md#spin-polarized-calculations) for
+isolated systems with `Correlation_Type: ca` or `pbe`, which must be given.
+
+```text
+Spin_Polarization: true
+Correlation_Type: pbe
+States_Num: 8                    # states of each channel
+Atom_Type: O
+Initial_Spin_Polarization: 0.3   # of this species; default 0.1
+```
+
+`SpeciesPotential.initial_spin_polarization` holds the starting polarization
+of a species. With a negative `Fermi_Temp`, `occup.in` must hold a section
+for each channel, the up channel first; an occupation of one is then one
+electron.
+
+A spin-polarized `SinglePointResult` has its two channels in `result.spin`
+(`SpinChannelResult`: eigenvalues, occupations, orbitals, density, the
+exchange-correlation and effective potentials, the electrons of the channel).
+Its other fields describe both channels together: `density` is the total
+density; `xc_potential` and the three effective potentials are the averages
+over the channels that the forces read; `eigenvalues`, `occupations` and the
+columns of `wavefunctions` list the states of the up channel followed by
+those of the down channel. Occupations are electrons per state divided by
+`result.spin_degeneracy` (2 without spin, 1 with). `result.net_magnetic_moment`
+is the electrons up minus the electrons down. The result archive adds
+`spin_*` members with a leading axis of two.
+
+Forces, structural relaxation, molecular dynamics and `Energy_Refinement:
+b3lyp` take such a result: the forces as `forcloc.f90` and `forcnloc.f90`
+form them for two channels; the refinement with the exact exchange of each
+channel and the spin-polarized Slater, B88, VWN (RPA) and LYP energies.
+
+Differences from Fortran PARSEC:
+
+- The functionals are evaluated where one spin density is zero. Fortran
+  skips the `ca` functional there and drops the PBE exchange energy, so a
+  state with an empty channel (H, H2+, any one-electron system) neither
+  converges nor has a meaningful energy in Fortran. Here it is an ordinary
+  calculation; it has no Fortran reference.
+- Spin-polarized PBE uses the potential of the discrete energy, like the
+  unpolarized PBE of this package, where Fortran evaluates the continuum
+  expression. The two programs then solve different discrete problems; with
+  equal spin densities both potentials of this package are its unpolarized
+  one. The derivative of `phi(zeta)` is kept finite at `|zeta| = 1` with the
+  `eta = 1e-12` of `spn_pbe.f90`, so the potential of a channel whose share
+  of the density is below about `5e-7` is not the exact derivative.
+- The first random basis of each channel starts the LAPACK stream afresh;
+  Fortran continues the stream of the up channel for the down channel. Only
+  the first SCF steps depend on it.
+- The starting spin densities are those of `initchrg.f90`, including their
+  sum of twice the total density, so that the first potentials are
+  Fortran's.
+
+The two channels are solved on the full grid on every backend.
 
 ## Performance expectations
 

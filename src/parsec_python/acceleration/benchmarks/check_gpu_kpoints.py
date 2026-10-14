@@ -6,7 +6,7 @@ Runs on the GPU(s) and on the CPU and compares:
 1. the device Bloch operator (scalar, and spinor with spin-orbit + Zeeman field)
    against the host operator, for every selected device;
 2. the device Chebyshev filter against the CPU filter;
-3. a short non-collinear spin-orbit SCF with 4 k-points: ``--kpoint-backend`` the
+3. a short non-collinear spin-orbit SCF with 4 k-points: the
    chosen backend against the CPU (same energy, eigenvalues);
 4. a short band path, GPU against CPU.
 

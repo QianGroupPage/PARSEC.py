@@ -51,7 +51,50 @@ settings that keep the large clusters at 10 or 11 SCF steps.
 The output headers are unchanged except that machine paths were shortened to
 file names.
 
-## Running this code
+## Quick start: `run_benchmark.sh`
+
+`run_benchmark.sh` runs the cases you name with the launch settings of the
+reference times. It then compares every run with its reference: total energy,
+SCF steps, program time and peak GPU memory. It writes a table to the screen
+and to `summary.csv`.
+
+```bash
+# the smallest benchmark case on one GPU
+examples/0d_nanodiamonds/run_benchmark.sh --gpus-per-node 1 k06
+
+# three cases on the four GPUs of one node
+examples/0d_nanodiamonds/run_benchmark.sh k06 k07 k08
+
+# inside a Slurm allocation of four nodes (salloc or sbatch): the largest case on 16 GPUs
+examples/0d_nanodiamonds/run_benchmark.sh --nodes 4 k14
+
+# every Fortran comparison case on one GPU, one plain main.py process each
+examples/0d_nanodiamonds/run_benchmark.sh --fortran-set --launcher main --gpus-per-node 1 all
+```
+
+The script needs the Python environment of the repository README: NumPy,
+SciPy, CuPy and the native extension. The default launcher also needs mpi4py
+built with the MPI of the site; `--launcher main` does without it, on one node.
+It checks these at the start, and `--check` prints the commands without
+running them; `--help` lists every option. Each line of the table looks like:
+
+```text
+  k06 C795H300: ok, 10 steps (reference 10), E = -9437.81995096 Ry (difference 0.0e+00), 11.3 s (A100 11.1), peak 4.2 GiB (A100 4.2)
+```
+
+A run whose total energy is within 1e-5 Ry of the reference is reported as
+`ok`. The A100 columns hold the reference for the same total number of GPUs,
+blank where the case did not fit on that many 80 GB GPUs.
+
+Before the table, the smallest case of the set runs once on the same GPUs.
+That run compiles the CUDA kernels into CuPy's cache, as the warm-up runs
+before the reference times did; `--no-warmup` skips it. Use the default
+launcher for timing comparisons. `--launcher main` runs `main.py` with the
+code's defaults, which keep the Hartree solver and parts of the set-up on the
+CPU; on four A100 it took about three times as long for k06, with the same
+energy.
+
+## Running this code by hand
 
 From the repository root, one process on one node uses the GPUs it is given:
 

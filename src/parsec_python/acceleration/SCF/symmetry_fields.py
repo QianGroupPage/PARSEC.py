@@ -247,12 +247,15 @@ class SymmetrySCFReducer:
         ion_ion_energy: float,
         volume_element: float,
         alpha_z_energy: float = 0.0,
+        band_energy_weight: float = 1.0,
     ) -> EnergyBreakdown:
         """Evaluate the unchanged PARSEC energy using weighted wedge dots.
 
         ``alpha_z_energy`` joins the band energy as in the reference
         ``total_energy``, which the SCF loop calls with the same arguments.
-        It is zero for an isolated system.
+        It is zero for an isolated system.  ``band_energy_weight`` is the
+        reference's per-k-point scale of the band energy; the wedge path is
+        Gamma-only, so it is 1.
         """
 
         eigenvalues = np.asarray(eigenvalues, dtype=np.float64)
@@ -275,9 +278,9 @@ class SymmetrySCFReducer:
                 volume_element * np.dot(weighted_density(), field_wedge)
             )
 
-        band_energy = float(2.0 * np.dot(occupations, eigenvalues)) + float(
-            alpha_z_energy
-        )
+        band_energy = float(
+            2.0 * band_energy_weight * np.dot(occupations, eigenvalues)
+        ) + float(alpha_z_energy)
         old_hxc_integral = float(
             volume_element
             * np.dot(

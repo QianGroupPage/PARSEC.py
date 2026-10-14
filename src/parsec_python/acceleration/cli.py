@@ -9,6 +9,7 @@ import sys
 import time
 from typing import Sequence
 
+from parsec_python.Eigensolvers.perturbative_soc import build_spin_orbit_projectors
 from parsec_python.Input import (
     ParsecInputError,
     parse_parsec_input,
@@ -28,9 +29,11 @@ from parsec_python.Relaxation.run import (
     symmetry_decision,
 )
 from parsec_python.cli import (
+    main as reference_main,
     refinement_progress,
     relaxation_exit_code,
     save_result_archive,
+    save_self_consistent_soc_result_archive,
 )
 
 from .Output import AcceleratedTextReporter
@@ -45,6 +48,7 @@ from .driver import (
     run_scf,
 )
 from .models import BackendUnavailableError
+from .SCF.self_consistent_soc import run_self_consistent_soc
 from .resources import Resources, native_thread_information, resolve_resources
 
 
@@ -248,6 +252,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="text log path; defaults to parsec.out beside parsec.in",
     )
     parser.add_argument(
+        "--kpoint-workers",
+        default=None,
+        metavar="N|auto",
+        help=(
+            "worker threads for the k-points of a periodic SCF and for the band path "
+            "(reference solver; default PARSEC_KPOINT_WORKERS, else auto)"
+        ),
+    )
+    parser.add_argument(
+        "--bands-from",
+        type=Path,
+        default=None,
+        metavar="ARCHIVE.npz",
+        help=(
+            "skip the SCF and compute the bandstruc bands from the converged potential in a "
+            "previous run's result archive (reference solver; log: parsec_bands.out)"
+        ),
+    )
+    parser.add_argument(
         "--no-archive",
         action="store_true",
         help="do not write parsec_python_results.npz",
@@ -350,6 +373,148 @@ def _resource_report(resources: Resources, system) -> list[str]:
     )
 
 
+
+def _accelerated_self_consistent_soc_eligible(translation) -> bool:
+    """Whether this input matches the one self-consistent-SOC shape the
+    accelerated path implements: Gamma-point only, not combined with
+    collinear spin polarization.
+
+    See :mod:`parsec_python.acceleration.SCF.self_consistent_soc`'s module
+    docstring.  Combined with spin polarization or a periodic
+    ``Boundary_Conditions`` always delegates to the reference CPU solver
+    (:mod:`parsec_python.SCF.self_consistent_soc_spin_polarized`/
+    ``kpoints_soc`` have no CuPy counterpart yet).
+    """
+
+    problem = translation.problem
+    return (
+        problem.scf.self_consistent_spin_orbit
+        and not problem.scf.spin_polarized
+        and not problem.scf.noncollinear
+        and problem.periodic_cell is None
+    )
+
+
+def _resolve_symmetry_mode(
+    requested_symmetry: str | None,
+    ignore_symmetry: bool,
+    *,
+    accelerated_self_consistent_soc: bool,
+) -> str:
+    """Resolve ``--symmetry``/``Ignore_Symmetry`` to an effective mode.
+
+    Self-consistent SOC on the accelerated path always forces "off": the
+    orbital-sector symmetry decomposition
+    (``CuPySymmetrySCFEigensolver``/``SymmetrySCFReducer``) assumes
+    real-valued, spin-diagonal 1-D irreps, but the spin-orbit L.S cross term
+    (``lzsz``/``lsxy``) mixes spin channels and breaks that assumption, and
+    ``CuPySpinorHamiltonian``/``run_chebff_spinor`` only accept plain
+    complex128 ndarrays, not the compact ``SymmetryScalarField``
+    representation the symmetry-reduced Hartree/XC/mixing hooks would
+    otherwise produce for this system. "auto"/unset falls back to full-grid
+    silently (its own documented contract); "on" explicitly promises a
+    nontrivial reduction, which this tier cannot deliver, so that
+    combination is rejected with a ``ValueError`` instead of silently
+    overriding the user's explicit request.
+    """
+
+    mode = (
+        requested_symmetry
+        if requested_symmetry is not None
+        else ("off" if ignore_symmetry else "auto")
+    )
+    if accelerated_self_consistent_soc:
+        if requested_symmetry == "on":
+            raise ValueError(
+                "self-consistent spin-orbit coupling on the accelerated "
+                "path does not yet support symmetry reduction, so "
+                "--symmetry on cannot be satisfied for this input; omit "
+                "--symmetry or pass --symmetry off"
+            )
+        return "off"
+    return mode
+
+
+def _reference_only_features(
+    translation, *, accelerated_backend_selected: bool
+) -> list[str]:
+    """Input features only the reference :mod:`parsec_python.cli` dispatches.
+
+    The accelerated driver runs a scalar Gamma-point SCF, spin-polarized
+    where the system is isolated and carries no spin-orbit species, plus (when ``accelerated_backend_selected`` and the input is
+    Gamma-point-only self-consistent SOC without spin polarization --
+    :func:`_accelerated_self_consistent_soc_eligible`) the CuPy spinor
+    Hamiltonian/eigensolver in
+    :mod:`parsec_python.acceleration.SCF.self_consistent_soc`.  Without this
+    check every other SOC/spin/k-point flag would be silently ignored.
+    """
+
+    problem = translation.problem
+    features = []
+    if problem.scf.noncollinear:
+        features.append("non-collinear magnetism (Non_Collinear_magnetism)")
+    elif problem.scf.self_consistent_spin_orbit:
+        if problem.scf.spin_polarized:
+            features.append(
+                "self-consistent spin-orbit coupling combined with spin "
+                "polarization (SO_from_scratch + Spin_Polarization)"
+            )
+        elif problem.periodic_cell is not None:
+            features.append(
+                "periodic self-consistent spin-orbit coupling "
+                "(SO_from_scratch with a periodic Boundary_Conditions)"
+            )
+        elif not accelerated_backend_selected:
+            features.append("self-consistent spin-orbit coupling (SO_from_scratch)")
+        # else: Gamma-point-only self-consistent SOC on a resolved CuPy
+        # backend -- accelerated, not reference-only.
+    elif problem.scf.spin_polarized and (
+        problem.periodic_cell is not None
+        or any(
+            specification.spin_orbit
+            for specification in problem.pseudopotentials.values()
+        )
+    ):
+        features.append(
+            "spin polarization of a periodic system or of spin-orbit species"
+        )
+    if problem.has_kpoint_sampling and not (
+        (problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear)
+        and problem.periodic_cell is not None
+    ):
+        features.append("k-point sampling (Monkhorst-Pack or explicit list)")
+    if problem.bands is not None:
+        features.append("band structure along a k-path (bandstruc)")
+    return features
+
+
+def _reference_argv(arguments: argparse.Namespace) -> list[str]:
+    """Forward the options the reference CLI shares with this one."""
+
+    argv = [str(arguments.input)]
+    for flag, value in (
+        ("--pp-dir", arguments.pp_dir),
+        ("--output", arguments.output),
+        ("--log", arguments.log),
+        ("--bands-from", arguments.bands_from),
+        ("--kpoint-workers", arguments.kpoint_workers),
+        ("--restart-from", arguments.restart_from),
+        ("--energy-refinement", arguments.energy_refinement),
+    ):
+        if value is not None:
+            argv += [flag, str(value)]
+    for flag, enabled in (
+        ("--no-archive", arguments.no_archive),
+        ("--save-wavefunctions", arguments.save_wavefunctions),
+        ("--dry-run", arguments.dry_run),
+        ("--quiet", arguments.quiet),
+        ("--debug", arguments.debug),
+    ):
+        if enabled:
+            argv.append(flag)
+    return argv
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
     try:
@@ -373,6 +538,9 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
     if arguments.profile_repeats < 1:
         print("Input error: --profile-repeats must be positive", file=sys.stderr)
         return 2
+    if arguments.bands_from is not None:
+        # Bands from a stored SCF potential only exist in the reference solver.
+        return reference_main(_reference_argv(arguments))
     try:
         translation = parse_parsec_input(
             arguments.input,
@@ -432,6 +600,62 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
     )
     # Forces are symmetrized where the calculation itself uses the group.
     symmetrize_forces = use_symmetry and symmetry_mode != "off"
+
+    accelerated_self_consistent_soc = False
+    if _accelerated_self_consistent_soc_eligible(translation):
+        try:
+            selection_probe = resolve_backend(arguments.backend, translation.problem)
+        except (BackendUnavailableError, NotImplementedError):
+            selection_probe = None
+        accelerated_self_consistent_soc = (
+            selection_probe is not None and selection_probe.selected == "cupy"
+        )
+
+    unsupported = _reference_only_features(
+        translation, accelerated_backend_selected=accelerated_self_consistent_soc
+    )
+    if unsupported:
+        features = ", ".join(unsupported)
+        if arguments.backend in ("cupy", "native"):
+            print(
+                f"Input error: {features} is not implemented on the accelerated "
+                f"path, so --backend {arguments.backend} cannot run this input; "
+                "use --backend scipy (or auto) to run it with the reference "
+                "solver",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"NOTE: {features} is not implemented on the accelerated path; "
+            "running the reference parsec_python.cli solver instead",
+            file=sys.stderr,
+        )
+        return reference_main(_reference_argv(arguments))
+
+    if accelerated_self_consistent_soc and (
+        translation.relaxation is not None
+        or translation.molecular_dynamics is not None
+        or translation.compute_forces
+        or getattr(translation, "energy_refinement", None) is not None
+    ):
+        print(
+            "Input error: Minimization, Molecular_Dynamics, Skip_Force: false and "
+            "Energy_Refinement are not implemented together with self-consistent "
+            "spin-orbit coupling",
+            file=sys.stderr,
+        )
+        return 2
+    if accelerated_self_consistent_soc:
+        try:
+            symmetry_mode = _resolve_symmetry_mode(
+                arguments.symmetry,
+                translation.ignore_symmetry,
+                accelerated_self_consistent_soc=True,
+            )
+        except ValueError as error:
+            print(f"Input error: {error}", file=sys.stderr)
+            return 2
+    symmetrize_forces = symmetrize_forces and symmetry_mode != "off"
 
     summary = summarize_translation(translation)
     if arguments.dry_run:
@@ -581,6 +805,51 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                 log.write()
 
             scf_started = time.perf_counter()
+            if accelerated_self_consistent_soc:
+                soc_projectors = tuple(
+                    build_spin_orbit_projectors(
+                        system.grid,
+                        system.atoms,
+                        system.pseudopotentials,
+                        translation.problem.pseudopotentials,
+                    )
+                )
+                result = run_self_consistent_soc(
+                    system,
+                    soc_projectors,
+                    callback=reporter.reference.iteration_self_consistent_soc,
+                )
+                scf_completed = time.perf_counter()
+                reporter.reference.finish_self_consistent_soc(
+                    result, scf_completed - scf_started
+                )
+                reporting_completed = time.perf_counter()
+                log.write(
+                    f" Pre-SCF setup/reporting wall time [sec] : "
+                    f"{scf_started - started:11.6f}"
+                )
+                log.write(
+                    f" Post-SCF finalization/reporting [sec] : "
+                    f"{reporting_completed - scf_completed:11.6f}"
+                )
+                log.write(
+                    f" Total accelerated Python wall time [sec] : "
+                    f"{time.perf_counter() - started:11.2f}"
+                )
+                if not arguments.no_archive:
+                    saved = save_self_consistent_soc_result_archive(
+                        archive_path,
+                        result,
+                        include_wavefunctions=(
+                            arguments.save_wavefunctions
+                            or translation.output_all_states
+                        ),
+                    )
+                    log.write(f"Result archive: {saved}")
+                log.write(f"Text log: {log_path}")
+                return 0 if result.converged else 3
+
+
             forces = None
             outcome = None
             dynamics = None

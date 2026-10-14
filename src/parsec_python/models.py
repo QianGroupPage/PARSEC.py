@@ -41,6 +41,12 @@ class Atom:
 
     symbol: str
     position: np.ndarray | Sequence[float]
+    initial_moment: np.ndarray | Sequence[float] | None = None
+    """Direction of this atom's initial magnetic moment for a non-collinear
+    calculation (Fortran's per-atom ``Initial_NCL_Moment``).  Only the
+    direction matters: it is normalized here, and the initial magnitude comes
+    from the species' ``initial_spin_polarization``.  ``None`` (or the zero
+    vector) seeds no moment on this atom."""
 
     def __post_init__(self) -> None:
         symbol = self.symbol.strip()
@@ -51,6 +57,14 @@ class Atom:
             raise ValueError("atom position must contain three finite Cartesian coordinates")
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "position", position)
+        if self.initial_moment is not None:
+            moment = np.asarray(self.initial_moment, dtype=float)
+            if moment.shape != (3,) or not np.all(np.isfinite(moment)):
+                raise ValueError("initial_moment must be three finite numbers")
+            norm = float(np.linalg.norm(moment))
+            object.__setattr__(
+                self, "initial_moment", None if norm == 0.0 else moment / norm
+            )
 
 
 @dataclass(frozen=True)
@@ -69,6 +83,14 @@ class SpeciesPotential:
     Such a correction is required before comparing total energies obtained
     with ordinary and core-hole pseudopotentials having different valence
     charges.
+
+    ``spin_orbit`` mirrors PARSEC's per-species ``SO_PSP`` flag and requires
+    the POTRE file to be a relativistic (``irel='rel'``) potential carrying
+    explicit p/d spin-orbit channels (see
+    :attr:`~parsec_python.Pseudopotential.ParsecPseudopotential.has_spin_orbit_channels`).
+    It switches on the spin-orbit term of the spin-orbit drivers (Fortran's
+    perturbative or self-consistent SOC); without it only the scalar components
+    of a relativistic file are used.
 
     ``pseudopotential_format`` is ``"martins_new"`` (a ``*_POTRE.DAT`` file)
     or ``"martins_old"`` (``*_POTR.DAT``).  An old file holds neither
@@ -92,6 +114,7 @@ class SpeciesPotential:
     use_spline: bool = False
     element_symbol: str | None = None
     atomic_energy_correction: float = 0.0
+    spin_orbit: bool = False
     pseudopotential_format: str = "martins_new"
     number_of_channels: int | None = None
     electrons_per_orbital: tuple[float, ...] | None = None
@@ -99,13 +122,19 @@ class SpeciesPotential:
     initial_spin_polarization: float = DEFAULT_INITIAL_SPIN_POLARIZATION
 
     def __repr__(self) -> str:
-        # A species that leaves the starting polarization at PARSEC's default
-        # prints what it printed before the field existed.
+        # Fields added later print nothing at their defaults, so the text of
+        # every calculation without them stays what it was before they existed
+        # (it is hashed by the cache keys of the accelerated driver).
+        hidden = {
+            "spin_orbit": not self.spin_orbit,
+            "initial_spin_polarization": (
+                self.initial_spin_polarization == DEFAULT_INITIAL_SPIN_POLARIZATION
+            ),
+        }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
             for item in fields(self)
-            if item.name != "initial_spin_polarization"
-            or self.initial_spin_polarization != DEFAULT_INITIAL_SPIN_POLARIZATION
+            if not hidden.get(item.name, False)
         ]
         return f"{type(self).__qualname__}({', '.join(shown)})"
 
@@ -516,6 +545,28 @@ class SCFSettings:
     ``fixed_occupations`` are then those of the up channel (the first
     section of ``occup.in``) and ``fixed_occupations_down`` those of the
     down channel (its second section).
+
+    For an isolated input without spin-orbit coupling, ``spin_polarized`` is
+    run by :func:`~parsec_python.SCF.spin_polarized.run_spin_scf`; periodic
+    cells, spin-orbit coupling and non-collinear magnetism use
+    :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized` and the
+    k-point drivers.
+
+    ``self_consistent_spin_orbit`` mirrors PARSEC's ``SO_from_scratch``
+    (and, as a deliberate simplification of Fortran's more convoluted
+    ``Non_Collinear_magnetism``-gated logic, ``SCF_SO`` treated the same
+    way): implemented by
+    :func:`~parsec_python.SCF.self_consistent_soc.run_self_consistent_soc`
+    for isolated inputs with at least one ``SO_PSP=true`` species and
+    ``spin_polarized=False`` (both spinor components share one
+    spin-unpolarized potential), and by the periodic k-point drivers.
+
+    ``noncollinear`` mirrors PARSEC's ``Non_Collinear_magnetism``: the
+    magnetization is a vector field ``m(r)`` whose direction varies in space
+    (see :mod:`parsec_python.SCF.noncollinear`).  Spin-orbit coupling is
+    added on top when ``self_consistent_spin_orbit`` is also set (as in
+    Fortran, a species with ``SO_PSP`` together with ``Non_Collinear_magnetism``
+    switches the self-consistent spin-orbit term on).
     """
 
     max_iterations: int = 50
@@ -529,17 +580,21 @@ class SCFSettings:
     fixed_occupations: tuple[float, ...] | None = None
     spin_polarized: bool = False
     fixed_occupations_down: tuple[float, ...] | None = None
+    self_consistent_spin_orbit: bool = False
+    noncollinear: bool = False
 
     def __repr__(self) -> str:
         # The text of these settings is hashed by the cache keys of the
         # accelerated driver and stored in test records.  Occupations that
-        # are not set and spin polarization that is off print nothing, so
-        # that the text of every calculation without them stays what it was
-        # before the fields existed.
+        # are not set, and spin or spin-orbit switches that are off, print
+        # nothing, so that the text of every calculation without them stays
+        # what it was before the fields existed.
         hidden = {
             "fixed_occupations": self.fixed_occupations is None,
             "spin_polarized": not self.spin_polarized,
             "fixed_occupations_down": self.fixed_occupations_down is None,
+            "self_consistent_spin_orbit": not self.self_consistent_spin_orbit,
+            "noncollinear": not self.noncollinear,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -767,6 +822,56 @@ class RelaxationSettings:
 
 
 @dataclass(frozen=True)
+class BandSegment:
+    """One straight piece of a band path (Fortran ``bandstruc`` block line).
+
+    ``start``/``end`` are in *relative* coordinates, i.e. multiples of the
+    reciprocal lattice vectors; ``name`` is the segment label (``gamma-X``).
+    """
+
+    start: tuple[float, float, float]
+    end: tuple[float, float, float]
+    name: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in ("start", "end"):
+            values = tuple(float(value) for value in getattr(self, field_name))
+            if len(values) != 3 or not all(np.isfinite(values)):
+                raise ValueError(f"band segment {field_name} must be three finite numbers")
+            object.__setattr__(self, field_name, values)
+        if self.start == self.end:
+            raise ValueError("a band segment must have non-zero length")
+
+
+@dataclass(frozen=True)
+class BandStructureSettings:
+    """Fortran ``bandstruc`` / ``bandstruc_points``: a band structure computed
+    after the SCF along a path of segments.
+
+    The shortest segment gets ``points`` k-points and the others
+    proportionally more (see :func:`~parsec_python.Grid.kpoints.band_path_kpoints`).
+    Each k-point is solved from scratch with the SCF's first eigensolver
+    (CHEBFF: ``FF_MaxIter`` filter cycles of degree ``Chebdav_Degree``) in the
+    converged self-consistent potential, exactly as Fortran ``calc_bands``.
+    """
+
+    segments: tuple[BandSegment, ...]
+    points: int = 20
+
+    def __post_init__(self) -> None:
+        segments = tuple(
+            segment if isinstance(segment, BandSegment) else BandSegment(**segment)
+            for segment in self.segments
+        )
+        if not segments:
+            raise ValueError("a band structure needs at least one segment")
+        object.__setattr__(self, "segments", segments)
+        if int(self.points) < 1:
+            raise ValueError("bandstruc_points must be at least 1")
+        object.__setattr__(self, "points", int(self.points))
+
+
+@dataclass(frozen=True)
 class SinglePointInput:
     """
     Complete input to the modular single-point calculator.
@@ -784,6 +889,28 @@ class SinglePointInput:
         default_factory=InitialDensitySettings
     )
     recenter_geometry: bool = True
+    monkhorst_pack_dimensions: tuple[int, int, int] | None = None
+    """PARSEC's ``Kpoint_Method: mp`` + ``Monkhorst_Pack_Grid`` block: an
+    unreduced, uniform (equal-weight) Brillouin-zone sample, implemented by
+    :func:`~parsec_python.SCF.kpoints.run_scf_kpoints` for periodic,
+    spin-unpolarized, non-SOC inputs.  ``None`` (the default) is the
+    ordinary Gamma-only periodic path."""
+    kpoints: np.ndarray | None = None
+    """An explicit k-point list (Fortran ``Kpoint_Method: manual``), shape
+    ``(n, 3)`` in Cartesian 1/bohr; mutually exclusive with
+    ``monkhorst_pack_dimensions`` and requiring ``periodic_cell``.  Convert
+    user units with :func:`~parsec_python.Grid.kpoints.explicit_kpoints`."""
+    kpoint_weights: np.ndarray | None = None
+    """Sampling weights for ``kpoints`` (non-negative, normalized to sum 1;
+    equal if omitted).  The SCF drivers currently require them equal."""
+    bands: BandStructureSettings | None = None
+    """Non-self-consistent band structure to compute after the SCF (periodic
+    systems only); see :class:`BandStructureSettings`."""
+
+    @property
+    def has_kpoint_sampling(self) -> bool:
+        """Whether k-points beyond Gamma are requested (grid or explicit list)."""
+        return self.monkhorst_pack_dimensions is not None or self.kpoints is not None
 
     def __post_init__(self) -> None:
         atoms = tuple(atom if isinstance(atom, Atom) else Atom(**atom) for atom in self.atoms)
@@ -802,6 +929,83 @@ class SinglePointInput:
             raise ValueError(
                 "a periodic calculation (periodic_cell set) requires PeriodicGridSettings"
             )
+        if self.monkhorst_pack_dimensions is not None:
+            if self.periodic_cell is None:
+                raise ValueError("monkhorst_pack_dimensions requires periodic_cell")
+            dims = tuple(int(value) for value in self.monkhorst_pack_dimensions)
+            if len(dims) != 3 or any(value < 1 for value in dims):
+                raise ValueError("monkhorst_pack_dimensions must be three positive integers")
+            object.__setattr__(self, "monkhorst_pack_dimensions", dims)
+        if self.kpoints is not None:
+            if self.periodic_cell is None:
+                raise ValueError("an explicit k-point list requires periodic_cell")
+            if self.monkhorst_pack_dimensions is not None:
+                raise ValueError(
+                    "give either monkhorst_pack_dimensions or an explicit kpoints "
+                    "list, not both"
+                )
+            k_points = np.asarray(self.kpoints, dtype=float)
+            if k_points.ndim != 2 or k_points.shape[0] < 1 or k_points.shape[1] != 3:
+                raise ValueError("kpoints must have shape (n, 3) with n >= 1")
+            if not np.all(np.isfinite(k_points)):
+                raise ValueError("kpoints must be finite")
+            if self.kpoint_weights is None:
+                weights = np.full(k_points.shape[0], 1.0 / k_points.shape[0])
+            else:
+                weights = np.asarray(self.kpoint_weights, dtype=float)
+                if weights.shape != (k_points.shape[0],) or not np.all(np.isfinite(weights)):
+                    raise ValueError("kpoint_weights must have one finite value per k-point")
+                if np.any(weights < 0.0) or float(np.sum(weights)) <= 0.0:
+                    raise ValueError("kpoint_weights must be non-negative and not all zero")
+                weights = weights / float(np.sum(weights))
+            object.__setattr__(self, "kpoints", k_points)
+            object.__setattr__(self, "kpoint_weights", weights)
+        elif self.kpoint_weights is not None:
+            raise ValueError("kpoint_weights given without kpoints")
+        if self.bands is not None and self.periodic_cell is None:
+            raise ValueError("a band structure requires periodic_cell")
+
+
+@dataclass
+class BandStructureResult:
+    """Eigenvalues along a band path computed with a fixed SCF potential.
+
+    ``eigenvalues`` has shape ``(n_channels, n_kpoints, n_states)`` in Ry,
+    with ``channels`` naming the first axis: ``("all",)`` for scalar and
+    spinor Hamiltonians, ``("up", "down")`` for collinear spin-polarized runs
+    without spin-orbit.  ``k_points`` are Cartesian (1/bohr) and flattened
+    over the segments; ``segment_counts[i]`` consecutive k-points belong to
+    segment ``i`` (``segment_names[i]``).  ``fermi_level`` is the SCF Fermi
+    level in the same energy zero.  ``residual_norms`` (channel, k) is the
+    largest ``|H v - e v|`` over the reported states: the Fortran CHEBFF
+    solver has no convergence test, so this is the quality diagnostic.
+    ``spin_expectation`` (spinor Hamiltonians) is ``<sigma_x,y,z>`` of every
+    state, shape ``(1, n_kpoints, n_states, 3)``.
+    """
+
+    mode: str
+    channels: tuple[str, ...]
+    segment_names: tuple[str, ...]
+    segment_counts: np.ndarray
+    k_points: np.ndarray
+    eigenvalues: np.ndarray
+    residual_norms: np.ndarray
+    fermi_level: float
+    spin_expectation: np.ndarray | None = None
+    attempts: np.ndarray | None = None
+    """Diagonalization attempts per ``(channel, k-point)``: 1 unless the CHEBDAV
+    re-solve with a larger block was needed (see :mod:`parsec_python.SCF.bands`)."""
+
+    @property
+    def segment_index(self) -> np.ndarray:
+        """Segment number (0-based) of every k-point."""
+        return np.repeat(np.arange(len(self.segment_counts)), self.segment_counts)
+
+    @property
+    def path_distance(self) -> np.ndarray:
+        """Cumulative Cartesian arc length along the path (1/bohr)."""
+        steps = np.linalg.norm(np.diff(self.k_points, axis=0), axis=1)
+        return np.concatenate([[0.0], np.cumsum(steps)])
 
 
 @dataclass(frozen=True)
@@ -937,6 +1141,23 @@ class SpinChannelResult:
     eigensolver_state: object | None = None
 
 
+@dataclass(frozen=True)
+class SpinPolarizedSCFIteration:
+    """Diagnostics retained for one :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized`
+    iteration -- the spin-polarized counterpart to :class:`SCFIteration`, with
+    both channels' eigenpairs instead of one combined set."""
+
+    iteration: int
+    weighted_residual: float
+    plain_residual: float
+    energies: EnergyBreakdown
+    eigenvalues_up: tuple[float, ...] = ()
+    eigenvalues_down: tuple[float, ...] = ()
+    occupations_up: tuple[float, ...] = ()
+    occupations_down: tuple[float, ...] = ()
+    fermi_level: float = float("nan")
+
+
 @dataclass
 class SinglePointResult:
     """Result of a modular isolated single-point calculation.
@@ -982,6 +1203,12 @@ class SinglePointResult:
         default_factory=lambda: np.empty(0, dtype=np.int32)
     )
     atomic_reference_correction: float = 0.0
+    k_points: np.ndarray | None = None
+    """Cartesian k-points, shape ``(n_k, 3)`` in bohr^-1, for a k-point-sampled
+    run (``None`` otherwise).  Pooled eigenvalue/occupation arrays are
+    k-major: entries ``i*n_states:(i+1)*n_states`` belong to ``k_points[i]``."""
+    k_weights: np.ndarray | None = None
+    """Normalized k-point weights, shape ``(n_k,)``."""
     # Buffered eigensubspace of the last eigenproblem.  An ionic step hands
     # it to the SCF loop of the next structure; nothing else reads it.
     eigensolver_state: object | None = None
@@ -1011,3 +1238,131 @@ class SinglePointResult:
         if self.spin is None:
             return 0.0
         return float(self.spin[0].electron_count - self.spin[1].electron_count)
+
+@dataclass
+class SpinPolarizedSinglePointResult:
+    """Result of :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized`.
+
+    A deliberately narrower counterpart to :class:`SinglePointResult`: it
+    carries what a caller (in particular PARSEC's ``pls.F90``-style
+    perturbative spin-orbit diagonalization) needs from a converged
+    collinear spin-polarized ground state -- both channels' eigenpairs, the
+    shared Fermi level, and the converged energy -- without the unpolarized
+    path's full per-iteration timing/history instrumentation.
+    """
+
+    converged: bool
+    iterations: int
+    atoms: tuple[Atom, ...]
+    electron_count: float
+    eigenvalues_up: np.ndarray
+    eigenvalues_down: np.ndarray
+    occupations_up: np.ndarray
+    occupations_down: np.ndarray
+    wavefunctions_up: np.ndarray
+    wavefunctions_down: np.ndarray
+    fermi_level: float
+    density_up: np.ndarray
+    density_down: np.ndarray
+    energies: EnergyBreakdown
+    occupation_weight: float = 1.0
+    """Brillouin-zone weight carried by each pooled eigenvalue: 1 for a
+    single (Gamma or cluster) calculation, ``1/n_k`` for an unreduced uniform
+    k-point grid whose eigenvalues and occupations are pooled over k."""
+    scf_potentials: dict[str, np.ndarray] | None = None
+    """Converged local potentials of a periodic run (output side of the last
+    iteration), the input of a non-self-consistent band calculation."""
+    k_points: np.ndarray | None = None
+    """Cartesian k-points, shape ``(n_k, 3)`` in bohr^-1, for a k-point-sampled
+    run (``None`` otherwise).  Pooled eigenvalue/occupation arrays are
+    k-major: entries ``i*n_states:(i+1)*n_states`` belong to ``k_points[i]``."""
+    k_weights: np.ndarray | None = None
+    """Normalized k-point weights, shape ``(n_k,)``."""
+
+    @property
+    def magnetic_moment(self) -> float:
+        """``N_up - N_down`` in Bohr magnetons (PARSEC's ``<S>`` diagnostic),
+        summed with each pooled state's k-point weight."""
+        return float(
+            self.occupation_weight
+            * (np.sum(self.occupations_up) - np.sum(self.occupations_down))
+        )
+
+
+@dataclass(frozen=True)
+class SelfConsistentSOCIteration:
+    """Diagnostics for one iteration of
+    :func:`~parsec_python.SCF.self_consistent_soc.run_self_consistent_soc`.
+
+    Unlike :class:`SpinPolarizedSCFIteration`, there is only one set of
+    (SOC-split, spinor) eigenpairs per iteration -- spin is not a separate
+    axis here, it is folded into each ``2*n_grid``-length eigenvector.
+    """
+
+    iteration: int
+    weighted_residual: float
+    plain_residual: float
+    energies: EnergyBreakdown
+    eigenvalues: tuple[float, ...] = ()
+    occupations: tuple[float, ...] = ()
+    fermi_level: float = float("nan")
+
+
+@dataclass
+class SelfConsistentSOCResult:
+    """Result of :func:`~parsec_python.SCF.self_consistent_soc.run_self_consistent_soc`.
+
+    Fortran's ``SO_from_scratch`` without ``Non_Collinear_magnetism``: SOC is
+    in the Hamiltonian from the first SCF iteration (unlike
+    :class:`PerturbativeSpinOrbitResult`, which only ever diagonalizes a
+    small fixed-basis matrix after an ordinary scalar SCF converges), but
+    both spinor components still share one spin-unpolarized effective
+    potential (no ``B_xc.sigma`` term) -- see
+    :mod:`parsec_python.Hamiltonian.spinor_operator`'s module docstring.
+    """
+
+    converged: bool
+    iterations: int
+    atoms: tuple[Atom, ...]
+    electron_count: float
+    eigenvalues: np.ndarray
+    occupations: np.ndarray
+    spinors: np.ndarray
+    """Shape ``(2*n_grid, n_states)`` complex: rows ``0:n_grid`` are each
+    state's spin-up component, rows ``n_grid:2*n_grid`` are spin-down."""
+    fermi_level: float
+    density: np.ndarray
+    energies: EnergyBreakdown
+    magnetic_moment: float | None = None
+    """Net ``N_up - N_down`` (Bohr magnetons) from the spin densities when
+    the run was spin-polarized; for a non-collinear run, the length of
+    ``magnetic_moment_vector``.  ``None`` for the spin-unpolarized drivers."""
+    magnetic_moment_vector: np.ndarray | None = None
+    """Net moment ``(m_x, m_y, m_z)`` in Bohr magnetons (non-collinear runs)."""
+    magnetization: np.ndarray | None = None
+    """Magnetization density ``m(r)``, shape ``(3, n_grid)``, in Bohr
+    magnetons per bohr^3 (non-collinear runs)."""
+    scf_potentials: dict[str, np.ndarray] | None = None
+    """Converged local potentials of a periodic run (output side of the last
+    iteration), the input of a non-self-consistent band calculation."""
+    k_points: np.ndarray | None = None
+    """Cartesian k-points, shape ``(n_k, 3)`` in bohr^-1, for a k-point-sampled
+    run (``None`` otherwise).  Pooled eigenvalue/occupation arrays are
+    k-major: entries ``i*n_states:(i+1)*n_states`` belong to ``k_points[i]``."""
+    k_weights: np.ndarray | None = None
+    """Normalized k-point weights, shape ``(n_k,)``."""
+    state_moments: np.ndarray | None = None
+    """``<S_z>`` of every pooled state (same k-major layout as ``eigenvalues``)
+    for k-point runs, where ``spinors`` only holds the first k-point."""
+
+    @property
+    def magnetic_moment_per_state(self) -> np.ndarray:
+        """Each SOC-split state's own ``<S_z>`` (up-component weight minus
+        down-component weight), matching ``elec_st%magmom``.  For a
+        k-point run this covers every pooled state (``state_moments``)."""
+        if self.state_moments is not None:
+            return self.state_moments
+        n_grid = self.spinors.shape[0] // 2
+        up_weight = np.sum(np.abs(self.spinors[:n_grid, :]) ** 2, axis=0)
+        down_weight = np.sum(np.abs(self.spinors[n_grid:, :]) ** 2, axis=0)
+        return up_weight - down_weight

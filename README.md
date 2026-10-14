@@ -568,6 +568,148 @@ The Hamiltonian and nonlocal potential remain matrix-free during iterative
 eigensolution. Static terms are prepared once; only density-dependent local
 fields change during SCF.
 
+## Parallel k-points, band paths and GPUs (periodic systems)
+
+The eigenproblems of different k-points (and spin channels) are independent: only the Fermi
+level and the density couple them. A periodic SCF with k-points, and every point of a band path,
+is therefore spread over workers that each keep the Bloch projectors, eigenvectors and Ritz
+subspaces of their own k-points; only potentials, eigenvalues and summed densities cross between
+them. This covers the scalar, spin-polarized, spin-orbit, spin-orbit + collinear-spin and
+non-collinear drivers and the `bandstruc` calculation. The results are the serial ones up to
+round-off (the eigenvalues of a k-point are the same computation; densities differ only by the
+order of the sum over k-points).
+
+```bash
+python -m parsec_python.main parsec.in --kpoint-workers 8          # CPU worker threads
+python -m parsec_python.main parsec.in --kpoint-workers auto       # default: half the CPUs
+python -m parsec_python.main parsec.in --device gpu                # GPUs, see below
+python -m parsec_python.main parsec.in --device cpu                # never touch a GPU
+```
+
+or the environment variables `PARSEC_KPOINT_WORKERS` (`auto` or a number; `auto` stays serial for a
+single k-point and for small grids) and `PARSEC_KPOINT_BACKEND` (`cpu`, `cupy`, `auto`, `numpy-device`; an explicit override of `--device`).
+The workers are threads of one process, as in the multi-GPU solver (there is no `fork`, which is
+unsafe after the native OpenMP kernels or a CUDA context exist); the NumPy/SciPy/BLAS kernels release
+the GIL, and the workers share the BLAS threads of the process. The sparse Bloch operators are
+memory-bandwidth bound, so the gain depends on the machine: 2.9x for 8 workers and 1.9x for 4 on a
+4-P-core + 8-E-core laptop (4-atom Co, 28^3 grid, 44 spinor states, 8 k-points, 3 SCF iterations),
+more on a server with more memory channels. Memory grows with the number of workers only through
+each worker's own k-points.
+
+**GPUs.** `--device gpu` (the default `--device auto` uses CuPy when it works, else the CPU; `--device cpu`
+never does; `--gpus`/`--gpu-ids` choose the devices) puts the Bloch Hamiltonian, including the spin-orbit and Zeeman terms, and the whole
+Chebyshev filter on the GPU, which is where almost all the matrix-vector products are. One worker
+thread drives each CUDA device (`PARSEC_CUPY_DEVICES=auto|current|0,1,...` as in the multi-GPU
+solver), the k-points are dealt out round-robin, and the eigensolver itself (CHEBFF, CHEBDAV,
+SUBSPACE: orthonormalization, Rayleigh-Ritz) is the unchanged CPU code, so a filter call costs one
+upload and one download of a block of vectors. Static matrices (Laplacian, projectors) are uploaded
+once per device; an SCF step uploads only the local potential and fields. Give the host BLAS a few
+threads per device (`OPENBLAS_NUM_THREADS`, the thread pool shares them out by default).
+`python -m parsec_python.acceleration.benchmarks.check_gpu_kpoints` compares the device operator, the filter, a short non-collinear
+spin-orbit SCF and a short band path against the CPU and times them; run it first on a GPU node.
+It needs `cupy`; `--backend numpy-device` runs the same device code on the host. This is a first
+version of the GPU path: `check_gpu_kpoints` passes on an NVIDIA A100-SXM4-80GB with CuPy 14.2.0
+(operator, filter, a short non-collinear spin-orbit SCF and a band path against the CPU); other
+devices and multi-GPU runs have not been checked yet.
+
+## Band structures (periodic systems)
+
+A `bandstruc` block adds a non-self-consistent band structure after the SCF, as in
+Fortran PARSEC's `calc_bands`. Each line is a path segment in *relative*
+(reciprocal-lattice) coordinates followed by a label, and `bandstruc_points` is the number of
+k-points on the shortest segment (default 20); longer segments get proportionally more, so the
+density along the path is constant:
+
+```
+begin bandstruc
+1 0.0 0.0 0.0   0.5 0.0 0.0   gamma-X
+2 0.5 0.0 0.0   0.5 0.5 0.0   X-M
+3 0.5 0.5 0.0   0.0 0.0 0.0   M-gamma
+end bandstruc
+bandstruc_points 20
+```
+
+The Hamiltonian follows the SCF mode, so the same block gives scalar, collinear spin-polarized
+(up and down channels), self-consistent spin-orbit (`SO_from_scratch` with `SO_PSP`),
+spin-orbit plus collinear spin, and non-collinear bands. Running the same input with and
+without the spin-orbit switches gives the effect of spin-orbit coupling. The perturbative
+spin-orbit route (`Spin_Polarization` with `SO_PSP` but no `SO_from_scratch`) is rejected for
+bands.
+
+At each k-point the Bloch Hamiltonian is built from the converged SCF potential and solved from
+scratch by the SCF's first eigensolver (`Eigensolver`, default `chebdav`, which converges to
+`Diag_Tolerance`; `chebff` only applies `FF_MaxIter` filter cycles and can leave the upper bands
+poorly converged). The log reports the largest residual `|Hv - ev|` and warns when the bands are
+not converged.
+
+CHEBDAV adds `Matvec_Blocksize` vectors per step and, at a highly symmetric k-point whose
+degenerate level is larger than that block (an 8-fold level in a folded cubic cell, 16-fold with
+spin-orbit), can leave reported bands unconverged. This is an extension beyond Fortran: such a
+k-point is re-solved with a larger block and a new random start (up to five attempts, keeping the
+smallest residual), and the log and archive record how many k-points needed it.
+
+The converged SCF potentials are stored in the SCF archive (`parsec_python_results.npz`), which is
+written before the band step. To recompute bands (another path, `States_Num`, solver settings)
+without repeating the SCF, pass the archive back with `--bands-from` (the log goes to
+`parsec_bands.out`, so the SCF log is kept):
+
+```bash
+python -m parsec_python.main parsec.in --bands-from parsec_python_results.npz
+```
+
+Outputs (written next to `parsec.in`):
+
+* `bands.dat` and `bands_plot.dat` in Fortran's formats (eigenvalues in Ry / eV, not shifted by
+  the Fermi level; `bands.dat` carries the SCF Fermi level),
+* `parsec_python_bands.npz` with the k-points, segment names, eigenvalues, residuals and (for
+  spinor Hamiltonians) `<sigma>` of every state.
+
+Overlay several runs, e.g. without and with spin-orbit coupling:
+
+```bash
+python -m parsec_python.Output.bands noso/bands.dat soc/bands.dat \
+    --labels "no SOC" "with SOC" --names "G-X,X-M,M-G" -o bands.png
+```
+
+PARSEC.py needs an orthorhombic cell, so cubic conventional cells are used for fcc/bcc
+crystals and their bands are folded into the simple-cubic Brillouin zone. Fortran's
+`nscf_kpoints` (an explicit k-point list read from a `parsec.dat` restart) is not implemented.
+
+## Modular Python API
+
+With `src` on `PYTHONPATH`, individual scientific pieces can be used without
+running SCF:
+
+```python
+from parsec_python import (
+    build_cluster_grid,
+    build_negative_laplacian,
+    ca_lda,
+    pbe,
+    read_parsec_pseudopotential,
+    solve_hartree,
+)
+```
+
+The public workflow functions use accelerated execution by default:
+
+```python
+from parsec_python import prepare_single_point, run_scf, run_single_point
+
+system = prepare_single_point("calculation/parsec.in", backend="auto")
+result = run_scf(system)
+```
+
+For audits and algorithm study, explicit aliases retain the readable SciPy
+path:
+
+```python
+from parsec_python import (
+    prepare_reference_single_point,
+    run_reference_scf,
+    run_reference_single_point,
+)
+```
 With `Minimization: bfgs | simple | manual` or `Molecular_Dynamics: true` the
 single point becomes one step of an ionic loop: the atomic forces are
 evaluated, the atoms are moved as PARSEC moves them, the terms that depend on

@@ -149,6 +149,20 @@ def chebyshev_filter(
     if not np.isfinite(sigma):
         raise ValueError("initial_sigma must be finite")
 
+    # An operator that can run the whole recurrence on a device (GPU) says so;
+    # the block goes up once and the filtered block comes back once.
+    device_filter = getattr(operator, "device_chebyshev_filter", None)
+    if device_filter is not None:
+        filtered, final_sigma = device_filter(
+            block, degree, lower_bound, upper_bound, reference_eigenvalue, initial_sigma
+        )
+        if not np.all(np.isfinite(filtered)):
+            raise FloatingPointError("Chebyshev recurrence produced nonfinite values")
+        filtered = filtered[:, 0] if was_vector else filtered
+        if return_final_sigma:
+            return filtered, float(final_sigma)
+        return filtered
+
     # q0 = V and q1 = sigma1 * ((H-cI)/e) * V.
     previous = block.copy()
     current = np.asarray(operator @ block)

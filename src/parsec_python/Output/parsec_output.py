@@ -11,7 +11,7 @@ import math
 import os
 from time import perf_counter
 from types import SimpleNamespace
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, Sequence, TYPE_CHECKING
 
 import numpy as np
 
@@ -39,7 +39,14 @@ from ..models import MAXIMUM_MULTIPOLE_ORDER, SCFIteration, SinglePointResult
 from ..V_ion import center_cluster_geometry, ionic_charge
 
 if TYPE_CHECKING:
+    from ..Eigensolvers.perturbative_soc import PerturbativeSpinOrbitResult
     from ..Input.parsec_input import ParsecInputTranslation
+    from ..models import (
+        SelfConsistentSOCIteration,
+        SelfConsistentSOCResult,
+        SpinPolarizedSCFIteration,
+        SpinPolarizedSinglePointResult,
+    )
     from ..SCF import PreparedSinglePointSystem
 
 
@@ -1259,6 +1266,7 @@ class ParsecTextReporter:
                         if self.problem.scf.fixed_occupations is None
                         else ()
                     ),
+                    *self._kpoint_note(),
                     "   State   Eigenvalue [Ry]      Eigenvalue [eV]"
                     "    Occup.     Repr.",
                     "",
@@ -1351,6 +1359,75 @@ class ParsecTextReporter:
             )
         self._previous_total = energies.total
         self.write("\n".join(lines))
+
+    def _kpoint_note(self) -> list[str]:
+        """Reminder in each iteration block that only one k-point is listed."""
+        if not self.problem.has_kpoint_sampling:
+            return []
+        return [
+            " (eigenvalues of the first k-point only; the converged states of "
+            "every k-point are listed at the end)",
+            "",
+        ]
+
+    def _kpoint_header(
+        self, index: int, count: int, k_point: Sequence[float], weight: float
+    ) -> list[str]:
+        """Banner for one k-point block: Cartesian k [bohr^-1], fractional
+        coordinates of the reciprocal lattice vectors, and the weight."""
+        k_point = np.asarray(k_point, dtype=float)
+        cell = self.problem.periodic_cell
+        fractional = (
+            cell.lattice_vectors @ k_point / (2.0 * np.pi) if cell is not None else None
+        )
+        text = (
+            f" k-point {index:3d} of {count:3d}   "
+            f"k = ({k_point[0]:10.6f} {k_point[1]:10.6f} {k_point[2]:10.6f}) [1/bohr]"
+        )
+        if fractional is not None:
+            text += (
+                f"   frac = ({fractional[0]:8.5f} {fractional[1]:8.5f} "
+                f"{fractional[2]:8.5f})"
+            )
+        return [text + f"   weight = {weight:9.6f}"]
+
+    def _k_blocks(self, result, array_size: int):
+        """Yield ``(slice, header_lines)`` per k-point for pooled arrays of
+        ``array_size`` entries; a single unlabeled block without k-points."""
+        k_points = getattr(result, "k_points", None)
+        if k_points is None or len(k_points) == 0:
+            yield slice(0, array_size), []
+            return
+        count = len(k_points)
+        per_k = array_size // count
+        weights = getattr(result, "k_weights", None)
+        if weights is None:
+            weights = np.full(count, 1.0 / count)
+        for index in range(count):
+            yield (
+                slice(index * per_k, (index + 1) * per_k),
+                self._kpoint_header(index + 1, count, k_points[index], weights[index]),
+            )
+
+    def _final_k_tables(self, result) -> list[str]:
+        """Converged eigenvalues of every k-point (scalar k-point runs)."""
+        if getattr(result, "k_points", None) is None:
+            return []
+        lines = ["", "Converged eigenvalues by k-point", ""]
+        eigenvalues = np.asarray(result.eigenvalues)
+        occupations = np.asarray(result.occupations)
+        for block, header in self._k_blocks(result, eigenvalues.size):
+            lines.extend(header)
+            lines.append("   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.")
+            for index, (eigenvalue, occupation) in enumerate(
+                zip(eigenvalues[block], occupations[block]), start=1
+            ):
+                lines.append(
+                    f"{index:5d}   {eigenvalue:18.10f}"
+                    f"   {eigenvalue * RYDBERG_TO_EV:18.10f} {occupation:9.4f}"
+                )
+            lines.append("")
+        return lines
 
     def finish(
         self,
@@ -1475,6 +1552,7 @@ class ParsecTextReporter:
                     " --------------------------------------------------",
                 ]
             )
+        lines.extend(self._final_k_tables(result))
         if forces is None:
             lines.extend(
                 [
@@ -1497,6 +1575,347 @@ class ParsecTextReporter:
                     " =================================================================",
                 ]
             )
+        self.write("\n".join(lines))
+
+    def _spin_channel_table(
+        self,
+        label: str,
+        eigenvalues: Sequence[float],
+        occupations: Sequence[float],
+    ) -> list[str]:
+        lines = [
+            f"   Spin {label}",
+            "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.",
+            "",
+        ]
+        for index, (eigenvalue, occupation) in enumerate(
+            zip(eigenvalues, occupations), start=1
+        ):
+            lines.append(
+                f"{index:5d}   {eigenvalue:18.10f}"
+                f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
+                f" {occupation:9.4f}"
+            )
+        lines.append("")
+        return lines
+
+    def iteration_spin_polarized(self, step: "SpinPolarizedSCFIteration") -> None:
+        """Per-iteration report for :func:`run_scf_spin_polarized`.
+
+        A leaner counterpart to :meth:`iteration`: the spin-polarized driver
+        does not yet carry per-stage timing instrumentation (see its module
+        docstring), so this omits the timing breakdown ``iteration`` prints.
+        """
+        energies = step.energies
+        atom_count = len(self.problem.atoms)
+        energy_per_atom_ev = energies.total * RYDBERG_TO_EV / max(atom_count, 1)
+        lines = [
+            f" Spin-polarized SCF iter # {step.iteration:3d}",
+            "",
+            f" Fermi level at {step.fermi_level:10.4f} [Ry]",
+            "",
+            *self._kpoint_note(),
+        ]
+        lines.extend(
+            self._spin_channel_table("up", step.eigenvalues_up, step.occupations_up)
+        )
+        lines.extend(
+            self._spin_channel_table(
+                "down", step.eigenvalues_down, step.occupations_down
+            )
+        )
+        moment = sum(step.occupations_up) - sum(step.occupations_down)
+        lines.extend(
+            [
+                f"   Magnetic moment N_up - N_down = {moment:12.4f}",
+                "",
+                f"   Eigenvalue Energy             = {energies.eigenvalue:20.8f} [Ry]",
+                f"   Hartree Energy                = {energies.hartree:20.8f} [Ry]",
+                (
+                    "   Integral_{Vxc*rho}            = "
+                    f"{energies.integral_vxc_rho:20.8f} [Ry]"
+                ),
+                (
+                    "   Exc = Integral{eps_xc*rho}    = "
+                    f"{energies.exchange_correlation:20.8f} [Ry]"
+                ),
+                (
+                    "   Electron-Ion energy           = "
+                    f"{energies.electron_ion:20.8f} [Ry]"
+                ),
+                f"   Ion-Ion Energy                = {energies.ion_ion:20.8f} [Ry]",
+                "",
+                f"   Total Energy = {energies.total:22.8f} [Ry]",
+                f"   Energy/atom  = {energy_per_atom_ev:22.8f} [eV]",
+                "",
+                (
+                    f"  0-{step.iteration:3d}    "
+                    "SRE of pot. & charge weighted pot = "
+                    f"{step.plain_residual:14.10f}"
+                    f" {step.weighted_residual:14.10f}"
+                ),
+                "",
+            ]
+        )
+        self.write("\n".join(lines))
+
+    def _final_spin_k_tables(self, result) -> list[str]:
+        """Converged up/down eigenvalues of every k-point."""
+        if getattr(result, "k_points", None) is None:
+            return []
+        lines = ["Converged eigenvalues by k-point", ""]
+        up = np.asarray(result.eigenvalues_up)
+        down = np.asarray(result.eigenvalues_down)
+        for block, header in self._k_blocks(result, up.size):
+            lines.extend(header)
+            lines.append("")
+            lines.extend(
+                self._spin_channel_table(
+                    "up", up[block], np.asarray(result.occupations_up)[block]
+                )
+            )
+            lines.extend(
+                self._spin_channel_table(
+                    "down", down[block], np.asarray(result.occupations_down)[block]
+                )
+            )
+        return lines
+
+    def finish_spin_polarized(
+        self, result: "SpinPolarizedSinglePointResult", elapsed_seconds: float
+    ) -> None:
+        status = (
+            "Self-consistency convergence achieved."
+            if result.converged
+            else "Maximum SCF iterations reached without convergence."
+        )
+        lines = [
+            status,
+            "",
+            f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
+            "",
+            f"Converged magnetic moment N_up - N_down = {result.magnetic_moment:12.4f}",
+            f"Total Energy = {result.energies.total:22.8f} [Ry]",
+            (
+                "Energy/atom  = "
+                f"{result.energies.total * RYDBERG_TO_EV / max(len(result.atoms), 1):22.8f} [eV]"
+            ),
+            "",
+            *self._final_spin_k_tables(result),
+            (
+                "Forces, dipoles, and MPI statistics are not calculated by "
+                "this Python single-point implementation."
+            ),
+            "",
+            " =================================================================",
+        ]
+        self.write("\n".join(lines))
+
+    def spin_orbit_correction(self, result: "PerturbativeSpinOrbitResult") -> None:
+        """Report PARSEC's ``pls.F90``-style perturbative spin-orbit split.
+
+        Diagonalizing the small ``2N x 2N`` spin-mixing matrix replaces the
+        two independent spin channels above with ``2N`` SOC-split spinor
+        eigenstates; ``magnetic_moment`` here is each spinor's own
+        ``<S_z>``, not a single system-wide total.
+        """
+        lines = [
+            " Perturbative spin-orbit correction (pls.F90-style)",
+            " ---------------------------------------------------",
+            "",
+            "   State   Eigenvalue [Ry]      Eigenvalue [eV]   <S_z>",
+            "",
+        ]
+        for index, (eigenvalue, moment) in enumerate(
+            zip(result.eigenvalues, result.magnetic_moment), start=1
+        ):
+            lines.append(
+                f"{index:5d}   {eigenvalue:18.10f}"
+                f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
+                f" {moment:9.4f}"
+            )
+        lines.append("")
+        self.write("\n".join(lines))
+
+    def iteration_self_consistent_soc(self, step: "SelfConsistentSOCIteration") -> None:
+        """Per-iteration report for :func:`run_self_consistent_soc`.
+
+        Eigenvalues here are already SOC-split spinor states (one set, not
+        two spin channels), each holding at most one electron.
+        """
+        energies = step.energies
+        atom_count = len(self.problem.atoms)
+        energy_per_atom_ev = energies.total * RYDBERG_TO_EV / max(atom_count, 1)
+        lines = [
+            f" Self-consistent SOC iter # {step.iteration:3d}",
+            "",
+            f" Fermi level at {step.fermi_level:10.4f} [Ry]",
+            "",
+            *self._kpoint_note(),
+            "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.",
+            "",
+        ]
+        for index, (eigenvalue, occupation) in enumerate(
+            zip(step.eigenvalues, step.occupations), start=1
+        ):
+            lines.append(
+                f"{index:5d}   {eigenvalue:18.10f}"
+                f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
+                f" {occupation:9.4f}"
+            )
+        lines.extend(
+            [
+                "",
+                f"   Eigenvalue Energy             = {energies.eigenvalue:20.8f} [Ry]",
+                f"   Hartree Energy                = {energies.hartree:20.8f} [Ry]",
+                (
+                    "   Integral_{Vxc*rho}            = "
+                    f"{energies.integral_vxc_rho:20.8f} [Ry]"
+                ),
+                (
+                    "   Exc = Integral{eps_xc*rho}    = "
+                    f"{energies.exchange_correlation:20.8f} [Ry]"
+                ),
+                (
+                    "   Electron-Ion energy           = "
+                    f"{energies.electron_ion:20.8f} [Ry]"
+                ),
+                f"   Ion-Ion Energy                = {energies.ion_ion:20.8f} [Ry]",
+                "",
+                f"   Total Energy = {energies.total:22.8f} [Ry]",
+                f"   Energy/atom  = {energy_per_atom_ev:22.8f} [eV]",
+                "",
+                (
+                    f"  0-{step.iteration:3d}    "
+                    "SRE of pot. & charge weighted pot = "
+                    f"{step.plain_residual:14.10f}"
+                    f" {step.weighted_residual:14.10f}"
+                ),
+                "",
+            ]
+        )
+        self.write("\n".join(lines))
+
+    def finish_self_consistent_soc(
+        self, result: "SelfConsistentSOCResult", elapsed_seconds: float
+    ) -> None:
+        status = (
+            "Self-consistency convergence achieved."
+            if result.converged
+            else "Maximum SCF iterations reached without convergence."
+        )
+        lines = [
+            status,
+            "",
+            f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
+            "",
+            "Converged spin-orbit-split spinor states",
+            "",
+        ]
+        moments = np.asarray(result.magnetic_moment_per_state)
+        eigenvalues = np.asarray(result.eigenvalues)
+        occupations = np.asarray(result.occupations)
+        for block, header in self._k_blocks(result, eigenvalues.size):
+            lines.extend(header)
+            lines.append(
+                "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.    <S_z>"
+            )
+            lines.append("")
+            for index, (eigenvalue, occupation, moment) in enumerate(
+                zip(eigenvalues[block], occupations[block], moments[block]), start=1
+            ):
+                lines.append(
+                    f"{index:5d}   {eigenvalue:18.10f}"
+                    f"   {eigenvalue * RYDBERG_TO_EV:18.10f}"
+                    f" {occupation:9.4f} {moment:9.4f}"
+                )
+            lines.append("")
+        if result.magnetic_moment_vector is not None:
+            mx, my, mz = (float(v) for v in result.magnetic_moment_vector)
+            lines.extend(
+                [
+                    "",
+                    "Converged magnetic moment vector (mx, my, mz) = "
+                    f"{mx:10.4f} {my:10.4f} {mz:10.4f}   |m| = "
+                    f"{float(result.magnetic_moment):10.4f}",
+                ]
+            )
+        elif result.magnetic_moment is not None:
+            lines.extend(
+                [
+                    "",
+                    "Converged magnetic moment N_up - N_down = "
+                    f"{result.magnetic_moment:12.4f}",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                f"Total Energy = {result.energies.total:22.8f} [Ry]",
+                (
+                    "Energy/atom  = "
+                    f"{result.energies.total * RYDBERG_TO_EV / max(len(result.atoms), 1):22.8f} [eV]"
+                ),
+                "",
+                (
+                    "Forces, dipoles, and MPI statistics are not calculated by "
+                    "this Python single-point implementation."
+                ),
+                "",
+                " =================================================================",
+            ]
+        )
+        self.write("\n".join(lines))
+
+
+    def band_structure(self, result, files: Sequence[object] = (), elapsed_seconds: float = 0.0) -> None:
+        """Summary of the post-SCF band structure (Fortran ``calc_bands``)."""
+        counts = [int(value) for value in result.segment_counts]
+        states = result.eigenvalues.shape[2]
+        worst = float(np.max(result.residual_norms)) if result.residual_norms.size else 0.0
+        lines = [
+            " Band structure (non-self-consistent, Fortran calc_bands)",
+            " -------------------------------------------------------",
+            f" Hamiltonian                   : {result.mode}"
+            + (f" (channels: {', '.join(result.channels)})" if len(result.channels) > 1 else ""),
+            f" Segments / k-points / states  : {len(counts)} / {sum(counts)} / {states}",
+            f" Fermi level (SCF)             : {result.fermi_level:16.8f} [Ry]",
+            "",
+            "   Segment  Name                       k-points",
+        ]
+        for index, (count, name) in enumerate(zip(counts, result.segment_names), start=1):
+            lines.append(f"   {index:7d}  {name:<26s} {count:8d}")
+        lines.extend(
+            [
+                "",
+                f" Largest eigenpair residual |H v - e v| : {worst:12.4E} [Ry]",
+            ]
+        )
+        attempts = getattr(result, "attempts", None)
+        if attempts is not None and int(attempts.max()) > 1:
+            retried = int(np.count_nonzero(attempts > 1))
+            lines.append(
+                f" CHEBDAV re-solved {retried} k-point(s) with a larger block "
+                f"(up to {int(attempts.max())} attempts) to converge degenerate levels."
+            )
+        if worst > 1.0e-2:
+            if self.problem.eigensolver.method == "chebff":
+                advice = (
+                    "CHEBFF has no convergence test: increase FF_MaxIter and/or "
+                    "Chebdav_Degree, or use Eigensolver: chebdav."
+                )
+            else:
+                advice = (
+                    "the unconverged ones are usually the highest reported bands: raise "
+                    "States_Num or Subspace_Buffer_Size."
+                )
+            lines.append(" WARNING: some bands have a residual above 1e-2 Ry;")
+            lines.append(f"          {advice}")
+        if elapsed_seconds:
+            lines.append(f" Time for band structure [sec] : {elapsed_seconds:10.2f}")
+        for path in files:
+            lines.append(f" Wrote {path}")
+        lines.append("")
         self.write("\n".join(lines))
 
 

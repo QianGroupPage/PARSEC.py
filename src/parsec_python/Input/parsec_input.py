@@ -14,6 +14,8 @@ from ..models import (
     DEFAULT_INITIAL_SPIN_POLARIZATION,
     DEFAULT_RELAXATION_MAXIMUM_STEP,
     Atom,
+    BandSegment,
+    BandStructureSettings,
     EigensolverSettings,
     GridSettings,
     HartreeSettings,
@@ -26,6 +28,7 @@ from ..models import (
     PeriodicCell,
     PeriodicGridSettings,
 )
+from ..Grid.kpoints import explicit_kpoints, read_kpoint_file
 from ..MLDensity.field import normalize_density_units
 from ..MolecularDynamics.settings import MolecularDynamicsSettings
 
@@ -550,6 +553,11 @@ def _parse_parsec_input(
         "atom_coord",
         "domain_shape_parameters",
         "cell_shape",
+        "monkhorst_pack_grid",
+        "monkhorst_pack_shift",
+        "initial_ncl_moment",
+        "kpoint_list",
+        "bandstruc",
         "electron_per_orbital",
     }
     accepted_global = {
@@ -568,6 +576,13 @@ def _parse_parsec_input(
         "net_charges",
         "fermi_temp",
         "spin_polarization",
+        "scf_so",
+        "so_from_scratch",
+        "non_collinear_magnetism",
+        "kpoint_method",
+        "kpoint_unit",
+        "kpoint_file",
+        "bandstruc_points",
         "max_iter",
         "convergence_criterion",
         "use_plain_sre",
@@ -703,12 +718,18 @@ def _parse_parsec_input(
             "Boundary_Conditions=cluster requires Periodic_System=false"
         )
     spin_polarized = optional_bool("spin_polarization")
-    if spin_polarized and is_periodic:
-        raise UnsupportedParsecOptionError(
-            "Spin_Polarization with Boundary_Conditions=bulk: spin-polarized "
-            "calculations are implemented for isolated systems "
-            "(Boundary_Conditions: cluster) only"
-        )
+    noncollinear = optional_bool("non_collinear_magnetism")
+    # Fortran only actually routes through the complex spinor path when
+    # SO_from_scratch=true (or, a combination this port does not implement,
+    # Non_Collinear_magnetism=true together with SCF_SO or a species'
+    # SO_PSP).  SCF_SO=true alone is otherwise inert in Fortran -- it is only
+    # consulted inside that NCL branch.  Treating SCF_SO=true here as also
+    # requesting self-consistent SOC is a deliberate simplification (users
+    # asking for "self-consistent spin-orbit" by either name get the same
+    # behavior) rather than strict key-for-key Fortran fidelity.
+    self_consistent_spin_orbit = optional_bool("so_from_scratch") or optional_bool(
+        "scf_so"
+    )
     if optional_bool("dynamic_diag_tol"):
         raise UnsupportedParsecOptionError("Dynamic_Diag_Tol is not supported")
     if optional_bool("old_interpolation_format"):
@@ -741,15 +762,11 @@ def _parse_parsec_input(
         raise UnsupportedParsecOptionError(
             f"Correlation_Type={correlation!r}; supported choices are CA/PZ LDA and PBE"
         )
-    if is_periodic and xc_functional != "ca":
-        raise UnsupportedParsecOptionError(
-            "the periodic (Boundary_Conditions=bulk) path only supports "
-            "Correlation_Type=CA: PBE's density gradient assumes the "
-            "isolated domain's zero-padded boundary, which is wrong under "
-            "periodic wraparound"
-        )
 
     periodic_cell = None
+    monkhorst_pack_dimensions: tuple[int, int, int] | None = None
+    explicit_kpoint_array: np.ndarray | None = None
+    explicit_kpoint_weights: np.ndarray | None = None
     shape: str | None = None
     # Only the sphere of a cluster can leave its radius to the default rule.
     default_radius = False
@@ -764,7 +781,84 @@ def _parse_parsec_input(
             ),
             box_lengths=tuple(np.diag(periodic_cell.lattice_vectors))
         )
+        kpoint_method = _normalize_label(one("kpoint_method", "none"))
+        if kpoint_method == "mp":
+            mp_blocks = blocks.get("monkhorst_pack_grid", [])
+            if len(mp_blocks) != 1 or len(mp_blocks[0].value) != 1:
+                raise ParsecInputError(
+                    "Kpoint_Method=mp requires exactly one Monkhorst_Pack_Grid "
+                    "block with exactly one line of three integers"
+                )
+            values, unit = _block_numbers(mp_blocks[0].value, label="Monkhorst_Pack_Grid")
+            if len(values) != 3 or unit or any(value <= 0 for value in values):
+                raise ParsecInputError(
+                    "Monkhorst_Pack_Grid must contain exactly three positive integers"
+                )
+            monkhorst_pack_dimensions = tuple(int(value) for value in values)
+            if any(value != original for value, original in zip(monkhorst_pack_dimensions, values)):
+                raise ParsecInputError("Monkhorst_Pack_Grid values must be integers")
+            if "monkhorst_pack_shift" in blocks:
+                raise UnsupportedParsecOptionError(
+                    "Monkhorst_Pack_Shift is not supported; only an unshifted "
+                    "Monkhorst-Pack grid is implemented"
+                )
+        elif kpoint_method == "manual":
+            list_blocks = blocks.get("kpoint_list", [])
+            file_path = input_relative_path("kpoint_file")
+            if len(list_blocks) > 1:
+                raise ParsecInputError("provide a single Kpoint_List block")
+            if bool(list_blocks) == (file_path is not None):
+                raise ParsecInputError(
+                    "Kpoint_Method=manual requires exactly one of a Kpoint_List "
+                    "block or a Kpoint_File (rows of 'kx ky kz [weight]')"
+                )
+            try:
+                if list_blocks:
+                    rows = []
+                    for line in list_blocks[0].value:
+                        values, unit = _block_numbers((line,), label="Kpoint_List")
+                        if unit or len(values) not in (3, 4):
+                            raise ParsecInputError(
+                                f"line {list_blocks[0].line}: every Kpoint_List row "
+                                "must be 'kx ky kz' or 'kx ky kz weight'"
+                            )
+                        rows.append(list(values))
+                    if len({len(row) for row in rows}) != 1:
+                        raise ParsecInputError(
+                            "every Kpoint_List row must have the same number of columns"
+                        )
+                    raw_kpoints = np.asarray(rows, dtype=float)
+                else:
+                    raw_kpoints = read_kpoint_file(file_path)
+                explicit_kpoint_array, explicit_kpoint_weights = explicit_kpoints(
+                    raw_kpoints,
+                    unit=_normalize_label(one("kpoint_unit", "cartesian_inverse_bohr")),
+                    cell=periodic_cell,
+                )
+            except (OSError, ValueError) as error:
+                raise ParsecInputError(f"Kpoint_Method=manual: {error}") from error
+            if not np.allclose(explicit_kpoint_weights, explicit_kpoint_weights[0]):
+                raise UnsupportedParsecOptionError(
+                    "Kpoint_Method=manual with unequal sampling weights is not "
+                    "supported yet: the SCF drivers pool every k-point into one "
+                    "Fermi level and need equal weights (an unreduced uniform "
+                    "sample).  Give equal weights, or omit the weight column"
+                )
+        elif kpoint_method != "none":
+            raise ParsecInputError(
+                f"Kpoint_Method must be 'none', 'mp', or 'manual', got {kpoint_method!r}"
+            )
+        if kpoint_method != "manual" and (
+            "kpoint_list" in blocks or "kpoint_file" in scalar or "kpoint_unit" in scalar
+        ):
+            raise ParsecInputError(
+                "Kpoint_List/Kpoint_File/Kpoint_Unit require Kpoint_Method: manual"
+            )
     else:
+        if "kpoint_list" in blocks or "kpoint_file" in scalar or "kpoint_unit" in scalar:
+            raise ParsecInputError(
+                "Kpoint_List/Kpoint_File/Kpoint_Unit apply only to periodic systems"
+            )
         shape = _normalize_label(one("cluster_domain_shape", "sphere"))
         spacing = _physical_length(one("grid_spacing"), label="Grid_Spacing")
         # A sphere whose radius the input leaves out, or gives as "auto", gets
@@ -860,6 +954,16 @@ def _parse_parsec_input(
             )
         return default
 
+    moment_blocks = blocks.get("initial_ncl_moment", [])
+    if moment_blocks and not noncollinear:
+        raise ParsecInputError(
+            "Initial_NCL_Moment blocks require Non_Collinear_magnetism: .true."
+        )
+    if moment_blocks and len(moment_blocks) != declared_types:
+        raise ParsecInputError(
+            f"expected {declared_types} Initial_NCL_Moment blocks (one per "
+            f"Atom_Type, in order), found {len(moment_blocks)}"
+        )
     minimization = _normalize_label(one("minimization", "none"))
     if minimization == "":
         minimization = "none"
@@ -903,11 +1007,10 @@ def _parse_parsec_input(
             raise ParsecInputError(
                 f"Atom_Type {symbol}: Local_Component must be s, p, d, or f"
             )
-        if _boolean(
+        spin_orbit = _boolean(
             species_value("so_psp", species_index, "false"),
             label=f"{symbol} SO_PSP",
-        ):
-            raise UnsupportedParsecOptionError("spin-orbit pseudopotentials are not supported")
+        )
         read_vcd = _boolean(
             species_value("read_vcd", species_index, "false"),
             label=f"{symbol} Read_VCD",
@@ -970,9 +1073,30 @@ def _parse_parsec_input(
             use_spline=use_spline,
             element_symbol=element_symbol,
             atomic_energy_correction=correction,
+            spin_orbit=spin_orbit,
             initial_spin_polarization=polarization,
             **format_input,
         )
+
+        species_moments: list[np.ndarray | None] = [None] * len(coordinate_item.value)
+        if moment_blocks:
+            moment_item = moment_blocks[species_index]
+            if len(moment_item.value) != len(coordinate_item.value):
+                raise ParsecInputError(
+                    f"Atom_Type {symbol}: Initial_NCL_Moment has "
+                    f"{len(moment_item.value)} rows but there are "
+                    f"{len(coordinate_item.value)} atoms of this type"
+                )
+            for row_index, moment_line in enumerate(moment_item.value):
+                moment_values, moment_unit = _block_numbers(
+                    (moment_line,), label=f"{symbol} Initial_NCL_Moment"
+                )
+                if moment_unit or len(moment_values) != 3:
+                    raise ParsecInputError(
+                        f"line {moment_item.line}: every Initial_NCL_Moment row "
+                        "must contain exactly three numbers"
+                    )
+                species_moments[row_index] = np.asarray(moment_values, dtype=float)
 
         # Move_Flag of usrinputfile.F90: 0 (default) moves every atom of the
         # type; n > 0 moves its first n atoms; a negative value reads a
@@ -1013,7 +1137,11 @@ def _parse_parsec_input(
                 moves = values[3] == 1.0
             movable.append(moves)
             atoms.append(
-                Atom(symbol, np.asarray(values[:3], dtype=float) * coordinate_factor)
+                Atom(
+                    symbol,
+                    np.asarray(values[:3], dtype=float) * coordinate_factor,
+                    initial_moment=species_moments[row_index],
+                )
             )
         if not any(atom.symbol == symbol for atom in atoms):
             raise ParsecInputError(f"Atom_Type {symbol} has an empty Atom_Coord block")
@@ -1036,6 +1164,20 @@ def _parse_parsec_input(
             "Read_VCD is set and the last Atom_Type has a martins_old "
             "pseudopotential: PARSEC stops there, because it tests the format "
             "of the last Atom_Type; put a martins_new Atom_Type last"
+        )
+
+    if (
+        is_periodic
+        and any(specification.spin_orbit for specification in specifications.values())
+        and not self_consistent_spin_orbit
+        and not noncollinear
+    ):
+        raise UnsupportedParsecOptionError(
+            "SO_PSP=true with a periodic Boundary_Conditions is only supported "
+            "together with SO_from_scratch/SCF_SO=true (self-consistent SOC, "
+            "run_self_consistent_soc_kpoints); the default perturbative "
+            "spin-orbit correction does not yet handle periodic k-point "
+            "sampling"
         )
 
     warnings: list[str] = list(coordinate_notes)
@@ -1280,6 +1422,12 @@ def _parse_parsec_input(
             "normalize_initial_density", True
         ),
         xc_functional=xc_functional,
+        self_consistent_spin_orbit=self_consistent_spin_orbit
+        or (
+            noncollinear
+            and any(specification.spin_orbit for specification in specifications.values())
+        ),
+        noncollinear=noncollinear,
     )
 
     initial_labels = []
@@ -1430,6 +1578,47 @@ def _parse_parsec_input(
             "and may be expensive."
         )
 
+    band_settings: BandStructureSettings | None = None
+    band_blocks = blocks.get("bandstruc", [])
+    if band_blocks or "bandstruc_points" in scalar:
+        if not is_periodic:
+            raise ParsecInputError("bandstruc applies only to periodic systems")
+        if len(band_blocks) != 1:
+            raise ParsecInputError(
+                "bandstruc_points requires exactly one bandstruc block"
+                if not band_blocks
+                else "provide a single bandstruc block"
+            )
+        segments = []
+        for line in band_blocks[0].value:
+            tokens = line.replace("\t", " ").split()
+            try:
+                if len(tokens) < 7:
+                    raise ValueError("expected 'n kx0 ky0 kz0 kx1 ky1 kz1 label'")
+                int(tokens[0])
+                numbers = [float(token.lower().replace("d", "e")) for token in tokens[1:7]]
+                segments.append(
+                    BandSegment(
+                        start=tuple(numbers[:3]),
+                        end=tuple(numbers[3:]),
+                        name=" ".join(tokens[7:]),
+                    )
+                )
+            except ValueError as error:
+                raise ParsecInputError(
+                    f"bandstruc line {band_blocks[0].line}: {error}; every line is "
+                    "'n kx0 ky0 kz0 kx1 ky1 kz1 label' in reciprocal-lattice coordinates"
+                ) from error
+        points = _integer(one("bandstruc_points", "20"), label="Bandstruc_Points")
+        try:
+            band_settings = BandStructureSettings(segments=tuple(segments), points=points)
+        except ValueError as error:
+            raise ParsecInputError(f"bandstruc: {error}") from error
+        if periodic_cell is not None and not np.allclose(
+            periodic_cell.lattice_vectors, np.diag(np.diag(periodic_cell.lattice_vectors))
+        ):
+            raise UnsupportedParsecOptionError("bandstruc needs an orthorhombic cell")
+
     domain_energy_tolerance = _energy_rydberg(
         one("domain_energy_tolerance", "1e-3 Ry"), label="Domain_Energy_Tolerance"
     )
@@ -1530,6 +1719,10 @@ def _parse_parsec_input(
         mixing=mixing,
         initial_density_settings=initial_density_settings,
         recenter_geometry=recenter and not is_periodic,
+        monkhorst_pack_dimensions=monkhorst_pack_dimensions,
+        kpoints=explicit_kpoint_array,
+        kpoint_weights=explicit_kpoint_weights,
+        bands=band_settings,
     )
     return ParsecInputTranslation(
         source=source,

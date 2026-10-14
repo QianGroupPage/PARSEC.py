@@ -440,17 +440,6 @@ class SpinInputTests(unittest.TestCase):
         with self.assertRaisesRegex(UnsupportedParsecOptionError, "Perdew-Wang LSDA"):
             self.parse(self.cases["ch3_ca"], drop=("Correlation_Type",))
 
-    def test_periodic_cell_is_refused(self) -> None:
-        from parsec_python.Input import UnsupportedParsecOptionError
-
-        with self.assertRaisesRegex(UnsupportedParsecOptionError, "isolated systems"):
-            self.parse(
-                self.cases["h_fixed_ca"],
-                "Boundary_Conditions: bulk",
-                "Periodic_System: true",
-                drop=("Fermi_Temp",),
-            )
-
     def test_imported_starting_density_is_refused(self) -> None:
         translation = self.parse(
             self.cases["h_fixed_ca"],

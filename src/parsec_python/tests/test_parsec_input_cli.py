@@ -420,11 +420,6 @@ class PeriodicAndClusterInputTests(unittest.TestCase):
         periodic = HYDROGEN_INPUT.format(domain=PERIODIC_DOMAIN)
         for old, new, message in (
             (
-                "Correlation_Type: ca",
-                "Correlation_Type: pbe",
-                "only supports Correlation_Type=CA",
-            ),
-            (
                 "Periodic_System: .true.\n",
                 "",
                 "Periodic_System and Boundary_Conditions disagree",

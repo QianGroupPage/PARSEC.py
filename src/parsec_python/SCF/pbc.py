@@ -14,7 +14,7 @@ import scipy.sparse as sp
 from ..Grid.pbc import PeriodicRealSpaceGrid, build_periodic_grid
 from ..Hamiltonian import KohnShamHamiltonian
 from ..Hartree.pbc import PeriodicHartreeResult, solve_periodic_hartree
-from ..Laplacian import build_negative_laplacian
+from ..Laplacian import build_gradient, build_negative_laplacian
 from ..models import (
     PreparationTimings,
     SCFIteration,
@@ -33,7 +33,16 @@ from ..V_ion import (
     normalize_density,
     superpose_atomic_density,
 )
-from ..V_xc import XCResult, ca_lda
+from ..V_xc import (
+    NoncollinearXCResult,
+    SpinPolarizedXCResult,
+    XCResult,
+    ca_lda,
+    ca_lda_spin_polarized,
+    pbe,
+    noncollinear_xc,
+    pbe_spin_polarized,
+)
 from .single_point import run_scf as _run_scf
 
 
@@ -48,6 +57,7 @@ class PeriodicPreparedSinglePointSystem:
     pseudopotentials: dict[str, ParsecPseudopotential]
     grid: PeriodicRealSpaceGrid
     negative_laplacian: sp.csr_matrix
+    gradient: tuple[sp.csr_matrix, sp.csr_matrix, sp.csr_matrix]
     ionic_potential: np.ndarray
     nonlocal_operator: NonlocalProjectorOperator
     initial_density: np.ndarray
@@ -96,11 +106,38 @@ class PeriodicPreparedSinglePointSystem:
 
         if self.input.scf.xc_functional == "ca":
             return ca_lda(density, self.grid.volume_element, self.core_density)
+        if self.input.scf.xc_functional == "pbe":
+            return pbe(density, self.grid, self.core_density)
         raise NotImplementedError(
             f"xc_functional={self.input.scf.xc_functional!r} is not supported for "
-            "the periodic path: pbe's density gradient zero-pads outside the "
-            "active domain (the isolated convention), not periodic wraparound"
+            "the periodic path"
         )
+
+    def evaluate_xc_spin_polarized(
+        self, density_up: np.ndarray, density_down: np.ndarray
+    ) -> SpinPolarizedXCResult:
+        """Collinear spin-polarized XC (LSDA or PBE) including frozen NLCC."""
+
+        functional = self.input.scf.xc_functional
+        if functional == "ca":
+            return ca_lda_spin_polarized(
+                density_up,
+                density_down,
+                self.grid.volume_element,
+                self.core_density,
+            )
+        if functional == "pbe":
+            return pbe_spin_polarized(
+                density_up, density_down, self.grid, self.core_density
+            )
+        raise ValueError(f"unsupported XC functional {functional!r}")
+
+    def evaluate_xc_noncollinear(
+        self, density: np.ndarray, magnetization: np.ndarray
+    ) -> NoncollinearXCResult:
+        """Non-collinear XC (``V_avg`` and ``B_xc``) from ``n`` and ``m(r)``."""
+
+        return noncollinear_xc(density, magnetization, self.evaluate_xc_spin_polarized)
 
 
 def prepare_periodic_single_point(
@@ -119,12 +156,6 @@ def prepare_periodic_single_point(
     """
     if problem.periodic_cell is None:
         raise ValueError("prepare_periodic_single_point requires problem.periodic_cell")
-    if problem.scf.spin_polarized:
-        raise NotImplementedError(
-            "spin-polarized calculations are implemented for isolated systems "
-            "only, not for a periodic cell"
-        )
-
     preparation_start = time.perf_counter()
     # 1. Geometry, pseudopotentials, and electron count.
     atoms = tuple(problem.atoms)
@@ -157,6 +188,11 @@ def prepare_periodic_single_point(
 
     stage_start = time.perf_counter()
     negative_laplacian = build_negative_laplacian(grid)
+    # Only needed for k-point sampling's -2i*k.grad kinetic term
+    # (Hamiltonian.kpoint_operator); computed unconditionally here since it
+    # is cheap relative to the Laplacian and keeps this prepared system
+    # self-contained for either the Gamma-only or k-point SCF path.
+    gradient = build_gradient(grid)
     finite_difference_seconds = time.perf_counter() - stage_start
 
     # 3. Local and Kleinman--Bylander nonlocal ionic terms.
@@ -245,6 +281,7 @@ def prepare_periodic_single_point(
         pseudopotentials=pseudopotentials,
         grid=grid,
         negative_laplacian=negative_laplacian,
+        gradient=gradient,
         ionic_potential=ionic_potential,
         nonlocal_operator=nonlocal_operator,
         initial_density=initial_density,

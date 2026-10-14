@@ -11,12 +11,16 @@ from .single_point import (
     update_geometry,
     warm_start_for_moved_atoms,
 )
-from .spin_polarized import run_spin_scf
+from .spin_polarized import run_scf_spin_polarized, run_spin_scf
+from .self_consistent_soc import run_self_consistent_soc
+from .self_consistent_soc_spin_polarized import run_self_consistent_soc_spin_polarized
 
 from .pbc import (
     PeriodicPreparedSinglePointSystem,
     prepare_periodic_single_point,
 )
+from .kpoints import run_scf_kpoints
+from .kpoints_soc import run_self_consistent_soc_kpoints
 
 __all__ = [
     "PreparedSinglePointSystem",
@@ -25,10 +29,15 @@ __all__ = [
     "initial_spin_densities",
     "prepare_single_point",
     "run_scf",
+    "run_scf_spin_polarized",
+    "run_self_consistent_soc",
+    "run_self_consistent_soc_spin_polarized",
     "run_spin_scf",
     "state_for_new_potential",
     "update_geometry",
     "warm_start_for_moved_atoms",
     "PeriodicPreparedSinglePointSystem",
     "prepare_periodic_single_point",
+    "run_scf_kpoints",
+    "run_self_consistent_soc_kpoints",
 ]

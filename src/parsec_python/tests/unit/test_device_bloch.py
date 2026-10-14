@@ -157,9 +157,9 @@ class BackendSelectionTests(unittest.TestCase):
             os.environ.pop("PARSEC_KPOINT_BACKEND", None)
             self.assertEqual(resolve_kpoint_backend().name, "cpu")
 
-    def test_numpy_device_uses_threads(self) -> None:
+    def test_numpy_device_is_a_device_backend(self) -> None:
         plan = resolve_kpoint_backend("numpy-device")
-        self.assertEqual((plan.name, plan.pool_kind, plan.uses_device), ("numpy-device", "thread", True))
+        self.assertEqual((plan.name, plan.uses_device), ("numpy-device", True))
         self.assertIsNotNone(plan.converter(0))
 
     def test_auto_falls_back_to_cpu_without_cupy_and_cupy_is_an_error(self) -> None:

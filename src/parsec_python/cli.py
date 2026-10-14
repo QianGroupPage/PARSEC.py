@@ -540,7 +540,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N|auto",
         help=(
-            "worker processes for the k-points of a periodic SCF and for the band path "
+            "worker threads for the k-points of a periodic SCF and for the band path "
             "(default: PARSEC_KPOINT_WORKERS, else auto = half the CPUs, serial for small "
             "problems)"
         ),

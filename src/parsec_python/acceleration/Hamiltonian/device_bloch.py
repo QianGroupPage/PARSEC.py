@@ -402,7 +402,6 @@ class KPointBackend:
     """Resolved execution backend of a k-point/band calculation."""
 
     name: str  # "cpu", "cupy" or "numpy-device"
-    pool_kind: str  # "process" for cpu, "thread" for device backends
     device_ids: tuple[int, ...] = ()
 
     @property
@@ -449,16 +448,16 @@ def resolve_kpoint_backend(requested: str | None = None) -> KPointBackend:
     """
     name = (requested or os.environ.get(BACKEND_ENV, "cpu")).strip().lower()
     if name == "cpu":
-        return KPointBackend("cpu", "process")
+        return KPointBackend("cpu")
     if name == "numpy-device":
-        return KPointBackend("numpy-device", "thread", (0,))
+        return KPointBackend("numpy-device", (0,))
     if name in ("cupy", "auto"):
         try:
-            return KPointBackend("cupy", "thread", _cupy_device_ids())
+            return KPointBackend("cupy", _cupy_device_ids())
         except Exception:
             if name == "cupy":
                 raise
-            return KPointBackend("cpu", "process")
+            return KPointBackend("cpu")
     raise ValueError(f"{BACKEND_ENV} must be cpu, cupy, auto or numpy-device, got {name!r}")
 
 

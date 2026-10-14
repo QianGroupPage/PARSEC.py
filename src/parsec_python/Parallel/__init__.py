@@ -6,7 +6,6 @@ from .pool import (
     WorkerError,
     WorkerPool,
     available_cpus,
-    fork_available,
     make_pool,
     resolve_workers,
 )
@@ -16,7 +15,6 @@ __all__ = [
     "WorkerError",
     "WorkerPool",
     "available_cpus",
-    "fork_available",
     "make_pool",
     "resolve_workers",
     "set_blas_threads",

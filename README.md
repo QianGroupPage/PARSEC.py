@@ -349,16 +349,18 @@ round-off (the eigenvalues of a k-point are the same computation; densities diff
 order of the sum over k-points).
 
 ```bash
-python -m parsec_python.main parsec.in --kpoint-workers 8          # CPU worker processes
+python -m parsec_python.main parsec.in --kpoint-workers 8          # CPU worker threads
 python -m parsec_python.main parsec.in --kpoint-workers auto       # default: half the CPUs
 python -m parsec_python.main parsec.in --kpoint-backend cupy       # GPUs, see below
 ```
 
 or the environment variables `PARSEC_KPOINT_WORKERS` (`auto` or a number; `auto` stays serial for a
-single k-point, for small grids, and without `fork`) and `PARSEC_KPOINT_BACKEND`.
-The workers are forked processes (Linux/macOS), each given `cpus / workers` BLAS threads. The sparse
-Bloch operators are memory-bandwidth bound, so the gain depends on the machine: about 1.8x for 8
-workers on a 4-P-core + 8-E-core laptop (4-atom Co, 28^3 grid, 44 spinor states, 8 k-points),
+single k-point and for small grids) and `PARSEC_KPOINT_BACKEND`.
+The workers are threads of one process, as in the multi-GPU solver (there is no `fork`, which is
+unsafe after the native OpenMP kernels or a CUDA context exist); the NumPy/SciPy/BLAS kernels release
+the GIL, and the workers share the BLAS threads of the process. The sparse Bloch operators are
+memory-bandwidth bound, so the gain depends on the machine: 2.9x for 8 workers and 1.9x for 4 on a
+4-P-core + 8-E-core laptop (4-atom Co, 28^3 grid, 44 spinor states, 8 k-points, 3 SCF iterations),
 more on a server with more memory channels. Memory grows with the number of workers only through
 each worker's own k-points.
 

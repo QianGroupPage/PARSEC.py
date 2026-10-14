@@ -36,7 +36,6 @@ import numpy as np
 from ..Eigensolvers import EigvalSettings, solve_eigval
 from ..Parallel import WORKERS_ENV, make_pool
 
-POOL_ENV = "PARSEC_KPOINT_POOL"  # "process" (default) or "thread"
 
 
 @dataclass
@@ -139,25 +138,18 @@ class KPointSolver:
         job: KPointJob,
         *,
         workers: int | str | None = None,
-        kind: str | None = None,
         problem_size: int | None = None,
         backend: str | None = None,
     ) -> None:
         self.job = job
         plan = resolve_backend(backend)
         if plan is not None:
-            kind = plan.pool_kind
             workers = device_worker_count(plan, job.n_tasks)
-        kind = kind or os.environ.get(POOL_ENV, "process")
-        if kind == "thread" and not isinstance(workers, int):
-            requested = os.environ.get(WORKERS_ENV, "1")
-            workers = int(requested) if requested.strip().isdigit() else 1
         self.backend = plan.name if plan is not None else "cpu"
         self.pool = make_pool(
             range(job.n_tasks),
             lambda tasks, index: _SolveWorker(job, tasks, index, plan),
             workers=workers,
-            kind=kind,
             problem_size=problem_size,
         )
 

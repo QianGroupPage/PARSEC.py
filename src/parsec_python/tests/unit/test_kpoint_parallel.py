@@ -1,7 +1,7 @@
 """Parallel k-point solution reproduces the serial SCF.
 
 Each k-point (and spin channel) is an independent eigenproblem, so spreading
-them over worker processes or threads must give the same eigenvalues exactly
+them over worker threads must give the same eigenvalues exactly
 and the same density, energy and moments to round-off (the density sums its
 k-point contributions in a different order).  All five periodic drivers are
 checked on a small Au cell with four k-points.
@@ -26,7 +26,7 @@ from parsec_python import (
     SinglePointInput,
     SpeciesPotential,
 )
-from parsec_python.Parallel import available_cpus, fork_available, resolve_workers
+from parsec_python.Parallel import available_cpus, resolve_workers
 from parsec_python.SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_polarized
 from parsec_python.SCF.kpoints_soc import (
     run_self_consistent_soc_kpoints,
@@ -74,11 +74,9 @@ DRIVERS = {
 }
 
 
-def _run(name: str, workers: str, pool: str = "process"):
+def _run(name: str, workers: str):
     driver, flags, soc = DRIVERS[name]
-    with mock.patch.dict(
-        os.environ, {"PARSEC_KPOINT_WORKERS": workers, "PARSEC_KPOINT_POOL": pool}
-    ):
+    with mock.patch.dict(os.environ, {"PARSEC_KPOINT_WORKERS": workers}):
         return driver(_system(soc=soc, **flags), _K, _WEIGHTS)
 
 
@@ -106,9 +104,8 @@ def _assert_same(case: unittest.TestCase, serial, parallel) -> None:
         np.testing.assert_allclose(parallel.spinors.shape, serial.spinors.shape)
 
 
-@unittest.skipUnless(fork_available(), "worker processes need fork")
 class ParallelDriversMatchSerialTests(unittest.TestCase):
-    def test_each_driver_with_two_worker_processes(self) -> None:
+    def test_each_driver_with_two_workers(self) -> None:
         for name in DRIVERS:
             with self.subTest(driver=name):
                 _assert_same(self, _run(name, "1"), _run(name, "2"))
@@ -116,18 +113,12 @@ class ParallelDriversMatchSerialTests(unittest.TestCase):
     def test_three_workers_leave_an_uneven_split_of_four_k_points(self) -> None:
         _assert_same(self, _run("soc", "1"), _run("soc", "3"))
 
-    def test_thread_pool_matches_for_a_spinor_and_a_spin_channel_driver(self) -> None:
-        for name in ("soc", "spin_polarized"):
-            with self.subTest(driver=name):
-                _assert_same(self, _run(name, "1"), _run(name, "2", pool="thread"))
-
 
 class WorkerCountTests(unittest.TestCase):
     def test_auto_stays_serial_for_one_task_or_a_small_problem(self) -> None:
         self.assertEqual(resolve_workers("auto", 1), 1)
         self.assertEqual(resolve_workers("auto", 8, problem_size=1000), 1)
 
-    @unittest.skipUnless(fork_available(), "worker processes need fork")
     def test_explicit_count_is_capped_by_the_number_of_tasks(self) -> None:
         self.assertEqual(resolve_workers(16, 4), 4)
         self.assertEqual(resolve_workers(1, 4), 1)

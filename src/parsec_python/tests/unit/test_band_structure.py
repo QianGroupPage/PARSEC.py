@@ -443,7 +443,7 @@ class ParallelBandTests(unittest.TestCase):
             self.assertEqual(serial.k_points.shape[0], 7)
             for options in (
                 dict(workers=3),
-                dict(workers=2, pool_kind="thread"),
+                dict(workers=2),
                 dict(backend="numpy-device"),  # the GPU code path, on the host
             ):
                 with self.subTest(**options):

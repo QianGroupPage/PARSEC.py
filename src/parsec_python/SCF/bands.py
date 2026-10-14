@@ -166,7 +166,6 @@ def run_band_structure(
     residual_tolerance: float = 2.0e-2,
     max_attempts: int = 5,
     workers: int | str | None = None,
-    pool_kind: str | None = None,
     backend: str | None = None,
 ) -> BandStructureResult:
     """Diagonalize the SCF Hamiltonian along ``settings``' path.
@@ -180,10 +179,8 @@ def run_band_structure(
     first solver is never retried).
 
     The k-points of the path are independent, so they are spread over
-    ``workers`` worker processes (``None``: ``PARSEC_KPOINT_WORKERS``, default
-    automatic; see :mod:`parsec_python.Parallel`).  ``pool_kind`` is
-    ``"process"`` (default, or ``PARSEC_KPOINT_POOL``) or ``"thread"``.
-    ``backend`` (or ``PARSEC_KPOINT_BACKEND``) selects ``cpu`` (default),
+    ``workers`` worker threads (``None``: ``PARSEC_KPOINT_WORKERS``, default
+    automatic; see :mod:`parsec_python.Parallel`).  ``backend`` (or ``PARSEC_KPOINT_BACKEND``) selects ``cpu`` (default),
     ``cupy`` (one worker thread per CUDA device; the Hamiltonian and the
     Chebyshev filter run on the GPU), ``auto`` or ``numpy-device`` (the device
     code on the host).
@@ -297,9 +294,6 @@ def run_band_structure(
                 point_sigma = spin_expectation(vectors)
         return point_values, point_residuals, point_attempts, point_sigma
 
-    import os
-
-    from ..Parallel import WORKERS_ENV
     from .kpoint_parallel import device_worker_count, resolve_backend
 
     plan = resolve_backend(backend)
@@ -314,18 +308,12 @@ def run_band_structure(
             for k_index in self.tasks:
                 yield k_index, solve_point(k_points[k_index], self.converter)
 
-    kind = pool_kind or os.environ.get("PARSEC_KPOINT_POOL", "process")
     if plan is not None:
-        kind = plan.pool_kind
         workers = device_worker_count(plan, n_k)
-    if kind == "thread" and not isinstance(workers, int):
-        requested = os.environ.get(WORKERS_ENV, "1")
-        workers = int(requested) if requested.strip().isdigit() else 1
     with make_pool(
         range(n_k),
         _BandWorker,
         workers=workers,
-        kind=kind,
         problem_size=system.grid.size,
     ) as pool:
         for k_index, (values, point_residuals, point_attempts, point_sigma) in pool.stream(

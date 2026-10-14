@@ -60,6 +60,7 @@ python src\parsec_python\main.py examples\0d_Si28H36\parsec.in --dry-run
 | `0d_benzene` | Twelve-atom benzene cluster with exact symmetry; medium physical and timing comparison. | `python src\parsec_python\main.py examples\0d_benzene\parsec.in --no-archive` |
 | `0d_naphthalene` | Eighteen-atom naphthalene benchmark used for GPU/C++ and symmetry optimization. | `python src\parsec_python\main.py examples\0d_naphthalene\parsec.in --no-archive` |
 | `0d_Si28H36` | Larger hydrogen-passivated silicon cluster; use this after validating the environment on a smaller case. | `python src\parsec_python\main.py examples\0d_Si28H36\parsec.in --no-archive` |
+| `0d_nanodiamonds` | Hydrogen-terminated nanodiamonds from C1H4 to C9449H1572 (up to 39,368 valence electrons): Fortran PARSEC comparisons up to C795H300 and the multi-GPU benchmark series with A100 reference times and memory. | See [`0d_nanodiamonds/README.md`](0d_nanodiamonds/README.md). |
 | `0_CH4_CF4` | ARES comparison, FHI98PP-generated ordinary/core-hole potentials, and four spin-unpolarized PBE delta-SCF inputs. | See the core-hole commands below. |
 | `ml_initial_density` | Fourteen-molecule SAD/SCDP/ChargE3Net suite with portable predicted densities and CHEBFF/CHEBDAV reference outputs. | See [`ml_initial_density/README.md`](ml_initial_density/README.md). |
 | `3d_Si` | Periodic boundary conditions for bulk silicon with an 8 atom conventional unit cell | `python src\parsec_python\main.py examples\3d_Si\parsec.in --no-archive` |

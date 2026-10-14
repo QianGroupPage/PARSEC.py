@@ -1,0 +1,71 @@
+# Original Fortran PARSEC timing comparison
+# Case: k00_C1H4
+# Fresh atomic-potential (SAD-equivalent) initialization
+# Prepared from the matched Python SAD input; physics settings unchanged
+
+Restart_run: false
+
+# CA-LDA initial-density comparison using a GFN2-xTB optimized nanodiamond
+# Formula: CH4
+# Initial density: sad
+# Radial vacuum beyond the outermost atom: >= 5.0 ang
+
+Boundary_Conditions: cluster
+Cluster_Domain_Shape: sphere
+Boundary_Sphere_Radius: 6.1 ang
+Grid_Spacing: 0.20 ang
+Expansion_Order: 8
+Coordinate_Unit: Cartesian_Ang
+Ignore_Symmetry: false
+
+Atom_Types_Num: 2
+Total_Atom_Num: 5
+
+Atom_Type: C
+Pseudopotential_Format: martins_new
+Local_Component: p
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  -0.0000000001  -0.0000000001  0.0000000002
+end Atom_Coord
+
+Atom_Type: H
+Pseudopotential_Format: martins_new
+Local_Component: s
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  -0.6247894608  -0.6247894608  -0.6247894608
+  -0.6247894608  0.6247894607  0.6247894608
+  0.6247894608  -0.6247894608  0.6247894608
+  0.6247894608  0.6247894608  -0.6247894608
+end Atom_Coord
+
+Correlation_Type: ca
+Spin_Polarization: false
+States_Num: 16
+Net_Charges: 0 e
+Fermi_Temp: 500 K
+Max_Iter: 50
+Convergence_Criterion: 2e-4 Ry
+
+Eigensolver: chebdav
+Chebdav_Degree: 15
+FF_MaxIter: 2
+Matvec_Blocksize: 6
+Chebyshev_Degree: 10
+Chebyshev_Degree_Delta: 3
+Subspace_Buffer_Size: 6
+Diag_Tolerance: 1e-4
+
+Mixing_Method: Anderson
+Mixing_Param: 0.30
+Memory_Param: 4
+Restart_Mixing: 20
+Solver_Lpole: 9
+Full_Hartree: false
+
+
+Output_Level: 1
+Output_All_States: false

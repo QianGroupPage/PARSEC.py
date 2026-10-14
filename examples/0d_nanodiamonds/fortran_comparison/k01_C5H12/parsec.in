@@ -1,0 +1,87 @@
+# CA-LDA initial-density comparison using a GFN2-xTB optimized nanodiamond
+# Formula: C5H12
+# Initial density: sad
+# Radial vacuum beyond the outermost atom: >= 5.0 ang
+
+Boundary_Conditions: cluster
+Cluster_Domain_Shape: sphere
+Boundary_Sphere_Radius: 7.2 ang
+Grid_Spacing: 0.20 ang
+Expansion_Order: 8
+Coordinate_Unit: Cartesian_Ang
+Ignore_Symmetry: false
+
+Atom_Types_Num: 2
+Total_Atom_Num: 17
+
+Atom_Type: C
+Element_Symbol: C
+Pseudopotential_Format: martins_new
+Local_Component: p
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  0.0000000003  -0.0000000002  -0.0000000002
+  -0.8833957169  -0.8833957168  -0.8833957167
+  -0.8833957166  0.8833957164  0.8833957165
+  0.8833957168  -0.8833957170  0.8833957170
+  0.8833957169  0.8833957170  -0.8833957170
+end Atom_Coord
+
+Atom_Type: H
+Element_Symbol: H
+Pseudopotential_Format: martins_new
+Local_Component: s
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  -1.5200397207  -1.5200397207  -0.2727540205
+  -1.5200397207  -0.2727540206  -1.5200397205
+  -0.2727540207  -1.5200397206  -1.5200397205
+  -1.5200397204  0.2727540202  1.5200397203
+  -1.5200397204  1.5200397202  0.2727540203
+  -0.2727540204  1.5200397202  1.5200397203
+  0.2727540206  -1.5200397208  1.5200397208
+  1.5200397205  -1.5200397207  0.2727540208
+  1.5200397206  -0.2727540208  1.5200397208
+  0.2727540207  1.5200397208  -1.5200397208
+  1.5200397207  0.2727540208  -1.5200397207
+  1.5200397207  1.5200397208  -0.2727540208
+end Atom_Coord
+
+Correlation_Type: ca
+Spin_Polarization: false
+States_Num: 23
+Net_Charges: 0 e
+Fermi_Temp: 500 K
+Max_Iter: 50
+Convergence_Criterion: 2e-4 Ry
+
+# PARSEC's Hartree boundary (multipoles up to Solver_Lpole = 9, no atomic tail), as in the
+# Fortran run beside this input. Without this line the code chooses the multipole order for a
+# boundary error of 1e-3 Ry, and the total energy of the larger clusters moves (C795H300: 3.2e-2 Ry).
+Hartree_Boundary_Tolerance: off
+
+
+Eigensolver: chebdav
+Chebdav_Degree: 15
+FF_MaxIter: 2
+Matvec_Blocksize: 6
+Chebyshev_Degree: 10
+Chebyshev_Degree_Delta: 3
+Subspace_Buffer_Size: 6
+Diag_Tolerance: 1e-4
+
+Mixing_Method: Anderson
+Mixing_Param: 0.30
+Memory_Param: 4
+Restart_Mixing: 20
+Solver_Lpole: 9
+Full_Hartree: false
+
+Initial_Density: sad
+Normalize_Initial_Density: true
+
+Skip_Force: true
+Output_Level: 1
+Output_All_States: false

@@ -608,8 +608,9 @@ threads per device (`OPENBLAS_NUM_THREADS`, the thread pool shares them out by d
 `python -m parsec_python.acceleration.benchmarks.check_gpu_kpoints` compares the device operator, the filter, a short non-collinear
 spin-orbit SCF and a short band path against the CPU and times them; run it first on a GPU node.
 It needs `cupy`; `--backend numpy-device` runs the same device code on the host. This is a first
-version of the GPU path: it has been checked on the host with NumPy standing in for CuPy, not yet on
-a CUDA device.
+version of the GPU path: `check_gpu_kpoints` passes on an NVIDIA A100-SXM4-80GB with CuPy 14.2.0
+(operator, filter, a short non-collinear spin-orbit SCF and a band path against the CPU); other
+devices and multi-GPU runs have not been checked yet.
 
 ## Band structures (periodic systems)
 

@@ -625,6 +625,22 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                 file=sys.stderr,
             )
             return 2
+        problem = translation.problem
+        reference_uses_gpu = (
+            problem.periodic_cell is not None
+            or problem.has_kpoint_sampling
+            or problem.bands is not None
+        )
+        if resources.device == "gpu" and not reference_uses_gpu:
+            # Only the k-point drivers and band paths of the reference solver have a GPU
+            # path; anything else would run on the CPU under a request for the GPU.
+            print(
+                f"Input error: {features} cannot run on the GPU here (the accelerated "
+                "path does not cover it, or CuPy is not usable), and the reference "
+                "solver it would fall back to uses no GPU; use --device cpu or auto",
+                file=sys.stderr,
+            )
+            return 2
         print(
             f"NOTE: {features} is not implemented on the accelerated path; "
             "running the reference parsec_python.cli solver instead",

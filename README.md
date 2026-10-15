@@ -590,7 +590,7 @@ or the environment variables `PARSEC_KPOINT_WORKERS` (`auto` or a number; `auto`
 single k-point and for small grids) and `PARSEC_KPOINT_BACKEND` (`cpu`, `cupy`, `auto`, `numpy-device`; an explicit override of `--device`).
 The workers are threads of one process, as in the multi-GPU solver (there is no `fork`, which is
 unsafe after the native OpenMP kernels or a CUDA context exist); the NumPy/SciPy/BLAS kernels release
-the GIL, and the workers share the BLAS threads of the process. The sparse Bloch operators are
+the GIL, and each worker runs a single-threaded BLAS (a multi-threaded BLAS called from several threads at once gave wrong eigenpairs; the BLAS thread count is restored when the pool closes). The sparse Bloch operators are
 memory-bandwidth bound, so the gain depends on the machine: 2.9x for 8 workers and 1.9x for 4 on a
 4-P-core + 8-E-core laptop (4-atom Co, 28^3 grid, 44 spinor states, 8 k-points, 3 SCF iterations),
 more on a server with more memory channels. Memory grows with the number of workers only through
@@ -603,8 +603,7 @@ thread drives each CUDA device (`PARSEC_CUPY_DEVICES=auto|current|0,1,...` as in
 solver), the k-points are dealt out round-robin, and the eigensolver itself (CHEBFF, CHEBDAV,
 SUBSPACE: orthonormalization, Rayleigh-Ritz) is the unchanged CPU code, so a filter call costs one
 upload and one download of a block of vectors. Static matrices (Laplacian, projectors) are uploaded
-once per device; an SCF step uploads only the local potential and fields. Give the host BLAS a few
-threads per device (`OPENBLAS_NUM_THREADS`, the thread pool shares them out by default).
+once per device; an SCF step uploads only the local potential and fields. The host BLAS runs one thread per device worker.
 `python -m parsec_python.acceleration.benchmarks.check_gpu_kpoints` compares the device operator, the filter, a short non-collinear
 spin-orbit SCF and a short band path against the CPU and times them; run it first on a GPU node.
 It needs `cupy`; `--backend numpy-device` runs the same device code on the host. This is a first

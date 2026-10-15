@@ -281,13 +281,26 @@ def run_band_structure(
                 else hamiltonian.as_linear_operator()
             )
             best = None
+            failure = None
             for attempt in range(max_attempts if can_retry else 1):
-                trial = solve(operator, attempt)
+                try:
+                    trial = solve(operator, attempt)
+                except FloatingPointError as error:
+                    # A diverged Chebyshev recurrence (a bad spectral bound from an
+                    # unlucky start vector): try again with another block size and seed.
+                    failure = error
+                    point_attempts[channel] = attempt + 1
+                    continue
                 point_attempts[channel] = attempt + 1
                 if best is None or trial[2] < best[2]:
                     best = trial
                 if trial[2] <= residual_tolerance:
                     break
+            if best is None:
+                raise FloatingPointError(
+                    f"band k-point at {np.round(k_point, 6).tolist()}: every one of "
+                    f"{point_attempts[channel]} diagonalization attempts diverged ({failure})"
+                ) from failure
             values, vectors, point_residuals[channel] = best
             point_values[channel] = values
             if spinor:

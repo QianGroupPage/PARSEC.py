@@ -107,9 +107,12 @@ class _ThreadPool:
 
     def __init__(self, task_ids, factory, workers: int):
         self.n_workers = workers
-        # The workers' host-side dense algebra shares one BLAS: split its threads
-        # between them for the lifetime of the pool.
-        self._blas_restore = available_cpus() if set_blas_threads(max(1, available_cpus() // workers)) else None
+        # The workers' host-side dense algebra shares one BLAS.  A multi-threaded
+        # OpenBLAS called from several Python threads at once returned wrong
+        # results (diverged Chebyshev filters, residuals 10x those of a serial run),
+        # so each worker gets a single-threaded BLAS for the lifetime of the pool;
+        # the parallelism is across the workers.
+        self._blas_restore = available_cpus() if set_blas_threads(1) else None
         self._commands: list[queue.Queue] = []
         self._results: queue.Queue = queue.Queue()
         self._threads = []

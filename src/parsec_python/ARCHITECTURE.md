@@ -47,6 +47,15 @@ reference_main.py
   -> cli.py -> driver.py -> SCF
 ```
 
+K-point and band-path parallelism follows the same rule. The readable
+definition is serial: `SCF/kpoint_solver.py` (`SerialKPointSolver`, `map_tasks`)
+is all the k-point, spin-orbit, non-collinear and band-path drivers import.
+`acceleration/SCF/kpoint_parallel.py` and `acceleration/Parallel/` (worker
+threads, BLAS control, GPU device workers, `acceleration/Hamiltonian/device_bloch.py`)
+are the performance counterpart; importing `parsec_python.acceleration` installs
+it with `set_parallel_backend`. `acceleration/tests/test_kpoint_parallel.py`
+checks it against the serial definition.
+
 The flow is a dependency direction, not permission for lower-level modules to
 import the SCF driver. Physics components must remain independently callable.
 

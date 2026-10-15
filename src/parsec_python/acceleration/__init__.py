@@ -68,3 +68,9 @@ __all__ = [
     "solve_scipy_hartree",
     "summarize_translation",
 ]
+
+# The k-point drivers and band paths of the reference SCF package run serially
+# unless this parallel backend is installed.
+from .SCF.kpoint_parallel import install as _install_kpoint_parallelism  # noqa: E402
+
+_install_kpoint_parallelism()

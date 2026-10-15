@@ -1,54 +1,34 @@
 """Parallel solution of the per-k-point eigenproblems of a periodic SCF.
 
-Every SCF step of a k-point-sampled calculation diagonalizes one Bloch
-Hamiltonian per k-point (per spin channel for collinear spin) and then needs
-only the pooled eigenvalues (one Fermi level) and the summed density.  The
-diagonalizations are independent, so they are spread over workers
-(:mod:`parsec_python.Parallel`).  A worker keeps what belongs to its tasks:
-the Bloch-phase projectors, the eigenvectors and the Ritz subspace the next
-SCF step starts from.  The driver sends the effective potentials, receives the
-eigenvalues, sends back the occupations and receives the summed partial
-densities.  The eigenvectors never leave the worker.
+The performance counterpart of
+:class:`parsec_python.SCF.kpoint_solver.SerialKPointSolver`, which is the
+readable definition.  The diagonalizations of the k-points are independent, so
+they are spread over workers (:mod:`parsec_python.acceleration.Parallel`):
+threads on the CPU, one thread per CUDA device on a GPU.  A worker keeps what
+belongs to its tasks: the Bloch-phase projectors, the eigenvectors and the Ritz
+subspace the next SCF step starts from.  The driver sends the effective
+potentials, receives the eigenvalues, sends back the occupations and receives
+the summed partial densities.  The eigenvectors never leave the worker.
 
-A *job* describes the physics of one driver:
-
-``make_hamiltonian(task, potentials)``
-    the Bloch Hamiltonian of task ``task`` for the potentials dict;
-``accumulate(task, vectors, occupations)``
-    the task's contribution to the density, as a ``{name: array}`` dict;
-``extras(task, vectors)`` (optional)
-    a small per-task quantity computed from the final vectors.
-
-With one worker the inline backend runs this in the calling process, so the
-serial and parallel paths are the same code.  Parallel results equal the
-serial ones to round-off (the eigenvalues exactly: each task is the same
-computation; the densities differ only by the order of the sum over tasks).
+With one worker the inline backend runs this in the calling process.  Parallel
+results equal the serial ones to round-off (the eigenvalues exactly: each task
+is the same computation; the densities differ only by the order of the sum over
+tasks).  Importing :mod:`parsec_python.acceleration` installs this solver and
+:func:`map_tasks` as the parallel backend of the reference drivers
+(:func:`parsec_python.SCF.kpoint_solver.set_parallel_backend`).
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
 
-from ..Eigensolvers import EigvalSettings, solve_eigval
+from parsec_python.Eigensolvers import solve_eigval
+from parsec_python.SCF.kpoint_solver import KPointJob, set_parallel_backend
+
 from ..Parallel import WORKERS_ENV, make_pool
-
-
-
-@dataclass
-class KPointJob:
-    """The physics of one SCF driver, given to every worker."""
-
-    n_tasks: int
-    number_of_states: int
-    eigval_settings: Callable[[int], EigvalSettings]
-    make_hamiltonian: Callable[[int, dict], Any]
-    accumulate: Callable[[int, np.ndarray, np.ndarray], dict[str, np.ndarray]]
-    extras: Callable[[int, np.ndarray], Any] | None = None
-
 
 def resolve_backend(requested: str | None = None):
     """The device backend plan, or ``None`` for the CPU.
@@ -70,7 +50,7 @@ def resolve_backend(requested: str | None = None):
             raise ValueError(f"PARSEC_DEVICE must be auto, gpu or cpu, not {device!r}")
     if name == "cpu":
         return None
-    from ..acceleration.Hamiltonian.device_bloch import resolve_kpoint_backend
+    from ..Hamiltonian.device_bloch import resolve_kpoint_backend
 
     plan = resolve_kpoint_backend(name)
     return plan if plan.uses_device else None
@@ -139,7 +119,7 @@ class _SolveWorker:
             yield task, self.vectors[task]
 
 
-class KPointSolver:
+class PooledKPointSolver:
     """Drives a pool of workers through the SCF steps of a k-point job."""
 
     def __init__(
@@ -196,21 +176,44 @@ class KPointSolver:
     def close(self) -> None:
         self.pool.close()
 
-    def __enter__(self) -> "KPointSolver":
+    def __enter__(self) -> "PooledKPointSolver":
         return self
 
     def __exit__(self, *exc_info) -> None:
         self.close()
 
 
-def split_pooled(pooled: np.ndarray, per_task: list[np.ndarray]) -> list[np.ndarray]:
-    """Cut a task-major pooled array back into one block per task."""
-    blocks = []
-    offset = 0
-    for reference in per_task:
-        blocks.append(pooled[offset : offset + reference.size])
-        offset += reference.size
-    return blocks
+class _TaskWorker:
+    """Runs ``solve_task(task, converter)`` for its tasks (band paths and the like)."""
+
+    def __init__(self, solve_task, tasks, index, plan=None) -> None:
+        self.solve_task = solve_task
+        self.tasks = tasks
+        # Built here, in the worker (thread), so the device is current for it.
+        self.converter = plan.converter(index) if plan is not None else None
+
+    def run(self):
+        for task in self.tasks:
+            yield task, self.solve_task(task, self.converter)
 
 
-__all__ = ["KPointJob", "KPointSolver", "split_pooled"]
+def map_tasks(solve_task, n_tasks: int, *, problem_size=None, workers=None, backend=None):
+    """Yield ``(task, result)`` as the workers finish the independent tasks."""
+    plan = resolve_backend(backend)
+    if plan is not None:
+        workers = device_worker_count(plan, n_tasks)
+    with make_pool(
+        range(n_tasks),
+        lambda tasks, index: _TaskWorker(solve_task, tasks, index, plan),
+        workers=workers,
+        problem_size=problem_size,
+    ) as pool:
+        yield from pool.stream("run")
+
+
+def install() -> None:
+    """Make this the parallel backend of the reference k-point drivers and band paths."""
+    set_parallel_backend(PooledKPointSolver, map_tasks)
+
+
+__all__ = ["PooledKPointSolver", "device_worker_count", "install", "map_tasks", "resolve_backend"]

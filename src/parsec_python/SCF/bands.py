@@ -40,7 +40,7 @@ from ..Eigensolvers import solve_eigval
 from ..Grid import band_path_kpoints, explicit_kpoints
 from ..Hamiltonian.kpoint_operator import KPointKohnShamHamiltonian
 from ..models import BandStructureResult, BandStructureSettings
-from ..Parallel import make_pool
+from .kpoint_solver import map_tasks
 from .kpoints_soc import _eigval_settings, _k_point_operators, _spinor_hamiltonian
 
 MODES = ("scalar", "spin_polarized", "soc", "soc_spin_polarized", "noncollinear")
@@ -180,7 +180,7 @@ def run_band_structure(
 
     The k-points of the path are independent, so they are spread over
     ``workers`` worker threads (``None``: ``PARSEC_KPOINT_WORKERS``, default
-    automatic; see :mod:`parsec_python.Parallel`).  ``backend`` (or ``PARSEC_KPOINT_BACKEND``) selects ``cpu`` (default),
+    automatic; see :mod:`parsec_python.acceleration.Parallel`; serial without the acceleration package).  ``backend`` (or ``PARSEC_KPOINT_BACKEND``) selects ``cpu`` (default),
     ``cupy`` (one worker thread per CUDA device; the Hamiltonian and the
     Chebyshev filter run on the GPU), ``auto`` or ``numpy-device`` (the device
     code on the host).
@@ -307,44 +307,26 @@ def run_band_structure(
                 point_sigma = spin_expectation(vectors)
         return point_values, point_residuals, point_attempts, point_sigma
 
-    from .kpoint_parallel import device_worker_count, resolve_backend
-
-    plan = resolve_backend(backend)
-
-    class _BandWorker:
-        def __init__(self, tasks, index):
-            self.tasks = tasks
-            # Built in the worker (thread) so the device is current for it.
-            self.converter = plan.converter(index) if plan is not None else None
-
-        def solve_k(self):
-            for k_index in self.tasks:
-                yield k_index, solve_point(k_points[k_index], self.converter)
-
-    if plan is not None:
-        workers = device_worker_count(plan, n_k)
-    with make_pool(
-        range(n_k),
-        _BandWorker,
-        workers=workers,
+    for k_index, (values, point_residuals, point_attempts, point_sigma) in map_tasks(
+        lambda k_index, converter: solve_point(k_points[k_index], converter),
+        n_k,
         problem_size=system.grid.size,
-    ) as pool:
-        for k_index, (values, point_residuals, point_attempts, point_sigma) in pool.stream(
-            "solve_k"
-        ):
-            eigenvalues[:, k_index] = values
-            residuals[:, k_index] = point_residuals
-            attempts[:, k_index] = point_attempts
-            if spinor:
-                sigma[0, k_index] = point_sigma
-            if callback is not None:
-                callback(
-                    k_index,
-                    n_k,
-                    values,
-                    float(point_residuals.max()),
-                    int(point_attempts.max()),
-                )
+        workers=workers,
+        backend=backend,
+    ):
+        eigenvalues[:, k_index] = values
+        residuals[:, k_index] = point_residuals
+        attempts[:, k_index] = point_attempts
+        if spinor:
+            sigma[0, k_index] = point_sigma
+        if callback is not None:
+            callback(
+                k_index,
+                n_k,
+                values,
+                float(point_residuals.max()),
+                int(point_attempts.max()),
+            )
 
     return BandStructureResult(
         mode=mode,

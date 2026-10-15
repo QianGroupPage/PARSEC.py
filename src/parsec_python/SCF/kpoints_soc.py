@@ -47,7 +47,7 @@ from ..Eigensolvers.perturbative_soc import build_spin_orbit_projectors
 from ..Energy import total_energy_no_degeneracy, total_energy_no_degeneracy_spin_polarized
 from ..Hamiltonian.kpoint_operator import KPointKohnShamHamiltonian
 from ..Hamiltonian.kpoint_spinor_operator import KPointSpinorKohnShamHamiltonian
-from .kpoint_parallel import KPointJob, KPointSolver, split_pooled
+from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
 from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
 from ..SCF.pbc import PeriodicPreparedSinglePointSystem
@@ -211,7 +211,7 @@ def _spinor_solver(
     accumulate,
     *,
     tasks: int | None = None,
-) -> KPointSolver:
+) -> object:
     """Parallel solver of the spinor Bloch problems, one task per k-point.
 
     The Bloch-phase nonlocal and spin-orbit projectors of a k-point are built
@@ -235,7 +235,7 @@ def _spinor_solver(
             xc_field=potentials.get("field"),
         )
 
-    return KPointSolver(
+    return make_kpoint_solver(
         KPointJob(
             k_points.shape[0] if tasks is None else tasks,
             number_of_states,

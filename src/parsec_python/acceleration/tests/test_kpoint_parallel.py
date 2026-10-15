@@ -26,7 +26,7 @@ from parsec_python import (
     SinglePointInput,
     SpeciesPotential,
 )
-from parsec_python.Parallel import available_cpus, resolve_workers
+from parsec_python.acceleration.Parallel import available_cpus, resolve_workers
 from parsec_python.SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_polarized
 from parsec_python.SCF.kpoints_soc import (
     run_self_consistent_soc_kpoints,
@@ -80,6 +80,19 @@ def _run(name: str, workers: str):
         return driver(_system(soc=soc, **flags), _K, _WEIGHTS)
 
 
+def _run_reference(name: str):
+    """The reference drivers with no parallel backend installed: the serial definition."""
+    from parsec_python.acceleration.SCF.kpoint_parallel import install
+    from parsec_python.SCF import kpoint_solver
+
+    kpoint_solver.set_parallel_backend(None, None)
+    try:
+        driver, flags, soc = DRIVERS[name]
+        return driver(_system(soc=soc, **flags), _K, _WEIGHTS)
+    finally:
+        install()
+
+
 def _assert_same(case: unittest.TestCase, serial, parallel) -> None:
     eigenvalues = getattr(serial, "eigenvalues", None)
     if eigenvalues is None:  # collinear spin without spin-orbit
@@ -109,6 +122,11 @@ class ParallelDriversMatchSerialTests(unittest.TestCase):
         for name in DRIVERS:
             with self.subTest(driver=name):
                 _assert_same(self, _run(name, "1"), _run(name, "2"))
+
+    def test_pooled_solver_matches_the_reference_serial_solver(self) -> None:
+        for name in DRIVERS:
+            with self.subTest(driver=name):
+                _assert_same(self, _run_reference(name), _run(name, "2"))
 
     def test_three_workers_leave_an_uneven_split_of_four_k_points(self) -> None:
         _assert_same(self, _run("soc", "1"), _run("soc", "3"))

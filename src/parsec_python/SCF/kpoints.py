@@ -55,7 +55,7 @@ from ..SCF.spin_polarized import (
     _weighted_initial_polarization,
 )
 from ..V_ion import build_nonlocal_projectors
-from .kpoint_parallel import KPointJob, KPointSolver, split_pooled
+from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
 from .kpoints_soc import _eigval_settings
 from ..models import (
     SCFIteration,
@@ -147,7 +147,7 @@ def run_scf_kpoints(
             * ((np.abs(vectors) ** 2) @ occupations)
         }
 
-    solver = KPointSolver(
+    solver = make_kpoint_solver(
         KPointJob(
             n_kpoints,
             number_of_states,
@@ -382,7 +382,7 @@ def run_scf_kpoints_spin_polarized(
             * ((np.abs(vectors) ** 2) @ occupations)
         }
 
-    solver = KPointSolver(
+    solver = make_kpoint_solver(
         KPointJob(
             2 * n_kpoints,
             number_of_states,

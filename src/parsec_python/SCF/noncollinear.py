@@ -41,7 +41,7 @@ from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
 from ..V_ion import superpose_atomic_density
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
-from .kpoint_parallel import KPointJob, KPointSolver, split_pooled
+from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
 from .kpoints_soc import (
     _eigval_settings,
     _k_point_operators,
@@ -152,7 +152,7 @@ def _run_noncollinear(
         )
         return {"density": density_k, "magnetization": magnetization_k}
 
-    solver = KPointSolver(
+    solver = make_kpoint_solver(
         KPointJob(
             n_kpoints,
             number_of_states,

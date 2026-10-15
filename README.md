@@ -572,7 +572,7 @@ fields change during SCF.
 
 The eigenproblems of different k-points (and spin channels) are independent: only the Fermi
 level and the density couple them. A periodic SCF with k-points, and every point of a band path,
-is therefore spread over workers that each keep the Bloch projectors, eigenvectors and Ritz
+is therefore spread over workers (`src/parsec_python/acceleration/Parallel`, installed into the serial reference drivers of `SCF/kpoint_solver.py`) that each keep the Bloch projectors, eigenvectors and Ritz
 subspaces of their own k-points; only potentials, eigenvalues and summed densities cross between
 them. This covers the scalar, spin-polarized, spin-orbit, spin-orbit + collinear-spin and
 non-collinear drivers and the `bandstruc` calculation. The results are the serial ones up to

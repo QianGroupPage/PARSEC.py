@@ -30,7 +30,7 @@ from parsec_python.tests.unit.test_hamiltonian_fast_paths import (
     _PeriodicFixture,
     _random_spinor,
 )
-from parsec_python.tests.unit import test_kpoint_parallel as parallel_tests
+from parsec_python.acceleration.tests import test_kpoint_parallel as parallel_tests
 
 
 class DeviceOperatorTests(_PeriodicFixture):

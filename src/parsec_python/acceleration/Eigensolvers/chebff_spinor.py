@@ -79,6 +79,8 @@ class SpinorEigvalResult:
     vectors: Any
     state: SpinorEigvalState
     stats: dict[str, float] = field(default_factory=dict)
+    residual_norms: np.ndarray | None = None
+    """``||H x - e x||`` of the requested Ritz pairs when ``converge_first`` measured them."""
 
 
 ChebFFSpinorResult = SpinorEigvalResult
@@ -249,6 +251,20 @@ def _rayleigh_ritz_in_place(xp, operator, basis, chunk: int):
         r1 = min(r0 + _ROW_CHUNK, dimension)
         basis[r0:r1] = basis[r0:r1] @ rotations
     return np.asarray(_to_host(xp, eigenvalues), dtype=np.float64)
+
+
+def _residual_norms(xp, operator, vectors, eigenvalues: np.ndarray, chunk: int) -> np.ndarray:
+    """``||H y_j - e_j y_j||`` of the columns of ``vectors`` (host array), chunk by chunk."""
+    count = int(vectors.shape[1])
+    norms = np.empty(count, dtype=np.float64)
+    for c0 in range(0, count, chunk):
+        c1 = min(c0 + chunk, count)
+        block = xp.ascontiguousarray(vectors[:, c0:c1])
+        applied = operator.apply(block)
+        applied -= block * xp.asarray(np.asarray(eigenvalues[c0:c1], dtype=np.float64))[None, :]
+        squares = applied.real * applied.real + applied.imag * applied.imag
+        norms[c0:c1] = np.sqrt(np.asarray(_to_host(xp, squares.sum(axis=0)), dtype=np.float64))
+    return norms
 
 
 def _to_host(xp, array):
@@ -477,6 +493,9 @@ def solve_spinor_eigval(
     state: SpinorEigvalState | None = None,
     xp=None,
     sync: Callable[[], None] | None = None,
+    converge_first: bool = False,
+    tolerance: float | None = None,
+    max_refinements: int | None = None,
 ) -> SpinorEigvalResult:
     """One eigensolve of the SCF loop (``solve_eigval``'s policy on the device).
 
@@ -484,6 +503,13 @@ def solve_spinor_eigval(
     ``(dimension, vectors)``.  ``settings`` is an ``EigvalSettings`` (only its
     ``chebff``, ``subspace`` and ``safety_buffer`` are read).  With ``state=None``
     the first solve (CHEBFF) runs, otherwise one SUBSPACE step.
+
+    ``converge_first`` makes the first solve a *converged* one, the device counterpart of CHEBDAV:
+    after the CHEBFF cycles the SUBSPACE step is repeated on the same operator until the residuals
+    ``||H x - e x||`` of the requested pairs fall below ``tolerance * max|e|`` (CHEBDAV's relative
+    test; default ``settings.chebdav.convergence_tolerance``) or ``max_refinements`` steps (default 8,
+    ``PARSEC_KPOINT_REFINE_STEPS``) were taken.  The state it returns continues as an ordinary
+    subspace state, and the residuals come back in ``residual_norms``.
     """
     if xp is None:
         xp, _ = require_cupy()
@@ -515,6 +541,33 @@ def solve_spinor_eigval(
             filters_completed=0,
         )
         stats.add("first_solves", 1)
+        residuals = None
+        if converge_first:
+            relative = float(settings.chebdav.convergence_tolerance if tolerance is None else tolerance)
+            if max_refinements is None:
+                env = os.environ.get("PARSEC_KPOINT_REFINE_STEPS", "").strip()
+                max_refinements = int(env) if env.isdigit() else 8
+            for step in range(int(max_refinements) + 1):
+                with stats.timed("residual_seconds"):
+                    residuals = _residual_norms(
+                        xp, counted, new_state.vectors[:, :requested_states], eigenvalues[:requested_states], chunk
+                    )
+                scale = max(float(np.max(np.abs(eigenvalues[:requested_states]))), 1.0e-8)
+                if residuals.max() <= relative * scale or step == int(max_refinements):
+                    break
+                vectors, eigenvalues, lower_bound, _ = _subspace_step(
+                    xp, counted, new_state, settings.subspace, chunk, stats
+                )
+                new_state = SpinorEigvalState(
+                    vectors=vectors,
+                    eigenvalues=eigenvalues,
+                    working_states=working,
+                    operator_dimension=dimension,
+                    first_filter=False,
+                    filter_lower_bound=lower_bound,
+                    filters_completed=new_state.filters_completed + 1,
+                )
+                stats.add("refinements", 1)
     else:
         vectors, eigenvalues, lower_bound, degree = _subspace_step(
             xp, counted, state, settings.subspace, chunk, stats
@@ -532,9 +585,10 @@ def solve_spinor_eigval(
         stats.add("polynomial_degree", degree)
     return SpinorEigvalResult(
         eigenvalues=eigenvalues[:requested_states].copy(),
-        vectors=vectors[:, :requested_states],
+        vectors=new_state.vectors[:, :requested_states],
         state=new_state,
         stats=dict(stats.values),
+        residual_norms=residuals if not reusable else None,
     )
 
 

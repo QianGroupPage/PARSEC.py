@@ -12,9 +12,10 @@ the summed partial densities.  The eigenvectors never leave the worker.
 
 On a device the worker keeps the Ritz subspace of every k-point *on the device* and runs the
 SUBSPACE steps of the later SCF iterations there (:func:`..Eigensolvers.chebff_spinor.solve_spinor_eigval`:
-filter, QR and Rayleigh-Ritz without leaving the GPU).  The first solve is CHEBFF on the device, or,
-for ``Eigensolver: chebdav``, the host CHEBDAV with the device filter, whose result is then moved to
-the device.  The eigenvectors come to the host only to form the density.  When the subspaces of all
+filter, QR and Rayleigh-Ritz without leaving the GPU).  The first solve is CHEBFF on the device; for ``Eigensolver: chebdav`` it is CHEBFF followed by
+SUBSPACE steps on the first potential until CHEBDAV's residual test is met (the device counterpart of
+CHEBDAV; ``PARSEC_KPOINT_FIRST_SOLVE=chebdav`` runs the host CHEBDAV with the device filter instead and
+moves its result to the device).  The eigenvectors come to the host only to form the density.  When the subspaces of all
 the worker's k-points would not fit in device memory they are kept on the host between solves
 (``PARSEC_KPOINT_STATE_STORAGE``).  ``PARSEC_KPOINT_SOLVER=host`` restores the former route: the host
 eigensolver with only the Chebyshev filter on the device.
@@ -42,6 +43,7 @@ from ..Parallel import WORKERS_ENV, make_pool
 
 SOLVER_ENV = "PARSEC_KPOINT_SOLVER"  # device (default) | host
 STORAGE_ENV = "PARSEC_KPOINT_STATE_STORAGE"  # auto (default) | device | host
+FIRST_SOLVE_ENV = "PARSEC_KPOINT_FIRST_SOLVE"  # refine (default) | chebdav
 _AUTO_FRACTION = 0.75  # of the device memory the subspaces (and one transient copy set) may take
 
 
@@ -50,6 +52,15 @@ def _device_solver_requested() -> bool:
     if value not in ("device", "host"):
         raise ValueError(f"{SOLVER_ENV} must be device or host, not {value!r}")
     return value == "device"
+
+
+def _first_solve_on_host() -> bool:
+    """Whether ``Eigensolver: chebdav`` runs as the host CHEBDAV (``chebdav``) or is replaced on the
+    device by CHEBFF followed by SUBSPACE steps until CHEBDAV's residual test is met (``refine``)."""
+    value = os.environ.get(FIRST_SOLVE_ENV, "refine").strip().lower() or "refine"
+    if value not in ("refine", "chebdav"):
+        raise ValueError(f"{FIRST_SOLVE_ENV} must be refine or chebdav, not {value!r}")
+    return value == "chebdav"
 
 
 def _storage_mode() -> str:
@@ -144,7 +155,7 @@ class _SolveWorker:
         self.vectors.pop(task, None)  # release the previous basis before the next one is made
         if state is not None and isinstance(state.vectors, np.ndarray) and backend.xp is not np:
             state.vectors = backend.asarray(state.vectors)  # a spilled subspace comes back
-        if state is None and settings.initial_method == "chebdav":
+        if state is None and settings.initial_method == "chebdav" and _first_solve_on_host():
             # CHEBDAV (the first solve of Eigensolver: chebdav) runs on the host with the device
             # filter; its subspace then continues on the device.
             host = solve_eigval(operator.as_linear_operator(), requested, settings=settings, state=None)
@@ -167,6 +178,9 @@ class _SolveWorker:
                 state=state,
                 xp=backend.xp,
                 sync=backend.synchronize,
+                # Eigensolver: chebdav converges its first solve; on the device that is CHEBFF plus
+                # SUBSPACE refinement to the same residual test
+                converge_first=settings.initial_method == "chebdav",
             )
             new_state = result.state
             eigenvalues = result.eigenvalues

@@ -275,16 +275,25 @@ def run_band_structure(
         point_attempts = np.ones(len(channels), dtype=int)
         point_sigma = np.zeros((number_of_states, 3)) if spinor else None
         for channel, hamiltonian in enumerate(hamiltonians(k_point)):
-            operator = (
-                converter.operator(hamiltonian).as_linear_operator()
-                if converter is not None
-                else hamiltonian.as_linear_operator()
-            )
+            # A device converter that can solve on the device (duck-typed, so that this module does
+            # not import the acceleration package) keeps the whole first solve on the GPU.
+            device_solve = converter is not None and getattr(converter, "device_solver", False)
+            if device_solve:
+                operator = None
+            else:
+                operator = (
+                    converter.operator(hamiltonian).as_linear_operator()
+                    if converter is not None
+                    else hamiltonian.as_linear_operator()
+                )
             best = None
             failure = None
             for attempt in range(max_attempts if can_retry else 1):
                 try:
-                    trial = solve(operator, attempt)
+                    if device_solve:
+                        trial = converter.eigensolve(hamiltonian, number_of_states, eigval_settings, attempt)
+                    else:
+                        trial = solve(operator, attempt)
                 except FloatingPointError as error:
                     # A diverged Chebyshev recurrence (a bad spectral bound from an
                     # unlucky start vector): try again with another block size and seed.

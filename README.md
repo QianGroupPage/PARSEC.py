@@ -602,13 +602,17 @@ Chebyshev filter on the GPU, which is where almost all the matrix-vector product
 thread drives each CUDA device (`PARSEC_CUPY_DEVICES=auto|current|0,1,...` as in the multi-GPU
 solver), and the k-points are dealt out round-robin. In an SCF the Ritz subspace of every k-point
 stays on its device and each later SCF step (the SUBSPACE step: filter, QR, Rayleigh-Ritz) runs
-there; the first solve is CHEBFF on the device or, for `Eigensolver: chebdav`, the host CHEBDAV with the
-device filter, whose subspace then moves to the device. The eigenvectors come to the host only to form
+there; the first solve is CHEBFF on the device, and for `Eigensolver: chebdav` it is CHEBFF followed by SUBSPACE
+steps on the first potential until CHEBDAV's residual test (`Diag_Tolerance`, relative to the largest Ritz
+value) is met or `PARSEC_KPOINT_REFINE_STEPS` (default 8) steps were taken: the device counterpart of CHEBDAV
+(`PARSEC_KPOINT_FIRST_SOLVE=chebdav` runs the host CHEBDAV with the device filter instead). The same
+converged first solve serves every k-point of a band path, with the existing retry from another random
+start when the residual stays above the band tolerance. The eigenvectors come to the host only to form
 the density. If the subspaces of a worker's k-points would take more than 75% of the device memory they
 stay on the host between solves (`PARSEC_KPOINT_STATE_STORAGE=auto|device|host`).
 `PARSEC_KPOINT_SOLVER=host` restores the former route (host eigensolver, only the filter on the
 device); `python -m parsec_python.acceleration.benchmarks.check_kpoint_solver` times the two routes on
-an input. Band paths still run CHEBDAV on the host with the device filter. Static matrices (Laplacian, projectors) are uploaded
+an input. Static matrices (Laplacian, projectors) are uploaded
 once per device; an SCF step uploads only the local potential and fields. The host BLAS runs one thread per device worker.
 `python -m parsec_python.acceleration.benchmarks.check_gpu_kpoints` compares the device operator, the filter, a short non-collinear
 spin-orbit SCF and a short band path against the CPU and times them; run it first on a GPU node.

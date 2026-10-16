@@ -352,6 +352,42 @@ class DeviceBlochConverter:
         self.backend = backend
         backend.use()
         self._static: dict[int, tuple[Any, Any]] = {}  # id(host object) -> (host ref, device data)
+        # PARSEC_KPOINT_SOLVER=host keeps the host eigensolver (only the filter on the device)
+        self.device_solver = os.environ.get("PARSEC_KPOINT_SOLVER", "device").strip().lower() != "host"
+
+    def eigensolve(self, hamiltonian, number_of_states: int, settings, attempt: int = 0):
+        """Lowest ``number_of_states`` pairs of a host Hamiltonian with the device-resident solver.
+
+        The first solve of :func:`~parsec_python.acceleration.Eigensolvers.chebff_spinor.solve_spinor_eigval`
+        from a random start: CHEBFF, and for ``initial_method == "chebdav"`` SUBSPACE refinement to
+        CHEBDAV's residual test.  A later ``attempt`` draws another start.  Returns the eigenvalues,
+        the host eigenvectors and the largest residual ``||H x - e x||`` of the pairs.  Used by the
+        band paths, where every k-point is a first solve.
+        """
+        import dataclasses
+
+        from ..Eigensolvers.chebff_spinor import solve_spinor_eigval
+
+        if attempt:
+            settings = dataclasses.replace(
+                settings,
+                chebff=dataclasses.replace(
+                    settings.chebff, random_seed=settings.chebff.random_seed + attempt
+                ),
+            )
+        operator = self.operator(hamiltonian)
+        result = solve_spinor_eigval(
+            operator,
+            number_of_states,
+            settings=settings,
+            state=None,
+            xp=self.backend.xp,
+            sync=self.backend.synchronize,
+            converge_first=settings.initial_method == "chebdav",
+        )
+        residual = float(np.max(result.residual_norms)) if result.residual_norms is not None else float("nan")
+        vectors = np.asarray(self.backend.asnumpy(result.vectors))
+        return np.asarray(result.eigenvalues, dtype=float), vectors, residual
 
     def _cached(self, host_object, build):
         entry = self._static.get(id(host_object))

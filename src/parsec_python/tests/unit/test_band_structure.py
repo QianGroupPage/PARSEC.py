@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import dataclasses
 import shutil
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -441,12 +443,14 @@ class ParallelBandTests(unittest.TestCase):
 
             serial, seen_serial = bands(workers=1)
             self.assertEqual(serial.k_points.shape[0], 7)
-            for options in (
-                dict(workers=3),
-                dict(workers=2),
-                dict(backend="numpy-device"),  # the GPU code path, on the host
+            # the same computation as the serial run: identical to round-off.  "host" is the route
+            # with the host eigensolver and only the filter on the device.
+            for options, environment in (
+                (dict(workers=3), {}),
+                (dict(workers=2), {}),
+                (dict(backend="numpy-device"), {"PARSEC_KPOINT_SOLVER": "host"}),
             ):
-                with self.subTest(**options):
+                with self.subTest(**options, **environment), mock.patch.dict(os.environ, environment):
                     parallel, seen = bands(**options)
                     np.testing.assert_allclose(
                         parallel.eigenvalues, serial.eigenvalues, atol=1e-9
@@ -457,6 +461,15 @@ class ParallelBandTests(unittest.TestCase):
                     )
                     self.assertEqual(sorted(index for index, _, _ in seen), list(range(7)))
                     self.assertTrue(all(count == 7 for _, count, _ in seen))
+            # the device-resident first solve (CHEBFF, or CHEBFF plus SUBSPACE refinement for
+            # Eigensolver: chebdav) reaches the same bands to the eigensolver tolerance
+            with self.subTest(route="device-resident"), mock.patch.dict(
+                os.environ, {"PARSEC_KPOINT_SOLVER": "device"}
+            ):
+                device, seen = bands(backend="numpy-device")
+                np.testing.assert_allclose(device.eigenvalues, serial.eigenvalues, atol=5e-5)
+                self.assertLess(float(device.residual_norms.max()), 5e-2)
+                self.assertEqual(sorted(index for index, _, _ in seen), list(range(7)))
             self.assertEqual([index for index, _, _ in seen_serial], list(range(7)))
 
 

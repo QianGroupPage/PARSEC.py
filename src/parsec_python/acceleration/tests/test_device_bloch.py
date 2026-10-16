@@ -241,6 +241,11 @@ class DeviceResidentSolverTests(unittest.TestCase):
             with self.subTest(driver=name):
                 self._compare(name, self.DEVICE, method="chebdav")
 
+    def test_host_chebdav_first_solve_option(self) -> None:
+        for name in ("scalar", "soc"):
+            with self.subTest(driver=name):
+                self._compare(name, {**self.DEVICE, "PARSEC_KPOINT_FIRST_SOLVE": "chebdav"}, method="chebdav")
+
     def test_subspaces_kept_on_the_host_between_solves(self) -> None:
         for name in ("scalar", "soc"):
             with self.subTest(driver=name):

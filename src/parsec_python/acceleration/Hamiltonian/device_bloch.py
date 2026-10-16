@@ -41,6 +41,17 @@ DEVICES_ENV = "PARSEC_CUPY_DEVICES"  # auto | current | 0,1,...
 
 
 # ---------------------------------------------------------------- array backends
+def _cast_matrix(host_matrix: sp.spmatrix, dtype=None) -> sp.csr_matrix:
+    """``host_matrix`` as CSR of ``dtype``; a complex matrix with no imaginary part becomes real
+    through ``.real`` (a plain ``astype`` would warn about discarding the imaginary part)."""
+    matrix = host_matrix.tocsr()
+    if dtype is None:
+        return matrix
+    if np.issubdtype(np.dtype(dtype), np.floating) and np.iscomplexobj(matrix.data):
+        return matrix.real.tocsr().astype(dtype)
+    return matrix.astype(dtype)
+
+
 class NumpyArrayBackend:
     """Host arrays through the device interface (reference and test double)."""
 
@@ -54,8 +65,7 @@ class NumpyArrayBackend:
         return None
 
     def matrix(self, host_matrix: sp.spmatrix, dtype=None):
-        matrix = host_matrix.tocsr()
-        return matrix.astype(dtype) if dtype is not None else matrix
+        return _cast_matrix(host_matrix, dtype)
 
     def asarray(self, host_array):
         return np.ascontiguousarray(host_array)
@@ -84,10 +94,7 @@ class CupyArrayBackend:
         self.cp.cuda.Device(self.device_id).use()
 
     def matrix(self, host_matrix: sp.spmatrix, dtype=None):
-        matrix = host_matrix.tocsr()
-        if dtype is not None:
-            matrix = matrix.astype(dtype)
-        return self.cpsparse.csr_matrix(matrix)
+        return self.cpsparse.csr_matrix(_cast_matrix(host_matrix, dtype))
 
     def asarray(self, host_array):
         return self.cp.asarray(np.ascontiguousarray(host_array))

@@ -10,6 +10,15 @@ subspace the next SCF step starts from.  The driver sends the effective
 potentials, receives the eigenvalues, sends back the occupations and receives
 the summed partial densities.  The eigenvectors never leave the worker.
 
+On a device the worker keeps the Ritz subspace of every k-point *on the device* and runs the
+SUBSPACE steps of the later SCF iterations there (:func:`..Eigensolvers.chebff_spinor.solve_spinor_eigval`:
+filter, QR and Rayleigh-Ritz without leaving the GPU).  The first solve is CHEBFF on the device, or,
+for ``Eigensolver: chebdav``, the host CHEBDAV with the device filter, whose result is then moved to
+the device.  The eigenvectors come to the host only to form the density.  When the subspaces of all
+the worker's k-points would not fit in device memory they are kept on the host between solves
+(``PARSEC_KPOINT_STATE_STORAGE``).  ``PARSEC_KPOINT_SOLVER=host`` restores the former route: the host
+eigensolver with only the Chebyshev filter on the device.
+
 With one worker the inline backend runs this in the calling process.  Parallel
 results equal the serial ones to round-off (the eigenvalues exactly: each task
 is the same computation; the densities differ only by the order of the sum over
@@ -28,7 +37,27 @@ import numpy as np
 from parsec_python.Eigensolvers import solve_eigval
 from parsec_python.SCF.kpoint_solver import KPointJob, set_parallel_backend
 
+from ..Eigensolvers.chebff_spinor import SpinorEigvalState, solve_spinor_eigval
 from ..Parallel import WORKERS_ENV, make_pool
+
+SOLVER_ENV = "PARSEC_KPOINT_SOLVER"  # device (default) | host
+STORAGE_ENV = "PARSEC_KPOINT_STATE_STORAGE"  # auto (default) | device | host
+_AUTO_FRACTION = 0.75  # of the device memory the subspaces (and one transient copy set) may take
+
+
+def _device_solver_requested() -> bool:
+    value = os.environ.get(SOLVER_ENV, "device").strip().lower() or "device"
+    if value not in ("device", "host"):
+        raise ValueError(f"{SOLVER_ENV} must be device or host, not {value!r}")
+    return value == "device"
+
+
+def _storage_mode() -> str:
+    value = os.environ.get(STORAGE_ENV, "auto").strip().lower() or "auto"
+    if value not in ("auto", "device", "host"):
+        raise ValueError(f"{STORAGE_ENV} must be auto, device or host, not {value!r}")
+    return value
+
 
 def resolve_backend(requested: str | None = None):
     """The device backend plan, or ``None`` for the CPU.
@@ -76,19 +105,96 @@ class _SolveWorker:
         self.tasks = tasks
         self.index = index
         self.states: dict[int, Any] = {}
-        self.vectors: dict[int, np.ndarray] = {}
+        self.vectors: dict[int, Any] = {}
+        self.stats: dict[str, float] = {}
         # Built here, in the worker (thread), so the device is current for it.
         self.converter = plan.converter(index) if plan is not None else None
+        self.device_solver = self.converter is not None and _device_solver_requested()
+        self._spill: bool | None = None
 
+    # ------------------------------------------------------------- host route
     def operator(self, hamiltonian):
         if self.converter is not None:
             return self.converter.operator(hamiltonian).as_linear_operator()
         return hamiltonian.as_linear_operator()
 
+    # ----------------------------------------------------------- device route
+    def _should_spill(self, dimension: int, working: int) -> bool:
+        """Whether the subspaces of this worker's tasks stay on the host between solves."""
+        mode = _storage_mode()
+        if mode != "auto":
+            return mode == "host"
+        backend = self.converter.backend
+        if backend.name != "cupy":
+            return False
+        backend.use()
+        _, total = backend.cp.cuda.runtime.memGetInfo()
+        needed = (len(self.tasks) + 6) * dimension * working * 16
+        return needed > _AUTO_FRACTION * total
+
+    def _to_host(self, array) -> np.ndarray:
+        return array if isinstance(array, np.ndarray) else self.converter.backend.asnumpy(array)
+
+    def _solve_on_device(self, task: int, hamiltonian, settings):
+        backend = self.converter.backend
+        backend.use()
+        operator = self.converter.operator(hamiltonian)
+        requested = self.job.number_of_states
+        state = self.states.pop(task, None)
+        self.vectors.pop(task, None)  # release the previous basis before the next one is made
+        if state is not None and isinstance(state.vectors, np.ndarray) and backend.xp is not np:
+            state.vectors = backend.asarray(state.vectors)  # a spilled subspace comes back
+        if state is None and settings.initial_method == "chebdav":
+            # CHEBDAV (the first solve of Eigensolver: chebdav) runs on the host with the device
+            # filter; its subspace then continues on the device.
+            host = solve_eigval(operator.as_linear_operator(), requested, settings=settings, state=None)
+            saved = host.state.subspace
+            new_state = SpinorEigvalState(
+                vectors=backend.asarray(np.ascontiguousarray(saved.vectors)),
+                eigenvalues=np.asarray(saved.eigenvalues, dtype=float),
+                working_states=saved.working_states,
+                operator_dimension=saved.operator_dimension,
+                first_filter=True,
+                filter_lower_bound=None,
+                filters_completed=0,
+            )
+            eigenvalues = np.asarray(host.eigenvalues, dtype=float)
+        else:
+            result = solve_spinor_eigval(
+                operator,
+                requested,
+                settings=settings,
+                state=state,
+                xp=backend.xp,
+                sync=backend.synchronize,
+            )
+            new_state = result.state
+            eigenvalues = result.eigenvalues
+            for name, value in result.stats.items():
+                self.stats[name] = self.stats.get(name, 0.0) + value
+        if self._spill is None:
+            self._spill = self._should_spill(new_state.operator_dimension, new_state.working_states)
+        if self._spill:
+            host_vectors = self._to_host(new_state.vectors)
+            new_state.vectors = host_vectors
+            self.vectors[task] = host_vectors[:, :requested]
+        else:
+            self.vectors[task] = new_state.vectors[:, :requested]
+        self.states[task] = new_state
+        return eigenvalues
+
+    def _host_vectors(self, task: int) -> np.ndarray:
+        return np.asarray(self._to_host(self.vectors[task]))
+
+    # ------------------------------------------------------------- SCF steps
     def solve(self, potentials: dict, filter_degree: int):
         settings = self.job.eigval_settings(filter_degree)
         for task in self.tasks:
-            operator = self.operator(self.job.make_hamiltonian(task, potentials))
+            hamiltonian = self.job.make_hamiltonian(task, potentials)
+            if self.device_solver:
+                yield task, self._solve_on_device(task, hamiltonian, settings)
+                continue
+            operator = self.operator(hamiltonian)
             solution = solve_eigval(
                 operator,
                 self.job.number_of_states,
@@ -102,7 +208,7 @@ class _SolveWorker:
     def accumulate(self, occupations: dict[int, np.ndarray]):
         total: dict[str, np.ndarray] = {}
         for task in self.tasks:
-            parts = self.job.accumulate(task, self.vectors[task], occupations[task])
+            parts = self.job.accumulate(task, self._host_vectors(task), occupations[task])
             for name, value in parts.items():
                 if name in total:
                     total[name] += value
@@ -112,11 +218,14 @@ class _SolveWorker:
 
     def extras(self):
         for task in self.tasks:
-            yield task, self.job.extras(task, self.vectors[task])
+            yield task, self.job.extras(task, self._host_vectors(task))
 
     def vectors_of(self, task: int):
         if task in self.vectors:
-            yield task, self.vectors[task]
+            yield task, self._host_vectors(task)
+
+    def stats_of(self):
+        yield None, dict(self.stats)
 
 
 class PooledKPointSolver:
@@ -172,6 +281,14 @@ class PooledKPointSolver:
         for _, vectors in self.pool.results("vectors_of", task):
             return vectors
         raise KeyError(task)
+
+    def stats(self) -> dict[str, float]:
+        """Eigensolver counters and seconds summed over the workers (device route)."""
+        total: dict[str, float] = {}
+        for _, part in self.pool.results("stats_of"):
+            for name, value in part.items():
+                total[name] = total.get(name, 0.0) + value
+        return total
 
     def close(self) -> None:
         self.pool.close()

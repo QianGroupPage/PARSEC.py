@@ -45,6 +45,8 @@ _WEIGHTS = np.full(4, 0.25)
 
 def _system(**flags):
     soc = flags.pop("soc", False)
+    criterion = flags.pop("criterion", 2.0e-3)
+    method = flags.pop("method", "chebff")
     problem = SinglePointInput(
         atoms=[Atom("Au", [_BOX / 2] * 3, [0.0, 0.0, 1.0])],
         pseudopotentials={
@@ -53,10 +55,10 @@ def _system(**flags):
         grid=PeriodicGridSettings(spacing=0.6, expansion_order=6),
         periodic_cell=PeriodicCell(lattice_vectors=_BOX * np.eye(3)),
         scf=SCFSettings(
-            max_iterations=60, number_of_states=20, convergence_criterion=2.0e-3, **flags
+            max_iterations=80, number_of_states=20, convergence_criterion=criterion, **flags
         ),
         hartree=HartreeSettings(multipole_order=4),
-        eigensolver=EigensolverSettings(method="chebff", tolerance=1.0e-6),
+        eigensolver=EigensolverSettings(method=method, tolerance=1.0e-6),
     )
     return prepare_periodic_single_point(problem)
 

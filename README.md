@@ -600,9 +600,15 @@ each worker's own k-points.
 never does; `--gpus`/`--gpu-ids` choose the devices) puts the Bloch Hamiltonian, including the spin-orbit and Zeeman terms, and the whole
 Chebyshev filter on the GPU, which is where almost all the matrix-vector products are. One worker
 thread drives each CUDA device (`PARSEC_CUPY_DEVICES=auto|current|0,1,...` as in the multi-GPU
-solver), the k-points are dealt out round-robin, and the eigensolver itself (CHEBFF, CHEBDAV,
-SUBSPACE: orthonormalization, Rayleigh-Ritz) is the unchanged CPU code, so a filter call costs one
-upload and one download of a block of vectors. Static matrices (Laplacian, projectors) are uploaded
+solver), and the k-points are dealt out round-robin. In an SCF the Ritz subspace of every k-point
+stays on its device and each later SCF step (the SUBSPACE step: filter, QR, Rayleigh-Ritz) runs
+there; the first solve is CHEBFF on the device or, for `Eigensolver: chebdav`, the host CHEBDAV with the
+device filter, whose subspace then moves to the device. The eigenvectors come to the host only to form
+the density. If the subspaces of a worker's k-points would take more than 75% of the device memory they
+stay on the host between solves (`PARSEC_KPOINT_STATE_STORAGE=auto|device|host`).
+`PARSEC_KPOINT_SOLVER=host` restores the former route (host eigensolver, only the filter on the
+device); `python -m parsec_python.acceleration.benchmarks.check_kpoint_solver` times the two routes on
+an input. Band paths still run CHEBDAV on the host with the device filter. Static matrices (Laplacian, projectors) are uploaded
 once per device; an SCF step uploads only the local potential and fields. The host BLAS runs one thread per device worker.
 `python -m parsec_python.acceleration.benchmarks.check_gpu_kpoints` compares the device operator, the filter, a short non-collinear
 spin-orbit SCF and a short band path against the CPU and times them; run it first on a GPU node.

@@ -178,16 +178,24 @@ class BackendSelectionTests(unittest.TestCase):
 
 
 class DeviceBackendDriversTests(unittest.TestCase):
-    """Whole SCF runs through the device code (host double, two worker threads)."""
+    """Whole SCF runs through the device code (host double, two worker threads).
 
-    def test_scf_drivers_match_the_cpu(self) -> None:
+    ``PARSEC_KPOINT_SOLVER=host`` is the former route (host eigensolver, device filter): the same
+    computation as the CPU, so it matches to round-off.
+    """
+
+    def test_scf_drivers_match_the_cpu_with_the_host_solver(self) -> None:
         for name in ("spin_polarized", "soc", "noncollinear"):
             with self.subTest(driver=name):
                 serial = parallel_tests._run(name, "1")
                 driver, flags, soc = parallel_tests.DRIVERS[name]
                 with mock.patch.dict(
                     os.environ,
-                    {"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "2"},
+                    {
+                        "PARSEC_KPOINT_BACKEND": "numpy-device",
+                        "PARSEC_KPOINT_SOLVER": "host",
+                        "PARSEC_KPOINT_WORKERS": "2",
+                    },
                 ):
                     device = driver(
                         parallel_tests._system(soc=soc, **flags),
@@ -195,6 +203,80 @@ class DeviceBackendDriversTests(unittest.TestCase):
                         parallel_tests._WEIGHTS,
                     )
                 parallel_tests._assert_same(self, serial, device)
+
+
+def _converged(name: str, environment: dict, **overrides):
+    driver, flags, soc = parallel_tests.DRIVERS[name]
+    with mock.patch.dict(os.environ, environment):
+        return driver(
+            parallel_tests._system(soc=soc, criterion=2.0e-5, **flags, **overrides),
+            parallel_tests._K,
+            parallel_tests._WEIGHTS,
+        )
+
+
+class DeviceResidentSolverTests(unittest.TestCase):
+    """The device-resident eigensolver (CHEBFF or CHEBDAV first solve, then SUBSPACE steps on the
+    device) is a different path to the same converged SCF: compare tightly converged runs."""
+
+    CPU = {"PARSEC_KPOINT_BACKEND": "cpu", "PARSEC_KPOINT_WORKERS": "1"}
+    DEVICE = {"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "2"}
+
+    def _compare(self, name: str, device_environment: dict, **overrides) -> None:
+        serial = _converged(name, self.CPU, **overrides)
+        device = _converged(name, device_environment, **overrides)
+        self.assertTrue(serial.converged and device.converged)
+        self.assertAlmostEqual(device.energies.total, serial.energies.total, delta=5.0e-5)
+        self.assertAlmostEqual(device.fermi_level, serial.fermi_level, delta=5.0e-4)
+        if getattr(serial, "eigenvalues", None) is not None:
+            np.testing.assert_allclose(device.eigenvalues, serial.eigenvalues, atol=1.0e-3)
+
+    def test_chebff_first_solve(self) -> None:
+        for name in ("scalar", "soc", "noncollinear"):
+            with self.subTest(driver=name):
+                self._compare(name, self.DEVICE)
+
+    def test_chebdav_first_solve(self) -> None:
+        for name in ("scalar", "soc"):
+            with self.subTest(driver=name):
+                self._compare(name, self.DEVICE, method="chebdav")
+
+    def test_subspaces_kept_on_the_host_between_solves(self) -> None:
+        for name in ("scalar", "soc"):
+            with self.subTest(driver=name):
+                self._compare(name, {**self.DEVICE, "PARSEC_KPOINT_STATE_STORAGE": "host"})
+
+    def test_solver_stats_are_collected(self) -> None:
+        from parsec_python.SCF import kpoint_solver
+
+        with mock.patch.dict(os.environ, self.DEVICE):
+            system = parallel_tests._system(criterion=2.0e-3)
+            seen = {}
+            original = kpoint_solver._parallel_solver
+
+            def capture(job, **options):
+                solver = original(job, **options)
+                close = solver.close
+
+                def close_after_stats():
+                    seen["stats"] = solver.stats()  # the pool is gone after close
+                    close()
+
+                solver.close = close_after_stats
+                return solver
+
+            kpoint_solver.set_parallel_backend(capture, kpoint_solver._parallel_mapper)
+            try:
+                from parsec_python.SCF.kpoints import run_scf_kpoints
+
+                run_scf_kpoints(system, parallel_tests._K, parallel_tests._WEIGHTS)
+                stats = seen["stats"]
+            finally:
+                from parsec_python.acceleration.SCF.kpoint_parallel import install
+
+                install()
+        self.assertGreater(stats.get("subspace_steps", 0), 0)
+        self.assertEqual(stats["first_solves"], len(parallel_tests._K))
 
 
 if __name__ == "__main__":

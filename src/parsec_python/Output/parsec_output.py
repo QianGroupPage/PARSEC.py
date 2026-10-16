@@ -1796,6 +1796,52 @@ class ParsecTextReporter:
         )
         self.write("\n".join(lines))
 
+    @staticmethod
+    def _soc_timing_lines(result: "SelfConsistentSOCResult") -> list[str]:
+        """The stage table of a self-consistent SOC run (``result.timings``)."""
+        timings = getattr(result, "timings", None)
+        if not timings:
+            return []
+        stages = (
+            ("setup_potentials", "Initial Hartree + exchange-correlation"),
+            ("hamiltonian", "Hamiltonian binding subtotal"),
+            ("diagonalization", "Diagonalization subtotal"),
+            ("density", "Occupation/density subtotal"),
+            ("hartree", "Hartree potential subtotal"),
+            ("xc", "Exchange-correlation subtotal"),
+            ("mixing_energy", "Mixing/energy subtotal"),
+            ("final_download", "Orbitals to the host"),
+        )
+        lines = [" SCF timing analysis [sec]", " " + "-" * 50]
+        total = 0.0
+        for key, label in stages:
+            if key in timings:
+                lines.append(f" {label:30s} : {timings[key]:12.6f}")
+                total += timings[key]
+        lines.append(f" {'Sum of the stages':30s} : {total:12.6f}")
+        lines.append(" " + "-" * 50)
+        counters = {k[4:]: v for k, v in timings.items() if k.startswith("eig_")}
+        if counters:
+            lines.append(" Eigensolver detail")
+            lines.append(" " + "-" * 50)
+            for key in (
+                "first_solves",
+                "subspace_steps",
+                "applications",
+                "application_columns",
+                "lanczos_seconds",
+                "filter_seconds",
+                "orthonormalize_seconds",
+                "ritz_seconds",
+            ):
+                if key in counters:
+                    value = counters[key]
+                    text = f"{value:12.6f}" if key.endswith("seconds") else f"{int(value):12d}"
+                    lines.append(f" {key:30s} : {text}")
+            lines.append(" " + "-" * 50)
+        lines.append("")
+        return lines
+
     def finish_self_consistent_soc(
         self, result: "SelfConsistentSOCResult", elapsed_seconds: float
     ) -> None:
@@ -1809,9 +1855,14 @@ class ParsecTextReporter:
             "",
             f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
             "",
-            "Converged spin-orbit-split spinor states",
-            "",
         ]
+        lines.extend(self._soc_timing_lines(result))
+        lines.extend(
+            [
+                "Converged spin-orbit-split spinor states",
+                "",
+            ]
+        )
         moments = np.asarray(result.magnetic_moment_per_state)
         eigenvalues = np.asarray(result.eigenvalues)
         occupations = np.asarray(result.occupations)

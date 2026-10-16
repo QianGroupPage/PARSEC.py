@@ -1354,6 +1354,10 @@ class SelfConsistentSOCResult:
     state_moments: np.ndarray | None = None
     """``<S_z>`` of every pooled state (same k-major layout as ``eigenvalues``)
     for k-point runs, where ``spinors`` only holds the first k-point."""
+    timings: dict[str, float] | None = None
+    """Seconds per SCF stage (``hamiltonian``, ``diagonalization``, ``density``,
+    ``hartree``, ``xc``, ``mixing_energy``) plus the eigensolver's own counters
+    (``eig_*``), for the single-point driver; ``None`` where not recorded."""
 
     @property
     def magnetic_moment_per_state(self) -> np.ndarray:

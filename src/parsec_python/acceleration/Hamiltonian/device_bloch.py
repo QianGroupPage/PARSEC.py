@@ -359,7 +359,7 @@ class DeviceBlochConverter:
         """Lowest ``number_of_states`` pairs of a host Hamiltonian with the device-resident solver.
 
         The first solve of :func:`~parsec_python.acceleration.Eigensolvers.chebff_spinor.solve_spinor_eigval`
-        from a random start: CHEBFF, and for ``initial_method == "chebdav"`` SUBSPACE refinement to
+        from a random start: CHEBFF, and for ``initial_method == "chebdav"`` extra CHEBFF cycles to
         CHEBDAV's residual test.  A later ``attempt`` draws another start.  Returns the eigenvalues,
         the host eigenvectors and the largest residual ``||H x - e x||`` of the pairs.  Used by the
         band paths, where every k-point is a first solve.

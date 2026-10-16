@@ -162,13 +162,13 @@ class SpinorEigvalTests(unittest.TestCase):
         scale = float(np.max(np.abs(result.eigenvalues)))
         self.assertLessEqual(result.residual_norms.max(), 1.0e-6 * scale)
         np.testing.assert_allclose(result.eigenvalues, self.exact[:6], atol=1e-5)
-        self.assertGreaterEqual(result.stats.get("refinements", 0), 0)
+        self.assertGreaterEqual(result.stats.get("extra_cycles", 0), 0)
         # and the state continues as a subspace state
         step = solve_spinor_eigval(self.operator, 6, settings=self.settings, state=result.state, xp=np)
         self.assertEqual(step.stats["subspace_steps"], 1)
         np.testing.assert_allclose(step.eigenvalues, self.exact[:6], atol=1e-5)
 
-    def test_refinement_improves_an_unconverged_chebff_solve(self) -> None:
+    def test_extra_cycles_improve_an_unconverged_chebff_solve(self) -> None:
         loose = EigvalSettings(
             safety_buffer=4,
             initial_method="chebff",
@@ -177,11 +177,11 @@ class SpinorEigvalTests(unittest.TestCase):
         )
         plain = solve_spinor_eigval(self.operator, 6, settings=loose, xp=np)
         refined = solve_spinor_eigval(
-            self.operator, 6, settings=loose, xp=np, converge_first=True, tolerance=1.0e-5, max_refinements=12
+            self.operator, 6, settings=loose, xp=np, converge_first=True, tolerance=1.0e-5, max_extra_cycles=40
         )
         error = lambda r: float(np.max(np.abs(r.eigenvalues - self.exact[:6])))
         self.assertLess(error(refined), error(plain))
-        self.assertGreater(refined.stats["refinements"], 0)
+        self.assertGreater(refined.stats["extra_cycles"], 0)
 
     def test_states_are_orthonormal(self) -> None:
         first = solve_spinor_eigval(self.operator, 6, settings=self.settings, xp=np)

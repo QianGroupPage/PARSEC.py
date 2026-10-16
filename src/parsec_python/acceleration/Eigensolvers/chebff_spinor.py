@@ -342,7 +342,19 @@ def _check_finite(xp, array) -> None:
 
 
 # ------------------------------------------------------------------- first solve
-def _first_solve(xp, operator, working: int, settings: ChebFFSettings, chunk: int, stats: _Stats):
+def _first_solve(
+    xp,
+    operator,
+    working: int,
+    settings: ChebFFSettings,
+    chunk: int,
+    stats: _Stats,
+    *,
+    max_cycles: int | None = None,
+    converged: Callable[[Any, np.ndarray], bool] | None = None,
+):
+    """CHEBFF from a random start: ``filter_cycles`` cycles, plus more (up to ``max_cycles`` in all)
+    while ``converged(vectors, eigenvalues)`` says the pairs are not yet converged."""
     dimension = int(operator.shape[0])
     rng = xp.random.default_rng(settings.random_seed)
     vectors = xp.empty((dimension, working), dtype=xp.complex128)
@@ -360,7 +372,8 @@ def _first_solve(xp, operator, working: int, settings: ChebFFSettings, chunk: in
     lower_bound = (2.0 * smallest_ritz + upper_bound) / 3.0
 
     eigenvalues = np.empty(working, dtype=float)
-    for _ in range(settings.filter_cycles):
+    total_cycles = settings.filter_cycles if converged is None else max(settings.filter_cycles, int(max_cycles or 0))
+    for cycle in range(total_cycles):
         half_span = 0.5 * (upper_bound - lower_bound)
         if half_span <= 0.0:
             raise ValueError("upper_bound must be greater than lower_bound")
@@ -407,6 +420,12 @@ def _first_solve(xp, operator, working: int, settings: ChebFFSettings, chunk: in
                 largest_ritz + 0.001 * (upper_bound - smallest_ritz),
                 largest_ritz + 0.05 * abs(largest_ritz),
             )
+        if converged is not None and cycle + 1 >= settings.filter_cycles:
+            if converged(vectors, eigenvalues):
+                stats.add("extra_cycles", cycle + 1 - settings.filter_cycles)
+                break
+            if cycle + 1 == total_cycles:
+                stats.add("extra_cycles", cycle + 1 - settings.filter_cycles)
     return vectors, eigenvalues
 
 
@@ -495,7 +514,7 @@ def solve_spinor_eigval(
     sync: Callable[[], None] | None = None,
     converge_first: bool = False,
     tolerance: float | None = None,
-    max_refinements: int | None = None,
+    max_extra_cycles: int | None = None,
 ) -> SpinorEigvalResult:
     """One eigensolve of the SCF loop (``solve_eigval``'s policy on the device).
 
@@ -505,11 +524,13 @@ def solve_spinor_eigval(
     the first solve (CHEBFF) runs, otherwise one SUBSPACE step.
 
     ``converge_first`` makes the first solve a *converged* one, the device counterpart of CHEBDAV:
-    after the CHEBFF cycles the SUBSPACE step is repeated on the same operator until the residuals
-    ``||H x - e x||`` of the requested pairs fall below ``tolerance * max|e|`` (CHEBDAV's relative
-    test; default ``settings.chebdav.convergence_tolerance``) or ``max_refinements`` steps (default 8,
-    ``PARSEC_KPOINT_REFINE_STEPS``) were taken.  The state it returns continues as an ordinary
-    subspace state, and the residuals come back in ``residual_norms``.
+    CHEBFF cycles continue beyond ``filter_cycles`` until the residuals ``||H x - e x||`` of the
+    requested pairs fall below ``tolerance * max|e|`` (CHEBDAV's relative test; default
+    ``settings.chebdav.convergence_tolerance``) or ``max_extra_cycles`` more cycles (default 24,
+    ``PARSEC_KPOINT_EXTRA_CYCLES``) were made.  More CHEBFF cycles from a random start converge the
+    upper requested states much faster than SUBSPACE steps (measured on GaAs bands: 8 SUBSPACE steps
+    left residuals of 1e-1 Ry that 10 CHEBFF cycles bring to 6e-4 Ry).  The state it returns continues
+    as an ordinary subspace state, and the residuals come back in ``residual_norms``.
     """
     if xp is None:
         xp, _ = require_cupy()
@@ -530,7 +551,38 @@ def solve_spinor_eigval(
         and state.working_states == working
     )
     if not reusable:
-        vectors, eigenvalues = _first_solve(xp, counted, working, settings.chebff, chunk, stats)
+        residuals = None
+        converged = None
+        extra = 0
+        if converge_first:
+            relative = float(settings.chebdav.convergence_tolerance if tolerance is None else tolerance)
+            if max_extra_cycles is None:
+                env = os.environ.get("PARSEC_KPOINT_EXTRA_CYCLES", "").strip()
+                max_extra_cycles = int(env) if env.isdigit() else 24
+            extra = int(max_extra_cycles)
+            seen: list[np.ndarray] = []
+
+            def converged(basis, values):
+                with stats.timed("residual_seconds"):
+                    norms = _residual_norms(
+                        xp, counted, basis[:, :requested_states], values[:requested_states], chunk
+                    )
+                seen.append(norms)
+                scale = max(float(np.max(np.abs(values[:requested_states]))), 1.0e-8)
+                return bool(norms.max() <= relative * scale)
+
+        vectors, eigenvalues = _first_solve(
+            xp,
+            counted,
+            working,
+            settings.chebff,
+            chunk,
+            stats,
+            max_cycles=settings.chebff.filter_cycles + extra,
+            converged=converged,
+        )
+        if converge_first:
+            residuals = seen[-1] if seen else None
         new_state = SpinorEigvalState(
             vectors=vectors,
             eigenvalues=eigenvalues,
@@ -541,33 +593,6 @@ def solve_spinor_eigval(
             filters_completed=0,
         )
         stats.add("first_solves", 1)
-        residuals = None
-        if converge_first:
-            relative = float(settings.chebdav.convergence_tolerance if tolerance is None else tolerance)
-            if max_refinements is None:
-                env = os.environ.get("PARSEC_KPOINT_REFINE_STEPS", "").strip()
-                max_refinements = int(env) if env.isdigit() else 8
-            for step in range(int(max_refinements) + 1):
-                with stats.timed("residual_seconds"):
-                    residuals = _residual_norms(
-                        xp, counted, new_state.vectors[:, :requested_states], eigenvalues[:requested_states], chunk
-                    )
-                scale = max(float(np.max(np.abs(eigenvalues[:requested_states]))), 1.0e-8)
-                if residuals.max() <= relative * scale or step == int(max_refinements):
-                    break
-                vectors, eigenvalues, lower_bound, _ = _subspace_step(
-                    xp, counted, new_state, settings.subspace, chunk, stats
-                )
-                new_state = SpinorEigvalState(
-                    vectors=vectors,
-                    eigenvalues=eigenvalues,
-                    working_states=working,
-                    operator_dimension=dimension,
-                    first_filter=False,
-                    filter_lower_bound=lower_bound,
-                    filters_completed=new_state.filters_completed + 1,
-                )
-                stats.add("refinements", 1)
     else:
         vectors, eigenvalues, lower_bound, degree = _subspace_step(
             xp, counted, state, settings.subspace, chunk, stats

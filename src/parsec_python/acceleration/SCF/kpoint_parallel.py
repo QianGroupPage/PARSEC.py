@@ -13,7 +13,7 @@ the summed partial densities.  The eigenvectors never leave the worker.
 On a device the worker keeps the Ritz subspace of every k-point *on the device* and runs the
 SUBSPACE steps of the later SCF iterations there (:func:`..Eigensolvers.chebff_spinor.solve_spinor_eigval`:
 filter, QR and Rayleigh-Ritz without leaving the GPU).  The first solve is CHEBFF on the device; for ``Eigensolver: chebdav`` it is CHEBFF followed by
-SUBSPACE steps on the first potential until CHEBDAV's residual test is met (the device counterpart of
+more CHEBFF cycles until CHEBDAV's residual test is met (the device counterpart of
 CHEBDAV; ``PARSEC_KPOINT_FIRST_SOLVE=chebdav`` runs the host CHEBDAV with the device filter instead and
 moves its result to the device).  The eigenvectors come to the host only to form the density.  When the subspaces of all
 the worker's k-points would not fit in device memory they are kept on the host between solves
@@ -56,7 +56,7 @@ def _device_solver_requested() -> bool:
 
 def _first_solve_on_host() -> bool:
     """Whether ``Eigensolver: chebdav`` runs as the host CHEBDAV (``chebdav``) or is replaced on the
-    device by CHEBFF followed by SUBSPACE steps until CHEBDAV's residual test is met (``refine``)."""
+    device by CHEBFF with extra cycles until CHEBDAV's residual test is met (``refine``)."""
     value = os.environ.get(FIRST_SOLVE_ENV, "refine").strip().lower() or "refine"
     if value not in ("refine", "chebdav"):
         raise ValueError(f"{FIRST_SOLVE_ENV} must be refine or chebdav, not {value!r}")
@@ -179,7 +179,7 @@ class _SolveWorker:
                 xp=backend.xp,
                 sync=backend.synchronize,
                 # Eigensolver: chebdav converges its first solve; on the device that is CHEBFF plus
-                # SUBSPACE refinement to the same residual test
+                # more cycles to the same residual test
                 converge_first=settings.initial_method == "chebdav",
             )
             new_state = result.state

@@ -94,6 +94,13 @@ def spill_download_order() -> str:
     ``A`` no array is taken on the device and none is copied on the host,
     and the host array is the same to the last bit.  A C-ordered array is
     downloaded as before under either value.
+
+    This is the download of ``PARSEC_CUPY_SPILL_BUFFERS=fresh``.  With the
+    host buffers of a spill, the default, a Fortran-ordered basis is
+    written into its buffer by one copy whatever this says
+    (:meth:`spill_buffers.SpillBuffer.download`), and the order is read only
+    for vectors of another layout, so ``C`` is the former download only
+    with ``fresh`` beside it.
     """
 
     order = os.environ.get("PARSEC_CUPY_SPILL_DOWNLOAD_ORDER", "A").strip().upper()

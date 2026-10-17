@@ -147,9 +147,9 @@ class BlockFilterGraphs:
         self.table = None
         self.has_upload = False
         self.has_finished = False
-        # The kernel that forms the projector coefficients in the recorded
-        # graphs (:meth:`_projection_kernel`).
-        self.projection_kernel = None
+        # The reduction of the projection with which the graphs were
+        # recorded (:meth:`_projection_reduction`).
+        self.projection_reduction = None
 
     @property
     def operator(self):
@@ -223,32 +223,38 @@ class BlockFilterGraphs:
             )
         return graph, views[current]
 
-    def _projection_kernel(self):
-        """The kernel with which the operator forms its projector coefficients now.
+    def _projection_reduction(self):
+        """The reduction with which the operator forms its projector coefficients now.
 
         ``None`` for an operator without projectors and for a projection
-        that names no kernel.
+        that names no reduction.  The reduction and the width of a block
+        name the kernel of every projection launch
+        (:func:`cupy_projectors.projection_launches`), and the kernels of a
+        reduction are compiled once per device: a graph, recorded for one
+        width on the device of the workspace, launches the kernel that this
+        reduction gives its width.
         """
 
         operator = self.operator
         if not operator.projector_count:
             return None
         projection = getattr(operator, "custom_projector_projection", None)
-        return getattr(projection, "kernel", None)
+        return getattr(projection, "reduction_mode", None)
 
-    def _keep_one_projection_kernel(self):
-        """Forget the graphs that were recorded with another projection kernel.
+    def _keep_one_projection_reduction(self):
+        """Forget the graphs that were recorded with another projection reduction.
 
         A graph launches the kernels it was recorded with, whatever the
-        operator launches since.  An operator keeps the projection kernel it
-        was built with (``PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS``), so this
-        finds nothing to forget unless its projection has been replaced:
-        every graph is then recorded again, with the kernel that the
-        operator launches outside its graphs and reports.
+        operator launches since.  An operator keeps the projection reduction
+        it was built with (``PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS``), so this
+        finds nothing to forget unless its projection has been replaced by
+        one of another reduction: every graph is then recorded again, with
+        the kernels that the operator launches outside its graphs and
+        reports.
         """
 
-        kernel = self._projection_kernel()
-        if kernel is self.projection_kernel:
+        reduction = self._projection_reduction()
+        if reduction == self.projection_reduction:
             return
         if self.recorded:
             # As before any other change of the workspace: the device has
@@ -260,10 +266,10 @@ class BlockFilterGraphs:
             self.key = None
             self.graphs = []
             self.shared = {}
-        self.projection_kernel = kernel
+        self.projection_reduction = reduction
 
     def _prepare(self, matrix, blocks):
-        self._keep_one_projection_kernel()
+        self._keep_one_projection_reduction()
         key = (int(matrix.shape[0]), tuple((b.start, b.stop, b.degree) for b in blocks))
         if key == self.key:
             return

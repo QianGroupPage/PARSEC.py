@@ -99,11 +99,17 @@ Since then the root of such a run sums its GPU ionic fields on the symmetry
 wedge where the images of the atoms are exact
 (`PARSEC_IONIC_SUM_GRID=auto`, see `GPU_SETUP_OPTIMIZATION.md`), which
 changes the fields by the round-off of one sum over the atoms and the
-totals with them; `PARSEC_IONIC_SUM_GRID=full` beside the launch settings
-gives the bits of the series again. That change has run on a laptop GPU
-only: the total energies of small runs under these launch settings (30 to
-176 electrons) moved by 2e-13 to 1.5e-11 Ry with the same number of SCF
-steps (`README.md`).
+totals with them: on a laptop GPU those of small runs under these launch
+settings (30 to 176 electrons) moved by 2e-13 to 1.5e-11 Ry with the same
+number of SCF steps (`README.md`), and on A100 nodes that of 39,368
+electrons on 16 GPUs by 3.2e-10 Ry. `PARSEC_IONIC_SUM_GRID=full` beside the
+launch settings undoes that change. Other switches that came after the
+series change totals by round-off too (`README.md`). With the switches that
+came after the series at their former values, `PARSEC_IONIC_SUM_GRID=full`
+and `PARSEC_CUPY_TALL_PRODUCT_SPLIT=0` among them, eight configurations on
+A100 nodes gave the total energies of the series to the last bit: 3,480
+electrons on 1, 4 and 16 GPUs, 14,680 on 4, 23,768 on 8 and 16, 29,576 on 8
+and 39,368 on 16.
 
 These are the settings of the measured runs, not the defaults of the code.
 Unset, the ionic backend, the Hartree linear backend and the Hartree boundary
@@ -373,11 +379,16 @@ between the steps), which would be 79.9 GiB here. The share is therefore
 0.974, the reciprocal of 1.027: a device is still taken as too small only
 where the least ratio that was measured puts its peak above its memory,
 2.06 GiB below a device of 79.25 GiB, and those sectors are spilled as they
-were. The band in which no run exists is now 0.927 to 0.976 of a device; a
-first run of those sectors on one A100 with `0.978` named would say whether
-the share can go back. With that buffer a device of 79.25 GiB keeps the
-states of sectors of 32 GiB and more up to 75.2 GiB of them, where it kept
-them up to 73.5: no layout of the measured series lies between. A device
+were. A first run of those sectors on one A100 with neither value named and
+`0.978` beside them has decided the share since: the rule kept their states
+on the device, and the first solve stopped for memory (an allocation of
+2,147,475,456 bytes failed with 81,874,197,504 allocated). With 0.974 the
+same launch spilled them and completed (below), so the share stays 0.974.
+Between 0.927 of a device, the fullest that kept its states, and 0.976,
+which did not fit, no run exists. With that buffer a device of 79.25 GiB
+keeps the states of sectors of 32 GiB and more up to 75.2 GiB of them,
+where it kept them up to 73.5: no layout of the measured series lies
+between. A device
 whose count lies between 0.974 and 0.978 of it with sectors of up to 16 GiB,
 whose buffer is what it was, kept its states and spills them now: none has
 run, and the least ratio that was measured puts its peak above its memory.
@@ -402,8 +413,12 @@ With the former limit named the count is the former one.
 
 The download of a spill now asks for the order the array has
 (`PARSEC_CUPY_SPILL_DOWNLOAD_ORDER=A`, the default; `C` is the call as it
-was). `cupy.asnumpy` returns C order unless told otherwise and makes the
-C-ordered copy of a Fortran-ordered array on the device, a second array of
+was, under `PARSEC_CUPY_SPILL_BUFFERS=fresh` since: with the host buffers
+of a spill, the default of that switch (below), a Fortran-ordered basis is
+written into its buffer whatever this says, and the order is read only for
+vectors of another layout). `cupy.asnumpy` returns C order unless told
+otherwise and makes the C-ordered copy of a Fortran-ordered array on the
+device, a second array of
 the size of the basis, and the host array was then copied once more into
 Fortran order. In its own order the basis of a sector, whole or as the
 leading columns that a smaller state count leaves, takes no array on the
@@ -521,7 +536,13 @@ is; `0` locks nothing. The plan is made with the storage, from the bytes of
 each basis at the state counts of the first solve and in the order of the
 sectors: a buffer is to be locked if it still fits the bound beside those
 before it, so that two launches on a host with the same memory available
-lock the same buffers. A buffer beyond the bound is pageable, and so is one
+lock the same buffers. Sectors whose operator was given a group of devices
+come last in that order: a shared basis never leaves its devices and takes
+no buffer, and whether one is shared is decided by the first solve, so the
+plan reads the group and asks no device. A sector on one device beside
+them is therefore not made pageable by the bytes of one that takes nothing,
+and one of them that is not shared after all is still planned, locked if
+the bound has room left. A buffer beyond the bound is pageable, and so is one
 that the driver refuses to lock (the record says what it answered): both
 move the same bytes by the same calls, at about half the rate, and a small
 host runs as it did, without the staging block. The bound holds for what is
@@ -574,33 +595,52 @@ no buffer. Half of the available memory was 0.13 to 7.9 GB on that host
 while other work ran on it, and every buffer was locked within it. The
 seconds of that laptop say nothing: its GPU was shared.
 
-None of the three has run on A100 nodes: what was measured there is the one
-array above, on one device with the host to itself. Derived from its rates
-for that run of 10,456 electrons: its 128 transfers, 2,412 GiB, take 98 s
-through page-locked buffers and the page-locking of the four another 38 s
-(38.4 s were measured for four blocks of that size one after another), where
-they took 517 s, so the run about 365 s in place of 745; the solves on the
-device are what they were. That stays above the run whose states fit: the
-same cluster in the sphere of the default rule keeps its states on the
-device and took 205.3 s. The page-locked memory goes back when the process
-ends, outside the reported time (13.9 s for those four blocks). Not
+Derived beforehand from the rates of the one array above for that run of
+10,456 electrons: its 128 transfers, 2,412 GiB, take 98 s through
+page-locked buffers and the page-locking of the four another 38 s (38.4 s
+were measured for four blocks of that size one after another), where they
+took 517 s, so the run about 365 s in place of 745; the solves on the
+device are what they were. A first run on one A100 node has been made
+since, with the storage left to the code, which spills those sectors, and
+the defaults against `fresh` with `release` in one allocation: 396.9
+against 746.4 s of SCF and 401.2 against 751.3 s of reported program, with
+the same total energy to the last bit. The four buffers page-locked 80.93
+GB in 40.0 s, inside the offloads, which took 73.9 against 116.3 s; the
+restores took 46.6 against 220.4 s. The host high-water mark fell from
+109.9 to 78.2 GiB, and the GPU peak was 23.61 against 23.53 GiB. That stays
+above the run whose states fit: the same cluster in the sphere of the
+default rule keeps its states on the device and took 205.3 s. The
+page-locked memory goes back when the process ends, after the reported
+program and outside every record of `timing.json` (13.9 s were measured for
+four blocks of that size): by the log of the batch job the whole process,
+start and teardown included, took 434 against 770 s, 32.8 against 18.7 s
+beyond the reported program: the return of the buffers costs about 14 s
+that no record holds, and a comparison of the two stagings reads that time
+beside the records. Not
 measured there at all: a buffer that is locked in the context of one device
 and read by another, as the density step of two devices does (the CUDA
 documentation says that memory from `cudaHostAlloc` is page-locked for every
-context under unified addressing); pageable buffers in a complete run; and
-`RLIMIT_MEMLOCK`, which those nodes do not set.
+context under unified addressing); pageable buffers in a complete run; each
+switch by itself; and `RLIMIT_MEMLOCK`, which those nodes do not set.
 `spill_staging` of a rank in `timing.json` says what ran: the staging, the
 calls that moved the states of a sector to its device and back with their
-wall seconds, and for the buffers the bound and where it comes from, the
+wall seconds (a basis that the devices of its sector share is not moved and
+not counted), and for the buffers the bound and where it comes from, the
 bytes that are page-locked and pageable, the seconds of the page-locking
 (inside the first download of each sector), what the driver answered where
 it refused, the bytes that went up and down, and the downloads that the
 former call made for vectors of another layout. `density_pool_release`
 counts the uploads of the density step under `host_uploads` and says
 whether the pinned pool is kept (`spill_pinned_pool`, `pinned_kept`). A run
-of the hybrid driver with buffers has the detail
-`orbital_sector_spill_staging`; a run that keeps its states on its devices,
-or stages them as before, has the details it had.
+whose sectors took buffers has the backend detail
+`orbital_sector_spill_staging`: how many of them are page-locked and the
+bytes of each kind. The bound is not in it, since it follows from what the
+host has available, and two launches of one calculation would differ there;
+`spill_staging` holds it. The detail is of the sectors of the process that
+writes the result, the root rank under the MPI runner; `spill_staging` of
+each rank says what the others did. A run that keeps its states on its
+devices, shares every basis, or stages them as before has the details it
+had.
 
 Before that release every rank collects Python's cyclic garbage, so that a
 device array held only by a reference cycle goes back with the cached blocks.
@@ -849,7 +889,16 @@ arrays just lay, and from the driver what does not fit there, and go back to
 that list; the estimate has ended before the small solve returns, and the
 blocks stay in that list for the next step like the others of a shared basis
 (the density step returned them before, and does with
-`PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE=1`).
+`PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE=1`). By default (`auto`) that
+device is never the one that holds the Hartree objects; `any` asks that one
+too where a sector of two devices has no other and the sharing rule counts
+the room for the estimate. `any` was the default for a while, until complete
+first calculations on 8 A100 GPUs, two of each value in alternation, took
+163.40 s of SCF on average with it against 163.51 s with `auto` for 23,768
+electrons and 236.16 against 235.92 s for 29,576, with the same total
+energies and the fullest device at 47.87 against 47.67 GiB and at 63.52 GiB
+with either (2026-10-16): it would have stayed the default for at least
+0.4 % less SCF time in either case (`README.md`).
 
 ## Optional FP64 initialization and filter submission improvements
 
@@ -881,18 +930,32 @@ all of them again whenever the block plan changes, as before; the filtered
 columns are the same to the last bit.
 Every recurrence step of a graph first forms the projector coefficients
 `diag(signs) B.T X` of its block. Where the projector rows have at least 256
-entries, one CUDA block of 128 threads forms them for a projector and the up
-to six columns of the filter block (`PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS=6`,
-the default); `1` keeps the former kernel, a CUDA block per projector and
-column. Both sum a column in the same order, so the coefficients and the
-filtered columns are the same to the last bit. A graph replays the kernel it
-was recorded with: an operator keeps the kernel it was built with, the other
-devices of a shared sector are given that of the sector owner, and a workspace
-whose operator has been given another projection records its graphs again. On
-one A100 the kernel of six columns took 0.066 against 0.097 ms per launch for
-4,601 projectors of 324 entries and 0.133 against 0.193 ms for 9,449 of 311
-(a synthetic factor, the kernel alone); complete calculations have not run
-with it on A100 nodes. `README.md` has the switch in its tables.
+entries, a block of two to six columns forms them in one launch of a CUDA
+block of 128 threads per projector (`PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS=6`,
+the default), the six-column kernel as first measured; a wider block, as
+the graphs of the distributed filter record them, in one launch of its group
+kernel, a CUDA block per projector and group of six columns; a block of one
+column takes the former kernel, a CUDA block per projector and column, which
+`1` keeps for every width. All of them sum a column in the same order, so the
+coefficients and the filtered columns are the same to the last bit. A graph
+is recorded for one block width and replays the kernel of that width: an
+operator keeps the kernels it was built with, the other devices of a shared
+sector are given the columns per block of the sector owner, and a workspace
+whose operator has been given a projection of another reduction records its
+graphs again. On one A100 with the real factor of sector 0 (2026-10-16) the
+six-column kernel formed six columns 1.71 and 1.80 times as fast as the
+former kernel with 19,392 and 39,368 electrons; a single column takes the
+former kernel since it was 0.62 and 0.67 times as fast there. One launch of
+the group kernel for 126 columns was 1.12 times as fast as 21 launches of the
+six-column kernel with 39,368 electrons, 1.23 times with 19,392 and 3.9 times
+with 3,480, but slower per group from three to six columns with 39,368, 6 %
+at six, so blocks of up to six columns keep the six-column kernel; their time
+with the launches of now is still to be measured, and is expected to be that
+of the six-column kernel.
+Complete calculations on 1, 4 and 16 GPUs took 0.44 to 3.9 s less SCF than
+with `1`, with the same totals, while every width took the six-column kernel
+six columns per launch. `README.md` has the switch in its tables, with these
+measurements.
 The bounded persistent graph buffers use direct CUDA allocations so that small
 long-lived pieces cannot strand multi-gigabyte orbital blocks in CuPy's caching
 pool. Temporary orbitals still use the configured allocator. These graph buffers

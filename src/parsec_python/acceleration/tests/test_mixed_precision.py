@@ -20,6 +20,7 @@ from parsec_python.acceleration.backends import (
     cupy as cupy_backend,
     cupy_compact,
     cupy_mixed_precision,
+    cupy_projectors,
     cupy_stencil_major,
     implicit_stencil,
 )
@@ -206,6 +207,7 @@ class _HostKernel:
         self.parameters = parameters
         self.evaluate = evaluate
         self.launches = 0
+        self.grids = []
 
     def __call__(self, grid, block, arguments):
         if len(arguments) != len(self.parameters):
@@ -219,17 +221,18 @@ class _HostKernel:
                 raise AssertionError(f"{name} is declared {kind}, got {actual}")
             named[name] = value
         self.launches += 1
+        self.grids.append(grid)
         self.evaluate(named)
 
 
 def _float32_host_kernels():
-    """The four FP32 kernels in the order of ``_kernels``, as NumPy stand-ins."""
+    """The five FP32 kernels in the order of ``_kernels``, as NumPy stand-ins."""
 
     return tuple(
         _HostKernel(kernel_parameters(cupy_mixed_precision._SOURCE, name), evaluate)
         for name, evaluate in zip(
             cupy_mixed_precision._KERNEL_NAMES,
-            (_host_recurrence, _host_projection, _host_projection, _host_projection),
+            (_host_recurrence, *[_host_projection] * 4),
             strict=True,
         )
     )
@@ -429,6 +432,7 @@ class KernelLaunchTests(unittest.TestCase):
             (PROJECTOR_SOURCE, "sparse_projector_projection"),
             (PROJECTOR_SOURCE, "sparse_projector_projection_serial"),
             (PROJECTOR_SOURCE, "sparse_projector_projection6"),
+            (PROJECTOR_SOURCE, "sparse_projector_projection6_groups"),
         ):
             with self.subTest(kernel=name):
                 double = kernel_parameters(source, name)
@@ -456,7 +460,8 @@ class HostFloat32RecurrenceTests(unittest.TestCase):
             coefficient_palette=metadata.coefficient_palette,
         )
         # In the order of ``_kernels``: recurrence, tree projection of one
-        # column per block, serial one, tree projection of six columns.
+        # column per block, serial one, tree projection of six columns and
+        # its group kernel.
         kernels = _float32_host_kernels()
         with (
             _environment(**settings),
@@ -494,7 +499,7 @@ class HostFloat32RecurrenceTests(unittest.TestCase):
         self.assert_step(first, _reference_step(hamiltonian, current))
         # Eight columns are two launches of at most six; one projection, by
         # the serial kernel of short rows.
-        self.assertEqual([kernel.launches for kernel in kernels], [2, 0, 1, 0])
+        self.assertEqual([kernel.launches for kernel in kernels], [2, 0, 1, 0, 0])
 
         following = recurrence(single, previous=single_previous, **_STEP)
         self.assert_step(following, _reference_step(hamiltonian, current, previous))
@@ -531,7 +536,7 @@ class HostFloat32RecurrenceTests(unittest.TestCase):
             recurrence(current.astype(np.float32, order="F"), previous=None, **_STEP),
             _reference_step(hamiltonian, current),
         )
-        self.assertEqual([kernel.launches for kernel in kernels], [1, 0, 0, 0])
+        self.assertEqual([kernel.launches for kernel in kernels], [1, 0, 0, 0, 0])
 
     def test_long_projector_rows_take_the_parallel_projection(self):
         dimension = 320
@@ -542,27 +547,29 @@ class HostFloat32RecurrenceTests(unittest.TestCase):
             kinetic, np.zeros(dimension), projectors, signs
         )
         generator = np.random.default_rng(33)
-        # By default a block per projector with six columns; with the former
-        # value of the switch a block per projector and column.  Launches of
-        # the recurrence, then of the three projection kernels, for two
-        # columns and for fourteen: three recurrence launches of at most six
-        # columns, and as many projections where a block carries six.
-        for settings, reduction, narrow, wide in (
-            ({}, "parallel6", [1, 0, 0, 1], [3, 0, 0, 3]),
-            (
-                dict(PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS="6"),
-                "parallel6",
-                [1, 0, 0, 1],
-                [3, 0, 0, 3],
-            ),
-            (
-                dict(PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS="1"),
-                "parallel",
-                [1, 1, 0, 0],
-                [3, 1, 0, 0],
-            ),
+        # By default the former kernel for a single column, a block per
+        # projector for two to six columns, and for more one launch of the
+        # group kernel, a block per projector and group of six columns; with
+        # the former value of the switch a block per projector and column.
+        # Launches of the recurrence (at most six columns each), then of the
+        # four projection kernels, and the grid of the one projection.
+        six = {
+            1: ([1, 1, 0, 0, 0], (1,)),
+            2: ([1, 0, 0, 1, 0], (1,)),
+            6: ([1, 0, 0, 1, 0], (1,)),
+            7: ([2, 0, 0, 0, 1], (1, 2)),
+            14: ([3, 0, 0, 0, 1], (1, 3)),
+        }
+        former = {
+            width: ([launches[0], 1, 0, 0, 0], (width,))
+            for width, (launches, _grid) in six.items()
+        }
+        for settings, reduction, launched in (
+            ({}, "parallel6", six),
+            (dict(PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS="6"), "parallel6", six),
+            (dict(PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS="1"), "parallel", former),
         ):
-            for columns, launches in ((2, narrow), (14, wide)):
+            for columns, (launches, grid) in launched.items():
                 with self.subTest(settings=settings, columns=columns):
                     recurrence, kernels = self.recurrence(
                         kinetic, np.zeros(dimension), projectors, signs, **settings
@@ -579,6 +586,9 @@ class HostFloat32RecurrenceTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         [kernel.launches for kernel in kernels], launches
+                    )
+                    self.assertEqual(
+                        [item for kernel in kernels[1:] for item in kernel.grids], [grid]
                     )
         # A value that the switch does not know is an error where the
         # recurrence is built.
@@ -662,6 +672,44 @@ class HostOperatorTests(unittest.TestCase):
             np.linalg.norm(result - expected), 1.0e-5 * np.linalg.norm(expected)
         )
         self.assertEqual(gpu.timing_stats.orbital_vectors_applied, 8)
+
+    def test_the_recurrence_carries_the_columns_its_operator_was_given(self):
+        # As the FP64 projection of the operator: the columns per block that
+        # the caller names, as a sector group names those of its owner,
+        # whatever the switch says; else the switch.  A projector of 320
+        # entries takes every row to the tree reduction.
+        dimension = 320
+        kinetic, potential, _, _ = _operator(dimension)
+        projectors = sp.csr_matrix(np.linspace(0.1, 1.0, dimension)[:, None])
+        for switch, named, reduction in (
+            ("6", 1, "parallel"),
+            ("1", 6, "parallel6"),
+            ("6", None, "parallel6"),
+            ("1", None, "parallel"),
+        ):
+            with self.subTest(switch=switch, named=named):
+                with (
+                    _environment(
+                        PARSEC_CUPY_MIXED_FILTER="on",
+                        PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS=switch,
+                    ),
+                    host_cupy(),
+                    patch.object(
+                        cupy_mixed_precision,
+                        "_kernels",
+                        return_value=_float32_host_kernels(),
+                    ),
+                ):
+                    gpu = CuPyHamiltonian(
+                        kinetic,
+                        potential,
+                        projectors=projectors,
+                        projector_signs=np.ones(1),
+                        projection_block_columns=named,
+                    )
+                recurrence = gpu.mixed_precision_recurrence
+                self.assertIsInstance(recurrence, CuPyMixedPrecisionRecurrence)
+                self.assertEqual(recurrence.projection_reduction, reduction)
 
 
 class LaterFilterRecordTests(unittest.TestCase):
@@ -953,20 +1001,35 @@ class DeviceFloat32RecurrenceTests(unittest.TestCase):
             (former.projection_reduction, six.projection_reduction),
             ("parallel", "parallel6"),
         )
-        self.assertIsNot(former.projection_kernel, six.projection_kernel)
+        # One column takes the former kernel in both; by default two to six
+        # columns the six-column kernel and more its group kernel.
+        self.assertEqual(sorted(former.projection_kernels), ["parallel"])
+        self.assertEqual(
+            sorted(six.projection_kernels), ["parallel", "parallel6", "parallel6_groups"]
+        )
+        self.assertIs(six.projection_kernels["parallel"], former.projection_kernels["parallel"])
+        self.assertEqual(
+            len({id(kernel) for kernel in six.projection_kernels.values()}), 3
+        )
         host = generator.standard_normal((dimension, 14)).astype(np.float32)
-        for width in range(1, 15):
-            for order in ("F", "C"):
-                with self.subTest(width=width, order=order):
-                    block = cp.asarray(host[:, :width], order=order)
-                    expected = cp.asnumpy(former._signed_projector_coefficients(block))
-                    actual = cp.asnumpy(six._signed_projector_coefficients(block))
-                    self.assertEqual(actual.dtype, np.float32)
-                    self.assertTrue(np.isfinite(expected).all() and expected.any())
-                    # The bits, so that a zero of the other sign differs too.
-                    np.testing.assert_array_equal(
-                        actual.view(np.uint32), expected.view(np.uint32)
-                    )
+        # Also with launches of the group kernel of two groups at most, as
+        # only a block of more than 393,210 columns has them.
+        for groups in (65535, 2):
+            for width in range(1, 15):
+                for order in ("F", "C"):
+                    with (
+                        self.subTest(width=width, order=order, groups=groups),
+                        patch.object(cupy_projectors, "_GRID_GROUPS", groups),
+                    ):
+                        block = cp.asarray(host[:, :width], order=order)
+                        expected = cp.asnumpy(former._signed_projector_coefficients(block))
+                        actual = cp.asnumpy(six._signed_projector_coefficients(block))
+                        self.assertEqual(actual.dtype, np.float32)
+                        self.assertTrue(np.isfinite(expected).all() and expected.any())
+                        # The bits, so that a zero of the other sign differs too.
+                        np.testing.assert_array_equal(
+                            actual.view(np.uint32), expected.view(np.uint32)
+                        )
         # And whole recurrence steps, which read those coefficients.
         current = cp.asarray(host, order="F")
         previous = cp.asarray(host[::-1], order="F")

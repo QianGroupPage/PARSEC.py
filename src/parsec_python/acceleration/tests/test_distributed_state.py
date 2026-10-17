@@ -113,10 +113,10 @@ class SharedPoolTests(unittest.TestCase):
 
     def test_the_count_of_a_helper_holds_what_its_estimate_takes_from_the_pool(self):
         # cuSOLVER sizes the work array of a spectrum itself, so the count that lets the device with the Hartree
-        # objects estimate a condition number is held against the device at hand: the same estimate of an
-        # overlap that the device holds, in a pool of its own.  Beside the copy that cuSOLVER overwrites, which
-        # a helper finds in what its Gram arrays have just freed, it takes no more than the count less the
-        # cuSOLVER handle, which lies outside the pool.
+        # objects estimate a condition number (where PARSEC_CUPY_RITZ_CONDITION_HELPER=any is named) is held
+        # against the device at hand: the same estimate of an overlap that the device holds, in a pool of its
+        # own.  Beside the copy that cuSOLVER overwrites, which a helper finds in what its Gram arrays have just
+        # freed, it takes no more than the count less the cuSOLVER handle, which lies outside the pool.
         from parsec_python.acceleration.Eigensolvers.distributed_state import condition_helper_bytes
         from parsec_python.acceleration.Eigensolvers.rayleigh_ritz import _device_overlap_condition
         cp, _ = require_cupy()

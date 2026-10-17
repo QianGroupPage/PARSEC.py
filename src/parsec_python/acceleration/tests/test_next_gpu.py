@@ -344,76 +344,48 @@ class PartitionTests(unittest.TestCase):
                              lambda:ritz.streaming_workspace_bytes(1000,600)):
                     with self.assertRaisesRegex(ValueError,limit):read()
 
-    def test_the_rotation_tile_of_one_array_follows_the_slab_that_is_cut_where_that_is_named(self):
+    def test_the_rotation_tile_of_one_array_takes_the_bytes_of_the_budget(self):
         import importlib
         from types import SimpleNamespace
         ritz=importlib.import_module('parsec_python.acceleration.Eigensolvers.rayleigh_ritz')
-        name,budget='PARSEC_CUPY_STREAMING_RITZ_TILE','PARSEC_CUPY_STREAMING_RITZ_BYTES'
+        budget='PARSEC_CUPY_STREAMING_RITZ_BYTES'
         shape=lambda rows,columns:ritz._streaming_shape(SimpleNamespace(shape=(rows,columns),nbytes=8*rows*columns))
         # Sectors of 3,480 to 19,392 electrons and one of many rows; the buffer of each in bytes.
         sectors=((677_542,442),(1_031_322,665),(1_194_720,897),(1_924_792,1314),(2_604_846,1842),(2_873_400,2431),
                  (5_660_200,1200))
         taken=lambda rows,columns:8*max(rows*shape(rows,columns)[0],shape(rows,columns)[1]*columns)
         with patch.dict(os.environ):
-            for unset in (name,budget,'PARSEC_CUPY_STREAMING_RITZ_LIMIT_BYTES','PARSEC_CUPY_RITZ_GRAM_MULTIPLE'):
+            for unset in (budget,'PARSEC_CUPY_STREAMING_RITZ_LIMIT_BYTES','PARSEC_CUPY_RITZ_GRAM_MULTIPLE'):
                 os.environ.pop(unset,None)
-            self.assertFalse(ritz._tile_follows_slab())
             default=[shape(*sector) for sector in sectors];held=[taken(*sector) for sector in sectors]
             counted=[ritz.streaming_workspace_bytes(*sector) for sector in sectors]
             # The tile of the budget: the buffer is the budget, to less than a row, whatever the slab is cut to.
             self.assertEqual(default,[(192,303660),(128,201831),(64,149629),(128,204288),(64,145730),(64,110421),(64,301877)])
             self.assertEqual(held,counted)
-            os.environ[name]='budget'
-            self.assertEqual(([shape(*sector) for sector in sectors],[ritz.streaming_workspace_bytes(*sector) for sector in sectors]),
-                             (default,counted))
-            os.environ[name]='slab'
-            self.assertTrue(ritz._tile_follows_slab())
-            follows=[shape(*sector) for sector in sectors]
-            # The slabs stay, so the Gram matrices do; the tile is as many rows as the slab that was cut holds.
-            self.assertEqual([width for width,_tile in follows],[width for width,_tile in default])
-            self.assertEqual(follows,[(192,294316),(128,198510),(64,85242),(128,187498),(64,90504),(64,75646),(64,301877)])
-            for (rows,columns),(width,tile),(_width,before) in zip(sectors,follows,default):
-                self.assertEqual(tile,min(before,rows*width//columns))
-                # The tile fits the slab, which is then the buffer: no more than a row of it is left over.
-                self.assertTrue(rows*width-columns<tile*columns<=rows*width)
-                self.assertEqual((taken(rows,columns),ritz.streaming_workspace_bytes(rows,columns)),(8*rows*width,)*2)
-            # 0.97, 0.98, 0.57, 1.84, 1.24, 1.37 and 2.70 GiB where the budget takes 1, 1, 1, 2, 2, 2 and 2.70.
-            self.assertEqual([round(taken(*sector)/2**30,2) for sector in sectors],[.97,.98,.57,1.84,1.24,1.37,2.7])
             self.assertEqual([round(count/2**30,2) for count in held],[1.,1.,1.,2.,2.,2.,2.7])
-            # The count follows the slab that the multiple in force cuts; under a multiple of 1 it is the slab of
-            # the budget, which the default counts at every multiple.
+            # The count is the slab of the budget, which no multiple moves.
             os.environ['PARSEC_CUPY_RITZ_GRAM_MULTIPLE']='1'
-            for (rows,columns),before in zip(sectors,counted):
-                width,tile=shape(rows,columns)
-                self.assertEqual(ritz.streaming_workspace_bytes(rows,columns),8*rows*width)
-                self.assertLessEqual(8*rows*width,before)
+            self.assertEqual([ritz.streaming_workspace_bytes(*sector) for sector in sectors],counted)
             os.environ.pop('PARSEC_CUPY_RITZ_GRAM_MULTIPLE')
-            # A basis that its budget holds is one slab and one tile either way, and a budget whose slab the
-            # multiple leaves gives the tile it gave: 70 columns of 1,000 rows are cut to 64, 60 are not.
+            # A basis that its budget holds is one slab and one tile, and a budget whose slab the multiple cuts
+            # keeps the tile of its bytes: 70 columns of 1,000 rows are cut to 64, 60 are not.
             self.assertEqual(shape(164_882,300),(300,164_882))
-            for columns,cut in ((70,(64,106)),(60,(60,100))):
+            for columns,cut in ((70,(64,116)),(60,(60,100))):
                 with patch.dict(os.environ,{budget:str(8*1000*columns)}):
                     self.assertEqual(shape(1000,600),cut)
-                    with patch.dict(os.environ,{name:'budget'}):self.assertEqual(shape(1000,600),(cut[0],columns*1000//600))
-            for bad in ('row','','0','SLABS'):
-                os.environ[name]=bad
-                for read in (ritz._tile_follows_slab,lambda:shape(1000,600),lambda:ritz.streaming_workspace_bytes(1000,600)):
-                    with self.assertRaisesRegex(ValueError,name):read()
-        # The two views of one buffer and a rotation in either tile, NumPy standing in for CuPy: 61 rows by 7
-        # columns under 1,100 bytes are slabs of 2 columns, with a tile of 19 rows by the budget and of 17 by the slab.
+        # The two views of one buffer and a rotation in the tile, NumPy standing in for CuPy: 61 rows by 7 columns
+        # under 1,100 bytes are slabs of 2 columns with a tile of 19 rows.
         shim=SimpleNamespace(float64=np.float64,dtype=np.dtype,empty=np.empty,zeros=np.zeros,
                              asfortranarray=np.asfortranarray,ascontiguousarray=np.ascontiguousarray,
                              ndarray=lambda shape,dtype,memptr,order:np.ndarray(shape,dtype=dtype,buffer=memptr,order=order))
-        rng=np.random.default_rng(97);host=rng.normal(size=(61,7));c=rng.normal(size=(7,7));x=np.array(host,order='F');moved={}
-        for value,tile,numbers in (('budget',19,133),('slab',17,122)):
-            with patch.object(ritz,'require_cupy',return_value=(shim,None)),patch.dict(os.environ,{name:value,budget:'1100'}):
-                slab,rotated=ritz._streaming_workspace(x)
-                self.assertEqual((slab.shape,rotated.shape,slab.ctypes.data),((61,2),(tile,7),rotated.ctypes.data))
-                self.assertEqual(max(slab.size,rotated.size),numbers)
-                self.assertEqual(ritz.streaming_workspace_bytes(61,7),8*numbers)
-                moved[value]=x.copy(order='F');ritz._rotate_in_place(moved[value],c,rotated)
-            np.testing.assert_allclose(moved[value],host@c,rtol=0,atol=1e-12)
-        np.testing.assert_allclose(moved['slab'],moved['budget'],rtol=0,atol=1e-13)
+        rng=np.random.default_rng(97);host=rng.normal(size=(61,7));c=rng.normal(size=(7,7));x=np.array(host,order='F')
+        with patch.object(ritz,'require_cupy',return_value=(shim,None)),patch.dict(os.environ,{budget:'1100'}):
+            slab,rotated=ritz._streaming_workspace(x)
+            self.assertEqual((slab.shape,rotated.shape,slab.ctypes.data),((61,2),(19,7),rotated.ctypes.data))
+            self.assertEqual(max(slab.size,rotated.size),133)
+            self.assertEqual(ritz.streaming_workspace_bytes(61,7),8*133)
+            ritz._rotate_in_place(x,c,rotated)
+        np.testing.assert_allclose(x,host@c,rtol=0,atol=1e-12)
 
     def test_lower_triangle_slabs_match_the_dense_product_on_the_host(self):
         import importlib
@@ -787,41 +759,25 @@ class NextDeviceTests(unittest.TestCase):
             for mine,theirs in zip(runs[value],runs[None]):np.testing.assert_array_equal(mine,theirs)
         np.testing.assert_allclose(runs[limit][0],runs[None][0],rtol=0,atol=5e-12)
 
-    def test_a_tile_that_follows_the_slab_leaves_the_gram_matrices_their_bits_on_the_device(self):
+    def test_a_slab_cut_to_a_multiple_leaves_the_tile_the_bytes_of_the_budget_on_the_device(self):
         import importlib
         ritz=importlib.import_module('parsec_python.acceleration.Eigensolvers.rayleigh_ritz')
         cp=self.cp;host=np.random.default_rng(101).normal(size=(257,17));x=cp.array(host,order='F')
-        name='PARSEC_CUPY_STREAMING_RITZ_TILE'
-        # A budget of 6 columns and a multiple of 4: slabs of 4 columns, with a tile of 90 rows by the budget and
-        # of 60 by the slab, in a buffer of 1,530 or of 1,028 numbers.  A rule counts the 1,542 numbers of the
-        # slab of the budget for the first and the buffer itself for the second.
+        # A budget of 6 columns and a multiple of 4: slabs of 4 columns, with a tile of 90 rows by the budget, in a
+        # buffer of 1,530 numbers.  A rule counts the 1,542 numbers of the slab of the budget.
         common=dict(PARSEC_CUPY_STREAMING_RITZ='1',PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8*257*6),PARSEC_CUPY_RITZ_GRAM_MULTIPLE='4',
                     PARSEC_CUPY_RITZ_DENSE_BACKEND='host',PARSEC_CUPY_RITZ_EIGH_BACKEND='host')
-        solve=ritz.solve_whitened_ritz;runs={}
-        for value,tile,numbers,counted in (('budget',90,1530,1542),('slab',60,1028,1028),(None,90,1530,1542)):
-            given=[]
-            def kept(overlap,projection):
-                given.append((np.array(overlap),np.array(projection)));return solve(overlap,projection)
-            with patch.dict(os.environ,common),patch.object(ritz,'solve_whitened_ritz',kept), \
-                    patch.object(ritz,'_rotate_in_place',wraps=ritz._rotate_in_place) as rotate:
-                os.environ.pop(name,None)
-                if value is not None:os.environ[name]=value
-                self.assertEqual(ritz._streaming_shape(x),(4,tile))
-                slab,rotated=ritz._streaming_workspace(x)
-                self.assertEqual((slab.shape,rotated.shape,slab.data.ptr),((257,4),(tile,17),rotated.data.ptr))
-                self.assertEqual((max(slab.size,rotated.size),ritz.streaming_workspace_bytes(257,17)),(numbers,8*counted))
-                del slab,rotated
-                result=ritz.generalized_rayleigh_ritz(self.op,x.copy(order='F'),consume_basis=True)
-            self.assertEqual(result.algorithm,'streaming_generalized_cholesky_rayleigh_ritz')
-            self.assertEqual(tuple(rotate.call_args.args[2].shape),(tile,17))
-            runs[value]=(*given[0],cp.asnumpy(result.eigenvalues),cp.asnumpy(result.wavefunctions))
-        # Unset is the tile of the budget, to the last bit of everything.
-        for mine,theirs in zip(runs[None],runs['budget']):np.testing.assert_array_equal(mine,theirs)
-        # The slabs do not move with the tile: the Gram pair and the Ritz values keep their bits.  The rows are
-        # rotated in tiles of another height, which cuBLAS need not sum alike: the same vectors at round-off.
-        for mine,theirs in zip(runs['slab'][:3],runs['budget'][:3]):np.testing.assert_array_equal(mine,theirs)
-        np.testing.assert_allclose(runs['slab'][3],runs['budget'][3],rtol=0,atol=1e-12)
-        np.testing.assert_allclose(runs['slab'][3].T@runs['slab'][3],np.eye(17),atol=1e-9)
+        with patch.dict(os.environ,common),patch.object(ritz,'_rotate_in_place',wraps=ritz._rotate_in_place) as rotate:
+            self.assertEqual(ritz._streaming_shape(x),(4,90))
+            slab,rotated=ritz._streaming_workspace(x)
+            self.assertEqual((slab.shape,rotated.shape,slab.data.ptr),((257,4),(90,17),rotated.data.ptr))
+            self.assertEqual((max(slab.size,rotated.size),ritz.streaming_workspace_bytes(257,17)),(1530,8*1542))
+            del slab,rotated
+            result=ritz.generalized_rayleigh_ritz(self.op,x.copy(order='F'),consume_basis=True)
+        self.assertEqual(result.algorithm,'streaming_generalized_cholesky_rayleigh_ritz')
+        self.assertEqual(tuple(rotate.call_args.args[2].shape),(90,17))
+        vectors=cp.asnumpy(result.wavefunctions)
+        np.testing.assert_allclose(vectors.T@vectors,np.eye(17),atol=1e-9)
 
     def test_failed_audit_releases_the_streaming_workspace(self):
         import importlib
@@ -989,6 +945,35 @@ class NextDeviceTests(unittest.TestCase):
         for policy in ('on','off'):
             with patch.dict(os.environ,PARSEC_CUPY_RITZ_SYRK=policy):
                 np.testing.assert_array_equal(cp.asnumpy(ritz._symmetric_overlap(x,128)),cp.asnumpy(ritz._symmetric_overlap(x)))
+
+    def test_a_sector_on_one_device_forms_its_overlap_in_the_slabs_of_the_count(self):
+        import importlib
+        ritz=importlib.import_module('parsec_python.acceleration.Eigensolvers.rayleigh_ritz')
+        # 157 columns of a basis on one device, as every sector has them on 1, 2 and 4 GPUs with four sectors: eight
+        # slabs of 20 by the count, where the rule of a shared row block would cut one of 128 and one of 29.  Neither
+        # route of the Ritz step that owns its basis names a width, so its overlap keeps the cut and the bits it had.
+        cp=self.cp;host=np.random.default_rng(107).normal(size=(257,157));x=cp.array(host,order='F')
+        solve=ritz.solve_whitened_ritz
+        for streaming in ('0','1'):
+            given=[]
+            def kept(overlap,projection):
+                given.append(np.array(overlap));return solve(overlap,projection)
+            with patch.dict(os.environ,PARSEC_CUPY_STREAMING_RITZ=streaming,PARSEC_CUPY_RITZ_DENSE_BACKEND='host',
+                            PARSEC_CUPY_RITZ_EIGH_BACKEND='host'),patch.object(ritz,'solve_whitened_ritz',kept), \
+                    patch.object(ritz,'_symmetric_overlap',wraps=ritz._symmetric_overlap) as overlap:
+                for name in ('PARSEC_CUPY_RITZ_GRAM_SLABS','PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS',
+                             'PARSEC_CUPY_RITZ_GRAM_MULTIPLE','PARSEC_CUPY_RITZ_SYRK','PARSEC_CUPY_STREAMING_RITZ_BYTES'):
+                    os.environ.pop(name,None)
+                counted=cp.asnumpy(ritz._lower_triangle_product(x,x))
+                result=ritz.generalized_rayleigh_ritz(self.op,x.copy(order='F'),consume_basis=True)
+            self.assertEqual(result.algorithm.startswith('streaming'),streaming=='1')
+            # One overlap, asked of the basis alone ...
+            self.assertEqual((overlap.call_count,len(overlap.call_args.args),overlap.call_args.kwargs),(1,1,{}))
+            # ... and cut as the count cuts it: nothing above the diagonal slabs of 20 columns, the bits of those slabs.
+            (lower,)=given
+            for start in range(20,157,20):self.assertFalse(lower[:start,start:start+20].any())
+            self.assertTrue(lower[19,:20].all())
+            np.testing.assert_array_equal(lower,counted)
 
     def test_gram_multiple_cuts_the_slabs_of_both_routes_on_the_device(self):
         import importlib

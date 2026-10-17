@@ -206,18 +206,24 @@ def _finalize_result(system, result, symmetry_eigensolver):
         )
         # Only where sector states were kept on the host in buffers of
         # their own (PARSEC_CUPY_SPILL_BUFFERS): a run that keeps them on
-        # its devices, or stages them as before, has the details it had.
+        # its devices, shares every basis, which takes no buffer, or stages
+        # them as before, has the details it had.  The bound of the
+        # page-locking follows from what the host had available when the
+        # storage was decided, so it is in the record of the staging and not
+        # here.  The sectors are those of this process.
         staging = getattr(symmetry_eigensolver, "spill_staging", None)
-        if isinstance(staging, dict) and staging["buffers"] == "persistent":
-            sectors = staging["sectors"].values()
+        taken = (
+            [item for item in staging["sectors"].values() if item["allocations"]]
+            if isinstance(staging, dict) and staging["buffers"] == "persistent"
+            else []
+        )
+        if taken:
             details += (
                 (
                     "orbital_sector_spill_staging",
                     "persistent host buffers with direct copies; "
-                    f"{sum(item['page_locked'] for item in sectors)} of "
-                    f"{len(sectors)} page-locked, "
-                    f"{staging['page_locked_bytes']} B within "
-                    f"{staging['bound_bytes']} B ({staging['bound_from']}), "
+                    f"{sum(item['page_locked'] for item in taken)} of "
+                    f"{len(taken)} page-locked ({staging['page_locked_bytes']} B), "
                     f"{staging['pageable_bytes']} B pageable",
                 ),
             )

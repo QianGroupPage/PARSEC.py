@@ -18,7 +18,7 @@ import sys
 import threading
 import weakref
 from time import perf_counter
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -407,6 +407,14 @@ class SpillBuffers:
     launches of one calculation on a host with the same memory available
     therefore lock the same buffers, whichever thread downloads first.
 
+    ``deferred`` names sectors whose basis the devices of a group may
+    share.  A shared basis never leaves its devices and takes no buffer,
+    so these are planned after the others, in their order, with what the
+    bound leaves: a sector on one device that is spilled beside them is
+    not made pageable by the bytes of one that takes nothing.  One of them
+    that is not shared after all, which the first solve decides, is still
+    planned, and is locked if the bound has room for it.
+
     No memory is taken here.  A sector takes its buffer when it is first
     downloaded (:class:`SpillBuffer`), so a sector whose basis never leaves
     its devices, a shared one, never takes any.  The bound holds for what
@@ -416,21 +424,31 @@ class SpillBuffers:
     result still reads the old one.
     """
 
-    def __init__(self, sizes: Mapping[int, int], bound: tuple[int, str] | None = None) -> None:
+    def __init__(
+        self,
+        sizes: Mapping[int, int],
+        bound: tuple[int, str] | None = None,
+        deferred: Iterable[int] = (),
+    ) -> None:
         self.bound_bytes, self.bound_from = page_lock_bound() if bound is None else bound
         self.bound_bytes = int(self.bound_bytes)
         # Reentrant: a buffer can go back, and be counted off, inside a call
         # that holds the lock.
         self._ledger = threading.RLock()
         self._locked = 0
-        self._buffers: dict[int, SpillBuffer] = {}
+        sizes = {int(sector): int(nbytes) for sector, nbytes in sizes.items()}
+        later = {int(sector) for sector in deferred}
+        locks: dict[int, bool] = {}
         planned = 0
-        for sector, nbytes in sizes.items():
-            nbytes = int(nbytes)
-            lock = 0 < nbytes and planned + nbytes <= self.bound_bytes
-            if lock:
-                planned += nbytes
-            self._buffers[int(sector)] = SpillBuffer(self, sector, lock)
+        for sector in [item for item in sizes if item not in later] + [
+            item for item in sizes if item in later
+        ]:
+            locks[sector] = 0 < sizes[sector] and planned + sizes[sector] <= self.bound_bytes
+            if locks[sector]:
+                planned += sizes[sector]
+        self._buffers: dict[int, SpillBuffer] = {
+            sector: SpillBuffer(self, sector, locks[sector]) for sector in sizes
+        }
         self.planned_bytes = planned
 
     def get(self, sector: int) -> SpillBuffer | None:

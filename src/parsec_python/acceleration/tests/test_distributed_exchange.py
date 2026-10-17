@@ -680,7 +680,8 @@ class ExchangePlanTests(unittest.TestCase):
         exact = larger = 0
         with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)), patch.dict(os.environ):
             for name in ('PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
-                         'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES'):
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
             os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_RANGES'] = 'fixed'
             for rows, columns, count in ((257, 96, 4), (257, 96, 2), (1000, 200, 4), (4097, 131, 4), (4097, 131, 2),
@@ -720,10 +721,12 @@ class ExchangePlanTests(unittest.TestCase):
                                 self.assertEqual(distributed_state.followed_slabs(away, widest),
                                                  tuple(sorted(set(held))) if 2 * len(held) >= len(widest) and held else ())
             # In bytes of basis, with the chunk of 1 GiB and the slab budgets of the default, for 1,000,000 rows.
-            # Four devices count more from a slab of 4/3 GiB, an eighth of a basis of 10.67 GiB (1,432
-            # columns), and all 128 MiB from a slab of 1.5 GiB, a basis of 12 GiB (1,616 columns with the
-            # slab in whole columns).  Two devices count nothing more with their slabs of at most 2 GiB, and
-            # the 128 MiB where their former slabs of 4 GiB are named.
+            # Slabs of 1 GiB, 134 columns, take 0.75 GiB outside a device on four devices and 0.5 GiB on two:
+            # neither counts more, at any size.  The former round of 8 GiB on four devices counts more from a
+            # slab of 4/3 GiB, an eighth of a basis of 10.67 GiB (1,432 columns), and all 128 MiB from a slab of
+            # 1.5 GiB, a basis of 12 GiB (1,616 columns with the slab in whole columns).  Two devices count
+            # nothing more with their former slabs of at most 2 GiB either, and the 128 MiB where their slabs
+            # of 4 GiB are named.
             del os.environ['PARSEC_CUPY_STREAMING_RITZ_BYTES']
             gib, rows = 1 << 30, 1000000
 
@@ -733,12 +736,17 @@ class ExchangePlanTests(unittest.TestCase):
                     with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib)):
                         return counted - distributed_state.shared_block_bytes(rows, columns, count)
 
-            self.assertEqual([more(columns, 4) for columns in (500, 1431)], [0, 0])
-            rising = [more(columns, 4) for columns in (1432, 1500, 1615)]
+            sizes = (500, 1431, 1432, 1500, 1615, 1616, 2000, 5000, 10000)
+            self.assertEqual([more(columns, 4) for columns in sizes], [0] * len(sizes))
+            self.assertEqual([more(columns, 2) for columns in (500, 1432, 1616, 5000, 10000)], [0] * 5)
+            rounds = dict(PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES=str(8 * gib))
+            self.assertEqual([more(columns, 4, **rounds) for columns in (500, 1431)], [0, 0])
+            rising = [more(columns, 4, **rounds) for columns in (1432, 1500, 1615)]
             self.assertEqual(rising, sorted(rising))
             self.assertTrue(0 < rising[0] and rising[-1] < 1 << 27, rising)
-            self.assertEqual([more(columns, 4) for columns in (1616, 2000, 5000, 10000)], [1 << 27] * 4)
-            self.assertEqual([more(columns, 2) for columns in (500, 1432, 1616, 5000, 10000)], [0] * 5)
+            self.assertEqual([more(columns, 4, **rounds) for columns in (1616, 2000, 5000, 10000)], [1 << 27] * 4)
+            pair = dict(PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(2 * gib))
+            self.assertEqual([more(columns, 2, **pair) for columns in (500, 1432, 1616, 5000, 10000)], [0] * 5)
             former = dict(PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(4 * gib))
             self.assertEqual([more(columns, 2, **former) for columns in (5000, 10000)], [1 << 27] * 2)
         self.assertGreater(min(exact, larger), 20)
@@ -775,18 +783,19 @@ class ExchangePlanTests(unittest.TestCase):
             for name in ('PARSEC_CUPY_RITZ_CONDITION_HELPER', 'PARSEC_CUPY_RITZ_CONDITION',
                          'PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
                          'PARSEC_CUPY_DISTRIBUTED_STATE_RANGES', 'PARSEC_CUPY_STREAMING_RITZ_BYTES',
-                         'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES'):
+                         'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
-            self.assertEqual(distributed_state.condition_helper_policy(), 'any')
+            self.assertEqual(distributed_state.condition_helper_policy(), 'auto')
             # The first device after the owner, which never helps itself ...
             self.assertEqual([helper(devices) for devices in ((0, 1, 2, 3), (2, 3), (3, 1, 0), (1,))], [1, 3, 1, None])
             # ... unless it holds the Hartree objects of the process: the root's sector on 16 GPUs and its
-            # two on 8, of which the second has no other device and asks that one.  Elsewhere the owner
-            # holds them.
+            # two on 8, of which the second has no other device and by default leaves the estimate to its
+            # owner.  Elsewhere the owner holds them.
             self.assertEqual([helper((0, 1, 2, 3), device) for device in (3, 1, 0)], [1, 2, 1])
-            self.assertEqual((helper((0, 1), 3), helper((2, 3), 3)), (1, 3))
-            # ``any``, the default, asks that device where the sector has no other, and only there; ``auto``,
-            # the default before, never asks it; ``off`` asks no device.
+            self.assertEqual((helper((0, 1), 3), helper((2, 3), 3)), (1, None))
+            # ``auto``, the default, never asks that device; ``any``, the default for a while, asks it where
+            # the sector has no other, and only there; ``off`` asks no device.
             for raw, expected in ((' Any ', (2, 3)), ('auto', (2, None)), ('OFF', (None, None))):
                 os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = raw
                 self.assertEqual(distributed_state.condition_helper_policy(), raw.strip().lower())
@@ -795,9 +804,9 @@ class ExchangePlanTests(unittest.TestCase):
             self.assertEqual([helper(devices, 1) for devices in ((0, 1), (0, 1, 2), (1,))], [1, 2, None])
             # Every layout of a rank that the runner plans (experimental.mpi_scf.sector_device_groups) with
             # the device that the driver gives the Hartree objects (driver._select_hartree_device): sectors,
-            # ranks and devices of a rank.  By default every shared sector has a helper, which is never its
-            # owner; with ``auto`` the sectors of two devices whose second one holds those objects have none,
-            # one sector of the root rank wherever its sectors have two devices each.
+            # ranks and devices of a rank.  With ``any`` every shared sector has a helper, which is never its
+            # owner; by default, as with ``auto``, the sectors of two devices whose second one holds those
+            # objects have none, one sector of the root rank wherever its sectors have two devices each.
             from parsec_python.acceleration import driver
             from parsec_python.acceleration.experimental.mpi_scf import sector_device_groups
             without = {}
@@ -806,17 +815,22 @@ class ExchangePlanTests(unittest.TestCase):
                 groups = sector_device_groups(sectors, ranks, 0, tuple(range(count)))
                 busy = driver._select_hartree_device('auto', tuple(range(count)), groups)
                 shared = [devices for devices in groups.values() if len(devices) > 1]
-                for policy in ('any', 'auto'):
-                    os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = policy
-                    found = [helper(devices, busy) for devices in shared]
-                    self.assertFalse(any(device == devices[0] for device, devices in zip(found, shared)))
-                    self.assertTrue(all(device is None or device in devices[1:] for device, devices in zip(found, shared)))
-                    if policy == 'any':
-                        self.assertNotIn(None, found, (sectors, ranks, count))
+                found = {}
+                for policy in ('any', 'auto', None):
+                    if policy is None:
+                        os.environ.pop('PARSEC_CUPY_RITZ_CONDITION_HELPER')
                     else:
-                        without[sectors, ranks, count] = [devices for device, devices in zip(found, shared) if device is None]
-                        self.assertEqual(without[sectors, ranks, count],
-                                         [devices for devices in shared if devices[1:] == (busy,)])
+                        os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = policy
+                    found[policy] = [helper(devices, busy) for devices in shared]
+                    self.assertFalse(any(device == devices[0] for device, devices in zip(found[policy], shared)))
+                    self.assertTrue(all(device is None or device in devices[1:]
+                                        for device, devices in zip(found[policy], shared)))
+                self.assertNotIn(None, found['any'], (sectors, ranks, count))
+                self.assertEqual(found[None], found['auto'], (sectors, ranks, count))
+                without[sectors, ranks, count] = [devices for device, devices in zip(found['auto'], shared)
+                                                  if device is None]
+                self.assertEqual(without[sectors, ranks, count],
+                                 [devices for devices in shared if devices[1:] == (busy,)])
             self.assertEqual({layout: sectors for layout, sectors in without.items() if sectors},
                              {(4, 2, 4): [(2, 3)], (4, 1, 8): [(6, 7)], (4, 4, 2): [(0, 1)], (4, 2, 3): [(0, 1)],
                               (8, 4, 4): [(2, 3)], (8, 2, 8): [(6, 7)], (2, 1, 4): [(2, 3)], (2, 2, 2): [(0, 1)]})
@@ -870,14 +884,15 @@ class ExchangePlanTests(unittest.TestCase):
     def test_the_device_with_the_hartree_objects_helps_only_where_the_sharing_rule_counts_the_room(self):
         gib = 1 << 30
         # The sector of 29,576 electrons on two devices, the second of which holds the Hartree objects (the
-        # root rank of 8 GPUs): the rule that shares the basis counts 66,534,064,304 bytes of blocks on a
+        # root rank of 8 GPUs): the rule that shares the basis counts 64,683,595,824 bytes of blocks on a
         # device, and the estimate 525,746,240.
         rows, states = 4130510, 3704
-        blocks, estimate = 66534064304, 525746240
+        blocks, estimate = 64683595824, 525746240
         names = ('PARSEC_CUPY_RITZ_CONDITION_HELPER', 'PARSEC_CUPY_RITZ_CONDITION',
                  'PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
                  'PARSEC_CUPY_DISTRIBUTED_STATE_RANGES', 'PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
-                 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_SLABS',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS', 'PARSEC_CUPY_DISTRIBUTED_STATE_SLABS',
                  'PARSEC_CUPY_DISTRIBUTED_STATE')
 
         def helper(total, devices=(2, 3), hartree_device=3, shape=(rows, states)):
@@ -893,10 +908,14 @@ class ExchangePlanTests(unittest.TestCase):
                 os.environ.pop(name, None)
             self.assertEqual((distributed_state.shared_block_bytes(rows, states, 2), distributed_state.condition_helper_bytes(states)),
                              (blocks, estimate))
-            # 0.85 of a device is the share: the device helps from 78,893,894,758 bytes on (73.5 GiB) and not
+            # By default, as with ``auto``, that device is asked on no device size.
+            self.assertEqual([helper(total) for total in (85093777408, 1 << 50)], [None, None])
+            # ``any`` asks it where the room is counted.
+            os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = 'any'
+            # 0.85 of a device is the share: the device helps from 76,716,873,017 bytes on (71.4 GiB) and not
             # one MiB below, and a device of an A100 node, 85,093,777,408 bytes, helps.
             least = -(-(blocks + estimate) * 20 // 17)
-            self.assertEqual(least, 78893894758)
+            self.assertEqual(least, 76716873017)
             self.assertEqual([helper(total) for total in (least + (1 << 20), least, least - (1 << 20), 85093777408)],
                              [3, 3, None, 3])
             # Without the estimate the blocks alone would fit a device that is too small for both: the rule
@@ -911,12 +930,9 @@ class ExchangePlanTests(unittest.TestCase):
                 with patch.dict(os.environ, PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION=fraction):
                     self.assertEqual(helper(least - gib), found, fraction)
             # A basis that is shared by name beyond its share has no room either: 0.85 of 70 GiB are less
-            # than the blocks alone.
+            # than the blocks alone.  No value asks that device whatever the room, as ``any`` did before it
+            # counted the room.
             self.assertEqual(helper(70 * gib), None)
-            # ``any`` named is the default, the room included: no value asks that device whatever the room,
-            # as ``any`` did while ``auto`` was the default.
-            with patch.dict(os.environ, PARSEC_CUPY_RITZ_CONDITION_HELPER='any'):
-                self.assertEqual([helper(total) for total in (least, least - (1 << 20), 70 * gib)], [3, None, None])
             # The count is that of the step in force: two tall blocks count 123 GiB on such a device.
             with patch.dict(os.environ, PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS='2'):
                 self.assertEqual([helper(total) for total in (85093777408, 200 * gib)], [None, 3])
@@ -1050,21 +1066,42 @@ class ExchangePlanTests(unittest.TestCase):
 
         # Sectors of 14,680, 19,392, 23,768, 29,576 and 39,368 electrons: rows and columns.
         sectors = ((2604846, 1842), (2873400, 2438), (3786832, 2979), (4130510, 3704), (6157900, 4928))
+        # The former round of 8 GiB on four devices and the former limit of 2 GiB on two, with which the runs
+        # below were made.
+        rounds = dict(PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES=str(8 * gib),
+                      PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(2 * gib))
         with patch.dict(os.environ):
-            for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES'):
+            for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
-            # A round of 8 GiB on four devices: slabs of 2 GiB.  Two devices have slabs of 2 GiB as well
-            # (see the test of two devices below); the other steps keep 4 GiB.
-            for sector, two, four in zip(sectors, (206, 186, 141, 129, 87), (103, 93, 70, 64, 43)):
+            # A round of 4 GiB on four devices: slabs of 1 GiB, and of the 36 columns of the budget of the floor
+            # of 32 where 1 GiB holds fewer, 23,768, 29,576 and 39,368 electrons, whose equal cut keeps 32
+            # columns or more.  Two devices have slabs of 1 GiB with that floor as well (see the test of two
+            # devices below); the other steps keep 4 GiB.  The former round gave slabs of 2 GiB, and so did the
+            # former limit of two devices.
+            for sector, two, pair, four, before in zip(sectors, (206, 186, 141, 129, 87), (51, 46, 36, 36, 36),
+                                                       (51, 46, 36, 36, 36), (103, 93, 70, 64, 43)):
                 rows = sector[0]
-                self.assertEqual((columns_of(*sector, 2, blocks=1), columns_of(*sector, 4, blocks=1)), (four, four))
+                self.assertEqual((columns_of(*sector, 2, blocks=1), columns_of(*sector, 4, blocks=1)), (pair, four))
                 self.assertEqual((columns_of(*sector, 2), columns_of(*sector, 4)), (two, two))
-                # The workspace is two slabs: about 4 GiB instead of 8 on four devices.
-                self.assertEqual(workspace(*sector, 4, 1), rows * four + -(-rows // 4) * 4 * four)
-                self.assertLess(8 * workspace(*sector, 4, 1), 4 * gib)
+                # The workspace is two slabs: 2 to 3.3 GiB instead of 8 on four devices, and below 4 with the
+                # former round.
+                held = workspace(*sector, 4, 1)
+                self.assertEqual(held, rows * four + -(-rows // 4) * 4 * four)
+                self.assertLess(8 * held, 3.4 * gib)
                 self.assertGreater(8 * workspace(*sector, 4, 2), 7.9 * gib)
-            # More devices share the round further.  Three keep the 4 GiB: none has run.
+                with patch.dict(os.environ, rounds):
+                    self.assertEqual((columns_of(*sector, 2, blocks=1), columns_of(*sector, 4, blocks=1)),
+                                     (before, before))
+                    self.assertLess(held, workspace(*sector, 4, 1))
+                    self.assertLess(8 * workspace(*sector, 4, 1), 4 * gib)
+            # More devices share the round further, down to the floor: the 17 columns of 512 MiB are widened
+            # towards the 36 of the budget of the floor up to the 35 of the former round, which the floor never
+            # exceeds.  Three keep the 4 GiB: none has run.
             self.assertEqual((columns_of(3786832, 2979, 8, blocks=1), columns_of(3786832, 2979, 3, blocks=1)), (35, 141))
+            with patch.dict(os.environ, rounds):
+                self.assertEqual((columns_of(3786832, 2979, 8, blocks=1), columns_of(3786832, 2979, 3, blocks=1)),
+                                 (35, 141))
 
             def cut(sector, widths, width):
                 """Rounds, columns of the widest slab and of the widest round, and megabytes of the workspace."""
@@ -1074,33 +1111,48 @@ class ExchangePlanTests(unittest.TestCase):
                 widest, joined = max(map(max, sizes)), max(map(sum, sizes))
                 return len(sizes), widest, joined, 8 * group._cut_capacity(sector[0], widest, joined, 1) / 2**20
 
-            # The cuts of the default on 16 GPUs, for the column blocks of the measured runs, against those of
-            # slabs of 4 GiB: rounds, widest slab, widest round, megabytes that the workspace returns.  The
-            # two that ran with a budget of 2 GiB, 23,768 and 29,576 electrons, gave back 3230 and 3474 MiB of
-            # their peaks; 14,680, 19,392 and 39,368 electrons have not run with theirs.
-            for sector, widths, default, before, returned in (
-                    ((2604846, 1842), (462, 462, 456, 462), (5, 93, 371), (3, 154, 614), 2425),
-                    ((2873400, 2431), (606, 612, 612, 601), (7, 88, 349), (4, 153, 609), 2850),
-                    ((3786832, 2979), (750, 744, 744, 740), (11, 69, 273), (6, 125, 497), 3236),
-                    ((4130510, 3704), (930, 924, 924, 926), (15, 62, 248), (8, 117, 465), 3466),
-                    ((6157900, 4928), (1230, 1236, 1236, 1226), (29, 43, 172), (15, 83, 330), 3758)):
-                now, then = cut(sector, widths, columns_of(*sector, 4, blocks=1)), cut(sector, widths, former(*sector, 4))
-                self.assertEqual((now[:3], then[:3], round(then[3] - now[3])), (default, before, returned))
-                # A budget of 2 GiB, with which the two ran, cuts as the default does, and one of 4 GiB as before.
-                for budget, expected in ((2 * gib, now), (4 * gib, then)):
+            # The cuts on 16 GPUs, for the column blocks of the measured runs: rounds, widest slab and widest
+            # round of the default, of the former round and of slabs of 4 GiB, the megabytes that the workspace
+            # of the former round returned against slabs of 4 GiB, and those that the default returns against
+            # the former round.  The two that ran with a budget of 2 GiB, 23,768 and 29,576 electrons, gave back
+            # 3230 and 3474 MiB of their peaks; 14,680, 19,392 and 39,368 electrons have not run with theirs.
+            for sector, widths, default, two, before, returned, more in (
+                    ((2604846, 1842), (462, 462, 456, 462), (10, 47, 187), (5, 93, 371), (3, 154, 614), 2425, 1828),
+                    ((2873400, 2431), (606, 612, 612, 601), (14, 44, 175), (7, 88, 349), (4, 153, 609), 2850, 1929),
+                    ((3786832, 2979), (750, 744, 744, 740), (21, 36, 144), (11, 69, 273), (6, 125, 497), 3236, 1907),
+                    ((4130510, 3704), (930, 924, 924, 926), (26, 36, 144), (15, 62, 248), (8, 117, 465), 3466, 1639),
+                    ((6157900, 4928), (1230, 1236, 1236, 1226), (35, 36, 144), (29, 43, 172), (15, 83, 330), 3758, 658)):
+                now = cut(sector, widths, columns_of(*sector, 4, blocks=1))
+                with patch.dict(os.environ, rounds):
+                    then = cut(sector, widths, columns_of(*sector, 4, blocks=1))
+                old = cut(sector, widths, former(*sector, 4))
+                self.assertEqual((now[:3], then[:3], old[:3], round(old[3] - then[3]), round(then[3] - now[3])),
+                                 (default, two, before, returned, more))
+                # A budget of 2 GiB, with which the two ran, cuts as the former round does, and one of 4 GiB as
+                # before.
+                for budget, expected in ((2 * gib, then), (4 * gib, old)):
                     with patch.dict(os.environ, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(budget)):
                         self.assertEqual(cut(sector, widths, columns_of(*sector, 4, blocks=1)), expected)
-            # 10,456 electrons on 16 GPUs are cut as before, in three rounds, although their slab may be narrower.
+            # 10,456 electrons on 16 GPUs cut slabs of 69 columns, 1 GiB, in five rounds of up to 263 columns.
+            # The former round cut them as before, in three rounds, although its slab of 139 may be narrower.
             small = (1924792, 1314)
-            self.assertEqual((columns_of(*small, 4, blocks=1), former(*small, 4)), (139, 164))
+            self.assertEqual((columns_of(*small, 4, blocks=1), former(*small, 4)), (69, 164))
+            self.assertEqual(cut(small, (330, 330, 324, 330), 69)[:3], (5, 66, 263))
+            with patch.dict(os.environ, rounds):
+                self.assertEqual(columns_of(*small, 4, blocks=1), 139)
             self.assertEqual(cut(small, (330, 330, 324, 330), 139), cut(small, (330, 330, 324, 330), 164))
             shapes = [(rows, columns) for rows in (257, 10**5, 10**6, 1924792, 2873400, 3786832, 6157900)
                       for columns in (8, 64, 500, 1300, 2979, 4928)]
-            # Three devices keep the slabs that they had, and two do up to 16 GiB of basis ...
+            # Three devices keep the slabs that they had, and two do up to 8 GiB of basis, or up to 16 GiB with
+            # their former limit of 2 GiB ...
             for rows, columns in shapes:
                 self.assertEqual(columns_of(rows, columns, 3, blocks=1), former(rows, columns, 3), (rows, columns))
-                if rows * columns <= 2 * gib:
+                if rows * columns <= gib:
                     self.assertEqual(columns_of(rows, columns, 2, blocks=1), former(rows, columns, 2), (rows, columns))
+                if rows * columns <= 2 * gib:
+                    with patch.dict(os.environ, rounds):
+                        self.assertEqual(columns_of(rows, columns, 2, blocks=1), former(rows, columns, 2),
+                                         (rows, columns))
             # ... and a budget of 4 GiB gives four and more devices theirs, whatever the size of the basis.
             os.environ['PARSEC_CUPY_STREAMING_RITZ_BYTES'] = str(4 * gib)
             for rows, columns in shapes:
@@ -1118,33 +1170,46 @@ class ExchangePlanTests(unittest.TestCase):
                 for devices in (2, 4, 8):
                     self.assertEqual(columns_of(3786832, 2979, devices, blocks=1), columns_of(3786832, 2979, devices))
         # The fit rule counts the workspace of those slabs.  On four A100 of 79.25 GiB, of which the blocks
-        # may take 67.4, a sector of 39,368 electrons in a sphere of 36.1 A (226 GiB) counts 61.5 GiB, and
-        # one of 6,417,000 rows (236 GiB, about 36.6 A) 63.9; with slabs of 4 GiB that one counted 67.9.
+        # may take 67.4, a sector of 39,368 electrons in a sphere of 36.1 A (226 GiB) counts 61.0 GiB, and
+        # one of 6,417,000 rows (236 GiB, about 36.6 A) 63.5; the former round counted 61.6 and 64.0 GiB, and
+        # slabs of 4 GiB 65.7 and 68.0.
         measured, _runtime = _stand_in(total_bytes=85093777408)
         with patch.object(distributed_state, 'require_cupy', lambda: (measured, None)), patch.dict(os.environ):
             for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
                          'PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
-                         'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES'):
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
             os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_RANGES'] = 'fixed'
             fits = distributed_state.shared_basis_fits
             self.assertEqual((fits(6157900, 4928, 4), fits(6417000, 4928, 4)), (True, True))
+            with patch.dict(os.environ, rounds):
+                self.assertEqual((fits(6157900, 4928, 4), fits(6417000, 4928, 4)), (True, True))
             with patch.dict(os.environ, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(4 * gib)):
                 self.assertEqual((fits(6157900, 4928, 4), fits(6417000, 4928, 4)), (True, False))
-            # Four devices share a basis of up to 249 GiB instead of 233, two of up to 125 instead of 117.
-            # The exchange buffer may follow a slab that is up to an eighth wider than a chunk, and the rule
-            # counts the 128 MiB wherever a slab of the budget is wider than a chunk outside a device: on four
-            # devices (5,570 columns fit where 5,581 did), and on two with slabs of 4 GiB (2,605 for 2,610).
-            # With the chunk named, 1 GiB as before, the rule shares what it shared.
+            # Four devices share a basis of up to 252 GiB, 249 with the former round and 233 with slabs of 4
+            # GiB; two of up to 126.2, 124.7 with their former limit and 116.5 with slabs of 4 GiB.  The
+            # exchange buffer may follow a slab that is up to an eighth wider than a chunk, and the rule counts
+            # the 128 MiB wherever a slab of the budget is wider than a chunk outside a device: on four devices,
+            # whose slabs of 36 columns, the budget of the floor, take 1.21 GiB outside a device of 6,000,000
+            # rows (5,634 columns fit where 5,645 do with the chunk named) as those of the former round did
+            # (5,570 for 5,581), and on two with slabs of 4 GiB (2,605 for 2,610).  With the chunk named, 1 GiB
+            # as before, the rule shares what it shared.
             rows = 6 * 10**6
-            self.assertEqual([fits(rows, columns, 4) for columns in (5570, 5580)], [True, False])
-            self.assertEqual([fits(rows, columns, 2) for columns in (2790, 2800)], [True, False])
+            self.assertEqual([fits(rows, columns, 4) for columns in (5630, 5635)], [True, False])
+            self.assertEqual([fits(rows, columns, 2) for columns in (2820, 2825)], [True, False])
+            with patch.dict(os.environ, rounds):
+                self.assertEqual([fits(rows, columns, 4) for columns in (5570, 5580)], [True, False])
+                self.assertEqual([fits(rows, columns, 2) for columns in (2790, 2800)], [True, False])
             with patch.dict(os.environ, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(4 * gib)):
                 self.assertEqual([fits(rows, columns, 4) for columns in (5210, 5220)], [True, False])
                 self.assertEqual([fits(rows, columns, 2) for columns in (2600, 2610)], [True, False])
             with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib)):
-                self.assertEqual([fits(rows, columns, 4) for columns in (5580, 5590)], [True, False])
-                self.assertEqual([fits(rows, columns, 2) for columns in (2790, 2800)], [True, False])
+                self.assertEqual([fits(rows, columns, 4) for columns in (5645, 5650)], [True, False])
+                self.assertEqual([fits(rows, columns, 2) for columns in (2820, 2825)], [True, False])
+                with patch.dict(os.environ, rounds):
+                    self.assertEqual([fits(rows, columns, 4) for columns in (5580, 5590)], [True, False])
+                    self.assertEqual([fits(rows, columns, 2) for columns in (2790, 2800)], [True, False])
                 with patch.dict(os.environ, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(4 * gib)):
                     self.assertEqual([fits(rows, columns, 4) for columns in (5220, 5230)], [True, False])
                     self.assertEqual([fits(rows, columns, 2) for columns in (2610, 2620)], [True, False])
@@ -1172,51 +1237,68 @@ class ExchangePlanTests(unittest.TestCase):
             return columns - columns // 2, columns // 2
 
         with patch.dict(os.environ):
-            for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', limit):
+            for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', limit, 'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
-            self.assertEqual(distributed_state.pair_slab_bytes(), 2 * gib)
+            self.assertEqual(distributed_state.pair_slab_bytes(), gib)
             # Rows and column blocks of the sectors of 14,680, 19,392, 23,768 and 29,576 electrons on 8 GPUs
-            # (36, 52, 84 and 114 GiB): the cut of the default against that of slabs of 4 GiB, as rounds,
-            # widest slab and widest round, and the megabytes that the workspace returns.  The two largest ran
-            # with a budget of 2 GiB and gave back 3936 and 3786 MiB of their peaks; the other two have not run.
-            for rows, widths, default, before, returned in (
-                    (2604846, (924, 918), (9, 103, 205), (5, 185, 369), 3259),
-                    (2873400, (1218, 1213), (14, 87, 174), (7, 174, 348), 3814),
-                    (3786832, (1494, 1484), (22, 68, 136), (11, 136, 271), 3929),
-                    (4130510, (1854, 1850), (29, 64, 128), (15, 124, 248), 3782)):
+            # (36, 52, 84 and 114 GiB): the cut of the default, of the former limit of 2 GiB and of slabs of 4
+            # GiB, as rounds, widest slab and widest round, the megabytes that the workspace of the former
+            # limit returned against slabs of 4 GiB, and those that the default returns against the former
+            # limit.  The two largest ran with a budget of 2 GiB and gave back 3936 and 3786 MiB of their
+            # peaks; the other two have not run.  The default slabs of 23,768 and 29,576 electrons are the 36
+            # columns of the budget of the floor, where 1 GiB holds 35 and 32.
+            for rows, widths, default, two, before, returned, more in (
+                    (2604846, (924, 918), (19, 49, 98), (9, 103, 205), (5, 185, 369), 3259, 2146),
+                    (2873400, (1218, 1213), (27, 46, 91), (14, 87, 174), (7, 174, 348), 3814, 1798),
+                    (3786832, (1494, 1484), (42, 36, 72), (22, 68, 136), (11, 136, 271), 3929, 1849),
+                    (4130510, (1854, 1850), (52, 36, 72), (29, 64, 128), (15, 124, 248), 3782, 1765)):
                 columns = sum(widths)
-                now, then = cut(rows, widths, columns_of(rows, columns, 2, blocks=1)), cut(rows, widths, former(rows, columns))
-                self.assertEqual((now[:3], then[:3], round(then[3] - now[3])), (default, before, returned))
-                # The workspace of the budget is two slabs of 2 GiB; the two-block step keeps two of 4.
-                self.assertLess(8 * workspace(rows, columns, 2, 1), 4 * gib)
+                now = cut(rows, widths, columns_of(rows, columns, 2, blocks=1))
+                with patch.dict(os.environ, {limit: str(2 * gib)}):
+                    then = cut(rows, widths, columns_of(rows, columns, 2, blocks=1))
+                old = cut(rows, widths, former(rows, columns))
+                self.assertEqual((now[:3], then[:3], old[:3], round(old[3] - then[3]), round(then[3] - now[3])),
+                                 (default, two, before, returned, more))
+                # The workspace of the budget is two slabs of 1 GiB, or of the 36 columns of the floor; the
+                # two-block step keeps two of 4.
+                self.assertLess(8 * workspace(rows, columns, 2, 1), 2.25 * gib)
                 self.assertGreater(8 * workspace(rows, columns, 2, 2), 7.9 * gib)
-                # A budget of 2 GiB, with which the two ran, cuts as the default does, and one of 4 GiB as before.
-                for budget, expected in ((2 * gib, now), (4 * gib, then)):
+                # A budget of 2 GiB, with which the two ran, cuts as the former limit does, and one of 4 GiB as
+                # before.
+                for budget, expected in ((2 * gib, then), (4 * gib, old)):
                     with patch.dict(os.environ, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(budget)):
                         self.assertEqual(cut(rows, widths, columns_of(rows, columns, 2, blocks=1)), expected)
                 # So does the limit of two devices at 4 GiB, and at 3 GiB it cuts as a budget of 3 GiB does.
                 with patch.dict(os.environ, {limit: str(4 * gib)}):
-                    self.assertEqual(cut(rows, widths, columns_of(rows, columns, 2, blocks=1)), then)
+                    self.assertEqual(cut(rows, widths, columns_of(rows, columns, 2, blocks=1)), old)
                 with patch.dict(os.environ, {limit: str(3 * gib)}):
                     between = columns_of(rows, columns, 2, blocks=1)
                 with patch.dict(os.environ, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(3 * gib)):
                     self.assertEqual(columns_of(rows, columns, 2, blocks=1), between)
-            # The sectors of 10,456 electrons on 8 GPUs (18.8 GiB) may cut narrower slabs than the eighth of
-            # the basis that they took, 2.4 GiB, and keep their five rounds of 132 columns; those of 7,120
-            # electrons (8.0 GiB) keep their slab and their five of 90.
-            for rows, widths, slabs, rounds in ((1924792, (660, 654), (139, 164), (5, 132, 263)),
-                                                (1194720, (450, 447), (112, 112), (5, 90, 180))):
+            # The sectors of 10,456 electrons on 8 GPUs (18.8 GiB) cut slabs of 69 columns, 1 GiB, in ten rounds
+            # of 66.  With the former limit they may cut narrower slabs than the eighth of the basis that they
+            # took, 2.4 GiB, and keep their five rounds of 132 columns; those of 7,120 electrons (8.0 GiB) keep
+            # their slab and their five of 90 either way.
+            for rows, widths, slabs, rounds in ((1924792, (660, 654), (69, 139, 164), ((10, 66, 132), (5, 132, 263))),
+                                                (1194720, (450, 447), (112, 112, 112), ((5, 90, 180), (5, 90, 180)))):
                 columns = sum(widths)
-                self.assertEqual((columns_of(rows, columns, 2, blocks=1), former(rows, columns)), slabs)
-                self.assertEqual(cut(rows, widths, slabs[0]), cut(rows, widths, slabs[1]))
-                self.assertEqual(cut(rows, widths, slabs[0])[:3], rounds)
+                with patch.dict(os.environ, {limit: str(2 * gib)}):
+                    named = columns_of(rows, columns, 2, blocks=1)
+                self.assertEqual((columns_of(rows, columns, 2, blocks=1), named, former(rows, columns)), slabs)
+                self.assertEqual(cut(rows, widths, slabs[1]), cut(rows, widths, slabs[2]))
+                self.assertEqual((cut(rows, widths, slabs[0])[:3], cut(rows, widths, slabs[1])[:3]), rounds)
             # The limit is the same for a basis of any size.  A column of a million rows is 8 MiB: a slab is the
-            # eighth of the basis up to 2048 columns, 16 GiB, and the 256 columns of 2 GiB from there on, where
-            # it grew to 512 at 4096 columns, 32 GiB.  The workspace is two slabs.
+            # 128 columns of 1 GiB at every size.  With the former limit it is the eighth of the basis up to 2048
+            # columns, 16 GiB, and the 256 columns of 2 GiB from there on, where it grew to 512 at 4096
+            # columns, 32 GiB.  The workspace is two slabs.
             rows, sizes = 1 << 20, (2047, 2048, 2049, 3000, 4095, 4096, 8192)
-            self.assertEqual([columns_of(rows, columns, 2, blocks=1) for columns in sizes], [255] + [256] * 6)
+            self.assertEqual([columns_of(rows, columns, 2, blocks=1) for columns in sizes], [128] * 7)
+            self.assertEqual([8 * workspace(rows, columns, 2, 1) // 2**20 for columns in sizes], [2048] * 7)
+            with patch.dict(os.environ, {limit: str(2 * gib)}):
+                self.assertEqual([columns_of(rows, columns, 2, blocks=1) for columns in sizes], [255] + [256] * 6)
+                self.assertEqual([8 * workspace(rows, columns, 2, 1) // 2**20 for columns in sizes], [4080] + [4096] * 6)
             self.assertEqual([former(rows, columns) for columns in sizes], [255, 256, 256, 375, 511, 512, 512])
-            self.assertEqual([8 * workspace(rows, columns, 2, 1) // 2**20 for columns in sizes], [4080] + [4096] * 6)
             # A slab never narrows as columns are added, so the workspace that the fit rule counts for the
             # columns of a first solve is the most that a later step of the trimmed basis holds.  A limit
             # that began at 32 GiB halved the slab there: the sector of 14,680 electrons, were it solved for
@@ -1227,27 +1309,57 @@ class ExchangePlanTests(unittest.TestCase):
             self.assertEqual(slabs, sorted(slabs))
             held = [workspace(rows, columns, 2, 1) for columns in range(1, 4000)]
             self.assertEqual(held, sorted(held))
-            cp, _runtime = _stand_in()
-            group = distributed_state.SectorDeviceGroup(_Owner(cp, (0, 1)), (0, 1))
-            counted = 8 * workspace(rows, 1652, 2, 1) / 2**20
-            steps = [cut(rows, halves(columns), columns_of(rows, columns, 2, blocks=1), group) for columns in (1652, 1646)]
-            self.assertEqual([step[:2] for step in steps], [(9, 92), (8, 103)])
-            self.assertEqual((int(counted), [int(step[3]) for step in steps]), (4093, [3656, 4093]))
-            self.assertLessEqual(steps[1][3], counted)
+            # So do the slabs that the floor widens, on two devices and on four: its budget of 36 columns is the
+            # same for every block, so that a trim of one, four or eight columns after a first solve never cuts
+            # wider slabs, nor holds a larger workspace, than that solve was counted for.  A floor that followed
+            # the block did: 3,712 columns of 29,576 electrons on four devices had slabs of 32, and trimmed to
+            # 3,708 slabs of 34 in 126 MiB more.
+            for taller in (4130510, 5660200, 9 * 10**6):
+                for devices in (4, 2):
+                    slabs = [columns_of(taller, columns, devices, blocks=1) for columns in range(64, 6001)]
+                    self.assertEqual(slabs, sorted(slabs), (taller, devices))
+                    held = [workspace(taller, columns, devices, 1) for columns in range(64, 6001)]
+                    self.assertEqual(held, sorted(held), (taller, devices))
+                    for index in range(8, len(slabs)):
+                        for trim in (1, 4, 8):
+                            self.assertLessEqual(slabs[index - trim], slabs[index], (taller, devices, index + 64, trim))
+                            self.assertLessEqual(held[index - trim], held[index], (taller, devices, index + 64, trim))
+                    # The floor acts on all of them: 1 GiB holds 32, 23 and 14 columns of these rows.
+                    self.assertGreater(slabs[-1], (1 << 30) // (8 * taller), (taller, devices))
+            # The slabs of the default are the 51 columns of 1 GiB before and after that trim: 17 rounds of 49
+            # columns, in 1,947 of the 2,027 MiB counted.  With the former limit of 2 GiB they are 92 and then
+            # 103 columns wide, in the 4093 MiB counted.
+            for named, expected, sizes in (({}, [(17, 49), (17, 49)], (2027, [1947, 1947])),
+                                           ({limit: str(2 * gib)}, [(9, 92), (8, 103)], (4093, [3656, 4093]))):
+                with patch.dict(os.environ, named):
+                    cp, _runtime = _stand_in()
+                    group = distributed_state.SectorDeviceGroup(_Owner(cp, (0, 1)), (0, 1))
+                    counted = 8 * workspace(rows, 1652, 2, 1) / 2**20
+                    steps = [cut(rows, halves(columns), columns_of(rows, columns, 2, blocks=1), group)
+                             for columns in (1652, 1646)]
+                self.assertEqual([step[:2] for step in steps], expected)
+                self.assertEqual((int(counted), [int(step[3]) for step in steps]), sizes)
+                self.assertLessEqual(steps[1][3], counted)
             # The way back is the limit at 4 GiB, which is then that of the streaming budget itself: the
-            # former slabs for a basis of any size, also for that sector before and after its trim.
+            # former slabs for a basis of any size, also for that sector before and after its trim.  The default
+            # keeps them up to 8 GiB of basis and the former limit of 2 GiB up to 16 GiB; of these shapes the
+            # default changes 61 and that limit changed 53.
             shapes = [(rows, columns) for rows in (257, 10**5, 10**6, 1924792, 2604846, 2873400, 3786832, 4130510, 6157900)
                       for columns in (8, 64, 500, 1300, 1646, 1652, 1842, 2431, 2978, 3704, 4928)]
-            changed = 0
+            changed = [0, 0]
             for rows, columns in shapes:
-                if rows * columns <= 2 * gib:
+                if rows * columns <= gib:
                     self.assertEqual(columns_of(rows, columns, 2, blocks=1), former(rows, columns), (rows, columns))
-                changed += columns_of(rows, columns, 2, blocks=1) != former(rows, columns)
+                changed[0] += columns_of(rows, columns, 2, blocks=1) != former(rows, columns)
+                with patch.dict(os.environ, {limit: str(2 * gib)}):
+                    if rows * columns <= 2 * gib:
+                        self.assertEqual(columns_of(rows, columns, 2, blocks=1), former(rows, columns), (rows, columns))
+                    changed[1] += columns_of(rows, columns, 2, blocks=1) != former(rows, columns)
                 for most in (4 * gib, 6 * gib):
                     with patch.dict(os.environ, {limit: str(most)}):
                         self.assertEqual(columns_of(rows, columns, 2, blocks=1), former(rows, columns), (rows, columns))
                         self.assertEqual(workspace(rows, columns, 2, 1), workspace(rows, columns, 2, 2), (rows, columns))
-            self.assertEqual(changed, 53)
+            self.assertEqual(changed, [61, 53])
             rows = 2604846
             with patch.dict(os.environ, {limit: str(4 * gib)}):
                 self.assertEqual([cut(rows, halves(columns), columns_of(rows, columns, 2, blocks=1))[:2]
@@ -1259,7 +1371,8 @@ class ExchangePlanTests(unittest.TestCase):
                 self.assertEqual([cut(rows, halves(columns), columns_of(rows, columns, 2, blocks=1))[:2]
                                   for columns in (1652, 1646)], [(5, 166), (4, 206)])
             # A budget that is set is the slab whatever the limit says.  One device, three and more, and the
-            # steps with two blocks never read it.
+            # steps with two blocks never read it: four devices take their share of a round of 4 GiB, 128
+            # columns.
             rows = 1 << 20
             with patch.dict(os.environ, {limit: str(gib // 2)}):
                 self.assertEqual(columns_of(rows, 4096, 2, blocks=1), 64)
@@ -1269,7 +1382,7 @@ class ExchangePlanTests(unittest.TestCase):
                 for columns in (2047, 4095, 4096, 8192):
                     self.assertEqual(columns_of(rows, columns, 3, blocks=1), former(rows, columns, 3))
                     self.assertEqual(columns_of(rows, columns, 1, blocks=1), former(rows, columns, 1))
-                    self.assertEqual(columns_of(rows, columns, 4, blocks=1), min(256, former(rows, columns, 4)))
+                    self.assertEqual(columns_of(rows, columns, 4, blocks=1), min(128, former(rows, columns, 4)))
                     self.assertEqual(columns_of(rows, columns, 2), former(rows, columns))
                 self.assertEqual([columns_of(rows, columns, 2, wide=True) for columns in (4095, 4096, 8192)], [511, 512, 768])
             # A value that is no size is refused, by the step with one tall block where the trial basis is
@@ -1290,22 +1403,198 @@ class ExchangePlanTests(unittest.TestCase):
                     else:
                         group._capacities(_columns((3, 2)), [0, 4, 9])
         # The fit rule counts the workspace of those slabs.  On two A100 of 79.25 GiB, of which the blocks may
-        # take 67.4, the 114 GiB sector of 29,576 electrons counts 62.0 GiB instead of 66.0, and a sector of
-        # 4,400 columns on the rows of 23,768 electrons (124 GiB), which counted 71.1, is shared at 67.0.
+        # take 67.4, the 114 GiB sector of 29,576 electrons counts 60.2 GiB, 62.0 with the former limit and
+        # 66.1 with slabs of 4 GiB, and a sector of 4,400 columns on the rows of 23,768 electrons (124 GiB),
+        # which counted 71.2 with those, is shared at 65.1, and at 67.0 with the former limit.
         measured, _runtime = _stand_in(total_bytes=85093777408)
         with patch.object(distributed_state, 'require_cupy', lambda: (measured, None)), patch.dict(os.environ):
             for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
-                         'PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', limit):
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', limit,
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
             os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_RANGES'] = 'fixed'
             fits = distributed_state.shared_basis_fits
             self.assertEqual((fits(4130510, 3704, 2), fits(3786832, 4400, 2)), (True, True))
+            with patch.dict(os.environ, {limit: str(2 * gib)}):
+                self.assertEqual((fits(4130510, 3704, 2), fits(3786832, 4400, 2)), (True, True))
             for slabs_of_4_gib in ({'PARSEC_CUPY_STREAMING_RITZ_BYTES': str(4 * gib)}, {limit: str(4 * gib)}):
                 with patch.dict(os.environ, slabs_of_4_gib):
                     self.assertEqual((fits(4130510, 3704, 2), fits(3786832, 4400, 2)), (True, False))
-            for fraction, counted in (('0.781', False), ('0.783', True)):
-                with patch.dict(os.environ, PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION=fraction):
-                    self.assertEqual(fits(4130510, 3704, 2), counted)
+            for named, fractions in (({}, ('0.760', '0.761')), ({limit: str(2 * gib)}, ('0.781', '0.783'))):
+                for fraction, counted in zip(fractions, (False, True)):
+                    with patch.dict(os.environ, named, PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION=fraction):
+                        self.assertEqual(fits(4130510, 3704, 2), counted, (named, fraction))
+
+    # The names of the budgets of the one-block Ritz step and the values that give its former slabs.
+    _ROUND, _PAIR, _FLOOR = ('PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES',
+                             'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS')
+    _FORMER_SLABS = {_ROUND: '8589934592', _PAIR: '2147483648'}
+
+    def _without_slab_settings(self):
+        for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_RITZ_GRAM_MULTIPLE', self._ROUND, self._PAIR,
+                     self._FLOOR):
+            os.environ.pop(name, None)
+
+    @staticmethod
+    def _even(columns, devices):
+        return tuple(columns * (index + 1) // devices - columns * index // devices for index in range(devices))
+
+    def test_the_default_slabs_of_one_tall_block_make_whole_rounds_of_32_columns_from_14680_electrons_up(self):
+        gib = 1 << 30
+        columns_of, rounds_of = distributed_state.slab_columns, distributed_state.block_rounds
+        with patch.dict(os.environ):
+            self._without_slab_settings()
+            self.assertEqual((distributed_state.round_bytes(), distributed_state.pair_slab_bytes(),
+                              distributed_state.min_slab_columns()), (4 * gib, gib, 32))
+            # Rows and columns of the sectors of 14,680, 19,392, 23,768, 29,576 and 39,368 electrons, the columns
+            # that 1 GiB holds, and the slabs of the default on four devices and on two with the rounds of the
+            # multiple of 64 on even column blocks.  A slab takes 1 GiB, or the 36 columns of the budget of the
+            # floor of 32 where 1 GiB holds fewer, whose equal cut of these blocks keeps 32 columns or more.
+            # From the smallest of them on, every round but the first is a whole one of 32 columns of each
+            # device, 128 columns on four and 64 on two, and the first brings no more together.
+            for rows, columns, plain, four, two in (
+                    (2604846, 1842, 51, (51, 15, 50), (51, 29, 50)), (2873400, 2431, 46, (46, 19, 127), (46, 38, 63)),
+                    (3786832, 2978, 35, (36, 24, 34), (36, 47, 34)), (4130510, 3704, 32, (36, 29, 120), (36, 58, 56)),
+                    (5660200, 4928, 23, (36, 39, 64), (36, 77, 64))):
+                self.assertEqual(gib // (8 * rows), plain)
+                for devices, (slab, count, opening) in ((4, four), (2, two)):
+                    self.assertEqual(columns_of(rows, columns, devices, blocks=1), slab, (rows, devices))
+                    sizes = [[last - first for first, last in taken]
+                             for taken in rounds_of(self._even(columns, devices), slab, 64)]
+                    self.assertEqual((len(sizes), sum(sizes[0])), (count, opening), (rows, devices))
+                    self.assertEqual({tuple(taken) for taken in sizes[1:]}, {(32,) * devices}, (rows, devices))
+                    self.assertLessEqual(sum(sizes[0]), 32 * devices)
+            # The sector of 39,368 electrons on four devices is cut into the rounds of the former slabs of 47
+            # columns, on even blocks and on those of the measured run: its slabs of 36 columns are the floor.
+            for widths in (self._even(4928, 4), (1230, 1236, 1236, 1226)):
+                now = rounds_of(widths, columns_of(5660200, 4928, 4, blocks=1), 64)
+                with patch.dict(os.environ, self._FORMER_SLABS):
+                    self.assertEqual(columns_of(5660200, 4928, 4, blocks=1), 47)
+                    self.assertEqual(rounds_of(widths, columns_of(5660200, 4928, 4, blocks=1), 64), now)
+                self.assertEqual(len(now), 39)
+
+    def test_the_former_round_and_limit_of_two_devices_give_back_the_former_slabs(self):
+        gib = 1 << 30
+        columns_of = distributed_state.slab_columns
+
+        def former(rows, columns, devices):
+            # The slab that this step cut before the slabs of 1 GiB: an eighth of the basis, at least 1 and at
+            # most 4 GiB, and at most an even share of 8 GiB on four and more devices and 2 GiB on two.
+            most = 8 * gib // devices if devices >= 4 else 2 * gib
+            budget = min(max(rows * columns, gib), 4 * gib, most)
+            return max(1, min(budget // (8 * rows), columns // (2 * devices)))
+
+        # The sectors of the measured series, 3,480 to 39,368 electrons, and smaller and other shapes.
+        shapes = [(677542, 442), (1031322, 665), (1194720, 897), (1924792, 1314), (2604846, 1842), (2873400, 2431),
+                  (3786832, 2978), (4130510, 3704), (5660200, 4928), (6157900, 4928)]
+        shapes += [(rows, columns) for rows in (257, 10**5, 10**6, 4 * 10**6, 8 * 10**6)
+                   for columns in (8, 64, 500, 1300, 2979, 4928, 9000)]
+        with patch.dict(os.environ):
+            self._without_slab_settings()
+            widened = 0
+            for rows, columns in shapes:
+                for devices in (2, 4, 5, 8):
+                    width = columns_of(rows, columns, devices, blocks=1)
+                    # The floor never widens a slab beyond its former width.
+                    self.assertLessEqual(width, former(rows, columns, devices), (rows, columns, devices))
+                    with patch.dict(os.environ, self._FORMER_SLABS):
+                        self.assertEqual(columns_of(rows, columns, devices, blocks=1), former(rows, columns, devices),
+                                         (rows, columns, devices))
+                        # Beside them the floor changes no slab, whatever its value.
+                        for floor in ('1', '64', '100000'):
+                            with patch.dict(os.environ, {self._FLOOR: floor}):
+                                self.assertEqual(columns_of(rows, columns, devices, blocks=1),
+                                                 former(rows, columns, devices), (rows, columns, devices, floor))
+                    with patch.dict(os.environ, {self._FLOOR: '1'}):
+                        widened += width > columns_of(rows, columns, devices, blocks=1)
+            # The floor widens the slabs of 59 of these 180, where 1 GiB or its share holds fewer than 36 columns.
+            self.assertEqual(widened, 59)
+
+    def test_without_the_floor_the_slabs_take_the_plain_1_gib(self):
+        gib = 1 << 30
+        columns_of, rounds_of = distributed_state.slab_columns, distributed_state.block_rounds
+        with patch.dict(os.environ):
+            self._without_slab_settings()
+            for rows, columns in ((2604846, 1842), (2873400, 2431), (3786832, 2978), (4130510, 3704), (5660200, 4928)):
+                with patch.dict(os.environ, {self._FLOOR: '1'}):
+                    self.assertEqual([columns_of(rows, columns, devices, blocks=1) for devices in (4, 2)],
+                                     [gib // (8 * rows)] * 2, rows)
+            # The column blocks of 29,576 electrons on 16 GPUs: rounds, the widest slab and the columns of the
+            # whole rounds that the multiple of 64 makes.  Without the floor the 32 columns of 1 GiB are equal
+            # slabs of 31 of the widest block and whole rounds of 16 columns of each device; the budget of the
+            # floor, 36 columns, keeps them at 32, as the former slabs of 64 columns kept them at 48.
+            widths = (930, 924, 924, 926)
+
+            def cut():
+                sizes = [[last - first for first, last in taken]
+                         for taken in rounds_of(widths, columns_of(4130510, 3704, 4, blocks=1), 64)]
+                return len(sizes), max(map(max, sizes)), {sum(taken) for taken in sizes[1:]}
+
+            with patch.dict(os.environ, {self._FLOOR: '1'}):
+                self.assertEqual((columns_of(4130510, 3704, 4, blocks=1), cut()), (32, (58, 18, {64})))
+            self.assertEqual((columns_of(4130510, 3704, 4, blocks=1), cut()), (36, (29, 34, {128})))
+            with patch.dict(os.environ, self._FORMER_SLABS):
+                self.assertEqual((columns_of(4130510, 3704, 4, blocks=1), cut()), (64, (20, 48, {192})))
+
+    def test_the_budget_of_the_floor_is_an_eighth_wider_and_keeps_equal_slabs_of_the_floor_from_nine_floors_on(self):
+        budget_of = distributed_state._slab_floor_budget
+        # The floor and an eighth of it, in whole columns: 36 for the default of 32.
+        self.assertEqual([budget_of(floor) for floor in (32, 1, 8, 64)], [36, 1, 9, 72])
+        # The equal cut of a block of b columns with a budget of w is ceil(b / w) slabs, the narrowest of them
+        # b // ceil(b / w) columns wide: the floor or more for every block of nine floors and more, 288 columns
+        # for the default, as block_rounds cuts it.
+        for floor in (8, 16, 32, 64):
+            budget = budget_of(floor)
+            for block in range(9 * floor, 6001):
+                count = -(-block // budget)
+                self.assertGreaterEqual(block // count, floor, (block, floor))
+                sizes = [last - first for (first, last), in distributed_state.block_rounds((block,), budget)]
+                self.assertEqual((len(sizes), min(sizes)), (count, block // count), (block, floor))
+        # Below, a block may be cut narrower: 255 columns are eight slabs of 31 or 32.  A budget of exactly the
+        # floor cuts narrower slabs wherever the block is no whole multiple of it: 924 columns are 29 slabs of
+        # 31 or 32, and 26 of 35 or 36 with the budget.
+        self.assertEqual(min(last - first for (first, last), in distributed_state.block_rounds((255,), 36)), 31)
+        self.assertEqual([(len(rounds), min(last - first for (first, last), in rounds))
+                          for rounds in (distributed_state.block_rounds((924,), width) for width in (32, 36))],
+                         [(29, 31), (26, 35)])
+
+    def test_the_round_the_limit_of_two_devices_and_the_floor_take_positive_integers_only(self):
+        # Each variable, what reads it, and the devices of a sector whose slabs read it and those whose slabs do
+        # not: the round four and more, the limit two, and the floor both.
+        readers = {self._ROUND: (distributed_state.round_bytes, (4, 8), (2, 3)),
+                   self._PAIR: (distributed_state.pair_slab_bytes, (2,), (3, 4)),
+                   self._FLOOR: (distributed_state.min_slab_columns, (2, 4), (3,))}
+        with patch.dict(os.environ):
+            self._without_slab_settings()
+            for name, (read, reading, others) in readers.items():
+                with patch.dict(os.environ, {name: ' 64 '}):
+                    self.assertEqual(read(), 64)
+                for bad in ('abc', '0', '-1', '1.5', ''):
+                    with patch.dict(os.environ, {name: bad}):
+                        with self.assertRaisesRegex(ValueError, name):
+                            read()
+                        for devices in reading:
+                            with self.assertRaisesRegex(ValueError, name):
+                                distributed_state.slab_columns(10**6, 1000, devices, blocks=1)
+                        # Nor do the slabs of the step with two tall blocks.
+                        for devices in others:
+                            distributed_state.slab_columns(10**6, 1000, devices, blocks=1)
+                        distributed_state.slab_columns(10**6, 1000, 4)
+                        # A mistyped value already stops the run where the trial basis is sized, before the first
+                        # filter, in the step with one tall block, named or by default; the steps with two and
+                        # three do not read it.
+                        for raw, refused in ((None, True), ('1', True), ('2', False), ('3', False)):
+                            os.environ.pop('PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS', None)
+                            if raw is not None:
+                                os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS'] = raw
+                            cp, _runtime = _stand_in()
+                            group = distributed_state.SectorDeviceGroup(_Owner(cp, (0, 1)), (0, 1))
+                            if refused:
+                                with self.assertRaisesRegex(ValueError, name):
+                                    group._capacities(_columns((3, 2)), [0, 4, 9])
+                            else:
+                                group._capacities(_columns((3, 2)), [0, 4, 9])
+                        os.environ.pop('PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS', None)
 
     def test_slabs_take_the_columns_of_every_device_once_in_rounds(self):
         for widths in ((6, 6, 6, 5), (23, 0, 0, 0), (12, 11), (30, 3, 7), (5, 0, 9), (1,)):
@@ -1561,8 +1850,13 @@ class ExchangePlanTests(unittest.TestCase):
 
         with patch.dict(os.environ):
             for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES',
-                         'PARSEC_CUPY_RITZ_GRAM_MULTIPLE'):
+                         'PARSEC_CUPY_RITZ_GRAM_MULTIPLE', 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
+            # The series ran with slabs of 2 GiB, which the former round of 8 GiB on four devices and the former
+            # limit of two devices give back.  The rounds of the slabs of 1 GiB of the default are those of
+            # test_the_default_slabs_of_one_tall_block_make_whole_rounds_of_32_columns_from_14680_electrons_up.
+            os.environ.update(PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES=str(8 << 30),
+                              PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(2 << 30))
             # Rows and column blocks of the shared sectors of the measured series, 10,456 to 29,576 electrons
             # on 8 GPUs and 10,456 to 39,368 on 16: the columns of a slab of 2 GiB, the equal cut as rounds,
             # widest slab and widest round, and the rounds of a multiple of 64 as their number, the widest
@@ -1674,7 +1968,8 @@ class ExchangePlanTests(unittest.TestCase):
         with patch.object(distributed_state, 'require_cupy', lambda: (measured, None)), patch.dict(os.environ):
             for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
                          'PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
-                         'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES'):
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
             os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_RANGES'] = 'fixed'
             counted = {}
@@ -1728,8 +2023,12 @@ class ExchangePlanTests(unittest.TestCase):
         with patch.dict(os.environ):
             for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES',
                          'PARSEC_CUPY_RITZ_GRAM_MULTIPLE', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
-                         'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS', 'PARSEC_CUPY_DISTRIBUTED_STATE_RANGES'):
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS', 'PARSEC_CUPY_DISTRIBUTED_STATE_RANGES',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
+            # The series ran with slabs of 2 GiB, which the former round of 8 GiB gives back: the whole rounds
+            # below are theirs.  Those of the default follow at the end.
+            os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES'] = str(8 << 30)
             self.assertEqual(distributed_state.exchange_chunk_bytes(), 1 << 30)
             for rows, widths, chunk, slab, equal, whole, larger, held, followed, beyond in (
                     (1924792, (330, 330, 324, 330), 92, 96, (12, 12, 0), (14, 14, 6), 129, (8, 8, 0), (8, 8, 0), 34938368),
@@ -1800,6 +2099,34 @@ class ExchangePlanTests(unittest.TestCase):
                 with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(chunk)):
                     counted.append(distributed_state.shared_block_bytes(5660200, 4928, 4))
             self.assertEqual(counted, [61162425024, 61588683200])
+            self.assertEqual(counted[1] - counted[0], 1500000000 - (1 << 30))
+            # The slabs of 1 GiB of the default, or of the 36 columns of the budget of the floor, make whole
+            # rounds of 64 columns per device for 10,456 electrons and of 32 for the others: within a chunk, but
+            # for 39,368 electrons, whose rounds are those of the former round and whose buffer follows their
+            # slab of 32 columns as it did, 13 MB beyond 1 GiB.  At the default radius that slab is within a
+            # chunk of 33 columns.  The count of the larger chunk is the same bytes more.
+            del os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES']
+            for rows, widths, slab, followed, beyond in (
+                    (1924792, (330, 330, 324, 330), 64, (), 0), (2604846, (462, 462, 456, 462), 32, (), 0),
+                    (2873400, (606, 612, 612, 601), 32, (), 0), (3786832, (750, 744, 744, 740), 32, (), 0),
+                    (4130510, (930, 924, 924, 926), 32, (), 0), (5660200, (1230, 1236, 1236, 1226), 32, (32,), 13016576),
+                    (5374994, (1230, 1236, 1236, 1226), 32, (), 0)):
+                away = rows - rows // 4
+                rounds = distributed_state.block_rounds(
+                    widths, distributed_state.slab_columns(rows, sum(widths), 4, blocks=1), 64)
+                widest = [max(last - first for first, last in taken) for taken in rounds]
+                self.assertEqual((widest[-1], set(widest[1:])), (slab, {slab}))
+                cp, _runtime = _stand_in()
+                with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)):
+                    group = distributed_state.SectorDeviceGroup(_Owner(cp, (0, 1, 2, 3)), (0, 1, 2, 3))
+                    sent = distributed_state.followed_slabs(away, widest)
+                    buffer = group._capacities(_columns(widths), [rows * index // 4 for index in range(5)], sent=sent)[1]
+                self.assertEqual((sent, 8 * buffer - (1 << 30)), (followed, beyond), rows)
+            counted = []
+            for chunk in (1 << 30, 1500000000):
+                with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(chunk)):
+                    counted.append(distributed_state.shared_block_bytes(5660200, 4928, 4))
+            self.assertEqual(counted, [60166229824, 60592488000])
             self.assertEqual(counted[1] - counted[0], 1500000000 - (1 << 30))
 
     def test_slabs_of_the_step_with_two_tall_blocks_are_whole_multiples_too(self):
@@ -1978,7 +2305,8 @@ class ExchangePlanTests(unittest.TestCase):
         gib = 1 << 30
         cp, _runtime = _stand_in(total_bytes=160 * gib)
         # 80 GiB of basis in columns of 80 MiB.  A slab of the step with one tall block has the 25 columns of
-        # 2 GiB, on two devices as on four.
+        # 2 GiB, on two devices as on four: 1 GiB holds 12, and the floor, a budget of 36 columns, widens them
+        # up to the width of the former slabs of 2 GiB and no further.
         rows, columns = 10 * (1 << 20), 1024
         slab, column = {2: 25 * 80 / 1024, 4: 25 * 80 / 1024}, 80 / 1024
         cases = (
@@ -1993,8 +2321,11 @@ class ExchangePlanTests(unittest.TestCase):
                 os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS'] = blocks
 
         with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)), patch.dict(os.environ):
-            for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES'):
+            for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
+            self.assertEqual([distributed_state.slab_columns(rows, columns, devices, blocks=1) for devices in (2, 4)],
+                             [25, 25])
             # One tall block is counted by default and where it is named.
             for blocks in (None, '1'):
                 select(blocks)
@@ -2008,28 +2339,39 @@ class ExchangePlanTests(unittest.TestCase):
         # Sectors of 19,392 and of 23,768 electrons in D2 symmetry on A100 of 79.25 GiB, of which the rule
         # lets the blocks take 67.4: devices of the sector -> GiB that the rule counts with one tall block,
         # with two and with three.  The larger basis, 84 GiB, is shared by two devices with one block only,
-        # and so by default.  The workspace of one block is 4 GiB less than that of two, on two devices as
-        # on four: with slabs of 4 GiB one block counted 35.08 and 51.01 GiB on two.
+        # and so by default.  The workspace of one block, two slabs of 1 GiB, is 6 GiB less than that of two,
+        # on two devices as on four.  The former slabs of 2 GiB, which the former round and limit give back,
+        # counted 31.10 and 47.00 GiB on two devices and 18.05 and 25.99 on four, and slabs of 4 GiB 35.08 and
+        # 51.01 on two.
         # Those are the counts with the chunk named, 1 GiB.  Where none is named the exchange buffer may
         # follow a slab that is up to an eighth wider than a chunk, and the rule counts 128 MiB more wherever
-        # a slab of the budget takes more than a chunk outside a device: with one block on four devices
-        # (slabs of 2 GiB, 1.5 GiB of them outside) but not on two (1 GiB outside), with two blocks on both
-        # (slabs of 4 GiB), and never with three, which send whole blocks of many chunks.
+        # a slab of the budget takes more than a chunk outside a device: with two blocks on both (slabs of 4
+        # GiB), never with three, which send whole blocks of many chunks, and with one block nowhere (slabs
+        # of 1 GiB, 0.75 GiB of them outside on four devices).  The former slabs of one block counted it on
+        # four devices (1.5 GiB outside) but not on two (1 GiB outside).
         a100, limit = 85093777408, .85 * 85093777408 / gib
         measured, _runtime = _stand_in(total_bytes=a100)
-        counted = {(2873400, 2438): {2: (31.10, 61.16, 79.29), 4: (18.05, 35.06, 40.15)},
-                   (3786832, 2979): {2: (47.00, 93.01, 127.07), 4: (25.99, 50.98, 64.04)}}
-        follows = {2: (0, 1, 0), 4: (1, 1, 0)}
+        counted = {(2873400, 2438): {2: (29.09, 61.16, 79.29), 4: (16.04, 35.06, 40.15)},
+                   (3786832, 2979): {2: (45.08, 93.01, 127.07), 4: (24.07, 50.98, 64.04)}}
+        follows = {2: (0, 1, 0), 4: (0, 1, 0)}
+        former = dict(PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES=str(8 * gib),
+                      PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(2 * gib))
+        before = {(2873400, 2438): {2: (31.10, 0), 4: (18.05, 1)}, (3786832, 2979): {2: (47.00, 0), 4: (25.99, 1)}}
         with patch.dict(os.environ):
             for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
-                         'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES'):
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'):
                 os.environ.pop(name, None)
             os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_RANGES'] = 'fixed'
             for sector, by_devices in counted.items():
                 for devices, sizes in by_devices.items():
-                    for blocks, size, more in zip((None, '1', '2', '3'), (sizes[0], *sizes),
-                                                  (follows[devices][0], *follows[devices])):
+                    cases = [({}, blocks, size, more) for blocks, size, more in zip(
+                        (None, '1', '2', '3'), (sizes[0], *sizes), (follows[devices][0], *follows[devices]))]
+                    cases += [(former, blocks, *before[sector][devices]) for blocks in (None, '1')]
+                    for named, blocks, size, more in cases:
                         select(blocks)
+                        for name in former:
+                            os.environ.pop(name, None)
+                        os.environ.update(named)
                         with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib)):
                             named = distributed_state.shared_block_bytes(*sector, devices)
                         self.assertAlmostEqual(named / gib, size, delta=.005)
@@ -2960,7 +3302,8 @@ class RitzStandInTests(unittest.TestCase):
              'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', 'PARSEC_CUPY_EXCHANGE_CONCURRENT', 'PARSEC_CUPY_EXCHANGE_COLUMN_COPIES',
              'PARSEC_CUPY_EXCHANGE_PAIRS', 'PARSEC_CUPY_DISTRIBUTED_STATE_SLABS', 'PARSEC_CUPY_RITZ_CONDITION_HELPER',
              'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_RITZ_GRAM_MULTIPLE',
-             'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE', 'PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS')
+             'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE', 'PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS',
+             'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS')
 
     def _step(self, rows, widths, blocks, *, eager=False, unstable=False, roomy=False, hartree_device=None,
               device_bytes=0, **environment):
@@ -3251,9 +3594,11 @@ class RitzStandInTests(unittest.TestCase):
 
     def test_one_tall_block_cuts_the_slabs_of_its_own_budget(self):
         # A basis that a host can hold is far below any slab of gigabytes, so the round is stood in for: two
-        # columns of all rows for every device of four.  Half of an even share of the columns is 5.
+        # columns of all rows for every device of four.  Half of an even share of the columns is 5.  The floor
+        # of 32 columns goes with the gigabytes: it would widen these slabs to that half share.
         rows, widths = 257, (12, 12, 12, 11)
-        with patch.object(distributed_state, '_ROUND_BYTES', 8 * rows * 2 * len(widths)):
+        with patch.object(distributed_state, '_ROUND_BYTES', 8 * rows * 2 * len(widths)), \
+             patch.object(distributed_state, '_MIN_SLAB_COLUMNS', 1):
             one, unnamed, two = (self._step(rows, widths, blocks, roomy=blocks != 2) for blocks in (1, None, 2))
             # A budget that is set is the slab of both steps.
             set_one, set_two = (self._step(rows, widths, blocks, roomy=blocks == 1,
@@ -3284,15 +3629,17 @@ class RitzStandInTests(unittest.TestCase):
             self._assert_ritz_pairs(run)
 
     def test_one_tall_block_on_two_devices_cuts_the_slabs_that_its_limit_allows(self):
-        # The limit of two devices is stood in for: two columns of all rows.  The streaming budget allows half
-        # of an even share of the columns, 11 of the 47 and 5 of the 23.
+        # The limit of two devices is stood in for: two columns of all rows, without the floor of 32 columns,
+        # which would widen them to half of an even share.  The streaming budget allows half of an even share
+        # of the columns, 11 of the 47 and 5 of the 23.
         rows, widths = 257, (24, 23)
-        limit = dict(PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(8 * rows * 2))
+        limit = dict(PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(8 * rows * 2),
+                     PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS='1')
         one, unnamed, two = (self._step(rows, widths, blocks, roomy=blocks != 2, **limit) for blocks in (1, None, 2))
         # A budget that is set is the slab, as before: four columns here.
         budget = self._step(rows, widths, 1, roomy=True, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8 * rows * 4), **limit)
         # The limit at the 4 GiB of the streaming budget is the way back: the slabs of that budget.  The default
-        # cuts them as well where an eighth of the basis is less than its 2 GiB, as here.
+        # cuts them as well where an eighth of the basis is less than its 1 GiB, as here.
         former = self._step(rows, widths, 1, roomy=True, PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(4 << 30))
         default = self._step(rows, widths, 1, roomy=True)
         # A smaller basis has the same limit, and one on three devices has none.
@@ -3829,11 +4176,12 @@ class RitzStandInTests(unittest.TestCase):
     def test_the_slab_limit_of_two_devices_and_the_turns_of_four_leave_each_other_alone(self):
         # The two switches of a shared basis that came together, in the step with one tall block.  A
         # sector on four devices takes the turns on the way to its rows with the slabs of its own round
-        # budget: the limit of two devices is not read there, neither at one column nor at the former 4
-        # GiB.  A sector on two devices follows that limit and is one pair, which has no turns to take
-        # whatever their switch says; one on three devices reads neither.
+        # budget: the limit of two devices is not read there, neither at one column, without the floor of
+        # 32 columns, nor at the former 4 GiB.  A sector on two devices follows that limit and is one pair,
+        # which has no turns to take whatever their switch says; one on three devices reads neither.
         rows, chunk = 257, dict(PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * 500))
-        limits = ({}, dict(PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(8 * rows)),
+        limits = ({}, dict(PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(8 * rows),
+                           PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS='1'),
                   dict(PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(4 << 30)))
         orders = ({}, dict(PARSEC_CUPY_EXCHANGE_PAIRS='1'), dict(PARSEC_CUPY_EXCHANGE_PAIRS='0'))
 
@@ -4437,25 +4785,31 @@ class RitzStandInTests(unittest.TestCase):
                     np.testing.assert_array_equal(beside.values, off.values)
                     np.testing.assert_array_equal(beside.rotated, off.rotated)
             # The device that holds the Hartree objects is passed over where the sector has another.  A sector
-            # that has no other asks it, by default and where the setting says ``any``, if the rule that
-            # shares a basis counts the room for the estimate on it; with ``auto``, the default before, and on
-            # a device without that room the estimate stays on the owner.  No bit depends on it.
+            # that has no other leaves the estimate on its owner by default, as with ``auto``; where the
+            # setting says ``any`` it asks that device if the rule that shares a basis counts the room for the
+            # estimate on it, and on a device without that room the estimate stays on the owner.  No bit
+            # depends on it.
             with self.subTest(rows=rows, layout=layout.parts, hartree_device=1):
                 room = dict(device_bytes=1 << 30)
-                passed = self._step(rows, widths, 1, roomy=True, hartree_device=1, **device, **room,
-                                    PARSEC_CUPY_RITZ_CONDITION_HELPER='auto')
-                self.assertEqual(passed.group.condition_device, 2 if count > 2 else 0)
-                self.assertEqual([estimate[0] for estimate in passed.estimates], [2] if count > 2 else [])
-                for named in ({}, dict(PARSEC_CUPY_RITZ_CONDITION_HELPER='any')):
-                    asked = self._step(rows, widths, 1, roomy=True, hartree_device=1, **device, **room, **named)
-                    self.assertEqual((asked.group.condition_device, [estimate[0] for estimate in asked.estimates]),
-                                     (2, [2]) if count > 2 else (1, [1]))
-                    np.testing.assert_array_equal(asked.rotated, passed.rotated)
-                    np.testing.assert_array_equal(asked.values, passed.values)
-                    full = self._step(rows, widths, 1, roomy=True, hartree_device=1, **device, **named)
-                    self.assertEqual((full.group.condition_device, [estimate[0] for estimate in full.estimates]),
-                                     (2, [2]) if count > 2 else (0, []))
-                    np.testing.assert_array_equal(full.rotated, passed.rotated)
+                runs = [self._step(rows, widths, 1, roomy=True, hartree_device=1, **device, **room, **named)
+                        for named in ({}, dict(PARSEC_CUPY_RITZ_CONDITION_HELPER='auto'))]
+                for passed in runs:
+                    self.assertEqual(passed.group.condition_device, 2 if count > 2 else 0)
+                    self.assertEqual([estimate[0] for estimate in passed.estimates], [2] if count > 2 else [])
+                    np.testing.assert_array_equal(passed.rotated, runs[0].rotated)
+                    np.testing.assert_array_equal(passed.values, runs[0].values)
+                passed = runs[0]
+                asked = self._step(rows, widths, 1, roomy=True, hartree_device=1, **device, **room,
+                                   PARSEC_CUPY_RITZ_CONDITION_HELPER='any')
+                self.assertEqual((asked.group.condition_device, [estimate[0] for estimate in asked.estimates]),
+                                 (2, [2]) if count > 2 else (1, [1]))
+                np.testing.assert_array_equal(asked.rotated, passed.rotated)
+                np.testing.assert_array_equal(asked.values, passed.values)
+                full = self._step(rows, widths, 1, roomy=True, hartree_device=1, **device,
+                                  PARSEC_CUPY_RITZ_CONDITION_HELPER='any')
+                self.assertEqual((full.group.condition_device, [estimate[0] for estimate in full.estimates]),
+                                 (2, [2]) if count > 2 else (0, []))
+                np.testing.assert_array_equal(full.rotated, passed.rotated)
             # A solve that fails its audit has waited for the helper, which holds nothing afterwards.
             with self.subTest(rows=rows, layout=layout.parts, unstable=True):
                 run = self._step(rows, widths, 1, unstable=True, roomy=True, **device)

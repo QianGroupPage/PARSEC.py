@@ -336,10 +336,16 @@ class CuPyHamiltonianBackend(HamiltonianBackend):
                 (
                     "gpu_projector_reduction",
                     (
-                        getattr(
-                            self.device_operator.custom_projector_projection,
-                            "reduction_mode",
-                            "cuSPARSE",
+                        # The projection forms the coefficients only where
+                        # the stencil kernel fuses the scatter.
+                        (
+                            getattr(
+                                self.device_operator.custom_projector_projection,
+                                "reduction_mode",
+                                "cuSPARSE",
+                            )
+                            if self.device_operator.fused_projector_scatter
+                            else "cuSPARSE"
                         )
                         if self.device_operator is not None
                         else "deferred_to_symmetry_sector_operators"

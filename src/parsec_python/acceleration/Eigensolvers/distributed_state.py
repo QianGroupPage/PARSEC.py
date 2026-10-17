@@ -113,12 +113,21 @@ _ALGORITHM = "distributed_generalized_cholesky_rayleigh_ritz"
 _WIDER_SLAB_BYTES = 6 << 30
 # The bytes, in all rows, of the columns that a round of the Ritz step with
 # one tall block brings together on four or more devices where no budget is
-# set: a slab is an even share of them for every device (see
-# :func:`slab_columns`).
-_ROUND_BYTES = 8 << 30
+# set and :func:`round_bytes` names no other: a slab is an even share of
+# them for every device (see :func:`slab_columns`), 1 GiB with four.
+_ROUND_BYTES = 4 << 30
+# What they were, 2 GiB per slab with four devices: the widest a slab of
+# that step grows to meet the floor of :func:`min_slab_columns`.
+_FORMER_ROUND_BYTES = 8 << 30
 # The most bytes of a slab of that step on two devices where no budget is
-# set and :func:`pair_slab_bytes` names no other limit: a round of 4 GiB.
-_PAIR_SLAB_BYTES = 2 << 30
+# set and :func:`pair_slab_bytes` names no other limit: a round of 2 GiB.
+_PAIR_SLAB_BYTES = 1 << 30
+# What it was, rounds of 4 GiB: the widest a slab of that step on two
+# devices grows to meet the floor.
+_FORMER_PAIR_SLAB_BYTES = 2 << 30
+# The fewest columns of a slab of that step where the limits above leave
+# fewer (see :func:`min_slab_columns`).
+_MIN_SLAB_COLUMNS = 32
 # The columns of a slab of the overlap of a row block where neither they nor
 # a count of slabs are named (see :func:`overlap_slab_width`).
 _OVERLAP_SLAB_COLUMNS = 128
@@ -595,7 +604,7 @@ def paired_exchange_requested() -> bool:
 
 
 def condition_helper_policy() -> str:
-    """``any``, ``auto`` or ``off`` from ``PARSEC_CUPY_RITZ_CONDITION_HELPER``.
+    """``auto``, ``any`` or ``off`` from ``PARSEC_CUPY_RITZ_CONDITION_HELPER``.
 
     The device small solve begins with the condition number of the overlap:
     a symmetric spectrum that is only compared with its limit and takes
@@ -608,15 +617,16 @@ def condition_helper_policy() -> str:
     the same bit for bit.
 
     The helper is the first device after the owner that does not hold the
-    Hartree objects of the process.  ``any``, the default, also asks the
-    device that holds them where a sector has no other, if the rule that
-    shares a basis gives it the room (below); while ``auto`` was the
-    default it asked that device whatever the room, which no value does
-    now.  ``auto``, the former default, never asks that device: such a
-    sector estimates on its owner before the factorization, as every
-    sector does with ``off``, the route before there were helpers.  A
-    sector on one device has no helper, and neither has a host solve or a
-    run whose ``PARSEC_CUPY_RITZ_CONDITION`` names the host SVD.
+    Hartree objects of the process.  ``auto``, the default, never asks the
+    device that holds them: a sector whose only other device it is
+    estimates on its owner before the factorization, as every sector does
+    with ``off``, the route before there were helpers.  ``any`` also asks
+    that device where a sector has no other, if the rule that shares a
+    basis gives it the room (below).  ``any`` was the default for a while
+    (below); before it counted the room it asked that device whatever the
+    room, which no value does now.  A sector on one device has no helper,
+    and neither has a host solve or a run whose
+    ``PARSEC_CUPY_RITZ_CONDITION`` names the host SVD.
 
     The sector that this is about has two devices, the second of which
     holds the Hartree objects: on 8 GPUs the second sector of the root
@@ -627,7 +637,7 @@ def condition_helper_policy() -> str:
 
     The helper takes memory that it did not take before
     (:func:`condition_helper_bytes`), which is why the Hartree device,
-    taken to be the fullest of its process, was passed over.  On A100
+    taken to be the fullest of its process, was passed over at first.  On A100
     nodes it was not the fullest.  In first runs on 8 GPUs it sampled
     50,567 and 66,491 MiB for 23,768 and 29,576 electrons where the owner
     of the first sector of its rank sampled 50,679 and 67,083: an owner
@@ -645,9 +655,20 @@ def condition_helper_policy() -> str:
     the next one: by the stage seconds of those runs about 0.5 and 0.2 s of
     166.9 and 242.9 s of SCF, and at most the 1.2 and 1.9 s of the stage.
 
-    The room: the device that holds the Hartree objects is asked only
-    where the blocks that the sharing rule counts on a device
-    (:func:`shared_block_bytes`) and the bytes of the estimate together
+    ``any`` became the default on those stage seconds, and complete
+    calculations decided against it: first runs on 8 A100 GPUs (FP64, the
+    launch profile of the measured series, two of each value in
+    alternation, the same total energies in every run) took 163.40 s of
+    SCF on average with ``any`` and 163.51 s with ``auto`` for 23,768
+    electrons (0.07 % less), and 236.16 against 235.92 s for 29,576
+    electrons (0.10 % more); the fullest device peaked at 47.87 against
+    47.67 GiB and at 63.52 GiB with either.  ``any`` would have stayed the
+    default had it taken at least 0.4 % less SCF time in either case, so
+    ``auto`` is the default again.
+
+    The room: where ``any`` is named, the device that holds the Hartree
+    objects is asked only where the blocks that the sharing rule counts on
+    a device (:func:`shared_block_bytes`) and the bytes of the estimate together
     stay within the share of that device which the rule allows
     (``PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION``).  So the helper never
     takes a device beyond what that rule lets a shared basis take, the rule
@@ -659,7 +680,7 @@ def condition_helper_policy() -> str:
     error of the owner would: nothing falls back to the owner.
     """
 
-    value = os.environ.get("PARSEC_CUPY_RITZ_CONDITION_HELPER", "any").strip().lower()
+    value = os.environ.get("PARSEC_CUPY_RITZ_CONDITION_HELPER", "auto").strip().lower()
     if value not in {"auto", "any", "off"}:
         raise ValueError("PARSEC_CUPY_RITZ_CONDITION_HELPER must be auto, any or off")
     return value
@@ -867,7 +888,8 @@ def pair_slab_bytes() -> int:
     """The most bytes of a slab of the one-block Ritz step of a sector on two devices.
 
     ``PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES`` sets it; the default
-    is 2 GiB (see :func:`slab_columns`).  It limits the slab that the
+    is 1 GiB, and ``2147483648`` the 2 GiB that it was before (see
+    :func:`slab_columns`).  It limits the slab that the
     streaming budget sizes where that is not set, an eighth of the basis
     but at least 1 GiB, and nothing else: a budget that is set is the slab
     as before, and one device, three and more, and the steps with two and
@@ -886,13 +908,69 @@ def pair_slab_bytes() -> int:
     its first solve.
     """
 
-    raw = os.environ.get("PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES", str(_PAIR_SLAB_BYTES)).strip()
+    return _positive_integer("PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES", _PAIR_SLAB_BYTES)
+
+
+def round_bytes() -> int:
+    """The bytes of a round of the one-block Ritz step of a sector on four or more devices.
+
+    ``PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES`` sets them; the default is
+    4 GiB, a slab of 1 GiB per device with four (see :func:`slab_columns`).
+    Like :func:`pair_slab_bytes` they limit the slab that the streaming
+    budget sizes where that is not set, and nothing else.
+    ``8589934592`` selects the slabs of 2 GiB that this step took before,
+    bit for bit.
+    """
+
+    return _positive_integer("PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES", _ROUND_BYTES)
+
+
+def min_slab_columns() -> int:
+    """The fewest columns of a slab of the one-block Ritz step where its limit leaves fewer.
+
+    ``PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS`` sets them; the
+    default is 32, and ``1`` leaves the slabs as the limits cut them.  The
+    floor widens a slab of a sector on two or on four and more devices up
+    to the width that the former limits gave (2 GiB per slab) and never
+    beyond, so it costs no memory that those runs did not hold.  Every
+    round of that step waits for all devices of the sector, so a narrow
+    slab costs a fixed time per round: on A100 nodes slabs of 18 instead
+    of 48 columns made the rounds of 29,576 electrons on 16 GPUs 2.7 times
+    as many and the SCF 2.2 % longer, and slabs of 20 instead of 32
+    columns those of 39,368 electrons 0.4 % longer.
+    """
+
+    return _positive_integer("PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS", _MIN_SLAB_COLUMNS)
+
+
+def _slab_floor_budget(floor: int) -> int:
+    """The slab budget that keeps the equal slabs of a block ``floor`` columns wide or wider.
+
+    :func:`block_rounds` cuts a block into as many slabs as the budget
+    needs and makes them equal, so a budget of exactly ``floor`` columns
+    gives slabs a little narrower than it wherever the block is no whole
+    multiple of it, and whole rounds then fall to the next multiple below:
+    blocks of 924 columns with a budget of 32 gave slabs of 16 and twice
+    the rounds.  A budget an eighth wider, ``w = 9 f / 8``, cuts a block of
+    ``b`` columns into ``ceil(b / w)`` slabs of at least ``w b / (b + w)``
+    columns, which is ``f`` or more for every block of ``9 f`` columns and
+    more (288 for the default).  The budget does not depend on the block,
+    so a slab never widens when a trim takes columns from a sector after
+    its first solve, which the fit rule counted once for that solve.
+    """
+
+    floor = int(floor)
+    return floor + floor // 8
+
+
+def _positive_integer(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default)).strip()
     try:
         value = int(raw)
     except ValueError as error:
-        raise ValueError("PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES must be an integer") from error
+        raise ValueError(f"{name} must be an integer") from error
     if value < 1:
-        raise ValueError("PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES must be positive")
+        raise ValueError(f"{name} must be positive")
     return value
 
 
@@ -941,8 +1019,13 @@ def overlap_slab_width(columns: int) -> int | None:
     to 0.47 s of a run).
 
     The rule is that of a row block: every step of a shared basis forms
-    its overlap from the complete row block of a device.  A sector on one
-    device keeps the count.  Its overlap is the same product over all its
+    its overlap from the complete row block of a device.  Which bases are
+    shared is decided per sector and not by the number of GPUs: a process
+    that drives more devices than it solves sectors gives each sector a
+    group of them (:func:`shared_basis_devices`), on 8 and 16 GPUs with the
+    four sectors of the measured series and on 2 and 4 as well where a
+    system has fewer sectors than devices.  A sector on one device keeps
+    the count.  Its overlap is the same product over all its
     rows, but its records time it together with the projection, so no run
     says what another width of the overlap gives there, and on a
     workstation GPU more slabs did not always gain
@@ -983,7 +1066,9 @@ def slab_columns(rows: int, columns: int, devices: int, wide: bool = False, bloc
 
     In the step with one tall block (``blocks`` of 1) on four or more
     devices, a slab that no set budget sizes takes at most an even share
-    of 8 GiB as well: 2 GiB with four devices.  A round of that step
+    of :func:`round_bytes` as well: 1 GiB with four devices, where it was
+    an even share of 8 GiB, 2 GiB with four, until the runs at the end of
+    this text.  A round of that step
     projects the slabs of all devices in one product, so the width of a
     round and not that of a slab is the width of the product, and the
     workspace is two slabs.  First runs on A100 nodes, four devices per
@@ -1006,8 +1091,9 @@ def slab_columns(rows: int, columns: int, devices: int, wide: bool = False, bloc
     further, at whole multiples of 64 columns (:func:`block_rounds`), into
     rounds of 320, 320 and 128 columns for these three.
 
-    On two devices a slab that no set budget sizes takes at most 2 GiB as
-    well (:func:`pair_slab_bytes`): rounds of 4 GiB.  They were left at 4
+    On two devices a slab that no set budget sizes takes at most 1 GiB as
+    well (:func:`pair_slab_bytes`): rounds of 2 GiB; it took 2 GiB, rounds
+    of 4 GiB, until the runs at the end of this text.  They were left at 4
     GiB at first, because rounds of about 135 columns had not run and the
     products of the two-block step of 23,768 electrons on 16 GPUs took
     17.5 s where they were 90 to 141 columns wide and 14.5 s at 184 to
@@ -1044,6 +1130,26 @@ def slab_columns(rows: int, columns: int, devices: int, wide: bool = False, bloc
 
     Three devices keep 4 GiB at every size: no run has had them.
 
+    Since then a slab takes 1 GiB on two and on four devices, no narrower
+    than 32 columns where the limits of 2 GiB would allow that width
+    (:func:`min_slab_columns`; :func:`_slab_floor_budget` makes the floor
+    survive the equal cut of :func:`block_rounds`).  On first runs on A100
+    nodes, the defaults against
+    ``PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES=8589934592`` and
+    ``PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=2147483648`` in one
+    allocation (old, new, new, old), the fullest device peaked 1.0 to 2.5
+    GiB lower for 10,456 to 29,576 electrons on 8 and 16 GPUs (2.7 to 12.5
+    %).  The SCF took between 1.3 % less and 1.1 % more, of the size of
+    the spread of repeated runs, except 29,576 electrons on 16 GPUs: 1.4 %
+    more in both pairs for 0.97 GiB less (slabs of 32 columns in 29 rounds
+    instead of 48 in 20).  The rounds of 39,368 electrons on 16 GPUs are
+    those of before (slabs of 32 columns either way), and so are their
+    peak and bits.  The total energies moved by 1e-9 to 8e-8 Ry: the
+    lower triangles are summed from other slabs.  Without the floor the
+    slabs of 29,576 electrons on 16 GPUs were 16 columns wide in 58 rounds,
+    and that SCF took 2.3 % longer.  The two former values together give
+    the slabs of before, bit for bit.
+
     ``PARSEC_CUPY_STREAMING_RITZ_BYTES=4294967296`` gives a sector on four
     or more devices the slabs it had, whatever the size of its basis.  It
     is the way back for those runs only, and what it gives back is this
@@ -1061,15 +1167,22 @@ def slab_columns(rows: int, columns: int, devices: int, wide: bool = False, bloc
 
     rows, columns, devices = int(rows), int(columns), int(devices)
     basis = 8 * rows * columns
-    if int(blocks) == 1:
-        budget = _streaming_bytes(basis)
+    if int(blocks) == 1 and (devices >= 4 or devices == 2):
+        budget = former = _streaming_bytes(basis)
         if devices >= 4:
-            budget = min(budget, _streaming_bytes(basis, _ROUND_BYTES // devices))
-        elif devices == 2:
+            budget = min(budget, _streaming_bytes(basis, round_bytes() // devices))
+            former = min(former, _streaming_bytes(basis, _FORMER_ROUND_BYTES // devices))
+        else:
             budget = min(budget, _streaming_bytes(basis, pair_slab_bytes()))
+            former = min(former, _streaming_bytes(basis, _FORMER_PAIR_SLAB_BYTES))
+        floor = _slab_floor_budget(min_slab_columns())
+        width = max(budget // (8 * rows), min(floor, former // (8 * rows)))
+    elif int(blocks) == 1:
+        width = _streaming_bytes(basis) // (8 * rows)
     else:
         budget = _streaming_bytes(basis, _WIDER_SLAB_BYTES) if wide else _streaming_bytes(basis)
-    return max(1, min(budget // (8 * rows), columns // (2 * devices)))
+        width = budget // (8 * rows)
+    return max(1, min(width, columns // (2 * devices)))
 
 
 def slab_workspace(rows: int, columns: int, devices: int, blocks: int = 2, wide: bool = False) -> int:
@@ -1760,6 +1873,8 @@ class SectorDeviceGroup:
             _streaming_bytes(0)
             if blocks == 1:
                 pair_slab_bytes()
+                round_bytes()
+                min_slab_columns()
             if equal_slabs_requested() and blocks == 2:
                 # Such a step asks wider_slabs_fit, which reads the share of
                 # a device that the blocks may take: also for a basis that
@@ -2389,12 +2504,13 @@ class SectorDeviceGroup:
         eigensolver): that one holds the Poisson and boundary arrays, and
         the estimate takes a copy of the overlap and the work arrays of its
         eigensolver there.  A sector whose only other device is that one
-        asks it where :func:`condition_helper_policy` says ``any``, the
-        default, and :meth:`_helper_fits` gives it the room.  ``None``
-        leaves the estimate to the owner, in front of its factorization:
-        for such a sector otherwise, for a sector on one device, where the
-        policy is ``off``, and where the condition number is the host SVD,
-        which needs no device.
+        asks it only where :func:`condition_helper_policy` says ``any``,
+        which must be named (the default, ``auto``, never asks it), and
+        :meth:`_helper_fits` gives it the room.  ``None`` leaves the
+        estimate to the owner, in front of its factorization: for such a
+        sector otherwise, for a sector on one device, where the policy is
+        ``off``, and where the condition number is the host SVD, which
+        needs no device.
         """
 
         policy = condition_helper_policy()
@@ -2418,8 +2534,9 @@ class SectorDeviceGroup:
         the bytes of the estimate (:func:`condition_helper_bytes`) take no
         more of the memory of ``helper`` than
         ``PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION``, 0.85 by default.
-        Asked of the device that holds the Hartree objects only: its
-        estimate is new, and the rule had counted no room for it.  Like
+        Asked of the device that holds the Hartree objects only, where
+        ``any`` is named: its estimate is new, and the rule had counted no
+        room for it.  Like
         the rule it reads the size of the device and nothing of its state.
         """
 

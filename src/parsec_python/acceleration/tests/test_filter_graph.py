@@ -120,13 +120,13 @@ class _CapturedOperator:
 
 
 class _Projection:
-    """Stands for the projection of an operator: the kernel it launches, noted at every call."""
+    """Stands for the projection of an operator: its reduction, noted at every call."""
 
-    def __init__(self, kernel, launched):
-        self.kernel, self.launched = kernel, launched
+    def __init__(self, reduction, launched):
+        self.reduction_mode, self.launched = reduction, launched
 
     def __call__(self, block, output=None):
-        self.launched.append(self.kernel)
+        self.launched.append(self.reduction_mode)
         return output
 
 
@@ -274,35 +274,35 @@ class CaptureStandInTests(_StandInCase):
         self.assertEqual([stream.ended for stream in self.streams], [3, 3])
         self.assertEqual(self.operator.timing_stats.filter_graph_builds, 6)
 
-    def test_graphs_of_another_projection_kernel_are_recorded_again(self):
+    def test_graphs_of_another_projection_reduction_are_recorded_again(self):
         launched = []
         workspace = self.workspace(lambda *args, **kwargs: None)
-        former, six = object(), object()
+        former, six = "parallel", "parallel6"
         self.operator.custom_projector_projection = _Projection(former, launched)
         workspace._prepare(self.matrix, self.blocks)
-        # Three graphs of three steps, each with a projection by the kernel
-        # of the operator.
+        # Three graphs of three steps, each with a projection of the
+        # operator's reduction.
         self.assertEqual(launched, [former] * 9)
-        self.assertIs(workspace.projection_kernel, former)
+        self.assertEqual(workspace.projection_reduction, former)
         graphs = list(workspace.graphs)
         workspace._prepare(self.matrix, self.blocks)
         self.assertEqual(len(launched), 9)
         # A filter was submitted with the workspace since.
         workspace.has_upload = workspace.has_finished = True
-        # The operator launches another kernel now: a graph would replay the
-        # former one, so the same plan is recorded again, once the device has
-        # done what was submitted.
+        # The operator's projection is of another reduction now: a graph
+        # would replay the kernels of the former one, so the same plan is
+        # recorded again, once the device has done what was submitted.
         self.operator.custom_projector_projection = _Projection(six, launched)
         workspace._prepare(self.matrix, self.blocks)
         self.assertEqual(launched[9:], [six] * 9)
-        self.assertIs(workspace.projection_kernel, six)
+        self.assertEqual(workspace.projection_reduction, six)
         self.assertEqual(len(workspace.graphs), 3)
         self.assertFalse(
             any(now[0] is before[0] for now, before in zip(workspace.graphs, graphs, strict=True))
         )
         self.assertEqual(self.waited, [5, 5, 5])
         self.assertEqual(self.operator.timing_stats.filter_graph_builds, 6)
-        # Another projection with the same kernel keeps the graphs.
+        # Another projection of the same reduction keeps the graphs.
         self.operator.custom_projector_projection = _Projection(six, launched)
         workspace._prepare(self.matrix, self.blocks)
         self.assertEqual(len(launched), 18)
@@ -657,31 +657,31 @@ class SharedGraphStandInTests(_StandInCase):
                 self.assertEqual(len(capturing), 6)
                 self.assertIs(self.streams[-1], stream)
 
-    def test_shared_graphs_of_another_projection_kernel_are_recorded_again(self):
+    def test_shared_graphs_of_another_projection_reduction_are_recorded_again(self):
         launched = []
         workspace = self.workspace(lambda *args, **kwargs: None)
-        former, six = object(), object()
+        former, six = "parallel", "parallel6"
         self.operator.custom_projector_projection = _Projection(former, launched)
         self.assertEqual(self.captured(workspace, self.matrix, self.blocks), 2)
         self.assertEqual(launched, [former] * 6)
-        self.assertIs(workspace.projection_kernel, former)
+        self.assertEqual(workspace.projection_reduction, former)
         buffers, shared = workspace.buffers, dict(workspace.shared)
         self.assertEqual(self.captured(workspace, self.matrix, self.blocks), 0)
         # A filter was submitted with the workspace since.
         workspace.has_upload = workspace.has_finished = True
-        # The graphs that the blocks share would replay the former kernel:
+        # The graphs that the blocks share would replay the former kernels:
         # the two of the plan are recorded again, on the buffers that are
         # there, each with a table of its own.
         self.operator.custom_projector_projection = _Projection(six, launched)
         self.assertEqual(self.captured(workspace, self.matrix, self.blocks), 2)
         self.assertEqual(launched[6:], [six] * 6)
-        self.assertIs(workspace.projection_kernel, six)
+        self.assertEqual(workspace.projection_reduction, six)
         self.assertIs(workspace.buffers, buffers)
         self.assertEqual(sorted(workspace.shared), sorted(shared))
         self.assertFalse(any(workspace.shared[kind][0] is shared[kind][0] for kind in shared))
         self.assertEqual(self.operator.timing_stats.filter_graph_builds, 4)
         # Another plan finds none of the former graphs either, and a plan of
-        # the same widths and degrees those recorded with the present kernel.
+        # the same widths and degrees those recorded with the present reduction.
         self.assertEqual(self.captured(workspace, self.matrix, uniform_filter_blocks(13, 6, 2)), 2)
         self.assertEqual(self.captured(workspace, self.matrix, self.blocks), 0)
         self.assertEqual(set(launched[12:]), {six})
@@ -1625,8 +1625,9 @@ class FilterGraphTests(unittest.TestCase):
                     with self.subTest(reuse=reuse, blocks=len(blocks), switch=name):
                         np.testing.assert_array_equal(results[name], results["1"])
             for name, workspace in workspaces.items():
-                self.assertIs(
-                    workspace.projection_kernel, operators[name].custom_projector_projection.kernel
+                self.assertEqual(
+                    workspace.projection_reduction,
+                    operators[name].custom_projector_projection.reduction_mode,
                 )
         # The filters of the eigensolvers, with graphs and without them,
         # where every recurrence step launches its projection by itself.
@@ -1654,12 +1655,66 @@ class FilterGraphTests(unittest.TestCase):
                         np.testing.assert_array_equal(later[name], later["1"])
                 self.assertTrue(first["1"].any() and later["1"].any())
 
-    def test_a_workspace_records_again_for_another_projection_kernel(self):
-        from parsec_python.acceleration.backends import cupy_projectors
+    def test_a_graph_launches_the_projection_kernel_of_its_width(self):
+        # A graph is recorded for one block width and replays the launches of
+        # its recording.  By default one column takes the kernel of a block
+        # per projector and column, two to six columns one launch of the
+        # six-column kernel, and more, as the graphs of the distributed
+        # filter record them, one launch of its group kernel.  The filtered
+        # columns are those of the former kernel to the last bit.
+        cp, operator = self.operator()
+        _, former = self.operator(block_columns="1")
+        projection = operator.custom_projector_projection
+        self.assertEqual(sorted(projection.kernels), ["parallel", "parallel6", "parallel6_groups"])
 
+        def launch(width):
+            if width == 1:
+                return ("parallel", (3,), 1)
+            if width <= 6:
+                return ("parallel6", (3,), width)
+            return ("parallel6_groups", (3, -(-width // 6)), width)
+
+        host = np.random.default_rng(143).normal(size=(257, 13))
+        plans = (
+            uniform_filter_blocks(13, 6, 4),
+            (FilterBlock(0, 13, 3),),
+            (FilterBlock(0, 1, 3), FilterBlock(1, 3, 2), FilterBlock(3, 10, 2)),
+        )
+        for reuse in ("1", "0"):
+            with patch.dict(os.environ, PARSEC_CUPY_FILTER_GRAPH_REUSE=reuse):
+                workspace = filter_graph.BlockFilterGraphs(operator)
+                reference = filter_graph.BlockFilterGraphs(former)
+            for blocks in plans:
+                widths = sorted({block.stop - block.start for block in blocks})
+                with self.subTest(reuse=reuse, widths=widths):
+                    matrix = cp.asarray(host[:, : blocks[-1].stop], order="F")
+                    launched = []
+                    counting = {}
+                    for name, kernel in projection.kernels.items():
+
+                        def count(grid, block, arguments, name=name, kernel=kernel):
+                            launched.append((name, grid, int(arguments[1])))
+                            return kernel(grid, block, arguments)
+
+                        counting[name] = count
+                    with patch.dict(projection.kernels, counting):
+                        actual = cp.asnumpy(workspace.apply(matrix, blocks, 0.0, 4.0, -0.5, False))
+                        recorded = len(launched)
+                        replayed = cp.asnumpy(workspace.apply(matrix, blocks, 0.0, 4.0, -0.5, False))
+                    expected = cp.asnumpy(reference.apply(matrix, blocks, 0.0, 4.0, -0.5, False))
+                    # Every recording launched the kernel of its width; a
+                    # replay launches nothing from here.
+                    self.assertGreater(recorded, 0)
+                    self.assertEqual(len(launched), recorded)
+                    self.assertEqual(sorted(set(launched)), sorted(launch(width) for width in widths))
+                    self.assertTrue(np.isfinite(expected).all() and expected.any())
+                    for result in (actual, replayed):
+                        np.testing.assert_array_equal(result.view(np.uint64), expected.view(np.uint64))
+        cp.cuda.get_current_stream().synchronize()
+
+    def test_a_workspace_records_again_for_another_projection_kernel(self):
         cp, operator = self.operator(block_columns="1")
         _, other = self.operator(block_columns="6")
-        kernels = cupy_projectors._kernels(cp)
         matrix = cp.asarray(np.random.default_rng(141).normal(size=(257, 13)), order="F")
         blocks = uniform_filter_blocks(13, 6, 5)
         original = operator.custom_projector_projection
@@ -1669,7 +1724,7 @@ class FilterGraphTests(unittest.TestCase):
                     workspace = filter_graph.BlockFilterGraphs(operator)
                 before = capture_statistics()["captures"]
                 expected = cp.asnumpy(workspace.apply(matrix, blocks, 0.0, 4.0, -0.5, False))
-                self.assertIs(workspace.projection_kernel, kernels[0])
+                self.assertEqual(workspace.projection_reduction, "parallel")
                 workspace.apply(matrix, blocks, 0.0, 4.0, -0.5, False)
                 self.assertEqual(capture_statistics()["captures"] - before, graphs)
                 # The operator is given the projection of six columns per
@@ -1677,7 +1732,7 @@ class FilterGraphTests(unittest.TestCase):
                 # and filter as before, to the last bit.
                 operator.custom_projector_projection = other.custom_projector_projection
                 actual = cp.asnumpy(workspace.apply(matrix, blocks, 0.0, 4.0, -0.5, False))
-                self.assertIs(workspace.projection_kernel, kernels[3])
+                self.assertEqual(workspace.projection_reduction, "parallel6")
                 self.assertEqual(capture_statistics()["captures"] - before, 2 * graphs)
                 np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
                 self.assertTrue(np.isfinite(expected).all() and expected.any())

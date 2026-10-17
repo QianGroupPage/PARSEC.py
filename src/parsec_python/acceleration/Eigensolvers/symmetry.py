@@ -47,7 +47,6 @@ from .distributed_state import shared_basis_devices, shared_block_bytes
 from .eigval import CuPyEigvalResult, CuPyEigvalSolver, spill_download_order
 from .filter_graph import graph_route_name
 from .rayleigh_ritz import (
-    _tile_follows_slab,
     gram_multiple,
     one_array_buffer_limit,
     streaming_ritz_requested,
@@ -340,6 +339,18 @@ def _pool_release_orbital_bytes() -> int:
     if threshold < 0:
         raise ValueError(f"{name} must be nonnegative")
     return threshold
+
+
+def _vectors_on_host(solver: Any) -> bool:
+    """Whether the saved state of a sector solver holds its vectors on the host, as a spill leaves them.
+
+    Not so for a basis on its device, nor for one that the devices of a
+    sector share (:class:`distributed_state.DistributedBasis`), which no
+    spill moves.
+    """
+
+    state = getattr(solver, "device_state", None)
+    return state is not None and isinstance(state.subspace.vectors, np.ndarray)
 
 
 class CuPySymmetrySCFEigensolver:
@@ -784,8 +795,9 @@ class CuPySymmetrySCFEigensolver:
 
         ``None`` where they share no device.  Every sector operator is told:
         a sector that shares its basis gives that device work beside its
-        own only where it has no other device for it and the sharing rule
-        counts the room
+        own only where it has no other device for it,
+        ``PARSEC_CUPY_RITZ_CONDITION_HELPER=any`` is named and the sharing
+        rule counts the room
         (:meth:`distributed_state.SectorDeviceGroup._condition_helper`).
         """
 
@@ -848,10 +860,17 @@ class CuPySymmetrySCFEigensolver:
 
     @property
     def projector_reduction_modes(self) -> str:
-        """Report the selected short/long-row CUDA dot policies."""
+        """Report the selected short/long-row CUDA dot policies.
+
+        An operator forms its coefficients with its projection only where
+        the stencil kernel fuses the scatter; elsewhere cuSPARSE forms them,
+        and the operator reports ``none``, as one without a projection does.
+        """
 
         modes = {
             getattr(operator.custom_projector_projection, "reduction_mode", "none")
+            if operator.fused_projector_scatter
+            else "none"
             for operator in self._operators
             if operator is not None and operator.projector_count
         }
@@ -1238,7 +1257,10 @@ class CuPySymmetrySCFEigensolver:
         therefore 0.974, the reciprocal of 1.027: a device is still taken
         as too small only where the least ratio that was measured puts its
         peak above its memory, 2.06 GiB below a device of 79.25 GiB, and
-        those sectors are spilled as they were.  ``0.978`` is the former
+        those sectors are spilled as they were.  A first run of them on an
+        A100 with ``0.978`` kept their states on the device and stopped for
+        memory in its first solve; with 0.974 it spilled them and
+        completed.  ``0.978`` is the former
         share and ``1`` holds the count against all of the device.  A
         device of 79.25 GiB keeps the states of sectors of 32 GiB and more
         up to 75.2 GiB of them, where it kept them up to 73.5.  A shared
@@ -1313,7 +1335,6 @@ class CuPySymmetrySCFEigensolver:
         # Read by the Ritz step of a sector on one device, inside the first
         # solve, and by the count below where ``auto`` asks for it.
         one_array_buffer_limit(0)
-        _tile_follows_slab()
 
         cp, _ = require_cupy()
         persistent_bytes: dict[int, int] = {
@@ -1362,18 +1383,36 @@ class CuPySymmetrySCFEigensolver:
         # page-locked (PARSEC_CUPY_SPILL_BUFFERS): planned here from the
         # bytes of each basis at the counts of the first solve, in the
         # order of the sectors, and taken by each sector when it is first
-        # downloaded.  ``fresh`` plans none: the staging is the former one.
+        # downloaded.  A sector whose operator was given a group of devices
+        # is planned after the others: its basis is to be shared, which
+        # takes no buffer.  Only the group is read, no device: the first
+        # solve decides whether the basis is shared.  ``fresh`` plans none:
+        # the staging is the former one.
         self._spill_staging = staging if self._host_spill_sector_states else None
         self._spill_buffers = None
         self._spill_seconds = {}
         if self._host_spill_sector_states and staging == "persistent":
-            self._spill_buffers = SpillBuffers({
+            sizes = {
                 representation: self.decomposition.sector_size(representation)
                 * int(count)
                 * np.dtype(np.float64).itemsize
                 for representation, count in enumerate(counts)
                 if self._solvers[representation] is not None
-            })
+            }
+            grouped = [
+                representation
+                for representation in sizes
+                if len(
+                    getattr(
+                        self._operators[representation],
+                        "distributed_filter_devices",
+                        None,
+                    )
+                    or ()
+                )
+                > 1
+            ]
+            self._spill_buffers = SpillBuffers(sizes, deferred=grouped)
         # PARSEC_CUPY_STREAMING_RITZ=auto: a sector whose basis lies on one
         # device keeps one array of its subspace.  The ordinary Ritz solve
         # keeps two (measured peak about twice the persistent orbitals plus
@@ -1586,6 +1625,8 @@ class CuPySymmetrySCFEigensolver:
         staged = () if buffers is None else (buffers.get(representation),)
         # Calls and wall seconds of the two moves of this sector, under
         # either staging: [restores, their seconds, offloads, theirs].
+        # Counted where the states moved: a basis that the devices of the
+        # sector share never leaves them, and both calls return at once.
         moves = (
             getattr(self, "_spill_seconds", {}).setdefault(
                 representation, [0, 0.0, 0, 0.0]
@@ -1599,20 +1640,24 @@ class CuPySymmetrySCFEigensolver:
                 if reset:
                     solver.reset()
                 elif spilled:
+                    moved = _vectors_on_host(solver)
                     started = perf_counter()
                     solver.restore_state_to_device(*staged)
-                    moves[0] += 1
-                    moves[1] += perf_counter() - started
+                    if moved:
+                        moves[0] += 1
+                        moves[1] += perf_counter() - started
                 result = solver.solve(
                     count,
                     settings=settings,
                     spectral_bound=spectral_bound,
                 )
                 if spilled:
+                    moved = not _vectors_on_host(solver)
                     started = perf_counter()
                     host_state = solver.offload_state_to_host(*staged)
-                    moves[2] += 1
-                    moves[3] += perf_counter() - started
+                    if moved and _vectors_on_host(solver):
+                        moves[2] += 1
+                        moves[3] += perf_counter() - started
                     assert host_state is not None
                     result = replace(
                         result,
@@ -1709,7 +1754,8 @@ class CuPySymmetrySCFEigensolver:
         names the staging (``PARSEC_CUPY_SPILL_BUFFERS``), and under either
         ``restores`` and ``offloads`` count the calls that moved the states
         of a sector to its device before a solve and to the host behind
-        it, with the wall seconds of those calls.  With ``fresh`` the
+        it, with the wall seconds of those calls; a basis that the devices
+        of its sector share is not moved and not counted.  With ``fresh`` the
         seconds of a restore end where ``cupy.asarray`` returns, which can
         be before its copy to the device has completed.  With
         ``persistent`` they are those of complete copies, the offloads

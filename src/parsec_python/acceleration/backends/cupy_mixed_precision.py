@@ -25,6 +25,7 @@ from .cupy_compile import compile_cupy_raw
 from .cupy_launch import kernel_parameters, launch_arguments
 from .cupy_projectors import (
     _SOURCE as _PROJECTOR_SOURCE,
+    projection_kernels,
     projection_launches,
     projection_reduction,
     projector_block_columns,
@@ -104,6 +105,7 @@ _SOURCE = _float_source(
     (
         "sparse_projector_projection",
         "sparse_projector_projection6",
+        "sparse_projector_projection6_groups",
         "sparse_projector_projection_serial",
         "sparse_projector_scatter",
     ),
@@ -114,15 +116,21 @@ _KERNEL_NAMES = (
     "sparse_projector_projection_float32",
     "sparse_projector_projection_serial_float32",
     "sparse_projector_projection6_float32",
+    "sparse_projector_projection6_groups_float32",
 )
-# Where ``_KERNEL_NAMES`` holds the projection kernel of a reduction
-# (:func:`cupy_projectors.projection_reduction`).
-_PROJECTION_KERNEL = {"parallel": 1, "serial": 2, "parallel6": 3}
-_KERNEL_CACHE: dict[int, tuple[Any, Any, Any, Any]] = {}
+# Where ``_KERNEL_NAMES`` holds the projection kernel of each name of
+# :func:`cupy_projectors.projection_kernels`.
+_PROJECTION_KERNEL = {
+    "parallel": 1,
+    "serial": 2,
+    "parallel6": 3,
+    "parallel6_groups": 4,
+}
+_KERNEL_CACHE: dict[int, tuple[Any, ...]] = {}
 _KERNEL_LOCK = Lock()
 
 
-def _kernels(cp: Any) -> tuple[Any, Any, Any, Any]:
+def _kernels(cp: Any) -> tuple[Any, ...]:
     """Compile the invariant FP32 recurrence kernels once per CUDA device."""
 
     device_id = int(cp.cuda.Device().id)
@@ -228,17 +236,24 @@ class CuPyMixedPrecisionRecurrence:
         )
 
         kernels = _kernels(cp)
-        selected = (0, _PROJECTION_KERNEL[self.projection_reduction])
-        self.recurrence_kernel, self.projection_kernel = (
-            kernels[index] for index in selected
-        )
+        self.recurrence_kernel = kernels[0]
+        # As in the FP64 projection: the kernels of the launches of every
+        # width, by the names of :func:`cupy_projectors.projection_kernels`.
+        selected = {
+            name: _PROJECTION_KERNEL[name]
+            for name in projection_kernels(self.projection_reduction)
+        }
+        self.projection_kernels = {
+            name: kernels[index] for name, index in selected.items()
+        }
         # The FP32 kernels are compiled from the FP64 sources, so their
         # parameter lists move with those.  The launches name their values
         # and are ordered by these declarations.
-        self.recurrence_parameters, self.projection_parameters = (
-            kernel_parameters(_SOURCE, _KERNEL_NAMES[index])
-            for index in selected
-        )
+        self.recurrence_parameters = kernel_parameters(_SOURCE, _KERNEL_NAMES[0])
+        self.projection_parameters = {
+            name: kernel_parameters(_SOURCE, _KERNEL_NAMES[index])
+            for name, index in selected.items()
+        }
 
     def update_potential(self, effective_potential: Any) -> None:
         """Refresh the FP32 shadow of the current FP64 SCF local field."""
@@ -280,11 +295,11 @@ class CuPyMixedPrecisionRecurrence:
             projector_values=self.transpose_values,
             signs=self.projector_signs,
         )
-        for blocks, start, stop in projection_launches(
+        for kernel, grid, start, stop in projection_launches(
             self.projection_reduction, self.projector_count, width
         ):
             # As the FP64 projection: one launch takes the arrays as they
-            # are, the launches of more than six columns views of them.
+            # are, the launches of more than 65,535 groups views of them.
             whole = start == 0 and stop == width
             source = vectors if whole else vectors[:, start:stop]
             target = output if whole else output[:, start:stop]
@@ -296,10 +311,10 @@ class CuPyMixedPrecisionRecurrence:
                 output=target,
                 **_strides("output", target),
             )
-            self.projection_kernel(
-                (blocks,),
+            self.projection_kernels[kernel](
+                grid,
                 (threads,),
-                launch_arguments(self.projection_parameters, values),
+                launch_arguments(self.projection_parameters[kernel], values),
             )
         return output
 

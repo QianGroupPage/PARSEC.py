@@ -477,8 +477,12 @@ def one_array_buffer_limit(rows: int) -> int:
     product, and none has been timed alone.  A sector of more than
     4,194,304 rows, of which 2 GiB hold fewer than 64 columns, therefore
     keeps slabs of 64 columns, 2 to 4 GiB of buffer, and from 8,388,608
-    rows the 4 GiB and the narrower slab that it had.  No such sector on
-    one device has run.
+    rows the 4 GiB and the narrower slab that it had.  That guard is
+    derived from the slabs of 64 columns and not measured.  It acts only
+    for such a sector whose basis lies on one device and holds more than
+    16 GiB; on A100 80 GB nodes no case of the measured series has one,
+    since its only sectors of that many rows, those of 39,368 electrons
+    (5,660,200 rows, 207.8 GiB), are shared by four devices.
 
     ``4294967296`` selects the former buffer, at most 4 GiB, for a basis
     of any size, bit for bit.  ``PARSEC_CUPY_STREAMING_RITZ_BYTES`` at
@@ -500,45 +504,6 @@ def one_array_buffer_limit(rows: int) -> int:
     return value
 
 
-def _tile_follows_slab() -> bool:
-    """Whether the rotation tile of a sector on one device takes the bytes of the slab that is cut.
-
-    ``PARSEC_CUPY_STREAMING_RITZ_TILE=slab``.  With ``budget``, the
-    default, the tile takes the bytes of the budget whatever the slab is
-    cut to: where the multiple of 64 columns cuts the slab down, the tile
-    is the larger view and the buffer is that of the budget
-    (:func:`_streaming_workspace`).  With ``slab`` the tile is as tall as
-    the slab lets it be, as it is in the steps of a shared basis, and the
-    buffer is the slab: 1.24 instead of 2.00 GiB for a sector of 14,680
-    electrons and 1.37 for one of 19,392, whose slabs are 64 of the 103
-    and 93 columns of 2 GiB, 1.84 for one of 10,456 (128 of 139) and 0.57
-    instead of 1.00 GiB for one of 7,120 (64 of 112).  Those figures follow
-    from the cut; no run on an A100 has had it.
-
-    It is offered and not the default because the results are not the
-    same to the last bit under it.  The Gram matrices are, since no slab
-    moves, but the rows are rotated in tiles of another height, and
-    cuBLAS does not form the product of a tile by the same sums at every
-    height.  On a workstation GPU (RTX 5070, CUDA 12.9) one random basis,
-    rotated with tiles of 12 to 17 heights up to all of its rows, from one
-    row for the smaller shapes and from 64 for the larger, came out with
-    other bits at some heights for every one of eight shapes from 257 x
-    17 to 400,000 x 442 and 120,000 x 1,314: in a few hundred entries at
-    some heights and in nearly all at others, by 8e-13 at most where the
-    entries are of the order of 30.  On A100 nodes one
-    pair of heights ran: a budget of 3 instead of 4 GiB, which left the
-    slabs of 19,392 electrons on 4 GPUs as they were and made the tile a
-    quarter lower, gave the total energy to the last bit and peaked 1.0
-    GiB lower in the same time.
-    """
-
-    name = "PARSEC_CUPY_STREAMING_RITZ_TILE"
-    value = os.environ.get(name, "budget").strip().lower()
-    if value not in {"budget", "slab"}:
-        raise ValueError(f"{name} must be budget or slab")
-    return value == "slab"
-
-
 def _streaming_views(rows: int, columns: int, basis_bytes: int) -> tuple[int, int, int]:
     """Columns of the slab of the budget and of the slab that is cut from it, and rows of the tile.
 
@@ -549,15 +514,11 @@ def _streaming_views(rows: int, columns: int, basis_bytes: int) -> tuple[int, in
     (:func:`gram_multiple`), since every slab is the right-hand side of a
     tall product: the 103 columns of 2 GiB at 2,604,846 rows become 64, as
     the 206 of 4 GiB became 192.  The tile is the left-hand side of its
-    product and keeps its rows, so the rotation is cut as it was, unless
-    the tile is to follow the slab (:func:`_tile_follows_slab`): it is
-    then no taller than the bytes of the slab that was cut hold.
+    product and keeps its rows, so the rotation is cut as it was.
     """
 
     budget_width, tile = _streaming_cut(rows, columns, basis_bytes)
     width = budget_width if budget_width >= columns else _whole_multiple(budget_width)
-    if _tile_follows_slab():
-        tile = max(1, min(tile, rows * width // columns))
     return budget_width, width, tile
 
 
@@ -599,16 +560,11 @@ def streaming_workspace_bytes(rows: int, columns: int) -> int:
     every multiple.  The buffer itself is the count with a multiple of 1
     and never more: a slab cut down to a whole multiple leaves the tile as
     the larger view, which is within ``8 * columns`` bytes of the budget.
-
-    Where the tile follows the slab (:func:`_tile_follows_slab`) the
-    buffer is the slab that is cut, and that is counted: the bytes that
-    the step takes at the multiple in force, which then moves the count.
     """
 
     rows, columns = int(rows), int(columns)
-    budget_width, width, tile = _streaming_views(rows, columns, 8 * rows * columns)
-    counted = width if _tile_follows_slab() else budget_width
-    return 8 * max(rows * counted, tile * columns)
+    budget_width, _width, tile = _streaming_views(rows, columns, 8 * rows * columns)
+    return 8 * max(rows * budget_width, tile * columns)
 
 
 def _streaming_workspace(matrix: Any):
@@ -619,8 +575,7 @@ def _streaming_workspace(matrix: Any):
     budget (:func:`_streaming_cut`), but whole columns and whole rows round them
     differently, so the two differ by a few megabytes, and by more where
     the slab was cut down to a multiple of 64 columns
-    (:func:`_streaming_views`; a tile that follows the slab is the smaller
-    view by less than a row).  A memory-pool block
+    (:func:`_streaming_views`).  A memory-pool block
     released by the smaller cannot serve the larger: two separate buffers
     would both stay in the pool until it is emptied after the SCF step.  The
     slab and the tile are never in use together, so one buffer of the larger

@@ -339,11 +339,10 @@ potential of 1,095 atoms).
 
 What has run where. The three stages were timed on A100 nodes as given
 above, each by itself. Complete runs with the switches on and off have run
-on a laptop GPU only (`README.md` gives what they compared: the former
-values restore every bit, and the defaults move the total energy of the
-small systems run there by 2e-13 to 1.5e-11 Ry, by the wedge sums alone); on
-A100 nodes they have not, so what the three
-save together before the first SCF step is not measured: the other ranks
+on a laptop GPU (`README.md` gives what they compared: the former values
+restore every bit, and the defaults move the total energy of the small
+systems run there by 2e-13 to 1.5e-11 Ry, by the wedge sums alone), and on
+A100 nodes for the largest run of the series only (below). The other ranks
 waited 4.42 s for the root in the run of 39,368 electrons named above, which
 bounds what the root can gain there, and the maps beside the projectors act
 on every rank. On the root the three act on one chain and their gains do
@@ -355,13 +354,22 @@ once it ends before the calling thread arrives a shorter one gains nothing
 more. In the runs of the series the join had waited 1.06 to 1.08 s for
 39,368 electrons on 16 GPUs, 0.63 to 0.66 s for 29,576, up to 0.44 s for
 23,768 and 0.08 s or less in every other run (all on 8 GPUs or fewer, and
-all up to 19,392 electrons). That wait and the 1.19 s are what these records
-support for the root of the largest run: from 10.1 to 10.7 s to about 7.9
-to 8.4 s. More would need its sector set-up to run faster once the
-full-grid kernels have left its devices, which was not measured. The run
-to judge them by is the same input with the three
-switches at `0`, `0` and `full` and at their defaults in one allocation,
-read at `preparation_seconds` and `preparation_stages` of every rank.
+all up to 19,392 electrons). That wait and the 1.19 s were what those
+records supported for the root of the largest run: from 10.1 to 10.7 s to
+about 7.9 to 8.4 s.
+
+That comparison has run since: 39,368 electrons on 16 GPUs, first runs on
+A100 nodes under the launch profile of the series, the defaults against the
+three switches at `0`, `0` and `full`. The root prepared in 6.48 against
+10.32 s and the three other ranks in 5.00 against 5.92 s; the program took
+264.9 against 268.9 s and the SCF 257.9 against 258.2 s, and the total
+energies were 3.2e-10 Ry apart, the round-off of the wedge sums. A run with
+these three and the other switches that came after the series at their
+former values, which gave the total energy of the series to the last bit,
+prepared the root in 9.38 s. So the root gained 2.9 to 3.8 s, more than the
+wait and the 1.19 s account for; which of its stages gave the rest has not
+been read from its `preparation_stages`. Smaller runs, and the switches one
+at a time, have not run there as complete calculations.
 
 `benchmarks/mpi_full_scf.py` used to create the CUDA contexts of a rank one
 after another before its preparation: 0.7-0.9 s per rank with four devices in

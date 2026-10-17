@@ -630,8 +630,16 @@ states and of 1.79 instead of 3.53 s for 48). Neither default is changed:
 the slab count is set for large bases on A100 nodes, and the generalized
 first solve is an opt-in.
 
-The overlap of a basis that the devices of a sector share (8 and 16 GPUs,
-below) is cut by a width instead of a count: slabs of 128 columns
+The overlap of a basis that the devices of a sector share (below) is cut by
+a width instead of a count. Whether a basis is shared is decided per sector
+and not by the number of GPUs: a process that drives more devices than it
+solves sectors gives each sector a group of them, and the basis of a sector
+with a group is shared where the rule for that allows it
+(`distributed_state.shared_basis_devices`). With the four sectors of the
+measured series that is so on 8 and 16 GPUs only; a system with fewer
+sectors than the devices of its process, one sector on 2 or 4 GPUs or two
+on 4, shares its bases there as well and takes this cut. The slabs are 128
+columns wide
 (`PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS`), and one slab, the full
 product, where the basis has no more. A slab of `w` of `m` columns is
 multiplied by the columns from its own first one onwards, so the slabs form
@@ -669,7 +677,9 @@ the projection, so no run says what another width gives there, and on a
 workstation GPU more slabs did not always gain (above). The projection of
 the step with three blocks keeps the count as well.
 
-The buffer of a sector on one device, which is the slab of its projection
+The buffer of a sector on one device (a basis that no group of devices
+shares, as every sector of the measured series has on 1, 2 and 4 GPUs),
+which is the slab of its projection
 and then the tile of its rotation, is an eighth of the basis, at least 1 GiB
 and at most 2 GiB (`PARSEC_CUPY_STREAMING_RITZ_LIMIT_BYTES`; 4 GiB before). A
 basis of up to 16 GiB keeps the buffer it had; one of 16 to 32 GiB took its
@@ -688,9 +698,14 @@ GiB, which has not run. Slabs of 64 columns are one whole multiple. A
 narrower slab pays for 64 columns in every product and none has been timed
 alone, so a sector of more than 4,194,304 rows, of which 2 GiB hold fewer
 than 64 columns, keeps slabs of 64 columns in 2 to 4 GiB, and from 8,388,608
-rows the 4 GiB and the narrower slab that it had; no such sector on one
-device has run. The limit acts where `PARSEC_CUPY_STREAMING_RITZ_BYTES` is
-not set: a budget that is set is the buffer as before. No step of a shared
+rows the 4 GiB and the narrower slab that it had. That guard is derived from
+the slabs of 64 columns and not measured. It acts only for a sector of more
+than 4,194,304 rows whose basis lies on one device and holds more than 16
+GiB, and on A100 80 GB nodes no case of the measured series has one: its
+only sectors of that many rows, those of 39,368 electrons (5,660,200 rows,
+207.8 GiB each), are shared by four devices. The limit acts where
+`PARSEC_CUPY_STREAMING_RITZ_BYTES` is not set: a budget that is set is the
+buffer as before. No step of a shared
 basis reads it; their slabs start from the 4 GiB as they did (below).
 `4294967296` gives the former buffer for a basis of any size, bit for bit,
 and the serial control of the runner names it; the budget at that value does
@@ -701,24 +716,14 @@ step takes it, and its share of a device has come down with that count
 
 The tile of that rotation takes the bytes of the budget, so the buffer is
 the budget also where the slab is cut down to a whole multiple: 2.00 GiB for
-slabs of 64 of the 103 columns that 2 GiB hold.
-`PARSEC_CUPY_STREAMING_RITZ_TILE=slab` makes the tile as tall as the slab
-that was cut lets it be, as the steps of a shared basis do, and the buffer
-the slab: 1.24 instead of 2.00 GiB for a sector of 14,680 electrons, 1.37
-for one of 19,392, 1.84 for one of 10,456 and 0.57 instead of 1.00 GiB for
-one of 7,120 (derived from the cut; it has not run on an A100). It is
-offered and not the default. The Gram matrices keep their bits under it,
-since no slab moves, but the rows are rotated in tiles of another height,
-and cuBLAS does not form the product of a tile by the same sums at every
-height. On a workstation GPU (RTX 5070, CUDA 12.9) one random basis, rotated
-with tiles of 12 to 17 heights up to all of its rows, came out with other
-bits at some heights for every one of eight shapes from 257 x 17 to 400,000
-x 442 and 120,000 x 1,314: in a few hundred entries at some heights and in
-nearly all at others, by 8e-13 at most where the entries are of the order of
-30. On A100 nodes one pair of heights ran, the budget of 3 against 4 GiB
-above, with the same total energy to the last bit. The rule of the state
-storage counts the slab as the buffer where the tile follows it, at the
-multiple in force.
+slabs of 64 of the 103 columns that 2 GiB hold. A tile only as tall as the
+slab that was cut would make the buffer smaller, but the rows would be
+rotated in tiles of another height, and cuBLAS does not form the product of
+a tile by the same sums at every height: on a workstation GPU (RTX 5070,
+CUDA 12.9) one random basis, rotated with tiles of 12 to 17 heights up to
+all of its rows, came out with other bits at some heights for every one of
+eight shapes from 257 x 17 to 400,000 x 442 and 120,000 x 1,314, by 8e-13
+at most where the entries are of the order of 30. No such tile is offered.
 
 The steps of that solve, and the placement of the sector bases and of the
 GPU Hartree objects, take by default the routes that measured fastest or
@@ -729,7 +734,7 @@ a setting that selects the former one:
 |---|---|---|
 | `PARSEC_CUPY_RITZ_SYRK` | `auto`: overlap from GEMMs on trailing columns | `on`: DSYRK |
 | `PARSEC_CUPY_RITZ_DENSE_BACKEND` | `device`: the small generalized problem is solved by cuSOLVER where the Gram matrices were formed | `host`: download, host LAPACK, upload |
-| `PARSEC_CUPY_RITZ_CONDITION_HELPER` | `any`: beside that solve on the owner of a shared basis, another device of the sector estimates the condition number of the overlap; the device that holds the Hartree objects only where the sector has no other and the sharing rule counts the room for the estimate | `off`: the owner estimates it first; `auto`: the device that holds the Hartree objects never helps (the default before `any`) |
+| `PARSEC_CUPY_RITZ_CONDITION_HELPER` | `auto`: beside that solve on the owner of a shared basis, another device of the sector estimates the condition number of the overlap, never the device that holds the Hartree objects. `any` asks that device too where the sector has no other and the sharing rule counts the room for the estimate; it was the default for a while (below) | `off`: the owner estimates it first |
 | `PARSEC_CUPY_STREAMING_RITZ` | `auto`: a symmetry sector whose basis lies on one device keeps one `N x m` array; `H X` is projected a slab of columns at a time and the basis is rotated in place | `0`: two arrays |
 | `PARSEC_CUPY_ROTATE_COLUMN_COPY` | `1`: the tiles of that rotation are written back along columns | `0` |
 | `PARSEC_CUPY_DISTRIBUTED_STATE` | `auto`: a sector that was given several devices (MPI sector runs) shares its basis among them if its blocks fit | `0`: the whole basis on the sector owner |
@@ -762,19 +767,22 @@ per state, 2 MiB, a byte per entry for the test that the overlap is finite,
 and the handle), which holds what cuSOLVER asked at every size from 100 to
 16,000 states there. The array stays in the free list of its stream for the
 next step. That memory is why the device that holds the Hartree objects of
-the process, taken to be its fullest, was passed over at first: the root's
-sector whose only other device holds them, the second of its two on 8 GPUs,
-then kept the estimate on its owner, and its dense stage took 3.06 against
-1.85 to 1.86 s and 4.88 against 2.87 to 2.89 s of the three other sectors
-for 23,768 and 29,576 electrons. On A100 nodes that device was not the fullest: it
+the process, taken to be its fullest, was passed over at first, and it is
+by default (`auto`): the root's sector whose only other device holds them,
+the second of its two on 8 GPUs, keeps the estimate on its owner, and its
+dense stage took 3.06 against 1.85 to 1.86 s and 4.88 against 2.87 to
+2.89 s of the three other sectors for 23,768 and 29,576 electrons. On A100
+nodes that device was not the fullest: it
 sampled 50,567 and 66,491 MiB where the owner of the first sector, which
-holds the work arrays of the small solve, sampled 50,679 and 67,083. Such a
-sector therefore asks that device by default (`any`) where the rule that
+holds the work arrays of the small solve, sampled 50,679 and 67,083.
+`PARSEC_CUPY_RITZ_CONDITION_HELPER=any` therefore has such a sector ask that
+device where the rule that
 shares a basis counts the room: the blocks of the basis and the bytes of the
 estimate together within the share of the device that the rule allows
 (`PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION`). The rule itself shares the
-same bases as before, and where the room is not counted, as for a basis that
-is shared by name beyond its share, the estimate stays on the owner. With
+same bases under every value, and where the room is not counted, as for a
+basis that is shared by name beyond its share, the estimate stays on the
+owner. With
 `any` named beside the default on A100 nodes, in runs that also cut the
 overlap into other slabs (first runs, 8 GPUs, one allocation), the dense
 stage of that sector took 1.88 instead of 3.06 s and 3.02 instead of 4.88 s,
@@ -783,20 +791,29 @@ fullest device of the run 192 MiB more for 23,768 electrons (50,871 MiB:
 the helper became it) and none for 29,576. The four sectors of such a run
 are solved side by side, so the run gains what its slowest sector loses to
 the next: by the stage seconds of those runs about 0.5 and 0.2 s of 166.9
-and 242.9 s of SCF, and at most the 1.2 and 1.9 s of the stage. Sectors on
+and 242.9 s of SCF, and at most the 1.2 and 1.9 s of the stage. `any` was
+the default for a while on those stage seconds, and complete calculations
+decided against it (2026-10-16): first runs on 8 A100 GPUs, FP64, with the
+launch profile of the measured series, two of each value in alternation and
+the same total energies in every run, took 163.40 s of SCF on average with
+`any` (164.03 and 162.76 s) against 163.51 s with `auto` (163.43 and
+163.59 s) for 23,768 electrons, 0.07 % less, and 236.16 s (236.82 and
+235.50 s) against 235.92 s (235.99 and 235.85 s) for 29,576, 0.10 % more;
+the fullest device peaked at 47.87 against 47.67 GiB and at 63.52 GiB with
+either. `any` would have stayed the default had it taken at least 0.4 % less
+SCF time in either case, so the default is `auto` again. Sectors on
 four devices (16 GPUs) and the other sectors on two always had a helper and
-are unchanged. `PARSEC_CUPY_RITZ_CONDITION_HELPER=auto` never asks the device
-that holds the Hartree objects, as before, and `off` no device. `any` named
-is the default, its room included: while `auto` was the default, `any` asked
-that device whatever the room, which no value does now, so a run that names
+are the same under `auto` and `any`; `off` asks no device. `any` has counted
+the room since it became the default: before, it asked that device whatever
+the room, which no value does now, so a run that names
 it for a basis shared by name beyond its share keeps that estimate on the
 owner, with the same bits. An error of
 the helper other than a failed estimate, out of memory among them, ends the
 run; nothing falls back to the owner. The solve with a helper first ran where
 one device stood for both, with the same bits. Sectors on several devices
 have run with it on 8 and 16 A100 GPUs since (`condition_device` of their
-records names the device of the estimate). The default itself, `any` with
-the room counted, has not run there. The
+records names the device of the estimate), and `any` with the room counted
+in the complete calculations above. The
 blocks of a shared basis fit if they take at most
 `PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION` of a device, 0.85 by default.
 Only a CHEBFF first solve creates a shared basis. It is filtered in FP64 and
@@ -817,9 +834,13 @@ by default an eighth of the sector basis but at least 1 and at most 4 GiB;
 the limit of 2 GiB of a sector on one device, above, is not read here)
 whatever `PARSEC_CUPY_DISTRIBUTED_STATE_SLABS` says, and with four or more
 devices per sector, where that budget is not set, of at most an even share
-of 8 GiB as well: 2 GiB with four. With two devices per sector a slab takes
-at most 2 GiB too where the budget is not set
-(`PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES`). The workspace and
+of 4 GiB as well (`PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES`): 1 GiB with
+four. With two devices per sector a slab takes at most 1 GiB too where the
+budget is not set (`PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES`). Where
+those limits leave fewer than 32 columns a slab is widened up to that, but not
+beyond the 2 GiB that both limits were before
+(`PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS`; the last table of switches
+below, with the runs). The workspace and
 the rotation tile have the size of the slabs that were cut. A slab is moved
 into the workspace and
 sent to the row layout of all devices, and the rows arrive in front of those
@@ -1389,7 +1410,7 @@ them; both have run there since (`result.hartree_boundary` in the
 | Environment variable | Default | Former route | Results | Says what ran | Described in |
 |---|---|---|---|---|---|
 | `PARSEC_CUPY_STREAMING_RITZ_BYTES` | unset: slabs of at most 2 GiB in the one-block Ritz step of a sector on four or more devices (16 GPUs) | `4294967296`, for 16 GPUs only; the rounds a run had take `PARSEC_CUPY_RITZ_GRAM_MULTIPLE=1` beside it | round-off | `slab_columns` of a shared sector in `timing.json` | above |
-| `PARSEC_CUPY_RITZ_CONDITION_HELPER` | `auto` when these runs were made, `any` since (last table below): another device of a shared sector estimates the condition number of the overlap beside the small solve of its owner, unless it holds the Hartree objects | `off` | same bits | `condition_device` and `condition_seconds` of a shared sector in `timing.json` | its row in the first table above |
+| `PARSEC_CUPY_RITZ_CONDITION_HELPER` | `auto`, as when these runs were made (`any` was the default for a while, in the table with `PARSEC_CUPY_EXCHANGE_CHUNK_BYTES` below): another device of a shared sector estimates the condition number of the overlap beside the small solve of its owner, unless it holds the Hartree objects | `off` | same bits | `condition_device` and `condition_seconds` of a shared sector in `timing.json` | its row in the first table above |
 | `PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS` | unset since the rule in filter work (the table of two defaults below); a value is the row count, over the square root of the sectors of the device, from which a sector alone on its device packs affine tiles: `650000` when these runs were made | `1100000`, `1555634` or `2200000` on 4, 2 or 1 GPUs | same bits | `orbital_sector_finite_difference_storage` | the row of `PARSEC_CUPY_IMPLICIT_TILE` above |
 | `PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS` | unset since the rule in filter work (the table of two defaults below); a value is the row count from which a sector on several devices (8 and 16 GPUs) packs them: `1100000` when these runs were made | `PARSEC_CUPY_IMPLICIT_TILE=0` | same bits | `stencil_storage` of a shared sector in `timing.json` | its row above |
 | `PARSEC_CUPY_SECTOR_POOL_RELEASE` | `1`: a finished sector returns the unused pool blocks of its stream where a device solves several sectors in turn (2 GPUs) | `0` | same bits | `sector_pool_release` of a rank in `timing.json` | `MULTI_GPU.md` |
@@ -1425,16 +1446,16 @@ for bit.
 | `PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS` with `PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS` | both unset: `PARSEC_CUPY_IMPLICIT_TILE=auto` packs affine tiles for a sector whose filter work repays the packing, whether one device filters it or several share it (the rule above; `GPU_COMPACT_OPTIMIZATION.md`) | `650000` and `1100000`: the row limits of a sector on one device and of a shared one | same bits | `orbital_sector_finite_difference_storage`; `stencil_storage` of a shared sector in `timing.json` | not named: it names `PARSEC_CUPY_IMPLICIT_TILE=0` | limits of 500,000 and 600,000 rows against 650,000 and 1,100,000 in one allocation, first runs, two of each: the filter of a sector took 2.47 against 2.66 s for 3,480 electrons on 8 GPUs and 1.31 against 1.40 on 16, 5.32 against 5.83 and 2.71 against 2.97 for 5,264, 7.65 against 8.38 and 3.92 against 4.29 for 7,120 in the sphere of the default rule; on 4 GPUs the filters of 3,480 electrons in that sphere took 17.7 against 18.9 thread-seconds. The set-up of the sector operators of a rank grew by 0.17 s where it packed four stencils, by 0.09 to 0.15 s for two of 1.0 to 1.1 million rows, by 0.04 s for one of them and by 0.03 s at most at 677,542 rows. The wall time before the SCF grew by more than that timer shows: by 0.11 s on 4 GPUs and by 0.18, 0.25 and 0.26 s on 8, where the filter of a sector saved 0.19, 0.51 and 0.73 s. The time before the SCF and the SCF together fell by 0.17 s on 4 GPUs and by 0.1, 0.2 and 0.5 s on 8: next to nothing for 3,480 electrons on 8 GPUs, a gain for the others. On 16 GPUs the program times cannot be read: the first step of five of six slot-major runs took 0.8 to 10 s longer than in the earlier series and that of no run with tiles, for a reason that was not found; the tiles are judged there by the filter seconds and the bits. The fullest device peaked 52 to 98 MiB lower on 8 and 16 GPUs. The same total energies to the last bit. The rule gives these sectors their tiles and keeps those of the larger ones; it has not run there itself |
 | `PARSEC_DOMAIN_REPORT_THREAD` | on: on the CuPy backend a host thread makes, while the SCF runs, the estimates of the omitted potential that the radius search of the block "Density at the sphere" can ask for, and the block reads them (below) | `0`: the search makes them after the SCF | same bits: every line of the block and every entry of `result.domain.after_scf` that is no time | `after_scf.radius_seconds` beside `estimates`; `post_scf_finalization_reporting_seconds`; `domain_report_thread` of the root in `timing.json` (the estimates the thread made, its seconds, a failure; null without a thread) | not named: a report, no route of the solver | not run with the thread. Without it the search took 1.21 s of the 1.62 s after the SCF of 39,368 electrons on 16 GPUs (five estimates) and 0.17 and 0.20 s for 23,768 and 29,576 (one each) |
 
-The switches below were the last added before those two, the four rows from
+The switches below were the last added before those two, the three rows from
 `PARSEC_CUPY_RITZ_GRAM_SLABS` on after the ten before them: what follows is
-about those ten, and the four have a paragraph behind the table. Each of
+about those ten, and the three have a paragraph behind the table. Each of
 the ten ran on A100 nodes against its
 own former value in one allocation (first runs, FP64; each item in the code
 that introduced it, the rows of `PARSEC_CUPY_RITZ_GRAM_MULTIPLE` and
 `PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE` together),
 which is the last column. With every one at its former value, and an input
 that gives its `Boundary_Sphere_Radius`, a calculation is that of the code
-before these switches bit for bit (with the four rows after them at their
+before these switches bit for bit (with the three rows after them at their
 former values as well, since those came). So it was on a laptop GPU through the MPI
 runner, every array of the archive and `parsec.out` apart from its times:
 for 32 and 176 electrons, as a run and as a serial control, with the states
@@ -1466,14 +1487,12 @@ on 8, and 117.6 against 123.5 s for 14,680 on 4.
 | `PARSEC_CUPY_EXCHANGE_PAIRS` | `1`: the four devices of a shared basis (16 GPUs) copy a chunk that all of them send to their rows in three turns of two pairs | `0`: all twelve copies at once | same bits | `to_rows_copies` of a shared sector | not named: it shares no basis | the way to the rows of a sector took 6.83 against 8.88 s for 23,768 electrons and 16.56 against 21.72 s for 39,368, the SCF 97.6 against 99.6 and 274.0 against 279.6 s; 1.93 to 2.00 against 2.41 to 2.49 s for 10,456, and 0.52 to 0.54 against 0.48 to 0.54 s for 3,480; all with the rounds of equal slabs, before those of whole multiples |
 | `PARSEC_CUDA_CONTEXT_CREATION` | `driver`: the context thread of `benchmarks/mpi_full_scf.py` creates the contexts through the CUDA driver library, outside Python's interpreter lock | `runtime`: inside CuPy's first calls on each device, which hold the lock | same bits | `cuda_context_driver_devices` and `cuda_context_driver_seconds` of a rank | `runtime` | preparation of the root for 3,480 electrons 1.62 to 1.77 against 2.57 to 2.70 s on 16 GPUs, 1.76 to 1.79 against 2.39 to 2.51 on 8, 2.83 to 3.03 against 3.70 to 4.44 on 4 and 2.65 to 2.74 against 3.22 to 3.26 on 1; 5.48 against 6.33 s for 23,768 on 16; every device of every rank listed, no capture repeated |
 | `PARSEC_CUPY_DIRECT_ALLOCATOR_FRACTION` | unset: `auto` of `PARSEC_CUPY_SECTOR_STATE_STORAGE` and of `PARSEC_CUPY_LARGE_PROBLEM_ALLOCATOR` keeps the sector states on their devices and the pool unless the count of a device exceeds `PARSEC_CUPY_SECTOR_STATE_AUTO_FRACTION` of it (0.978 then, 0.974 since its own row below; `1` for all of it) | `0.5`: the host spill and the direct allocator from half of a device's memory in sector vectors | same bits: it chooses the storage and the allocator | `orbital_sector_state_storage`, `orbital_memory_allocator` and `sector_state_fit_bytes` of a rank | `0.5`: its Ritz step takes two arrays per sector, and the count is that of one | 19,392 electrons with neither value named had the bits and the peak of the run with both named, on 4 GPUs in 183.2 against 183.7 s where the former rule had stopped, on 8 and 16 likewise; 14,680 on 2 GPUs took 242.5 s and 80,157 MiB; 10,456 on one GPU ended by the spill in 770.6 s with 24,465 MiB, and stopped for memory with the share at `1` |
-| `PARSEC_CUPY_SPILL_DOWNLOAD_ORDER` | `A`: a sector basis that is spilled to the host is downloaded in the order it has, without a second array on its device | `C`: in C order, by a C-ordered copy on the device and a copy on the host | same bits | the variable under `environment` of a rank | `C` | 7,120 electrons spilled on one GPU: 254.1 s and a peak of 11,085 MiB against 458.9 s and 18,175 MiB, the same total energy |
+| `PARSEC_CUPY_SPILL_DOWNLOAD_ORDER` | `A`: a sector basis that is spilled to the host is downloaded in the order it has, without a second array on its device | `C`: in C order, by a C-ordered copy on the device and a copy on the host, the former download only with `PARSEC_CUPY_SPILL_BUFFERS=fresh` beside it since: the host buffers of a spill, the default of that switch, take a Fortran-ordered basis by one copy whatever this says, and read it only for vectors of another layout | same bits | the variable under `environment` of a rank | `C` | 7,120 electrons spilled on one GPU: 254.1 s and a peak of 11,085 MiB against 458.9 s and 18,175 MiB, the same total energy |
 | `PARSEC_CUPY_RITZ_GRAM_MULTIPLE` | `64`: the slabs of the two Gram matrices of the Ritz step, and the rounds of a shared basis, are cut at whole multiples of 64 columns, on every route (1 to 16 GPUs); a slab only narrows | `1` | round-off wherever a slab or a round changes: the overlap of every sector from 512 columns, the projection of one array from 64 columns of budget, and the rounds of a shared basis from 32 columns per slab on two devices and 16 on four, which is every shared sector of the measured series | `slab_cut` (`multiple`), `slab_columns` and `projection_columns` of a shared sector in `timing.json`; the stage `subspace_ritz_projection_seconds`, and `gram` with the `overlap_seconds` in it | `1`: its projection is formed in slabs; its overlap is DSYRK's (`PARSEC_CUPY_RITZ_SYRK=on`) and has none | SCF of a run 166.9 against 173.6 s for 23,768 electrons on 8 GPUs, 242.1 against 246.2 for 29,576, 98.6 against 101.3 for 19,392 and 69.5 against 70.5 for 14,680; on 16 GPUs 95.4 against 96.9 (23,768), 136.0 against 138.1 (29,576), 275.3 against 275.8 (39,368), 41.9 against 42.0 (14,680) and 22.7 against 23.0 (10,456); 118.4 against 121.6 for 14,680 on 4, 112.4 against 114.9 for 10,456 on 2 and 60.1 against 60.9 on 4; the fullest device of a shared sector 0.2 to 1.2 GiB lower (62,709 against 63,913 MiB for 39,368 electrons) and the same for 29,576 on 8 GPUs, whose slabs stay (67,083 against 67,079); total energies within 6e-8 Ry, 1.2e-7 for 39,368. Per sector the overlap took 0.1 to 4.2 s less and the products of the rounds 0.05 to 6.4 s less; the stages around the rounds took 5.0 s more for 39,368 electrons on 16 GPUs, whose rounds lost 1.9 s. Three totals were those of the first run on a node (64.3 against 56.5 s for 5,264 electrons and 95.7 against 86.9 for 7,120 on one GPU, 180.1 against 176.5 for 19,392 on 4) while their projection stage fell (3.35 against 5.17 s, 7.03 against 7.36, 112.4 against 127.4 thread-seconds) |
 | `PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE` | `0`: after a density nothing is collected or returned for a sector whose basis several devices share (8 and 16 GPUs): its next step takes the same blocks again; its group returns a slab workspace that a pass has outgrown before it takes the larger one. The pinned pool then keeps its blocks too: 0.3 to 1.1 GiB of host memory more on the root rank, measured with the release off. A sector on one device empties its pool as before | `1`: the pools of the devices of a shared basis are emptied after every density | same bits | `shared`, `shared_kept` and `calls` under `density_pool_release` of a rank in `timing.json` | not named: it shares no basis | density stage of a run 0.88 against 1.56 s (14,680 electrons, 8 GPUs), 1.85 against 2.64 (23,768, 8), 1.68 against 2.70 (29,576, 8), 0.80 against 1.23 (14,680, 16), 1.01 against 1.67 (23,768, 16) and 0.99 against 1.89 (29,576, 16); SCF 0.6 to 2.1 s less; the same total energy to the last bit; the fullest device 2 MiB higher in four pairs and 44 and 48 MiB higher for 23,768 and 29,576 electrons on 8 GPUs (50,677 and 67,083 MiB); `calls` 0 and `shared_kept` as many as the densities on every rank; the root rank 0.7 to 1.1 GiB higher at its high-water mark of host memory, the other ranks the same to 0.01 GiB |
-| `PARSEC_CUPY_RITZ_GRAM_SLABS` | unset: the overlap of a sector basis that several devices share (8 and 16 GPUs) in slabs of 128 columns (`PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS`); eight slabs, as before, for the overlap of a sector on one device and for a projection that is formed from `H X` as an array | `8`: eight slabs on every route | round-off for a shared sector below 1,017 columns and from 1,529; same bits between them, and on 1, 2 and 4 GPUs | `overlap_columns` of a shared sector in `timing.json`, beside its `overlap_seconds` | not named: it shares no basis, and its projection keeps the count | the count named so that the slabs are 128 columns wide, against the eight slabs in one allocation: overlap of a sector 26.79 against 31.46 s for 39,368 electrons on 16 GPUs (27.81 s in slabs of 256), 11.04 against 12.18 for 29,576 and 6.57 against 7.14 for 23,768; on 8 GPUs 22.53 against 25.83 for 29,576 and 13.59 against 14.97 for 23,768; total energies 2e-8 to 1.6e-7 Ry apart. The rule cuts those slabs; it has not run there itself, nor where it widens the slabs (below 1,017 columns) or narrows them from 192 and 256 |
-| `PARSEC_CUPY_STREAMING_RITZ_LIMIT_BYTES` | unset: the buffer of a sector on one device (1, 2 and 4 GPUs), an eighth of its basis and at least 1 GiB, takes at most 2 GiB, or 64 columns of all rows where 2 GiB hold fewer (more than 4,194,304 rows), up to 4 GiB; a budget that is set (`PARSEC_CUPY_STREAMING_RITZ_BYTES`) is the buffer as before, and no step of a shared basis reads the limit | `4294967296`: at most 4 GiB | round-off for a basis above 16 GiB, whose projection is cut into other slabs or whose rows are rotated in lower tiles; same bits up to 16 GiB | the variable under `environment` of a rank; `sector_state_fit_bytes` holds the buffer where `auto` asked | `4294967296` | the budget set to 2 GiB against the default of 4 in one allocation: 14,680 electrons on 2 GPUs 78,109 against 80,157 MiB on the fullest device in 231.4 against 231.6 s, on 4 GPUs 41,049 against 43,141 MiB in 123.9 against 124.5 s; 19,392 electrons on 4 GPUs 58,155 against 60,251 MiB in 180.7 against 180.5 s; total energies 5e-9 to 5e-8 Ry apart. The limit gives those sectors that budget; it has not run there itself |
-| `PARSEC_CUPY_SECTOR_STATE_AUTO_FRACTION` | `0.974`: the share of a device that the vectors of its sectors and one buffer may take before `auto` spills the states (`MULTI_GPU.md`): the reciprocal of 1.027, the least ratio of sampled peak to count with the buffer of 2 GiB | `0.978`, beside the former limit of the buffer | same bits: it chooses the storage and the allocator | `orbital_sector_state_storage`, `orbital_memory_allocator` and `sector_state_fit_bytes` of a rank | not named: it decides by the rule before (`PARSEC_CUPY_DIRECT_ALLOCATOR_FRACTION=0.5`) | no run: 10,456 electrons on one GPU count 0.976 of the device with the buffer of 2 GiB and are spilled as before, where 0.978 would keep them; every other layout of the measured series keeps the storage it had |
-| `PARSEC_CUPY_STREAMING_RITZ_TILE` | `budget`: the rotation tile of a sector on one device takes the bytes of the budget, as before, so this row changes no default. `slab`: the tile is as tall as the slab that is cut lets it be and the buffer is that slab, 1.24 instead of 2.00 GiB for a sector of 14,680 electrons and 1.37 for one of 19,392 | `budget` | `slab`: round-off (the Gram matrices keep their bits, the rows are rotated in tiles of another height) | the variable under `environment` of a rank; `sector_state_fit_bytes` holds the slab where `auto` asked | `budget` | none with `slab`; a tile a quarter lower under the same slabs (a budget of 3 against 4 GiB for 19,392 electrons on 4 GPUs) gave the same total energy to the last bit, 59,227 against 60,251 MiB and 180.4 against 180.5 s |
-
+| `PARSEC_CUPY_RITZ_GRAM_SLABS` | unset: the overlap of a sector basis that several devices share (8 and 16 GPUs with four sectors, also 2 and 4 with fewer sectors than devices) in slabs of 128 columns (`PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS`); eight slabs, as before, for the overlap of a sector on one device and for a projection that is formed from `H X` as an array | `8`: eight slabs on every route | round-off for a shared sector below 1,017 columns and from 1,529; same bits between them, and wherever no basis is shared (1, 2 and 4 GPUs with four sectors) | `overlap_columns` of a shared sector in `timing.json`, beside its `overlap_seconds` | not named: it shares no basis, and its projection keeps the count | the count named so that the slabs are 128 columns wide, against the eight slabs in one allocation: overlap of a sector 26.79 against 31.46 s for 39,368 electrons on 16 GPUs (27.81 s in slabs of 256), 11.04 against 12.18 for 29,576 and 6.57 against 7.14 for 23,768; on 8 GPUs 22.53 against 25.83 for 29,576 and 13.59 against 14.97 for 23,768; total energies 2e-8 to 1.6e-7 Ry apart. The rule cuts those slabs; it has not run there itself, nor where it widens the slabs (below 1,017 columns) or narrows them from 192 and 256 |
+| `PARSEC_CUPY_STREAMING_RITZ_LIMIT_BYTES` | unset: the buffer of a sector whose basis no group of devices shares (1, 2 and 4 GPUs with four sectors), an eighth of its basis and at least 1 GiB, takes at most 2 GiB, or 64 columns of all rows where 2 GiB hold fewer (more than 4,194,304 rows), up to 4 GiB, a guard derived from the slabs of 64 columns and not measured, which no case of the measured series reaches; a budget that is set (`PARSEC_CUPY_STREAMING_RITZ_BYTES`) is the buffer as before, and no step of a shared basis reads the limit | `4294967296`: at most 4 GiB | round-off for a basis above 16 GiB, whose projection is cut into other slabs or whose rows are rotated in lower tiles; same bits up to 16 GiB | the variable under `environment` of a rank; `sector_state_fit_bytes` holds the buffer where `auto` asked | `4294967296` | the budget set to 2 GiB against the default of 4 in one allocation: 14,680 electrons on 2 GPUs 78,109 against 80,157 MiB on the fullest device in 231.4 against 231.6 s, on 4 GPUs 41,049 against 43,141 MiB in 123.9 against 124.5 s; 19,392 electrons on 4 GPUs 58,155 against 60,251 MiB in 180.7 against 180.5 s; total energies 5e-9 to 5e-8 Ry apart. The limit gives those sectors that budget; it has not run there itself |
+| `PARSEC_CUPY_SECTOR_STATE_AUTO_FRACTION` | `0.974`: the share of a device that the vectors of its sectors and one buffer may take before `auto` spills the states (`MULTI_GPU.md`): the reciprocal of 1.027, the least ratio of sampled peak to count with the buffer of 2 GiB | `0.978`, beside the former limit of the buffer | same bits: it chooses the storage and the allocator | `orbital_sector_state_storage`, `orbital_memory_allocator` and `sector_state_fit_bytes` of a rank | not named: it decides by the rule before (`PARSEC_CUPY_DIRECT_ALLOCATOR_FRACTION=0.5`) | 10,456 electrons on one GPU count 0.976 of the device with the buffer of 2 GiB. With the storage left to the code, `0.978` kept their states on the device and the first solve stopped for memory (an allocation of 2,147,475,456 bytes with 81,874,197,504 allocated); `0.974` spilled them and the run completed (first runs). Every other layout of the measured series keeps the storage it had |
 The first row is described in the reference `README.md` ("Sphere radius left
 to the code") and below, the slabs, the turns and the multiple above, the
 two releases, the rule of the state storage and the download in
@@ -1495,7 +1514,7 @@ and the budget of four allow. The former value of either gives back the
 slabs a run had; the rounds come back only with
 `PARSEC_CUPY_RITZ_GRAM_MULTIPLE=1` beside it, and the bits with
 `PARSEC_CUPY_RITZ_GRAM_SLABS=8` beside both (its row, the first of the last
-four).
+three).
 The turns of four devices and the slab limit of two never act on one sector.
 The turns are taken with the slabs of 2 GiB that a sector on four devices
 cuts and, since, with the whole rounds of the multiple: every chunk of the
@@ -1566,16 +1585,16 @@ control than PARSEC's boundary did. Where a control does not fit beside them
 `PARSEC_HARTREE_BOUNDARY_BACKEND=native`: the boundary on the host, see
 `Hartree/GPU_HARTREE.md`.
 
-The four rows from `PARSEC_CUPY_RITZ_GRAM_SLABS` on came after the ten
-before them. Three change a default: the slabs of the overlap of a shared
+The three rows from `PARSEC_CUPY_RITZ_GRAM_SLABS` on came after the ten
+before them. Each changes a default: the slabs of the overlap of a shared
 basis, the buffer of a sector on one device and the share of a device that
-its states may take; the tile is offered and changes none. With the three
+its states may take. With the three
 at their former values a calculation is that of the code before them bit for
 bit, and the former values of the ten rows before them give the calculations
-that they name only with these beside them. The slabs of the overlap, the
-limit of the buffer and the tile are described above, where the Gram
+that they name only with these beside them. The slabs of the overlap and the
+limit of the buffer are described above, where the Gram
 matrices are, and the share of a device in `MULTI_GPU.md`. The serial
-control names the limit at its former value and the tile of the budget, for
+control names the limit at its former value, for
 a launcher that asks it for one array. It shares no basis and decides the
 storage of its states by the rule before, so the rows of the slabs and of
 the share do not reach it. The limit and the share meet in the count of a
@@ -1583,30 +1602,35 @@ device: the count holds the buffer that the step takes, 2 GiB less for a
 sector of 32 GiB and more, and the share was chosen anew for that count. The
 former count and the former decisions take both former values. `0.978`
 alone, with the buffer of 2 GiB, keeps the states of 10,456 electrons on one
-device, which are expected to stop for memory there (`MULTI_GPU.md`).
+device, and a first run on an A100 with it stopped for memory in its first
+solve, where the default spilled them and completed (`MULTI_GPU.md`): the
+share stays 0.974.
 With the three former values named, complete calculations on a laptop GPU
 had every array of the archive and every line of `parsec.out` apart from its
 times as the code before these rows gave them: the hybrid driver and the MPI
 runner with one array per sector for 32 and 176 electrons, a serial control
 of the same two (apart from the line that lists its routes, which names the
-limit and the tile beside the 24 it had), and 176 and 864 electrons with
+limit beside the settings it had), and 176 and 864 electrons with
 every sector basis shared, that one GPU named two and four times as the
 devices of a sector. With the defaults the runs
 without a shared basis kept every bit as well, also 176 electrons with a
 budget of 6 columns per slab under a multiple of 4, with those bytes named
-as the limit instead of the budget, and with the tile that follows the slab.
+as the limit instead of the budget.
 With every basis shared the total energy of 176 electrons moved by 9e-13 and
 1.1e-11 Ry on four and two devices (sectors of 36 and 37 columns: one slab
 where the count cut eight of 5), and that of 864 electrons by 2.9e-11 Ry on
 either, in the same nine steps, the eigenvalues by 2e-13 Ry at most (156 and
 157 columns: a slab of 128 and one of 28 or 29 for eight of 20).
 
-Two more defaults followed. Each rests on first runs on A100 nodes in which
+Two more defaults followed, and the second has gone back since: complete
+calculations on A100 nodes showed no gain from it (below the table), so its
+former value is the default again. Each rests on first runs on A100 nodes in which
 the existing switch was named beside the default in one allocation, which is
 the last column. What became the default differs from what was named there,
-as the rows say, and has not run on A100 nodes itself. With both at their
-former value a calculation is that of the code before them bit for bit, and
-the defaults give the same bits too. So it was on a laptop GPU, every array
+as the rows say, and had not run on A100 nodes itself when the rows were
+written; the second has since, in those complete calculations. With both at
+their former value a calculation is that of the code before them bit for
+bit, and the defaults of then gave the same bits too. So it was on a laptop GPU, every array
 of the archive and `parsec.out` apart from its times: through the reference
 command line for 32 electrons and the accelerated one for 32 and 176,
 through the MPI runner as a run and as a serial control for the same two,
@@ -1620,29 +1644,60 @@ slabs within an eighth of it that most rounds of their sector send went to
 the rows in one chunk and the others in two, with the same bits, as with
 that size named. And shared cases ran with the one GPU named as the device
 of the Hartree objects, so that no sector had another device (176 electrons
-on two and on four named devices, 864 on two): the default asked it for the
-estimate, `auto` did not, and the bits were the same.
+on two and on four named devices, 864 on two): the default of then, `any`,
+asked it for the estimate, `auto` did not, and the bits were the same. The
+former value of the second is the default again and need not be named.
 
 | Switch | Default | Former value | Results | Says what ran | Serial control | A100 nodes, the switch named against the default of then |
 |---|---|---|---|---|---|---|
 | `PARSEC_CUPY_EXCHANGE_CHUNK_BYTES` | unset: chunks of 1 GiB, and on the way to the rows one chunk for a slab (or a block) of a shared basis of which up to an eighth more than 1 GiB lies outside a device, in a buffer of exactly its size (at most 1,207,959,552 bytes); the way back keeps the chunks of 1 GiB | `1073741824`: chunks and a buffer of 1 GiB whatever travels | same bits | `exchange_buffer_bytes` of a shared sector in `timing.json` | not named: it shares no basis | `1090000000` named, which makes the slab of 32 columns of 39,368 electrons on 16 GPUs one chunk both ways: the way to the rows of a sector 16.04 against 17.41 s, the way back 10.65 against 10.57 s. The default takes that chunk on the way to the rows only, in a buffer of 1,086,758,400 bytes |
-| `PARSEC_CUPY_RITZ_CONDITION_HELPER` | `any`: a sector on two devices whose second one holds the Hartree objects (one sector of the root rank on 8 GPUs) has that device estimate the condition number of its overlap beside the small solve, where the rule that shares a basis counts the room for the estimate (also where `any` is named: it no longer asks that device whatever the room) | `auto`: that device never helps and such a sector estimates on its owner first | same bits | `condition_device` and `condition_seconds` of a shared sector in `timing.json` | not named: it shares no basis | `any` named on 8 GPUs, in runs that also named another count of overlap slabs: the dense stage of that sector 1.88 against 3.06 s for 23,768 electrons and 3.02 against 4.88 s for 29,576; its helper 304 and 448 MiB more, the fullest device of the run 192 MiB more (50,871 MiB) and none; by the stage seconds about 0.5 and 0.2 s of 166.9 and 242.9 s of SCF, since the sectors are solved side by side |
+| `PARSEC_CUPY_RITZ_CONDITION_HELPER` | `auto` again, the former value (next column). `any`, the default for a while and a value that can still be named: a sector on two devices whose second one holds the Hartree objects (one sector of the root rank on 8 GPUs) has that device estimate the condition number of its overlap beside the small solve, where the rule that shares a basis counts the room for the estimate (it no longer asks that device whatever the room) | `auto`: that device never helps and such a sector estimates on its owner first; the default again, so it need not be named | same bits | `condition_device` and `condition_seconds` of a shared sector in `timing.json` | not named: it shares no basis | `any` named on 8 GPUs, in runs that also named another count of overlap slabs: the dense stage of that sector 1.88 against 3.06 s for 23,768 electrons and 3.02 against 4.88 s for 29,576; its helper 304 and 448 MiB more, the fullest device of the run 192 MiB more (50,871 MiB) and none; by the stage seconds about 0.5 and 0.2 s of 166.9 and 242.9 s of SCF, since the sectors are solved side by side. Complete calculations of `any` against `auto` decided the default (below the table) |
 
 The first row is described with the turns of four devices above, the second
-with the device solve above. The two do not meet: the buffer follows a slab
+with the device solve above. The second is a default no longer: complete
+first calculations on 8 A100 GPUs, two of each value in alternation with the
+same total energies, took 163.40 s of SCF on average with `any` against
+163.51 s with `auto` for 23,768 electrons and 236.16 against 235.92 s for
+29,576 (2026-10-16), where `any` would have stayed the default for at least
+0.4 % less in either case. The two do not meet: the buffer follows a slab
 that takes more than a chunk outside a device, which a sector on two devices
 sends for a few bytes at most, and the helper of the second row is that of a
 sector on two devices. Neither changes which bases are shared but for the up
 to 128 MiB that the first adds to the count of a sector on four devices, and
 of one on two that names slabs of 4 GiB.
 
-One switch came after these runs. Its kernel was timed by itself on one
-A100; no complete calculation has run with it on A100 nodes, and the last
-column says what was measured there:
+One switch came after these runs. It was measured on A100 nodes on
+2026-10-16, first while every width took the six-column kernel six columns
+per launch (the last column and the first table below), then with one launch
+per block (the second table). The launches of now, described below the
+tables, give blocks of two to six columns the six-column kernel of the first
+measurement unchanged; with them it is still to be timed there:
 
-| Switch | Default | Former value | Results | Says what ran | Serial control | A100, default against former |
+| Switch | Default | Former value | Results | Says what ran | Serial control | A100, default against former, six columns per launch |
 |---|---|---|---|---|---|---|
-| `PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS` | `6`: where the projector coefficients `diag(signs) B.T X` take the tree reduction (projector rows of at least 256 entries, `PARSEC_CUPY_PROJECTOR_REDUCTION`), one CUDA block of 128 threads serves a projector and up to six columns, on every route that forms them: each recurrence step of a filter, in recorded graphs and outside them, `H X` of the Ritz step, every device of a shared sector, the full-grid operator, and the FP32 kernels of the opt-in later filter | `1`: a block per projector and column | same bits | `orbital_sector_projector_reduction`, and `gpu_projector_reduction` without symmetry sectors: `parallel6` against `parallel` (`serial`, the kernel of shorter rows, under either value); the variable under `environment` of a rank | `1` | the kernel alone on one A100, six columns of a synthetic factor: 0.066 against 0.097 ms per launch for 4,601 projectors of 324 entries on 2,873,400 rows and 0.133 against 0.193 ms for 9,449 of 311 on 5,660,200, 1.47 and 1.45 times as fast, the time that of the device in both; the same coefficients to the last bit for one to six columns |
+| `PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS` | `6`: where the projector coefficients `diag(signs) B.T X` take the tree reduction (projector rows of at least 256 entries, `PARSEC_CUPY_PROJECTOR_REDUCTION`), a block of two to six columns is one launch of a CUDA block of 128 threads per projector, a wider block one launch of a CUDA block per projector and group of six columns, and a single column takes the former kernel; on every route that forms them: each recurrence step of a filter, in recorded graphs and outside them, `H X` of the Ritz step, every device of a shared sector, the full-grid operator, and the FP32 kernels of the opt-in later filter | `1`: a block per projector and column, every width in one launch | same bits | `orbital_sector_projector_reduction`, and `gpu_projector_reduction` without symmetry sectors: `parallel6` against `parallel` (`serial`, the kernel of shorter rows, under either value), `parallel6` also for the launches of now, whose single columns take the kernel of `parallel`. They name the kernel where the stencil kernel fuses the scatter (the default); with `PARSEC_CUPY_FUSED_PROJECTORS=0` cuSPARSE forms the coefficients and the entries say `none` and `cuSPARSE`. The variable under `environment` of a rank | `1` | complete first calculations, the same totals: SCF 25.26 against 25.70 s for 3,480 electrons on 1 GPU, 168.65 against 172.53 s for 19,392 on 4 GPUs, 257.9 against 261.8 s for 39,368 on 16 GPUs. The kernel alone in the tables below |
+
+The kernel alone, from part A of a probe of the nonlocal step on one A100
+with the real factor of sector 0 of each case (2026-10-16, six columns per
+launch): the time of one projection with the former kernel divided by that
+with the six-column kernel, so that above 1 the six-column kernel was faster.
+The coefficients were the same to the last bit at every width.
+
+| Columns | 3,480 electrons: 677,542 rows, 795 projectors | 19,392: 2,873,400 rows, 4,601 | 39,368: 5,660,200 rows, 9,449 |
+|---|---|---|---|
+| 1 | 0.81 | 0.62 (0.0196 against 0.0314 ms) | 0.67 |
+| 2 | 0.81 | 1.07 | 0.99 |
+| 3 | 0.89 | 1.23 | 1.27 |
+| 4 | 1.01 | 1.42 | 1.48 |
+| 5 | 0.92 | 1.58 | 1.66 |
+| 6 | 0.94 | 1.71 (0.0894 against 0.0521 ms) | 1.80 (0.177 against 0.098 ms) |
+| 126 | 0.42 (0.280 against 0.670 ms) | 1.48 (1.62 against 1.10 ms) | 1.63 |
+
+With 3,480 electrons every call of up to six columns took the time of its
+launch from the host, about 0.018 to 0.022 ms with either kernel: those
+ratios compare what the host pays for a launch, which a filter graph does not
+pay. At 126 columns the six-column kernel took 21 launches against one; their
+enqueue alone took 0.67 ms with 3,480 electrons and 0.63 ms with 19,392.
 
 The former kernel launches a block of 128 threads for every projector and
 column: a thread sums every 128th entry of the projector row for its column,
@@ -1650,27 +1705,64 @@ and seven barriers reduce the 128 partial sums in a tree. With six columns
 per block a thread keeps six partial sums. It reads the index and the value
 of an entry once instead of six times, and the block passes its barriers
 once. Every column has the partial sums it had, in the same order, and the
-same tree, so the coefficients are the same to the last bit. A block of more
-than six columns, as `H X` of the Ritz step has them, is launched six
-columns at a time, as the stencil kernels take it; one launch took them all
-before. Rows below 256 entries keep the canonical-order kernel, one thread
-per projector and column, which the switch does not reach.
+same tree, so the coefficients are the same to the last bit.
 
-An operator reads the switch when it is built and keeps its kernel. Its
-filter graphs record that kernel, the other devices of a shared sector are
-given the one of the owner, and a graph workspace whose operator has been
-given another projection since records its graphs again: a graph replays
-the kernel it was recorded with. A value that is neither `6` nor `1` stops
-the construction of the operator.
+From the table came one launch per block: a single column took the former
+kernel, in the launch that `1` makes, and every wider block one launch of the
+six-column kernel on a grid of a block per projector and group of six
+columns, whose `blockIdx.y` named the group. Measured the same way on one
+A100 (2026-10-16), a single column then took the time of the former kernel,
+0.0198 against 0.0198 ms with 19,392 electrons and 0.0482 against 0.0482 ms
+with 39,368, and 126 columns in one launch were 3.9, 1.23 and 1.12 times as
+fast as in 21; complete calculations gave the same totals to the last bit.
+But that kernel took longer than the six-column kernel of the first table
+from three to six columns, 6 % longer at six, measured side by side in one
+allocation with 39,368 electrons, and blocks of six columns are the main work
+of a filter:
 
-What the kernel is of a calculation follows from an earlier timing on one
-A100: with 19,392 electrons (a sector of 2,873,400 rows and 4,601
-projectors, slot-major stencil) the projection took 0.090 ms of a filter
-step of 1.150 ms for six columns. At 1.47 times a step would lose 0.029 ms
-of that, 2.5 %; this is derived, not measured in a calculation, and so is
-any gain of a run. The other part of the nonlocal term in a step, the
-scatter `B C` inside the fused kernel (0.081 ms of that step), already
-serves six columns per thread and is unchanged.
+| Columns | Case | One launch on a grid of groups | Six-column kernel, six columns per launch |
+|---|---|---|---|
+| 126 | 3,480 electrons | 0.157 ms | 0.616 ms (21 launches) |
+| 126 | 19,392 | 0.957 ms | 1.182 ms |
+| 126 | 39,368 | 1.969 ms | 2.196 ms |
+| 2 | 39,368 | 0.0672 ms | 0.0693 ms |
+| 3 | 39,368 | 0.0829 ms | 0.0753 ms |
+| 4 | 39,368 | 0.0891 ms | 0.0831 ms |
+| 5 | 39,368 | 0.0964 ms | 0.0906 ms |
+| 6 | 39,368 | 0.1044 ms | 0.0984 ms (the former kernel 0.1770 ms) |
+
+Hence the launches of now. A single column takes the former kernel. Two to
+six columns take one launch of the six-column kernel of the first table,
+whose text is unchanged, a block per projector; their time with these
+launches is still to be measured on an A100, and as the kernel and its
+launch are those of the first table it should be that time. A block of more
+than six columns, as `H X` of the Ritz step and the graphs of the distributed
+filter have them, takes one launch of the group kernel,
+`sparse_projector_projection6_groups`, on a grid of a block per projector and
+group of six columns, the narrower rest in the last group; it is the
+six-column kernel with the columns of its group, and every column keeps its
+partial sums and its tree. Only a block of more than 393,210 columns (65,535
+groups, the largest second dimension of a CUDA grid), which no calculation
+has, takes a launch for every 65,535 groups. Rows below 256 entries keep the
+canonical-order kernel, one thread per projector and column, which the switch
+does not reach.
+
+An operator reads the switch when it is built and keeps its kernels. A filter
+graph is recorded for one block width and replays the kernel of that width,
+the other devices of a shared sector are given the columns per block of the
+owner, and a graph workspace whose operator has been given a projection of
+another reduction since records its graphs again: a graph replays the kernels
+it was recorded with. A value that is neither `6` nor `1` stops the
+construction of the operator.
+
+The complete calculations above saved 0.44, 3.88 and 3.9 s of SCF. The share
+of the projection in their filter step has not been measured: the reference
+run of 19,392 electrons on 4 GPUs reports affine tiles of 16 rows
+(`implicit_affine_tile_16`), while the only step timing with the projection,
+0.090 ms of 1.150 ms for six columns with 19,392 electrons, was made with the
+slot-major stencil. The other part of the nonlocal term in a step, the scatter
+`B C` inside the fused kernel, already serves six columns per thread and is
+unchanged.
 
 Three switches of the preparation of a rank came after those tables. They
 act where the launch profile puts the GPU ionic fields on their thread
@@ -1700,11 +1792,16 @@ with the radius of the default rule, and the density by at most 9e-13
 electrons per cubic bohr, with the same number of SCF steps in every pair
 (11 to 14); states that are degenerate by symmetry can change places in the
 list of eigenvalues. The stages the switches act on were timed on A100
-nodes one by one (last column); complete runs with the switches on and off
-have not been made there, so what they save together before the first SCF
-step is not measured. On the root the three act on one chain, the ionic
-thread and the join that waits for it, so the gains of their stages do not
-add up there (`GPU_SETUP_OPTIMIZATION.md`).
+nodes one by one (last column). Complete runs with the switches on and off
+have run there for 39,368 electrons on 16 GPUs (first runs, the launch
+profile of the series): the root prepared in 6.48 against 10.32 s and the
+other ranks in 5.00 against 5.92 s, the program took 264.9 against 268.9 s
+and the SCF 257.9 against 258.2 s, and the total energies were 3.2e-10 Ry
+apart. With these three and the other switches that came after the series
+at their former values, eight of its configurations gave its total
+energies to the last bit there (`MULTI_GPU.md`). On the root the three act
+on one chain, the ionic thread and the join that waits for it, so the gains
+of their stages do not add up there (`GPU_SETUP_OPTIMIZATION.md`).
 
 | Switch | Default | Former value | Results | Says what ran | Serial control | Measured |
 |---|---|---|---|---|---|---|
@@ -1718,19 +1815,23 @@ shows the chain of stages of a rank (`preparation_stages`, below under
 former values, so the line of its routes in `parsec.out` has three settings
 more than it had.
 
-Three switches of the host staging came after that table. They act only
+Three switches of the host staging came after that table. They act
 where sector states are kept on the host
 (`PARSEC_CUPY_SECTOR_STATE_STORAGE=host`, or `auto` where a device that
 solves several sectors in turn cannot hold them together, as on 1 and 2
-GPUs); which sectors are spilled is not theirs to decide. They have not run
-on A100 nodes as complete
-calculations: the last column is one array of 18.84 GiB, the basis of a
-sector of 10,456 electrons, between an A100 and its host.
+GPUs); which sectors are spilled is not theirs to decide. The first also
+selects how the device builder of a density uploads any orbitals that it is
+handed on the host: on the shipped routes only the columns of a spilled
+sector are, so it changes nothing elsewhere, and a caller of the API that
+hands the builder host orbitals gets the direct copy too, with the same
+bits. The last column is one array of 18.84 GiB, the basis of a sector of
+10,456 electrons, between an A100 and its host; a complete run follows the
+table.
 
 | Switch | Default | Former value | Results | Says what ran | Serial control | A100 node, one array of 18.84 GiB |
 |---|---|---|---|---|---|---|
-| `PARSEC_CUPY_SPILL_BUFFERS` | `persistent`: a spilled sector keeps one host buffer of the size of its basis; a download writes into it and an upload reads it where it lies (`ndarray.get(out=)`, `ndarray.set`), before a solve and for the density, with no staging block and no second array on the device | `fresh`: a new pageable array for every download (`cupy.asnumpy`) and a block of CuPy's pinned pool for every upload (`cupy.asarray`); `PARSEC_CUPY_SPILL_DOWNLOAD_ORDER` belongs to this staging | same bits | `spill_staging` of a rank in `timing.json`; the detail `orbital_sector_spill_staging` of a run with buffers; `host_uploads` under `density_pool_release` | `fresh` | 0.758 s up and 0.770 s down through a page-locked buffer (24.8 and 24.5 GiB/s) and 1.40 and 1.52 s through a pageable one that is kept, against 1.75 s up with the staging block in the pool (17.99 s with the pool empty) and 2.62 s down into a new array |
-| `PARSEC_CUPY_SPILL_PINNED_BYTES` | unset: the buffers of a process are page-locked while their sum stays within half of the memory that the host has available when the storage is decided, and within `RLIMIT_MEMLOCK` where the system sets one; the buffers beyond that, and one that the driver refuses to lock, are pageable | a number of bytes, taken as it is; `0` locks nothing. There is no former value: `fresh` has no buffers | same bits | `bound_bytes`, `bound_from`, `page_locked_bytes`, `pageable_bytes`, `lock_seconds` and `lock_failures` under `spill_staging` | not named: it has no buffers | page-locking one buffer took 9.6 to 9.7 s, four of them one after another 38.4 s, and their return 13.9 s |
+| `PARSEC_CUPY_SPILL_BUFFERS` | `persistent`: a spilled sector keeps one host buffer of the size of its basis; a download writes into it and an upload reads it where it lies (`ndarray.get(out=)`, `ndarray.set`), before a solve and for the density, with no staging block and no second array on the device | `fresh`: a new pageable array for every download (`cupy.asnumpy`) and a block of CuPy's pinned pool for every upload (`cupy.asarray`); `PARSEC_CUPY_SPILL_DOWNLOAD_ORDER` belongs to this staging | same bits | `spill_staging` of a rank in `timing.json`; the detail `orbital_sector_spill_staging` of a run whose sectors took buffers, without the bound, which `spill_staging` holds; `host_uploads` under `density_pool_release` | `fresh` | 0.758 s up and 0.770 s down through a page-locked buffer (24.8 and 24.5 GiB/s) and 1.40 and 1.52 s through a pageable one that is kept, against 1.75 s up with the staging block in the pool (17.99 s with the pool empty) and 2.62 s down into a new array |
+| `PARSEC_CUPY_SPILL_PINNED_BYTES` | unset: the buffers of a process are page-locked while their sum stays within half of the memory that the host has available when the storage is decided, and within `RLIMIT_MEMLOCK` where the system sets one; the buffers beyond that, and one that the driver refuses to lock, are pageable | a number of bytes, taken as it is; `0` locks nothing. There is no former value: `fresh` has no buffers | same bits | `bound_bytes`, `bound_from`, `page_locked_bytes`, `pageable_bytes`, `lock_seconds` and `lock_failures` under `spill_staging` | not named: it has no buffers | page-locking one buffer took 9.6 to 9.7 s, four of them one after another 38.4 s, and their return 13.9 s, which a run spends when its process ends, outside every record of `timing.json` |
 | `PARSEC_CUPY_SPILL_PINNED_POOL` | `keep`: a density that was handed a sector whose states are on the host leaves CuPy's pinned pool as it is; with `fresh` the staging block then serves every upload of the run | `release`: the pinned pool is emptied after every density | same bits | `spill_pinned_pool` and `pinned_kept` under `density_pool_release` of a rank | `release` | emptying the pool with the staging block of 32 GiB in it took 5.82 to 5.89 s, and page-locking that block again 15.9 to 16.3 s |
 
 `MULTI_GPU.md` describes them. With `fresh` and `release` named a spilled
@@ -1743,6 +1844,71 @@ and `parsec.out` apart from its times; with the buffers, page-locked and
 pageable, the arrays and that file were the same and the details had one
 entry more. The serial control names both where its launcher names neither,
 so the line that lists its routes has these two settings more.
+
+A complete first run on one A100 node (FP64) has been made since: 10,456
+electrons in the input with 5 ang of vacuum, the storage left to the code,
+which spills the four sectors, with the defaults and with `fresh` and
+`release` named in one allocation. The SCF took 396.9 against 746.4 s and
+the reported program 401.2 against 751.3 s, with the same total energy to
+the last bit. The four buffers page-locked 80.93 GB in 40.0 s, inside the
+offloads, which took 73.9 against 116.3 s; the restores took 46.6 against
+220.4 s. The host high-water mark was 78.2 against 109.9 GiB, and the GPU
+peak 23.61 against 23.53 GiB. The page-locked buffers go back when the
+process ends, after the reported program and outside every record: by the
+log of the batch job the whole process, start and teardown included, took
+434 against 770 s, 32.8 against 18.7 s beyond the reported program: the
+return of the buffers costs about 14 s that no record holds. Two devices,
+pageable buffers in a complete run and
+each switch by itself have not run on A100 nodes.
+
+The slabs of the one-block Ritz step of a shared basis (8 and 16 GPUs) take
+1 GiB since, where they took 2 GiB, on two and on four devices. Where 1 GiB
+holds fewer than 32 columns, a slab is widened up to that again, but never
+beyond the width that 2 GiB gave. The floor is a budget an eighth above 32
+columns, 36: `block_rounds` cuts a block into equal slabs and a whole round
+falls to the next multiple of 64 columns below, so a budget of exactly 32
+columns gave the blocks of 29,576 electrons (924 to 930 columns) slabs of 16
+and 58 rounds, and that SCF took 2.3 % longer than with the slabs of 2 GiB;
+36 keeps slabs of 32 columns for every block of 288 columns and more. The
+floor does not depend on the columns, so a slab never widens when a trim
+takes columns from a sector after the first solve that the sharing rule
+counted. With
+`PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES=8589934592` and
+`PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=2147483648` together a
+calculation is that of the code before them bit for bit. The count of the
+sharing rule follows the slabs, so it falls with them.
+
+| Switch | Default | Former value | Results | Says what ran |
+|---|---|---|---|---|
+| `PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES` | `4294967296`: the bytes, in all rows, of a round of the one-block Ritz step of a sector on four or more devices where `PARSEC_CUPY_STREAMING_RITZ_BYTES` is not set; slabs of 1 GiB with four devices | `8589934592` (slabs of 2 GiB) | round-off where the rounds change: 1e-9 to 8e-8 Ry on A100 nodes | `slab_columns` of a shared sector in `timing.json` |
+| `PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES` | `1073741824` now: slabs of at most 1 GiB on two devices | `2147483648` (the default before); `4294967296` stays the slabs of series F9 | as above | as above |
+| `PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS` | `32`: the fewest columns of such a slab where its limit leaves fewer, up to the width of the former limit | `1` (no floor) | as above | as above |
+
+First runs on A100 nodes with the launch profile of the series, the defaults
+against the two former values in one allocation, in the order old, new, new,
+old (one of each for 39,368 electrons); the peak of the fullest device and
+the SCF seconds are the means of each side:
+
+| Electrons | GPUs | Peak, former / default (GiB) | SCF, former / default (s) |
+|---|---|---|---|
+| 10,456 | 16 | 10.02 / 9.07 | 22.6 / 23.5 |
+| 14,680 | 16 | 14.93 / 13.06 | 41.0 / 40.7 |
+| 19,392 | 16 | 19.61 / 17.72 | 55.9 / 56.3 |
+| 23,768 | 16 | 28.48 / 26.67 | 92.6 / 91.8 |
+| 29,576 | 16 | 36.19 / 35.21 | 129.3 / 131.1 |
+| 39,368 | 16 | 61.23 / 61.23 | 257.7 / 257.9 |
+| 10,456 | 8 | 15.73 / 13.89 | 36.3 / 35.8 |
+| 14,680 | 8 | 24.65 / 22.16 | 68.0 / 68.8 |
+| 19,392 | 8 | 32.18 / 30.81 | 96.3 / 97.3 |
+| 23,768 | 8 | 49.68 / 47.87 | 161.6 / 162.9 |
+| 29,576 | 8 | 65.50 / 63.50 | 233.5 / 235.7 |
+
+The SCF moved by 1.3 % less to 1.1 % more, of the size of the spread of
+repeated runs (10,456 electrons on 16 GPUs: 22.2 and 23.1 against 22.2 and
+24.9 s), except 29,576 electrons on 16 GPUs, 1.4 % more in both pairs for
+0.97 GiB less. 39,368 electrons on 16 GPUs keep their rounds (32 columns
+either way), their peak and their bits. All runs converged in the steps of
+the former side.
 
 The sphere radius has no environment switch. An input that leaves
 `Boundary_Sphere_Radius` out gets the radius and the Hartree tolerance of
@@ -1978,9 +2144,12 @@ The default `PARSEC_CUPY_PROJECTOR_REDUCTION=auto` retains canonical serial
 summation for short projector rows and selects a deterministic 128-thread
 tree reduction only for rows with at least 256 entries. `serial` and
 `parallel` force either policy for profiling. A CUDA block of the tree
-reduction serves one projector and up to six vector columns
-(`PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS=6`, the default; `1` is the former
-kernel with a block per projector and column, see the switch below the last
+reduction serves one projector and up to six vector columns: a block of two
+to six columns is one launch of the six-column kernel, a wider block one
+launch of its group kernel, a CUDA block per projector and group of
+six columns, and a single column takes the kernel of a block per projector
+and column (`PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS=6`, the default; `1`, the
+former value, takes that kernel at every width, see the switch below the last
 table of switches).
 Set `PARSEC_CUPY_CUSTOM_PROJECTOR_DOT=0` to restore cuSPARSE and
 `PARSEC_CUPY_FUSED_PROJECTORS=0` for an unfused comparison. The earlier compact CSR-order

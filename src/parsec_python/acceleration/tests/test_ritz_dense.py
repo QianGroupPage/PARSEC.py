@@ -75,9 +75,9 @@ _ROUTES = dict(PARSEC_CUPY_GENERALIZED_RITZ='on', PARSEC_CUPY_MIXED_FILTER='off'
 def _helper_cases(devices):
     """Setting, device with the Hartree objects -> device of the group ``devices`` that estimates the condition number.
 
-    ``any``, the default, asks the device with the Hartree objects only where the sector has no other and that
-    device has the room, as the devices of a test have: a group of three or more passes it over as ``auto``
-    does, and a group of two leaves the estimate to its owner under ``auto``, the default before.
+    ``auto``, the default, never asks the device with the Hartree objects: a group of three or more passes it
+    over, and a group of two leaves the estimate to its owner.  ``any`` asks it only where the sector has no
+    other and that device has the room, as the devices of a test have.
     """
     owner, second = devices[:2]
     third = devices[2] if len(devices) > 2 else owner

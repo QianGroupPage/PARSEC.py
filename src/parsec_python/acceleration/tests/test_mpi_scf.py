@@ -824,7 +824,8 @@ class MPISCFTests(unittest.TestCase):
                               'PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
                               'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_EXCHANGE_PAIRS',
                               'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
-                              'PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS'} & set(names))
+                              'PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS', 'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES',
+                              'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS'} & set(names))
             # The count of the slabs of a Gram product stays the launcher's, as it was: the control cuts its
             # projection by it, eight where none is named, and forms the overlap of no row block.
             self.assertNotIn('PARSEC_CUPY_RITZ_GRAM_SLABS', names)

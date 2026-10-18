@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import time
 from typing import Callable, Mapping
+import warnings
 
 import numpy as np
 import scipy.sparse as sp
@@ -724,6 +725,7 @@ def _density_and_energy_stages(
         # Imported lazily: default SAD calculations do not import or initialize
         # an ML framework.  The model itself runs in an isolated subprocess.
         from ..MLDensity import build_initial_density
+        from ..MLDensity.providers import electron_count_warning
 
         initial_density = build_initial_density(
             problem.initial_density_settings,
@@ -731,6 +733,13 @@ def _density_and_energy_stages(
             atoms,
             problem.pseudopotentials,
         ).density
+        message = electron_count_warning(
+            grid.integrate(initial_density),
+            electron_count,
+            f"Initial_Density: {problem.initial_density_settings.method}",
+        )
+        if message is not None:
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
     # PARSEC normalizes its atomic initial guess.  Applying the same operation
     # to an ML prediction removes model/grid-integration charge drift and is
     # the scientifically safe default.  Disabling it is diagnostic only.

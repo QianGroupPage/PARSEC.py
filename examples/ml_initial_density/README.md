@@ -33,9 +33,20 @@ normalization; normalization remains enabled as the safe general default.
 
 These are offline regression runs: the SCDP and ChargE3Net repositories are
 not invoked. A named provider plus `ML_Density_File` preserves the density's
-provenance while loading a previously generated prediction. Remove the
-`ML_Density_File` line from an input to exercise direct model inference
-instead (after configuring its model environment and checkpoint).
+provenance while loading a previously generated prediction. To run the
+models instead, remove the `ML_Density_File` line from an input (the model
+then runs before the SCF), or predict the file first:
+
+```powershell
+.\.venv312\Scripts\python.exe src\parsec_python\ml_density.py predict `
+  --input examples\ml_initial_density\small_molecules\H2O\scdp\parsec.in `
+  --pp-dir examples\ml_initial_density\pseudopotentials
+```
+
+The [quick start](quickstart/README.md) and the
+[tutorial](../../src/parsec_python/MLDensity/README.md) describe the model
+environments; [stored and direct predictions](#stored-and-direct-predictions)
+compares the two kinds of start.
 
 ## Layout
 
@@ -171,6 +182,32 @@ time building and residual-testing a better first eigensubspace. For these
 ML-density tests, that additional first-step work prevents eigensolver error
 from obscuring differences in the starting Kohn--Sham potential; fewer later
 SCF/subspace iterations more than recover its cost in nearly every case.
+
+## Stored and direct predictions
+
+The stored fields are the starting densities of the old code
+(`*_init_rho.npy`): already normalized, so their electron count says nothing
+about the raw model output, and predicted on boxes whose points lie off this
+grid (by 0.087 Å in y for water), so they are imported by linear
+interpolation, which lowers the density peaks near the nuclei (water,
+ChargE3Net: 1.007 instead of 1.123 e/bohr³ at the maximum, 5.9 % L1
+difference). Predicting at the exact grid points with `ml_density.py predict`
+changed the SCF iterations as follows (A100, 2026-10-18; final energies
+within 1.1e-6 Ry of SAD):
+
+| Molecule | SAD | ChargE3Net stored / direct | SCDP fast stored / direct | SCDP accurate, direct |
+|---|---:|---:|---:|---:|
+| H2O | 13 | 13 / 9 | 12 / 12 | 11 |
+| CH4 | 18 | 9 / 7 | 12 / 10 | 7 |
+| C6H6 | 14 | 11 / 15 | 10 / 9 | 9 |
+| C10H8 | 13 | 8 / 8 | 10 / 7 | 8 |
+
+The geometries of this suite are not relaxed: water has O–H bonds of 1.10 Å
+(0.96 Å at equilibrium) and CO2 C=O bonds of 1.40 Å (1.16 Å), outside the
+equilibrium structures of QM9 on which both models were trained. SCDP's fast
+model gives 7.21 instead of 8 electrons for this water and 7.77 for a relaxed
+one. The SCF result does not depend on the start; the comparison of starts
+does.
 
 See [the complete interface guide](../../src/parsec_python/MLDensity/README.md)
 for direct-model environments, schemas, units, cache behavior, normalization,

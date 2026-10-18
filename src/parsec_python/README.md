@@ -77,7 +77,7 @@ python src\parsec_python\reference_main.py calculation\parsec.in --no-archive
 | Location | Responsibility |
 |---|---|
 | `Input/` | Translate and validate PARSEC/ESDF input. |
-| `MLDensity/` | Load or predict optional SCDP/ChargE3Net initial densities on the exact DFT grid. |
+| `MLDensity/` | Load or predict optional ML initial densities (SCDP, ChargE3Net, custom bridges) on the exact DFT grid or a box; `ml_density.py` is its command line. |
 | `Grid/` | Build centered isolated sphere or box grids. |
 | `Laplacian/` | Generate high-order finite-difference coefficients and sparse `-nabla^2`. |
 | `Pseudopotential/` | Read Martins-new `POTRE.DAT` and old-format `POTR.DAT`, integrate radial data, and reproduce PARSEC splines. |
@@ -431,8 +431,9 @@ their inputs with 5 ang of vacuum:
 Machine-learned densities are optional initial guesses, not new functionals.
 They are converted/validated/normalized on the authoritative PARSEC grid and
 do not replace the PP core density or any converged DFT term. See
-[MLDensity/README.md](MLDensity/README.md) for direct SCDP/ChargE3Net setup,
-input labels, cache behavior, and training-domain limitations.
+[the ML initial-density tutorial](MLDensity/README.md) for installing the
+models, `ml_density.py`, input labels, connecting other models, cache
+behavior, and training-domain limitations.
 
 The default mixer remains the strict PARSEC Anderson formula.  Difficult
 large systems may opt into a fixed-point-preserving safeguard that limits

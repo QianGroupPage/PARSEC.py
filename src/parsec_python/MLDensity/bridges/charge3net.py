@@ -11,8 +11,14 @@ import gc
 import os
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
+
+
+# GPU memory of one atom-to-probe edge in the published model (mul=500,
+# lmax=4), measured on an RTX 5070 at 10k and 25k edges per segment.
+_BYTES_PER_PROBE_EDGE = 170_000
 
 
 def _device(torch, requested: str):
@@ -23,6 +29,26 @@ def _device(torch, requested: str):
     return torch.device(requested)
 
 
+def _probe_edge_budget(torch, device) -> int:
+    """Atom-to-probe edges per model call.
+
+    ``PARSEC_CHARGE3NET_MAX_PROBE_EDGES`` fixes it.  Otherwise half of the
+    free GPU memory is used: a budget past the free memory does not fail on
+    Windows but spills into system memory and runs about twice as slowly.
+    """
+
+    configured = os.environ.get("PARSEC_CHARGE3NET_MAX_PROBE_EDGES")
+    if configured:
+        budget = int(configured)
+        if budget < 1:
+            raise ValueError("PARSEC_CHARGE3NET_MAX_PROBE_EDGES must be positive")
+        return budget
+    if device.type != "cuda":
+        return 80_000
+    free, _ = torch.cuda.mem_get_info(device)
+    return int(min(200_000, max(2_000, 0.5 * free / _BYTES_PER_PROBE_EDGE)))
+
+
 def _move_batch(torch, batch, device):
     return {
         key: (value.to(device) if torch.is_tensor(value) else value)
@@ -31,6 +57,7 @@ def _move_batch(torch, batch, device):
 
 
 def predict(args: argparse.Namespace) -> None:
+    started = time.perf_counter()
     repository = Path(args.repository).resolve()
     sys.path.insert(0, str(repository))
 
@@ -43,8 +70,8 @@ def predict(args: argparse.Namespace) -> None:
         from src.charge3net.models.e3 import E3DensityModel
     except ImportError as error:
         raise RuntimeError(
-            "ChargE3Net dependencies are missing in this Python environment; "
-            "install the official repository requirements"
+            f"ChargE3Net dependencies are missing in this Python environment "
+            f"({error}); install the official repository requirements"
         ) from error
 
     torch.set_default_dtype(torch.float32)
@@ -101,13 +128,32 @@ def predict(args: argparse.Namespace) -> None:
     # merely with the probe count.  A fixed 10k-probe chunk can therefore fit
     # for a molecule yet exhaust an 8-GB GPU for a dense cluster.  Bound the
     # actual edge workload while retaining ``--chunk-size`` as an outer cap.
-    max_probe_edges = int(
-        os.environ.get("PARSEC_CHARGE3NET_MAX_PROBE_EDGES", "80000")
+    max_probe_edges = _probe_edge_budget(torch, device)
+    near = np.isfinite(
+        atom_tree.query(probes, k=1, distance_upper_bound=probe_cutoff)[0]
     )
-    if max_probe_edges < 1:
-        raise ValueError("PARSEC_CHARGE3NET_MAX_PROBE_EDGES must be positive")
+    device_name = (
+        torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"
+    )
+    print(
+        f"progress: ChargE3Net {args.model} on {device_name} (torch "
+        f"{torch.__version__}), loaded in {time.perf_counter() - started:.1f} s; "
+        f"{probes.shape[0]:,} points, "
+        f"{int(near.sum()):,} within {probe_cutoff:g} A of an atom; "
+        f"{max_probe_edges:,} edges per call",
+        flush=True,
+    )
+    reported = 0
     with torch.inference_mode():
         for start in range(0, probes.shape[0], args.chunk_size):
+            percent = int(100 * start / probes.shape[0])
+            if percent >= reported + 10:
+                reported = percent - percent % 10
+                print(
+                    f"progress: {reported}% of the points "
+                    f"({time.perf_counter() - started:.0f} s)",
+                    flush=True,
+                )
             chunk = probes[start : start + args.chunk_size]
             # The published graph has no atom-to-probe edge beyond its 4-A
             # cutoff, hence the learned local density is exactly zero there.
@@ -198,7 +244,12 @@ def predict(args: argparse.Namespace) -> None:
         provider=np.asarray("charge3net"),
         metadata_model=np.asarray(args.model),
         metadata_checkpoint=np.asarray(str(Path(args.checkpoint).resolve())),
+        metadata_device=np.asarray(device_name),
+        metadata_torch=np.asarray(torch.__version__),
+        metadata_probe_edges_per_call=np.asarray(str(max_probe_edges)),
+        metadata_seconds=np.asarray(f"{time.perf_counter() - started:.3f}"),
     )
+    print(f"progress: done in {time.perf_counter() - started:.1f} s", flush=True)
 
 
 def main() -> None:

@@ -134,6 +134,45 @@ def _convert_to_bohr_density(
     raise ValueError(f"cannot convert density units {units!r}")
 
 
+# A density made for the same atoms in another frame is off by a rigid
+# translation; beyond this mean displacement (bohr) the import is refused.
+_FRAME_TOLERANCE_BOHR = 0.25
+
+
+def _check_frame(
+    archive: Mapping[str, np.ndarray],
+    source: Path,
+    atom_positions_bohr: np.ndarray | None,
+) -> None:
+    """Refuse a density whose recorded atoms sit elsewhere in the frame.
+
+    Files written by ``ml_density.py predict`` record the atoms they were
+    predicted for.  When the calculation has as many atoms, their mean
+    displacement is the translation between the two frames: a density
+    predicted from an XYZ file in its own coordinates, used by a calculation
+    that recentres the atoms, would otherwise be applied off-centre without
+    any error.  Other geometry changes are allowed: the density is only a
+    starting guess.
+    """
+
+    if atom_positions_bohr is None or "atom_positions_bohr" not in archive:
+        return
+    recorded = np.asarray(archive["atom_positions_bohr"], dtype=float).reshape(-1, 3)
+    current = np.asarray(atom_positions_bohr, dtype=float).reshape(-1, 3)
+    if recorded.shape != current.shape:
+        return
+    shift = (current - recorded).mean(axis=0)
+    if np.linalg.norm(shift) > _FRAME_TOLERANCE_BOHR:
+        shift_angstrom = ", ".join(f"{value:+.3f}" for value in shift * BOHR_TO_ANGSTROM)
+        raise ValueError(
+            f"{source.name} was predicted for these atoms translated by "
+            f"({shift_angstrom}) angstrom.  PARSEC.py places the atoms as the "
+            "calculation does (by default with the midpoint of their bounding "
+            "box at the origin); predict with 'ml_density.py predict --input "
+            "parsec.in', or from an XYZ file without --no-center"
+        )
+
+
 def load_density_for_grid(
     path: str | Path,
     grid: RealSpaceGrid,
@@ -141,13 +180,16 @@ def load_density_for_grid(
     units: str = "auto",
     interpolation: str = "linear",
     negative_policy: str = "clip",
+    atom_positions_bohr: np.ndarray | None = None,
 ) -> DensityLoadResult:
     """Load, map, unit-convert, and validate an ML initial density.
 
     A bare legacy ``.npy`` array is interpreted as ``e/angstrom^3`` when
     ``units='auto'``, matching the old-architecture ML4Den path.  Portable
     ``.npz`` fields must carry a ``units`` scalar unless the caller explicitly
-    supplies one.
+    supplies one.  With ``atom_positions_bohr`` (the atoms of the
+    calculation, as placed on its grid), a file that records its atoms is
+    checked to be in the same frame.
     """
 
     source = Path(path).expanduser().resolve()
@@ -175,6 +217,7 @@ def load_density_for_grid(
             schema = _npz_string(archive, "schema")
             if schema is not None and schema != _SCHEMA:
                 raise ValueError(f"unsupported ML density schema {schema!r}")
+            _check_frame(archive, source, atom_positions_bohr)
             key_units = {
                 "density_e_per_bohr3": "e_per_bohr3",
                 "density_e_per_angstrom3": "e_per_angstrom3",
@@ -278,6 +321,30 @@ def load_density_for_grid(
     )
 
 
+def _common_payload(
+    units: str,
+    provider: str,
+    metadata: Mapping[str, str] | None,
+    symbols,
+    atom_positions_bohr,
+) -> dict[str, np.ndarray]:
+    payload: dict[str, np.ndarray] = {
+        "schema": np.asarray(_SCHEMA),
+        "units": np.asarray(normalize_density_units(units)),
+        "provider": np.asarray(str(provider)),
+    }
+    if atom_positions_bohr is not None:
+        positions = np.asarray(atom_positions_bohr, dtype=float).reshape(-1, 3)
+        payload["atom_positions_bohr"] = positions
+        if symbols is not None:
+            if len(symbols) != positions.shape[0]:
+                raise ValueError("give one symbol per recorded atom")
+            payload["atom_symbols"] = np.asarray(symbols, dtype="U3")
+    for key, value in (metadata or {}).items():
+        payload[f"metadata_{key}"] = np.asarray(str(value))
+    return payload
+
+
 def save_point_density(
     path: str | Path,
     density: np.ndarray,
@@ -286,8 +353,14 @@ def save_point_density(
     units: str,
     provider: str,
     metadata: Mapping[str, str] | None = None,
+    symbols=None,
+    atom_positions_bohr: np.ndarray | None = None,
 ) -> Path:
-    """Write the portable exact-point density format used by model adapters."""
+    """Write the portable exact-point density format used by model adapters.
+
+    ``symbols``/``atom_positions_bohr`` record the atoms of the prediction,
+    so that an import can verify it is used in the same frame.
+    """
 
     output = Path(path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -295,23 +368,120 @@ def save_point_density(
     coordinates = np.asarray(coordinates_bohr, dtype=float)
     if values.ndim != 1 or coordinates.shape != (values.size, 3):
         raise ValueError("point density and coordinates have inconsistent shapes")
-    payload: dict[str, np.ndarray] = {
-        "schema": np.asarray(_SCHEMA),
-        "density": values,
-        "coordinates_bohr": coordinates,
-        "units": np.asarray(normalize_density_units(units)),
-        "provider": np.asarray(str(provider)),
-    }
-    for key, value in (metadata or {}).items():
-        payload[f"metadata_{key}"] = np.asarray(str(value))
+    payload = _common_payload(units, provider, metadata, symbols, atom_positions_bohr)
+    payload["density"] = values
+    payload["coordinates_bohr"] = coordinates
     np.savez_compressed(output, **payload)
+    return output
+
+
+def save_box_density(
+    path: str | Path,
+    density: np.ndarray,
+    origin_bohr: np.ndarray,
+    voxel_vectors_bohr: np.ndarray,
+    *,
+    units: str,
+    provider: str,
+    metadata: Mapping[str, str] | None = None,
+    symbols=None,
+    atom_positions_bohr: np.ndarray | None = None,
+) -> Path:
+    """Write a density on a regular box: ``r(i,j,k) = origin + [i,j,k] @ vectors``.
+
+    PARSEC.py interpolates such a file onto any calculation grid
+    (``ML_Density_Interpolation``).
+    """
+
+    output = Path(path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    values = np.asarray(density, dtype=float)
+    origin = np.asarray(origin_bohr, dtype=float)
+    vectors = np.asarray(voxel_vectors_bohr, dtype=float)
+    if values.ndim != 3 or origin.shape != (3,) or vectors.shape != (3, 3):
+        raise ValueError("a box density needs a 3D array, an origin, and 3x3 voxel vectors")
+    payload = _common_payload(units, provider, metadata, symbols, atom_positions_bohr)
+    payload["density"] = values
+    payload["origin_bohr"] = origin
+    payload["voxel_vectors_bohr"] = vectors
+    np.savez_compressed(output, **payload)
+    return output
+
+
+def dense_from_grid(
+    values: np.ndarray, grid: RealSpaceGrid
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Place a field of the active grid in its Cartesian box (zero outside).
+
+    Returns the dense array, the position of its element ``[0, 0, 0]``, and
+    the voxel vectors, as :func:`save_box_density` and :func:`write_cube`
+    take them.
+    """
+
+    values = np.asarray(values, dtype=float)
+    if values.shape != (grid.size,):
+        raise ValueError("the field does not hold one value per grid point")
+    dense = np.zeros(grid.lookup.shape, dtype=float)
+    local = grid.integer_coordinates - grid.index_min[None, :]
+    dense[local[:, 0], local[:, 1], local[:, 2]] = values
+    origin = grid.physical_coordinates(grid.index_min[None, :])[0]
+    return dense, np.asarray(origin, dtype=float), np.eye(3) * grid.spacing
+
+
+def write_cube(
+    path: str | Path,
+    density_e_per_bohr3: np.ndarray,
+    origin_bohr: np.ndarray,
+    voxel_vectors_bohr: np.ndarray,
+    atomic_numbers,
+    atom_positions_bohr: np.ndarray,
+    *,
+    comment: str = "",
+) -> Path:
+    """Write a Gaussian cube file (bohr, electrons per bohr^3).
+
+    The format is read by VESTA, VMD, Avogadro, Jmol, ASE and most DFT codes.
+    """
+
+    output = Path(path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    values = np.asarray(density_e_per_bohr3, dtype=float)
+    if values.ndim != 3:
+        raise ValueError("a cube file needs a 3D array")
+    origin = np.asarray(origin_bohr, dtype=float)
+    vectors = np.asarray(voxel_vectors_bohr, dtype=float)
+    positions = np.asarray(atom_positions_bohr, dtype=float).reshape(-1, 3)
+    numbers = [int(value) for value in atomic_numbers]
+    lines = [
+        (comment or "PARSEC.py ML density").replace("\n", " ")[:200],
+        "electron density in e/bohr^3; outer loop x, inner loop z",
+        f"{len(numbers):5d} {origin[0]:12.6f} {origin[1]:12.6f} {origin[2]:12.6f}",
+    ]
+    for count, vector in zip(values.shape, vectors):
+        lines.append(f"{count:5d} {vector[0]:12.6f} {vector[1]:12.6f} {vector[2]:12.6f}")
+    for number, position in zip(numbers, positions):
+        lines.append(
+            f"{number:5d} {float(number):12.6f} {position[0]:12.6f} "
+            f"{position[1]:12.6f} {position[2]:12.6f}"
+        )
+    with output.open("w", encoding="ascii", newline="\n") as stream:
+        stream.write("\n".join(lines) + "\n")
+        rows = values.reshape(-1, values.shape[2])
+        for row in rows:
+            for start in range(0, row.size, 6):
+                stream.write(
+                    " ".join(f"{value:13.5E}" for value in row[start : start + 6]) + "\n"
+                )
     return output
 
 
 __all__ = [
     "BOHR_TO_ANGSTROM",
     "DensityLoadResult",
+    "dense_from_grid",
     "load_density_for_grid",
     "normalize_density_units",
+    "save_box_density",
     "save_point_density",
+    "write_cube",
 ]

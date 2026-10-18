@@ -23,7 +23,9 @@ HartreeAtomicTail = Literal["auto", "on", "off"]
 # becomes subnormal at l = m = 86 and would silently drop terms.
 MAXIMUM_MULTIPOLE_ORDER = 60
 XCFunctional = Literal["ca", "pbe"]
-InitialDensityMethod = Literal["sad", "file", "charge3net", "scdp"]
+# ``sad``, ``file``, or a density model of ``MLDensity.registry`` (built in:
+# ``charge3net``, ``scdp``, ``custom``).
+InitialDensityMethod = str
 DensityUnits = Literal[
     "auto",
     "e_per_bohr3",
@@ -670,9 +672,11 @@ class InitialDensitySettings:
     the unchanged default.  ``file`` imports a portable ``.npz`` field or a
     legacy three-dimensional ``.npy`` field.  ``charge3net`` and ``scdp`` run
     an isolated model environment through the optional :mod:`MLDensity`
-    adapters and cache their prediction as the same portable ``.npz`` format.
-    Supplying ``file`` with either named provider imports an earlier prediction
-    from that provider without launching its environment.
+    adapters and cache their prediction as the same portable ``.npz`` format;
+    ``custom`` runs the script ``bridge`` the same way, and further models can
+    be registered in :mod:`MLDensity.registry`.  Supplying ``file`` with a
+    named provider imports an earlier prediction from that provider without
+    launching its environment.
 
     The DFT grid always remains authoritative.  A model prediction is either
     evaluated at those exact active grid points or interpolated onto them; it
@@ -692,15 +696,28 @@ class InitialDensitySettings:
     cache_directory: str | Path | None = None
     regenerate: bool = False
     prediction_chunk_size: int = 50000
+    # The script of ``method="custom"``.  It enters the reference cache key
+    # of the accelerated driver through the provider fingerprint (its path
+    # and bytes), so it stays out of the printed settings, which the stored
+    # records of earlier trees compare.
+    bridge: str | Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         method = str(self.method).strip().lower()
         if method == "ml":
             method = "file"
-        if method not in {"sad", "file", "charge3net", "scdp"}:
-            raise ValueError(
-                "initial density method must be sad, file, charge3net, or scdp"
-            )
+        provider = None
+        if method not in {"sad", "file"}:
+            # Imported here: a SAD calculation never loads the ML package.
+            from .MLDensity.registry import get_provider, initial_density_methods
+
+            try:
+                provider = get_provider(method)
+            except ValueError:
+                raise ValueError(
+                    "initial density method must be one of "
+                    + ", ".join(initial_density_methods())
+                ) from None
         if self.units not in {
             "auto",
             "e_per_bohr3",
@@ -724,16 +741,15 @@ class InitialDensitySettings:
         model = str(self.model).strip().lower()
         if not model:
             raise ValueError("ML density model name cannot be empty")
-        if method == "charge3net" and model not in {"qm9", "mp", "nmc"}:
-            raise ValueError("ChargE3Net model must be qm9, mp, or nmc")
-        if method == "scdp" and model not in {
-            "qm9",
-            "fast",
-            "accurate",
-            "qm9-fast",
-            "qm9-accurate",
-        }:
-            raise ValueError("SCDP model must be fast or accurate")
+        if provider is not None:
+            model = provider.check_model(model)
+            if provider.bridge is None and self.bridge is None and self.file is None:
+                raise ValueError(
+                    f"Initial_Density: {method} needs ML_Density_Bridge, the "
+                    "script that runs the model (or ML_Density_File)"
+                )
+        elif self.bridge is not None:
+            raise ValueError("ML_Density_Bridge needs a model Initial_Density")
         object.__setattr__(self, "method", method)
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "prediction_chunk_size", chunk_size)
@@ -743,6 +759,7 @@ class InitialDensitySettings:
             "checkpoint",
             "python_executable",
             "cache_directory",
+            "bridge",
         ):
             value = getattr(self, name)
             if value is not None:

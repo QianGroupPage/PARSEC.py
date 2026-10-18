@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import os
 from pathlib import Path
 import re
 from time import perf_counter
@@ -642,6 +643,7 @@ def _parse_parsec_input(
         "ml_density_cache",
         "ml_density_regenerate",
         "ml_density_chunk_size",
+        "ml_density_bridge",
         "normalize_initial_density",
         "lattice_vector_scale",
         # PARSEC.py extension: one post-SCF evaluation of a hybrid functional
@@ -675,8 +677,13 @@ def _parse_parsec_input(
             return default
         return _boolean(one(key), label=key)
 
-    def input_relative_path(key: str) -> Path | None:
-        """Resolve an optional quoted path relative to the input file."""
+    def input_relative_path(key: str, *, follow_links: bool = True) -> Path | None:
+        """Resolve an optional quoted path relative to the input file.
+
+        ``follow_links=False`` keeps symbolic links: an interpreter of a
+        Linux venv is a link to the base interpreter, which run under its
+        own name would not see the packages of the venv.
+        """
 
         if key not in scalar:
             return None
@@ -686,11 +693,9 @@ def _parse_parsec_input(
         if not raw:
             raise ParsecInputError(f"{key} cannot be empty")
         candidate = Path(raw).expanduser()
-        return (
-            candidate.resolve()
-            if candidate.is_absolute()
-            else (source.parent / candidate).resolve()
-        )
+        if not candidate.is_absolute():
+            candidate = source.parent / candidate
+        return candidate.resolve() if follow_links else Path(os.path.abspath(candidate))
 
     if optional_bool("restart_run"):
         raise UnsupportedParsecOptionError(
@@ -1445,7 +1450,7 @@ def _parse_parsec_input(
         raise UnsupportedParsecOptionError(
             "Density_Method=sad_ml_grid changed the DFT grid in the old architecture. "
             "The modular implementation keeps Grid_Spacing/domain authoritative; "
-            "use Initial_Density=sad, file, charge3net, or scdp."
+            "use Initial_Density=sad, file, charge3net, scdp, or custom."
         )
     file_keys = [key for key in ("ml_density_file", "ml_file_path") if key in scalar]
     if len(file_keys) > 1:
@@ -1453,9 +1458,20 @@ def _parse_parsec_input(
             "provide only one of ML_Density_File and legacy ML_File_Path"
         )
     density_file = input_relative_path(file_keys[0]) if file_keys else None
-    default_model = "fast" if initial_method == "scdp" else "qm9"
+    model_method = initial_method not in {"sad", "file"}
+    default_model = "qm9"
+    if model_method:
+        from ..MLDensity.registry import get_provider, initial_density_methods
+
+        try:
+            default_model = get_provider(initial_method).default_model
+        except ValueError:
+            raise ParsecInputError(
+                f"unknown Initial_Density {initial_method!r}; use one of "
+                + ", ".join(initial_density_methods())
+            ) from None
     density_cache = input_relative_path("ml_density_cache")
-    if density_cache is None and initial_method in {"charge3net", "scdp"}:
+    if density_cache is None and model_method:
         density_cache = source.parent / ".parsec_ml_density_cache"
     initial_density_settings = InitialDensitySettings(
         method=initial_method,
@@ -1469,7 +1485,7 @@ def _parse_parsec_input(
         ),
         repository=input_relative_path("ml_density_repository"),
         checkpoint=input_relative_path("ml_density_checkpoint"),
-        python_executable=input_relative_path("ml_density_python"),
+        python_executable=input_relative_path("ml_density_python", follow_links=False),
         model=one("ml_density_model", default_model).strip().lower(),
         device=_normalize_label(one("ml_density_device", "auto")),
         cache_directory=density_cache,
@@ -1478,6 +1494,7 @@ def _parse_parsec_input(
             one("ml_density_chunk_size", "50000"),
             label="ML_Density_Chunk_Size",
         ),
+        bridge=input_relative_path("ml_density_bridge"),
     )
 
     relaxation = None

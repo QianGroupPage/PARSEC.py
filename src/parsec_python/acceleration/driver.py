@@ -147,7 +147,7 @@ def _reference_cache_key(
                 ).tobytes()
             )
     if (
-        problem.initial_density_settings.method in {"charge3net", "scdp"}
+        problem.initial_density_settings.method not in {"sad", "file"}
         and problem.initial_density_settings.file is None
     ):
         from parsec_python.MLDensity.providers import provider_source_fingerprint

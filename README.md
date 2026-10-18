@@ -45,9 +45,6 @@ branch.
 - [Scientific flow](#scientific-flow)
 - [Acceleration policy](#acceleration-policy)
 - [Optional ML initial densities](#optional-ml-initial-densities)
-  - [Run directly with ChargE3Net](#run-directly-with-charge3net)
-  - [Run directly with SCDP](#run-directly-with-scdp)
-  - [Run from an existing `.npz` or `.npy`](#run-from-an-existing-npz-or-npy)
 
 **The code**
 
@@ -739,89 +736,44 @@ for implementation and parity details.
 
 ## Optional ML initial densities
 
-PARSEC.py can use a density predicted by **ChargE3Net** or **SCDP** as the
-initial SCF guess. This changes only the starting density: the Hartree and XC
-potentials, Hamiltonian, eigensolver, mixing, convergence test, and final
-energy remain ordinary PARSEC.py calculations.
+PARSEC.py can start the SCF of an isolated calculation from a valence density
+predicted by **ChargE3Net** or **SCDP** instead of the superposition of atomic
+densities. Only the starting density changes: the Hartree and XC potentials,
+Hamiltonian, eigensolver, mixing, convergence test, and final energy remain
+those of an ordinary calculation. Each model runs in its own Python
+environment; PARSEC.py does not import PyTorch.
 
-For direct inference, install ChargE3Net or SCDP in its own environment. Their
-PyTorch/e3nn versions are independent of the PARSEC.py `.venv312` environment.
-A separate XYZ or POSCAR is not required: the interface reads the species and
-coordinates from `parsec.in` and evaluates the model at the exact active DFT
-grid points.
-
-The pretrained molecular checkpoints used by this interface were trained on
-QM9. They should be used for H/C/N/O/F molecules only unless a different,
-validated checkpoint is supplied.
-
-### Run directly with ChargE3Net
-
-After installing the official ChargE3Net repository and confirming that
-`models/charge3net_qm9.pt` is present, add this block to `parsec.in`:
+With the models installed (the tutorial gives the commands for Linux clusters
+and Windows), one line of `parsec.in` selects them:
 
 ```text
-Initial_Density: charge3net
-ML_Density_Model: qm9
-ML_Density_Repository: C:\path\to\charge3net
-ML_Density_Python: C:\path\to\charge3net\.venv\Scripts\python.exe
-ML_Density_Device: auto
-Normalize_Initial_Density: true
+Initial_Density: charge3net          # or: scdp
 ```
 
-### Run directly with SCDP
+`src/parsec_python/ml_density.py` checks the installations, and predicts a
+density without running DFT, on the exact grid of an input or on a box of
+chosen size and points per direction around any XYZ file (`.npz` for PARSEC.py,
+`.cube` for viewers):
 
-Install the official SCDP repository in a separate environment and download
-one of its published QM9 checkpoints. For the fast checkpoint, use:
-
-```text
-Initial_Density: scdp
-ML_Density_Model: fast
-ML_Density_Repository: C:\path\to\scdp
-ML_Density_Python: C:\path\to\scdp\.venv\Scripts\python.exe
-ML_Density_Checkpoint: C:\path\to\scdp_fast.ckpt
-ML_Density_Device: auto
-Normalize_Initial_Density: true
+```bash
+python src/parsec_python/ml_density.py check
+python src/parsec_python/ml_density.py predict --input parsec.in
+python src/parsec_python/ml_density.py predict --xyz mol.xyz --provider scdp --box 14 --points 70 --cube mol.cube
 ```
 
-Run either case with the normal command:
+A calculation reads a stored prediction with `ML_Density_File`, without the
+model. Other density models are connected through a small bridge script
+(`Initial_Density: custom`, template in `MLDensity/bridges/template.py`) or
+registered as built-in models.
 
-```powershell
-python src\parsec_python\main.py path\to\calculation\parsec.in --no-archive
-```
-
-Before SCF, PARSEC.py launches the external environment, generates a portable
-exact-grid `density.npz`, validates its values and units, normalizes it to the
-pseudopotential valence-electron count, and caches it under
-`.parsec_ml_density_cache` beside `parsec.in`. An unchanged model, geometry,
-and grid reuse the exact cached prediction. Set `ML_Density_Regenerate: true`
-to force a new prediction.
-
-### Run from an existing `.npz` or `.npy`
-
-The generated `.npz` can be copied with the calculation and reused without
-installing ChargE3Net, SCDP, PyTorch, or the original checkpoint:
-
-```text
-Initial_Density: charge3net
-ML_Density_File: charge3net_qm9_density.npz
-ML_Density_Model: qm9
-ML_Density_Units: auto
-ML_Density_Interpolation: linear
-ML_Density_Negative_Policy: clip
-Normalize_Initial_Density: true
-```
-
-Use `Initial_Density: scdp` for a stored SCDP prediction, or
-`Initial_Density: file` for a provider-neutral density. `.npz` is preferred
-because it stores coordinates, units, and provenance. A legacy `.npy` must be
-a three-dimensional density on exactly the same underlying Cartesian grid;
-with automatic units it is interpreted as electrons per cubic angstrom.
-
-For installation commands, checkpoint details, cache discovery, file schemas,
-and a complete start-to-finish example, see the
-[ML-density interface guide](src/parsec_python/MLDensity/README.md). The
-[42-case regression suite](examples/ml_initial_density/README.md) contains
-runnable SAD, ChargE3Net, and SCDP comparisons with stored predictions.
+The [ML initial-density tutorial](src/parsec_python/MLDensity/README.md)
+covers installation, checks, the four ways to use a model, connecting another
+model, every input key, file formats, and troubleshooting. A water example is
+in [`examples/ml_initial_density/quickstart`](examples/ml_initial_density/quickstart/README.md),
+and the [42-case regression suite](examples/ml_initial_density/README.md)
+compares SAD, ChargE3Net, and SCDP starts with stored predictions. The
+public checkpoints were trained on QM9 (H, C, N, O, F molecules); validate
+any other use against a SAD start.
 
 ## Source layout
 
@@ -842,9 +794,10 @@ src/
 │   ├── __main__.py                python -m parsec_python
 │   ├── driver.py                  readable preparation/reference workflow
 │   ├── reference_main.py          explicit readable CLI launcher
+│   ├── ml_density.py              ML densities: check models, predict on grids and boxes
 │   ├── models.py                  shared physical/settings/result data
 │   ├── Input/                     parsec.in translation and validation
-│   ├── MLDensity/                 optional SCDP/ChargE3Net initial guesses
+│   ├── MLDensity/                 optional ML initial densities (ChargE3Net, SCDP, custom)
 │   ├── Grid/                      isolated real-space domains
 │   ├── Laplacian/                 high-order finite differences
 │   ├── Pseudopotential/           PARSEC POTRE reader and radial splines

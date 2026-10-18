@@ -1,0 +1,75 @@
+# Water with a machine-learned initial density (see quickstart/README.md).
+# Run from this folder:
+#   python ../../../src/parsec_python/main.py parsec.in --pp-dir ../pseudopotentials
+
+Boundary_Conditions: cluster
+Cluster_Domain_Shape: sphere
+Boundary_Sphere_Radius: 7.0 ang
+Grid_Spacing: 0.2 ang
+Expansion_Order: 8
+Coordinate_Unit: Cartesian_Ang
+Ignore_Symmetry: false
+
+Atom_Types_Num: 2
+Total_Atom_Num: 3
+
+Atom_Type: H
+Element_Symbol: H
+Pseudopotential_Format: martins_new
+Local_Component: s
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  7.0000000000  6.5115440000  7.9500000000
+  7.0000000000  6.5115440000  6.0500000000
+end Atom_Coord
+
+Atom_Type: O
+Element_Symbol: O
+Pseudopotential_Format: martins_new
+Local_Component: p
+Read_VCD: true
+Cubic_Spline: true
+begin Atom_Coord
+  7.0000000000  7.0615440000  7.0000000000
+end Atom_Coord
+
+Correlation_Type: pbe
+Spin_Polarization: false
+States_Num: 16
+Net_Charges: 0 e
+Fermi_Temp: 500 K
+Max_Iter: 50
+Convergence_Criterion: 2e-4 Ry
+
+Eigensolver: chebdav
+Chebdav_Degree: 15
+FF_MaxIter: 2
+Matvec_Blocksize: 6
+Chebyshev_Degree: 10
+Chebyshev_Degree_Delta: 3
+Subspace_Buffer_Size: 6
+Diag_Tolerance: 1e-4
+
+Mixing_Method: Anderson
+Mixing_Param: 0.30
+Memory_Param: 4
+Restart_Mixing: 20
+Solver_Lpole: 9
+Full_Hartree: false
+
+# The initial density: a model instead of the superposition of atoms (sad).
+# Write scdp for SCDP; each model has a default ML_Density_Model (qm9 for
+# ChargE3Net, fast for SCDP).  Without the path lines below, the model is
+# looked for in a folder parsec_ml_workspace next to the PARSEC.py
+# checkout, or named by CHARGE3NET_REPO / CHARGE3NET_PYTHON (SCDP_REPO /
+# SCDP_PYTHON).
+Initial_Density: charge3net
+# ML_Density_Repository: /path/to/charge3net
+# ML_Density_Python: /path/to/charge3net/.venv/bin/python
+# ML_Density_Checkpoint: /path/to/scdp/models/share_models/qm9_none_K4L3_beta_2.0/epoch=59-step=464400.ckpt
+Normalize_Initial_Density: true
+
+Skip_Force: true
+Output_Level: 1
+Output_All_States: false

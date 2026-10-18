@@ -11,6 +11,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 
@@ -31,7 +32,33 @@ def _device(torch, requested: str):
     return torch.device(requested)
 
 
+def _virtual_nodes(model: str, checkpoint: Path) -> str:
+    """Virtual-node method of the model, checked against the checkpoint path.
+
+    The fast model has no virtual nodes and the accurate one bond midpoints
+    (``qm9`` is an alias of the fast model).  A checkpoint does not record
+    the method, but the directories of the published archive name it
+    (``qm9_none_...``, ``qm9_bond_...``); a mismatch would silently give a
+    wrong density, so it is refused.
+    """
+
+    method = "bond" if model in {"accurate", "qm9-accurate"} else "none"
+    path = checkpoint.as_posix().lower()
+    named = {name for name in ("none", "bond") if f"_{name}_" in path}
+    if len(named) == 1 and method not in named:
+        expected = "accurate" if "bond" in named else "fast"
+        raise RuntimeError(
+            f"ML_Density_Model {model} uses virtual nodes '{method}', but the "
+            f"checkpoint {checkpoint.name} in {checkpoint.parent.name} is a "
+            f"'{named.pop()}' model; set ML_Density_Model: {expected}"
+        )
+    return method
+
+
 def predict(args: argparse.Namespace) -> None:
+    started = time.perf_counter()
+    # Before the imports, which take a while: a mismatch fails at once.
+    vnode_method = _virtual_nodes(args.model, Path(args.checkpoint))
     repository = Path(args.repository).resolve()
     sys.path.insert(0, str(repository))
     try:
@@ -42,8 +69,9 @@ def predict(args: argparse.Namespace) -> None:
         from scdp.model.module import ChgLightningModule
     except ImportError as error:
         raise RuntimeError(
-            "SCDP dependencies are missing in this Python environment; use a "
-            "dedicated environment compatible with the official requirements"
+            "SCDP dependencies are missing in this Python environment "
+            f"({error}); use a dedicated environment compatible with the "
+            "official requirements"
         ) from error
 
     device = _device(torch, args.device)
@@ -73,9 +101,15 @@ def predict(args: argparse.Namespace) -> None:
             "the SCDP checkpoint has no Gaussian basis for atomic number(s) "
             + ", ".join(str(value) for value in unsupported)
         )
-    # The public fast model has no virtual nodes; the accurate model uses bond
-    # midpoints.  ``qm9`` is retained as a convenient alias for the fast model.
-    vnode_method = "bond" if args.model in {"accurate", "qm9-accurate"} else "none"
+    device_name = (
+        torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"
+    )
+    print(
+        f"progress: SCDP {args.model} on {device_name} (torch "
+        f"{torch.__version__}), loaded in {time.perf_counter() - started:.1f} s; "
+        f"{probes.shape[0]:,} points",
+        flush=True,
+    )
     dummy_density = torch.zeros((1, 1, 1), dtype=torch.float32)
     data = AtomicData.build_graph_with_vnodes(
         atom_types=torch.as_tensor(numbers, dtype=torch.long),
@@ -88,21 +122,29 @@ def predict(args: argparse.Namespace) -> None:
         atom_cutoff=6.0,
         disable_pbc=True,
         vnode_method=vnode_method,
-        # SCDP defaults to a 24-entry top-k before removing self edges.  An
-        # isolated molecule with fewer than 24 atoms has fewer candidates than
-        # that fixed request, which makes torch.topk fail.  Cap the request at
-        # the available atom count; after the self edge is masked this retains
-        # every possible neighbour and is identical to the default for larger
-        # structures.
-        max_neighbors=min(24, int(numbers.size)),
+        # Every neighbour within the cutoff, as SCDP's preprocessing built
+        # the training graphs (``preprocess.py``: max_neighbors=None).  The
+        # 24 of this function's signature would cut the graph of a molecule
+        # of more than 24 nodes, and the bond virtual nodes of the accurate
+        # model count as nodes.
+        max_neighbors=None,
         device=str(device),
     )
     batch = Batch.from_data_list([data]).to(device)
 
     predictions: list[np.ndarray] = []
+    reported = 0
     with torch.inference_mode():
         coeffs, expo_scaling = model.predict_coeffs(batch)
         for start in range(0, probes.shape[0], args.chunk_size):
+            percent = int(100 * start / probes.shape[0])
+            if percent >= reported + 10:
+                reported = percent - percent % 10
+                print(
+                    f"progress: {reported}% of the points "
+                    f"({time.perf_counter() - started:.0f} s)",
+                    flush=True,
+                )
             chunk = torch.as_tensor(
                 probes[start : start + args.chunk_size],
                 dtype=coeffs.dtype,
@@ -128,7 +170,12 @@ def predict(args: argparse.Namespace) -> None:
         provider=np.asarray("scdp"),
         metadata_model=np.asarray(args.model),
         metadata_checkpoint=np.asarray(str(Path(args.checkpoint).resolve())),
+        metadata_virtual_nodes=np.asarray(vnode_method),
+        metadata_device=np.asarray(device_name),
+        metadata_torch=np.asarray(torch.__version__),
+        metadata_seconds=np.asarray(f"{time.perf_counter() - started:.3f}"),
     )
+    print(f"progress: done in {time.perf_counter() - started:.1f} s", flush=True)
 
 
 def main() -> None:

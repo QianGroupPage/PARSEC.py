@@ -114,12 +114,25 @@ def split_pooled(pooled: np.ndarray, per_task: list[np.ndarray]) -> list[np.ndar
 
 _parallel_solver: Callable[..., Any] | None = None
 _parallel_mapper: Callable[..., Iterator[tuple[int, Any]]] | None = None
+_uses_device: Callable[[], bool] | None = None
 
 
-def set_parallel_backend(solver: Callable[..., Any] | None, mapper: Callable[..., Any] | None) -> None:
-    """Install (or, with ``None``, remove) the parallel solver factory and task mapper."""
-    global _parallel_solver, _parallel_mapper
-    _parallel_solver, _parallel_mapper = solver, mapper
+def set_parallel_backend(
+    solver: Callable[..., Any] | None,
+    mapper: Callable[..., Any] | None,
+    uses_device: Callable[[], bool] | None = None,
+) -> None:
+    """Install (or, with ``None``, remove) the parallel solver factory and task mapper.
+
+    ``uses_device`` tells whether the installed solver would run on a device for the current run.
+    """
+    global _parallel_solver, _parallel_mapper, _uses_device
+    _parallel_solver, _parallel_mapper, _uses_device = solver, mapper, uses_device
+
+
+def parallel_backend_uses_device() -> bool:
+    """Whether the installed parallel backend would solve the k-points on a device."""
+    return _uses_device is not None and bool(_uses_device())
 
 
 def make_kpoint_solver(job: KPointJob, *, problem_size: int | None = None, **options):
@@ -153,6 +166,7 @@ __all__ = [
     "SerialKPointSolver",
     "make_kpoint_solver",
     "map_tasks",
+    "parallel_backend_uses_device",
     "set_parallel_backend",
     "split_pooled",
 ]

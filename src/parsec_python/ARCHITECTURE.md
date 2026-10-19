@@ -56,6 +56,13 @@ are the performance counterpart; importing `parsec_python.acceleration` installs
 it with `set_parallel_backend`. `acceleration/tests/test_kpoint_parallel.py`
 checks it against the serial definition.
 
+Preparing a periodic cell follows the same rule. `V_ion` keeps the direct definitions: the Ewald local
+potential and the projector and atomic-density builders measure the distance of every grid point to every atom
+image. `acceleration/V_ion/periodic_setup.py` supplies a grid-ball query (integer index boxes, identical
+rows and distances) through `V_ion.ionic_potential.set_support_finder`, and the local potential as one FFT
+through `V_ion.ewald.set_local_potential_provider`; importing `parsec_python.acceleration` installs both.
+`acceleration/tests/test_periodic_setup.py` checks them against the definitions.
+
 The flow is a dependency direction, not permission for lower-level modules to
 import the SCF driver. Physics components must remain independently callable.
 

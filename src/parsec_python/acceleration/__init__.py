@@ -74,3 +74,9 @@ __all__ = [
 from .SCF.kpoint_parallel import install as _install_kpoint_parallelism  # noqa: E402
 
 _install_kpoint_parallelism()
+
+# Preparing a periodic cell scans the whole grid for every atom image unless the fast
+# replacements are installed.
+from .V_ion.periodic_setup import install as _install_periodic_setup  # noqa: E402
+
+_install_periodic_setup()

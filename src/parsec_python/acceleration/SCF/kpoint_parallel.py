@@ -31,6 +31,7 @@ tasks).  Importing :mod:`parsec_python.acceleration` installs this solver and
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Callable
 
 import numpy as np
@@ -123,6 +124,13 @@ class _SolveWorker:
         self.device_solver = self.converter is not None and _device_solver_requested()
         self._spill: bool | None = None
 
+    def _tick(self, name: str, start: float) -> None:
+        """Add the seconds since ``start`` to the worker's ``worker_<name>_seconds`` counter."""
+        if self.converter is not None:
+            self.converter.backend.synchronize()
+        key = f"worker_{name}_seconds"
+        self.stats[key] = self.stats.get(key, 0.0) + time.perf_counter() - start
+
     # ------------------------------------------------------------- host route
     def operator(self, hamiltonian):
         if self.converter is not None:
@@ -149,8 +157,11 @@ class _SolveWorker:
     def _solve_on_device(self, task: int, hamiltonian, settings):
         backend = self.converter.backend
         backend.use()
+        start = time.perf_counter()
         operator = self.converter.operator(hamiltonian)
+        self._tick("upload", start)
         requested = self.job.number_of_states
+        solve_start = time.perf_counter()
         state = self.states.pop(task, None)
         self.vectors.pop(task, None)  # release the previous basis before the next one is made
         if state is not None and isinstance(state.vectors, np.ndarray) and backend.xp is not np:
@@ -186,12 +197,15 @@ class _SolveWorker:
             eigenvalues = result.eigenvalues
             for name, value in result.stats.items():
                 self.stats[name] = self.stats.get(name, 0.0) + value
+        self._tick("solve", solve_start)
         if self._spill is None:
             self._spill = self._should_spill(new_state.operator_dimension, new_state.working_states)
         if self._spill:
+            spill_start = time.perf_counter()
             host_vectors = self._to_host(new_state.vectors)
             new_state.vectors = host_vectors
             self.vectors[task] = host_vectors[:, :requested]
+            self._tick("spill", spill_start)
         else:
             self.vectors[task] = new_state.vectors[:, :requested]
         self.states[task] = new_state
@@ -204,17 +218,23 @@ class _SolveWorker:
     def solve(self, potentials: dict, filter_degree: int):
         settings = self.job.eigval_settings(filter_degree)
         for task in self.tasks:
+            start = time.perf_counter()
             hamiltonian = self.job.make_hamiltonian(task, potentials)
+            self._tick("hamiltonian", start)  # builds the Bloch projectors of a k-point on first use
             if self.device_solver:
                 yield task, self._solve_on_device(task, hamiltonian, settings)
                 continue
+            start = time.perf_counter()
             operator = self.operator(hamiltonian)
+            self._tick("upload", start)
+            start = time.perf_counter()
             solution = solve_eigval(
                 operator,
                 self.job.number_of_states,
                 settings=settings,
                 state=self.states.get(task),
             )
+            self._tick("solve", start)
             self.states[task] = solution.state
             self.vectors[task] = np.asarray(solution.vectors)
             yield task, np.asarray(solution.eigenvalues, dtype=float)
@@ -222,7 +242,12 @@ class _SolveWorker:
     def accumulate(self, occupations: dict[int, np.ndarray]):
         total: dict[str, np.ndarray] = {}
         for task in self.tasks:
-            parts = self.job.accumulate(task, self._host_vectors(task), occupations[task])
+            start = time.perf_counter()
+            vectors = self._host_vectors(task)
+            self._tick("download", start)
+            start = time.perf_counter()
+            parts = self.job.accumulate(task, vectors, occupations[task])
+            self._tick("density", start)
             for name, value in parts.items():
                 if name in total:
                     total[name] += value
@@ -344,7 +369,9 @@ def map_tasks(solve_task, n_tasks: int, *, problem_size=None, workers=None, back
 
 def install() -> None:
     """Make this the parallel backend of the reference k-point drivers and band paths."""
-    set_parallel_backend(PooledKPointSolver, map_tasks)
+    set_parallel_backend(
+        PooledKPointSolver, map_tasks, uses_device=lambda: resolve_backend() is not None
+    )
 
 
 __all__ = ["PooledKPointSolver", "device_worker_count", "install", "map_tasks", "resolve_backend"]

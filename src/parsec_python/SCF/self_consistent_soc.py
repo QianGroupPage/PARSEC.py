@@ -32,8 +32,6 @@ the unpolarized path's implicit factor of two).
 
 from __future__ import annotations
 
-import time
-from contextlib import contextmanager
 from typing import Callable
 
 import numpy as np
@@ -53,6 +51,7 @@ from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
 from ..SCF.single_point import PreparedSinglePointSystem
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
+from .stage_timer import StageTimer
 
 
 def spinor_density_from_orbitals(
@@ -82,29 +81,7 @@ def spinor_density_from_orbitals(
     return np.sum(weighted, axis=1) / volume_element
 
 
-class _StageTimer:
-    """Seconds per SCF stage; ``synchronize`` (a device barrier) makes them exact on a GPU."""
-
-    def __init__(self, synchronize: Callable[[], None] | None = None) -> None:
-        self.seconds: dict[str, float] = {}
-        self._synchronize = synchronize
-
-    @contextmanager
-    def stage(self, name: str):
-        if self._synchronize is not None:
-            self._synchronize()
-        start = time.perf_counter()
-        try:
-            yield
-        finally:
-            if self._synchronize is not None:
-                self._synchronize()
-            self.seconds[name] = self.seconds.get(name, 0.0) + time.perf_counter() - start
-
-    def add_counters(self, prefix: str, counters) -> None:
-        for name, value in (counters or {}).items():
-            key = f"{prefix}{name}"
-            self.seconds[key] = self.seconds.get(key, 0.0) + float(value)
+_StageTimer = StageTimer
 
 
 def _number_of_states(system: PreparedSinglePointSystem) -> int:

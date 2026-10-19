@@ -1552,6 +1552,7 @@ class ParsecTextReporter:
                     " --------------------------------------------------",
                 ]
             )
+            lines.extend(self._kpoint_detail_lines(timings))
         lines.extend(self._final_k_tables(result))
         if forces is None:
             lines.extend(
@@ -1612,6 +1613,15 @@ class ParsecTextReporter:
         lines = [
             f" Spin-polarized SCF iter # {step.iteration:3d}",
             "",
+            *(
+                (
+                    f" Diagonalization time [sec] : {step.diagonalization_seconds:10.2f},"
+                    f"      iteration time = {step.total_seconds:10.2f}",
+                    "",
+                )
+                if getattr(step, "total_seconds", 0.0) > 0.0
+                else ()
+            ),
             f" Fermi level at {step.fermi_level:10.4f} [Ry]",
             "",
             *self._kpoint_note(),
@@ -1681,6 +1691,78 @@ class ParsecTextReporter:
             )
         return lines
 
+    @staticmethod
+    def _kpoint_stage_lines(timings) -> list[str]:
+        """Stage table of a k-point SCF that carries no ``SinglePointResult`` table (spin)."""
+        if timings is None or timings.total_seconds <= 0.0:
+            return []
+        lines = [
+            " SCF timing analysis [sec]",
+            " --------------------------------------------------",
+            f" Initial Hartree potential      : {timings.initial_hartree_seconds:12.6f}",
+            f" Initial exchange-correlation   : {timings.initial_xc_seconds:12.6f}",
+            f" Diagonalization subtotal       : {timings.diagonalization_seconds:12.6f}",
+            f" Occupation/density subtotal    : {timings.occupations_density_seconds:12.6f}",
+            f" Hartree potential subtotal     : {timings.hartree_seconds:12.6f}",
+            f" Exchange-correlation subtotal  : {timings.xc_seconds:12.6f}",
+            f" Mixing/energy subtotal         : {timings.mixing_energy_seconds:12.6f}",
+            f" SCF wall time                   : {timings.total_seconds:12.6f}",
+            " --------------------------------------------------",
+        ]
+        lines.extend(ParsecTextReporter._kpoint_detail_lines(timings))
+        lines.append("")
+        return lines
+
+    @staticmethod
+    def _kpoint_detail_lines(timings) -> list[str]:
+        """What the k-point solver measured: its set-up and the seconds inside its workers."""
+        detail = getattr(timings, "detail", None)
+        if not detail:
+            return []
+        lines = ["", " K-point solver detail", " --------------------------------------------------"]
+        if "workers" in detail:
+            lines.append(f" {'Workers':30s} : {int(detail['workers']):12d}")
+        lines.append(f" {'Solver and worker start-up':30s} : {detail.get('solver_setup', 0.0):12.6f}")
+        worker = (
+            ("worker_hamiltonian_seconds", "Bloch Hamiltonian (projectors)"),
+            ("worker_upload_seconds", "Operator upload"),
+            ("worker_solve_seconds", "Eigensolver"),
+            ("worker_spill_seconds", "Subspace to the host"),
+            ("worker_download_seconds", "Eigenvectors to the host"),
+            ("worker_density_seconds", "Density of the k-points"),
+        )
+        present = [(key, label) for key, label in worker if key in detail]
+        if present:
+            lines.append(" Summed over the workers [worker-sec]")
+            for key, label in present:
+                lines.append(f"   {label:28s} : {detail[key]:12.6f}")
+        solver = (
+            ("lanczos_seconds", "Lanczos bounds"),
+            ("filter_seconds", "Chebyshev filter"),
+            ("orthonormalize_seconds", "Orthonormalization"),
+            ("ritz_seconds", "Rayleigh-Ritz"),
+            ("residual_seconds", "Residuals"),
+        )
+        present = [(key, label) for key, label in solver if key in detail]
+        if present:
+            lines.append(" Device eigensolver [worker-sec]")
+            for key, label in present:
+                lines.append(f"   {label:28s} : {detail[key]:12.6f}")
+        counters = (
+            ("first_solves", "First solves"),
+            ("subspace_steps", "Subspace steps"),
+            ("extra_cycles", "Extra CHEBFF cycles"),
+            ("applications", "Operator applications"),
+            ("application_columns", "Application columns"),
+        )
+        present = [(key, label) for key, label in counters if key in detail]
+        if present:
+            lines.append(" Eigensolver counters")
+            for key, label in present:
+                lines.append(f"   {label:28s} : {int(detail[key]):12d}")
+        lines.append(" --------------------------------------------------")
+        return lines
+
     def finish_spin_polarized(
         self, result: "SpinPolarizedSinglePointResult", elapsed_seconds: float
     ) -> None:
@@ -1694,6 +1776,7 @@ class ParsecTextReporter:
             "",
             f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
             "",
+            *self._kpoint_stage_lines(getattr(result, "timings", None)),
             f"Converged magnetic moment N_up - N_down = {result.magnetic_moment:12.4f}",
             f"Total Energy = {result.energies.total:22.8f} [Ry]",
             (

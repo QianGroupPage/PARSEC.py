@@ -152,3 +152,125 @@ class WorkerCountTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KPointTimingTests(unittest.TestCase):
+    """The k-point drivers record a stage table and what the workers measured."""
+
+    def _check(self, result, workers: int) -> None:
+        timings = result.timings
+        self.assertGreater(timings.total_seconds, 0.0)
+        self.assertGreater(timings.diagonalization_seconds, 0.0)
+        for stage in (
+            timings.initial_hartree_seconds,
+            timings.occupations_density_seconds,
+            timings.hartree_seconds,
+            timings.xc_seconds,
+            timings.mixing_energy_seconds,
+        ):
+            self.assertGreaterEqual(stage, 0.0)
+        staged = (
+            timings.initial_hartree_seconds
+            + timings.initial_xc_seconds
+            + timings.diagonalization_seconds
+            + timings.occupations_density_seconds
+            + timings.hartree_seconds
+            + timings.xc_seconds
+            + timings.mixing_energy_seconds
+            + timings.detail["solver_setup"]
+        )
+        self.assertLessEqual(staged, timings.total_seconds * 1.001)
+        self.assertEqual(timings.detail["workers"], workers)
+        # Bloch projectors are built on first use; the eigensolver takes the rest of the solve
+        self.assertGreater(timings.detail["worker_hamiltonian_seconds"], 0.0)
+        self.assertGreater(timings.detail["worker_solve_seconds"], 0.0)
+        self.assertGreater(timings.detail["worker_density_seconds"], 0.0)
+
+    def test_scalar_driver_fills_run_timings_and_iteration_seconds(self) -> None:
+        with mock.patch.dict(os.environ, {"PARSEC_KPOINT_WORKERS": "2"}):
+            result = run_scf_kpoints(_system(), _K, _WEIGHTS)
+        self._check(result, 2)
+        self.assertEqual(len(result.history), result.iterations)
+        self.assertGreater(result.history[0].diagonalization_seconds, 0.0)
+        self.assertGreater(result.history[0].total_seconds, 0.0)
+
+    def test_spin_polarized_driver_fills_run_timings(self) -> None:
+        iterations = []
+        with mock.patch.dict(os.environ, {"PARSEC_KPOINT_WORKERS": "2"}):
+            result = run_scf_kpoints_spin_polarized(
+                _system(spin_polarized=True), _K, _WEIGHTS, callback=iterations.append
+            )
+        self._check(result, 2)
+        self.assertTrue(all(step.total_seconds > 0.0 for step in iterations))
+
+    def test_device_route_reports_eigensolver_counters(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "1"}
+        ):
+            result = run_scf_kpoints(_system(), _K, _WEIGHTS)
+        detail = result.timings.detail
+        self.assertEqual(detail["first_solves"], len(_K))
+        self.assertGreater(detail["filter_seconds"], 0.0)
+        self.assertGreater(detail["worker_upload_seconds"], 0.0)
+
+
+class GammaSpinRoutingTests(unittest.TestCase):
+    """A Gamma-only periodic spin run goes through the k-point driver when a device is in use."""
+
+    _INPUT = """\
+Periodic_System: .true.
+Boundary_Conditions: bulk
+begin Cell_Shape
+   8.0  8.0  8.0
+end Cell_Shape
+Grid_Spacing: 0.7
+Expansion_Order: 6
+Spin_Polarization: .true.
+States_Num: 12
+Net_Charges: 0
+Fermi_Temp: 500.0
+Max_Iter: 60
+Convergence_Criterion: 5.0e-3
+Mixing_Method: Anderson
+Mixing_Param: 0.25
+Eigensolver: chebff
+Atom_Types_Num: 1
+Total_Atom_Num: 1
+Atom_Type: Au
+Local_Component: s
+Begin atom_coord
+   4.0 4.0 4.0
+End atom_coord
+Correlation_Type: CA
+"""
+
+    def _log(self, uses_device: bool) -> str:
+        import tempfile
+
+        from parsec_python.acceleration.SCF.kpoint_parallel import install
+        from parsec_python.cli import main as cli_main
+        from parsec_python.SCF import kpoint_solver
+
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            (directory / "Au_POTRE.DAT").write_bytes(_AU_POTRE.read_bytes())
+            (directory / "parsec.in").write_text(self._INPUT, encoding="utf-8")
+            kpoint_solver.set_parallel_backend(
+                kpoint_solver._parallel_solver,
+                kpoint_solver._parallel_mapper,
+                uses_device=lambda: uses_device,
+            )
+            try:
+                self.assertEqual(cli_main([str(directory / "parsec.in"), "--quiet", "--no-archive"]), 0)
+            finally:
+                install()
+            return (directory / "parsec.out").read_text(encoding="utf-8")
+
+    def test_gamma_spin_uses_the_kpoint_driver_only_on_a_device(self) -> None:
+        on_device = self._log(True)
+        on_host = self._log(False)
+        self.assertIn("K-point solver detail", on_device)
+        self.assertNotIn("K-point solver detail", on_host)
+        energy = [float(line.split()[3]) for line in on_device.splitlines() if "Total Energy =" in line and "iter" not in line]
+        reference = [float(line.split()[3]) for line in on_host.splitlines() if "Total Energy =" in line and "iter" not in line]
+        self.assertAlmostEqual(energy[-1], reference[-1], delta=2.0e-3)

@@ -51,6 +51,7 @@ from .SCF.bands import (
     run_band_structure,
 )
 from .SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_polarized
+from .SCF.kpoint_solver import parallel_backend_uses_device
 from .SCF.noncollinear import (
     run_self_consistent_noncollinear,
     run_self_consistent_noncollinear_kpoints,
@@ -810,6 +811,15 @@ def _run_extended_drivers(
         return 0 if result.converged else 3
 
     if spin_polarized:  # periodic or with spin-orbit (isolated and plain: main's run_spin_scf)
+        if (
+            k_sampling is None
+            and is_periodic
+            and not has_soc_species
+            and parallel_backend_uses_device()
+        ):
+            # A Gamma-only periodic spin run is the 1x1x1 k-point run.  Through the k-point driver
+            # it runs on the device; the Gamma driver has no device path.
+            k_sampling = (np.zeros((1, 3)), np.ones(1))
         if k_sampling is not None:
             k_points, k_weights = k_sampling
             result = run_scf_kpoints_spin_polarized(

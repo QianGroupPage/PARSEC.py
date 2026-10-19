@@ -1065,6 +1065,9 @@ class RunTimings:
     xc_seconds: float = 0.0
     mixing_energy_seconds: float = 0.0
     total_seconds: float = 0.0
+    detail: dict[str, float] = field(default_factory=dict)
+    """Seconds and counters of the parts of a stage that a driver measures inside its eigensolver
+    workers (k-point drivers); worker seconds are summed over the workers."""
 
 
 @dataclass(frozen=True)
@@ -1156,6 +1159,8 @@ class SpinPolarizedSCFIteration:
     occupations_up: tuple[float, ...] = ()
     occupations_down: tuple[float, ...] = ()
     fermi_level: float = float("nan")
+    diagonalization_seconds: float = 0.0
+    total_seconds: float = 0.0
 
 
 @dataclass
@@ -1278,6 +1283,8 @@ class SpinPolarizedSinglePointResult:
     k-major: entries ``i*n_states:(i+1)*n_states`` belong to ``k_points[i]``."""
     k_weights: np.ndarray | None = None
     """Normalized k-point weights, shape ``(n_k,)``."""
+    timings: RunTimings | None = None
+    """Stage timings, recorded by the k-point driver (``None`` where not measured)."""
 
     @property
     def magnetic_moment(self) -> float:

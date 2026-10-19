@@ -568,6 +568,19 @@ The Hamiltonian and nonlocal potential remain matrix-free during iterative
 eigensolution. Static terms are prepared once; only density-dependent local
 fields change during SCF.
 
+## Preparing a large periodic cell
+
+The reference preparation of a periodic cell (local ionic potential, Kleinman-Bylander projectors, atomic
+densities) measures the distance of every grid point to every atom image, so it costs atoms x grid points x
+images: about 35 s for 64 atoms (47k points) and, extrapolated, almost two hours for 864 atoms (630k points).
+With `parsec_python.acceleration` imported (the `parsec_python.main` entry point does) the projectors and
+densities visit only the grid points inside the support radius of an atom (same rows and values as the scan),
+and the local potential is evaluated as an Ewald split whose reciprocal part is one FFT of the structure
+factor (the Gaussian width is chosen so the series ends below the Nyquist frequency of the grid, which makes
+it exact on the grid). The 864-atom cell is prepared in about a minute. The potential equals the direct sum
+once that sum is converged; the direct sum at its default tolerance leaves out images that still contribute a
+few 1e-6 Ry, so the two differ by that much (`acceleration/tests/test_periodic_setup.py`).
+
 ## Parallel k-points, band paths and GPUs (periodic systems)
 
 The eigenproblems of different k-points (and spin channels) are independent: only the Fermi
@@ -611,7 +624,12 @@ start when the residual stays above the band tolerance. The eigenvectors come to
 the density. If the subspaces of a worker's k-points would take more than 75% of the device memory they
 stay on the host between solves (`PARSEC_KPOINT_STATE_STORAGE=auto|device|host`).
 `PARSEC_KPOINT_SOLVER=host` restores the former route (host eigensolver, only the filter on the
-device); `python -m parsec_python.acceleration.benchmarks.check_kpoint_solver` times the two routes on
+device). The k-point drivers print an `SCF timing analysis` (initial potentials, diagonalization,
+density, Hartree, XC, mixing), the diagonalization time of every iteration and a `K-point solver detail`
+block (worker start-up, Bloch projectors, operator upload, eigensolver, eigenvector download and the
+device eigensolver's own seconds and counters, summed over the workers). A Gamma-only periodic
+spin-polarized run (no `Kpoint_Method`) goes through the 1x1x1 k-point driver when the k-points run on a
+device, because the Gamma-point spin driver has no device path; `python -m parsec_python.acceleration.benchmarks.check_kpoint_solver` times the two routes on
 an input. Static matrices (Laplacian, projectors) are uploaded
 once per device; an SCF step uploads only the local potential and fields. The host BLAS runs one thread per device worker.
 `python -m parsec_python.acceleration.benchmarks.check_gpu_kpoints` compares the device operator, the filter, a short non-collinear

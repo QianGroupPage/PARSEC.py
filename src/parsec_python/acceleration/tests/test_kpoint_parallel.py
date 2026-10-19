@@ -274,3 +274,32 @@ Correlation_Type: CA
         energy = [float(line.split()[3]) for line in on_device.splitlines() if "Total Energy =" in line and "iter" not in line]
         reference = [float(line.split()[3]) for line in on_host.splitlines() if "Total Energy =" in line and "iter" not in line]
         self.assertAlmostEqual(energy[-1], reference[-1], delta=2.0e-3)
+
+
+class IsolatedNonCollinearDeviceTests(unittest.TestCase):
+    """A non-collinear cluster hands its eigenproblem to the device k-point worker (one task)."""
+
+    def _energy(self, environment: dict) -> float:
+        import tempfile
+
+        from parsec_python.cli import main as cli_main
+        from parsec_python.tests.unit.test_noncollinear import _CLUSTER_INPUT
+
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            (directory / "Au_POTRE.DAT").write_bytes(_AU_POTRE.read_bytes())
+            (directory / "parsec.in").write_text(
+                _CLUSTER_INPUT.format(extra="begin Initial_NCL_Moment\n0 3 4\nend Initial_NCL_Moment\n"),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, environment):
+                self.assertEqual(cli_main([str(directory / "parsec.in"), "--quiet", "--no-archive"]), 0)
+            log = (directory / "parsec.out").read_text(encoding="utf-8")
+        return float(
+            [line for line in log.splitlines() if line.startswith("Total Energy")][-1].split()[3]
+        )
+
+    def test_device_route_reproduces_the_host_energy(self) -> None:
+        host = self._energy({"PARSEC_KPOINT_BACKEND": "cpu"})
+        device = self._energy({"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "1"})
+        self.assertAlmostEqual(device, host, delta=2.0e-3)

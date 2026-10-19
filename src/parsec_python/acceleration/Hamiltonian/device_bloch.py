@@ -409,13 +409,18 @@ class DeviceBlochConverter:
             hamiltonian.negative_laplacian,
             lambda: backend.matrix(hamiltonian.negative_laplacian, dtype=np.float64),
         )
+        # an isolated Hamiltonian has no Bloch term, and keeps its potential as ``effective_potential``
+        host_gradient = getattr(hamiltonian, "_k_gradient", None)
         k_gradient = None
-        if hamiltonian._k_gradient is not None:
+        if host_gradient is not None:
             k_gradient = self._cached(
-                hamiltonian._k_gradient,
-                lambda: backend.matrix(hamiltonian._k_gradient, dtype=np.float64),
+                host_gradient,
+                lambda: backend.matrix(host_gradient, dtype=np.float64),
             )
-        diagonal = backend.asarray(np.asarray(hamiltonian._diagonal, dtype=np.float64))
+        host_diagonal = getattr(hamiltonian, "_diagonal", None)
+        if host_diagonal is None:
+            host_diagonal = hamiltonian.effective_potential
+        diagonal = backend.asarray(np.asarray(host_diagonal, dtype=np.float64))
         nonlocal_operator = hamiltonian.nonlocal_operator
         projector_real = False
         if nonlocal_operator.projectors.shape[1] == 0:
@@ -472,12 +477,16 @@ class DeviceBlochConverter:
         return self._cached(soc_projectors, build)
 
     def operator(self, hamiltonian) -> DeviceBlochOperator:
-        """Device operator for a host ``KPointKohnShamHamiltonian`` or spinor one."""
+        """Device operator for a host ``KPointKohnShamHamiltonian`` or spinor one.
+
+        A k-point spinor Hamiltonian carries its scalar part as ``scalar_hamiltonian``; the spinor
+        Hamiltonian of an isolated system (``SpinorKohnShamHamiltonian``) is its own scalar part.
+        """
         backend = self.backend
         backend.use()
         scalar = getattr(hamiltonian, "scalar_hamiltonian", None)
-        spinor = scalar is not None
-        parts = self._scalar_parts(scalar if spinor else hamiltonian)
+        spinor = scalar is not None or hasattr(hamiltonian, "soc_projectors")
+        parts = self._scalar_parts(scalar if scalar is not None else hamiltonian)
         soc, delta, field = None, None, None
         if spinor:
             soc = self._soc_parts(hamiltonian.soc_projectors, int(parts[2].shape[0]))

@@ -72,6 +72,28 @@ class DeviceOperatorTests(_PeriodicFixture):
                 np.testing.assert_allclose(device.matmat(spinor), host.apply(spinor), atol=1e-10)
                 self.assertEqual(device.dimension, 2 * self.grid.size)
 
+    def test_isolated_spinor_operator_matches_the_host(self) -> None:
+        """The spinor Hamiltonian of an isolated system (no ``scalar_hamiltonian``, no Bloch term)."""
+        from parsec_python.Hamiltonian.spinor_operator import SpinorKohnShamHamiltonian
+        from parsec_python.V_ion import build_nonlocal_projectors
+
+        gamma_nonlocal = build_nonlocal_projectors(
+            self.grid, self.atoms, self.pots, self.specs, self.cell.lattice_vectors
+        )
+        spinor = _random_spinor(self.grid.size, 4, seed=5)
+        for name, extra in (
+            ("noncollinear", dict(soc_projectors=(), xc_field=self.field)),
+            ("collinear", dict(soc_projectors=(), xc_delta=self.delta)),
+            ("noncollinear with soc", dict(soc_projectors=self.soc, xc_field=self.field)),
+        ):
+            with self.subTest(name):
+                host = SpinorKohnShamHamiltonian(
+                    self.laplacian, self.potential, gamma_nonlocal, **extra
+                )
+                device = self.converter.operator(host)
+                np.testing.assert_allclose(device.matmat(spinor), host.apply(spinor), atol=1e-10)
+                self.assertEqual(device.dimension, 2 * self.grid.size)
+
     def test_device_operator_is_hermitian(self) -> None:
         host = self._spinors()["field + soc"]
         operator = self.converter.operator(host).as_linear_operator()

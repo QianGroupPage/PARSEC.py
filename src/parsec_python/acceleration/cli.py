@@ -630,10 +630,13 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
             problem.periodic_cell is not None
             or problem.has_kpoint_sampling
             or problem.bands is not None
+            # the non-collinear driver hands its eigenproblem to the k-point device workers, also
+            # for an isolated system
+            or problem.scf.noncollinear
         )
         if resources.device == "gpu" and not reference_uses_gpu:
-            # Only the k-point drivers and band paths of the reference solver have a GPU
-            # path; anything else would run on the CPU under a request for the GPU.
+            # Only the k-point drivers, band paths and the non-collinear driver of the reference
+            # solver have a GPU path; anything else would run on the CPU under a request for the GPU.
             print(
                 f"Input error: {features} cannot run on the GPU here (the accelerated "
                 "path does not cover it, or CuPy is not usable), and the reference "

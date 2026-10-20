@@ -44,6 +44,7 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 | `Cooling_Method`, `Tinit`, `T_Final`, `T_Step`, `Time_Step`, `Friction_Coefficient`, `Step_num`, `Restart_mode`, `rng_seed`, `test_rng` | PARSEC's | Controls of `moldyn.f90`; see "Molecular dynamics" below. |
 | `Initial_Structure` | `input` | Not a PARSEC keyword. `mlff` relaxes the input structure with a machine-learned force field (UMA, MACE, `MLFF_Model`) before the first SCF loop; see [MLFF/README.md](MLFF/README.md). |
 | `Potential_Extrapolation` | `none` | Not a PARSEC keyword. How the SCF loop of a moved structure starts: `none` as PARSEC, `atomic` with the superposed atomic densities moved along with the atoms, `second_order` with the density change also extrapolated along the trajectory; see "Start of the next SCF loop" below. |
+| `Relaxation_SCF_Upscale` | 1 | Not a PARSEC keyword. `bfgs` and `simple` only: the SCF loop of a structure may stop at up to this many times `Convergence_Criterion` while the forces are large; 1 keeps the criterion fixed as PARSEC does. See "SCF criterion of a relaxation". |
 
 ### Command lines
 
@@ -194,6 +195,17 @@ starts, not where it ends (`SCF/single_point.py`):
   `d = rho_out - rho_atoms` is extrapolated as well,
   `rho_atoms(R_new) + 2 d(R_old) - d(R_older)`.
 
+The eigensolver always starts from the subspace of the last structure. A
+first-order extrapolation of that subspace along an MD trajectory (QE's
+`wfc_extrapolation = 'first_order'`: `2 X(t) - X(t-1) R`, with `R` the
+polar factor of the overlap of the two bases) was tried and left out: it
+saves no SCF iterations, since the density decides when the loop ends, and
+only lets the first iteration after a move filter at the later degree. On
+C35H36 (`second_order`) that gave 3.2 iterations per step against 3.1 with
+the stronger first filter; on C795H300 (four A100) 4.0 against 3.6
+iterations, 10.96 against 10.66 s per step and 18 GB more on each GPU,
+and C1653H508 no longer fitted.
+
 Without superposed atomic densities as the first density (an imported or
 predicted one) and with spin polarization the loop starts as with `none`.
 The extrapolation alone saved nothing on nanodiamonds; with the stronger
@@ -202,6 +214,45 @@ structure (numbers under "On A100 GPUs"). Converged tightly, both starts give
 Fortran's trajectory; at a loose SCF criterion a trajectory changes within
 the SCF noise of its forces, so a relaxation can end one or two structures
 earlier or later.
+
+### SCF criterion of a relaxation
+
+With `Relaxation_SCF_Upscale: U` the SCF loop of a structure stops at
+`Convergence_Criterion * clamp(F / Force_Min, 1, U)`, `F` the largest force
+on a movable atom of the structure before, and that of the input structure
+at `U` times the criterion (`adaptive_scf_criterion` in
+`Relaxation/ionic_loop.py`; Quantum ESPRESSO's `upscale` scales its
+criterion the same way from the other end). A structure whose forces meet
+`Force_Min` at a looser criterion is converged again at
+`Convergence_Criterion`, continuing from its own loop, before the mover sees
+it, so the run ends on forces of the input's accuracy. The log names the
+criterion of every structure.
+
+The forces of a looser loop are less accurate. C35H36 at its input
+structure (largest force 0.037 Ry/bohr), from superposed atomic densities:
+
+| Criterion | SCF iterations | Energy error | Largest force error |
+|---|---:|---:|---:|
+| 2e-4 Ry | 13 | 9e-7 Ry | 9e-5 Ry/bohr |
+| 5e-4 Ry | 11 | 5e-6 Ry | 5e-5 Ry/bohr |
+| 1e-3 Ry | 9 | 5e-5 Ry | 6e-4 Ry/bohr |
+| 2e-3 Ry | 7 | 4e-4 Ry | 1.1e-3 Ry/bohr |
+
+The criterion is `U` times looser only where the forces are `U` times
+`Force_Min` or more, so the error stays near a hundredth of the force. The
+BFGS relaxation of C35H36 (`Force_Min` 0.01 Ry/bohr, `atomic`) took 9
+structures and 64 SCF iterations at the fixed criterion, 8 structures and
+43 iterations with `U = 10`; the two final structures differ by at most
+0.015 bohr, within what `Force_Min` allows. On 16 A100 (inputs of
+`gpu_benchmark/`, `atomic`), with `U = 10` against 1:
+
+| Cluster | Structures | SCF per later structure | Program |
+|---|---:|---:|---:|
+| C795H300 | 7 and 7 | 1.51 s against 1.77 s | 19.2 s against 21.0 s |
+| C1653H508 | 6 and 6 | 3.95 s against 4.24 s | 38.0 s against 40.4 s |
+
+The final energies differ by 4e-5 Ry and 2.5e-3 Ry (about 1e-6 Ry per
+atom): both runs meet `Force_Min` at slightly different structures.
 
 Symmetry: the point-group operations of the input structure that respect the
 movable flags are found once. Forces are averaged over them and so are the
@@ -267,16 +318,40 @@ Nothing leaves the devices that a single point keeps there.
   contracts its part of the nonlocal force (`forces`); the root sums them.
 
 The multi-node runner divides the symmetry sectors of the structure among its
-ranks. A structure without point-group symmetry, a relaxation whose movable
-flags break the symmetry, a `manual` run and molecular dynamics therefore run
-on the GPUs of one node. Launched with one rank, the runner solves them as
-the single sector of the identity, whose basis the GPUs of the node share
-column by column (`PARSEC_CUPY_SINGLE_SECTOR=auto`, the default; `on` takes
-this route outside the runner too, `off` never). The numbers are those of
-the full grid; each GPU holds a quarter of the orbitals. `--serial-control`
-keeps the former route, on which the first GPU holds them all. Several nodes
-for such runs would need the grid divided among them, which the SCF loop does
-not do.
+ranks, one per node. A structure without point-group symmetry, a relaxation
+whose movable flags break the symmetry, a `manual` run and molecular
+dynamics have one sector, the identity. Launched with one rank, the runner
+solves it on the GPUs of one node, which share its basis column by column
+(`PARSEC_CUPY_SINGLE_SECTOR=auto`, the default; `on` takes this route outside
+the runner too, `off` never). The numbers are those of the full grid; each
+GPU holds a quarter of the orbitals. `--serial-control` keeps the former
+route, on which the first GPU holds them all.
+
+On several nodes such a run starts one rank per GPU
+(`scripts/run_multi_gpu_scf.sh --nodes N --rank-per-gpu`), and the ranks
+share the basis of the one sector (`acceleration/Eigensolvers/mpi_shared_basis.py`):
+each holds all grid rows of its columns with a replica of the operator and
+filters them alone; the Ritz step moves the filtered columns and `H` times
+them to row blocks (`Alltoallv` of GPU arrays), sums the Gram matrices,
+lets the root solve the small problem and broadcast the coefficients, and
+moves the rotated rows back. Densities and nonlocal forces are summed over
+the ranks; the root alone runs the Hartree solve, the mixer and the mover.
+The trial basis is the single-device DLARNV stream, so the runs give the
+trajectory of one node. Molecular dynamics with `second_order` on A100,
+per later structure (`md_nrg.dat` equal to that of one node to the last
+printed digit in every case, 3.6 SCF iterations per structure):
+
+| Cluster | One node, one rank | 4 ranks, one node | 8 ranks, two nodes | 16 ranks, four nodes |
+|---|---:|---:|---:|---:|
+| C795H300 | 10.66 s, 14.2 GB | 13.07 s | 9.65 s | 6.77 s, 15.6 GB |
+| C1653H508 | 40.47 s, 39.8 GB | | | 23.02 s, 39.0 GB |
+
+On one node the shared basis of a single rank is faster: its devices copy
+their blocks to each other directly. Across nodes the exchanges carry about
+17 GB/s per rank, near what the network interface of a GPU carries, and take
+half of the eigensolver's time on 16 ranks (C795H300: per Ritz step 0.37 s to
+rows, 0.19 s back, against 0.32 s of filtering). A filter pipelined with
+those exchanges was measured slower and left out (see the module).
 
 ## Differences from Fortran PARSEC
 

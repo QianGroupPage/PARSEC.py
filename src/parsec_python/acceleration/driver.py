@@ -1409,6 +1409,8 @@ def _planned_sector_device_groups(
             mpi_context.size,
             mpi_context.rank,
             device_ids,
+            # The one sector of a run without symmetry, which the ranks share.
+            shared=int(representation_count) == 1 and mpi_context.size > 1,
         )
     return {
         index: (device_ids[index % len(device_ids)],)
@@ -4214,14 +4216,22 @@ def run_scf(
     *,
     callback: Callable[[SCFIteration], None] | None = None,
     warm_start=None,
+    convergence_criterion: float | None = None,
 ) -> AcceleratedSinglePointResult:
     """Run the validated SCF loop using the selected execution backend.
 
     ``warm_start`` continues from the loop of the structure before an ionic
     move; :func:`warm_start_for_moved_atoms` builds it.
+    ``convergence_criterion`` replaces the criterion of the input for this
+    loop.
     """
 
-    result = run_accelerated_scf(system, callback=callback, warm_start=warm_start)
+    result = run_accelerated_scf(
+        system,
+        callback=callback,
+        warm_start=warm_start,
+        convergence_criterion=convergence_criterion,
+    )
     boundary_check = _hartree_boundary_check(system, result)
     if boundary_check:
         result.backend = replace(
@@ -4356,6 +4366,7 @@ def ionic_backend(potential_extrapolation: str = "none"):
         compute_forces=compute_forces,
         update_geometry=update_geometry,
         warm_start=partial(warm_start_for_moved_atoms, **keywords),
+        restart_scf=lambda system, result: warm_start_for_moved_atoms(system, result, system),
     )
 
 

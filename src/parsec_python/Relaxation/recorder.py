@@ -12,11 +12,24 @@ drivers use.  It writes what a PARSEC user expects beside the input,
 adds an extended-XYZ trajectory with energies and forces, and sends the SCF
 iterations, the force tables and the movement lines of each step to the text
 reporter of the run.
+
+The files are formatted and written by a host thread of their own, in the
+order of the events, while the next SCF loop runs: the state of the
+optimizer in ``relax_restart.dat`` alone is some 10^5 numbers in the layout
+of gfortran for a cluster of a thousand atoms.  What the thread writes is
+taken from copies, and :meth:`RelaxationRecorder.finish` waits for it, so the
+files are those of a recorder without the thread
+(``PARSEC_IONIC_FILE_THREAD=off``, which writes them where the events
+happen).  The lines of the log are written at once, in order.
 """
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import os
 from pathlib import Path
+import time
 from typing import Callable, Sequence
 
 import numpy as np
@@ -33,12 +46,45 @@ from .files import (
     format_xyz_frame,
 )
 from .ionic_loop import IonicObserver, IonicOutcome, IonicStepRecord
+from .lbfgsb import RestartBlockFormatter
 
 
 ATOM_COR = "atom.cor"
 ITERATE = "iterate.dat"
 RELAX_RESTART = "relax_restart.dat"
 TRAJECTORY = "relaxation.xyz"
+
+
+def file_thread_setting() -> str:
+    """``PARSEC_IONIC_FILE_THREAD``: ``on`` (default) or ``off``."""
+
+    value = os.environ.get("PARSEC_IONIC_FILE_THREAD", "on").strip().lower() or "on"
+    if value in {"1", "true", "yes"}:
+        value = "on"
+    if value in {"0", "false", "no"}:
+        value = "off"
+    if value not in {"on", "off"}:
+        raise ValueError("PARSEC_IONIC_FILE_THREAD must be on or off")
+    return value
+
+
+def _snapshot(state):
+    """A copy of an L-BFGS-B state that later calls of the optimizer do not change."""
+
+    if state is None:
+        return None
+    return replace(
+        state,
+        lsave=state.lsave.copy(),
+        isave=state.isave.copy(),
+        dsave=state.dsave.copy(),
+        wa=state.wa.copy(),
+        iwa=state.iwa.copy(),
+    )
+
+
+def _copy(array):
+    return None if array is None else np.array(array, dtype=np.float64, copy=True)
 
 
 class RelaxationRecorder(IonicObserver):
@@ -69,29 +115,95 @@ class RelaxationRecorder(IonicObserver):
         self.elements = None if elements is None else list(elements)
         self._scf: tuple[object, float] | None = None
         self.files: list[Path] = []
+        self._writer: ThreadPoolExecutor | None = None
+        self._pending: list = []
+        self._held: list = []
+        if self.directory is not None and file_thread_setting() == "on":
+            self._writer = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="parsec-ionic-files"
+            )
+        # On the file thread the formatter yields the interpreter lock to the
+        # SCF loop now and then; without the thread it need not.
+        self._block = RestartBlockFormatter(
+            pause=None if self._writer is None else (lambda: time.sleep(0))
+        )
 
     # ----- files ---------------------------------------------------------
 
     def _path(self, name: str) -> Path | None:
         return None if self.directory is None else self.directory / name
 
-    def _start(self, name: str, text: str) -> None:
+    def _later(self, work: Callable[[], None]) -> None:
+        """Run ``work`` on the file thread, after the work given before it.
+
+        The work of a movement is held until the next SCF loop begins
+        (:meth:`_release`): the rebuild for the moved atoms, which comes
+        first, runs on the host too, and the thread would compete with it.
+        """
+
+        if self._writer is None:
+            work()
+            return
+        self._held.append(work)
+
+    def _release(self) -> None:
+        """Hand the held work to the file thread; raise what the thread raised."""
+
+        if self._writer is None:
+            return
+        still = []
+        for future in self._pending:
+            if future.done():
+                future.result()
+            else:
+                still.append(future)
+        held, self._held = self._held, []
+        still.extend(self._writer.submit(work) for work in held)
+        self._pending = still
+
+    def flush(self) -> None:
+        """Wait until every file is written; raise what the file thread raised."""
+
+        self._release()
+        pending, self._pending = self._pending, []
+        for future in pending:
+            future.result()
+
+    def _start(self, name: str, text) -> None:
+        """Write file ``name`` anew with ``text``, a string or a function returning one."""
+
         path = self._path(name)
         if path is None:
             return
-        path.write_text(text, encoding="utf-8", newline="\n")
         self.files.append(path)
 
-    def _append(self, name: str, text: str) -> None:
+        def work():
+            # A whole file at every moment: a run stopped while the thread
+            # writes keeps the previous relax_restart.dat.
+            partial = path.with_name(path.name + ".partial")
+            partial.write_text(text() if callable(text) else text, encoding="utf-8", newline="\n")
+            os.replace(partial, path)
+
+        self._later(work)
+
+    def _append(self, name: str, text) -> None:
+        """Append ``text``, a string or a function returning one, to file ``name``."""
+
         path = self._path(name)
         if path is None:
             return
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
+
+        def work():
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(text() if callable(text) else text)
+
+        self._later(work)
 
     # ----- events --------------------------------------------------------
 
     def scf_start(self, step: int, system) -> None:
+        # The files of the last movement are written while this SCF loop runs.
+        self._release()
         if step == 0:
             symbols = [atom.symbol for atom in system.atoms]
             positions = np.array([atom.position for atom in system.atoms])
@@ -110,6 +222,24 @@ class RelaxationRecorder(IonicObserver):
             )
         )
 
+    def scf_criterion(self, step: int, criterion: float, again: bool) -> None:
+        if again:
+            self.write(
+                "\n".join(
+                    [
+                        "",
+                        " The forces of this structure meet Force_Min at a looser SCF",
+                        f" criterion: the SCF loop continues to {criterion:.2E} Ry.",
+                        "",
+                    ]
+                )
+            )
+        else:
+            self.write(
+                f" SCF criterion of structure {step:4d}: {criterion:.2E} Ry"
+                " (Relaxation_SCF_Upscale)"
+            )
+
     def scf_iteration(self, step: int, iteration) -> None:
         self.reporter.iteration(iteration)
 
@@ -127,9 +257,10 @@ class RelaxationRecorder(IonicObserver):
         report: MoveReport | None,
         state: MovementState,
     ) -> None:
+        # The record is not changed after this step: the thread formats it.
         self._append(
             TRAJECTORY,
-            format_xyz_frame(
+            lambda: format_xyz_frame(
                 record.symbols,
                 record.positions,
                 step=step,
@@ -161,16 +292,19 @@ class RelaxationRecorder(IonicObserver):
             # domove.f90 saves the restart information after every move and
             # announces the next structure unless the movements are used up.
             bfgs = self.settings.method == "bfgs"
+            # The optimizer goes on changing its state: the thread formats a copy.
             restart = RelaxRestart(
-                positions=report.positions,
+                positions=_copy(report.positions),
                 iteration=step,
                 movable_atoms=self.movable_atoms,
-                lbfgsb=state.lbfgsb if bfgs else None,
-                lower=state.lower if bfgs else None,
-                upper=state.upper if bfgs else None,
+                lbfgsb=_snapshot(state.lbfgsb) if bfgs else None,
+                lower=_copy(state.lower) if bfgs else None,
+                upper=_copy(state.upper) if bfgs else None,
                 bound_step=state.bound_step if bfgs else None,
             )
-            self._start(RELAX_RESTART, format_relax_restart(restart))
+            self._start(
+                RELAX_RESTART, lambda: format_relax_restart(restart, block=self._block)
+            )
             if step < self.settings.max_movements:
                 text += format_atom_cor_structure(
                     step + 1, record.symbols, report.positions
@@ -218,6 +352,10 @@ class RelaxationRecorder(IonicObserver):
         if outcome.positions is not None:
             text += format_atom_cor_final(outcome.positions)
         self._append(ATOM_COR, text)
+        self.flush()
+        if self._writer is not None:
+            self._writer.shutdown(wait=True)
+            self._writer = None
 
 
 __all__ = ["ATOM_COR", "ITERATE", "RELAX_RESTART", "RelaxationRecorder", "TRAJECTORY"]

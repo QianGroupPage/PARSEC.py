@@ -18,6 +18,7 @@ eigenpair or energy residual.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import os
 import time
 from typing import Callable, Mapping
 import warnings
@@ -1018,6 +1019,24 @@ def complete_single_point(
     )
 
 
+def geometry_thread_setting() -> str:
+    """``PARSEC_GEOMETRY_THREAD``: ``on`` (default) or ``off``.
+
+    ``on`` builds the projectors of moved atoms on a host thread while the
+    local potential and the densities are made; ``off`` one after another.
+    Neither changes a number.
+    """
+
+    value = os.environ.get("PARSEC_GEOMETRY_THREAD", "on").strip().lower() or "on"
+    if value in {"1", "true", "yes"}:
+        value = "on"
+    if value in {"0", "false", "no"}:
+        value = "off"
+    if value not in {"on", "off"}:
+        raise ValueError("PARSEC_GEOMETRY_THREAD must be on or off")
+    return value
+
+
 def update_geometry(
     system: PreparedSinglePointSystem,
     atoms,
@@ -1065,20 +1084,30 @@ def update_geometry(
     _require_atoms_inside_domain(problem.grid, atoms)
     pseudopotentials = system.pseudopotentials
 
-    stage_start = time.perf_counter()
     build_nonlocal = (
         build_nonlocal_projectors
         if nonlocal_projector_builder is None
         else nonlocal_projector_builder
     )
-    nonlocal_operator = build_nonlocal(
-        grid, atoms, pseudopotentials, problem.pseudopotentials
-    )
-    if nonlocal_projector_builder is not None:
-        _require_core_radius_support(
-            nonlocal_operator, grid, atoms, pseudopotentials
-        )
-    nonlocal_ionic_seconds = time.perf_counter() - stage_start
+
+    def projectors():
+        stage_start = time.perf_counter()
+        operator = build_nonlocal(grid, atoms, pseudopotentials, problem.pseudopotentials)
+        if nonlocal_projector_builder is not None:
+            _require_core_radius_support(operator, grid, atoms, pseudopotentials)
+        return operator, time.perf_counter() - stage_start
+
+    pending = None
+    if system.ionic_potential is not None and geometry_thread_setting() == "on":
+        # The projectors are built on the host beside the local potential and
+        # the densities, which the accelerated builders make on a device.
+        from concurrent.futures import ThreadPoolExecutor
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parsec-projectors")
+        pending = executor.submit(projectors)
+        executor.shutdown(wait=False)
+    else:
+        nonlocal_operator, nonlocal_ionic_seconds = projectors()
     if system.ionic_potential is None:
         # A system prepared with ``orbital_operators_only`` applies the
         # Hamiltonian for an SCF loop that runs elsewhere: it has projectors
@@ -1119,6 +1148,8 @@ def update_geometry(
         boundary_plan,
         build_atomic_tail,
     )
+    if pending is not None:
+        nonlocal_operator, nonlocal_ionic_seconds = pending.result()
     return replace(
         system,
         input=problem,
@@ -1223,12 +1254,15 @@ def run_scf(
     total_energy_evaluator: Callable[..., object] | None = None,
     scalar_field_adapter: object | None = None,
     warm_start: SCFWarmStart | None = None,
+    convergence_criterion: float | None = None,
 ) -> SinglePointResult:
     """Run PARSEC-style potential mixing on a prepared system.
 
     ``warm_start`` continues from the SCF loop of a previous structure (see
     :class:`SCFWarmStart`); without it the loop starts from the prepared
-    initial density.
+    initial density.  ``convergence_criterion`` replaces the
+    ``Convergence_Criterion`` of the input for this loop (Ry), as a
+    relaxation with ``Relaxation_SCF_Upscale`` asks.
 
     A spin-polarized system (``Spin_Polarization``) is handed to
     :func:`parsec_python.SCF.spin_polarized.run_spin_scf`, which runs the
@@ -1259,6 +1293,7 @@ def run_scf(
             total_energy_evaluator=total_energy_evaluator,
             scalar_field_adapter=scalar_field_adapter,
             warm_start=warm_start,
+            convergence_criterion=convergence_criterion,
         )
     scf_start = time.perf_counter()
     # The validated reference path always selects ``solve_eigval`` here.  The
@@ -1310,6 +1345,8 @@ def run_scf(
     # internally works with number_of_states + subspace_buffer vectors.
     number_of_states = _number_of_states(system)
     settings = system.input.scf
+    if convergence_criterion is not None:
+        settings = replace(settings, convergence_criterion=float(convergence_criterion))
     eigensolver_settings = system.input.eigensolver
     if eigensolver_settings.method not in {"chebff", "chebdav"}:
         raise NotImplementedError(

@@ -723,6 +723,8 @@ def _parse_parsec_input(
         "max_step",
         "min_step",
         "bfgs_number_corr",
+        # PARSEC.py extension: a looser SCF criterion while the forces are large.
+        "relaxation_scf_upscale",
         *_MOLECULAR_DYNAMICS_KEYS,
         "dynamic_diag_tol",
         # PARSEC.py extension: the start of the SCF loop after a move.
@@ -1611,6 +1613,21 @@ def _parse_parsec_input(
         bridge=input_relative_path("ml_density_bridge"),
     )
 
+    scf_upscale = 1.0
+    if "relaxation_scf_upscale" in scalar:
+        scf_upscale = _strict_float(
+            one("relaxation_scf_upscale"), label="Relaxation_SCF_Upscale"
+        )
+        if not (np.isfinite(scf_upscale) and scf_upscale >= 1.0):
+            raise ParsecInputError("Relaxation_SCF_Upscale must be a number of at least 1")
+        if minimization not in {"bfgs", "simple"}:
+            if scf_upscale != 1.0:
+                warnings.append(
+                    "Relaxation_SCF_Upscale loosens the SCF loops of a BFGS or "
+                    "steepest-descent relaxation; here it is ignored."
+                )
+            scf_upscale = 1.0
+
     relaxation = None
     use_symmetry = True
     # A manual run keeps the coordinates of the input and of manual.dat as
@@ -1633,6 +1650,7 @@ def _parse_parsec_input(
                 one("bfgs_number_corr", "7"), label="BFGS_number_corr"
             ),
             restart=optional_bool("relax_restart"),
+            scf_upscale=scf_upscale,
         )
         if minimization == "manual":
             # parsec.F90 uses no symmetry when the structures are imposed,

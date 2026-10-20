@@ -384,7 +384,8 @@ class CuPySymmetryDensityBuilder:
                 int(device)
                 for item in vectors
                 if isinstance(item, DistributedBasis) and self.shared_release
-                for device in item.group.devices
+                # A basis that MPI ranks share names the device of this rank.
+                for device in getattr(item.group, "local_devices", item.group.devices)
             }
         )
         started = perf_counter()

@@ -33,6 +33,29 @@ from .domove import MoveReport, MovementState, RelaxationSettings, domove
 from .files import RYDBERG_TO_EV, RelaxRestart
 
 
+def adaptive_scf_criterion(
+    criterion: float, upscale: float, largest_force: float | None, minimum_force: float
+) -> float:
+    """The SCF criterion of the next structure of a relaxation (``Relaxation_SCF_Upscale``).
+
+    ``criterion * clamp(F / Force_Min, 1, upscale)`` with ``F`` the largest
+    force on a movable atom of the last structure, and ``criterion *
+    upscale`` before any force (the input structure).  The forces of an SCF
+    loop stopped at a looser criterion are less accurate, by an amount that
+    is small beside large forces; as the forces approach ``Force_Min`` the
+    criterion returns to the one of the input.  Quantum ESPRESSO's
+    ``upscale`` scales its criterion in the same way, from the other end.
+    """
+
+    if upscale <= 1.0:
+        return float(criterion)
+    if largest_force is None:
+        return float(criterion) * float(upscale)
+    return float(criterion) * min(
+        max(float(largest_force) / float(minimum_force), 1.0), float(upscale)
+    )
+
+
 class IonicObserver:
     """Receives the events of an ionic loop; every method may be overridden.
 
@@ -41,6 +64,14 @@ class IonicObserver:
 
     def scf_start(self, step: int, system) -> None:
         """An SCF loop is about to start for structure ``step``."""
+
+    def scf_criterion(self, step: int, criterion: float, again: bool) -> None:
+        """The SCF loop of structure ``step`` runs to ``criterion`` (Ry).
+
+        Called only with ``Relaxation_SCF_Upscale``: before the loop of each
+        structure, and with ``again`` before the second loop of a structure
+        whose forces met ``Force_Min`` at a looser criterion.
+        """
 
     def scf_iteration(self, step: int, iteration) -> None:
         """One SCF iteration of structure ``step`` finished."""
@@ -122,6 +153,48 @@ def run_relaxation(
     symmetrize: bool = True,
     output_level: int = 1,
 ) -> IonicOutcome:
+    """Relax a prepared system; see :func:`_relaxation_loop`.
+
+    An observer that writes on a thread of its own (a ``flush`` method) has
+    written everything when this returns, also when a structure failed.
+    """
+
+    try:
+        return _relaxation_loop(
+            system,
+            settings,
+            backend,
+            movable=movable,
+            observer=observer,
+            restart=restart,
+            manual_structures=manual_structures,
+            warm_start=warm_start,
+            symmetrize=symmetrize,
+            output_level=output_level,
+        )
+    except BaseException:
+        flush = getattr(observer, "flush", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:
+                pass  # The error of the structure is the one to report.
+        raise
+
+
+def _relaxation_loop(
+    system,
+    settings: RelaxationSettings,
+    backend: IonicBackend,
+    *,
+    movable: Sequence[bool] | None = None,
+    observer: IonicObserver | None = None,
+    restart: RelaxRestart | None = None,
+    manual_structures: Sequence[np.ndarray] | None = None,
+    warm_start: bool = True,
+    symmetrize: bool = True,
+    output_level: int = 1,
+) -> IonicOutcome:
     """Relax a prepared system; the control flow of ``parsec.F90``.
 
     ``movable`` marks the atoms that move (all of them by default, and
@@ -164,28 +237,76 @@ def run_relaxation(
     state = MovementState()
     outcome = IonicOutcome(state=state)
     carried = None
+    # Relaxation_SCF_Upscale: the SCF criterion of each structure follows
+    # its forces (adaptive_scf_criterion); 1 keeps PARSEC's fixed criterion.
+    upscale = float(settings.scf_upscale) if settings.method in {"bfgs", "simple"} else 1.0
+    base_criterion = (
+        float(system.input.scf.convergence_criterion) if upscale > 1.0 else None
+    )
+    criterion = (
+        None
+        if base_criterion is None
+        else adaptive_scf_criterion(base_criterion, upscale, None, settings.minimum_force)
+    )
+
+    def largest_movable(forces) -> float:
+        moving = np.asarray(forces.total)[mask]
+        return float(np.max(np.linalg.norm(moving, axis=1), initial=0.0))
+
     while True:
         step = state.number
         started = time.perf_counter()
         watch.scf_start(step, system)
+        keywords = {}
+        if criterion is not None:
+            watch.scf_criterion(step, criterion, False)
+            keywords["convergence_criterion"] = criterion
         result = backend.run_scf(
             system,
             callback=lambda iteration, step=step: watch.scf_iteration(step, iteration),
             warm_start=carried,
+            **keywords,
         )
-        scf_done = time.perf_counter()
-        watch.scf_finish(step, system, result, scf_done - started)
+        scf_seconds = time.perf_counter() - started
+        watch.scf_finish(step, system, result, scf_seconds)
         forces_started = time.perf_counter()
         forces = backend.compute_forces(
             system, result, symmetrize=operations is not None, operations=operations
         )
-        forces_done = time.perf_counter()
+        forces_seconds = time.perf_counter() - forces_started
+        iterations = int(result.iterations)
+        if (
+            criterion is not None
+            and criterion > base_criterion
+            and largest_movable(forces) < settings.minimum_force
+        ):
+            # The run would end on the forces of a looser loop: converge this
+            # structure to the criterion of the input first.
+            watch.scf_criterion(step, base_criterion, True)
+            again_started = time.perf_counter()
+            restart_scf = backend.restart_scf or (
+                lambda system, result: backend.warm_start(system, result, system)
+            )
+            result = backend.run_scf(
+                system,
+                callback=lambda iteration, step=step: watch.scf_iteration(step, iteration),
+                warm_start=restart_scf(system, result) if warm_start else None,
+                convergence_criterion=base_criterion,
+            )
+            scf_seconds += time.perf_counter() - again_started
+            iterations += int(result.iterations)
+            watch.scf_finish(step, system, result, scf_seconds)
+            forces_started = time.perf_counter()
+            forces = backend.compute_forces(
+                system, result, symmetrize=operations is not None, operations=operations
+            )
+            forces_seconds += time.perf_counter() - forces_started
         watch.forces(step, system, forces)
         clock = {
             "step": float(step),
-            "scf": scf_done - started,
-            "forces": forces_done - forces_started,
-            "report": forces_started - scf_done + time.perf_counter() - forces_done,
+            "scf": scf_seconds,
+            "forces": forces_seconds,
+            "report": time.perf_counter() - started - scf_seconds - forces_seconds,
             "move": 0.0,
             "update": 0.0,
         }
@@ -208,7 +329,7 @@ def run_relaxation(
             energy=energy,
             energy_per_atom_ev=RYDBERG_TO_EV * energy / atom_count,
             converged=bool(result.converged),
-            scf_iterations=int(result.iterations),
+            scf_iterations=iterations,
             forces=forces,
             maximum_force=float(
                 np.max(np.linalg.norm(moving, axis=1), initial=0.0)
@@ -220,6 +341,10 @@ def run_relaxation(
         outcome.positions = positions
         outcome.scf_failed = outcome.scf_failed or not result.converged
 
+        if criterion is not None:
+            criterion = adaptive_scf_criterion(
+                base_criterion, upscale, record.maximum_force, settings.minimum_force
+            )
         if settings.max_movements == 0:
             watch.movement(step, record, None, state)
             break
@@ -275,6 +400,7 @@ def run_relaxation(
 
 
 __all__ = [
+    "adaptive_scf_criterion",
     "IonicBackend",
     "IonicObserver",
     "IonicOutcome",

@@ -151,8 +151,11 @@ symmetry wedge of the grid.
 
 The ranks divide the symmetry sectors of the structure. A structure without
 point-group symmetry, a relaxation whose `Move_Flag` breaks the symmetry, a
-`manual` relaxation and molecular dynamics therefore run on the GPUs of one
-node, with the runner option `--serial-control`.
+`manual` relaxation and molecular dynamics have one sector: one rank solves it
+on the GPUs of one node, or one rank per GPU on several nodes
+(`scripts/run_multi_gpu_scf.sh --rank-per-gpu`), whose ranks share its basis
+(`Eigensolvers/mpi_shared_basis.py`; numbers in
+`../FORCES_AND_RELAXATION.md`, "On GPUs and several nodes").
 
 Measured for C795H300 on A100 nodes (seven structures to 0.01 Ry/bohr with
 the inputs of the series above): 47 s on 4 GPUs, 35 s on 8 and 30 s on 16,

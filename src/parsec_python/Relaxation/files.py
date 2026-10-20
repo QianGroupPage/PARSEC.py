@@ -170,8 +170,13 @@ class RelaxRestart:
     bound_step: float | None = None
 
 
-def format_relax_restart(restart: RelaxRestart) -> str:
-    """Write ``relax_restart.dat`` as ``domove.f90`` does."""
+def format_relax_restart(restart: RelaxRestart, block=format_restart_block) -> str:
+    """Write ``relax_restart.dat`` as ``domove.f90`` does.
+
+    ``block`` formats the optimizer state: :func:`format_restart_block` or a
+    :class:`parsec_python.Relaxation.lbfgsb.RestartBlockFormatter` that
+    keeps the records of the previous move.
+    """
 
     lines = ["  Atomic coordinates follow (all atoms)"]
     for row in np.asarray(restart.positions, dtype=np.float64):
@@ -181,7 +186,7 @@ def format_relax_restart(restart: RelaxRestart) -> str:
     text = "\n".join(lines) + "\n"
     if restart.lbfgsb is not None:
         text += "  LBFGS work variables follow\n"
-        text += format_restart_block(
+        text += block(
             restart.lbfgsb,
             restart.lower,
             restart.upper,

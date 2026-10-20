@@ -405,7 +405,11 @@ scripts/run_multi_gpu_scf.sh parsec.in output_directory
 scripts/run_multi_gpu_scf.sh --nodes 1 --gpus-per-node 2 parsec.in output_directory
 ```
 
-The first form uses every node of the allocation with four GPUs each.
+The first form uses every node of the allocation with four GPUs each. A run
+without point-group symmetry, such as molecular dynamics, has a single
+symmetry sector; on several nodes add `--rank-per-gpu`, which starts one rank
+per GPU that share its orbitals (C1653H508 MD: 40.5 s per step on one node,
+23.0 s on four).
 `src/parsec_python/acceleration/MULTI_GPU.md` ("Several nodes") lists the
 settings and says which ones the solver chooses for itself.
 

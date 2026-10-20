@@ -188,19 +188,23 @@ def run_recorded_relaxation(
         directory=directory,
         elements=elements,
     )
-    return run_relaxation(
-        system,
-        settings,
-        backend,
-        movable=translation.movable,
-        observer=recorder,
-        restart=restart,
-        manual_structures=(
-            None if source is None else manual_structures(translation, source)
-        ),
-        symmetrize=symmetrize,
-        output_level=translation.output_level,
-    )
+    try:
+        return run_relaxation(
+            system,
+            settings,
+            backend,
+            movable=translation.movable,
+            observer=recorder,
+            restart=restart,
+            manual_structures=(
+                None if source is None else manual_structures(translation, source)
+            ),
+            symmetrize=symmetrize,
+            output_level=translation.output_level,
+        )
+    finally:
+        # Also when a structure failed: the files are complete on return.
+        recorder.flush()
 
 
 def run_single_point_with_forces(
@@ -268,6 +272,12 @@ def relaxation_header_lines(translation) -> list[str]:
     if extrapolation != "none":
         # Not a line of PARSEC, which always starts from the last potential.
         lines.append(f" Potential extrapolation after a move: {extrapolation}")
+    if settings.method in {"bfgs", "simple"} and settings.scf_upscale > 1.0:
+        # Not a line of PARSEC, which keeps Convergence_Criterion fixed.
+        lines.append(
+            f" SCF criterion up to {settings.scf_upscale:g} times Convergence_Criterion"
+            " while the forces exceed Force_Min (Relaxation_SCF_Upscale)"
+        )
     return [*lines, ""]
 
 

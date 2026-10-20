@@ -11,10 +11,12 @@
 # An input with Minimization (bfgs, simple) runs the structural relaxation on
 # the same layout, and Skip_Force: false adds the forces to a single point;
 # OUTPUT_DIR then also receives atom.cor, relax_restart.dat, iterate.dat and
-# relaxation.xyz. The ranks divide the symmetry sectors of the structure, so
-# a structure without point-group symmetry, a manual relaxation and molecular
-# dynamics run on one node with the runner option --serial-control. See
-# src/parsec_python/FORCES_AND_RELAXATION.md.
+# relaxation.xyz. The ranks divide the symmetry sectors of the structure. A
+# structure without point-group symmetry, a manual relaxation and molecular
+# dynamics have one sector: they run on one node with one rank, or on several
+# nodes with --rank-per-gpu, which starts one rank per GPU; the ranks then
+# share the orbitals of that sector (src/parsec_python/acceleration/
+# Eigensolvers/mpi_shared_basis.py). See src/parsec_python/FORCES_AND_RELAXATION.md.
 #
 # Call the script by its path in the checkout, from a batch script or from the
 # shell of an interactive allocation, after loading the MPI and CUDA modules
@@ -27,7 +29,7 @@
 #
 # Usage:
 #   scripts/run_multi_gpu_scf.sh [--nodes N] [--gpus-per-node G] [--cpus-per-rank C]
-#                                INPUT OUTPUT_DIR [runner options]
+#                                [--rank-per-gpu] INPUT OUTPUT_DIR [runner options]
 #
 #   INPUT        parsec.in, with its pseudopotential files beside it
 #   OUTPUT_DIR   a new directory; it receives parsec.out, timing.json and the
@@ -37,11 +39,19 @@
 #   --gpus-per-node   GPUs each rank drives (default 4)
 #   --cpus-per-rank   CPUs of each rank as srun -c counts them (default 32,
 #                which is 16 cores with two hardware threads each)
+#   --rank-per-gpu    G ranks per node, one GPU each, for a run without
+#                symmetry (molecular dynamics) on several nodes. Their
+#                exchanges pass GPU arrays to MPI: Cray MPICH needs mpi4py
+#                built with craype-accel-nvidia80 loaded (it links
+#                libmpi_gtl_cuda); PARSEC_MPI_SHARED_TRANSPORT=host stages
+#                them through the host instead, several times slower. On one
+#                node the default layout (one rank) is faster.
 #   runner options are passed on, for example --symmetry-cache DIR or --quiet
 #
 # Examples:
 #   scripts/run_multi_gpu_scf.sh parsec.in out                    # every node, 4 GPUs each
 #   scripts/run_multi_gpu_scf.sh --nodes 1 --gpus-per-node 2 parsec.in out
+#   scripts/run_multi_gpu_scf.sh --nodes 4 --rank-per-gpu md/parsec.in md_out   # MD on 16 GPUs
 #
 # Environment: a setting below that is already in the environment is left as
 # it is, except the OpenMP binding, which is switched off (OMP_PROC_BIND=false,
@@ -67,8 +77,10 @@ fail() { printf '%s\n' "$*" >&2; exit 2; }
 nodes=
 gpus=4
 cpus=32
+rank_per_gpu=
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --rank-per-gpu) rank_per_gpu=1; shift;;
         --nodes|--gpus-per-node|--cpus-per-rank)
             [[ $# -ge 2 ]] || fail "$1 needs a value"
             case $1 in
@@ -136,16 +148,18 @@ export PARSEC_CUPY_STAGE_TIMING="${PARSEC_CUPY_STAGE_TIMING:-1}"
 
 # Cray MPICH: the network interface nearest to the GPUs (other MPI libraries
 # ignore the variable). The runner itself switches MPICH_GPU_SUPPORT_ENABLED
-# off: its ranks exchange host arrays only.
+# off where its ranks exchange host arrays only, and on for --rank-per-gpu.
 export MPICH_OFI_NIC_POLICY="${MPICH_OFI_NIC_POLICY:-GPU}"
 
 devices=0
 for ((device = 1; device < gpus; device++)); do devices+=,$device; done
+[[ -z $rank_per_gpu ]] || devices=0
 runner=("$python" -m parsec_python.acceleration.benchmarks.mpi_full_scf
         --input "$input" --output-dir "$output" --devices "$devices" "$@")
 
 if [[ -z ${SLURM_JOB_ID:-} ]]; then
     [[ -z $nodes || $nodes == 1 ]] || fail 'more than one node needs a Slurm allocation'
+    [[ -z $rank_per_gpu ]] || fail '--rank-per-gpu needs a Slurm allocation'
     exec "${runner[@]}"
 fi
 allocated=${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-$(squeue -h -j "$SLURM_JOB_ID" -o %D 2>/dev/null | head -n 1 || true)}}
@@ -154,6 +168,18 @@ if [[ -z $nodes ]]; then
     nodes=$allocated
 elif [[ $allocated =~ $number ]] && (( nodes > allocated )); then
     fail "$nodes nodes asked for, the allocation has $allocated"
+fi
+if [[ -n $rank_per_gpu ]]; then
+    # Every rank sees the GPU of its place on the node; the node-level allocation keeps CUDA IPC between them.
+    exec srun -N "$nodes" -n "$((nodes * gpus))" --ntasks-per-node="$gpus" -c "$cpus" --cpu-bind=cores \
+        --gpus-per-node="$gpus" --gpu-bind=none --kill-on-bad-exit=1 bash -c '
+            if [[ -n ${CUDA_VISIBLE_DEVICES:-} ]]; then
+                IFS=, read -r -a visible <<< "$CUDA_VISIBLE_DEVICES"
+                export CUDA_VISIBLE_DEVICES="${visible[$SLURM_LOCALID]}"
+            else
+                export CUDA_VISIBLE_DEVICES="$SLURM_LOCALID"
+            fi
+            exec "$@"' parsec-rank "${runner[@]}"
 fi
 exec srun -N "$nodes" -n "$nodes" --ntasks-per-node=1 -c "$cpus" --cpu-bind=cores \
     --gpus-per-node="$gpus" --gpu-bind=none --kill-on-bad-exit=1 "${runner[@]}"

@@ -783,7 +783,11 @@ class RelaxationSettings:
     ``minimum_force`` is ``Force_Min`` in Ry/bohr; ``maximum_step`` and
     ``minimum_step`` are ``Max_Step`` and ``Min_Step`` in bohr;
     ``bfgs_corrections`` is ``BFGS_number_corr``; ``restart`` is
-    ``Relax_Restart``.
+    ``Relax_Restart``.  ``scf_upscale`` is ``Relaxation_SCF_Upscale``, not
+    a PARSEC keyword: how much looser than ``Convergence_Criterion`` the SCF
+    loop of a structure may be while the forces are large (1, the default,
+    keeps the criterion fixed as PARSEC does; see
+    :func:`parsec_python.Relaxation.ionic_loop.adaptive_scf_criterion`).
     """
 
     method: RelaxationMethod
@@ -793,6 +797,7 @@ class RelaxationSettings:
     minimum_step: float = 1.0e-4
     bfgs_corrections: int = 7
     restart: bool = False
+    scf_upscale: float = 1.0
 
     def __post_init__(self) -> None:
         if self.method not in {"simple", "bfgs", "manual"}:
@@ -816,6 +821,9 @@ class RelaxationSettings:
                 )
         if self.method == "bfgs" and self.bfgs_corrections < 1:
             raise ValueError("BFGS_number_corr must be positive")
+        if not (np.isfinite(self.scf_upscale) and self.scf_upscale >= 1.0):
+            raise ValueError("Relaxation_SCF_Upscale must be a number of at least 1")
+        object.__setattr__(self, "scf_upscale", float(self.scf_upscale))
         object.__setattr__(self, "max_movements", int(self.max_movements))
         object.__setattr__(self, "bfgs_corrections", int(self.bfgs_corrections))
 

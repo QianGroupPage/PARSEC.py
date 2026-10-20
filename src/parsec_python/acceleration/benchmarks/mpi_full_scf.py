@@ -629,6 +629,15 @@ def _stack_phases(result, scf_seconds, reported_seconds, check_seconds=0.0):
     return phases
 
 
+def _ranks_per_node_of_launch() -> int:
+    """Ranks per node that Slurm started (``SLURM_NTASKS_PER_NODE``, e.g. ``4`` or ``4(x2)``); 1 outside Slurm."""
+    raw = os.environ.get('SLURM_NTASKS_PER_NODE', '1').strip()
+    try:
+        return max(int(raw.split('(')[0].split(',')[0]), 1)
+    except ValueError:
+        return 1
+
+
 def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
     import numpy as np
     from parsec_python.Input import parse_parsec_input
@@ -648,8 +657,15 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
     if args.serial_control and size != 1:
         raise ValueError('--serial-control requires exactly one MPI rank')
     hosts = comm.allgather(socket.gethostname())
-    if len(set(hosts)) != size:
-        raise ValueError('full-SCF runner requires one MPI rank per node')
+    # One rank per node divides the symmetry sectors among the nodes; several ranks per node, one GPU each,
+    # share the basis of the single sector of a run without symmetry (Eigensolvers/mpi_shared_basis.py).
+    per_node = {host: hosts.count(host) for host in hosts}
+    shared_ranks = size > 1 and max(per_node.values()) > 1
+    if shared_ranks and len(set(per_node.values())) != 1:
+        raise ValueError('several MPI ranks per node must be the same number on every node')
+    if shared_ranks and (len(args.devices) != 1 or args.serial_control):
+        raise ValueError('with several ranks per node every rank takes one GPU: launch with --devices 0 and '
+                         'CUDA_VISIBLE_DEVICES set per rank (scripts/run_multi_gpu_scf.sh --rank-per-gpu)')
 
     translation = parse_parsec_input(args.input, pseudopotential_directory=args.pp_dir)
     if args.mlff is not None:
@@ -675,11 +691,12 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
     # No point group for manual movements, or where the movable flags do not respect it. One rank can still
     # solve such a run as the single sector of the identity, whose basis the GPUs of its node then share.
     from parsec_python.acceleration.driver import single_sector_setting
-    one_sector = single_sector_setting() != 'off' and size == 1 and not args.serial_control
+    one_sector = single_sector_setting() != 'off' and (size == 1 or shared_ranks) and not args.serial_control
     if translation.molecular_dynamics is not None and not args.serial_control and not one_sector:
         # The ranks of this runner divide the symmetry sectors, and molecular dynamics uses no symmetry.
-        raise ValueError('molecular dynamics uses no symmetry and so cannot be divided among ranks: '
-                         'run it with one rank (one node), or on one node with --serial-control')
+        raise ValueError('molecular dynamics uses no symmetry and so cannot be divided among the sectors of '
+                         'one rank per node: run it with one rank (one node), or with one rank per GPU, '
+                         'whose ranks share the basis of its one sector')
     from parsec_python.MolecularDynamics.run import (restart_structure as dynamics_restart_structure,
                                                      run_recorded_molecular_dynamics)
     translation, dynamics_restart, dynamics_notes = dynamics_restart_structure(translation, translation.source.parent)
@@ -700,7 +717,11 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         raise ValueError('this run uses no point-group symmetry'
                          + (f' ({symmetry_note})' if symmetry_note else '')
                          + ', so its sectors cannot be divided among ranks: run it with one rank (one node), '
-                         'or on one node with --serial-control')
+                         'with one rank per GPU, or on one node with --serial-control')
+    if shared_ranks and symmetry != 'off':
+        # Several ranks per node share one sector; the sectors of a symmetric run go to one rank per node.
+        raise ValueError('several ranks per node share the basis of a run without symmetry; this run uses its '
+                         'point group: launch it with one rank per node')
     # As in acceleration.cli: none unless --symmetry-cache names its directory.
     cache = _symmetry_cache_directory(args)
     output = args.output_dir.resolve()
@@ -760,9 +781,14 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                 log.write('\n'.join(relaxation_header_lines(translation)))
             if translation.output_all_states:
                 log.write('BENCHMARK: Output_All_States overridden false; no full orbital materialization/archive.')
-            log.write(f'Full SCF mode: {"serial production control" if args.serial_control else "MPI symmetry sectors"}; '
-                      f'{size} ranks/nodes, {size*len(args.devices)} GPUs total; devices/rank={args.devices}; '
-                      'MPI transport=host-fields')
+            mode = ('serial production control' if args.serial_control
+                    else 'one sector shared by the ranks' if shared_ranks else 'MPI symmetry sectors')
+            transport = ('host-fields and ' + ('device' if os.environ.get('MPICH_GPU_SUPPORT_ENABLED') == '1'
+                                               else 'host-staged') + ' orbital exchanges'
+                         if shared_ranks else 'host-fields')
+            log.write(f'Full SCF mode: {mode}; '
+                      f'{size} ranks on {len(set(hosts))} nodes, {size*len(args.devices)} GPUs total; '
+                      f'devices/rank={args.devices}; MPI transport={transport}')
             if args.serial_control:
                 for line in _serial_control_notes(cache):
                     log.write(line)
@@ -813,6 +839,15 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
             scf_started = time.perf_counter()
             forces = outcome = dynamics = None
             moves = ionic_backend(translation.potential_extrapolation)
+            # Diagnostic: PARSEC_PROFILE_IONIC=<file> profiles the ionic loop of the root rank (cProfile, main
+            # thread only) and stores the statistics in <file>.
+            profile_path = os.environ.get('PARSEC_PROFILE_IONIC', '').strip()
+            profiler = None
+            if profile_path and rank == 0 and (translation.molecular_dynamics is not None
+                                               or translation.relaxation is not None):
+                import cProfile
+                profiler = cProfile.Profile()
+                profiler.enable()
             try:
                 if translation.molecular_dynamics is not None:
                     dynamics = run_recorded_molecular_dynamics(translation, system, moves, reporter,
@@ -831,6 +866,9 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                                                                   symmetrize=symmetrize_forces)
                 else:
                     result = run_scf(system, callback=iteration)
+                if profiler is not None:
+                    profiler.disable()
+                    profiler.dump_stats(profile_path)
                 _synchronize(cp, args.devices)
                 scf_completed = time.perf_counter()
             finally:
@@ -948,6 +986,14 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
             # 1 GiB, or what a slab takes that is up to an eighth wider where no chunk size is named, which
             # then goes to the rows in one chunk (0 before the first step).
             shared_state[-1].update(exchange_buffer_bytes=group.exchange_buffer_bytes)
+    # A sector whose basis the ranks share (Eigensolvers/mpi_shared_basis.py): this rank's Ritz passes, the
+    # seconds of its stages, the orbital bytes it sent in the exchanges and how they travelled.
+    for sector, operator in enumerate(getattr(solver, '_operators', None) or ()):
+        group = getattr(operator, '_mpi_shared_group', None)
+        if group is not None:
+            shared_state.append(dict(sector=sector, ranks=group.size, device=group.device,
+                                     transport=group.transport, ritz_passes=group.passes,
+                                     seconds=dict(group.seconds), exchanged_bytes=group.exchanged_bytes))
     # What became of the host thread that made the estimates of the radius search beside the SCF of the root
     # (PARSEC_DOMAIN_REPORT_THREAD): a dict, and none for a rank or a run without that thread.
     radius_thread = getattr(reporter, 'radius_thread_record', None)
@@ -1073,7 +1119,12 @@ def main(argv=None):
     # There are no GPU buffers in the MPI sector protocol. Disabling the
     # GPU transport layer avoids an unused CUDA-runtime dependency and lets
     # CUDA initialize inside the same measured setup region as the CLI.
-    os.environ['MPICH_GPU_SUPPORT_ENABLED'] = '0'
+    # Several ranks per node share the basis of one sector, whose exchanges
+    # pass device arrays to MPI unless PARSEC_MPI_SHARED_TRANSPORT=host.
+    shared_launch = _ranks_per_node_of_launch() > 1
+    os.environ['MPICH_GPU_SUPPORT_ENABLED'] = (
+        '1' if shared_launch and os.environ.get('PARSEC_MPI_SHARED_TRANSPORT', 'auto').strip().lower() != 'host'
+        else '0')
     os.environ['PARSEC_CUPY_DEVICES'] = ','.join(map(str, args.devices))
     if args.serial_control:
         _keep_former_routes(os.environ)

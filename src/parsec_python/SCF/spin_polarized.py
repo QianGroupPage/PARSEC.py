@@ -31,6 +31,7 @@ spin-orbit coupling runs :func:`run_spin_scf`.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import sys
 import time
 from typing import Callable, Union
@@ -171,6 +172,7 @@ def run_spin_scf(
     total_energy_evaluator: Callable[..., object] | None = None,
     scalar_field_adapter: object | None = None,
     warm_start: SCFWarmStart | None = None,
+    convergence_criterion: float | None = None,
 ) -> SinglePointResult:
     """Run PARSEC-style potential mixing with two spin channels.
 
@@ -210,6 +212,8 @@ def run_spin_scf(
     volume_element = system.grid.volume_element
     number_of_states = _number_of_states(system)
     settings = system.input.scf
+    if convergence_criterion is not None:
+        settings = replace(settings, convergence_criterion=float(convergence_criterion))
     eigensolver_settings = system.input.eigensolver
     if eigensolver_settings.method not in {"chebff", "chebdav"}:
         raise NotImplementedError(

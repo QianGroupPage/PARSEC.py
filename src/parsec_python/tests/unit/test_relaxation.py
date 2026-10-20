@@ -615,6 +615,101 @@ class RelaxRestartFileTests(unittest.TestCase):
         ("water_bfgs_part2_from_python", "relax_restart_in.dat"),
     )
 
+    @staticmethod
+    def _block_record_by_record(state, lower, upper, stepmax) -> str:
+        """The L-BFGS part of relax_restart.dat by one list-directed write per record."""
+
+        from parsec_python.Relaxation.lbfgsb import list_directed
+
+        lines = [
+            list_directed(state.m, float(stepmax)),
+            state.task.ljust(60),
+            state.csave.ljust(60),
+        ]
+        lines += [list_directed(bool(value)) for value in state.lsave]
+        for low, high in zip(lower.tolist(), upper.tolist()):
+            lines += [list_directed(low), list_directed(high)]
+        lines += [list_directed(int(value)) for value in state.isave]
+        lines += [list_directed(int(value)) for value in state.iwa]
+        lines += [list_directed(value) for value in state.wa.tolist()]
+        lines += [list_directed(value) for value in state.dsave.tolist()]
+        return "\n".join(lines) + "\n"
+
+    def test_records_of_whole_arrays_are_those_of_single_writes(self) -> None:
+        """Both forms of gfortran, their borders, zeros of both signs and the rest."""
+
+        from parsec_python.Relaxation.lbfgsb import _real_records, list_directed
+
+        rng = np.random.default_rng(5)
+        borders = [
+            sign * 10.0**power * factor
+            for power in range(-30, 30)
+            for factor in (1.0, 0.9999999999999999, 1.0000000000000002, 9.999999999999998)
+            for sign in (1.0, -1.0)
+        ]
+        special = [
+            0.0, -0.0, 0.1, 0.09999999999999999, 0.099999999999999999,
+            9.999999999999999e16, 99999999999999999.0, 1e-99, 9.99999999999999e-100,
+            1e-100, 9.8e99, 9.9e99, 1e100, 1e300, -1e-300, 5e-324,
+            np.inf, -np.inf, np.nan, 2.5, 0.30000000000000004,
+        ]
+        values = np.concatenate(
+            [
+                rng.standard_normal(4000) * 10.0 ** rng.uniform(-25, 25, 4000),
+                np.array(borders),
+                np.array(special),
+            ]
+        )
+        expected = "".join(list_directed(value) + "\n" for value in values.tolist())
+        self.assertEqual(_real_records(values, chunk=100).tobytes().decode("ascii"), expected)
+
+    def test_the_incremental_formatter_writes_the_block_of_every_step(self) -> None:
+        """``RestartBlockFormatter`` keeps records, never their text."""
+
+        from parsec_python.Relaxation.lbfgsb import (
+            LBFGSBState,
+            RestartBlockFormatter,
+            format_restart_block,
+            setulb,
+        )
+
+        reference = self._block_record_by_record
+        rng = np.random.default_rng(3)
+        n = 60
+        curvature = rng.uniform(0.5, 2.0, n)
+        x = rng.standard_normal(n)
+        lower, upper = np.zeros(n), np.zeros(n)
+        bounds = np.zeros(n, dtype=np.int32)
+        state = LBFGSBState.start(n, 5)
+        pauses = []
+        formatter = RestartBlockFormatter(pause=lambda: pauses.append(1), every=16)
+        f, g = 0.5 * np.sum(curvature * x * x), curvature * x
+        blocks = 0
+        for call in range(80):
+            setulb(state, x, lower, upper, bounds, f, g, 1e-15, 1e-15)
+            if state.task.startswith("FG"):
+                f, g = 0.5 * np.sum(curvature * x * x), curvature * x
+                continue
+            if not state.task.startswith("NEW_X"):
+                break
+            if blocks == 3:
+                # Zeros of both signs compare equal and are written apart.
+                state.wa[:4] = [0.0, -0.0, 0.0, -0.0]
+            if blocks == 4:
+                state.wa[:4] = [-0.0, 0.0, -0.0, 0.0]
+            text = reference(state, lower, upper, -1.0)
+            self.assertEqual(formatter(state, lower, upper, -1.0), text)
+            self.assertEqual(format_restart_block(state, lower, upper, -1.0), text)
+            blocks += 1
+        self.assertGreater(blocks, 5)
+        self.assertGreater(len(pauses), 0)
+        # Another optimizer size: everything is formatted again.
+        other = LBFGSBState.start(n + 3, 5)
+        self.assertEqual(
+            formatter(other, np.zeros(n + 3), np.zeros(n + 3), 0.5),
+            reference(other, np.zeros(n + 3), np.zeros(n + 3), 0.5),
+        )
+
     def test_fortran_bfgs_file_is_read(self) -> None:
         """Coordinates, counters and the optimizer state of a PARSEC file.
 
@@ -2072,6 +2167,102 @@ class IonicLoopTests(unittest.TestCase):
             )
 
 
+class _LooseSurface(_SurfaceBackend):
+    """Springs whose forces carry an error proportional to the SCF criterion.
+
+    The systems carry the ``Convergence_Criterion`` of an input; the loop
+    passes each loop's criterion to ``run_scf``.
+    """
+
+    CRITERION = 2.0e-4
+
+    def __init__(self, **keywords) -> None:
+        super().__init__(**keywords)
+        self.criteria: list[float | None] = []
+
+    @classmethod
+    def molecule(cls, positions):
+        system = _molecule(positions)
+        system.input = SimpleNamespace(scf=SimpleNamespace(convergence_criterion=cls.CRITERION))
+        return system
+
+    def run_scf(self, system, callback=None, warm_start=None, convergence_criterion=None):
+        self.criteria.append(convergence_criterion)
+        return super().run_scf(system, callback=callback, warm_start=warm_start)
+
+    def compute_forces(self, system, result, *, symmetrize=True, operations=None):
+        forces = super().compute_forces(
+            system, result, symmetrize=symmetrize, operations=operations
+        )
+        used = self.criteria[result.index]
+        error = 0.0 if used is None else 2.0 * (used - self.CRITERION)
+        return SimpleNamespace(total=forces.total + error * _NOISE)
+
+    def update_geometry(self, system, atoms):
+        moved = super().update_geometry(system, atoms)
+        moved.input = system.input
+        return moved
+
+
+class AdaptiveSCFCriterionTests(unittest.TestCase):
+    """``Relaxation_SCF_Upscale``: a looser SCF loop while the forces are large."""
+
+    BFGS = RelaxationSettings(method="bfgs", max_movements=60, minimum_force=0.005)
+
+    def test_the_criterion_follows_the_largest_force(self) -> None:
+        from parsec_python.Relaxation.ionic_loop import adaptive_scf_criterion
+
+        self.assertEqual(adaptive_scf_criterion(2e-4, 1.0, None, 0.01), 2e-4)
+        self.assertAlmostEqual(adaptive_scf_criterion(2e-4, 10.0, None, 0.01), 2e-3)
+        self.assertAlmostEqual(adaptive_scf_criterion(2e-4, 10.0, 0.05, 0.01), 1e-3)
+        self.assertAlmostEqual(adaptive_scf_criterion(2e-4, 10.0, 0.5, 0.01), 2e-3)
+        self.assertEqual(adaptive_scf_criterion(2e-4, 10.0, 0.004, 0.01), 2e-4)
+
+    def test_a_relaxation_ends_on_forces_at_the_criterion_of_the_input(self) -> None:
+        from parsec_python.Relaxation.ionic_loop import adaptive_scf_criterion
+
+        events = []
+
+        class Watch(IonicObserver):
+            def scf_criterion(self, step, criterion, again):
+                events.append((step, criterion, again))
+
+        settings = replace(self.BFGS, scf_upscale=10.0)
+        surface = _LooseSurface()
+        outcome = run_relaxation(
+            _LooseSurface.molecule(ASYMMETRIC), settings, surface.backend(), observer=Watch()
+        )
+        self.assertTrue(outcome.minimum_force_found)
+        base = _LooseSurface.CRITERION
+        # The input structure at the loosest criterion, every later one at the
+        # criterion that the forces of the one before give.
+        expected = [10.0 * base]
+        for record in outcome.records[:-1]:
+            expected.append(
+                adaptive_scf_criterion(base, 10.0, record.maximum_force, settings.minimum_force)
+            )
+        first_loops = [criterion for _, criterion, again in events if not again]
+        np.testing.assert_allclose(first_loops, expected, rtol=1e-12)
+        self.assertGreater(len(set(np.round(first_loops, 12))), 2)
+        # The last structure met Force_Min at a looser criterion and was
+        # converged again at the criterion of the input, on the same atoms.
+        self.assertGreater(expected[-1], base)
+        self.assertEqual(events[-1], (outcome.records[-1].step, base, True))
+        self.assertEqual(surface.criteria[-2:], [expected[-1], base])
+        np.testing.assert_array_equal(surface.scf_calls[-1][0], surface.scf_calls[-2][0])
+        self.assertEqual(outcome.records[-1].scf_iterations, 2 * surface.scf_iterations)
+        # The forces of the record are those of the second loop: no error.
+        _, exact = _Springs.evaluate(outcome.records[-1].positions)
+        np.testing.assert_allclose(outcome.records[-1].forces.total, exact, rtol=0, atol=1e-15)
+        self.assertLess(outcome.records[-1].maximum_force, settings.minimum_force)
+
+    def test_without_the_keyword_the_loop_passes_no_criterion(self) -> None:
+        surface = _LooseSurface()
+        outcome = run_relaxation(_LooseSurface.molecule(ASYMMETRIC), self.BFGS, surface.backend())
+        self.assertTrue(outcome.minimum_force_found)
+        self.assertEqual(set(surface.criteria), {None})
+
+
 class RestartedLoopTests(_ScratchCase):
     def continue_from_file(self, settings, movements, *, movable=(True, True, True)):
         """Stop a run after ``movements``, restart it from its file, join both."""
@@ -2245,6 +2436,48 @@ class RecorderTests(_ScratchCase):
             )
         text += "".join(f"{statement}\n" for statement in statements)
         return text + format_atom_cor_final(outcome.positions)
+
+    def test_the_file_thread_writes_what_the_events_write(self) -> None:
+        """``PARSEC_IONIC_FILE_THREAD``: the same bytes with and without the thread.
+
+        The optimizer changes its state in place after every move, so this
+        also shows that the thread formats a copy of it.
+        """
+
+        settings = RelaxationSettings(method="bfgs", max_movements=6, minimum_force=1e-5)
+        written = {}
+        for setting in ("on", "off"):
+            with patch.dict(os.environ, {"PARSEC_IONIC_FILE_THREAD": setting}):
+                outcome, recorder, _reporter, log = self.record(settings)
+            self.assertEqual(recorder._pending, [])
+            # The log differs in its seconds only (two decimals).
+            written[setting] = (
+                {path.name: path.read_bytes() for path in sorted(self.directory.iterdir())},
+                re.sub(r"(?<![\d.])\d+\.\d\d(?![\d.])", "s", log),
+            )
+            for path in self.directory.iterdir():
+                path.unlink()
+        self.assertEqual(written["on"], written["off"])
+        self.assertEqual(
+            sorted(written["on"][0]),
+            ["atom.cor", "iterate.dat", "relax_restart.dat", "relaxation.xyz"],
+        )
+        with patch.dict(os.environ, {"PARSEC_IONIC_FILE_THREAD": "sometimes"}):
+            with self.assertRaisesRegex(ValueError, "on or off"):
+                self.record(settings)
+
+    def test_an_error_of_the_file_thread_is_raised(self) -> None:
+        with patch.dict(os.environ, {"PARSEC_IONIC_FILE_THREAD": "on"}):
+            recorder = RelaxationRecorder(
+                reporter=_Reporter(),
+                write=lambda text="": None,
+                settings=RelaxationSettings(method="bfgs"),
+                movable=(True,) * 3,
+                directory=self.directory / "missing",
+            )
+            recorder._start("atom.cor", "text")
+            with self.assertRaises(FileNotFoundError):
+                recorder.flush()
 
     def test_files_of_a_run_stopped_by_movement_num(self) -> None:
         """``atom.cor``, ``relax_restart.dat``, ``relaxation.xyz``, ``iterate.dat``.
@@ -3316,6 +3549,30 @@ class RelaxationInputTests(_ScratchCase):
         self.assertIn("no atom moves", "\n".join(single_point.warnings))
         with self.assertRaisesRegex(ParsecInputError, "Potential_Extrapolation must be one of"):
             self.parse(_water_lines("Minimization: bfgs\nPotential_Extrapolation: linear"))
+
+    def test_relaxation_scf_upscale(self) -> None:
+        """1 (PARSEC's fixed criterion) unless a BFGS or simple relaxation asks for more."""
+
+        plain = self.parse(_water_lines("Minimization: bfgs"))
+        self.assertEqual(plain.relaxation.scf_upscale, 1.0)
+        for method in ("bfgs", "simple"):
+            translation = self.parse(
+                _water_lines(f"Minimization: {method}\nRelaxation_SCF_Upscale: 10")
+            )
+            self.assertEqual(translation.relaxation.scf_upscale, 10.0)
+            self.assertEqual(translation.warnings, self.parse(_water_lines(f"Minimization: {method}")).warnings)
+        header = "\n".join(relaxation_header_lines(translation))
+        self.assertIn("SCF criterion up to 10 times Convergence_Criterion", header)
+        self.assertNotIn("Relaxation_SCF_Upscale", "\n".join(relaxation_header_lines(plain)))
+        for control in ("", "Minimization: manual\n", "Molecular_Dynamics: true\nStep_num: 2\n"):
+            with self.subTest(control=control):
+                other = self.parse(_water_lines(control + "Relaxation_SCF_Upscale: 10"))
+                self.assertIn("Relaxation_SCF_Upscale loosens", "\n".join(other.warnings))
+                if other.relaxation is not None:
+                    self.assertEqual(other.relaxation.scf_upscale, 1.0)
+        for value, message in (("0.5", "at least 1"), ("nan", "Relaxation_SCF_Upscale")):
+            with self.assertRaisesRegex(ParsecInputError, message):
+                self.parse(_water_lines(f"Minimization: bfgs\nRelaxation_SCF_Upscale: {value}"))
 
     def test_periodic_relaxation_is_refused(self) -> None:
         """Relaxation is implemented for isolated systems only."""

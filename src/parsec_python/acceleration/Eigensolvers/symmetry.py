@@ -683,6 +683,11 @@ class CuPySymmetrySCFEigensolver:
                 )
                 if mpi_context is not None:
                     operator.distributed_filter_devices = self.sector_device_groups[representation]
+                    if getattr(mpi_context, "shared", False):
+                        # The ranks share this sector's basis, one device each.
+                        from .mpi_shared_basis import attach_shared_group
+
+                        attach_shared_group(operator, mpi_context.comm)
                 if neighbors_are_shared and device_id not in shared_device_neighbors:
                     selected_stencil = operator.compact_finite_difference
                     shared_device_neighbors[device_id] = getattr(
@@ -1273,6 +1278,16 @@ class CuPySymmetrySCFEigensolver:
                 continue
             rows = self.decomposition.sector_size(representation)
             owner = self._sector_device_ids[representation]
+            group = getattr(self._operators[representation], "_mpi_shared_group", None)
+            if group is not None:
+                # A basis that the ranks share (mpi_shared_basis): this rank's
+                # columns, H times them and the two row blocks of a Ritz step,
+                # and the two buffers of an exchange round.
+                from .mpi_shared_basis import exchange_bytes
+
+                share = -(-int(count) // group.size)
+                states[owner] += 4 * rows * share * np.dtype(np.float64).itemsize + 2 * exchange_bytes()
+                continue
             with cp.cuda.Device(owner):
                 shared = shared_basis_devices(
                     self._operators[representation], int(count)

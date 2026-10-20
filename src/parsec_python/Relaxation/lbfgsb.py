@@ -129,6 +129,7 @@ import numpy as np
 
 __all__ = [
     "LBFGSBState",
+    "RestartBlockFormatter",
     "UNIT_ITERATE",
     "UNIT_OUT",
     "format_restart_block",
@@ -3012,24 +3013,167 @@ def format_restart_block(
     ``wa`` and ``dsave(1:29)``.  Numbers use gfortran's list-directed layout
     (17 significant digits), so the text is read back without loss.
     """
-    lower = np.asarray(lower, dtype=np.float64)
-    upper = np.asarray(upper, dtype=np.float64)
-    if lower.shape != (state.n,) or upper.shape != (state.n,):
-        raise ValueError(f"lower and upper must have shape ({state.n},)")
-    lines = [
-        list_directed(state.m, float(stepmax)),
-        state.task.ljust(_TASK_LENGTH),
-        state.csave.ljust(_TASK_LENGTH),
-    ]
-    lines.extend(list_directed(bool(value)) for value in state.lsave.tolist())
-    for low, high in zip(lower.tolist(), upper.tolist()):
-        lines.append(list_directed(low))
-        lines.append(list_directed(high))
-    lines.extend(list_directed(value) for value in state.isave.tolist())
-    lines.extend(list_directed(value) for value in state.iwa.tolist())
-    lines.extend(list_directed(value) for value in state.wa.tolist())
-    lines.extend(list_directed(value) for value in state.dsave.tolist())
-    return "\n".join(lines) + "\n"
+    return RestartBlockFormatter()(state, lower, upper, stepmax)
+
+
+_SPACE, _POINT, _MINUS, _ZERO, _LETTER_E, _NEWLINE = (ord(c) for c in " .-0E\n")
+
+
+def _real_records(
+    values: np.ndarray, pause: Callable[[], None] | None = None, chunk: int = 1024
+) -> np.ndarray:
+    """``" " + _list_real(v) + "\\n"`` of every value, one row of 27 bytes each.
+
+    Python formats all numbers with two-digit exponents by one ``%`` per
+    ``chunk`` of them (``%+.16E``: 23 columns, the 17 significant digits
+    correctly rounded); the digits are then laid out as the fixed or the
+    exponent form of gfortran by array operations.  ``pause`` is called
+    after every chunk.  Other values (beyond 1e-99 to 9.9e99, infinities,
+    NaN) take :func:`_list_real` one by one.
+    """
+
+    values = np.ascontiguousarray(values, dtype=np.float64).ravel()
+    out = np.full((values.size, 27), _SPACE, dtype=np.uint8)
+    out[:, 26] = _NEWLINE
+    magnitude = np.abs(values)
+    regular = (magnitude == 0.0) | ((magnitude >= 1.0e-99) & (magnitude < 9.9e99))
+    rows = np.flatnonzero(regular)
+    items = values[rows].tolist()
+    pieces = []
+    for start in range(0, len(items), chunk):
+        part = items[start : start + chunk]
+        pieces.append((("%+.16E" * len(part)) % tuple(part)).encode("ascii"))
+        if pause is not None:
+            pause()
+    text = np.frombuffer(b"".join(pieces), dtype=np.uint8).reshape(len(items), 23)
+    exponent = (text[:, 21].astype(np.int64) - _ZERO) * 10 + (text[:, 22] - _ZERO)
+    exponent[text[:, 20] == _MINUS] *= -1
+    negative = text[:, 0] == _MINUS
+    digits = np.concatenate([text[:, 1:2], text[:, 3:19]], axis=1)
+    field = np.full((len(items), 25), _SPACE, dtype=np.uint8)
+    # "%.*f" with 16 - exponent decimals, right-justified in 20 columns: the
+    # same 17 digits with the point after exponent + 1 of them.
+    fixed = (exponent >= -1) & (exponent <= 16)
+    for power in np.unique(exponent[fixed]).tolist():
+        group = np.flatnonzero(exponent == power)
+        block = np.full((group.size, 20), _SPACE, dtype=np.uint8)
+        if power == -1:
+            block[:, 1] = _ZERO
+            block[:, 2] = _POINT
+            block[:, 3:20] = digits[group]
+            block[negative[group], 0] = _MINUS
+        else:
+            block[:, 2 : 3 + power] = digits[group, : power + 1]
+            block[:, 3 + power] = _POINT
+            block[:, 4 + power : 20] = digits[group, power + 1 :]
+            block[negative[group], 1] = _MINUS
+        field[group, :20] = block
+    # The exponent form: mantissa, E, sign and three digits, in 25 columns.
+    scientific = np.flatnonzero(~fixed)
+    if scientific.size:
+        block = np.full((scientific.size, 25), _SPACE, dtype=np.uint8)
+        block[:, 2:20] = text[scientific, 1:19]
+        block[:, 20] = _LETTER_E
+        block[:, 21] = text[scientific, 20]
+        block[:, 22] = _ZERO
+        block[:, 23:25] = text[scientific, 21:23]
+        block[negative[scientific], 1] = _MINUS
+        field[scientific] = block
+    out[rows, 1:26] = field
+    for index in np.flatnonzero(~regular).tolist():
+        out[index, 1:26] = np.frombuffer(
+            _list_real(float(values[index])).encode("ascii"), dtype=np.uint8
+        )
+    return out
+
+
+def _integer_records(values: np.ndarray) -> np.ndarray:
+    """``" " + str(v).rjust(11) + "\\n"`` of every value, one row of 13 bytes each."""
+
+    items = np.asarray(values).ravel().tolist()
+    text = ("%12d\n" * len(items)) % tuple(items)
+    if len(text) != 13 * len(items):
+        text = "".join(" " + str(int(value)).rjust(11) + "\n" for value in items)
+    return np.frombuffer(text.encode("ascii"), dtype=np.uint8).reshape(len(items), -1)
+
+
+class RestartBlockFormatter:
+    """:func:`format_restart_block` for one optimizer, step after step.
+
+    Every number is one record of fixed width, so the records of an array
+    are kept as one block of bytes.  Between two moves L-BFGS-B changes about
+    a third of its work array (one correction pair, the work vectors and the
+    small matrices); only the records of the entries whose bits changed are
+    formatted again.  ``pause`` is called after every ``every`` formatted
+    numbers: a formatter on a host thread of its own gives the interpreter
+    lock to the threads of the SCF loop there (``time.sleep(0)``).  The text
+    is that of :func:`format_restart_block`.
+    """
+
+    def __init__(self, pause: Callable[[], None] | None = None, every: int = 1024) -> None:
+        self.pause = pause
+        self.every = int(every)
+        self._arrays: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _records(self, name: str, values: np.ndarray, integer: bool = False) -> np.ndarray:
+        values = np.ascontiguousarray(values, dtype=np.int64 if integer else np.float64)
+        previous = self._arrays.get(name)
+        if previous is None or previous[0].shape != values.shape:
+            records = (
+                _integer_records(values)
+                if integer
+                else _real_records(values, self.pause, self.every)
+            )
+        else:
+            old, records = previous[0], previous[1].copy()
+            # Bits, not values: -0.0 and 0.0 are written differently.
+            changed = np.flatnonzero(values.view(np.int64) != old.view(np.int64))
+            if changed.size:
+                part = values[changed]
+                if integer:
+                    new = _integer_records(part)
+                    if new.shape[1] != records.shape[1]:
+                        new, records = None, _integer_records(values)
+                else:
+                    new = _real_records(part, self.pause, self.every)
+                if new is not None:
+                    records[changed] = new
+        self._arrays[name] = (values.copy(), records)
+        return records
+
+    def __call__(
+        self,
+        state: LBFGSBState,
+        lower: np.ndarray,
+        upper: np.ndarray,
+        stepmax: float,
+    ) -> str:
+        lower = np.asarray(lower, dtype=np.float64)
+        upper = np.asarray(upper, dtype=np.float64)
+        if lower.shape != (state.n,) or upper.shape != (state.n,):
+            raise ValueError(f"lower and upper must have shape ({state.n},)")
+        lines = [
+            list_directed(state.m, float(stepmax)),
+            state.task.ljust(_TASK_LENGTH),
+            state.csave.ljust(_TASK_LENGTH),
+        ]
+        lines.extend(list_directed(bool(value)) for value in state.lsave.tolist())
+        # One number per record: list_directed(x) of a real is " " +
+        # _list_real(x) and of an integer " " + rjust(11); lower(j) and
+        # upper(j) alternate.
+        bounds = np.stack(
+            [self._records("lower", lower), self._records("upper", upper)], axis=1
+        ).reshape(-1, 27)
+        blocks = [
+            bounds,
+            _integer_records(state.isave),
+            self._records("iwa", state.iwa, integer=True),
+            self._records("wa", state.wa),
+            _real_records(state.dsave),
+        ]
+        return "\n".join(lines) + "\n" + b"".join(
+            block.tobytes() for block in blocks
+        ).decode("ascii")
 
 
 def _parse_real(text: str) -> float:

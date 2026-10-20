@@ -78,11 +78,14 @@ def run_scf(
     *,
     callback: Callable[[SCFIteration], None] | None = None,
     warm_start=None,
+    convergence_criterion: float | None = None,
 ) -> AcceleratedSinglePointResult:
     """Run the validated SCF algorithm through an accelerated H backend.
 
     ``warm_start`` continues from the SCF loop of the structure before an
-    ionic move (:class:`parsec_python.SCF.SCFWarmStart`).
+    ionic move (:class:`parsec_python.SCF.SCFWarmStart`);
+    ``convergence_criterion`` replaces the criterion of the input for this
+    loop.
     """
     symmetry_eigensolver = getattr(
         system.backend, "symmetry_eigensolver", None
@@ -101,6 +104,7 @@ def run_scf(
             total_energy_evaluator=system.total_energy_evaluator,
             scalar_field_adapter=system.scalar_field_adapter,
             warm_start=warm_start,
+            convergence_criterion=convergence_criterion,
         )
         return _finalize_result(system, result, symmetry_eigensolver)
     finally:

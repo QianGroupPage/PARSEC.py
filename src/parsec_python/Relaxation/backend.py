@@ -27,13 +27,18 @@ class IonicBackend:
     ``update_geometry(system, atoms)`` returns the prepared system of the
     moved atoms on the same grid; ``warm_start(previous_system,
     previous_result, system)`` returns what the next SCF loop takes over, in
-    the form ``run_scf`` accepts.
+    the form ``run_scf`` accepts.  ``restart_scf(system, result)``, where
+    given, is what a second SCF loop of the same structure continues from,
+    without any extrapolation (``Relaxation_SCF_Upscale``); without it the
+    loop takes ``warm_start(system, result, system)``.  ``run_scf`` takes
+    ``convergence_criterion=`` where the relaxation loosens the criterion.
     """
 
     run_scf: Callable[..., object]
     compute_forces: Callable[..., object]
     update_geometry: Callable[[object, Sequence[Atom]], object]
     warm_start: Callable[[object, object, object], object]
+    restart_scf: Callable[[object, object], object] | None = None
 
 
 def reference_backend(potential_extrapolation: str = "none") -> IonicBackend:
@@ -56,6 +61,7 @@ def reference_backend(potential_extrapolation: str = "none") -> IonicBackend:
         compute_forces=compute_forces,
         update_geometry=update_geometry,
         warm_start=partial(warm_start_for_moved_atoms, **keywords),
+        restart_scf=lambda system, result: warm_start_for_moved_atoms(system, result, system),
     )
 
 

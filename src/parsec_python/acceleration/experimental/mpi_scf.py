@@ -19,14 +19,23 @@ class MPISCFError(RuntimeError):
     """A worker failed; the outer launcher must abort the MPI job."""
 
 
-def sector_device_groups(representations, size, rank, devices):
-    """Assign sectors cyclically to ranks and disjoint GPU groups when possible."""
+def sector_device_groups(representations, size, rank, devices, shared=False):
+    """Assign sectors cyclically to ranks and disjoint GPU groups when possible.
+
+    With ``shared`` the one sector of a run without symmetry belongs to every
+    rank, each of which holds a share of its basis on its first device
+    (:mod:`..Eigensolvers.mpi_shared_basis`).
+    """
     representations, size, rank = int(representations), int(size), int(rank)
     devices = tuple(int(device) for device in devices)
-    if representations < 1 or not 1 <= size <= representations or not 0 <= rank < size:
-        raise ValueError('MPI ranks must be between one and the representation count')
     if not devices or len(set(devices)) != len(devices) or min(devices) < 0:
         raise ValueError('devices must be a nonempty list of distinct nonnegative indices')
+    if shared:
+        if representations != 1 or not 0 <= rank < size:
+            raise ValueError('only the single sector of a run without symmetry is shared by the ranks')
+        return {0: (devices[0],)}
+    if representations < 1 or not 1 <= size <= representations or not 0 <= rank < size:
+        raise ValueError('MPI ranks must be between one and the representation count')
     owned = tuple(range(rank, representations, size))
     if len(devices) < len(owned):
         return {sector: (devices[index % len(devices)],)
@@ -56,14 +65,18 @@ class MPISectorContext:
         self.stopped = False
         self.owned_sectors = ()
         self.device_groups = {}
+        # Whether the ranks share the basis of the single sector (configure).
+        self.shared = False
         self.command_counts = {}
         # Wall seconds of each command on this rank, collective calls included.
         self.command_seconds = {}
 
     def configure(self, representations, devices):
+        # More ranks than the one sector of a run without symmetry: they share its basis.
+        shared = int(representations) == 1 and self.size > 1
         error = None
         try:
-            groups = sector_device_groups(representations, self.size, self.rank, devices)
+            groups = sector_device_groups(representations, self.size, self.rank, devices, shared=shared)
         except Exception as exc:
             groups = {}
             error = f'{type(exc).__name__}: {exc}'
@@ -75,6 +88,7 @@ class MPISectorContext:
         self.representation_count = int(representations)
         self.device_groups = groups
         self.owned_sectors = tuple(groups)
+        self.shared = shared
         self.topology = tuple(record[1] for record in records)
         return groups
 
@@ -153,6 +167,9 @@ class MPISectorContext:
                 # The failure that every rank reports is the one to raise.
                 raise failure from released
             raise failure
+        if command == 'solve' and self.shared:
+            # Every rank solved the shared sector together: the Ritz values are those of all of them.
+            return value if self.rank == self.root else None
         if command == 'solve':
             records = self.comm.allgather(packed)
             if self.rank != self.root:

@@ -3343,9 +3343,13 @@ def shared_basis_devices(operator: Any, columns: int | None = None) -> tuple[int
 def sector_device_group(operator: Any, columns: int | None = None) -> SectorDeviceGroup | None:
     """Return the operator's device group when its basis is to be shared.
 
-    :func:`shared_basis_devices` decides that.
+    :func:`shared_basis_devices` decides that.  An operator whose sector the
+    ranks of an MPI run share (:mod:`mpi_shared_basis`) returns their group.
     """
 
+    shared = getattr(operator, "_mpi_shared_group", None)
+    if shared is not None:
+        return shared
     devices = shared_basis_devices(operator, columns)
     if devices is None:
         return None

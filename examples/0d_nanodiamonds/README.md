@@ -10,6 +10,9 @@ both as correctness checks and as GPU benchmarks.
   series on which the multi-GPU solver of this code was measured on
   NVIDIA A100 80 GB GPUs. The tables below give the reference times and GPU
   memory on 1 to 16 GPUs.
+- `performance/` has figures and data of those measurements: time and GPU
+  memory against the number of electrons and of GPUs, fitted power laws, where
+  the time goes, and what limits the size of a system.
 
 All inputs share the following settings:
 
@@ -159,37 +162,41 @@ took 7.5 s).
 
 | Case | Formula | Valence electrons | Grid points | States computed | SCF steps | Total energy (Ry) | 1 GPU | 2 GPUs | 4 GPUs | 8 GPUs | 16 GPUs |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| k06 | C795H300 | 3,480 | 2,710,168 | 1,767 | 10 | -9437.81995096 | 27.8 | 17.0 | 11.1 | 7.8 | 6.0 |
-| k07 | C1213H412 | 5,264 | 4,125,288 | 2,659 | 10 | -14346.75097475 | 58.1 | 32.7 | 20.4 | 13.3 | 9.5 |
-| k08 | C1653H508 | 7,120 | 4,778,880 | 3,588 | 10 | -19488.31721372 | 90.1 | 49.3 | 28.7 | 18.6 | 12.6 |
-| k09 | C2455H636 | 10,456 | 7,699,168 | 5,256 | 11 | -28808.04029769 | 745.1 (a) | 117.3 | 65.0 | 39.7 | 25.3 |
-| k10 | C3469H804 | 14,680 | 10,419,384 | 7,367 | 11 | -40596.27462396 |  | 231.6 | 123.8 | 73.8 | 44.4 |
-| k11 | C4601H988 | 19,392 | 11,493,600 | 9,724 | 10 | -53752.09127639 |  |  | 180.1 | 103.8 | 61.4 |
-| k12 | C5659H1132 | 23,768 | 15,147,328 | 11,911 | 10 | -66016.14132692 |  |  |  | 172.5 | 98.9 |
-| k13 | C7067H1308 | 29,576 | 16,522,040 | 14,815 | 10 | -82319.08242217 |  |  |  | 249.2 | 140.2 |
-| k14 | C9449H1572 | 39,368 | 22,640,800 | 19,711 | 10 | -109862.37143299 |  |  |  |  | 279.9 |
+| k06 | C795H300 | 3,480 | 2,710,168 | 1,767 | 10 | -9437.81995096 | 27.7 | 17.1 | 11.2 | 7.6 | 5.9 |
+| k07 | C1213H412 | 5,264 | 4,125,288 | 2,659 | 10 | -14346.75097475 | 56.2 | 32.1 | 19.6 | 12.4 | 8.9 |
+| k08 | C1653H508 | 7,120 | 4,778,880 | 3,588 | 10 | -19488.31721372 | 87.9 | 48.3 | 28.3 | 17.8 | 11.8 |
+| k09 | C2455H636 | 10,456 | 7,699,168 | 5,256 | 11 | -28808.04029769 | 403.5 (a) | 114.1 | 63.3 | 39.0 | 24.6 |
+| k10 | C3469H804 | 14,680 | 10,419,384 | 7,367 | 11 | -40596.27462396 |  | 226.3 | 120.2 | 72.2 | 43.2 |
+| k11 | C4601H988 | 19,392 | 11,493,600 | 9,724 | 10 | -53752.09127639 |  |  | 174.8 | 101.7 | 59.7 |
+| k12 | C5659H1132 | 23,768 | 15,147,328 | 11,911 | 10 | -66016.14132692 |  |  |  | 168.5 | 96.0 |
+| k13 | C7067H1308 | 29,576 | 16,522,040 | 14,815 | 10 | -82319.08242217 |  |  |  | 240.9 | 134.7 |
+| k14 | C9449H1572 | 39,368 | 22,640,800 | 19,711 | 10 | -109862.37143299 |  |  |  |  | 264.5 |
 
 Measured on Perlmutter at NERSC: nodes of four A100-SXM4-80GB, one MPI rank
 per node, launched with `scripts/run_multi_gpu_scf.sh`. Runs on 1, 2 and
 4 GPUs use one node; runs on 8 and 16 GPUs use two and four nodes. One run per
-cell after a warm-up run. Blank cells: the basis does not fit in the memory
-of that many 80 GB GPUs. (a) With this input the basis of k09 does not fit on
-one card, so the code keeps it in host memory (110 GiB) and moves one sector at
-a time to the GPU. Without the `Boundary_Sphere_Radius` line, the code chooses
-a sphere 0.7 Angstrom smaller, which fits on one card: 205 s.
+cell after a warm-up run (k09 on 1 GPU and k10 on 2 GPUs: one run). Measured on
+17 October 2026 with `master` f8f3a50. Blank cells: the basis does not fit in
+the memory of that many 80 GB GPUs. (a) With this input the basis of k09 does
+not fit on one card, so the code keeps it in page-locked host buffers (78 GiB
+of host memory in all) and moves one sector at a time to the GPU. Without the
+`Boundary_Sphere_Radius` line, the code chooses a sphere 0.7 Angstrom smaller,
+which fits on one card (205 s with the code of 10 October 2026).
+`performance/` has figures of these times and memory peaks and how they grow
+with the size of the system.
 
 ### GPU benchmark (k06-k14): peak memory of the fullest GPU in GiB
 
 | Case | 1 GPU | 2 GPUs | 4 GPUs | 8 GPUs | 16 GPUs |
 |---|---:|---:|---:|---:|---:|
-| k06 | 11.2 | 6.5 | 4.2 | 3.2 | 2.2 |
-| k07 | 23.1 | 12.5 | 7.3 | 6.1 | 4.1 |
+| k06 | 11.2 | 6.5 | 4.3 | 3.2 | 2.2 |
+| k07 | 23.1 | 12.5 | 7.3 | 6.0 | 4.0 |
 | k08 | 34.8 | 18.5 | 10.3 | 7.3 | 5.3 |
-| k09 | 23.9 (a) | 42.1 | 23.0 | 15.6 | 10.0 |
-| k10 |  | 78.3 | 42.1 | 24.5 | 14.9 |
-| k11 |  |  | 58.8 | 32.0 | 19.6 |
-| k12 |  |  |  | 49.5 | 28.5 |
-| k13 |  |  |  | 65.5 | 36.1 |
+| k09 | 23.6 (a) | 41.7 | 22.6 | 13.8 | 9.1 |
+| k10 |  | 76.3 | 40.1 | 22.0 | 13.1 |
+| k11 |  |  | 56.8 | 30.6 | 17.7 |
+| k12 |  |  |  | 47.7 | 26.7 |
+| k13 |  |  |  | 63.5 | 35.2 |
 | k14 |  |  |  |  | 61.2 |
 
 The peak memory is the largest value that `nvidia-smi`, sampled every 200 ms,
@@ -215,8 +222,12 @@ Notes:
   comparison. Times are of a first calculation of each structure (no symmetry
   cache) in double precision. Program time runs from the end of input parsing
   to the final report and includes CUDA initialization.
-- **Version of the benchmark references.** The `gpu_benchmark/` outputs and
-  times come from the code published on 10 October 2026. The present `master`
-  gives the same SCF step counts and total energies within 2e-7 Ry. In the
-  five cells measured side by side (k06 on 1 and 16 GPUs, k10 on 4, k12 and
-  k14 on 16), its program time is 3.6 to 5.4 % lower.
+- **Version of the benchmark references.** The times and memory peaks of the
+  two GPU tables (and the references of `run_benchmark.sh`) were measured with
+  `master` f8f3a50 of 17 October 2026. The `gpu_benchmark/` outputs and the
+  total energies in the table come from the code published on 10 October 2026;
+  the code of 17 October gives the same SCF step counts in all 32 cells and
+  total energies within 2e-7 Ry of them. Against the code of 10 October its
+  program time is between 7 % lower and 1 % higher on 1 to 16 GPUs (46 % lower
+  for k09 on one GPU, whose basis lives in host memory), and the fullest GPU
+  holds up to 2.5 GiB less.

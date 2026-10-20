@@ -951,6 +951,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--mlff",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "relax the input structure with a machine-learned force field first "
+            "(Initial_Structure: mlff); MODEL as MLFF_Model, for example uma-s-1p2, "
+            "mace-mp-medium-mpa-0 or a file.model; without MODEL the input's or uma-s-1p2"
+        ),
+    )
+    parser.add_argument(
         "--energy-refinement",
         choices=("b3lyp", "none"),
         default=None,
@@ -993,6 +1005,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ParsecInputError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
+    if arguments.mlff is not None:
+        from .MLFF import apply_mlff_option
+
+        translation = apply_mlff_option(translation, arguments.mlff)
     if arguments.energy_refinement is not None:
         from .Energy.refinement import apply_refinement_option
 
@@ -1026,7 +1042,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     input_directory = translation.source.parent
+    from .MLFF import MLFFError, relax_initial_structure
+
     try:
+        problem_of_input = translation.problem
         translation, relax_restart, restart_notes = restart_structure(
             translation,
             input_directory,
@@ -1038,7 +1057,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             translation, input_directory
         )
         restart_notes = [*restart_notes, *dynamics_notes]
+        # Initial_Structure: mlff, unless a restart file gave the structure.
+        translation, mlff_notes = relax_initial_structure(
+            translation,
+            input_directory,
+            restarted=translation.problem is not problem_of_input,
+            progress=None if arguments.quiet else print,
+        )
+        restart_notes = [*restart_notes, *mlff_notes]
         use_symmetry, symmetry_note = symmetry_decision(translation)
+    except MLFFError as error:
+        print(f"MLFF error: {error}", file=sys.stderr)
+        return 2
     except (OSError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
@@ -1192,7 +1222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 outcome = run_recorded_relaxation(
                     translation,
                     system,
-                    reference_backend(),
+                    reference_backend(translation.potential_extrapolation),
                     reporter,
                     log.write,
                     directory=input_directory,
@@ -1205,7 +1235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dynamics = run_recorded_molecular_dynamics(
                     translation,
                     system,
-                    reference_backend(),
+                    reference_backend(translation.potential_extrapolation),
                     reporter,
                     log.write,
                     directory=input_directory,

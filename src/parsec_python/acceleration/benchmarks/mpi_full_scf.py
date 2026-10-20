@@ -652,6 +652,9 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         raise ValueError('full-SCF runner requires one MPI rank per node')
 
     translation = parse_parsec_input(args.input, pseudopotential_directory=args.pp_dir)
+    if args.mlff is not None:
+        from parsec_python.MLFF import apply_mlff_option
+        translation = apply_mlff_option(translation, args.mlff)
     if translation.problem.periodic_cell is not None:
         # Refused here by name: the sphere and the symmetry sectors read below are those of a cluster.
         raise ValueError('the full-SCF runner divides the symmetry sectors of an isolated cluster; a periodic input '
@@ -665,14 +668,18 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         raise ValueError('a spin-polarized calculation solves its two channels on the full grid and so cannot be '
                          'divided among ranks: run it with parsec_python/main.py or with --serial-control')
     # Relax_Restart, or --restart-from, replaces the coordinates of the input on every rank alike.
+    problem_of_input = translation.problem
     translation, relax_restart, restart_notes = restart_structure(
         translation, translation.source.parent,
         None if args.restart_from is None else args.restart_from.expanduser().resolve())
-    # No point group for manual movements, or where the movable flags do not respect it.
-    if translation.molecular_dynamics is not None and not args.serial_control:
+    # No point group for manual movements, or where the movable flags do not respect it. One rank can still
+    # solve such a run as the single sector of the identity, whose basis the GPUs of its node then share.
+    from parsec_python.acceleration.driver import single_sector_setting
+    one_sector = single_sector_setting() != 'off' and size == 1 and not args.serial_control
+    if translation.molecular_dynamics is not None and not args.serial_control and not one_sector:
         # The ranks of this runner divide the symmetry sectors, and molecular dynamics uses no symmetry.
         raise ValueError('molecular dynamics uses no symmetry and so cannot be divided among ranks: '
-                         'run it with parsec_python/main.py or with --serial-control')
+                         'run it with one rank (one node), or on one node with --serial-control')
     from parsec_python.MolecularDynamics.run import (restart_structure as dynamics_restart_structure,
                                                      run_recorded_molecular_dynamics)
     translation, dynamics_restart, dynamics_notes = dynamics_restart_structure(translation, translation.source.parent)
@@ -688,11 +695,12 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                 else ('auto' if use_symmetry else 'off'))
     # Forces are symmetrized where the calculation itself uses the group.
     symmetrize_forces = keeps_group and symmetry != 'off'
-    if symmetry == 'off' and not args.serial_control:
+    if symmetry == 'off' and not args.serial_control and not one_sector:
         # The ranks of this runner divide the symmetry sectors.
         raise ValueError('this run uses no point-group symmetry'
                          + (f' ({symmetry_note})' if symmetry_note else '')
-                         + ', so its sectors cannot be divided among ranks: run it on one node with --serial-control')
+                         + ', so its sectors cannot be divided among ranks: run it with one rank (one node), '
+                         'or on one node with --serial-control')
     # As in acceleration.cli: none unless --symmetry-cache names its directory.
     cache = _symmetry_cache_directory(args)
     output = args.output_dir.resolve()
@@ -708,6 +716,24 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
     if any(item != inputs for item in identical_inputs):
         raise ValueError('input or pseudopotential content differs across ranks')
     _require_same_domain(comm.allgather(_parsed_domain(translation)))
+    if translation.mlff is not None:
+        # Initial_Structure: mlff: the root relaxes the structure with the force field, and every rank takes it.
+        from parsec_python.MLFF import relax_initial_structure, with_positions
+        outcome = None
+        if rank == 0:
+            try:
+                output.mkdir(parents=True, exist_ok=True)
+                relaxed, mlff_notes = relax_initial_structure(
+                    translation, output, restarted=translation.problem is not problem_of_input,
+                    progress=None if args.quiet else print)
+                outcome = ('done', np.array([atom.position for atom in relaxed.problem.atoms]), mlff_notes)
+            except Exception as error:
+                outcome = ('failed', f'{type(error).__name__}: {error}', [])
+        outcome = comm.bcast(outcome, root=0)
+        if outcome[0] == 'failed':
+            raise RuntimeError(f'MLFF error: {outcome[1]}')
+        translation = with_positions(translation, outcome[1])
+        restart_notes = [*restart_notes, *outcome[2]]
     context = None if args.serial_control else MPISectorContext(comm)
     memory = []
     # As in acceleration.cli, this clock begins after imports, input parsing
@@ -786,15 +812,16 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                 memory.append(_observe_memory(cp, args.devices, f'iteration_{item.iteration}'))
             scf_started = time.perf_counter()
             forces = outcome = dynamics = None
+            moves = ionic_backend(translation.potential_extrapolation)
             try:
                 if translation.molecular_dynamics is not None:
-                    dynamics = run_recorded_molecular_dynamics(translation, system, ionic_backend(), reporter,
+                    dynamics = run_recorded_molecular_dynamics(translation, system, moves, reporter,
                                                                log.write, directory=output, restart=dynamics_restart)
                     result, forces = dynamics.result, dynamics.forces
                 elif translation.relaxation is not None:
                     # Every structure is solved by the ranks as the first one: the root moves the atoms on all of
                     # them, continues its SCF loop from the previous one and collects the forces.
-                    outcome = run_recorded_relaxation(translation, system, ionic_backend(), reporter, log.write,
+                    outcome = run_recorded_relaxation(translation, system, moves, reporter, log.write,
                                                       directory=output, input_directory=translation.source.parent,
                                                       restart=relax_restart, symmetrize=symmetrize_forces)
                     result = outcome.result
@@ -1031,6 +1058,9 @@ def _build_parser():
                        help='read and write the symmetry cache in DIRECTORY; it pays only for repeated calculations of '
                             'the same structure and grid, and every rank then loads or builds all sectors')
     cache.add_argument('--no-symmetry-cache', action='store_true', help='use no symmetry cache (the default)')
+    parser.add_argument('--mlff', nargs='?', const='', default=None, metavar='MODEL',
+                        help='relax the input structure with a machine-learned force field first '
+                             '(Initial_Structure: mlff), on the root rank; MODEL as MLFF_Model')
     parser.add_argument('--quiet', action='store_true')
     return parser
 

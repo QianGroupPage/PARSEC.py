@@ -36,17 +36,26 @@ class IonicBackend:
     warm_start: Callable[[object, object, object], object]
 
 
-def reference_backend() -> IonicBackend:
-    """The readable full-grid NumPy/SciPy path."""
+def reference_backend(potential_extrapolation: str = "none") -> IonicBackend:
+    """The readable full-grid NumPy/SciPy path.
+
+    ``potential_extrapolation`` is how the SCF loop of moved atoms starts
+    (``Potential_Extrapolation``; see
+    :func:`parsec_python.SCF.warm_start_for_moved_atoms`).
+    """
+
+    from functools import partial
 
     from ..Forces import compute_forces
     from ..SCF import run_scf, update_geometry, warm_start_for_moved_atoms
+    from ..SCF.single_point import extrapolation_keywords
 
+    keywords = extrapolation_keywords(potential_extrapolation)
     return IonicBackend(
         run_scf=run_scf,
         compute_forces=compute_forces,
         update_geometry=update_geometry,
-        warm_start=warm_start_for_moved_atoms,
+        warm_start=partial(warm_start_for_moved_atoms, **keywords),
     )
 
 

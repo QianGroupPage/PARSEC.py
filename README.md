@@ -45,6 +45,7 @@ branch.
 - [Scientific flow](#scientific-flow)
 - [Acceleration policy](#acceleration-policy)
 - [Optional ML initial densities](#optional-ml-initial-densities)
+- [Optional MLFF initial structures](#optional-mlff-initial-structures)
 
 **The code**
 
@@ -714,6 +715,10 @@ from the previous wavefunctions. `Skip_Force: false` adds the forces to a
 single point. See
 [Forces, relaxation and molecular dynamics](src/parsec_python/FORCES_AND_RELAXATION.md).
 
+`Initial_Structure: mlff` (or `--mlff` on the command line) first relaxes
+the input structure with a machine-learned force field; see
+[Optional MLFF initial structures](#optional-mlff-initial-structures).
+
 ## Acceleration policy
 
 Acceleration changes execution, not the physical model:
@@ -774,6 +779,64 @@ and the [42-case regression suite](examples/ml_initial_density/README.md)
 compares SAD, ChargE3Net, and SCDP starts with stored predictions. The
 public checkpoints were trained on QM9 (H, C, N, O, F molecules); validate
 any other use against a SAD start.
+
+## Optional MLFF initial structures
+
+A calculation can start from its input structure relaxed with a
+machine-learned force field (MLFF) instead of the coordinates as written:
+UMA (`uma-s-1p2`, the default), MACE, or any ASE calculator. The DFT run that
+follows, a single point, a relaxation or molecular dynamics, is unchanged;
+only its starting coordinates are. It pays for structures built by hand or
+by a cheap method: on nanodiamonds expanded by 3 % the force field (20 to
+35 s) cut the DFT relaxation by 37 to 49 %.
+
+The model runs in a Python environment of its own (NumPy, ASE and the model
+package), made once:
+
+```bash
+# Linux, macOS, or a cluster login node (there: an environment on scratch, see the guide)
+python3 -m venv ~/venvs/mlff
+~/venvs/mlff/bin/pip install fairchem-core ase
+~/venvs/mlff/bin/hf auth login          # after accepting the UMA licence at https://huggingface.co/facebook/UMA
+export PARSEC_MLFF_PYTHON=$HOME/venvs/mlff/bin/python    # also in ~/.bashrc
+python src/parsec_python/mlff.py check  # downloads the weights, evaluates water
+```
+
+```powershell
+# Windows (the extra index gives PyTorch with CUDA; leave it out for the CPU)
+py -3.12 -m pip install uv
+py -3.12 -m uv venv $HOME\venvs\mlff --python 3.12
+py -3.12 -m uv pip install --python $HOME\venvs\mlff\Scripts\python.exe fairchem-core ase `
+    --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match
+& $HOME\venvs\mlff\Scripts\hf.exe auth login
+setx PARSEC_MLFF_PYTHON "$HOME\venvs\mlff\Scripts\python.exe"
+python src\parsec_python\mlff.py check  # in a new terminal
+```
+
+Then one line of `parsec.in`, or one option:
+
+```text
+Initial_Structure: mlff
+```
+
+```bash
+python src/parsec_python/main.py calculation/parsec.in --mlff
+scripts/run_multi_gpu_scf.sh calculation/parsec.in results/run1 --mlff      # several GPUs and nodes
+python src/parsec_python/mlff.py relax calculation/parsec.in                # the relaxed structure only
+```
+
+The run writes `mlff_structure.xyz` (taken again by the next run with the same
+input) and reports the model, its steps and the change of the structure in
+`parsec.out`; the point group and the atoms fixed by `Move_Flag` are kept, and
+a structure the model does not describe is refused before the DFT run. MACE
+needs no login (`pip install mace-torch ase`, `MLFF_Model: mace-mp-medium-mpa-0`).
+
+The [MLFF guide](src/parsec_python/MLFF/README.md) covers the steps for each
+system and for clusters (where to put the environment and the weights, batch
+scripts), every `MLFF_*` keyword, the models compared on the nanodiamonds, and
+troubleshooting; [`examples/0d_mlff_initial_structure`](examples/0d_mlff_initial_structure/README.md)
+relaxes a benzene molecule built by hand and two nanodiamonds (C35H36,
+C185H124) expanded by 3 %, with and without the force field.
 
 ## Source layout
 

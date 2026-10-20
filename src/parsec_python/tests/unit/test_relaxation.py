@@ -359,7 +359,9 @@ class _SurfaceBackend:
         self.warm_calls.append((previous_system, previous_result, system))
         return ("continue from", previous_result.index)
 
-    def backend(self) -> IonicBackend:
+    def backend(self, potential_extrapolation: str = "none") -> IonicBackend:
+        # What the driver read for Potential_Extrapolation.
+        self.extrapolation = potential_extrapolation
         return IonicBackend(
             run_scf=self.run_scf,
             compute_forces=self.compute_forces,
@@ -2596,6 +2598,11 @@ class DriverHelperTests(_ScratchCase):
         self.assertEqual(
             relaxation_header_lines(self.parse(_water_lines())), [" No minimization!", ""]
         )
+        atomic = replace(_translation("water_bfgs"), potential_extrapolation="atomic")
+        self.assertEqual(
+            relaxation_header_lines(atomic)[-2:],
+            [" Potential extrapolation after a move: atomic", ""],
+        )
 
     def test_relax_restart_reads_the_file_beside_the_input(self) -> None:
         """``Relax_Restart``: coordinates and optimizer of ``relax_restart.dat``.
@@ -2934,7 +2941,18 @@ class DriverHelperTests(_ScratchCase):
         self.assertIs(backend.run_scf, run_scf)
         self.assertIs(backend.compute_forces, compute_forces)
         self.assertIs(backend.update_geometry, update_geometry)
-        self.assertIs(backend.warm_start, warm_start_for_moved_atoms)
+        self.assertIs(backend.warm_start.func, warm_start_for_moved_atoms)
+        self.assertEqual(backend.warm_start.keywords, {"extrapolation": "none"})
+        atomic = reference_backend("atomic")
+        self.assertEqual(atomic.warm_start.keywords, {"extrapolation": "atomic"})
+        # Each loop of second order follows its own trajectory.
+        histories = [
+            reference_backend("second_order").warm_start.keywords["history"]
+            for _ in range(2)
+        ]
+        self.assertIsNot(histories[0], histories[1])
+        with self.assertRaisesRegex(ValueError, "Potential_Extrapolation"):
+            reference_backend("linear")
         # A result with host orbitals has nothing to release.
         release_orbitals(SimpleNamespace(wavefunctions=np.zeros(3)))
         release_orbitals(SimpleNamespace())
@@ -3282,6 +3300,22 @@ class RelaxationInputTests(_ScratchCase):
         warnings = "\n".join(translation.warnings)
         self.assertIn("ignored for this fixed single point", warnings)
         self.assertIn("Relax_Restart is set without Minimization", warnings)
+
+    def test_potential_extrapolation(self) -> None:
+        """``none`` (PARSEC) unless the input asks for ``atomic``; nothing else."""
+
+        self.assertEqual(
+            self.parse(_water_lines("Minimization: bfgs")).potential_extrapolation, "none"
+        )
+        translation = self.parse(
+            _water_lines("Minimization: bfgs\nPotential_Extrapolation: Atomic")
+        )
+        self.assertEqual(translation.potential_extrapolation, "atomic")
+        self.assertEqual(translation.warnings, self.parse(_water_lines("Minimization: bfgs")).warnings)
+        single_point = self.parse(_water_lines("Potential_Extrapolation: atomic"))
+        self.assertIn("no atom moves", "\n".join(single_point.warnings))
+        with self.assertRaisesRegex(ParsecInputError, "Potential_Extrapolation must be one of"):
+            self.parse(_water_lines("Minimization: bfgs\nPotential_Extrapolation: linear"))
 
     def test_periodic_relaxation_is_refused(self) -> None:
         """Relaxation is implemented for isolated systems only."""
@@ -3687,6 +3721,11 @@ class DriverOnTheSpringsTests(_ScratchCase):
         symmetrize, operations = surface.force_calls[0]
         self.assertTrue(symmetrize)
         self.assertEqual(len(operations), 4)
+
+        self.assertEqual(surface.extrapolation, "none")
+        _, surface = self.run_driver(control + "\nPotential_Extrapolation: atomic")
+        self.assertEqual(surface.extrapolation, "atomic")
+        self.assertIn(" Potential extrapolation after a move: atomic", self.log())
 
         _, surface = self.run_driver(control + "\nIgnore_Symmetry: .true.")
         self.assertEqual(surface.force_calls[0], (False, None))

@@ -318,6 +318,25 @@ def sector_pool_release_requested() -> bool:
     return value in {"1", "on", "true"}
 
 
+def force_prefetch_setting() -> str:
+    """``PARSEC_CUPY_FORCE_PREFETCH``: ``on`` (default) or ``off``.
+
+    ``on`` builds the projector gradients of a moved structure on a host
+    thread while its SCF loop runs (:meth:`CuPySymmetrySCFEigensolver.prefetch_force_gradients`);
+    ``off`` builds them when the forces are asked for, as before.  Neither
+    changes a result.
+    """
+
+    value = os.environ.get("PARSEC_CUPY_FORCE_PREFETCH", "on").strip().lower() or "on"
+    if value in {"1", "true", "yes"}:
+        value = "on"
+    if value in {"0", "false", "no"}:
+        value = "off"
+    if value not in {"on", "off"}:
+        raise ValueError("PARSEC_CUPY_FORCE_PREFETCH must be on or off")
+    return value
+
+
 def _pool_release_orbital_bytes() -> int:
     """``PARSEC_CUPY_POOL_RELEASE_ORBITAL_BYTES``, 512 MiB by default.
 
@@ -1079,31 +1098,24 @@ class CuPySymmetrySCFEigensolver:
         occupations: np.ndarray,
     ) -> np.ndarray:
         from time import perf_counter
-        from types import SimpleNamespace
 
-        from ..Forces.nonlocal_device import gradient_transposes, projector_force_terms
+        from ..Forces.nonlocal_device import projector_force_terms
 
-        provider = self.projector_gradient_provider
-        if provider is None:
-            raise RuntimeError(
-                "this eigensolver was not given the projector gradients of its system"
-            )
         started = perf_counter()
-        gradients = provider()
-        built = perf_counter()
-        reduced = [
-            self.decomposition.reduce_nonlocal_operators(
-                SimpleNamespace(
-                    projectors=component,
-                    signs=gradients.signs,
-                    labels=gradients.labels,
-                ),
-                self._owned_representations,
-            )
-            for component in gradients.components
-        ]
+        prepared = getattr(self, "_prepared_force_gradients", None)
+        self._prepared_force_gradients = None
+        if prepared is None:
+            count, transposes, phases = self._sector_force_gradients()
+        else:
+            count, transposes, phases = prepared.result()
+            # Built beside the SCF loop: what remains here is the wait.
+            phases = {
+                "gradients": perf_counter() - started,
+                "reduction": 0.0,
+                "background": phases["gradients"] + phases["reduction"],
+            }
         reduced_at = perf_counter()
-        total = np.zeros((len(gradients.labels), 3), dtype=np.float64)
+        total = np.zeros((count, 3), dtype=np.float64)
         for representation in self._owned_representations:
             selected = np.flatnonzero(representations == representation)
             if not selected.size:
@@ -1126,18 +1138,80 @@ class CuPySymmetrySCFEigensolver:
                 self._operators[representation],
                 state.subspace.vectors,
                 weights,
-                gradient_transposes(
-                    tuple(reduced[axis][representation].projectors for axis in range(3))
-                ),
+                transposes[representation],
             )
         # Wall seconds of this process: building the gradients on the full
         # grid, reducing them to its sectors, contracting them on its devices.
         self.force_phase_seconds = {
-            "gradients": built - started,
-            "reduction": reduced_at - built,
+            **phases,
             "contraction": perf_counter() - reduced_at,
         }
         return total
+
+    def _sector_force_gradients(self):
+        """Projector gradients of the present atoms, ready for the sectors of this process.
+
+        Returns the number of projectors, the host transposes of the three
+        reduced gradient matrices of every owned sector
+        (:func:`..Forces.nonlocal_device.gradient_transposes`) and the
+        seconds of the build and of the reduction.
+        """
+
+        from time import perf_counter
+        from types import SimpleNamespace
+
+        from ..Forces.nonlocal_device import gradient_transposes
+
+        provider = self.projector_gradient_provider
+        if provider is None:
+            raise RuntimeError(
+                "this eigensolver was not given the projector gradients of its system"
+            )
+        started = perf_counter()
+        gradients = provider()
+        built = perf_counter()
+        reduced = [
+            self.decomposition.reduce_nonlocal_operators(
+                SimpleNamespace(
+                    projectors=component,
+                    signs=gradients.signs,
+                    labels=gradients.labels,
+                ),
+                self._owned_representations,
+            )
+            for component in gradients.components
+        ]
+        transposes = {
+            representation: gradient_transposes(
+                tuple(reduced[axis][representation].projectors for axis in range(3))
+            )
+            for representation in self._owned_representations
+        }
+        return (
+            len(gradients.labels),
+            transposes,
+            {"gradients": built - started, "reduction": perf_counter() - built},
+        )
+
+    def prefetch_force_gradients(self) -> None:
+        """Build the host part of the next nonlocal forces beside the SCF loop.
+
+        Called once the atoms of a structure are in place: a host thread
+        samples the projector gradients of these atoms and reduces them to
+        the sectors of this process, while the devices solve the SCF loop;
+        the forces of the structure then take them
+        (``PARSEC_CUPY_FORCE_PREFETCH``, default ``on``).  Nothing is put on a
+        device before the forces, so the memory of the SCF loop is unchanged.
+        """
+
+        if self.projector_gradient_provider is None or force_prefetch_setting() == "off":
+            return
+        executor = getattr(self, "_force_gradient_executor", None)
+        if executor is None:
+            executor = self._force_gradient_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="parsec-force-gradients"
+            )
+        self._prepared_force_gradients = executor.submit(self._sector_force_gradients)
 
     def _state_fit_bytes(self, counts: list[int]) -> dict[int, int]:
         """Bytes that the rule of the state storage counts on each device for the sectors solved here.

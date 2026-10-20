@@ -394,6 +394,27 @@ def _stabilizer_symmetry_disabled() -> bool:
     return policy in {"off", "0", "false", "no"}
 
 
+def single_sector_setting() -> str:
+    """``PARSEC_CUPY_SINGLE_SECTOR``: ``auto`` (default), ``on`` or ``off``.
+
+    ``on`` gives a CuPy calculation without point-group symmetry one sector
+    of the identity, so that the devices of the process share its basis;
+    ``auto`` does so in the sector context of the full-SCF runner, where
+    that basis is shared (molecular dynamics, structures without symmetry),
+    and leaves the other routes as they were.  ``off`` never does.  The
+    numbers are those of the full grid.
+    """
+
+    value = os.environ.get("PARSEC_CUPY_SINGLE_SECTOR", "auto").strip().lower() or "auto"
+    if value in {"1", "true", "yes"}:
+        value = "on"
+    if value in {"0", "false", "no"}:
+        value = "off"
+    if value not in {"auto", "on", "off"}:
+        raise ValueError("PARSEC_CUPY_SINGLE_SECTOR must be auto, on or off")
+    return value
+
+
 def _orbital_reduction(symmetry_reduction, stabilizer_disabled: bool):
     """Return the reduction the orbitals take of a detected one, or ``None``.
 
@@ -2497,6 +2518,28 @@ def _prepare_single_point(
                         "symmetry='on' requested, but only the identity "
                         "operation preserves the labeled atoms and active grid"
                     )
+    # Without a point group the orbitals may still take the route of the
+    # sectors, as one sector of the identity, so that the devices of the
+    # process share its basis (PARSEC_CUPY_SINGLE_SECTOR).
+    single_sector_mode = single_sector_setting()
+    single_sector = (
+        (
+            single_sector_mode == "on"
+            or (single_sector_mode == "auto" and mpi_context is not None)
+        )
+        and symmetry_reduction is None
+        and not is_periodic
+        and not spin_polarized
+        and selection.selected == "cupy"
+    )
+    if single_sector:
+        from .Symmetry import AxisReflectionReduction
+
+        symmetry_reduction = AxisReflectionReduction.identity(reference.grid)
+        symmetry_detection = (
+            f"{symmetry_detection}; one sector of the identity "
+            f"(PARSEC_CUPY_SINGLE_SECTOR={single_sector_mode})"
+        )
     # The reduction of this preparation is decided: a thread that waits for
     # it goes on (the thread of the maps has published it where it ran).
     preparation.symmetry_reduction.publish(symmetry_reduction)
@@ -2513,9 +2556,11 @@ def _prepare_single_point(
         symmetry_reduction, _stabilizer_symmetry_disabled()
     )
     orbital_symmetry = "full grid"
-    if symmetry_mode == "off":
+    if symmetry_mode == "off" and not single_sector:
         orbital_symmetry = "full grid (symmetry disabled)"
-    elif orbital_reduction is None or orbital_reduction.group_order <= 1:
+    elif orbital_reduction is None or (
+        orbital_reduction.group_order <= 1 and not single_sector
+    ):
         orbital_symmetry = "full grid (no nontrivial supported symmetry)"
     elif selection.selected != "cupy":
         orbital_symmetry = (
@@ -2543,8 +2588,8 @@ def _prepare_single_point(
                 )(
                     reference.grid,
                     orbital_reduction,
-                    reduction_key=symmetry_geometry_cache_info.key,
-                    cache_directory=symmetry_cache_directory,
+                    reduction_key=getattr(symmetry_geometry_cache_info, "key", None),
+                    cache_directory=None if single_sector else symmetry_cache_directory,
                 )
             orbital_decomposition, symmetry_representation_cache_info = built
         except (ValueError, RuntimeError) as error:
@@ -2602,7 +2647,7 @@ def _prepare_single_point(
     }
     if selection.hartree_backend != "native":
         hartree_reduction = None
-    elif symmetry_mode == "off" or (
+    elif (symmetry_mode == "off" and not single_sector) or (
         symmetry_mode == "auto" and legacy_hartree_disabled
     ):
         hartree_reduction = None
@@ -4053,6 +4098,10 @@ def _prepare_single_point(
                     scf_reducer,
                 )
         reference = moved
+        if symmetry_eigensolver is not None:
+            # The forces of these atoms follow their SCF loop: the host part
+            # of the nonlocal term is built beside it.
+            symmetry_eigensolver.prefetch_force_gradients()
 
     def update_system(system, atoms):
         """Move the atoms on every rank; return the system of the new structure."""
@@ -4207,7 +4256,29 @@ def update_geometry(
     return updater(system, atoms)
 
 
-def warm_start_for_moved_atoms(previous_system, previous_result, system):
+def warm_start_for_moved_atoms(
+    previous_system, previous_result, system, *, extrapolation="none", history=None
+):
+    """What the SCF loop of moved atoms takes over, with ``extrapolation`` added.
+
+    See :func:`parsec_python.SCF.warm_start_for_moved_atoms` for
+    ``extrapolation``; the guessed density is evaluated on the devices by the
+    SCF loop itself.
+    """
+
+    from parsec_python.SCF.single_point import extrapolated_warm_start
+
+    return extrapolated_warm_start(
+        _parsec_warm_start(previous_system, previous_result, system),
+        previous_system,
+        previous_result,
+        system,
+        extrapolation,
+        history,
+    )
+
+
+def _parsec_warm_start(previous_system, previous_result, system):
     """What the SCF loop of moved atoms takes over (``parsec.F90`` after ``domove``).
 
     The counterpart of :func:`parsec_python.SCF.warm_start_for_moved_atoms`:
@@ -4265,16 +4336,26 @@ def compute_forces(system, result, *, symmetrize: bool = True, operations=None):
     )
 
 
-def ionic_backend():
-    """The accelerated operations of an ionic loop (:mod:`parsec_python.Relaxation`)."""
+def ionic_backend(potential_extrapolation: str = "none"):
+    """The accelerated operations of an ionic loop (:mod:`parsec_python.Relaxation`).
+
+    ``potential_extrapolation`` is how the SCF loop of moved atoms starts
+    (``Potential_Extrapolation``): ``none`` as PARSEC, ``atomic`` with the
+    superposed atomic densities moved along, ``second_order`` further along
+    the trajectory.  Each backend follows one trajectory.
+    """
+
+    from functools import partial
 
     from parsec_python.Relaxation.ionic_loop import IonicBackend
+    from parsec_python.SCF.single_point import extrapolation_keywords
 
+    keywords = extrapolation_keywords(potential_extrapolation)
     return IonicBackend(
         run_scf=run_scf,
         compute_forces=compute_forces,
         update_geometry=update_geometry,
-        warm_start=warm_start_for_moved_atoms,
+        warm_start=partial(warm_start_for_moved_atoms, **keywords),
     )
 
 

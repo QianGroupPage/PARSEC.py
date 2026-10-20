@@ -263,8 +263,12 @@ def relaxation_header_lines(translation) -> list[str]:
             f" Number of corrections used in LBFGS update = {settings.bfgs_corrections:4d}"
         )
     movable = int(np.count_nonzero(np.asarray(translation.movable, dtype=bool)))
-    lines += [f" Movable atoms = {movable:6d} of {len(translation.movable):6d}", ""]
-    return lines
+    lines.append(f" Movable atoms = {movable:6d} of {len(translation.movable):6d}")
+    extrapolation = getattr(translation, "potential_extrapolation", "none")
+    if extrapolation != "none":
+        # Not a line of PARSEC, which always starts from the last potential.
+        lines.append(f" Potential extrapolation after a move: {extrapolation}")
+    return [*lines, ""]
 
 
 __all__ = [

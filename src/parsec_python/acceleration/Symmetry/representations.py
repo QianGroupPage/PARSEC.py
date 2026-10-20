@@ -215,8 +215,10 @@ class ReflectionRepresentationDecomposition:
         """Build all characters and apply the exact orbit-stabilizer rule."""
 
         order = reduction.group_order
-        if order <= 1:
-            raise ValueError("orbital decomposition requires nontrivial symmetry")
+        if order < 1:
+            raise ValueError("orbital decomposition requires a group")
+        # A group of the identity alone gives one sector: the whole grid
+        # (AxisReflectionReduction.identity, PARSEC_CUPY_SINGLE_SECTOR).
         character_rows: list[np.ndarray] = []
         seen: set[bytes] = set()
         if isinstance(reduction, SignedPermutationReduction):

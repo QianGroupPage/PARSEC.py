@@ -609,6 +609,24 @@ class AxisReflectionReduction:
             multiplicities=np.ascontiguousarray(multiplicities, dtype=np.int64),
         )
 
+    @classmethod
+    def identity(cls, grid: RealSpaceGrid) -> "AxisReflectionReduction":
+        """The group of the identity alone: one orbit per grid point.
+
+        Its single representation is the whole grid.  It lets a calculation
+        without point-group symmetry use the machinery of the sectors, which
+        spreads one sector over the devices of a process.
+        """
+
+        size = int(grid.size)
+        rows = np.arange(size, dtype=np.int64)
+        return cls(
+            signs=np.ones((1, 3), dtype=np.int8),
+            representative_rows=rows,
+            full_to_wedge=rows.copy(),
+            multiplicities=np.ones(size, dtype=np.int64),
+        )
+
     def reduce_vector(self, values: np.ndarray) -> np.ndarray:
         """Apply ``U.T`` to a full vector, averaging symmetry noise exactly."""
 

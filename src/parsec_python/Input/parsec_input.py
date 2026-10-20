@@ -35,6 +35,7 @@ from ..MolecularDynamics.settings import MolecularDynamicsSettings
 
 if TYPE_CHECKING:
     from ..Hartree.domain import DomainChoice
+    from ..MLFF.settings import MLFFSettings
 
 
 # PARSEC's ESDF table uses 1 bohr = 0.529177 angstrom exactly.
@@ -89,6 +90,17 @@ class ParsecInputTranslation:
     use_symmetry: bool = True
     # Molecular dynamics (``Molecular_Dynamics``), ``None`` when it is off.
     molecular_dynamics: "MolecularDynamicsSettings | None" = None
+    # ``Potential_Extrapolation``: how the SCF loop of a moved structure
+    # starts.  ``none`` as PARSEC (the last potential with the ionic
+    # potential exchanged), ``atomic`` with the superposed atomic densities
+    # moved along with the atoms, ``second_order`` with the change of the
+    # density extrapolated along the trajectory
+    # (:mod:`parsec_python.SCF.single_point`).
+    potential_extrapolation: str = "none"
+    # ``Initial_Structure: mlff``: the input structure is relaxed with a
+    # machine-learned force field before the run (:mod:`parsec_python.MLFF`),
+    # ``None`` when the run starts from the coordinates of the input.
+    mlff: "MLFFSettings | None" = None
     # ``Energy_Refinement``: the hybrid functional whose exchange-correlation
     # energy is evaluated once on the converged orbitals after the SCF
     # (:mod:`parsec_python.Energy.refinement`), ``None`` when it is off.  It
@@ -288,6 +300,93 @@ def _force_rydberg_per_bohr(value: str, *, label: str) -> float:
             "Hartree/bohr, or eV/ang"
         )
     return number * factor
+
+
+def _force_ev_per_angstrom(value: str, *, label: str) -> float:
+    """A force in eV/angstrom, the unit when the value names none."""
+
+    remainder = _FLOAT_PATTERN.sub("", value, count=1).strip()
+    if not remainder:
+        return _first_float(value, label=label)
+    return _force_rydberg_per_bohr(value, label=label) * ANGSTROM_TO_BOHR / EV_TO_RYDBERG
+
+
+def _unquoted(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1].strip()
+    return text
+
+
+def _mlff_settings(one, scalar, source: Path):
+    """``MLFFSettings`` of ``Initial_Structure: mlff`` from the ``MLFF_*`` keywords.
+
+    A model file, a ``python:file.py:function`` and ``MLFF_Python`` are
+    taken relative to the input.  The interpreter path is made absolute but
+    not resolved: a virtual environment's interpreter is a link.
+    """
+
+    import os
+    import shutil
+
+    from ..MLFF.settings import (
+        DEFAULT_FMAX,
+        DEFAULT_MODEL,
+        DEFAULT_STEPS,
+        DEFAULT_TASK,
+        MLFFSettings,
+    )
+
+    def beside_input(text: str) -> str:
+        path = Path(text).expanduser()
+        return text if path.is_absolute() else os.path.abspath(source.parent / path)
+
+    model = _unquoted(one("mlff_model", DEFAULT_MODEL))
+    lower = model.lower()
+    if lower.startswith("python:"):
+        target = model.split(":", 1)[1]
+        location, separator, function = target.rpartition(":")
+        if separator and location.lower().endswith(".py"):
+            model = f"python:{beside_input(location)}:{function}"
+    elif lower.endswith((".model", ".pt")):
+        model = beside_input(model)
+    else:
+        model = lower
+    python = None
+    if "mlff_python" in scalar:
+        raw = _unquoted(one("mlff_python"))
+        if not raw:
+            raise ParsecInputError("MLFF_Python cannot be empty")
+        if any(mark in raw for mark in ("/", "\\")):
+            python = Path(beside_input(raw))
+        else:
+            found = shutil.which(raw)
+            if found is None:
+                raise ParsecInputError(f"MLFF_Python: {raw} is not on the PATH")
+            python = Path(found)
+
+    def optional_integer(key: str, label: str):
+        return _integer(one(key), label=label) if key in scalar else None
+
+    try:
+        return MLFFSettings(
+            model=model,
+            task=_normalize_label(one("mlff_task", DEFAULT_TASK)),
+            fmax=(
+                _force_ev_per_angstrom(one("mlff_fmax"), label="MLFF_Fmax")
+                if "mlff_fmax" in scalar
+                else DEFAULT_FMAX
+            ),
+            steps=_integer(one("mlff_steps", str(DEFAULT_STEPS)), label="MLFF_Steps"),
+            optimizer=_normalize_label(one("mlff_optimizer", "lbfgs")),
+            device=_normalize_label(one("mlff_device", "auto")),
+            python=python,
+            charge=optional_integer("mlff_charge", "MLFF_Charge"),
+            spin=optional_integer("mlff_spin", "MLFF_Spin"),
+            reuse=_boolean(one("mlff_reuse", "true"), label="MLFF_Reuse"),
+        )
+    except ValueError as error:
+        raise ParsecInputError(str(error)) from error
 
 
 def _temperature_kelvin(value: str, *, label: str) -> float:
@@ -626,6 +725,21 @@ def _parse_parsec_input(
         "bfgs_number_corr",
         *_MOLECULAR_DYNAMICS_KEYS,
         "dynamic_diag_tol",
+        # PARSEC.py extension: the start of the SCF loop after a move.
+        "potential_extrapolation",
+        # PARSEC.py extension: the input structure relaxed with a
+        # machine-learned force field first (parsec_python.MLFF).
+        "initial_structure",
+        "mlff_model",
+        "mlff_task",
+        "mlff_fmax",
+        "mlff_steps",
+        "mlff_optimizer",
+        "mlff_device",
+        "mlff_python",
+        "mlff_charge",
+        "mlff_spin",
+        "mlff_reuse",
         # PARSEC.py extension: a modular initial-density source.  These
         # labels do not alter the DFT grid or any post-initialization physics.
         "initial_density",
@@ -1569,6 +1683,37 @@ def _parse_parsec_input(
             "isolated systems only; this periodic run reports energies only."
         )
 
+    potential_extrapolation = "none"
+    if "potential_extrapolation" in scalar:
+        from ..SCF.single_point import POTENTIAL_EXTRAPOLATIONS
+
+        potential_extrapolation = _normalize_label(one("potential_extrapolation"))
+        if potential_extrapolation not in POTENTIAL_EXTRAPOLATIONS:
+            raise ParsecInputError(
+                "Potential_Extrapolation must be one of "
+                + ", ".join(POTENTIAL_EXTRAPOLATIONS)
+            )
+        if not atoms_move:
+            warnings.append(
+                "Potential_Extrapolation is set, but no atom moves; it is ignored."
+            )
+
+    mlff = None
+    structure_source = _normalize_label(one("initial_structure", "input"))
+    if structure_source not in {"input", "mlff"}:
+        raise ParsecInputError("Initial_Structure must be input or mlff")
+    if structure_source == "mlff":
+        if is_periodic:
+            raise UnsupportedParsecOptionError(
+                "Initial_Structure: mlff with Boundary_Conditions=bulk: the force-field "
+                "relaxation is implemented for isolated systems only"
+            )
+        mlff = _mlff_settings(one, scalar, source)
+    elif any(key.startswith("mlff_") for key in scalar):
+        warnings.append(
+            "MLFF_* keywords are present without Initial_Structure: mlff and are ignored."
+        )
+
     energy_refinement = None
     if "energy_refinement" in scalar:
         from ..Energy.refinement import check_refinement_request, normalize_refinement
@@ -1757,6 +1902,8 @@ def _parse_parsec_input(
         compute_forces=compute_forces,
         use_symmetry=use_symmetry,
         molecular_dynamics=molecular_dynamics if molecular_dynamics.enabled else None,
+        potential_extrapolation=potential_extrapolation,
+        mlff=mlff,
         energy_refinement=energy_refinement,
     )
 
@@ -1841,6 +1988,20 @@ def summarize_translation(translation: ParsecInputTranslation) -> str:
             "Initial density: "
             f"{problem.initial_density_settings.method}, "
             f"normalize={problem.scf.normalize_initial_density}"
+        ),
+        *(
+            ()
+            if translation.mlff is None
+            else (
+                f"Initial structure: relaxed with the force field {translation.mlff.model}"
+                + (
+                    f" (task {translation.mlff.task})"
+                    if translation.mlff.model.startswith(("uma", "esen", "allscaip"))
+                    else ""
+                )
+                + f", fmax={translation.mlff.fmax:g} eV/ang, steps={translation.mlff.steps}, "
+                f"{translation.mlff.optimizer}, device={translation.mlff.device}",
+            )
         ),
         # A periodic cell has no Hartree boundary values to control.
         *(

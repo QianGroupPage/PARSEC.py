@@ -261,11 +261,129 @@ class SCFWarmStart:
     A spin-polarized loop takes ``input_potential`` and
     ``eigensolver_state`` as pairs, the up channel first; the Hartree
     potential is common to both channels.
+
+    ``density_guess`` and ``hxc_reference`` carry the atomic extrapolation
+    (:func:`warm_start_for_moved_atoms`): the loop then adds to
+    ``input_potential`` the Hartree and exchange-correlation potentials of
+    ``density_guess`` on the moved structure and subtracts ``hxc_reference``,
+    the Hartree plus exchange-correlation part of the last output potential
+    before the move.  Without them the first input potential is PARSEC's.
+    ``first_iteration_degree`` is the filter degree of the first iteration,
+    ``None`` for the later degree of the input.  An extrapolated potential is
+    close to the one of the moved atoms while the saved orbitals still belong
+    to the old structure; one stronger filter lets them catch up before the
+    mixer sees their density.
     """
 
     input_potential: np.ndarray
     hartree_potential: np.ndarray
     eigensolver_state: object | None = None
+    density_guess: np.ndarray | None = None
+    hxc_reference: np.ndarray | None = None
+    first_iteration_degree: int | None = None
+
+
+#: Ways to start the SCF loop of moved atoms (``Potential_Extrapolation``).
+POTENTIAL_EXTRAPOLATIONS = ("none", "atomic", "second_order")
+
+
+@dataclass
+class DensityHistory:
+    """What second-order extrapolation keeps of one trajectory.
+
+    ``change`` is ``rho_out - rho_atoms`` of the structure before the last
+    move and ``positions`` the atoms that move went to; the next move
+    continues from it only when it starts from those atoms.
+    """
+
+    change: np.ndarray | None = None
+    positions: np.ndarray | None = None
+
+
+def _positions(system) -> np.ndarray:
+    return np.array([atom.position for atom in system.atoms], dtype=np.float64)
+
+
+def atomic_density_guess(previous_system, previous_result, system, history=None):
+    """The density of the moved atoms by atomic extrapolation, or ``None``.
+
+    ``rho_out - rho_atoms(R_old) + rho_atoms(R_new)``: the last output
+    density before the move with the superposed atomic densities moved
+    along with their nuclei.  The superposition of the old structure is
+    scaled to the electron count of the new one, so that the correction
+    carries no charge.  ``None`` when the structure before the move did not
+    start from superposed atomic densities (an imported or predicted first
+    density) or when there are spin channels.
+
+    With a :class:`DensityHistory` the extrapolation is of second order in
+    the change ``d = rho_out - rho_atoms``:
+    ``rho_atoms(R_new) + 2 d(R_old) - d(R_older)`` (``pot_extrapolation =
+    'second_order'`` of Quantum ESPRESSO), from the second move on.
+    """
+
+    if getattr(previous_result, "spin", None) is not None:
+        return None
+    settings = getattr(getattr(previous_system, "input", None), "initial_density_settings", None)
+    if settings is not None and getattr(settings, "method", "sad") != "sad":
+        return None
+    old_atoms = np.asarray(previous_system.initial_density, dtype=np.float64)
+    new_atoms = np.asarray(system.initial_density, dtype=np.float64)
+    old_charge = float(np.sum(old_atoms))
+    scale = float(np.sum(new_atoms)) / old_charge if old_charge else 1.0
+    change = np.asarray(previous_result.density, dtype=np.float64) - scale * old_atoms
+    guess = new_atoms + change
+    if history is not None:
+        if (
+            history.change is not None
+            and history.change.shape == change.shape
+            and np.array_equal(history.positions, _positions(previous_system))
+        ):
+            guess += change - history.change
+        history.change, history.positions = change, _positions(system)
+    # The output density can be smaller than the atomic density it loses
+    # where an atom moved away: the guess is a density, so it is not negative.
+    return np.maximum(guess, 0.0)
+
+
+def extrapolated_warm_start(
+    warm_start, previous_system, previous_result, system, extrapolation, history=None
+):
+    """``warm_start`` with the extrapolation ``extrapolation`` added.
+
+    ``history`` is the :class:`DensityHistory` of a second-order
+    extrapolation; without one it is of first order.
+    """
+
+    if extrapolation not in POTENTIAL_EXTRAPOLATIONS:
+        raise ValueError(
+            "Potential_Extrapolation must be one of " + ", ".join(POTENTIAL_EXTRAPOLATIONS)
+        )
+    if extrapolation == "none":
+        return warm_start
+    guess = atomic_density_guess(
+        previous_system,
+        previous_result,
+        system,
+        history if extrapolation == "second_order" else None,
+    )
+    if guess is None:
+        return warm_start
+    eigensolver = system.input.eigensolver
+    return replace(
+        warm_start,
+        density_guess=guess,
+        hxc_reference=(
+            np.asarray(previous_result.output_effective_potential, dtype=np.float64)
+            - np.asarray(previous_system.ionic_potential, dtype=np.float64)
+        ),
+        # The degree of the first solve of the input (Chebdav_Degree) for the
+        # first iteration: measured on nanodiamonds C35H36 and C87H76, the
+        # extrapolation alone saved nothing, together with it a quarter to a
+        # third of the SCF iterations of a relaxation and of MD.
+        first_iteration_degree=max(
+            int(eigensolver.filter_degree), int(eigensolver.first_filter_degree)
+        ),
+    )
 
 
 def state_for_new_potential(state: object | None) -> object | None:
@@ -292,13 +410,47 @@ def warm_start_for_moved_atoms(
     previous_system: "PreparedSinglePointSystem",
     previous_result: SinglePointResult,
     system: "PreparedSinglePointSystem",
+    *,
+    extrapolation: str = "none",
+    history: DensityHistory | None = None,
 ) -> SCFWarmStart:
     """Build the warm start of ``system`` from the run before the move.
 
     ``parsec.F90`` after ``domove``: ``vnew = vnew - vion_old`` and then
     ``vnew = vnew + vion_new``, with ``vnew`` the potential the mixer left,
-    for each spin channel where there are two.
+    for each spin channel where there are two.  ``extrapolation="atomic"``
+    adds the change of the Hartree and exchange-correlation potentials that
+    the superposed atomic densities make when they move with their nuclei
+    (:func:`atomic_density_guess`); ``"second_order"`` extrapolates the
+    density further along the trajectory that ``history`` follows.
     """
+
+    return extrapolated_warm_start(
+        _parsec_warm_start(previous_system, previous_result, system),
+        previous_system,
+        previous_result,
+        system,
+        extrapolation,
+        history,
+    )
+
+
+def extrapolation_keywords(extrapolation: str) -> dict:
+    """Keywords of :func:`warm_start_for_moved_atoms` for one ionic loop.
+
+    A second-order extrapolation gets a fresh :class:`DensityHistory`.
+    """
+
+    if extrapolation not in POTENTIAL_EXTRAPOLATIONS:
+        raise ValueError(
+            "Potential_Extrapolation must be one of " + ", ".join(POTENTIAL_EXTRAPOLATIONS)
+        )
+    if extrapolation == "second_order":
+        return {"extrapolation": extrapolation, "history": DensityHistory()}
+    return {"extrapolation": extrapolation}
+
+
+def _parsec_warm_start(previous_system, previous_result, system) -> SCFWarmStart:
 
     channels = getattr(previous_result, "spin", None)
     if channels is not None:
@@ -1213,6 +1365,27 @@ def run_scf(
             np.array(warm_start.input_potential, dtype=np.float64)
         )
         eigval_state = warm_start.eigensolver_state
+        density_guess = getattr(warm_start, "density_guess", None)
+        if density_guess is not None:
+            # Atomic extrapolation: the Hartree and XC potentials of the
+            # guessed density replace those of the last output density.
+            guess = to_internal_scalar(np.array(density_guess, dtype=np.float64))
+            stage_start = time.perf_counter()
+            moved_hartree = system.solve_hartree(
+                guess, initial_potential=hartree_potential
+            )
+            initial_hartree_seconds = time.perf_counter() - stage_start
+            stage_start = time.perf_counter()
+            moved_xc = system.evaluate_xc(guess)
+            initial_xc_seconds = time.perf_counter() - stage_start
+            hartree_potential = moved_hartree.potential
+            input_potential = (
+                input_potential
+                + (hartree_potential + moved_xc.potential)
+                - to_internal_scalar(
+                    np.array(warm_start.hxc_reference, dtype=np.float64)
+                )
+            )
     mixer = build_mixer(system.input.mixing)
     history: list[SCFIteration] = []
     # This is the later-SCF SUBSPACE polynomial degree.  The first-solver
@@ -1251,7 +1424,15 @@ def run_scf(
         # Rebuild the small policy object so a degree reduced by the SCF logic
         # below is used by the next SUBSPACE call.  solve_eigval dispatches on
         # eigval_state, not on the nonlinear iteration number itself.
-        eigval_settings = eigval_settings_for(eigensolver_settings, filter_degree)
+        first_degree = (
+            getattr(warm_start, "first_iteration_degree", None)
+            if warm_start is not None and iteration == 1
+            else None
+        )
+        eigval_settings = eigval_settings_for(
+            eigensolver_settings,
+            filter_degree if first_degree is None else max(filter_degree, int(first_degree)),
+        )
         # This is the Hamiltonian assembly/handoff point.  The lightweight
         # object combines the current mixed V_in with the static kinetic and
         # KB terms; LinearOperator routes all Lanczos and Chebyshev H@Q calls

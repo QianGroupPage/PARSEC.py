@@ -281,6 +281,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="include wavefunctions in the result archive",
     )
     parser.add_argument(
+        "--mlff",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "relax the input structure with a machine-learned force field first "
+            "(Initial_Structure: mlff); MODEL as MLFF_Model, for example uma-s-1p2, "
+            "mace-mp-medium-mpa-0 or a file.model; without MODEL the input's or uma-s-1p2"
+        ),
+    )
+    parser.add_argument(
         "--energy-refinement",
         choices=("b3lyp", "none"),
         default=None,
@@ -503,6 +515,8 @@ def _reference_argv(arguments: argparse.Namespace) -> list[str]:
     ):
         if value is not None:
             argv += [flag, str(value)]
+    if arguments.mlff is not None:
+        argv += ["--mlff"] + ([arguments.mlff] if arguments.mlff else [])
     for flag, enabled in (
         ("--no-archive", arguments.no_archive),
         ("--save-wavefunctions", arguments.save_wavefunctions),
@@ -549,6 +563,10 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
     except (ParsecInputError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
+    if arguments.mlff is not None:
+        from parsec_python.MLFF import apply_mlff_option
+
+        translation = apply_mlff_option(translation, arguments.mlff)
     if arguments.energy_refinement is not None:
         from parsec_python.Energy.refinement import apply_refinement_option
 
@@ -560,7 +578,10 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
             print(f"Input error: {error}", file=sys.stderr)
             return 2
 
+    from parsec_python.MLFF import MLFFError, relax_initial_structure
+
     try:
+        problem_of_input = translation.problem
         translation, relax_restart, restart_notes = restart_structure(
             translation,
             translation.source.parent,
@@ -572,6 +593,17 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
             translation, translation.source.parent
         )
         restart_notes = [*restart_notes, *dynamics_notes]
+        # Initial_Structure: mlff, unless a restart file gave the structure;
+        # a dry run only reports the settings.
+        mlff_notes = []
+        if not arguments.dry_run:
+            translation, mlff_notes = relax_initial_structure(
+                translation,
+                translation.source.parent,
+                restarted=translation.problem is not problem_of_input,
+                progress=None if arguments.quiet else print,
+            )
+        restart_notes = [*restart_notes, *mlff_notes]
         use_symmetry, symmetry_note = symmetry_decision(translation)
         # Whether the atoms stay in the point group of the first structure,
         # which Ignore_Symmetry does not tell.  The command line may overrule
@@ -579,6 +611,9 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
         keeps_group, group_note = symmetry_decision(
             replace(translation, ignore_symmetry=False)
         )
+    except MLFFError as error:
+        print(f"MLFF error: {error}", file=sys.stderr)
+        return 2
     except (OSError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
@@ -858,7 +893,7 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                 outcome = run_recorded_relaxation(
                     translation,
                     system,
-                    ionic_backend(),
+                    ionic_backend(translation.potential_extrapolation),
                     reporter,
                     log.write,
                     directory=input_directory,
@@ -874,7 +909,7 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                 dynamics = run_recorded_molecular_dynamics(
                     translation,
                     system,
-                    ionic_backend(),
+                    ionic_backend(translation.potential_extrapolation),
                     reporter,
                     log.write,
                     directory=input_directory,

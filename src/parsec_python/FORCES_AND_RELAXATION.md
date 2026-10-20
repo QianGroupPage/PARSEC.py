@@ -42,6 +42,8 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 | `Move_Flag` (per `Atom_Type`) | 0 | 0 moves every atom of the type, `n > 0` its first `n` atoms, a negative value reads a fourth column of `Atom_Coord` (1 moves, 0 fixes). |
 | `Molecular_Dynamics` | `false` | Switches molecular dynamics on; it excludes `Minimization`. |
 | `Cooling_Method`, `Tinit`, `T_Final`, `T_Step`, `Time_Step`, `Friction_Coefficient`, `Step_num`, `Restart_mode`, `rng_seed`, `test_rng` | PARSEC's | Controls of `moldyn.f90`; see "Molecular dynamics" below. |
+| `Initial_Structure` | `input` | Not a PARSEC keyword. `mlff` relaxes the input structure with a machine-learned force field (UMA, MACE, `MLFF_Model`) before the first SCF loop; see [MLFF/README.md](MLFF/README.md). |
+| `Potential_Extrapolation` | `none` | Not a PARSEC keyword. How the SCF loop of a moved structure starts: `none` as PARSEC, `atomic` with the superposed atomic densities moved along with the atoms, `second_order` with the density change also extrapolated along the trajectory; see "Start of the next SCF loop" below. |
 
 ### Command lines
 
@@ -174,6 +176,33 @@ and from the previous mixed potential with the ionic part exchanged
 (`V_new - V_ion,old + V_ion,new`); the mixer history is restarted. The domain
 stays that of the input structure: an atom that leaves it stops the run.
 
+### Start of the next SCF loop
+
+`Potential_Extrapolation` changes where the SCF loop of a moved structure
+starts, not where it ends (`SCF/single_point.py`):
+
+- `none`, the default: PARSEC's start above.
+- `atomic` (Quantum ESPRESSO's `pot_extrapolation = 'atomic'`): the density
+  `rho_out - rho_atoms(R_old) + rho_atoms(R_new)`, the last output density
+  with the superposed atomic densities moved along with their nuclei, gives
+  the Hartree and exchange-correlation potentials of the first input
+  potential, which replace those of the last output potential. The first
+  iteration filters with the degree of the first solve (`Chebdav_Degree`),
+  so that the saved orbitals catch up with the moved potential before the
+  mixer sees their density.
+- `second_order` (QE's `'second_order'`): from the second move on, the change
+  `d = rho_out - rho_atoms` is extrapolated as well,
+  `rho_atoms(R_new) + 2 d(R_old) - d(R_older)`.
+
+Without superposed atomic densities as the first density (an imported or
+predicted one) and with spin polarization the loop starts as with `none`.
+The extrapolation alone saved nothing on nanodiamonds; with the stronger
+first filter it saves a quarter to a third of the SCF iterations of a later
+structure (numbers under "On A100 GPUs"). Converged tightly, both starts give
+Fortran's trajectory; at a loose SCF criterion a trajectory changes within
+the SCF noise of its forces, so a relaxation can end one or two structures
+earlier or later.
+
 Symmetry: the point-group operations of the input structure that respect the
 movable flags are found once. Forces are averaged over them and so are the
 positions the mover returns, which keeps a symmetric structure symmetric to
@@ -227,6 +256,12 @@ Nothing leaves the devices that a single point keeps there.
   group operations complete them, which costs as many times less as the group
   has operations and changes the forces by round-off only;
   `PARSEC_LOCAL_FORCE_SUMS=full` sums over the whole grid as before.
+- **Projector gradients**: once the atoms of a structure are in place, a host
+  thread samples the gradients of its projectors and reduces them to the
+  sectors of the process while the devices solve its SCF loop; the forces
+  then take them (`PARSEC_CUPY_FORCE_PREFETCH=on`, the default; `off` builds
+  them when the forces are asked for). Nothing reaches a device before the
+  forces, and the forces are the same to the last bit.
 - **Several nodes**: the rank of each node rebuilds the projectors of its own
   sectors (command `geometry`), restarts its solvers (`new_scf_loop`) and
   contracts its part of the nonlocal force (`forces`); the root sums them.
@@ -234,7 +269,14 @@ Nothing leaves the devices that a single point keeps there.
 The multi-node runner divides the symmetry sectors of the structure among its
 ranks. A structure without point-group symmetry, a relaxation whose movable
 flags break the symmetry, a `manual` run and molecular dynamics therefore run
-on the GPUs of one node (`--serial-control`).
+on the GPUs of one node. Launched with one rank, the runner solves them as
+the single sector of the identity, whose basis the GPUs of the node share
+column by column (`PARSEC_CUPY_SINGLE_SECTOR=auto`, the default; `on` takes
+this route outside the runner too, `off` never). The numbers are those of
+the full grid; each GPU holds a quarter of the orbitals. `--serial-control`
+keeps the former route, on which the first GPU holds them all. Several nodes
+for such runs would need the grid divided among them, which the SCF loop does
+not do.
 
 ## Differences from Fortran PARSEC
 
@@ -378,3 +420,63 @@ local sums and 0.2 s the ion-ion forces. For C795H300 the three parts take
 number of grid points: for C2455H636 they took about 2.8 s over the whole grid
 on one GPU and 1.8 s on the four GPUs of the root node, and take 0.25 s on
 those four GPUs over the wedge of the D2 group.
+
+### Starts of the SCF loop and molecular dynamics on A100 GPUs
+
+The nanodiamonds of `examples/0d_nanodiamonds`. Fortran PARSEC is the same
+version built on Perlmutter's CPU nodes (GNU compilers, 128 MPI ranks per
+node); both codes use the inputs of `fortran_comparison/` with the SCF
+criterion lowered to 1e-7 Ry. BFGS:
+
+| Cluster | Structures | `none` | `atomic` | `second_order` |
+|---|---:|---|---|---|
+| C35H36 | 9 | coordinates within 1.6e-5 bohr | within 5.9e-5 bohr | |
+| C87H76 | 6 | within 3e-6 bohr | within 1.4e-5 bohr | |
+| C185H124 | 7 | within 3.6e-5 bohr | within 1.4e-5 bohr | within 2.1e-5 bohr |
+
+Energies per atom and largest forces agree within one unit of their last
+printed digit, with the same number of structures. Molecular dynamics at
+300 K (5 steps of 20 a.u., `test_rng`): `md_nrg.dat` of C35H36 and C87H76
+(the latter also with `second_order`) agrees with the Fortran file within
+one unit of the last digit. Fortran PARSEC needed the 3500 s of its job for
+five rows of C185H124 on one node; those five agree, and this package took
+128 s on four GPUs.
+
+Relaxations with the inputs of `gpu_benchmark/` (`Force_Min` 0.01 Ry/bohr,
+SCF criterion 2e-4 Ry) on 16 GPUs. A later structure of C795H300:
+
+| Start | Gradients | SCF | Forces |
+|---|---|---:|---:|
+| `none` | built for the forces | 2.20 s | 0.52 s |
+| `atomic` | built for the forces | 1.71 s | 0.53 s |
+| `atomic` | built beside the SCF loop (default) | 1.73 s | 0.14 s |
+
+Program times, gradients beside the SCF loop:
+
+| Cluster | Structures | `none` | `atomic` |
+|---|---:|---:|---:|
+| C1213H412 | 4 | 27.3 s | 25.7 s |
+| C1653H508 | 6 | 54.2 s | 46.0 s |
+
+At this SCF criterion the forces carry noise of about 1e-3 Ry/bohr, so the
+two starts can end a relaxation at different structures: with the inputs
+of `fortran_comparison/` C795H300 took 7 structures with `atomic` and 5 with
+`none`. `second_order` saves nothing in BFGS, whose steps do not follow a
+smooth path (C795H300 on 4 GPUs: 4.13 s of SCF per later structure against
+3.44 s with `atomic`).
+
+Molecular dynamics (5 steps) on the four GPUs of one node, per later
+structure and largest memory of one GPU; C185H124 to C795H300 with the
+first-solve controls of the GPU benchmark, the larger clusters with the
+inputs of `gpu_benchmark/`:
+
+| Cluster | `--serial-control` | Sector of the identity, `none` | `atomic` | `second_order` |
+|---|---|---|---:|---:|
+| C185H124 | 4.33 s, 17.1 GB | 2.99 s, 4.2 GB | 2.73 s | 2.02 s |
+| C459H204 | 17.6 s, 69.4 GB | 9.8 s, 9.1 GB | 8.1 s | 5.9 s |
+| C795H300 | out of memory (inputs of `fortran_comparison/`) | 18.1 s, 14.2 GB | 14.2 s | 10.7 s |
+| C1213H412 | | 41.9 s, 27.0 GB | 32.7 s | 25.5 s |
+| C1653H508 | | 69.0 s, 39.8 GB | 54.2 s | 40.5 s |
+
+A later structure takes 6 to 7 SCF iterations with `none`, 5 with `atomic`
+and 3 to 4 with `second_order`.

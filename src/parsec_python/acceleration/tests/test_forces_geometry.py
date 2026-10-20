@@ -11,9 +11,11 @@ gives.
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -332,6 +334,77 @@ class MovedAtomTests(unittest.TestCase):
         np.testing.assert_allclose(
             tables["on"].total, tables["off"].total, rtol=0, atol=2e-6
         )
+
+    def test_one_sector_of_the_identity_is_the_full_grid(self) -> None:
+        # PARSEC_CUPY_SINGLE_SECTOR: a run without point group solved as the
+        # single sector of the identity (what the full-SCF runner does for
+        # molecular dynamics), its atoms moved once.
+        lopsided = (
+            SYMMETRIC_WATER[0],
+            Atom(SYMMETRIC_WATER[1].symbol, SYMMETRIC_WATER[1].position + [0.0, 0.05, 0.1]),
+            SYMMETRIC_WATER[2],
+        )
+        problem = replace(self.problem, atoms=lopsided)
+        outcomes = {}
+        for setting in ("on", "auto"):
+            with mock.patch.dict(os.environ, {"PARSEC_CUPY_SINGLE_SECTOR": setting}):
+                system = self._prepare(problem, "off")
+                sectors = getattr(system.backend, "symmetry_eigensolver", None)
+                # Without the sector context of the runner, auto keeps the full grid.
+                self.assertEqual(sectors is not None, setting == "on")
+                result = driver.run_scf(system)
+                forces = driver.compute_forces(system, result, symmetrize=False)
+                atoms = tuple(
+                    Atom(atom.symbol, atom.position + 0.02 * force / np.abs(forces.total).max())
+                    for atom, force in zip(system.atoms, forces.total)
+                )
+                moved = driver.update_geometry(system, atoms)
+                warm = driver.run_scf(
+                    moved,
+                    warm_start=driver.warm_start_for_moved_atoms(system, result, moved),
+                )
+                outcomes[setting] = (
+                    result.energies.total,
+                    forces.total,
+                    warm.energies.total,
+                    driver.compute_forces(moved, warm, symmetrize=False).total,
+                )
+        sector, grid = outcomes["on"], outcomes["auto"]
+        self.assertAlmostEqual(sector[0], grid[0], delta=1e-9)
+        np.testing.assert_allclose(sector[1], grid[1], rtol=0, atol=1e-7)
+        self.assertAlmostEqual(sector[2], grid[2], delta=1e-8)
+        np.testing.assert_allclose(sector[3], grid[3], rtol=0, atol=1e-6)
+        with mock.patch.dict(os.environ, {"PARSEC_CUPY_SINGLE_SECTOR": "sometimes"}):
+            with self.assertRaisesRegex(ValueError, "auto, on or off"):
+                driver.single_sector_setting()
+
+    def test_gradients_built_beside_the_scf_loop_give_the_same_forces(self) -> None:
+        # PARSEC_CUPY_FORCE_PREFETCH: the gradients of a moved structure are
+        # sampled on a host thread during its SCF loop.
+        with mock.patch.dict(os.environ, {"PARSEC_CUPY_FORCE_PREFETCH": "on"}):
+            system = self._prepare(self.problem, "on")
+            result = driver.run_scf(system)
+            forces = driver.compute_forces(system, result)
+            step = 0.04 * forces.total / np.abs(forces.total).max()
+            atoms = tuple(
+                Atom(atom.symbol, atom.position + delta)
+                for atom, delta in zip(system.atoms, step)
+            )
+            moved = driver.update_geometry(system, atoms)
+            sectors = moved.backend.symmetry_eigensolver
+            self.assertIsNotNone(sectors._prepared_force_gradients)
+            warm = driver.run_scf(
+                moved, warm_start=driver.warm_start_for_moved_atoms(system, result, moved)
+            )
+            prefetched = driver.compute_forces(moved, warm)
+            self.assertIn("background", sectors.force_phase_seconds)
+            self.assertIsNone(sectors._prepared_force_gradients)
+            built = driver.compute_forces(moved, warm)
+            self.assertNotIn("background", sectors.force_phase_seconds)
+        np.testing.assert_array_equal(prefetched.total, built.total)
+        with mock.patch.dict(os.environ, {"PARSEC_CUPY_FORCE_PREFETCH": "off"}):
+            again = driver.update_geometry(moved, system.atoms)
+            self.assertIsNone(again.backend.symmetry_eigensolver._prepared_force_gradients)
 
     def test_atoms_that_leave_the_point_group_of_the_sectors_are_refused(self) -> None:
         # Sectors, wedge fields and wedge sums hold for the group of the

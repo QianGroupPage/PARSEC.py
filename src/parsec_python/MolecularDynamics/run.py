@@ -202,6 +202,10 @@ def run_recorded_molecular_dynamics(
     source = settings.random_source(random, compiler=_seeded_compiler(settings, random))
 
     write(format_parsec_out_summary(settings).rstrip("\n"))
+    extrapolation = getattr(translation, "potential_extrapolation", "none")
+    if extrapolation != "none":
+        # Not a line of PARSEC, which always starts from the last potential.
+        write(f" Potential extrapolation after a move: {extrapolation}")
     files = _Files(directory)
     files.append(initial_records(state, species, positions))
     outcome = MolecularDynamicsOutcome(state=state, positions=positions)

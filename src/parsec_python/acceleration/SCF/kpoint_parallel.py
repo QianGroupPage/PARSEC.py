@@ -246,12 +246,26 @@ class _SolveWorker:
     def accumulate(self, occupations: dict[int, np.ndarray]):
         total: dict[str, np.ndarray] = {}
         for task in self.tasks:
-            start = time.perf_counter()
-            vectors = self._host_vectors(task)
-            self._tick("download", start)
-            start = time.perf_counter()
-            parts = self.job.accumulate(task, vectors, occupations[task])
-            self._tick("density", start)
+            vectors = self.vectors[task]
+            if self.converter is not None and not isinstance(vectors, np.ndarray):
+                # form the density where the orbitals are: only the grid-length fields come back
+                start = time.perf_counter()
+                backend = self.converter.backend
+                backend.use()
+                parts = {
+                    name: np.asarray(backend.asnumpy(value))
+                    for name, value in self.job.accumulate(
+                        task, vectors, occupations[task], xp=backend.xp
+                    ).items()
+                }
+                self._tick("density", start)
+            else:
+                start = time.perf_counter()
+                vectors = self._host_vectors(task)
+                self._tick("download", start)
+                start = time.perf_counter()
+                parts = self.job.accumulate(task, vectors, occupations[task])
+                self._tick("density", start)
             for name, value in parts.items():
                 if name in total:
                     total[name] += value
@@ -261,7 +275,12 @@ class _SolveWorker:
 
     def extras(self):
         for task in self.tasks:
-            yield task, self.job.extras(task, self._host_vectors(task))
+            vectors = self.vectors[task]
+            if self.converter is not None and not isinstance(vectors, np.ndarray):
+                self.converter.backend.use()
+                yield task, self.job.extras(task, vectors, xp=self.converter.backend.xp)
+            else:
+                yield task, self.job.extras(task, self._host_vectors(task))
 
     def vectors_of(self, task: int):
         if task in self.vectors:

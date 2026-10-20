@@ -48,6 +48,7 @@ from ..Energy import total_energy_no_degeneracy, total_energy_no_degeneracy_spin
 from ..Hamiltonian.kpoint_operator import KPointKohnShamHamiltonian
 from ..Hamiltonian.kpoint_spinor_operator import KPointSpinorKohnShamHamiltonian
 from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
+from .orbital_density import weighted_square_sum
 from .stage_timer import StageTimer, solver_residual_max, solver_timings
 from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
@@ -117,16 +118,27 @@ def _eigval_settings(
     )
 
 
-def _state_sz(spinors_by_k: list[np.ndarray]) -> np.ndarray:
+def _state_sz(spinors_by_k: list[np.ndarray], xp=np) -> np.ndarray:
     """``<S_z>`` (up weight minus down weight) of every state at every k-point,
-    k-major like the pooled eigenvalues."""
+    k-major like the pooled eigenvalues.
+
+    The weights are sums over the rows given, so a block that holds only some rows of the grid gives
+    the partial sums (``xp`` is the array namespace the block lives in; the result is a host array).
+    """
     moments = []
     for spinors in spinors_by_k:
         n_grid = spinors.shape[0] // 2
-        moments.append(
-            np.sum(np.abs(spinors[:n_grid, :]) ** 2, axis=0)
-            - np.sum(np.abs(spinors[n_grid:, :]) ** 2, axis=0)
-        )
+        count = int(spinors.shape[1])
+        values = np.empty(count)
+        for c0 in range(0, count, 64):
+            c1 = min(c0 + 64, count)
+            up, down = spinors[:n_grid, c0:c1], spinors[n_grid:, c0:c1]
+            difference = (up.real * up.real + up.imag * up.imag).sum(axis=0) - (
+                down.real * down.real + down.imag * down.imag
+            ).sum(axis=0)
+            get = getattr(difference, "get", None)
+            values[c0:c1] = get() if get is not None else np.asarray(difference)
+        moments.append(values)
     return np.concatenate(moments)
 
 
@@ -243,7 +255,7 @@ def _spinor_solver(
             lambda degree: _eigval_settings(system, degree),
             make_hamiltonian,
             accumulate,
-            extras=lambda task, vectors: _state_sz([vectors]),
+            extras=lambda task, vectors, xp=np: _state_sz([vectors], xp),
         ),
         problem_size=system.grid.size,
     )
@@ -286,10 +298,11 @@ def run_self_consistent_soc_kpoints(
     dV = system.grid.volume_element
     n_grid = system.grid.size
 
-    def accumulate(task, vectors, occupations):
+    def accumulate(task, vectors, occupations, xp=np):
         # rho(r) = sum_k w_k*(1/dV)*sum_n f_nk*(|u_up,nk|**2+|u_down,nk|**2).
-        weighted = (np.abs(vectors) ** 2) @ occupations
-        return {"density": (weight / dV) * (weighted[:n_grid] + weighted[n_grid:])}
+        weighted = weighted_square_sum(vectors, occupations, xp)
+        rows = weighted.shape[0] // 2  # the rows of this block of the grid (all of it, unless distributed)
+        return {"density": (weight / dV) * (weighted[:rows] + weighted[rows:])}
 
     solver = _spinor_solver(system, k_points, number_of_states, accumulate)
     mixer = AndersonMixer(system.input.mixing)
@@ -477,11 +490,12 @@ def run_self_consistent_soc_kpoints_spin_polarized(
 
     dV = system.grid.volume_element
 
-    def accumulate(task, vectors, occupations):
-        weighted = (np.abs(vectors) ** 2) @ occupations
+    def accumulate(task, vectors, occupations, xp=np):
+        weighted = weighted_square_sum(vectors, occupations, xp)
+        rows = weighted.shape[0] // 2
         return {
-            "up": (weight / dV) * weighted[:n_grid],
-            "down": (weight / dV) * weighted[n_grid:],
+            "up": (weight / dV) * weighted[:rows],
+            "down": (weight / dV) * weighted[rows:],
         }
 
     solver = _spinor_solver(system, k_points, number_of_states, accumulate)

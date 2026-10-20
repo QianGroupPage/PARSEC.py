@@ -42,6 +42,7 @@ from ..Occupations import fermi_occupations
 from ..V_ion import superpose_atomic_density
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
 from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
+from .orbital_density import spinor_sums
 from .stage_timer import StageTimer, solver_residual_max, solver_timings
 from .kpoints_soc import (
     _eigval_settings,
@@ -58,14 +59,16 @@ def spinor_density_and_magnetization(
     occupations: np.ndarray,
     volume_element: float,
     weight: float = 1.0,
+    xp=np,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``(n, m)`` from stacked spinors ``(2*n_grid, n_states)``.
 
     ``n`` has shape ``(n_grid,)`` and ``m`` has shape ``(3, n_grid)``;
-    ``weight`` is the k-point weight of these states.
+    ``weight`` is the k-point weight of these states.  ``xp`` is the array
+    namespace the spinors live in (a device block gives device arrays); a block that holds only some
+    rows of the grid gives those rows.
     """
 
-    spinors = np.asarray(spinors)
     occupations = np.asarray(occupations, dtype=float)
     if spinors.ndim != 2 or spinors.shape[0] % 2:
         raise ValueError("spinors must have shape (2*n_grid, n_states)")
@@ -73,16 +76,14 @@ def spinor_density_and_magnetization(
         raise ValueError("occupation count does not match the spinor columns")
     if volume_element <= 0:
         raise ValueError("volume_element must be positive")
-    n_grid = spinors.shape[0] // 2
-    up = spinors[:n_grid, :]
-    down = spinors[n_grid:, :]
     scale = weight / volume_element
-    cross = np.conj(up) * down
-    density = scale * ((np.abs(up) ** 2 + np.abs(down) ** 2) @ occupations)
-    magnetization = np.empty((3, n_grid))
-    magnetization[0] = scale * (2.0 * cross.real @ occupations)
-    magnetization[1] = scale * (2.0 * cross.imag @ occupations)
-    magnetization[2] = scale * ((np.abs(up) ** 2 - np.abs(down) ** 2) @ occupations)
+    up_sum, down_sum, cross_sum = spinor_sums(spinors, occupations, xp)
+    rows = up_sum.shape[0]
+    density = scale * (up_sum + down_sum)
+    magnetization = xp.empty((3, rows))
+    magnetization[0] = scale * (2.0 * cross_sum.real)
+    magnetization[1] = scale * (2.0 * cross_sum.imag)
+    magnetization[2] = scale * (up_sum - down_sum)
     return density, magnetization
 
 
@@ -150,9 +151,9 @@ def _run_noncollinear(
     input_potential = ionic_potential + hartree_potential + xc.potential
     input_field = xc.field
 
-    def accumulate(task, vectors, occupations):
+    def accumulate(task, vectors, occupations, xp=np):
         density_k, magnetization_k = spinor_density_and_magnetization(
-            vectors, occupations, volume_element, weight
+            vectors, occupations, volume_element, weight, xp
         )
         return {"density": density_k, "magnetization": magnetization_k}
 
@@ -165,7 +166,7 @@ def _run_noncollinear(
                 task, potentials["V"], potentials["field"]
             ),
             accumulate,
-            extras=lambda task, vectors: _state_sz([vectors]),
+            extras=lambda task, vectors, xp=np: _state_sz([vectors], xp),
         ),
         problem_size=system.grid.size,
     )

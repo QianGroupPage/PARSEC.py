@@ -58,6 +58,7 @@ from ..SCF.spin_polarized import (
 from ..V_ion import build_nonlocal_projectors
 from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
 from .kpoints_soc import _eigval_settings
+from .orbital_density import weighted_square_sum
 from .stage_timer import StageTimer, solver_residual_max
 from ..models import (
     RunTimings,
@@ -170,12 +171,12 @@ def run_scf_kpoints(
             k_points[task],
         )
 
-    def accumulate(task, vectors, occupations):
+    def accumulate(task, vectors, occupations, xp=np):
         # rho(r) = sum_k w_k*(2/dV)*sum_n f_nk*|u_nk(r)|**2.  u_nk is complex
         # even though the resulting density is real.
         return {
             "density": (weight * 2.0 / system.grid.volume_element)
-            * ((np.abs(vectors) ** 2) @ occupations)
+            * weighted_square_sum(vectors, occupations, xp)
         }
 
     with timer.stage("solver_setup"):
@@ -428,11 +429,11 @@ def run_scf_kpoints_spin_polarized(
             k_points[k_index],
         )
 
-    def accumulate(task, vectors, occupations):
+    def accumulate(task, vectors, occupations, xp=np):
         spin_index = task // n_kpoints
         return {
             "up" if spin_index == 0 else "down": (weight / system.grid.volume_element)
-            * ((np.abs(vectors) ** 2) @ occupations)
+            * weighted_square_sum(vectors, occupations, xp)
         }
 
     with timer.stage("solver_setup"):

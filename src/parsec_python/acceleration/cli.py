@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import os
 from pathlib import Path
 import sys
 import time
@@ -271,6 +272,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--mpi",
+        action="store_true",
+        help=(
+            "run as one of several MPI ranks (start them with mpirun or srun, one per GPU): "
+            "the basis of the k-point and non-collinear eigenproblems is split by blocks of grid "
+            "rows over all the GPUs, so a basis larger than one GPU fits. Every rank runs the same "
+            "calculation; only rank 0 writes the log and the archive. Same as PARSEC_MPI=1"
+        ),
+    )
+    parser.add_argument(
         "--no-archive",
         action="store_true",
         help="do not write parsec_python_results.npz",
@@ -515,8 +526,43 @@ def _reference_argv(arguments: argparse.Namespace) -> list[str]:
     return argv
 
 
+def _join_mpi(arguments: argparse.Namespace) -> int | None:
+    """Make this process one rank of an MPI run; ``None`` if all is well, else an exit status.
+
+    Every rank runs the whole calculation (see :mod:`.Parallel.mpi`); the ranks other than 0 are
+    silent and write no files.
+    """
+    from .Parallel import mpi
+
+    if not (arguments.mpi or mpi.requested()):
+        return None
+    os.environ[mpi.MPI_ENV] = "1"
+    try:
+        context = mpi.context()
+    except ImportError as error:
+        print(f"Input error: --mpi needs mpi4py: {error}", file=sys.stderr)
+        return 2
+    if arguments.dry_run:
+        return None
+    if not context.is_root:
+        arguments.quiet = True
+        arguments.log = Path(os.devnull)
+        arguments.no_archive = True
+        arguments.output = None
+    elif context.size > 1:
+        print(
+            f"MPI: {context.size} ranks, {context.ranks_per_node} per node; the eigenproblem basis "
+            "is split by blocks of grid rows over the ranks",
+            flush=True,
+        )
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _build_parser().parse_args(argv)
+    status = _join_mpi(arguments)
+    if status is not None:
+        return status
     try:
         resources = resolve_resources(
             device=arguments.device,
@@ -531,7 +577,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     # The request reaches the solver through its variables, for this
     # calculation only: a process that runs several keeps none of them.
     with resources.applied():
-        return _run(arguments, resources)
+        try:
+            status = _run(arguments, resources)
+        except BaseException:
+            _abort_mpi(1)
+            raise
+    if status not in (0, 3):
+        _abort_mpi(status)
+    return status
+
+
+def _abort_mpi(status: int) -> None:
+    """A rank that failed must not leave the others waiting in a collective (the interpreter's exit
+    would wait for them in MPI_Finalize): end the whole MPI job."""
+    from .Parallel import mpi
+
+    context = mpi.context()
+    if context is not None and context.size > 1:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        context.comm.Abort(int(status))
 
 
 def _run(arguments: argparse.Namespace, resources: Resources) -> int:

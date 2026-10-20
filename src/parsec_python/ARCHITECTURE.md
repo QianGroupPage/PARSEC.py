@@ -56,6 +56,12 @@ are the performance counterpart; importing `parsec_python.acceleration` installs
 it with `set_parallel_backend`. `acceleration/tests/test_kpoint_parallel.py`
 checks it against the serial definition.
 
+A basis too large for one GPU is split over MPI ranks by blocks of grid rows:
+`acceleration/Parallel/mpi.py` (the communicator and its collectives), `acceleration/Hamiltonian/distributed_bloch.py`
+(row-sliced operators with halo exchange and projector sums) and `acceleration/SCF/kpoint_mpi.py` (the solver that the
+drivers get from `make_kpoint_solver` when `PARSEC_MPI=1`). The eigensolver in `chebff_spinor.py` is the same code
+with its reductions routed through the operator; the drivers stay replicated and unaware of MPI.
+
 Preparing a periodic cell follows the same rule. `V_ion` keeps the direct definitions: the Ewald local
 potential and the projector and atomic-density builders measure the distance of every grid point to every atom
 image. `acceleration/V_ion/periodic_setup.py` supplies a grid-ball query (integer index boxes, identical

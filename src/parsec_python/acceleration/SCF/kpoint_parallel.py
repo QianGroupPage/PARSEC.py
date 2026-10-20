@@ -40,7 +40,7 @@ from parsec_python.Eigensolvers import solve_eigval
 from parsec_python.SCF.kpoint_solver import KPointJob, residual_max, set_parallel_backend
 
 from ..Eigensolvers.chebff_spinor import SpinorEigvalState, solve_spinor_eigval
-from ..Parallel import WORKERS_ENV, make_pool
+from ..Parallel import WORKERS_ENV, make_pool, mpi
 
 SOLVER_ENV = "PARSEC_KPOINT_SOLVER"  # device (default) | host
 STORAGE_ENV = "PARSEC_KPOINT_STATE_STORAGE"  # auto (default) | device | host
@@ -386,8 +386,25 @@ class _TaskWorker:
             yield task, self.solve_task(task, self.converter)
 
 
+def _mpi_map_tasks(context, solve_task, n_tasks: int, backend=None):
+    """The independent tasks dealt out to the MPI ranks, each solved whole on the device of its rank;
+    every rank gets all the results (in task order) and yields them."""
+    plan = resolve_backend(backend)
+    converter = plan.converter(context.local_rank) if plan is not None else None
+    mine = [(task, solve_task(task, converter)) for task in range(context.rank, n_tasks, context.size)]
+    gathered = {}
+    for part in context.comm.allgather(mine):
+        gathered.update(part)
+    for task in range(n_tasks):
+        yield task, gathered[task]
+
+
 def map_tasks(solve_task, n_tasks: int, *, problem_size=None, workers=None, backend=None):
     """Yield ``(task, result)`` as the workers finish the independent tasks."""
+    context = mpi.context()
+    if context is not None and context.size > 1:
+        yield from _mpi_map_tasks(context, solve_task, n_tasks, backend)
+        return
     plan = resolve_backend(backend)
     if plan is not None:
         workers = device_worker_count(plan, n_tasks)
@@ -400,10 +417,22 @@ def map_tasks(solve_task, n_tasks: int, *, problem_size=None, workers=None, back
         yield from pool.stream("run")
 
 
+def make_solver(job: KPointJob, **options):
+    """The solver of a k-point job: row-distributed over the MPI ranks if the run is an MPI run
+    (``PARSEC_MPI=1``), else the pool of threads and devices of this process."""
+    if mpi.context() is not None:
+        from .kpoint_mpi import MPIKPointSolver
+
+        return MPIKPointSolver(job, **options)
+    return PooledKPointSolver(job, **options)
+
+
 def install() -> None:
     """Make this the parallel backend of the reference k-point drivers and band paths."""
     set_parallel_backend(
-        PooledKPointSolver, map_tasks, uses_device=lambda: resolve_backend() is not None
+        make_solver,
+        map_tasks,
+        uses_device=lambda: mpi.requested() or resolve_backend() is not None,
     )
 
 

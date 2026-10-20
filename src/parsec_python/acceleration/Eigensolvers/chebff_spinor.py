@@ -121,6 +121,10 @@ class _CountingOperator:
         self._stats = stats
         self.shape = operator.shape
 
+    def __getattr__(self, name):
+        # allsum, mpi, local_dimension, ... of a distributed operator
+        return getattr(self._operator, name)
+
     def apply(self, block):
         self._stats.add("applications", 1)
         if block.ndim == 1:  # the Lanczos start vectors are single vectors
@@ -130,6 +134,103 @@ class _CountingOperator:
         return self._operator.apply(block)
 
 
+# ------------------------------------------------- row-distributed bases (MPI)
+# A distributed operator carries ``mpi`` (the context), ``allsum`` (sum a device array over the ranks),
+# ``local_dimension`` (the rows this rank holds) and ``local_vector``.  Serially none of them exists and
+# every helper below is the identity.
+def _mpi(operator):
+    return getattr(operator, "mpi", None)
+
+
+def _sum_host(operator, array: np.ndarray) -> np.ndarray:
+    context = _mpi(operator)
+    return array if context is None else context.allsum_host(np.ascontiguousarray(array))
+
+
+def _sum_device(operator, array):
+    allsum = getattr(operator, "allsum", None)
+    return array if allsum is None else allsum(array)
+
+
+def _local_rows(operator, dimension: int) -> int:
+    return int(getattr(operator, "local_dimension", dimension))
+
+
+def _vdot(operator, cp, left, right) -> float:
+    value = np.array([float(cp.real(cp.vdot(left, right)))])
+    return float(_sum_host(operator, value)[0])
+
+
+def _eigh(xp, operator, hermitian):
+    """``eigh`` of a small replicated matrix; with several ranks the root's result goes to all of them,
+    so that the eigenvalues (which drive the occupations of every replicated driver) agree bit for bit."""
+    context = _mpi(operator)
+    if context is None or context.size == 1:
+        return xp.linalg.eigh(hermitian)
+    eigenvalues, rotations = xp.linalg.eigh(hermitian)
+    host_values = np.ascontiguousarray(np.asarray(_to_host(xp, eigenvalues), dtype=np.float64))
+    host_rotations = np.ascontiguousarray(np.asarray(_to_host(xp, rotations), dtype=np.complex128))
+    context.bcast(host_values)
+    context.bcast(host_rotations)
+    return xp.asarray(host_values), xp.asarray(host_rotations)
+
+
+def _row_chunk(count: int) -> int:
+    """Rows per chunk of a tall block of ``count`` columns: about 512 MB of complex numbers."""
+    return max(256, min(_ROW_CHUNK, (1 << 25) // max(int(count), 1)))
+
+
+def _distributed_orthonormalize(xp, vectors, operator):
+    """Orthonormalize the columns of a row-distributed block in place (shifted Cholesky QR, three passes).
+
+    ``X <- X R^-1`` with ``R^H R = X^H X (+ shift)``, the Gram matrix summed over the ranks.  The first
+    pass is shifted so that it survives the poor conditioning of a filtered block; two more passes
+    restore orthogonality to round-off.  Only a few chunks of rows are ever extra; the Gram matrix and
+    ``R`` are ``count x count``.  Replaces the Householder QR of a block on one device.
+    """
+    rows, count = vectors.shape
+    dimension = int(operator.shape[0])
+    chunk = _row_chunk(count)
+    eps = float(np.finfo(np.float64).eps)
+    for pass_index in range(3):
+        gram = xp.zeros((count, count), dtype=xp.complex128)
+        for r0 in range(0, rows, chunk):
+            block = vectors[r0 : min(r0 + chunk, rows)]
+            gram += block.conj().T @ block
+        gram = _sum_device(operator, gram)
+        trace = float(xp.real(xp.trace(gram)))
+        shift = 11.0 * (dimension * count + count * (count + 1)) * eps * trace if pass_index == 0 else 0.0
+        factor = None
+        for attempt in range(4):
+            try:
+                lower = xp.linalg.cholesky(gram + shift * xp.eye(count, dtype=xp.complex128))
+                factor = lower
+                break
+            except Exception:  # LinAlgError (NumPy) or the backend's equivalent: not positive definite
+                shift = max(shift * 100.0, 1.0e-14 * trace)
+        if factor is None:
+            raise FloatingPointError("the block is numerically rank deficient: Cholesky QR failed")
+        # R = L^H;  X <- X R^-1 = X (L^H)^-1.  Invert the triangular factor once (count x count).
+        r_inverse = _solve_triangular_inverse(xp, factor)
+        for r0 in range(0, rows, chunk):
+            r1 = min(r0 + chunk, rows)
+            vectors[r0:r1] = vectors[r0:r1] @ r_inverse
+    return vectors
+
+
+def _solve_triangular_inverse(xp, lower):
+    """``(L^H)^-1`` for a lower-triangular ``L`` (the inverse of the Cholesky factor ``R = L^H``)."""
+    count = lower.shape[0]
+    try:
+        if xp is np:
+            from scipy.linalg import solve_triangular
+        else:
+            from cupyx.scipy.linalg import solve_triangular
+        return solve_triangular(lower.conj().T, xp.eye(count, dtype=xp.complex128), lower=False)
+    except ImportError:
+        return xp.linalg.inv(lower.conj().T)
+
+
 # --------------------------------------------------------------------- primitives
 def _lanczos_upper_bound(cp, operator, dimension: int, steps: int, rng: np.random.Generator):
     """Device counterpart of
@@ -137,25 +238,29 @@ def _lanczos_upper_bound(cp, operator, dimension: int, steps: int, rng: np.rando
 
     target_steps = min(max(int(steps), 4), 8, dimension)
     host_start = rng.random(dimension) + 1j * rng.random(dimension)
-    vector = cp.asarray(host_start, dtype=cp.complex128)
-    vector = vector / cp.linalg.norm(vector)
+    local_start = host_start
+    take_local = getattr(operator, "local_vector", None)
+    if take_local is not None:
+        local_start = take_local(host_start)  # this rank's rows of the same global start vector
+    vector = cp.asarray(local_start, dtype=cp.complex128)
+    vector = vector / np.sqrt(_vdot(operator, cp, vector, vector))
 
     projected = np.zeros((target_steps, target_steps), dtype=float)
     residual = operator.apply(vector)
-    alpha = float(cp.real(cp.vdot(vector, residual)))
+    alpha = _vdot(operator, cp, vector, residual)
     residual = residual - alpha * vector
     projected[0, 0] = alpha
 
     actual_steps = 1
-    raw_beta = float(cp.linalg.norm(residual))
+    raw_beta = float(np.sqrt(_vdot(operator, cp, residual, residual)))
     for column in range(1, target_steps):
-        raw_beta = float(cp.linalg.norm(residual))
+        raw_beta = float(np.sqrt(_vdot(operator, cp, residual, residual)))
         if raw_beta <= _BREAKDOWN_TOLERANCE:
             break
         previous = vector
         vector = residual / raw_beta
         residual = operator.apply(vector) - raw_beta * previous
-        alpha = float(cp.real(cp.vdot(vector, residual)))
+        alpha = _vdot(operator, cp, vector, residual)
         residual = residual - alpha * vector
         projected[column, column - 1] = raw_beta
         projected[column - 1, column] = raw_beta
@@ -213,7 +318,9 @@ def _chebyshev_filter(
     return current
 
 
-def _orthonormalize(cp, vectors):
+def _orthonormalize(cp, vectors, operator=None):
+    if operator is not None and _mpi(operator) is not None:
+        return _distributed_orthonormalize(cp, vectors, operator)
     basis, _ = cp.linalg.qr(vectors)
     return basis
 
@@ -235,7 +342,7 @@ def _rayleigh_ritz_in_place(xp, operator, basis, chunk: int):
     """Rayleigh-Ritz with the projection accumulated by column chunks and the
     rotation written over ``basis``.  Returns the Ritz values (host)."""
 
-    dimension, count = basis.shape
+    dimension, count = basis.shape  # dimension: the rows held here
     projection = xp.empty((count, count), dtype=xp.complex128)
     for c0 in range(0, count, chunk):
         c1 = min(c0 + chunk, count)
@@ -244,11 +351,13 @@ def _rayleigh_ritz_in_place(xp, operator, basis, chunk: int):
             r1 = min(r0 + chunk, count)
             projection[r0:r1, c0:c1] = xp.ascontiguousarray(basis[:, r0:r1]).conj().T @ applied
         del applied
+    projection = _sum_device(operator, projection)
     lower = xp.tril(projection)
     hermitian = lower + xp.tril(lower, -1).conj().T
-    eigenvalues, rotations = xp.linalg.eigh(hermitian)
-    for r0 in range(0, dimension, _ROW_CHUNK):
-        r1 = min(r0 + _ROW_CHUNK, dimension)
+    eigenvalues, rotations = _eigh(xp, operator, hermitian)
+    row_chunk = _row_chunk(count)
+    for r0 in range(0, dimension, row_chunk):
+        r1 = min(r0 + row_chunk, dimension)
         basis[r0:r1] = basis[r0:r1] @ rotations
     return np.asarray(_to_host(xp, eigenvalues), dtype=np.float64)
 
@@ -263,7 +372,8 @@ def _residual_norms(xp, operator, vectors, eigenvalues: np.ndarray, chunk: int) 
         applied = operator.apply(block)
         applied -= block * xp.asarray(np.asarray(eigenvalues[c0:c1], dtype=np.float64))[None, :]
         squares = applied.real * applied.real + applied.imag * applied.imag
-        norms[c0:c1] = np.sqrt(np.asarray(_to_host(xp, squares.sum(axis=0)), dtype=np.float64))
+        partial = np.ascontiguousarray(np.asarray(_to_host(xp, squares.sum(axis=0)), dtype=np.float64))
+        norms[c0:c1] = np.sqrt(_sum_host(operator, partial))
     return norms
 
 
@@ -336,8 +446,11 @@ def _filter_group(
         del current
 
 
-def _check_finite(xp, array) -> None:
-    if not bool(xp.all(xp.isfinite(array))):
+def _check_finite(xp, array, operator=None) -> None:
+    bad = np.array([0.0 if bool(xp.all(xp.isfinite(array))) else 1.0])
+    if operator is not None:
+        bad = _sum_host(operator, bad)  # every rank must take the same decision
+    if bad[0] > 0.0:
         raise FloatingPointError("Chebyshev recurrence produced nonfinite values")
 
 
@@ -356,12 +469,15 @@ def _first_solve(
     """CHEBFF from a random start: ``filter_cycles`` cycles, plus more (up to ``max_cycles`` in all)
     while ``converged(vectors, eigenvalues)`` says the pairs are not yet converged."""
     dimension = int(operator.shape[0])
-    rng = xp.random.default_rng(settings.random_seed)
-    vectors = xp.empty((dimension, working), dtype=xp.complex128)
+    rows = _local_rows(operator, dimension)
+    context = _mpi(operator)
+    # each rank draws its own rows: the start of a distributed basis depends on the number of ranks
+    rng = xp.random.default_rng(settings.random_seed + (0 if context is None else 7919 * context.rank))
+    vectors = xp.empty((rows, working), dtype=xp.complex128)
     for c0 in range(0, working, chunk):
         c1 = min(c0 + chunk, working)
-        vectors[:, c0:c1] = rng.uniform(-1.0, 1.0, (dimension, c1 - c0)) + 1j * rng.uniform(
-            -1.0, 1.0, (dimension, c1 - c0)
+        vectors[:, c0:c1] = rng.uniform(-1.0, 1.0, (rows, c1 - c0)) + 1j * rng.uniform(
+            -1.0, 1.0, (rows, c1 - c0)
         )
     bound_rng = np.random.default_rng(settings.random_seed + 1)
     with stats.timed("lanczos_seconds"):
@@ -401,9 +517,9 @@ def _first_solve(
                 chunk,
             )
             del vectors
-        _check_finite(xp, filtered[:, :1])
+        _check_finite(xp, filtered[:, :1], operator)
         with stats.timed("orthonormalize_seconds"):
-            vectors = _orthonormalize(xp, filtered)
+            vectors = _orthonormalize(xp, filtered, operator)
             del filtered
         with stats.timed("ritz_seconds"):
             eigenvalues = _rayleigh_ritz_in_place(xp, operator, vectors, chunk)
@@ -492,9 +608,9 @@ def _subspace_step(xp, operator, state: SpinorEigvalState, settings: SubspaceSet
                 chunk,
             )
         state.vectors = None  # consumed
-    _check_finite(xp, filtered[:, :1])
+    _check_finite(xp, filtered[:, :1], operator)
     with stats.timed("orthonormalize_seconds"):
-        vectors = _orthonormalize(xp, filtered)
+        vectors = _orthonormalize(xp, filtered, operator)
         del filtered
     with stats.timed("ritz_seconds"):
         eigenvalues = _rayleigh_ritz_in_place(xp, operator, vectors, chunk)

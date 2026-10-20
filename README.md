@@ -639,6 +639,36 @@ version of the GPU path: `check_gpu_kpoints` passes on an NVIDIA A100-SXM4-80GB 
 (operator, filter, a short non-collinear spin-orbit SCF and a band path against the CPU); other
 devices and multi-GPU runs have not been checked yet.
 
+### Several GPUs and nodes for one large eigenproblem (MPI)
+
+A k-point or non-collinear basis that does not fit one GPU (a two-component basis of a few thousand
+states on a few million grid points is hundreds of GB) is split by blocks of grid rows over the GPUs of
+several nodes. Start one MPI rank per GPU and add `--mpi` (or `PARSEC_MPI=1`; needs `mpi4py`):
+
+```bash
+srun --nodes=3 --ntasks=12 --ntasks-per-node=4 --gpus-per-node=4 --gpu-bind=none \
+    python -m parsec_python.main parsec.in --mpi --device gpu --gpus 4
+```
+
+Rank `r` holds rows `[start_r, stop_r)` of every orbital, of the finite-difference matrices, of the
+projectors and of the local fields, and picks the GPU of its local index. Applying the Hamiltonian
+exchanges the halo rows of the stencil with the neighbouring ranks and sums the overlaps with the
+projectors (and the spin-orbit projectors) over the ranks. Orthonormalization is a shifted Cholesky QR
+of the summed Gram matrix, the Rayleigh-Ritz projection and the residuals are summed `states x states`
+matrices, and the root's eigenvalues and rotations go to every rank. The SCF driver is replicated on
+every rank (the ranks compare a checksum of the potentials every iteration and stop with a message
+should they ever diverge); the density is formed from the local rows and joined on every rank, and only
+rank 0 writes the log and the archive. Wavefunctions are not gathered. The tasks of a job (k-points,
+spin channels) are solved one after the other, each over all the ranks; the independent points of a band
+path are dealt out to the ranks instead.
+
+A GPU needs about twice the local rows of one subspace plus a few `states x states` matrices, so a basis
+of `B` GB needs at least `2B/(0.92 x GPU memory)` GPUs; the run stops with that number if the GPUs are
+too few. The MPI library is used through the host unless it is CUDA aware and `PARSEC_MPI_CUDA_AWARE=1`.
+`acceleration/tests/test_kpoint_mpi.py` runs the distributed operator, the drivers and the command line
+on 2 and 3 ranks (the device code on the host) against the single-process solver; it has not been run on
+GPUs or on more than one node.
+
 ## Band structures (periodic systems)
 
 A `bandstruc` block adds a non-self-consistent band structure after the SCF, as in

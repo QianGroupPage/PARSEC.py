@@ -1740,6 +1740,7 @@ class ParsecTextReporter:
             ("worker_spill_seconds", "Subspace to the host"),
             ("worker_download_seconds", "Eigenvectors to the host"),
             ("worker_density_seconds", "Density of the k-points"),
+            ("worker_gather_seconds", "Density joined over the MPI ranks"),
         )
         present = [(key, label) for key, label in worker if key in detail]
         if present:
@@ -1938,6 +1939,7 @@ class ParsecTextReporter:
                 ("worker_spill_seconds", "worker: subspace to the host"),
                 ("worker_download_seconds", "worker: eigenvectors to the host"),
                 ("worker_density_seconds", "worker: density of the states"),
+                ("worker_gather_seconds", "worker: density joined over ranks"),
             ):
                 if key in counters:
                     value = counters[key]

@@ -55,6 +55,7 @@ class SerialKPointSolver:
         self.job = job
         self.states: dict[int, Any] = {}
         self._vectors: dict[int, np.ndarray] = {}
+        self._residuals: dict[int, float] = {}
 
     def solve(self, potentials: dict, filter_degree: int) -> list[np.ndarray]:
         """One eigenvalue array per task (task order), vectors kept in the solver."""
@@ -70,8 +71,13 @@ class SerialKPointSolver:
             )
             self.states[task] = solution.state
             self._vectors[task] = np.asarray(solution.vectors)
+            self._residuals[task] = residual_max(solution.residual_norms)
             eigenvalues.append(np.asarray(solution.eigenvalues, dtype=float))
         return eigenvalues
+
+    def residuals(self) -> list[float]:
+        """Largest eigenpair residual of each task's last solve (NaN where none was measured)."""
+        return [self._residuals.get(task, float("nan")) for task in range(self.job.n_tasks)]
 
     def accumulate(self, occupations: list[np.ndarray]) -> dict[str, np.ndarray]:
         """Sum of every task's density contribution for the given occupations."""
@@ -100,6 +106,14 @@ class SerialKPointSolver:
 
     def __exit__(self, *exc_info) -> None:
         self.close()
+
+
+def residual_max(norms) -> float:
+    """Largest residual norm, NaN if the solver reported none."""
+    if norms is None:
+        return float("nan")
+    norms = np.asarray(norms, dtype=float)
+    return float(np.max(norms)) if norms.size else float("nan")
 
 
 def split_pooled(pooled: np.ndarray, per_task: list[np.ndarray]) -> list[np.ndarray]:
@@ -167,6 +181,7 @@ __all__ = [
     "make_kpoint_solver",
     "map_tasks",
     "parallel_backend_uses_device",
+    "residual_max",
     "set_parallel_backend",
     "split_pooled",
 ]

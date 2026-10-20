@@ -37,7 +37,7 @@ from typing import Any, Callable
 import numpy as np
 
 from parsec_python.Eigensolvers import solve_eigval
-from parsec_python.SCF.kpoint_solver import KPointJob, set_parallel_backend
+from parsec_python.SCF.kpoint_solver import KPointJob, residual_max, set_parallel_backend
 
 from ..Eigensolvers.chebff_spinor import SpinorEigvalState, solve_spinor_eigval
 from ..Parallel import WORKERS_ENV, make_pool
@@ -119,6 +119,7 @@ class _SolveWorker:
         self.states: dict[int, Any] = {}
         self.vectors: dict[int, Any] = {}
         self.stats: dict[str, float] = {}
+        self.residual: dict[int, float] = {}
         # Built here, in the worker (thread), so the device is current for it.
         self.converter = plan.converter(index) if plan is not None else None
         self.device_solver = self.converter is not None and _device_solver_requested()
@@ -181,6 +182,7 @@ class _SolveWorker:
                 filters_completed=0,
             )
             eigenvalues = np.asarray(host.eigenvalues, dtype=float)
+            self.residual[task] = residual_max(host.residual_norms)
         else:
             result = solve_spinor_eigval(
                 operator,
@@ -195,6 +197,7 @@ class _SolveWorker:
             )
             new_state = result.state
             eigenvalues = result.eigenvalues
+            self.residual[task] = residual_max(result.residual_norms)
             for name, value in result.stats.items():
                 self.stats[name] = self.stats.get(name, 0.0) + value
         self._tick("solve", solve_start)
@@ -237,6 +240,7 @@ class _SolveWorker:
             self._tick("solve", start)
             self.states[task] = solution.state
             self.vectors[task] = np.asarray(solution.vectors)
+            self.residual[task] = residual_max(solution.residual_norms)
             yield task, np.asarray(solution.eigenvalues, dtype=float)
 
     def accumulate(self, occupations: dict[int, np.ndarray]):
@@ -265,6 +269,9 @@ class _SolveWorker:
 
     def stats_of(self):
         yield None, dict(self.stats)
+
+    def residuals_of(self):
+        yield None, dict(self.residual)
 
 
 class PooledKPointSolver:
@@ -328,6 +335,13 @@ class PooledKPointSolver:
             for name, value in part.items():
                 total[name] = total.get(name, 0.0) + value
         return total
+
+    def residuals(self) -> list[float]:
+        """Largest eigenpair residual of each task's last solve (NaN where none was measured)."""
+        merged: dict[int, float] = {}
+        for _, part in self.pool.results("residuals_of"):
+            merged.update(part)
+        return [merged.get(task, float("nan")) for task in range(self.job.n_tasks)]
 
     def close(self) -> None:
         self.pool.close()

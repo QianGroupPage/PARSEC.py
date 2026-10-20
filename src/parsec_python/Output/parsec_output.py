@@ -1252,6 +1252,7 @@ class ParsecTextReporter:
                 f"      tdiag_sum = {self._diagonalization_total:11.2f}"
             ),
             "",
+            *self._residual_lines(step),
         ]
         if getattr(step, "spin_polarized", False):
             # flevel.f90 and rho_hart.F90 report each channel.
@@ -1622,6 +1623,7 @@ class ParsecTextReporter:
                 if getattr(step, "total_seconds", 0.0) > 0.0
                 else ()
             ),
+            *self._residual_lines(step),
             f" Fermi level at {step.fermi_level:10.4f} [Ry]",
             "",
             *self._kpoint_note(),
@@ -1690,6 +1692,14 @@ class ParsecTextReporter:
                 )
             )
         return lines
+
+    @staticmethod
+    def _residual_lines(step) -> list[str]:
+        """The largest eigenpair residual ``||H x - e x||`` of an iteration, where one was measured."""
+        value = getattr(step, "eigen_residual_max", float("nan"))
+        if value != value:  # NaN
+            return []
+        return [f" Eigensolver residual max [Ry] : {value:12.4e}", ""]
 
     @staticmethod
     def _kpoint_stage_lines(timings) -> list[str]:
@@ -1832,6 +1842,7 @@ class ParsecTextReporter:
         lines = [
             f" Self-consistent SOC iter # {step.iteration:3d}",
             "",
+            *self._residual_lines(step),
             f" Fermi level at {step.fermi_level:10.4f} [Ry]",
             "",
             *self._kpoint_note(),
@@ -1881,12 +1892,14 @@ class ParsecTextReporter:
 
     @staticmethod
     def _soc_timing_lines(result: "SelfConsistentSOCResult") -> list[str]:
-        """The stage table of a self-consistent SOC run (``result.timings``)."""
+        """The stage table of a self-consistent SOC or non-collinear run (``result.timings``)."""
         timings = getattr(result, "timings", None)
         if not timings:
             return []
         stages = (
+            ("initial_magnetization", "Initial magnetization"),
             ("setup_potentials", "Initial Hartree + exchange-correlation"),
+            ("solver_setup", "Solver and worker start-up"),
             ("hamiltonian", "Hamiltonian binding subtotal"),
             ("diagonalization", "Diagonalization subtotal"),
             ("density", "Occupation/density subtotal"),
@@ -1907,21 +1920,31 @@ class ParsecTextReporter:
         if counters:
             lines.append(" Eigensolver detail")
             lines.append(" " + "-" * 50)
-            for key in (
-                "first_solves",
-                "subspace_steps",
-                "applications",
-                "application_columns",
-                "lanczos_seconds",
-                "filter_seconds",
-                "orthonormalize_seconds",
-                "ritz_seconds",
+            for key, label in (
+                ("workers", "workers"),
+                ("first_solves", "first_solves"),
+                ("subspace_steps", "subspace_steps"),
+                ("extra_cycles", "extra CHEBFF cycles"),
+                ("applications", "applications"),
+                ("application_columns", "application_columns"),
+                ("lanczos_seconds", "lanczos_seconds"),
+                ("filter_seconds", "filter_seconds"),
+                ("orthonormalize_seconds", "orthonormalize_seconds"),
+                ("ritz_seconds", "ritz_seconds"),
+                ("residual_seconds", "residual_seconds"),
+                ("worker_hamiltonian_seconds", "worker: Bloch Hamiltonian"),
+                ("worker_upload_seconds", "worker: operator upload"),
+                ("worker_solve_seconds", "worker: eigensolver"),
+                ("worker_spill_seconds", "worker: subspace to the host"),
+                ("worker_download_seconds", "worker: eigenvectors to the host"),
+                ("worker_density_seconds", "worker: density of the states"),
             ):
                 if key in counters:
                     value = counters[key]
                     text = f"{value:12.6f}" if key.endswith("seconds") else f"{int(value):12d}"
-                    lines.append(f" {key:30s} : {text}")
+                    lines.append(f" {label:34s} : {text}")
             lines.append(" " + "-" * 50)
+            lines.append(" (worker rows are seconds summed over the workers)")
         lines.append("")
         return lines
 

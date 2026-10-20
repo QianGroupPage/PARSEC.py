@@ -1161,6 +1161,7 @@ class SpinPolarizedSCFIteration:
     fermi_level: float = float("nan")
     diagonalization_seconds: float = 0.0
     total_seconds: float = 0.0
+    eigen_residual_max: float = float("nan")
 
 
 @dataclass
@@ -1313,6 +1314,8 @@ class SelfConsistentSOCIteration:
     eigenvalues: tuple[float, ...] = ()
     occupations: tuple[float, ...] = ()
     fermi_level: float = float("nan")
+    eigen_residual_max: float = float("nan")
+    """Largest ``||H x - e x||`` of the requested pairs after this iteration's solve (NaN if not measured)."""
 
 
 @dataclass

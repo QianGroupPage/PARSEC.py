@@ -504,6 +504,15 @@ def _subspace_step(xp, operator, state: SpinorEigvalState, settings: SubspaceSet
 
 
 # ---------------------------------------------------------------------- driver
+def _residual_period() -> int:
+    """Every how many SCF solves the residuals of the requested pairs are measured
+    (``PARSEC_KPOINT_RESIDUALS``: 0 never, 1 every solve, the default, N every Nth)."""
+    text = os.environ.get("PARSEC_KPOINT_RESIDUALS", "1").strip()
+    if not text.isdigit():
+        raise ValueError(f"PARSEC_KPOINT_RESIDUALS must be a non-negative integer, not {text!r}")
+    return int(text)
+
+
 def solve_spinor_eigval(
     operator: Any,
     requested_states: int,
@@ -515,6 +524,7 @@ def solve_spinor_eigval(
     converge_first: bool = False,
     tolerance: float | None = None,
     max_extra_cycles: int | None = None,
+    residual_period: int | None = None,
 ) -> SpinorEigvalResult:
     """One eigensolve of the SCF loop (``solve_eigval``'s policy on the device).
 
@@ -531,6 +541,11 @@ def solve_spinor_eigval(
     upper requested states much faster than SUBSPACE steps (measured on GaAs bands: 8 SUBSPACE steps
     left residuals of 1e-1 Ry that 10 CHEBFF cycles bring to 6e-4 Ry).  The state it returns continues
     as an ordinary subspace state, and the residuals come back in ``residual_norms``.
+
+    ``residual_period`` (default ``PARSEC_KPOINT_RESIDUALS``, 1) measures the residuals of the
+    requested Ritz pairs after every Nth solve, one more application of the operator to the
+    requested block (about 1/16 of a solve at filter degree 15); 0 measures them only where the
+    first solve's convergence test needs them.
     """
     if xp is None:
         xp, _ = require_cupy()
@@ -543,6 +558,7 @@ def solve_spinor_eigval(
     if not 1 <= requested_states <= dimension:
         raise ValueError(f"requested_states must be between 1 and {dimension}, got {requested_states}")
     chunk = _filter_columns()
+    period = _residual_period() if residual_period is None else int(residual_period)
 
     reusable = (
         state is not None
@@ -593,6 +609,11 @@ def solve_spinor_eigval(
             filters_completed=0,
         )
         stats.add("first_solves", 1)
+        if residuals is None and period > 0:
+            with stats.timed("residual_seconds"):
+                residuals = _residual_norms(
+                    xp, counted, vectors[:, :requested_states], eigenvalues[:requested_states], chunk
+                )
     else:
         vectors, eigenvalues, lower_bound, degree = _subspace_step(
             xp, counted, state, settings.subspace, chunk, stats
@@ -608,12 +629,18 @@ def solve_spinor_eigval(
         )
         stats.add("subspace_steps", 1)
         stats.add("polynomial_degree", degree)
+        residuals = None
+        if period > 0 and new_state.filters_completed % period == 0:
+            with stats.timed("residual_seconds"):
+                residuals = _residual_norms(
+                    xp, counted, vectors[:, :requested_states], eigenvalues[:requested_states], chunk
+                )
     return SpinorEigvalResult(
         eigenvalues=eigenvalues[:requested_states].copy(),
         vectors=new_state.vectors[:, :requested_states],
         state=new_state,
         stats=dict(stats.values),
-        residual_norms=residuals if not reusable else None,
+        residual_norms=residuals,
     )
 
 

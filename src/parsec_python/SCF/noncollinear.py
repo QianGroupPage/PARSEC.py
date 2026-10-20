@@ -42,6 +42,7 @@ from ..Occupations import fermi_occupations
 from ..V_ion import superpose_atomic_density
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
 from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
+from .stage_timer import StageTimer, solver_residual_max, solver_timings
 from .kpoints_soc import (
     _eigval_settings,
     _k_point_operators,
@@ -138,11 +139,14 @@ def _run_noncollinear(
     number_of_states = _number_of_states(system)
     ionic_potential = system.ionic_potential
 
+    timer = StageTimer()
     density = system.initial_density
-    magnetization = _initial_magnetization(system)
-    hartree = system.solve_hartree(density, initial_potential=-ionic_potential)
-    hartree_potential = hartree.potential
-    xc = system.evaluate_xc_noncollinear(density, magnetization)
+    with timer.stage("initial_magnetization"):
+        magnetization = _initial_magnetization(system)
+    with timer.stage("setup_potentials"):
+        hartree = system.solve_hartree(density, initial_potential=-ionic_potential)
+        hartree_potential = hartree.potential
+        xc = system.evaluate_xc_noncollinear(density, magnetization)
     input_potential = ionic_potential + hartree_potential + xc.potential
     input_field = xc.field
 
@@ -178,60 +182,66 @@ def _run_noncollinear(
         for iteration in range(1, settings.max_iterations + 1):
             eigval_settings = _eigval_settings(system, filter_degree)
 
-            eigenvalues_by_k = solver.solve({"V": input_potential, "field": input_field}, filter_degree)
+            with timer.stage("diagonalization"):
+                eigenvalues_by_k = solver.solve({"V": input_potential, "field": input_field}, filter_degree)
+            residual_max = solver_residual_max(solver)
 
-            stacked = np.concatenate(eigenvalues_by_k)
-            order = np.argsort(stacked, kind="stable")
-            occupation_result = fermi_occupations(
-                stacked[order],
-                system.electron_count,
-                settings.fermi_temperature_kelvin,
-                degeneracy=weight,
-            )
-            stacked_occupations = np.empty_like(stacked)
-            stacked_occupations[order] = occupation_result.occupations
-            fermi_level = occupation_result.fermi_level
-            pooled_eigenvalues = stacked
-            pooled_occupations = stacked_occupations
+            with timer.stage("density"):
+                stacked = np.concatenate(eigenvalues_by_k)
+                order = np.argsort(stacked, kind="stable")
+                occupation_result = fermi_occupations(
+                    stacked[order],
+                    system.electron_count,
+                    settings.fermi_temperature_kelvin,
+                    degeneracy=weight,
+                )
+                stacked_occupations = np.empty_like(stacked)
+                stacked_occupations[order] = occupation_result.occupations
+                fermi_level = occupation_result.fermi_level
+                pooled_eigenvalues = stacked
+                pooled_occupations = stacked_occupations
 
-            parts = solver.accumulate(split_pooled(stacked_occupations, eigenvalues_by_k))
-            density = parts["density"]
-            magnetization = parts["magnetization"]
+                parts = solver.accumulate(split_pooled(stacked_occupations, eigenvalues_by_k))
+                density = parts["density"]
+                magnetization = parts["magnetization"]
 
-            hartree = system.solve_hartree(density, initial_potential=hartree_potential)
-            hartree_potential = hartree.potential
-            xc = system.evaluate_xc_noncollinear(density, magnetization)
-            output_potential = ionic_potential + hartree_potential + xc.potential
-            output_field = xc.field
+            with timer.stage("hartree"):
+                hartree = system.solve_hartree(density, initial_potential=hartree_potential)
+                hartree_potential = hartree.potential
+            with timer.stage("xc"):
+                xc = system.evaluate_xc_noncollinear(density, magnetization)
+                output_potential = ionic_potential + hartree_potential + xc.potential
+                output_field = xc.field
 
             input_combined = np.concatenate([input_potential, input_field.reshape(-1)])
             output_combined = np.concatenate([output_potential, output_field.reshape(-1)])
-            metrics = potential_residual_metrics(
-                input_combined,
-                output_combined,
-                np.tile(density, 4),
-                volume_element,
-                system.electron_count,
-            )
-            energies = total_energy_noncollinear(
-                pooled_eigenvalues,
-                pooled_occupations,
-                density,
-                magnetization,
-                input_potential,
-                input_field,
-                ionic_potential,
-                hartree_potential,
-                xc.potential,
-                xc.field,
-                xc.total_energy,
-                system.ion_ion_energy,
-                volume_element,
-                alpha_z_energy=system.alpha_z_energy,
-                band_energy_weight=weight,
-            )
+            with timer.stage("mixing_energy"):
+                metrics = potential_residual_metrics(
+                    input_combined,
+                    output_combined,
+                    np.tile(density, 4),
+                    volume_element,
+                    system.electron_count,
+                )
+                energies = total_energy_noncollinear(
+                    pooled_eigenvalues,
+                    pooled_occupations,
+                    density,
+                    magnetization,
+                    input_potential,
+                    input_field,
+                    ionic_potential,
+                    hartree_potential,
+                    xc.potential,
+                    xc.field,
+                    xc.total_energy,
+                    system.ion_ion_energy,
+                    volume_element,
+                    alpha_z_energy=system.alpha_z_energy,
+                    band_energy_weight=weight,
+                )
 
-            mixed = mixer.mix(input_combined, output_combined, iteration=iteration)
+                mixed = mixer.mix(input_combined, output_combined, iteration=iteration)
             selected_residual = (
                 metrics.plain if settings.use_plain_residual else metrics.weighted
             )
@@ -246,6 +256,7 @@ def _run_noncollinear(
                         eigenvalues=tuple(float(v) for v in eigenvalues_by_k[0]),
                         occupations=tuple(float(v) for v in stacked_occupations[:first_k]),
                         fermi_level=float(fermi_level),
+                        eigen_residual_max=residual_max,
                     )
                 )
             input_potential = mixed[:n_grid]
@@ -278,6 +289,7 @@ def _run_noncollinear(
             k_points=k_points,
             k_weights=None if k_points is None else np.full(n_kpoints, weight),
             state_moments=None if k_points is None else np.concatenate(solver.extras()),
+            timings=solver_timings(timer, solver),
             scf_potentials={
                 "effective_potential": output_potential,
                 "xc_field": output_field,

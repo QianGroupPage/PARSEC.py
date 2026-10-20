@@ -58,7 +58,7 @@ from ..SCF.spin_polarized import (
 from ..V_ion import build_nonlocal_projectors
 from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
 from .kpoints_soc import _eigval_settings
-from .stage_timer import StageTimer
+from .stage_timer import StageTimer, solver_residual_max
 from ..models import (
     RunTimings,
     SCFIteration,
@@ -206,6 +206,7 @@ def run_scf_kpoints(
 
             with timer.stage("diagonalization"):
                 eigenvalues_by_k = solver.solve({"V": input_potential}, filter_degree)
+            residual_max = solver_residual_max(solver)
 
             # Pool every k-point's eigenvalues into one shared Fermi-level
             # bisection (flevel.f90's convention, generalized from spin
@@ -276,7 +277,7 @@ def run_scf_kpoints(
                 iteration=iteration,
                 weighted_residual=metrics.weighted,
                 plain_residual=metrics.plain,
-                eigen_residual_max=float("nan"),
+                eigen_residual_max=residual_max,
                 hartree_residual=hartree.residual_norm,
                 energies=energies,
                 eigenvalues=tuple(float(value) for value in eigenvalues_by_k[0]),
@@ -463,6 +464,7 @@ def run_scf_kpoints_spin_polarized(
                 by_task = solver.solve(
                     {"up": input_potential_up, "down": input_potential_down}, filter_degree
                 )
+            residual_max = solver_residual_max(solver)
             eigenvalues_by_spin_k = [by_task[:n_kpoints], by_task[n_kpoints:]]
 
             with timer.stage("density"):
@@ -554,6 +556,7 @@ def run_scf_kpoints_spin_polarized(
                         fermi_level=float(fermi_level),
                         diagonalization_seconds=lap.get("diagonalization", 0.0),
                         total_seconds=sum(lap.values()),
+                        eigen_residual_max=residual_max,
                     )
                 )
             input_potential_up = mixed_combined[:n_grid]

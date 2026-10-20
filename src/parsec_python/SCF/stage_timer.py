@@ -6,6 +6,8 @@ import time
 from contextlib import contextmanager
 from typing import Callable
 
+import numpy as np
+
 
 class StageTimer:
     """Seconds per named stage; ``synchronize`` (a device barrier) makes them exact on a GPU.
@@ -45,4 +47,30 @@ class StageTimer:
         return gained
 
 
-__all__ = ["StageTimer"]
+def solver_residual_max(solver) -> float:
+    """Largest eigenpair residual ``||H x - e x||`` the k-point solver measured in its last solve.
+
+    NaN where the solver measured none (a first solve without a residual test, residual reporting
+    switched off with ``PARSEC_KPOINT_RESIDUALS=0``, or a solver that does not report them).
+    """
+    getter = getattr(solver, "residuals", None)
+    if getter is None:
+        return float("nan")
+    values = [float(v) for v in getter() if v is not None and np.isfinite(v)]
+    return max(values) if values else float("nan")
+
+
+def solver_timings(timer: StageTimer, solver) -> dict[str, float]:
+    """The stage seconds plus what the solver measured inside (``eig_*``, worker-seconds summed)."""
+    timings = dict(timer.seconds)
+    stats = getattr(solver, "stats", None)
+    if stats is not None:
+        for name, value in stats().items():
+            timings[f"eig_{name}"] = float(value)
+    workers = getattr(solver, "n_workers", None)
+    if workers is not None:
+        timings["eig_workers"] = float(workers)
+    return timings
+
+
+__all__ = ["StageTimer", "solver_residual_max", "solver_timings"]

@@ -303,3 +303,42 @@ class IsolatedNonCollinearDeviceTests(unittest.TestCase):
         host = self._energy({"PARSEC_KPOINT_BACKEND": "cpu"})
         device = self._energy({"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "1"})
         self.assertAlmostEqual(device, host, delta=2.0e-3)
+
+
+class StageTimingAndResidualTests(unittest.TestCase):
+    """The spinor drivers carry a stage table; every driver reports the eigenpair residual."""
+
+    def test_spinor_drivers_fill_the_stage_table(self) -> None:
+        for name in ("soc", "soc_spin_polarized", "noncollinear"):
+            with self.subTest(driver=name):
+                result = _run(name, "2")
+                timings = result.timings
+                for stage in ("setup_potentials", "diagonalization", "density", "hartree", "xc", "mixing_energy"):
+                    self.assertGreater(timings[stage], 0.0, stage)
+                self.assertEqual(timings["eig_workers"], 2)
+                self.assertGreater(timings["eig_worker_solve_seconds"], 0.0)
+
+    def test_every_driver_reports_a_residual(self) -> None:
+        for name in ("scalar", "spin_polarized", "soc", "noncollinear"):
+            with self.subTest(driver=name):
+                driver, flags, soc = DRIVERS[name]
+                seen = []
+                with mock.patch.dict(os.environ, {"PARSEC_KPOINT_WORKERS": "2"}):
+                    driver(_system(soc=soc, **flags), _K, _WEIGHTS, callback=seen.append)
+                finite = [step.eigen_residual_max for step in seen if np.isfinite(step.eigen_residual_max)]
+                # the first CHEBFF solve has no residual test; the later SUBSPACE steps do
+                self.assertGreater(len(finite), 0)
+                self.assertTrue(all(value > 0.0 for value in finite))
+
+    def test_device_route_measures_residuals_each_solve_and_can_stop(self) -> None:
+        environment = {"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "1"}
+        seen = []
+        with mock.patch.dict(os.environ, environment):
+            run_scf_kpoints(_system(), _K, _WEIGHTS, callback=seen.append)
+        self.assertTrue(all(np.isfinite(step.eigen_residual_max) for step in seen))
+        self.assertLess(seen[-1].eigen_residual_max, seen[0].eigen_residual_max)
+        seen = []
+        with mock.patch.dict(os.environ, {**environment, "PARSEC_KPOINT_RESIDUALS": "0"}):
+            result = run_scf_kpoints(_system(), _K, _WEIGHTS, callback=seen.append)
+        self.assertTrue(all(np.isnan(step.eigen_residual_max) for step in seen))
+        self.assertNotIn("residual_seconds", result.timings.detail)

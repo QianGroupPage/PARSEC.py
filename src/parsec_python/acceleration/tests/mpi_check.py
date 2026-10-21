@@ -69,13 +69,19 @@ def check_operators(context) -> None:
     context.barrier()
 
 
-def run_scf(context, name: str, criterion: float) -> None:
+def run_scf(context, names: str, criterion: float) -> None:
+    for name in names.split(","):
+        run_one_scf(context, name, criterion)
+
+
+def run_one_scf(context, name: str, criterion: float) -> None:
     driver, flags, soc = fixtures.DRIVERS[name]
     system = fixtures._system(soc=soc, criterion=criterion, **flags)
     result = driver(system, fixtures._K, fixtures._WEIGHTS)
     if context.is_root:
         eigenvalues = getattr(result, "eigenvalues", None)
         payload = {
+            "driver": name,
             "iterations": int(result.iterations),
             "converged": bool(result.converged),
             "energy": float(result.energies.total),

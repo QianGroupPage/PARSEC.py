@@ -10,6 +10,7 @@ through the device code gives the CPU result.
 
 from __future__ import annotations
 
+import functools
 import os
 import unittest
 from unittest import mock
@@ -228,10 +229,16 @@ class DeviceBackendDriversTests(unittest.TestCase):
 
 
 def _converged(name: str, environment: dict, **overrides):
+    """A tightly converged run; the same run (the CPU baselines mostly) is made once for all the tests."""
+    return _converged_cached(name, tuple(sorted(environment.items())), tuple(sorted(overrides.items())))
+
+
+@functools.lru_cache(maxsize=None)
+def _converged_cached(name: str, environment: tuple, overrides: tuple):
     driver, flags, soc = parallel_tests.DRIVERS[name]
-    with mock.patch.dict(os.environ, environment):
+    with mock.patch.dict(os.environ, dict(environment)):
         return driver(
-            parallel_tests._system(soc=soc, criterion=2.0e-5, **flags, **overrides),
+            parallel_tests._system(soc=soc, criterion=2.0e-5, **flags, **dict(overrides)),
             parallel_tests._K,
             parallel_tests._WEIGHTS,
         )

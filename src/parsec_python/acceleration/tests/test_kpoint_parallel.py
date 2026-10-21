@@ -9,6 +9,8 @@ checked on a small Au cell with four k-points.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import os
 import unittest
 from pathlib import Path
@@ -43,7 +45,13 @@ _K = 2.0 * np.pi / _BOX * np.array(
 _WEIGHTS = np.full(4, 0.25)
 
 
+_PREPARED: dict[bool, object] = {}
+
+
 def _system(**flags):
+    """A prepared Au cell with the settings given.  The preparation (potentials, projectors, Ewald) does
+    not depend on them, so it is made once per pseudopotential flavour and each call puts its own
+    input around it."""
     soc = flags.pop("soc", False)
     criterion = flags.pop("criterion", 2.0e-3)
     method = flags.pop("method", "chebff")
@@ -60,7 +68,10 @@ def _system(**flags):
         hartree=HartreeSettings(multipole_order=4),
         eigensolver=EigensolverSettings(method=method, tolerance=1.0e-6),
     )
-    return prepare_periodic_single_point(problem)
+    base = _PREPARED.get(soc)
+    if base is None:
+        base = _PREPARED[soc] = prepare_periodic_single_point(problem)
+    return dataclasses.replace(base, input=problem)
 
 
 DRIVERS = {
@@ -76,12 +87,21 @@ DRIVERS = {
 }
 
 
-def _run(name: str, workers: str):
+@functools.lru_cache(maxsize=None)
+def _recorded(name: str, workers: str):
+    """``(result, iteration records)`` of a driver with ``workers`` workers; the runs are shared by the tests."""
     driver, flags, soc = DRIVERS[name]
+    steps: list = []
     with mock.patch.dict(os.environ, {"PARSEC_KPOINT_WORKERS": workers}):
-        return driver(_system(soc=soc, **flags), _K, _WEIGHTS)
+        result = driver(_system(soc=soc, **flags), _K, _WEIGHTS, callback=steps.append)
+    return result, steps
 
 
+def _run(name: str, workers: str):
+    return _recorded(name, workers)[0]
+
+
+@functools.lru_cache(maxsize=None)
 def _run_reference(name: str):
     """The reference drivers with no parallel backend installed: the serial definition."""
     from parsec_python.acceleration.SCF.kpoint_parallel import install
@@ -187,32 +207,16 @@ class KPointTimingTests(unittest.TestCase):
         self.assertGreater(timings.detail["worker_density_seconds"], 0.0)
 
     def test_scalar_driver_fills_run_timings_and_iteration_seconds(self) -> None:
-        with mock.patch.dict(os.environ, {"PARSEC_KPOINT_WORKERS": "2"}):
-            result = run_scf_kpoints(_system(), _K, _WEIGHTS)
+        result = _run("scalar", "2")
         self._check(result, 2)
         self.assertEqual(len(result.history), result.iterations)
         self.assertGreater(result.history[0].diagonalization_seconds, 0.0)
         self.assertGreater(result.history[0].total_seconds, 0.0)
 
     def test_spin_polarized_driver_fills_run_timings(self) -> None:
-        iterations = []
-        with mock.patch.dict(os.environ, {"PARSEC_KPOINT_WORKERS": "2"}):
-            result = run_scf_kpoints_spin_polarized(
-                _system(spin_polarized=True), _K, _WEIGHTS, callback=iterations.append
-            )
+        result, iterations = _recorded("spin_polarized", "2")
         self._check(result, 2)
         self.assertTrue(all(step.total_seconds > 0.0 for step in iterations))
-
-    def test_device_route_reports_eigensolver_counters(self) -> None:
-        with mock.patch.dict(
-            os.environ, {"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "1"}
-        ):
-            result = run_scf_kpoints(_system(), _K, _WEIGHTS)
-        detail = result.timings.detail
-        self.assertEqual(detail["first_solves"], len(_K))
-        self.assertGreater(detail["filter_seconds"], 0.0)
-        self.assertGreater(detail["worker_upload_seconds"], 0.0)
-
 
 class GammaSpinRoutingTests(unittest.TestCase):
     """A Gamma-only periodic spin run goes through the k-point driver when a device is in use."""
@@ -321,10 +325,7 @@ class StageTimingAndResidualTests(unittest.TestCase):
     def test_every_driver_reports_a_residual(self) -> None:
         for name in ("scalar", "spin_polarized", "soc", "noncollinear"):
             with self.subTest(driver=name):
-                driver, flags, soc = DRIVERS[name]
-                seen = []
-                with mock.patch.dict(os.environ, {"PARSEC_KPOINT_WORKERS": "2"}):
-                    driver(_system(soc=soc, **flags), _K, _WEIGHTS, callback=seen.append)
+                seen = _recorded(name, "2")[1]
                 finite = [step.eigen_residual_max for step in seen if np.isfinite(step.eigen_residual_max)]
                 # the first CHEBFF solve has no residual test; the later SUBSPACE steps do
                 self.assertGreater(len(finite), 0)
@@ -334,7 +335,11 @@ class StageTimingAndResidualTests(unittest.TestCase):
         environment = {"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "1"}
         seen = []
         with mock.patch.dict(os.environ, environment):
-            run_scf_kpoints(_system(), _K, _WEIGHTS, callback=seen.append)
+            result = run_scf_kpoints(_system(), _K, _WEIGHTS, callback=seen.append)
+        detail = result.timings.detail  # the device route's counters
+        self.assertEqual(detail["first_solves"], len(_K))
+        self.assertGreater(detail["filter_seconds"], 0.0)
+        self.assertGreater(detail["worker_upload_seconds"], 0.0)
         self.assertTrue(all(np.isfinite(step.eigen_residual_max) for step in seen))
         self.assertLess(seen[-1].eigen_residual_max, seen[0].eigen_residual_max)
         seen = []

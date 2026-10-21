@@ -8,6 +8,7 @@ the images it leaves out are still of order 1e-6 Ry).
 
 from __future__ import annotations
 
+import functools
 import unittest
 from pathlib import Path
 
@@ -35,6 +36,7 @@ _EXAMPLES = Path(__file__).resolve().parents[4] / "examples" / "0d_AuH"
 _SIDES = (6.0, 7.2, 8.4)  # spacing 0.6 on all three axes
 
 
+@functools.lru_cache(maxsize=None)
 def _system():
     problem = SinglePointInput(
         atoms=[
@@ -124,6 +126,15 @@ class SupportBuildersTests(unittest.TestCase):
                     self.assertGreater(results[0].max(), 0.0)
 
 
+_CONVERGED: dict[str, np.ndarray] = {}
+
+
+def _converged_direct_sum(arguments) -> np.ndarray:
+    if "value" not in _CONVERGED:
+        _CONVERGED["value"] = ewald_local_ionic_potential(*arguments, tolerance=1.0e-26)
+    return _CONVERGED["value"]
+
+
 class FFTLocalPotentialTests(unittest.TestCase):
     def setUp(self) -> None:
         self.problem, self.system = _system()
@@ -138,7 +149,7 @@ class FFTLocalPotentialTests(unittest.TestCase):
 
     def test_matches_the_converged_direct_sum(self) -> None:
         periodic_setup.uninstall()
-        converged = ewald_local_ionic_potential(*self.arguments, tolerance=1.0e-26)
+        converged = _converged_direct_sum(self.arguments)
         fast = periodic_setup.fft_local_ionic_potential(
             *self.arguments, None, 1.0e-14
         )

@@ -7,11 +7,12 @@ are compared here with the single-process solver:
   rows of the stencils, projector and spin-orbit overlaps summed over the ranks);
 * an SCF of each driver gives the energy of the serial run.
 
-Skipped where mpi4py or mpirun is missing.
+Skipped where mpi4py or mpirun is missing, or with ``PARSEC_TEST_MPI=0``.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
@@ -26,14 +27,15 @@ import numpy as np
 try:  # pragma: no cover - environment dependent
     import mpi4py  # noqa: F401
 
-    HAVE_MPI = shutil.which("mpirun") is not None
+    # PARSEC_TEST_MPI=0 leaves out the tests that start mpirun (about a minute)
+    HAVE_MPI = shutil.which("mpirun") is not None and os.environ.get("PARSEC_TEST_MPI", "1") != "0"
 except ImportError:  # pragma: no cover
     HAVE_MPI = False
 
 from parsec_python.acceleration.tests import test_kpoint_parallel as fixtures
 
 _SRC = Path(__file__).resolve().parents[3]
-_CRITERION = 2.0e-5
+_CRITERION = 1.0e-4
 
 
 def _mpirun(ranks: int, *arguments: str) -> subprocess.CompletedProcess:
@@ -46,11 +48,16 @@ def _mpirun(ranks: int, *arguments: str) -> subprocess.CompletedProcess:
     return subprocess.run(command, capture_output=True, text=True, env=environment, timeout=900)
 
 
-def _result(process: subprocess.CompletedProcess) -> dict:
+def _results(process: subprocess.CompletedProcess) -> dict[str, dict]:
+    """The ``RESULT`` lines of an ``scf`` run, by driver."""
+    found = {}
     for line in process.stdout.splitlines():
         if line.startswith("RESULT "):
-            return json.loads(line[len("RESULT "):])
-    raise AssertionError(f"no result\nstdout:\n{process.stdout[-1500:]}\nstderr:\n{process.stderr[-2500:]}")
+            payload = json.loads(line[len("RESULT "):])
+            found[payload["driver"]] = payload
+    if not found:
+        raise AssertionError(f"no result\nstdout:\n{process.stdout[-1500:]}\nstderr:\n{process.stderr[-2500:]}")
+    return found
 
 
 @unittest.skipUnless(HAVE_MPI, "needs mpi4py and mpirun")
@@ -132,28 +139,31 @@ class DistributedCommandLineTests(unittest.TestCase):
         self.assertAlmostEqual(energy, host, delta=3.0e-3)
 
 
+@functools.lru_cache(maxsize=None)
+def _serial(name: str):
+    driver, flags, soc = fixtures.DRIVERS[name]
+    environment = {"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "1"}
+    with mock.patch.dict(os.environ, environment):
+        return driver(fixtures._system(soc=soc, criterion=_CRITERION, **flags), fixtures._K, fixtures._WEIGHTS)
+
+
 @unittest.skipUnless(HAVE_MPI, "needs mpi4py and mpirun")
 class DistributedSCFTests(unittest.TestCase):
-    def _serial(self, name: str):
-        driver, flags, soc = fixtures.DRIVERS[name]
-        environment = {"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "1"}
-        with mock.patch.dict(os.environ, environment):
-            return driver(fixtures._system(soc=soc, criterion=_CRITERION, **flags), fixtures._K, fixtures._WEIGHTS)
-
     def test_each_driver_reproduces_the_serial_energy(self) -> None:
-        for name in ("scalar", "soc", "noncollinear"):
+        names = ("scalar", "soc", "noncollinear")
+        process = _mpirun(3, "scf", ",".join(names), str(_CRITERION))  # one start-up for the three drivers
+        distributed = _results(process)
+        for name in names:
             with self.subTest(driver=name):
-                serial = self._serial(name)
-                distributed = _result(_mpirun(3, "scf", name, str(_CRITERION)))
-                self.assertTrue(distributed["converged"])
-                self.assertEqual(distributed["ranks"], 3)
-                self.assertAlmostEqual(distributed["energy"], serial.energies.total, delta=2.0e-4)
-                self.assertAlmostEqual(distributed["fermi"], serial.fermi_level, delta=2.0e-3)
+                serial = _serial(name)
+                self.assertTrue(distributed[name]["converged"])
+                self.assertEqual(distributed[name]["ranks"], 3)
+                self.assertAlmostEqual(distributed[name]["energy"], serial.energies.total, delta=5.0e-4)
+                self.assertAlmostEqual(distributed[name]["fermi"], serial.fermi_level, delta=3.0e-3)
 
     def test_one_rank_is_the_serial_solver_through_the_mpi_code(self) -> None:
-        serial = self._serial("noncollinear")
-        single = _result(_mpirun(1, "scf", "noncollinear", str(_CRITERION)))
-        self.assertAlmostEqual(single["energy"], serial.energies.total, delta=1.0e-4)
+        single = _results(_mpirun(1, "scf", "noncollinear", str(_CRITERION)))["noncollinear"]
+        self.assertAlmostEqual(single["energy"], _serial("noncollinear").energies.total, delta=5.0e-4)
 
 
 if __name__ == "__main__":

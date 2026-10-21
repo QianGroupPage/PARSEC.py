@@ -36,6 +36,13 @@ import scipy.sparse as sp
 
 from .cupy_compact import _coefficient_palette
 from .cupy_compile import compile_cupy_raw
+from .stencil_pipeline import (
+    THREADS,
+    WIDTH,
+    StencilKernels,
+    compiled_kernels,
+    stencil_kernel_setting,
+)
 
 
 _CUDA_SOURCE = r"""
@@ -257,38 +264,35 @@ void stencil_major_chebyshev6(
 """
 
 
-_KERNEL_CACHE: dict[int, tuple[Any, Any]] = {}
+_KERNEL_CACHE: dict[Any, Any] = {}
 _KERNEL_CACHE_LOCK = Lock()
 
 
-def _compiled_kernels(cp: Any) -> tuple[Any, Any]:
+def _compiled_kernels(cp: Any, slot_count: int) -> StencilKernels:
     """Compile each device's invariant stencil kernels exactly once.
 
     Every full-grid or representation operator uses the same CUDA source and
     launch ABI.  Recreating and explicitly compiling identical ``RawKernel``
     objects for all eight irreps only repeated module setup; sharing them does
-    not share any numerical data or alter a kernel launch.
+    not share any numerical data or alter a kernel launch.  Returns the apply
+    kernel, the recurrence kernel and the former recurrence kernel
+    (:func:`.stencil_pipeline.compiled_kernels`): the former pair is kept per
+    device, as it always was, and the recurrence kernel of
+    ``PARSEC_CUPY_STENCIL_KERNEL=pipelined`` per device and slot count beside
+    it, or why it could not be built.
     """
 
-    device_id = int(cp.cuda.Device().id)
-    with _KERNEL_CACHE_LOCK:
-        kernels = _KERNEL_CACHE.get(device_id)
-        if kernels is None:
-            apply_kernel = cp.RawKernel(
-                _CUDA_SOURCE,
-                "stencil_major_spmm6",
-                options=("--std=c++11",),
-            )
-            recurrence_kernel = cp.RawKernel(
-                _CUDA_SOURCE,
-                "stencil_major_chebyshev6",
-                options=("--std=c++11",),
-            )
-            compile_cupy_raw(apply_kernel)
-            compile_cupy_raw(recurrence_kernel)
-            kernels = apply_kernel, recurrence_kernel
-            _KERNEL_CACHE[device_id] = kernels
-    return kernels
+    return compiled_kernels(
+        cp,
+        _KERNEL_CACHE,
+        _KERNEL_CACHE_LOCK,
+        int(cp.cuda.Device().id),
+        _CUDA_SOURCE,
+        0,
+        slot_count,
+        stencil_kernel_setting(),
+        compile_cupy_raw,
+    )
 
 
 def _stencil_major_metadata(
@@ -444,13 +448,122 @@ class CuPyStencilMajorFiniteDifference:
             self.neighbors = device_neighbors
         self.coefficient_codes = cp.asarray(codes)
         self.coefficient_palette = cp.asarray(palette, dtype=cp.float64)
-        self.apply_kernel, self.recurrence_kernel = _compiled_kernels(cp)
+        self.hold_kernels(_compiled_kernels(cp, self.slot_count))
+
+    def hold_kernels(self, kernels: StencilKernels | tuple[Any, Any, Any]) -> None:
+        """Keep the apply, recurrence and former recurrence kernels of the stencil.
+
+        ``kernels`` is what :func:`.stencil_pipeline.compiled_kernels`
+        returns; a plain triple is the former kernels.
+        ``stencil_major_spmm6`` (``apply_kernel``) is the former kernel under
+        every value of ``PARSEC_CUPY_STENCIL_KERNEL``.  Under ``pipelined``
+        ``recurrence_kernel`` holds the fast path for six columns of unit row
+        stride, generated for the slot count of this stencil
+        (``fast_path_slots``), and ``former_recurrence_kernel`` the former
+        kernel for the other launches; under ``former`` both are the former
+        kernel and ``fast_path_slots`` is None.  So they are under
+        ``pipelined`` where the generated kernel could not be built:
+        ``stencil_kernel_fallback`` then says why (it is None otherwise).
+        ``stencil_kernel_setting`` is the value the kernels were compiled for.
+
+        Every launch of the stencil names its slot count, the one part of the
+        guard of the fast path that all of them share: it is compared with
+        the slot count of the fast path here, once.  A kernel generated for
+        another slot count would take its former loop in every launch; the
+        stencil then holds the former kernel alone.
+        """
+
+        held = StencilKernels(*kernels)
+        self.apply_kernel = held.apply
+        self.former_recurrence_kernel = held.former_recurrence
+        fallback = held.fallback
+        fast = held.recurrence is not held.former_recurrence
+        if fast and held.fast_path_slots != int(self.slot_count):
+            fast = False
+            fallback = fallback or (
+                f"the generated kernel has the fast path of "
+                f"{held.fast_path_slots} slots, the stencil {int(self.slot_count)}"
+            )
+        self.recurrence_kernel = held.recurrence if fast else held.former_recurrence
+        self.fast_path_slots = int(self.slot_count) if fast else None
+        self.stencil_kernel_setting = held.setting
+        self.stencil_kernel_fallback = fallback
+
+    def recurrence_kernel_for(self, width: int, row_stride: int) -> Any:
+        """The kernel of one launch of the recurrence, of ``width`` columns and ``row_stride``.
+
+        Without a fast path (``fast_path_slots`` is None, as under
+        ``former``) that is ``recurrence_kernel``, as before.  With one, a
+        launch that the fast path takes (the guard of
+        :func:`.stencil_pipeline.takes_fast_path`: six columns, unit row
+        stride, the slot count it was generated for, which
+        :meth:`hold_kernels` compared with that of the stencil) goes to
+        ``recurrence_kernel``, and every other launch to the former kernel:
+        inside the generated kernel it would take the former loop with the
+        same bits, held at the registers of the fast path, 2 to 6 % slower
+        than the former kernel on A100.  The choice is made in Python when
+        the launch is made, and so when a filter graph records it;
+        :meth:`chebyshev_recurrence` makes the same choice in its loop of
+        launches, with plain integers and no call.
+        """
+
+        if self.fast_path_slots is None or (
+            int(width) == WIDTH and int(row_stride) == 1
+        ):
+            return self.recurrence_kernel
+        return self.former_recurrence_kernel
+
+    @property
+    def stencil_kernel_record(self) -> str:
+        """Which recurrence kernels the stencil launches, for the backend details of a run.
+
+        The value of ``PARSEC_CUPY_STENCIL_KERNEL`` that its kernels were
+        compiled for, an unset variable included: ``former``; ``pipelined``
+        with the slot count of the fast path (``pipelined: fast path for 25
+        slots``: the generated kernel for the launches of six columns of unit
+        row stride, the former one for the others); or ``pipelined`` with the
+        reason why the stencil holds the former kernels instead
+        (``stencil_kernel_fallback``).
+        """
+
+        if self.fast_path_slots is not None:
+            return (
+                f"{self.stencil_kernel_setting}: fast path for "
+                f"{self.fast_path_slots} slots"
+            )
+        if self.stencil_kernel_fallback:
+            return (
+                f"{self.stencil_kernel_setting}: former kernels "
+                f"({self.stencil_kernel_fallback})"
+            )
+        return self.stencil_kernel_setting
 
     @property
     def storage_mode(self) -> str:
         if hasattr(self, "implicit_statistics"):
             return f"implicit_affine_tile_{self.implicit_statistics['tile']}"
         return "stencil_major_int32_neighbors_uint8_coefficient_palette"
+
+    @property
+    def stencil_kernel_attributes(self) -> dict[str, dict[str, int]]:
+        """Registers and local memory of the kernels, by the attribute that holds each.
+
+        ``num_regs`` and ``local_size_bytes`` (where registers spill, the
+        spill is local memory) of ``apply_kernel``, ``recurrence_kernel`` and
+        ``former_recurrence_kernel`` as the driver reports them for the
+        current device.  A stand-in kernel that reports no attributes gives
+        an empty entry.
+        """
+
+        found = {}
+        for name in ("apply_kernel", "recurrence_kernel", "former_recurrence_kernel"):
+            attributes = getattr(getattr(self, name), "attributes", None) or {}
+            found[name] = {
+                key: int(attributes[key])
+                for key in ("num_regs", "local_size_bytes")
+                if key in attributes
+            }
+        return found
 
     def _columns(self, vectors: Any) -> tuple[Any, bool]:
         cp = self.cp
@@ -627,16 +740,30 @@ class CuPyStencilMajorFiniteDifference:
             output = cp.empty(block.shape, dtype=cp.float64, order="F")
         elif output.shape != block.shape or output.dtype != cp.dtype(cp.float64):
             raise ValueError("recurrence output must match the float64 block")
-        threads = 256
+        # The block size that the launch bounds of the generated kernel name.
+        threads = THREADS
         grid = ((self.shape[0] + threads - 1) // threads,)
         itemsize = int(block.dtype.itemsize)
+        # The kernel of each launch, as recurrence_kernel_for chooses it,
+        # without a call per launch: every launch takes recurrence_kernel
+        # where the stencil has no fast path (fast_path_slots None, as under
+        # former); otherwise a launch of six columns of unit row stride takes
+        # it and every other launch the former kernel.  hold_kernels compared
+        # the slot count.
+        fast_path = self.fast_path_slots is not None
+        recurrence_kernel = self.recurrence_kernel
+        former_recurrence_kernel = self.former_recurrence_kernel
         for start in range(0, int(block.shape[1]), self.chunk_width):
             stop = min(start + self.chunk_width, int(block.shape[1]))
             source = block[:, start:stop]
             previous_source = previous_block[:, start:stop]
             coefficient_source = coefficient_block[:, start:stop]
             target = output[:, start:stop]
-            self.recurrence_kernel(
+            source_row_stride = source.strides[0] // itemsize
+            kernel = recurrence_kernel
+            if fast_path and (stop - start != WIDTH or source_row_stride != 1):
+                kernel = former_recurrence_kernel
+            kernel(
                 grid,
                 (threads,),
                 (
@@ -654,7 +781,7 @@ class CuPyStencilMajorFiniteDifference:
                     np.int64(coefficient_source.strides[1] // itemsize),
                     np.int32(add_nonlocal),
                     source,
-                    np.int64(source.strides[0] // itemsize),
+                    np.int64(source_row_stride),
                     np.int64(source.strides[1] // itemsize),
                     previous_source,
                     np.int64(previous_source.strides[0] // itemsize),

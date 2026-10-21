@@ -901,6 +901,34 @@ class CuPySymmetrySCFEigensolver:
         return "+".join(sorted(modes)) if modes else "none"
 
     @property
+    def stencil_kernel(self) -> str:
+        """Which recurrence kernels the stencils of the sectors solved here launch.
+
+        ``PARSEC_CUPY_STENCIL_KERNEL`` as the stencil of each sector was
+        built with it (``stencil_kernel_record``: ``former``, ``pipelined:
+        fast path for 25 slots``, or why a stencil of ``pipelined`` holds the
+        former kernels); ``none`` for an operator without the stencil-major
+        kernels.  One record where every sector gives the same, which is the
+        rule, else each record with its sectors.  The stencils of the other
+        devices of a shared sector are built as their owner's.
+        """
+
+        sectors: dict[str, list[int]] = {}
+        for sector, operator in enumerate(self._operators):
+            if operator is None:
+                continue
+            record = getattr(
+                operator.compact_finite_difference, "stencil_kernel_record", None
+            )
+            sectors.setdefault(record or "none", []).append(sector)
+        if len(sectors) == 1:
+            return next(iter(sectors))
+        return "; ".join(
+            f"{record} (sectors {' '.join(map(str, indices))})"
+            for record, indices in sectors.items()
+        ) or "none"
+
+    @property
     def later_filter_precision(self) -> str:
         """Precision of the later filter passes of the symmetry sectors.
 

@@ -1993,6 +1993,95 @@ same either way. A calculation on a host
 backend gets no thread: its SCF works on the cores the thread would take.
 The thread has not run on A100 nodes.
 
+The recurrence kernel of the filter has a switch since 2026-10-21,
+`PARSEC_CUPY_STENCIL_KERNEL`. `pipelined`, the default, gives every stencil
+operator, beside the former kernels, a `stencil_major_chebyshev6` whose slot
+loop is a software pipeline of its loads (`backends/stencil_pipeline.py`);
+`former` restores the kernels of before, exactly. For the
+launches of production, six columns of unit row stride on a stencil of the
+slot count it was generated for, the slots run as straight-line code: the
+neighbour record of slot s + 2 and the coefficient and six values of slot
+s + 1 are loaded before the six FMAs of slot s, so that a warp has two slots
+of loads in flight where the former loop, which waits for each record behind
+a branch, had at most one. `__launch_bounds__(256, 4)` holds the kernel at
+64 registers, the four blocks of 256 threads per multiprocessor that the 56
+registers of the former kernel give, with no local memory on an A100. Every
+column still sums its slots in order with the FMA of the former loop, a
+missing neighbour adds nothing, and the epilogue (scatter, potential,
+recurrence) is the former text after the same join, so every output word is
+that of the former kernel, NaN payloads included on an A100 (other GPUs at
+the end of this section). `stencil_major_spmm6` (`H X`) stays the former kernel
+under both values: given the same fast path, ptxas commuted the operands of
+one of its additions, which changed the NaN that came out where two NaNs of
+different payloads met. Every other launch of the recurrence (fewer than six
+columns, another row stride) goes to the former recurrence kernel as well:
+inside the generated one it took the former loop at the registers of the
+fast path, 2 to 6 % slower. An operator reads the switch when it is built and
+compiles all its kernels then; a filter graph records the kernel each of its
+launches took, and the other devices of a shared sector build the kernels of
+their owner. A value other than `former` or `pipelined` stops the
+construction of the operator. A generated kernel that cannot be compiled
+gives way to the former recurrence kernel with a `RuntimeWarning`: the
+operator keeps its layout and the former kernels, and so the former bits,
+and the record of the run says why. With an empty CuPy cache, the first
+operator on a device took 0.68 instead of 0.35 s to build in tiles of 16
+rows and 0.54 instead of 0.20 s slot-major, most of it compiling; from the
+cache it took 0.11 to 0.14 s.
+
+| Switch | Default | Former value | Results | Says what ran | Serial control | A100, 2026-10-20 |
+|---|---|---|---|---|---|---|
+| `PARSEC_CUPY_STENCIL_KERNEL` | `pipelined`, also when unset or empty: the recurrence kernel above for the launches of six columns of unit row stride, the former kernels for every other launch and for `H X` | `former`: the stencil kernels as they were | same bits, NaN payloads included on an A100 (on another GPU the payload where two NaNs meet may differ, below) | `orbital_sector_stencil_kernel` among the backend details (`gpu_stencil_kernel` of a full-grid operator), an unset variable included: `former`, `pipelined: fast path for 25 slots`, or `pipelined: former kernels (...)` with the reason where the generated kernel could not be built; in `parsec.out`, the short report too, in `result.backend` of `timing.json` with `per_rank[].orbital_sector_stencil_kernel` of the MPI runner, and in the archive. `stencil_kernel_attributes` of the stencil of an operator gives the registers of its kernels (64 against 56 for the recurrence) | `former` | a probe of the filter on sector 0 in tiles of 16 rows, prepared as a run prepares it (CUDA events around graphs of launches), either value on its own GPU of one node: one recurrence step of six columns took 0.617 against 0.925 ms with 19,392 electrons (2,873,400 rows) and 1.289 against 1.831 ms with 39,368 (5,660,200 rows), 0.667 and 0.704 of the time, the first step 0.670 and 0.689; a block of six columns through the filter graphs 10.35 against 14.95 ms and 21.24 against 29.50 ms (0.693, 0.720), the same per block in a plan of 48 columns; one, two and five columns within 0.3 % of the former kernel. Every word was the former one on those sectors and on that of 3,480 electrons, in tiles of 16 rows and, for 3,480 and 19,392 electrons, slot-major: every launch path of the recurrence kernel, the operator's methods, `H X`, the graphs and the filter without them, with finite inputs and with NaNs (`benchmarks/stencil_pipelined_check.py`) |
+
+The kernel alone was measured the same day with former and generated
+kernels alternating in one process (medians of 11 groups of 40 launches):
+0.664 and 0.699 of the time with 19,392 and 39,368 electrons, 0.639 with
+3,480, and 0.690 with 19,392 electrons slot-major. Complete calculations of
+3,480 electrons on 1 and 4 GPUs, and without symmetry on 4, gave every array
+of the archive apart from timings as the former kernels
+(`backend_detail_values` differed only in their `*_seconds` entries). Those
+runs were made in a form that had the fast path in `stencil_major_spmm6` as
+well and sent the narrow launches into the generated kernel. The source of
+now is, to the byte, the one that was then compared with the former kernels
+with the fast path in `stencil_major_chebyshev6` alone: 0 differing words in
+79,272 launch pairs, every value a NaN among the inputs
+(`tests/test_stencil_pipeline.py` holds its digests). In this form, complete
+calculations of the same 3,480 electrons at `Expansion_Order` 6, 12 and 20
+on one A100, and at 12 without symmetry on four, gave archives identical to
+those of the former kernels apart from timings, and took 21.3 against 26.0 s,
+27.7 against 36.4 s, 40.3 against 52.8 s and 46.7 against 54.8 s
+(`Total accelerated Python wall time`; single runs, on A100 nodes whose CPUs
+other jobs shared). Every slot count from 1 to 61 in the
+slot-major layout and in tiles of 16 to 256 rows, 366 cases with 186,864
+pairs of launches and method calls on finite inputs, NaN payloads and signed
+zeros, gave no differing word either. The archives of runs made since name
+the kernel among `backend_detail_values` as well, an entry that differs
+between the two values by design. The former kernel was latency-bound on
+these sectors (0.71 eligible of 7.04 active warps per scheduler, 71 % of the
+stalls waiting on loads, 30 % of the bandwidth of the device); the generated
+one keeps the same warps resident and has more loads in flight.
+`tests/test_stencil_pipeline.py` compares the two kernels on synthetic
+stencils of 2 to 61 slots, in the slot-major layout and in tiles of 16 to 256
+rows, on every launch path, with the NaN payloads of two NaNs that meet, NaN
+coefficients and signed zeros; it is the check to run again after a change
+of CUDA, CuPy or driver, since the equality rests on how ptxas compiles both.
+
+On a GeForce RTX 5070 Laptop GPU (compute capability 12.0, CUDA 12.9,
+2026-10-21) the same tests found every number and every NaN of the former
+kernel in its place, in the sweep of slot counts and tiles as well; where two
+NaNs of different payloads met in one operation, the result sometimes carried
+the other payload, which IEEE 754 leaves open, and ptxas kept local memory
+under the launch bounds: 16 bytes for 25 slots in tiles (none slot-major), up
+to 56 for other slot counts. The tests demand the payloads and no
+local memory on compute capability 8.0 alone and, elsewhere, the NaNs in
+their places and every other word. One recurrence step of six columns took
+there the time of the former kernel, 0.460 ms either way on sector 0 of 864
+electrons (274,784 rows in tiles of 16; two runs each),
+and 0.96 and 1.04 of the former time at 12 and 24 columns (one run each). At
+25 FMAs per row and column that step makes 180 Gflop/s, about half of the
+360 to 410 Gflop/s of FP64 FMAs the device does at most, where an A100 makes
+1.4 of its 9.7 Tflop/s: FP64 units that slow leave little waiting on loads to
+hide. No other architecture has run the kernel.
+
 CuPy supports either translated first-SCF path: fixed-cycle CHEBFF or
 locking/restart CHEBDAV. Both retain the complete buffered Ritz space on the
 device and use the translated saved-SUBSPACE path on later SCF iterations.
@@ -2130,7 +2219,10 @@ int32 neighbor rows and uint8 coefficient codes; the palette retains the
 exact float64 coefficient bits. Each thread still visits its row in canonical
 CSR order. A second kernel fuses kinetic, the current local diagonal,
 optional nonlocal image, and the normalized Chebyshev recurrence into one
-grid pass for blocks of up to six orbitals. For KB projectors a canonical-
+grid pass for blocks of up to six orbitals; by default its slot loop is a
+software pipeline of its loads, with the same bits
+(`PARSEC_CUPY_STENCIL_KERNEL=former` keeps the loop of before; the end of the
+tables of switches above). For KB projectors a canonical-
 order CUDA kernel computes the small `diag(signs) @ B.T @ X` contraction
 without the launch overhead of many tiny cuSPARSE calls, while the large
 `B @ coefficients` scatter is fused into that same row kernel. This avoids a

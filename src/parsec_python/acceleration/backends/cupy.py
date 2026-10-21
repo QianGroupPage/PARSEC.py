@@ -48,6 +48,7 @@ from .implicit_stencil import (
     implicit_tile_setting,
     pack_worker_setting,
 )
+from .stencil_pipeline import stencil_kernel_setting
 
 
 class CuPyUnavailableError(RuntimeError):
@@ -383,6 +384,13 @@ class CuPyHamiltonian:
                         # A setting of the packer that is no thread count is
                         # an error as well, whoever chose the tiles.
                         pack_worker_setting()
+                    # So is a stencil kernel that PARSEC_CUPY_STENCIL_KERNEL
+                    # does not know, in every layout: not a reason to give
+                    # way to another kernel.  A generated recurrence kernel
+                    # that does not compile is no failure of a layout either:
+                    # the operator holds the former kernels and says so
+                    # (stencil_pipeline.compiled_kernels).
+                    stencil_kernel_setting()
                     # A stencil that arrives packed, the tiles of a sector
                     # for another of its devices, has that layout alone.
                     packed = isinstance(

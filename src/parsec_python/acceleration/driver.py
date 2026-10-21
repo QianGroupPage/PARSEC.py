@@ -3778,6 +3778,14 @@ def _prepare_single_point(
                 symmetry_eigensolver.finite_difference_neighbors,
             ),
             (
+                # PARSEC_CUPY_STENCIL_KERNEL as the stencils of the sectors
+                # were built with it, an unset variable included: the slot
+                # count of the fast path of the pipelined kernel, or why they
+                # hold the former kernels.
+                "orbital_sector_stencil_kernel",
+                symmetry_eigensolver.stencil_kernel,
+            ),
+            (
                 "orbital_sector_nonlocal_application",
                 (
                     (

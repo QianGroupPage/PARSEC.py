@@ -361,6 +361,16 @@ extrapolated. `PARSEC_CUPY_IMPLICIT_TILE_MIN_ROWS=650000` with
 `PARSEC_CUPY_IMPLICIT_TILE_GROUP_MIN_ROWS=1100000` gives every sector the
 choice it had before the rule, and either alone that of its route.
 
+The saving per row, column and application was measured with the former
+recurrence kernel. With the kernel whose slot loop is a software pipeline of
+its loads, the default since (`PARSEC_CUPY_STENCIL_KERNEL`, `README.md`;
+`former` keeps the kernel of these measurements), the kernel alone took
+0.842 of its slot-major time in tiles of 16 rows at 2,873,400 rows, against
+0.874 with the former kernel, and 0.886 against 0.931 at 677,542 rows (one
+A100, 2026-10-20): the tiles saved 6.7 and 5.0 ps per row, column and
+application where the rule counts 8.0 and 4.6, within 16 %. The rule was
+left as it is.
+
 Complete calculations with a tiled group had run on 8 and 16 A100 GPUs
 before (7,120 to 39,368 electrons; `stencil_storage` of their records reads
 `implicit_affine_tile_16`), without a slot-major run beside them. What

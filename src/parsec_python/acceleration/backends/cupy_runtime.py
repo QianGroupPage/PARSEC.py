@@ -295,6 +295,22 @@ class CuPyHamiltonianBackend(HamiltonianBackend):
                     ),
                 ),
                 (
+                    # PARSEC_CUPY_STENCIL_KERNEL as the stencil was built
+                    # with it (stencil_kernel_record); none without the
+                    # stencil-major kernels.
+                    "gpu_stencil_kernel",
+                    (
+                        getattr(
+                            self.device_operator.compact_finite_difference,
+                            "stencil_kernel_record",
+                            None,
+                        )
+                        or "none"
+                        if self.device_operator is not None
+                        else "deferred_to_symmetry_sector_operators"
+                    ),
+                ),
+                (
                     "gpu_chebyshev_recurrence",
                     (
                         "fused_hamiltonian_recurrence"

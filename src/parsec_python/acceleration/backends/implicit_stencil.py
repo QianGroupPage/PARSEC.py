@@ -508,9 +508,26 @@ def implicit_source(tile):
     return _CUDA_SOURCE.replace(old, new)
 
 
+def stencil_source(tile, slot_count, kernel="former"):
+    """The source of the two stencil kernels for tiles of ``tile`` rows (0: slot-major).
+
+    ``kernel`` is a value of ``PARSEC_CUPY_STENCIL_KERNEL`` (:mod:`.stencil_pipeline`).
+    ``former`` gives the source as it was, :func:`implicit_source` or the slot-major source;
+    ``pipelined`` is generated from it for a stencil of ``slot_count`` slots, with the fast path
+    in ``stencil_major_chebyshev6`` alone.
+    """
+    from .cupy_stencil_major import _CUDA_SOURCE
+    base = implicit_source(tile) if tile else _CUDA_SOURCE
+    if kernel == "former":
+        return base
+    from .stencil_pipeline import pipelined_source
+    return pipelined_source(base, slot_count, tile)
+
+
 def initialize_implicit(instance, cp, metadata, tile):
     from .cupy_compile import compile_cupy_raw
-    source = implicit_source(tile)
+    from .stencil_pipeline import compiled_kernels, stencil_kernel_setting
+    setting = stencil_kernel_setting()
     if isinstance(metadata, PackedTileHostMetadata):
         if metadata.tile != tile:
             raise ValueError(f"stencil is packed into tiles of {metadata.tile}, not {tile}")
@@ -522,12 +539,9 @@ def initialize_implicit(instance, cp, metadata, tile):
     instance.neighbors = cp.asarray(n)
     instance.coefficient_codes = cp.asarray(c)
     instance.coefficient_palette = cp.asarray(metadata.coefficient_palette, dtype=cp.float64)
-    key = int(cp.cuda.Device().id), tile
-    with _LOCK:
-        if key not in _CACHE:
-            kernels = tuple(cp.RawKernel(source, name, options=("--std=c++11",))
-                            for name in ("stencil_major_spmm6", "stencil_major_chebyshev6"))
-            for kernel in kernels:
-                compile_cupy_raw(kernel)
-            _CACHE[key] = kernels
-        instance.apply_kernel, instance.recurrence_kernel = _CACHE[key]
+    # The former kernels keep the key (device, tile) they had under every value; the recurrence kernel of
+    # ``pipelined`` is generated for the slot count, which a stencil that arrives packed names in its
+    # metadata alone, and kept beside them.
+    instance.hold_kernels(compiled_kernels(
+        cp, _CACHE, _LOCK, (int(cp.cuda.Device().id), tile), implicit_source(tile), tile, instance.slot_count,
+        setting, compile_cupy_raw))

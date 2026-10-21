@@ -833,6 +833,7 @@ class MPIRolePreparationTests(unittest.TestCase):
             collective_lanczos=False,
             finite_difference_storage="stencil",
             finite_difference_neighbors="shared",
+            stencil_kernel="former",
             fused_projector_scatter=False,
             custom_projector_projection=False,
             projector_reduction_modes="none",
@@ -1204,6 +1205,28 @@ class MPIRolePreparationTests(unittest.TestCase):
                 self.assertEqual(
                     dict(prepared.system.backend_info.details)[key], statement
                 )
+
+    def test_stencil_kernel_detail_is_the_record_of_the_sector_eigensolver(
+        self,
+    ) -> None:
+        # Which recurrence kernels the stencils of the sectors launch, also
+        # where PARSEC_CUPY_STENCIL_KERNEL is unset.
+        key = "orbital_sector_stencil_kernel"
+        prepared = self.prepare(None)
+        self.assertEqual(dict(prepared.system.backend_info.details)[key], "former")
+        for record in (
+            "pipelined: fast path for 25 slots",
+            "pipelined: former kernels (the generated kernel could not be built: "
+            "CompileException: nvrtc failed)",
+        ):
+            for mpi_context in (None, SimpleNamespace(rank=0, root=0, size=2)):
+                with self.subTest(record=record, mpi_context=mpi_context):
+                    prepared = self.prepare(
+                        mpi_context, sector={"stencil_kernel": record}
+                    )
+                    self.assertEqual(
+                        dict(prepared.system.backend_info.details)[key], record
+                    )
 
     def test_preparation_under_doubles_leaves_none_bound_in_the_gpu_ionic_module(
         self,

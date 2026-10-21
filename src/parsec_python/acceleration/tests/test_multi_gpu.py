@@ -1245,8 +1245,10 @@ class SectorStateStorageTests(unittest.TestCase):
                 "PARSEC_CUPY_RITZ_GRAM_MULTIPLE")})
         # And the limit of that buffer, at the value it had.
         self.assertEqual({name: control[name] for name in later}, later)
-        # The projection kernel with a CUDA block per projector and column came after them.
+        # The projection kernel with a CUDA block per projector and column came after them, and the former
+        # recurrence kernel of the filter after that.
         self.assertEqual(control.pop("PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS"), "1")
+        self.assertEqual(control.pop("PARSEC_CUPY_STENCIL_KERNEL"), "former")
         # And the former values of the three switches of the preparation that came later: the ion-ion
         # energy, the symmetry maps and the grid of the ionic sums.
         preparation = {"PARSEC_OVERLAP_ION_ION_SETUP": "0", "PARSEC_OVERLAP_SYMMETRY_SETUP": "0",

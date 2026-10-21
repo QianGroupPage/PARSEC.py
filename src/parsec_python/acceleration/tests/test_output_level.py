@@ -31,6 +31,8 @@ class BackendOutputLevelTests(unittest.TestCase):
                          ('hartree_backend', 'native'),
                          ('native_openmp_max_threads', '28'),
                          ('orbital_sector_later_filter_precision', 'float64'),
+                         ('gpu_stencil_kernel', 'deferred_to_symmetry_sector_operators'),
+                         ('orbital_sector_stencil_kernel', 'pipelined: fast path for 25 slots'),
                          ('orbital_symmetry', 'CuPy real representations'),
                          ('gpu_kernel_configuration', 'verbose kernel settings'),
                          ('backend_resolution_seconds', '0.123')),
@@ -46,6 +48,9 @@ class BackendOutputLevelTests(unittest.TestCase):
                      'symmetry_cache_directory = disabled',
                      'native_openmp_max_threads = 28',
                      'orbital_sector_later_filter_precision = float64',
+                     # Which recurrence kernel the filter launches, also where its switch is unset.
+                     'gpu_stencil_kernel = deferred_to_symmetry_sector_operators',
+                     'orbital_sector_stencil_kernel = pipelined: fast path for 25 slots',
                      'example fallback warning', 'Output_Level: 2'):
             self.assertIn(text, report)
         self.assertNotIn('Implementation    =', report)

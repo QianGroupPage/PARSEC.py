@@ -959,6 +959,23 @@ Complete calculations on 1, 4 and 16 GPUs took 0.44 to 3.9 s less SCF than
 with `1`, with the same totals, while every width took the six-column kernel
 six columns per launch. `README.md` has the switch in its tables, with these
 measurements.
+The recurrence step itself is one launch of `stencil_major_chebyshev6` per
+block. By default (`PARSEC_CUPY_STENCIL_KERNEL=pipelined`; `former` keeps the
+one kernel of before) an operator holds two of them, both compiled when it is
+built: one whose slot loop is a software pipeline of its loads, for the
+launches of six columns of unit row stride, and the former kernel, for every
+other launch. A graph recorded for a block of
+six columns replays the first, one recorded for a narrower block (the last
+block of a plan, two columns in a plan of 14) the second, and the other
+devices of a shared sector build the kernels of their owner. The filtered
+columns are the same to the last bit, NaN payloads included on an A100
+(`README.md`). On A100 GPUs
+(2026-10-20, each value on its own GPU of one node, sector 0 in tiles of 16
+rows, a probe of the filter) a block of six
+columns and degree 15 took 10.35 against 14.95 ms through the graphs with
+19,392 electrons and 21.24 against 29.50 ms with 39,368, 0.69 and 0.72 of the
+time, and blocks of one, two and five columns the time of the former kernel.
+`README.md` describes the kernel with the switches.
 The bounded persistent graph buffers use direct CUDA allocations so that small
 long-lived pieces cannot strand multi-gigabyte orbital blocks in CuPy's caching
 pool. Temporary orbitals still use the configured allocator. These graph buffers
@@ -971,7 +988,8 @@ On an allocated GPU node, validate these paths with:
 ```bash
 PYTHONPATH=src python -m unittest \
   parsec_python.acceleration.tests.test_device_lapack_random \
-  parsec_python.acceleration.tests.test_filter_graph
+  parsec_python.acceleration.tests.test_filter_graph \
+  parsec_python.acceleration.tests.test_stencil_pipeline
 ```
 
 The tests check bitwise sequence/seed continuity, filtering equivalence,
@@ -982,6 +1000,12 @@ projection block against one over the same plans and through both filters, a
 workspace that records again for another projection kernel, and independent
 concurrent capture on two devices.
 They also verify that graph workspaces do not retain or fragment the orbital pool.
+The last module compares the pipelined recurrence kernel with the former one
+word for word on every launch path (NaN payloads where two NaNs meet on
+compute capability 8.0 alone, `README.md`), also for stencils of 2 to 61 slots in
+every tile size, records which kernel each launch of a graph took, filters a
+sector shared by two devices with either kernel, and checks the entry of the
+backend details that names the kernel (`orbital_sector_stencil_kernel`).
 Use complete converged SCF runs to select performance options; increasing batch
 size or CPU/stream concurrency is not automatically beneficial. Compare total
 SCF time separately from the eigensolver and program startup/preparation time.

@@ -517,7 +517,7 @@ class ImplicitTilePolicyTests(unittest.TestCase):
         def build(**arguments):
             packed.clear()
             # NumPy stands in for CuPy: the constructor uploads three arrays.
-            with patch.object(cupy_stencil_major, "_compiled_kernels", return_value=(None, None)), \
+            with patch.object(cupy_stencil_major, "_compiled_kernels", return_value=(None, None, None)), \
                  patch.object(implicit_stencil, "initialize_implicit", record):
                 CuPyStencilMajorFiniteDifference(np, metadata=metadata, **arguments)
             return list(packed)
@@ -830,7 +830,10 @@ class SectorGroupTileTests(unittest.TestCase):
                                     finite_difference_metadata=metadata, implicit_tile=tile)
             # As the routes that use the worker leave it, for the group of the sector to find.
             worker = owner._distributed_filter = DistributedFilter(owner, devices)
-            kernels = sorted(implicit_stencil._CACHE), sorted(cupy_stencil_major._KERNEL_CACHE)
+            # The devices (and tiles) whose kernels were compiled.  PARSEC_CUPY_STENCIL_KERNEL=pipelined keeps a
+            # recurrence kernel beside the former ones, under a key that names its value and the slot count as well.
+            kernels = (sorted({key[:2] for key in implicit_stencil._CACHE}),
+                       sorted({key if isinstance(key, int) else key[0] for key in cupy_stencil_major._KERNEL_CACHE}))
         return cp, metadata, owner, worker, packs, kernels
 
     def test_replicas_upload_the_tiles_that_the_owner_packed(self):

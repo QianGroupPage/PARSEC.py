@@ -26,7 +26,9 @@ from ..models import AcceleratedSinglePointResult
 # first calculation of its structure, so the directory, or that none was
 # named, is kept as well. It says nothing of what a resident worker kept in
 # memory; reference_static_cache and orbital_operator_cache of the detailed
-# report do. Everything remains in backend_info; this allowlist controls text
+# report do. So is the recurrence kernel of the filter that the stencils were
+# built with (PARSEC_CUPY_STENCIL_KERNEL), which an unset variable does not
+# show. Everything remains in backend_info; this allowlist controls text
 # presentation only.
 _SUMMARY_DETAIL_KEYS = frozenset({
     "symmetry_cache_directory",
@@ -36,6 +38,8 @@ _SUMMARY_DETAIL_KEYS = frozenset({
     "native_openmp_max_threads",
     "gpu_later_subspace_filter_precision",
     "orbital_sector_later_filter_precision",
+    "gpu_stencil_kernel",
+    "orbital_sector_stencil_kernel",
     "orbital_symmetry",
     "hartree_symmetry",
 })

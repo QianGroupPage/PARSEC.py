@@ -6,9 +6,14 @@ GPUs. They are the measurements behind the two GPU tables of `../README.md`.
 
 ## How they were measured
 
-- Code: `master` f8f3a50 of 17 October 2026, default settings, double
+- Code: `master` 224a876 of 21 October 2026, default settings, double
   precision, first calculations (no symmetry cache), the inputs of
-  `gpu_benchmark/` (sphere 5 Angstrom beyond the outermost atom).
+  `gpu_benchmark/` (sphere 5 Angstrom beyond the outermost atom). Besides the
+  settings of the launch script, 30 of the 32 runs set
+  `PARSEC_CUPY_SECTOR_STATE_STORAGE=device` and
+  `PARSEC_CUPY_LARGE_PROBLEM_ALLOCATOR=pool` (the basis on the GPUs, the CuPy
+  memory pool), as the earlier series did; k09 on 1 GPU and k10 on 2 GPUs leave
+  both to the code, which chose the same for k10.
 - Hardware: Perlmutter at NERSC, nodes of four A100-SXM4-80GB and one AMD EPYC
   7763; one MPI rank per node with 32 CPUs and 16 OpenMP threads, launched with
   `scripts/run_multi_gpu_scf.sh`. 1, 2 and 4 GPUs use one node; 8 and 16 GPUs
@@ -41,29 +46,30 @@ Each figure is in `figures/` as PNG and PDF.
 
 ## What they show
 
-- **Time.** A complete calculation takes 5.9 s (k06 on 16 GPUs) to 265 s (k14
-  on 16 GPUs). At a fixed number of GPUs the program time grows as N^1.57
-  (16 GPUs) to N^1.80 (2 GPUs) in the number of electrons N, and as N^1.76
-  above 10,000 electrons on 16 GPUs.
-- **Where the time goes.** The Chebyshev filter (sparse) grows as N^1.78. The
-  dense products of the Rayleigh-Ritz step grow faster (Gram matrices N^2.36,
-  rotation N^2.66, on 16 GPUs), so their share of the program time rises from
-  5 % for k06 to 39 % for k14. Copies of the basis between the GPUs of a sector
-  take 10 to 13 % of the program time on 16 GPUs.
+- **Time.** With the basis in GPU memory a complete calculation takes 6.0 s
+  (k06 on 16 GPUs) to 239 s (k14 on 16 GPUs). At a fixed number of GPUs the
+  program time grows as N^1.52 (16 GPUs) to N^1.78 (2 GPUs) in the number of
+  electrons N, and as N^1.76 above 10,000 electrons on 16 GPUs.
+- **Where the time goes.** The Chebyshev filter (sparse) grows as N^1.80. The
+  dense products of the Rayleigh-Ritz step grow faster (Gram matrices N^2.35,
+  rotation N^2.65, on 16 GPUs), so their share of the program time rises from
+  4 % for k06 to 43 % for k14. Copies of the basis between the GPUs of a sector
+  take 9 to 14 % of the program time on 16 GPUs (11 to 14 % above 10,000
+  electrons).
 - **Memory.** The dense basis (grid points by states, per symmetry sector) must
   stay in GPU memory and grows as N^1.86. The measured peak of a GPU is about
   2.7 GiB plus 1.06 times the part of the basis it holds. The peak grows as
   N^1.32 (16 GPUs) to N^1.72 (2 GPUs).
 - **The limit is GPU memory.** At every GPU count the largest cluster that fits
-  finishes in under five minutes. A sector is shared by at most the four GPUs
+  finishes in under four minutes. A sector is shared by at most the four GPUs
   of one node, so a
   system with four sectors stops at 16 GPUs: on 80 GB cards at about 43,400
   electrons, 10 % above k14. By extrapolation a cluster of 100,000 electrons
-  would take about 39 minutes on 16 GPUs, but needs 293 GiB of basis per GPU,
+  would take about 36 minutes on 16 GPUs, but needs 293 GiB of basis per GPU,
   3.7 times what an 80 GB card has.
 - **Basis in host memory.** k09 does not fit on one card with this input: the
   code keeps its basis in page-locked host memory and moves one sector at a
-  time to the GPU (403 s, against 114 s on two GPUs).
+  time to the GPU (355 s, against 91 s on two GPUs).
 
 ## Data
 

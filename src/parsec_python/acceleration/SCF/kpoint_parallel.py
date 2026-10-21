@@ -427,12 +427,63 @@ def make_solver(job: KPointJob, **options):
     return PooledKPointSolver(job, **options)
 
 
+def describe() -> list[str]:
+    """The lines of ``parsec.out`` that say what the k-point eigenproblems run on."""
+    lines = [" Execution resources (k-point eigensolver):", " -------------------------------------------"]
+    context = mpi.context()
+    try:
+        plan = resolve_backend()
+    except Exception as error:  # no GPU where one was requested, for instance
+        return lines + [f" Device            = unavailable ({error})"]
+    if plan is None:
+        lines += [
+            " Device            = CPU",
+            " Eigensolver       = host, k-points and spin channels spread over worker threads",
+        ]
+    else:
+        names = []
+        if plan.name == "cupy":
+            try:
+                from ..backends.cupy import require_cupy
+
+                cp, _ = require_cupy()
+                for device_id in plan.device_ids[:1]:
+                    names.append(cp.cuda.runtime.getDeviceProperties(device_id)["name"].decode())
+            except Exception:
+                pass
+        kind = {"cupy": "GPU", "numpy-device": "CPU (device code on the host, a test double)"}[plan.name]
+        ids = ",".join(str(i) for i in plan.device_ids)
+        lines.append(f" Device            = {kind}" + (f" ({names[0]})" if names else ""))
+        if plan.name == "cupy":
+            lines.append(f" GPUs              = {len(plan.device_ids)} visible to a process, index {ids}")
+        route = (
+            "device-resident Ritz subspaces (filter, QR and Rayleigh-Ritz on the device)"
+            if _device_solver_requested()
+            else "host eigensolver, only the Chebyshev filter on the device"
+        )
+        lines.append(f" Eigensolver       = {route}")
+    if context is not None:
+        lines.append(
+            f" MPI               = {context.size} ranks, {context.ranks_per_node} per node; the basis of every "
+            "eigenproblem is split by blocks of grid rows over the ranks"
+        )
+        if plan is not None and plan.name == "cupy":
+            lines.append(
+                f" GPU of this rank  = index {plan.device_ids[context.local_rank % len(plan.device_ids)]} "
+                "(local rank order)"
+            )
+    elif plan is not None and plan.name == "cupy":
+        lines.append(" Workers           = one thread per GPU; the k-points and spin channels are dealt out to them")
+    return lines
+
+
 def install() -> None:
     """Make this the parallel backend of the reference k-point drivers and band paths."""
     set_parallel_backend(
         make_solver,
         map_tasks,
         uses_device=lambda: mpi.requested() or resolve_backend() is not None,
+        describe=describe,
     )
 
 

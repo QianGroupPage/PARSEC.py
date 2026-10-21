@@ -51,7 +51,7 @@ from .SCF.bands import (
     run_band_structure,
 )
 from .SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_polarized
-from .SCF.kpoint_solver import parallel_backend_uses_device
+from .SCF.kpoint_solver import parallel_backend_report, parallel_backend_uses_device
 from .SCF.noncollinear import (
     run_self_consistent_noncollinear,
     run_self_consistent_noncollinear_kpoints,
@@ -1164,6 +1164,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             for note in restart_notes:
                 log.write(note)
             log.write()
+            if (
+                noncollinear
+                or (is_periodic and (self_consistent_spin_orbit or k_sampling is not None))
+                or (is_periodic and spin_polarized and not has_soc_species and parallel_backend_uses_device())
+            ):
+                # these drivers hand their eigenproblems to the k-point solver: say where it runs
+                for line in parallel_backend_report():
+                    log.write(line)
+                log.write()
             if translation.relaxation is not None:
                 log.write("\n".join(relaxation_header_lines(translation)))
             if is_periodic:

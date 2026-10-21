@@ -275,6 +275,9 @@ Correlation_Type: CA
         on_host = self._log(False)
         self.assertIn("K-point solver detail", on_device)
         self.assertNotIn("K-point solver detail", on_host)
+        # the log says where the eigenproblems of the k-point driver run
+        self.assertIn("Execution resources (k-point eigensolver)", on_device)
+        self.assertNotIn("Execution resources (k-point eigensolver)", on_host)
         energy = [float(line.split()[3]) for line in on_device.splitlines() if "Total Energy =" in line and "iter" not in line]
         reference = [float(line.split()[3]) for line in on_host.splitlines() if "Total Energy =" in line and "iter" not in line]
         self.assertAlmostEqual(energy[-1], reference[-1], delta=2.0e-3)
@@ -299,6 +302,7 @@ class IsolatedNonCollinearDeviceTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment):
                 self.assertEqual(cli_main([str(directory / "parsec.in"), "--quiet", "--no-archive"]), 0)
             log = (directory / "parsec.out").read_text(encoding="utf-8")
+        self.log = log
         return float(
             [line for line in log.splitlines() if line.startswith("Total Energy")][-1].split()[3]
         )
@@ -307,6 +311,10 @@ class IsolatedNonCollinearDeviceTests(unittest.TestCase):
         host = self._energy({"PARSEC_KPOINT_BACKEND": "cpu"})
         device = self._energy({"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "1"})
         self.assertAlmostEqual(device, host, delta=2.0e-3)
+        # a cluster of spinors: complex wavefunctions, and the log says where the eigensolver ran
+        self.assertIn("WAVEFUNCTIONS ARE COMPLEX!", self.log)
+        self.assertIn("Execution resources (k-point eigensolver)", self.log)
+        self.assertIn("device-resident Ritz subspaces", self.log)
 
 
 class StageTimingAndResidualTests(unittest.TestCase):

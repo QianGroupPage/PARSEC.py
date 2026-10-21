@@ -129,19 +129,33 @@ def split_pooled(pooled: np.ndarray, per_task: list[np.ndarray]) -> list[np.ndar
 _parallel_solver: Callable[..., Any] | None = None
 _parallel_mapper: Callable[..., Iterator[tuple[int, Any]]] | None = None
 _uses_device: Callable[[], bool] | None = None
+_describe: Callable[[], list[str]] | None = None
 
 
 def set_parallel_backend(
     solver: Callable[..., Any] | None,
     mapper: Callable[..., Any] | None,
     uses_device: Callable[[], bool] | None = None,
+    describe: Callable[[], list[str]] | None = None,
 ) -> None:
     """Install (or, with ``None``, remove) the parallel solver factory and task mapper.
 
-    ``uses_device`` tells whether the installed solver would run on a device for the current run.
+    ``uses_device`` tells whether the installed solver would run on a device for the current run;
+    ``describe`` returns the lines of ``parsec.out`` that say what it runs on.
     """
-    global _parallel_solver, _parallel_mapper, _uses_device
-    _parallel_solver, _parallel_mapper, _uses_device = solver, mapper, uses_device
+    global _parallel_solver, _parallel_mapper, _uses_device, _describe
+    _parallel_solver, _parallel_mapper, _uses_device, _describe = solver, mapper, uses_device, describe
+
+
+def parallel_backend_report() -> list[str]:
+    """What the k-point eigenproblems run on, for the log; the serial solver on the host if none is installed."""
+    if _describe is None:
+        return [
+            " Execution resources (k-point eigensolver):",
+            " -------------------------------------------",
+            " Device            = CPU (serial solver, no parallel backend installed)",
+        ]
+    return list(_describe())
 
 
 def parallel_backend_uses_device() -> bool:
@@ -180,6 +194,7 @@ __all__ = [
     "SerialKPointSolver",
     "make_kpoint_solver",
     "map_tasks",
+    "parallel_backend_report",
     "parallel_backend_uses_device",
     "residual_max",
     "set_parallel_backend",

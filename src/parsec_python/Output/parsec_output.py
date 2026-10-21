@@ -820,6 +820,32 @@ class ParsecTextReporter:
         # Two spin channels change the header and the report of every step.
         self._spin = bool(getattr(self.problem.scf, "spin_polarized", False))
 
+    def _complex_wavefunctions(self) -> bool:
+        scf = self.problem.scf
+        return bool(
+            getattr(scf, "self_consistent_spin_orbit", False)
+            or getattr(scf, "noncollinear", False)
+            or getattr(self.problem, "has_kpoint_sampling", False)
+        )
+
+    def _boundary_lines(self, shape_name: str, domain_line: str) -> list[str]:
+        """The boundary conditions and the domain: the wording of usrinputfile.F90 for each."""
+        cell = getattr(self.problem, "periodic_cell", None)
+        if cell is None:
+            return [
+                " Confined system (cluster) with zero boundary condition!",
+                f"  {shape_name} domain shape:",
+                domain_line,
+                *domain_header_lines(self.translation),
+            ]
+        vectors = np.asarray(cell.lattice_vectors, dtype=float)
+        return [
+            " Periodic boundary conditions!",
+            " System is fully periodic ",
+            " Unit lattice vectors [bohr] : ",
+            *(" ".join(f"{value:15.10f}" for value in row) for row in vectors),
+        ]
+
     def header(self) -> None:
         grid = self.problem.grid
         scf = self.problem.scf
@@ -868,10 +894,7 @@ class ParsecTextReporter:
             " Grid data:",
             " ~~------~~",
             "",
-            " Confined system (cluster) with zero boundary condition!",
-            f"  {shape_name} domain shape:",
-            domain_line,
-            *domain_header_lines(self.translation),
+            *self._boundary_lines(shape_name, domain_line),
             f" Grid spacing is {grid.spacing:9.6f} bohrs",
             " Order of double grid is    1",
             (
@@ -884,7 +907,13 @@ class ParsecTextReporter:
                 + " ".join(f"{value:8.4f}" for value in grid.shift)
                 + "   [units of grid spacing]"
             ),
-            " WAVEFUNCTIONS ARE REAL!",
+            # usrinputfile.F90: complex with k-point sampling, a magnetic field or complex_wfn; here also
+            # the two-component spinors of spin-orbit coupling and non-collinear magnetism
+            (
+                " WAVEFUNCTIONS ARE COMPLEX!"
+                if self._complex_wavefunctions()
+                else " WAVEFUNCTIONS ARE REAL!"
+            ),
             (
                 " The Finite-difference expansion is of order "
                 f"{grid.expansion_order:2d}"

@@ -38,13 +38,14 @@ _SRC = Path(__file__).resolve().parents[3]
 _CRITERION = 1.0e-4
 
 
-def _mpirun(ranks: int, *arguments: str) -> subprocess.CompletedProcess:
+def _mpirun(ranks: int, *arguments: str, environment_extra: dict | None = None) -> subprocess.CompletedProcess:
     command = [
         "mpirun", "-n", str(ranks), "--oversubscribe", sys.executable, "-m",
         "parsec_python.acceleration.tests.mpi_check", *arguments,
     ]
     environment = {**os.environ, "PYTHONPATH": f"{_SRC}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"}
     environment.pop("PARSEC_MPI", None)
+    environment.update(environment_extra or {})
     return subprocess.run(command, capture_output=True, text=True, env=environment, timeout=900)
 
 
@@ -62,11 +63,15 @@ def _results(process: subprocess.CompletedProcess) -> dict[str, dict]:
 
 @unittest.skipUnless(HAVE_MPI, "needs mpi4py and mpirun")
 class DistributedOperatorTests(unittest.TestCase):
-    def test_application_matches_the_serial_operator_on_three_ranks(self) -> None:
-        process = _mpirun(3, "operators")
-        self.assertEqual(process.returncode, 0, process.stdout[-1500:] + process.stderr[-2500:])
-        for name in ("scalar k-point", "spinor field + soc", "spinor delta + soc", "isolated non-collinear"):
-            self.assertIn(f"ok {name}", process.stdout)
+    def test_application_matches_the_serial_operator(self) -> None:
+        # 3 ranks through the host, 2 ranks with device buffers handed to MPI (host arrays here),
+        # 5 ranks so that the slabs are thin and some ranks have neighbours on both sides
+        for ranks, direct in ((3, "0"), (2, "1"), (5, "0")):
+            with self.subTest(ranks=ranks, direct=direct):
+                process = _mpirun(ranks, "operators", environment_extra={"PARSEC_MPI_CUDA_AWARE": direct})
+                self.assertEqual(process.returncode, 0, process.stdout[-1500:] + process.stderr[-2500:])
+                for name in ("scalar k-point", "spinor field + soc", "spinor delta + soc", "isolated non-collinear"):
+                    self.assertIn(f"ok {name}", process.stdout)
 
 
 @unittest.skipUnless(HAVE_MPI, "needs mpi4py and mpirun")

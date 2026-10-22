@@ -653,7 +653,10 @@ srun --nodes=3 --ntasks=12 --ntasks-per-node=4 --gpus-per-node=4 --gpu-bind=none
 Rank `r` holds rows `[start_r, stop_r)` of every orbital, of the finite-difference matrices, of the
 projectors and of the local fields, and picks the GPU of its local index. Applying the Hamiltonian
 exchanges the halo rows of the stencil with the neighbouring ranks and sums the overlaps with the
-projectors (and the spin-orbit projectors) over the ranks. Orthonormalization is a shifted Cholesky QR
+projectors (and the spin-orbit projectors) over the ranks. Each stencil matrix is split into the part on
+the local rows and the part on the halo rows: the exchange is started, the local part is applied while it
+runs, and the halo part is added when the rows have arrived. The two spin components are applied as one
+block, so a spinor application makes one exchange and one projector sum. Orthonormalization is a shifted Cholesky QR
 of the summed Gram matrix, the Rayleigh-Ritz projection and the residuals are summed `states x states`
 matrices, and the root's eigenvalues and rotations go to every rank. The SCF driver is replicated on
 every rank (the ranks compare a checksum of the potentials every iteration and stop with a message
@@ -664,7 +667,11 @@ path are dealt out to the ranks instead.
 
 A GPU needs about twice the local rows of one subspace plus a few `states x states` matrices, so a basis
 of `B` GB needs at least `2B/(0.92 x GPU memory)` GPUs; the run stops with that number if the GPUs are
-too few. The MPI library is used through the host unless it is CUDA aware and `PARSEC_MPI_CUDA_AWARE=1`.
+too few. The halo rows and the sums go through the host unless the MPI library is CUDA aware and
+`PARSEC_MPI_CUDA_AWARE=1` (Cray MPICH also needs `MPICH_GPU_SUPPORT_ENABLED=1`): then they go between the GPUs and
+the halo exchange overlaps the local product. Without GPU-aware MPI the exchange cannot overlap much, because
+the copy to the host is synchronous. The log's eigensolver detail gives the time rank 0 spent packing,
+waiting for halo rows and summing over the ranks.
 `acceleration/tests/test_kpoint_mpi.py` runs the distributed operator, the drivers and the command line
 on 2 and 3 ranks (the device code on the host) against the single-process solver; it has not been run on
 GPUs or on more than one node.

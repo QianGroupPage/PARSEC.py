@@ -65,7 +65,7 @@ def check_operators(context) -> None:
             error = float(np.max(np.abs(assembled - expected)))
             if error > 1e-10:
                 raise SystemExit(f"{name}: distributed apply differs from the serial one by {error:.2e}")
-            print(f"ok {name} ({context.size} ranks, halo {operator.halo is not None}) max error {error:.1e}")
+            print(f"ok {name} ({context.size} ranks, halo {operator.halo_begin is not None}) max error {error:.1e}")
     context.barrier()
 
 

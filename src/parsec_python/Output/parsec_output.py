@@ -1775,6 +1775,9 @@ class ParsecTextReporter:
             ("worker_download_seconds", "Eigenvectors to the host"),
             ("worker_density_seconds", "Density of the k-points"),
             ("worker_gather_seconds", "Density joined over the MPI ranks"),
+            ("worker_halo_begin_seconds", "Halo rows packed and sent (rank 0)"),
+            ("worker_halo_wait_seconds", "Waiting for the halo rows (rank 0)"),
+            ("worker_allsum_seconds", "Projector overlaps summed over ranks (rank 0)"),
         )
         present = [(key, label) for key, label in worker if key in detail]
         if present:
@@ -1983,6 +1986,9 @@ class ParsecTextReporter:
                 ("worker_download_seconds", "worker: eigenvectors to the host"),
                 ("worker_density_seconds", "worker: density of the states"),
                 ("worker_gather_seconds", "worker: density joined over ranks"),
+                ("worker_halo_begin_seconds", "rank 0: halo rows packed and sent"),
+                ("worker_halo_wait_seconds", "rank 0: waiting for halo rows"),
+                ("worker_allsum_seconds", "rank 0: sums over the ranks"),
             ):
                 if key in counters:
                     value = counters[key]

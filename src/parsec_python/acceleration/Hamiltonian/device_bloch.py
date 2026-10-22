@@ -164,7 +164,10 @@ class DeviceBlochOperator:
         delta=None,
         field=None,
         projector_real: bool = False,
-        halo=None,
+        halo_begin=None,
+        halo_finish=None,
+        laplacian_halo=None,
+        k_gradient_halo=None,
         allsum=None,
         global_grid_size: int | None = None,
         mpi=None,
@@ -185,9 +188,15 @@ class DeviceBlochOperator:
         self.delta = delta
         self.field = field
         # A basis distributed over MPI ranks by blocks of grid rows: ``grid_size`` counts the rows of
-        # this rank, ``halo(block)`` adds the rows of the neighbours that the stencils reach, and
-        # ``allsum(array)`` sums the overlaps with the projectors over the ranks.  Serially none.
-        self.halo = halo
+        # this rank.  The stencils reach rows of the neighbours: ``halo_begin(block)`` starts the exchange
+        # of those rows, ``halo_finish(pending)`` returns them, and ``laplacian_halo`` / ``k_gradient_halo``
+        # are the parts of the stencil matrices on those rows; the part on the local rows is applied while
+        # the exchange is under way.  ``allsum(array)`` sums the overlaps with the projectors over the
+        # ranks.  Serially none of these exists.
+        self.halo_begin = halo_begin
+        self.halo_finish = halo_finish
+        self.laplacian_halo = laplacian_halo
+        self.k_gradient_halo = k_gradient_halo
         self.allsum = allsum
         self.mpi = mpi  # the MPI context of a distributed basis, None serially
         self.row_bounds = row_bounds  # rows [start, stop) of the grid held here
@@ -247,14 +256,21 @@ class DeviceBlochOperator:
     def _scalar(self, block):
         """``H_k`` on one ``(n, vectors)`` complex block."""
         xp = self.xp
-        # the stencils reach rows of neighbouring ranks when the basis is distributed
-        reached = block if self.halo is None else self.halo(block)
-        real = reached.view(xp.float64)
+        # the stencils reach rows of the neighbouring ranks when the basis is distributed: start the
+        # exchange, apply the stencils to the local rows meanwhile, then add the part on the halo rows
+        pending = None if self.halo_begin is None else self.halo_begin(block)
+        real = block.view(xp.float64)
         # cuSPARSE returns a column-major product; the complex view below needs
         # row-major data, so make it so (a no-op for NumPy, which already is).
         result = xp.ascontiguousarray(self.laplacian @ real).view(xp.complex128)
         if self.k_gradient is not None:
             result -= 2j * xp.ascontiguousarray(self.k_gradient @ real).view(xp.complex128)
+        if pending is not None:
+            halo_real = self.halo_finish(pending).view(xp.float64)
+            if self.laplacian_halo is not None:
+                result += xp.ascontiguousarray(self.laplacian_halo @ halo_real).view(xp.complex128)
+            if self.k_gradient_halo is not None:
+                result -= 2j * xp.ascontiguousarray(self.k_gradient_halo @ halo_real).view(xp.complex128)
         result += self.diagonal[:, None] * block
         if self.projector_forward is not None:
             if self.projector_real:
@@ -312,8 +328,12 @@ class DeviceBlochOperator:
             return self._scalar(block)
         n = self.grid_size
         up, down = block[:n], block[n:]
-        q_up = self._scalar(up)
-        q_down = self._scalar(down)
+        # the two components see the same scalar operator: apply it to both as one block of twice the
+        # columns (one stencil product, one halo exchange, one projector sum instead of two of each)
+        both = self.xp.concatenate((up, down), axis=1)
+        scalar_part = self._scalar(both)
+        vectors = block.shape[1]
+        q_up, q_down = scalar_part[:, :vectors], scalar_part[:, vectors:]
         if self.delta is not None:
             q_up += self.delta[:, None] * up
             q_down -= self.delta[:, None] * down

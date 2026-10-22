@@ -482,6 +482,14 @@ def describe() -> list[str]:
         )
         if device is not None:
             lines.append(
+                " GPU-aware MPI     = "
+                + (
+                    "on: halo rows and sums go between the GPUs, the halo overlaps the local product"
+                    if context.cuda_aware
+                    else "off: halo rows and sums go through the host (PARSEC_MPI_CUDA_AWARE=1 for GPU buffers)"
+                )
+            )
+            lines.append(
                 f" GPUs              = {sum(len(g) for g in nodes.values())} active, one per rank, "
                 f"on {len(nodes)} node(s):"
             )

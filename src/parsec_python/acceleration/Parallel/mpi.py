@@ -17,6 +17,7 @@ Arrays move through the host unless the MPI library is CUDA aware and
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import numpy as np
@@ -63,6 +64,7 @@ class MPIContext:
         self.ranks_per_node = int(node.Get_size())
         node.Free()
         self.cuda_aware = os.environ.get(CUDA_AWARE_ENV, "").strip().lower() in ("1", "true", "on", "yes")
+        self.allsum_seconds = 0.0  # time of the sums over the ranks (``allsum``), for the report
 
     @property
     def is_root(self) -> bool:
@@ -84,6 +86,13 @@ class MPIContext:
         """Sum over the ranks of a host or device array; a device array comes back as a device array."""
         if self.size == 1:
             return array
+        started = time.perf_counter()
+        try:
+            return self._allsum(array, backend)
+        finally:
+            self.allsum_seconds += time.perf_counter() - started
+
+    def _allsum(self, array: Any, backend) -> Any:
         if isinstance(array, np.ndarray):
             return self.allsum_host(np.ascontiguousarray(array) if not array.flags.c_contiguous else array)
         if backend is None:

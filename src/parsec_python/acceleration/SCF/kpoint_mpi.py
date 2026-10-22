@@ -169,8 +169,12 @@ class MPIKPointSolver:
         return 0 if state is None else int(state.operator_dimension)
 
     def stats(self) -> dict[str, float]:
-        """Eigensolver counters and seconds of this rank (the same work on every rank)."""
-        return dict(self._stats)
+        """Eigensolver counters and seconds of this rank (the same work on every rank), and what the
+        communication between the ranks cost it."""
+        stats = dict(self._stats)
+        for name, value in self.converter.communication().items():
+            stats[f"worker_{name}_seconds" if name != "halo_bytes" else "worker_halo_bytes"] = value
+        return stats
 
     def residuals(self) -> list[float]:
         return [self._residual.get(task, float("nan")) for task in range(self.job.n_tasks)]

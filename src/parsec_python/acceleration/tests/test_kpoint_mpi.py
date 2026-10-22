@@ -132,6 +132,7 @@ class DistributedCommandLineTests(unittest.TestCase):
             log = (directory / "parsec.out").read_text(encoding="utf-8")
             self.assertIn("Self-consistency convergence achieved.", log)
             self.assertIn("Eigensolver residual max", log)
+            self.assertIn("MPI               = 2 ranks on 1 node(s), 2 per node", log)
             self.assertEqual(process.stdout.count("MPI: 2 ranks"), 1)
             energy = float([l for l in log.splitlines() if l.startswith("Total Energy")][-1].split()[3])
         with mock.patch.dict(os.environ, {"PARSEC_KPOINT_BACKEND": "numpy-device"}):

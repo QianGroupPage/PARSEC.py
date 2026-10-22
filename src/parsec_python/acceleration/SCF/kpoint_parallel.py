@@ -455,7 +455,10 @@ def describe() -> list[str]:
         ids = ",".join(str(i) for i in plan.device_ids)
         lines.append(f" Device            = {kind}" + (f" ({names[0]})" if names else ""))
         if plan.name == "cupy":
-            lines.append(f" GPUs              = {len(plan.device_ids)} visible to a process, index {ids}")
+            if context is not None:
+                lines.append(f" GPUs/node         = {len(plan.device_ids)} visible, index {ids}")
+            else:
+                lines.append(f" GPUs              = {len(plan.device_ids)} active, index {ids}")
         route = (
             "device-resident Ritz subspaces (filter, QR and Rayleigh-Ritz on the device)"
             if _device_solver_requested()
@@ -463,15 +466,27 @@ def describe() -> list[str]:
         )
         lines.append(f" Eigensolver       = {route}")
     if context is not None:
-        lines.append(
-            f" MPI               = {context.size} ranks, {context.ranks_per_node} per node; the basis of every "
-            "eigenproblem is split by blocks of grid rows over the ranks"
-        )
+        import socket
+
+        device = None
         if plan is not None and plan.name == "cupy":
+            device = plan.device_ids[context.local_rank % len(plan.device_ids)]
+        # every rank takes part: the report says where all of them run, not only rank 0
+        placement = context.comm.allgather((socket.gethostname(), device))
+        nodes: dict[str, list] = {}
+        for host, gpu in placement:
+            nodes.setdefault(host, []).append(gpu)
+        lines.append(
+            f" MPI               = {context.size} ranks on {len(nodes)} node(s), {context.ranks_per_node} per node; "
+            "the basis of every eigenproblem is split by blocks of grid rows over the ranks"
+        )
+        if device is not None:
             lines.append(
-                f" GPU of this rank  = index {plan.device_ids[context.local_rank % len(plan.device_ids)]} "
-                "(local rank order)"
+                f" GPUs              = {sum(len(g) for g in nodes.values())} active, one per rank, "
+                f"on {len(nodes)} node(s):"
             )
+            for host, gpus in nodes.items():
+                lines.append(f"   node {host}: GPU index {','.join(str(g) for g in gpus)}")
     elif plan is not None and plan.name == "cupy":
         lines.append(" Workers           = one thread per GPU; the k-points and spin channels are dealt out to them")
     return lines

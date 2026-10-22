@@ -318,6 +318,7 @@ def run_self_consistent_soc_kpoints(
     # spinors (storing all k-points would multiply the memory); the
     # per-state <S_z> of every k-point is stored separately (state_moments).
     with solver:
+        timer.lap()  # what came before the loop (potentials, solver start-up) is not part of iteration 1
         for iteration in range(1, settings.max_iterations + 1):
             eigval_settings = _eigval_settings(system, filter_degree)
 
@@ -381,6 +382,7 @@ def run_self_consistent_soc_kpoints(
                 )
 
                 mixed_potential = mixer.mix(input_potential, output_potential, iteration=iteration)
+            lap = timer.lap()
             selected_residual = (
                 metrics.plain if settings.use_plain_residual else metrics.weighted
             )
@@ -397,6 +399,8 @@ def run_self_consistent_soc_kpoints(
                         ),
                         fermi_level=float(fermi_level),
                         eigen_residual_max=residual_max,
+                        diagonalization_seconds=lap.get("diagonalization", 0.0),
+                        total_seconds=sum(lap.values()),
                     )
                 )
             input_potential = mixed_potential
@@ -512,6 +516,7 @@ def run_self_consistent_soc_kpoints_spin_polarized(
     density_down_out = density_down
 
     with solver:
+        timer.lap()  # what came before the loop (potentials, solver start-up) is not part of iteration 1
         for iteration in range(1, settings.max_iterations + 1):
             eigval_settings = _eigval_settings(system, filter_degree)
             effective_potential_avg = 0.5 * (input_potential_up + input_potential_down)
@@ -583,6 +588,7 @@ def run_self_consistent_soc_kpoints_spin_polarized(
                 )
 
                 mixed_combined = mixer.mix(input_combined, output_combined, iteration=iteration)
+            lap = timer.lap()
             selected_residual = (
                 metrics.plain if settings.use_plain_residual else metrics.weighted
             )
@@ -599,6 +605,8 @@ def run_self_consistent_soc_kpoints_spin_polarized(
                         ),
                         fermi_level=float(fermi_level),
                         eigen_residual_max=residual_max,
+                        diagonalization_seconds=lap.get("diagonalization", 0.0),
+                        total_seconds=sum(lap.values()),
                     )
                 )
             input_potential_up = mixed_combined[:n_grid]

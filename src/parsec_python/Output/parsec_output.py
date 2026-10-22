@@ -1280,6 +1280,11 @@ class ParsecTextReporter:
                 f"{step.diagonalization_seconds:10.2f},"
                 f"      tdiag_sum = {self._diagonalization_total:11.2f}"
             ),
+            *(
+                (f" Iteration time [sec]       : {step.total_seconds:10.2f}",)
+                if getattr(step, "total_seconds", 0.0) > 0.0
+                else ()
+            ),
             "",
             *self._residual_lines(step),
         ]
@@ -1872,6 +1877,15 @@ class ParsecTextReporter:
         lines = [
             f" Self-consistent SOC iter # {step.iteration:3d}",
             "",
+            *(
+                (
+                    f" Diagonalization time [sec] : {step.diagonalization_seconds:10.2f},"
+                    f"      iteration time = {step.total_seconds:10.2f}",
+                    "",
+                )
+                if getattr(step, "total_seconds", 0.0) > 0.0
+                else ()
+            ),
             *self._residual_lines(step),
             f" Fermi level at {step.fermi_level:10.4f} [Ry]",
             "",

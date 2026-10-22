@@ -330,6 +330,15 @@ class StageTimingAndResidualTests(unittest.TestCase):
                 self.assertEqual(timings["eig_workers"], 2)
                 self.assertGreater(timings["eig_worker_solve_seconds"], 0.0)
 
+    def test_every_driver_times_its_iterations(self) -> None:
+        for name in ("scalar", "spin_polarized", "soc", "soc_spin_polarized", "noncollinear"):
+            with self.subTest(driver=name):
+                steps = _recorded(name, "2")[1]
+                self.assertTrue(all(step.total_seconds > 0.0 for step in steps))
+                self.assertTrue(all(step.diagonalization_seconds > 0.0 for step in steps))
+                # the stages before the loop (potentials, solver start-up) are not part of iteration 1
+                self.assertLess(steps[0].total_seconds, 20.0 * steps[-1].total_seconds + 1.0)
+
     def test_every_driver_reports_a_residual(self) -> None:
         for name in ("scalar", "spin_polarized", "soc", "noncollinear"):
             with self.subTest(driver=name):

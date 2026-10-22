@@ -1316,6 +1316,9 @@ class SelfConsistentSOCIteration:
     fermi_level: float = float("nan")
     eigen_residual_max: float = float("nan")
     """Largest ``||H x - e x||`` of the requested pairs after this iteration's solve (NaN if not measured)."""
+    diagonalization_seconds: float = 0.0
+    total_seconds: float = 0.0
+    """Seconds of this iteration's diagonalization and of the whole iteration (0 where not measured)."""
 
 
 @dataclass

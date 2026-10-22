@@ -202,6 +202,7 @@ def run_scf_kpoints(
     history: list[SCFIteration] = []
 
     with solver:
+        timer.lap()  # what came before the loop (potentials, solver start-up) is not part of iteration 1
         for iteration in range(1, settings.max_iterations + 1):
             eigval_settings = _eigval_settings(system, filter_degree)
 
@@ -458,6 +459,7 @@ def run_scf_kpoints_spin_polarized(
     converged = False
 
     with solver:
+        timer.lap()  # what came before the loop (potentials, solver start-up) is not part of iteration 1
         for iteration in range(1, settings.max_iterations + 1):
             eigval_settings = _eigval_settings(system, filter_degree)
 

@@ -179,6 +179,8 @@ class BandStructureRunTests(unittest.TestCase):
             bands_dat = read_bands_dat(directory / "bands.dat")
             archive = load_band_structure_archive(directory / "parsec_python_bands.npz")
             plot_text = (directory / "bands_plot.dat").read_text(encoding="utf-8")
+            spin_path = directory / "bands_spin.dat"
+            self.spin_text = spin_path.read_text(encoding="utf-8") if spin_path.exists() else None
             return log, scf, bands_dat, archive, plot_text
 
     def test_spin_orbit_bands(self) -> None:
@@ -212,6 +214,26 @@ class BandStructureRunTests(unittest.TestCase):
         np.testing.assert_allclose(e[2, :14], pooled[1, :14], atol=5e-3)
         # |<sigma>| <= 1 for a normalized spinor.
         self.assertLess(np.abs(archive.spin_expectation).max(), 1.0 + 1e-6)
+
+        # bands_spin.dat: a block of k-points per state, columns k, path, E[eV], Sx, Sy, Sz, level size
+        self.assertIsNotNone(self.spin_text)
+        rows = [line.split() for line in self.spin_text.splitlines() if line.strip() and not line.startswith("#")]
+        self.assertEqual(len(rows), 3 * 20)
+        table = np.array(rows, dtype=float)
+        np.testing.assert_allclose(table[:3, 2], archive.eigenvalues[0, :, 0] * 13.605693122994, rtol=1e-6)
+        from parsec_python.Output.bands import level_averaged_spin
+
+        averaged, sizes = level_averaged_spin(archive)  # what the file holds, at the default tolerance
+        np.testing.assert_allclose(table[:, 3:6].reshape(20, 3, 3).transpose(1, 0, 2), averaged, atol=1e-5)
+        # a crystal with inversion symmetry has Kramers-degenerate levels: the mean spin of a level is zero
+        # (only the sum over the level is determined, and it cancels) whatever the spins of its states.  The
+        # pairs of this loosely converged run agree to 5e-3 Ry, so group them at 1e-2 Ry (a group may hold two
+        # pairs: still a sum of complete Kramers pairs)
+        averaged, sizes = level_averaged_spin(archive, 1.0e-2)
+        for point in range(3):
+            for state in range(0, 14, 2):
+                self.assertGreaterEqual(int(sizes[point, state]), 2)
+                self.assertLess(np.abs(averaged[point, state]).max(), 0.1)
 
     def test_scalar_bands_match_the_scf_levels(self) -> None:
         log, scf, bands, archive, _ = self._run(so_psp="false", states=12)

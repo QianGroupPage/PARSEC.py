@@ -726,7 +726,27 @@ Outputs (written next to `parsec.in`):
 * `bands.dat` and `bands_plot.dat` in Fortran's formats (eigenvalues in Ry / eV, not shifted by
   the Fermi level; `bands.dat` carries the SCF Fermi level),
 * `parsec_python_bands.npz` with the k-points, segment names, eigenvalues, residuals and (for
-  spinor Hamiltonians) `<sigma>` of every state.
+  spinor Hamiltonians) `<sigma>` of every state,
+* `bands_spin.dat` for spinor bands (spin-orbit, non-collinear): for every band a gnuplot block of
+  `k index, path length [1/bohr], E [eV], <S_x>, <S_y>, <S_z>, level size`, with the spin in units of
+  hbar/2 (the Pauli expectation, between -1 and 1) in the axes of the cell. Only the *sum* of the spin over a
+  degenerate level is determined (Kramers pairs, every level of an inversion-symmetric crystal): any mixture
+  of the states of a level is an eigenvector. So states within `1e-4 Ry` of each other show the mean spin of
+  their level, and the last column is the level's size; the archive keeps the spin of each state as the
+  eigensolver returned it. For a Rashba or Dresselhaus system the bands are non-degenerate away from the
+  time-reversal-invariant points and carry a well-defined spin texture.
+
+Plot the spin texture (bands coloured by `<S_x>`, `<S_y>`, `<S_z>`, energies relative to the Fermi level):
+
+```bash
+python -m parsec_python.Output.bands --spin parsec_python_bands.npz --components xyz \
+    --names "G-X,X-M,M-G" --window -2 2 -o bands_spin.png
+```
+
+(`gnuplot`: `plot 'bands_spin.dat' using 2:3:4 with lines lc palette` for `S_x`.) A surface Rashba state needs
+a slab (non-periodic along the surface normal), which the periodic cells here do not have yet; bulk examples
+are the Dresselhaus splitting of a zinc-blende crystal off the high-symmetry lines and non-centrosymmetric
+Rashba-type semiconductors.
 
 Overlay several runs, e.g. without and with spin-orbit coupling:
 

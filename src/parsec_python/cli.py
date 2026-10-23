@@ -43,7 +43,7 @@ from .models import (
 )
 from .Grid import kpoint_sampling
 from .Output import ParsecTextReporter
-from .Output.bands import save_band_structure_archive, write_bands_files
+from .Output.bands import save_band_structure_archive, write_bands_files, write_spin_file
 from .SCF.bands import (
     band_mode,
     band_potentials,
@@ -653,6 +653,9 @@ def _band_progress(reporter):
 
 def _write_band_outputs(band_result, reporter, directory: Path, start: float) -> None:
     files = list(write_bands_files(directory, band_result))
+    spin_file = write_spin_file(directory, band_result)  # spinor bands only
+    if spin_file is not None:
+        files.append(spin_file)
     files.append(
         save_band_structure_archive(directory / "parsec_python_bands.npz", band_result)
     )

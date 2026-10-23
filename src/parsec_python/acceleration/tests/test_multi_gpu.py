@@ -640,8 +640,8 @@ class SectorStateStorageTests(unittest.TestCase):
     def test_a_shared_basis_is_counted_by_the_blocks_of_its_devices(self):
         from parsec_python.acceleration.Eigensolvers import distributed_state
         gib = 1 << 30
-        # The counts of the exchange that the measured series took and whose buffer they hold, the packed one
-        # (PARSEC_CUPY_EXCHANGE_STRIDED=0).  The pitched exchange of the default takes none: end of the test.
+        # The counts of the exchange that the measured series took and whose buffer they hold, the packed one of
+        # the default, named (PARSEC_CUPY_EXCHANGE_STRIDED=0).  The pitched exchange takes none: end of the test.
         packed = dict(PARSEC_CUPY_EXCHANGE_STRIDED="0")
         # 29,576 electrons: a sector on two devices (a rank of 8 GPUs has two of them) or on four (16
         # GPUs, one).  The whole sector, 114 GiB, was counted on its owner: more than a device has.
@@ -723,15 +723,20 @@ class SectorStateStorageTests(unittest.TestCase):
         self.assertEqual((round(10_428_230_944 / 2 ** 20), round(10_562_448_672 / 2 ** 20)), (9_945, 10_073))
         self.assertGreater(10_428_230_944, (10_005 - 426) << 20)
         self.assertLess(10_428_230_944, 10_005 << 20)
-        # The pitched exchange, the default since 2026-10-22, takes no buffer, and the count holds none: 1 GiB
-        # less for 29,576 electrons on two devices and on four, whose slabs lie within a chunk, and the same
-        # decisions.
+        # The default counts the buffer of its packed exchange, as named above.  The pitched exchange
+        # (PARSEC_CUPY_EXCHANGE_STRIDED=1, the default of the code published on 2026-10-22) takes no buffer,
+        # and the count holds none: 1 GiB less for 29,576 electrons on two devices and on four, whose slabs lie
+        # within a chunk, and the same decisions.
         for groups, owned in ((((0, 1), (9,), (2, 3), (9,)), (0, 2)), (((9,), (0, 1, 2, 3), (9,), (9,)), (1,))):
             default, events = self.decide(self.K13, groups, owned)
             self.assertEqual((default._host_spill_sector_states, default.sector_state_storage, events),
                              (False, self.KEPT, []))
             former, events = self.decide(self.K13, groups, owned, **packed)
-            self.assertEqual({device: former.state_fit_bytes[device] - count
+            self.assertEqual(former.state_fit_bytes, default.state_fit_bytes)
+            pitched, events = self.decide(self.K13, groups, owned, PARSEC_CUPY_EXCHANGE_STRIDED="1")
+            self.assertEqual((pitched._host_spill_sector_states, pitched.sector_state_storage, events),
+                             (False, self.KEPT, []))
+            self.assertEqual({device: count - pitched.state_fit_bytes[device]
                               for device, count in default.state_fit_bytes.items()}, dict.fromkeys((0, 1, 2, 3), gib))
         # The slabs of 1 GiB of the default, 69 columns, are counted 2 GiB lower, 7,889 MiB, and lie within a
         # chunk whether one is named or not.
@@ -897,7 +902,8 @@ class SectorStateStorageTests(unittest.TestCase):
                          {0: 81_064_975_872, 1: 81_064_975_872})
         self.assertEqual(self.decide(self.K10, ((0,), (1,), (0,), (1,)))[0].state_fit_bytes,
                          {0: 78_917_498_592, 1: 78_917_498_592})
-        # The series ran the packed exchange, whose buffer the counts hold (PARSEC_CUPY_EXCHANGE_STRIDED=0).
+        # The series ran the packed exchange of the default, whose buffer the counts hold, named here
+        # (PARSEC_CUPY_EXCHANGE_STRIDED=0).
         packed = dict(PARSEC_CUPY_EXCHANGE_STRIDED="0")
         chunk = dict(packed, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(1 << 30))
         series = dict(chunk, PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(4 << 30))
@@ -943,9 +949,11 @@ class SectorStateStorageTests(unittest.TestCase):
                     self.assertEqual((now._host_spill_sector_states, left), (False, []))
                     self.assertLess(max(now.state_fit_bytes.values()),
                                     max((unnamed if ranks == 4 else default).state_fit_bytes.values()))
-                    # The pitched exchange of the default since takes no buffer: 1 GiB less, or up to 1.125
-                    # GiB where the buffer follows a slab, and the same route.
-                    pitched, left = self.decide((rows, columns), groups, tuple(mine))
+                    # The default is that count, and the pitched exchange (PARSEC_CUPY_EXCHANGE_STRIDED=1) takes
+                    # no buffer: 1 GiB less, or up to 1.125 GiB where the buffer follows a slab, and the same route.
+                    default_count, left = self.decide((rows, columns), groups, tuple(mine))
+                    self.assertEqual(default_count.state_fit_bytes, now.state_fit_bytes)
+                    pitched, left = self.decide((rows, columns), groups, tuple(mine), PARSEC_CUPY_EXCHANGE_STRIDED="1")
                     self.assertEqual((pitched._host_spill_sector_states, left), (False, []))
                     less = max(now.state_fit_bytes.values()) - max(pitched.state_fit_bytes.values())
                     self.assertTrue(1 << 30 <= less <= (1 << 30) + (1 << 27), less)

@@ -298,13 +298,12 @@ budget allows, and the slabs that are cut can be narrower. It also counts
 the most that an exchange buffer can take which follows a slab, where no
 chunk size is named: up to 128 MiB above the chunk of 1 GiB on four devices,
 from 10.7 GiB of basis and all of it from 12 GiB
-(`PARSEC_CUPY_EXCHANGE_CHUNK_BYTES` in `README.md`). Since 2026-10-22 the
-pieces between the devices go as pitched copies by default, which take no
-buffer, and the rule counts none: up to 1.125 GiB less per device (about
-1 GiB for the large sectors), with the
-same decisions for every case of the measured series
-(`PARSEC_CUPY_EXCHANGE_STRIDED=0` counts the buffer with the exchange that
-takes it). The figures that follow are counts with the buffer. The devices
+(`PARSEC_CUPY_EXCHANGE_CHUNK_BYTES` in `README.md`). That is the packed
+exchange of the default. Where `PARSEC_CUPY_EXCHANGE_STRIDED=1` names the
+pitched one, which takes no buffer, the rule counts none: up to 1.125 GiB
+less per device (about 1 GiB for the large sectors), with the same
+decisions for every case of the measured series. The figures that follow
+are counts with the buffer. The devices
 of 10,456 electrons on 16 GPUs counted 9,945 MiB each with the chunk of 1 GiB
 that they had (10,073 MiB where none is named) and sampled as little as
 10,005 MiB, 426 of them the CUDA context: 366 MiB less than the count
@@ -909,10 +908,10 @@ energies and the fullest device at 47.87 against 47.67 GiB and at 63.52 GiB
 with either (2026-10-16): it would have stayed the default for at least
 0.4 % less SCF time in either case (`README.md`).
 
-The rounds of the Ritz step of a shared basis run their stages side by side
-by default since 2026-10-22 (`PARSEC_CUPY_RITZ_PIPELINE=p2`; `off` restores
-the former step; `README.md`). Under `p1` and `p2` every device of the group
-gets a second stream, its exchange
+The rounds of the Ritz step of a shared basis can run their stages side by
+side (`PARSEC_CUPY_RITZ_PIPELINE=p2` or `p1`; `off`, the default, is the step
+of the code of 21 October; `README.md`). Under `p1` and `p2` every device of
+the group gets a second stream, its exchange
 stream, which the group keeps for its life: the slabs and `H` times them go
 to the row layout on it while the compute stream applies `H` (`p1`) and
 forms the slabs of the overlap (`p2`). It runs on the thread of its device,
@@ -926,21 +925,28 @@ conversion and once after the last round, and a step that fails waits for
 every stream of its devices before the error leaves it. The workspace, the
 buffer and the Gram arrays are those of `off`; `p2` forms the overlap into
 the Gram pair directly, without the temporary `m x m` product of before.
-The pitched exchange, the default since then as well
-(`PARSEC_CUPY_EXCHANGE_STRIDED=1`; `0` restores the packed one), sends every
-piece with one pitched copy and takes no exchange buffer
-(`exchange_buffer_bytes` 0), about 1 GiB less on every device of a large
-sector. Both give the bits of the former step. They were compared on a
+The pitched exchange (`PARSEC_CUPY_EXCHANGE_STRIDED=1`; `0`, the default, is
+the packed one) sends every piece with one pitched copy and takes no
+exchange buffer (`exchange_buffer_bytes` 0), about 1 GiB less on every
+device of a large sector. Both give the bits of the default step. They were
+compared on a
 laptop GPU named twice and four times as the devices of a group, on the four
 A100 of a node, and in complete calculations of 3,480 electrons on 8 A100
 GPUs with every value and on 16 with `off`, `p2` and `p2` with pitched
 copies, whose archives were the same bit for bit apart from timings and
 backend details. On
-dedicated A100 nodes (2026-10-22, ABBA) the two defaults together took 4.4
-and 3.6 % less SCF time for 23,768 and 29,576 electrons on 8 GPUs and 6.4
-and 5.4 % less for 23,768 and 39,368 on 16 (231.1 against 218.8 s), with the
-same totals and steps, and the fullest devices peaked 1.0 to 1.2 GiB lower
-(`README.md`).
+dedicated A100 nodes (2026-10-22, ABBA) `p2` and `1` together took 4.1 to
+6.4 % less SCF time on 8 and 16 GPUs (231.1 and 231.2 against 218.8 and
+219.0 s for 39,368 electrons on 16), with the same totals and steps, and the
+fullest devices peaked 1.0 to 1.2 GiB lower; the series F12, which took
+both, ran 4 to 7 % less SCF time than F11 on 8 GPUs and 3 to 6 % less on 16
+from 19,392 electrons on. The code published on 2026-10-22 took them by
+default. The owner made `off` and `0` the defaults again to keep the default
+behaviour of the code of 21 October, after small calculations on four nodes
+ran slower on Perlmutter after its maintenance of 2026-10-21: the machine,
+not the code, since on the same nodes the published code was 5 to 8 % faster
+than that of 21 October (3,480 electrons on 16 GPUs in 5.5 to 5.6 s against
+5.9 to 6.2 s). Naming both takes the measured gains (`README.md`).
 
 ## Optional FP64 initialization and filter submission improvements
 
@@ -1055,8 +1061,8 @@ PYTHONPATH=src python -m unittest \
   parsec_python.acceleration.tests.test_distributed_exchange
 ```
 
-The first module compares every value with the former step (`off`, packed
-exchange) to the last bit, the defaults among them, on
+The first module compares every value with the default step (`off`, packed
+exchange) to the last bit, on
 one GPU named twice and four times and on the distinct GPUs of the node,
 and sees a wait of the exchange stream that is left out; the last runs the
 same step on a host stand-in whose streams hold their work until something
@@ -1082,10 +1088,10 @@ is well conditioned, `X L^-T` in the cycles before the last, and rotates in
 the last. The Ritz values are those of the rotation; the bases differ, so the
 SCF path moves beyond round-off, by a step at the default criterion and up to
 two at 2e-6 Ry in the cases run so far, with totals up to 2.1e-5 Ry apart
-(`README.md`). On dedicated A100 nodes (2026-10-22, with the defaults of the
-rounds) it took 6.3 to 9.3 % less SCF time on 8 and 16 GPUs (198.7 against
-219.0 s for 39,368 electrons on 16) and 2.6 to 9.5 % less with one array per
-sector.
+(`README.md`). On dedicated A100 nodes (2026-10-22, with `p2` and the pitched
+exchange, the defaults of the rounds then) it took 6.3 to 9.3 % less SCF
+time on 8 and 16 GPUs (198.7 against 219.0 s for 39,368 electrons on 16) and
+2.6 to 9.5 % less with one array per sector.
 
 On a basis shared by two or four devices the factor is formed in the row
 order of the row blocks, with the lower-half columns of the band where the
@@ -1101,7 +1107,7 @@ and the owner sums the pieces, at most 128 MiB at a time, on the streams of the
 device threads, whose pools hold the workspace of the Ritz step between
 passes. So the hand-over takes no memory beside the pass: the fullest GPU of
 39,368 electrons on 16 GPUs peaked at 62,707 MiB against 62,699 MiB with the
-rotation (A100, 2026-10-22, under the former step, `PARSEC_CUPY_RITZ_PIPELINE=off`
+rotation (A100, 2026-10-22, under the step of the defaults, `PARSEC_CUPY_RITZ_PIPELINE=off`
 with the packed exchange), where a first form that summed all rows of the
 corrected vectors at once in a buffer of the calling thread had reached
 65,605 MiB. The nonlocal forces use the same identity, and the trim of a
@@ -1114,7 +1120,7 @@ shared by the devices of one rank (8 and 16 GPUs) with one tall block, the
 default, under every value of `PARSEC_CUPY_RITZ_PIPELINE` and
 `PARSEC_CUPY_EXCHANGE_STRIDED` (above), which it leaves as they are: its
 product follows the rounds, and its corrections use the compute streams of
-the devices and no exchange buffer. With both at their defaults (p2, strided),
+the devices and no exchange buffer. With `p2` and the pitched exchange,
 39,368 electrons on 16 GPUs peaked at 61,483 MiB against 61,475 MiB with the
 rotation (A100, 2026-10-22). A basis that MPI ranks share (`--rank-per-gpu`, MD across nodes),
 two or three tall blocks, CHEBDAV, the full grid and spin keep the rotation.

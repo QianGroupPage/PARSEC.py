@@ -33,9 +33,10 @@ from parsec_python.acceleration.Eigensolvers.lapack_random import LapackRandom
 rayleigh_ritz = importlib.import_module('parsec_python.acceleration.Eigensolvers.rayleigh_ritz')
 
 # The tests of this module were written for the packed exchange (buffers, chunks, pack and unpack kernels) and
-# for the rounds of the Ritz step one stage after another, the defaults before 2026-10-22 and the values that
-# restore them: the module names those.  The tests of the pipelined rounds and of pitched copies name the
-# values they take, and those of the defaults remove both.
+# for the rounds of the Ritz step one stage after another, the defaults: the module names those, so that its
+# tests stay of that step whatever the defaults are (the code published on 2026-10-22 took p2 and pitched
+# copies).  The tests of the pipelined rounds and of pitched copies name the values they take, and those of
+# the defaults remove both.
 _FORMER_STEP = dict(PARSEC_CUPY_EXCHANGE_STRIDED='0', PARSEC_CUPY_RITZ_PIPELINE='off')
 _FORMER_ENVIRONMENT = patch.dict(os.environ, _FORMER_STEP)
 
@@ -2394,10 +2395,11 @@ class ExchangePlanTests(unittest.TestCase):
         self.assertEqual(ends, [68, 68, 68, 97])
         self.assertGreater(max(ends), max(rows * 5, 5 * 17))
 
-    def test_fit_counts_no_buffer_for_the_pitched_exchange_of_the_default(self):
-        # The pitched exchange, the default since 2026-10-22, takes no buffer and the rule counts none: what the
-        # packed one counts less its chunk, at most 1 GiB and an eighth, with every count of tall blocks.  On
-        # the sectors of 23,768 to 39,368 electrons of the measured series, on two devices and on four.
+    def test_fit_counts_the_buffer_of_the_default_and_none_for_the_pitched_exchange(self):
+        # The packed exchange of the default takes its buffer and is counted with it; the pitched one
+        # (PARSEC_CUPY_EXCHANGE_STRIDED=1) takes none and the rule counts none: the default less its chunk, at
+        # most 1 GiB and an eighth, with every count of tall blocks.  On the sectors of 23,768 to 39,368
+        # electrons of the measured series, on two devices and on four.
         gib = 1 << 30
         with patch.dict(os.environ):
             for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES',
@@ -2410,10 +2412,12 @@ class ExchangePlanTests(unittest.TestCase):
                     for devices in (2, 4):
                         with self.subTest(blocks=blocks, rows=rows, devices=devices):
                             os.environ.pop('PARSEC_CUPY_EXCHANGE_STRIDED', None)
-                            pitched = distributed_state.shared_block_bytes(rows, columns, devices)
+                            default = distributed_state.shared_block_bytes(rows, columns, devices)
                             os.environ['PARSEC_CUPY_EXCHANGE_STRIDED'] = '0'
-                            packed = distributed_state.shared_block_bytes(rows, columns, devices)
-                            self.assertTrue(gib <= packed - pitched <= gib + gib // 8, packed - pitched)
+                            self.assertEqual(distributed_state.shared_block_bytes(rows, columns, devices), default)
+                            os.environ['PARSEC_CUPY_EXCHANGE_STRIDED'] = '1'
+                            pitched = distributed_state.shared_block_bytes(rows, columns, devices)
+                            self.assertTrue(gib <= default - pitched <= gib + gib // 8, default - pitched)
 
     def test_fit_counts_one_tall_block_and_the_slab_workspace_unless_two_or_three_are_named(self):
         gib = 1 << 30
@@ -4365,23 +4369,29 @@ class RitzStandInTests(unittest.TestCase):
                             self.assertEqual(len(exchange), 0 if mode == 'off' else len(run.layout.parts))
                             self.assertFalse(any(id(stream) in exchange for stream in run.runtime.allocation_streams))
 
-    def test_the_defaults_take_the_pipelined_rounds_and_pitched_copies_with_the_bits_of_the_former_step(self):
-        # Both switches unset, as since 2026-10-22: p2 and pitched copies, with the bits of the former step that
-        # the class names (off and the packed exchange); lazy and eager streams.
+    def test_the_defaults_take_the_former_step_and_p2_with_pitched_copies_gives_its_bits(self):
+        # Both switches unset: the step that the class names (off and the packed exchange), and p2 with pitched
+        # copies, the defaults of the code published on 2026-10-22, with its bits; lazy and eager streams.
         unset = dict(PARSEC_CUPY_RITZ_PIPELINE=None, PARSEC_CUPY_EXCHANGE_STRIDED=None)
         for rows, widths in ((257, (6, 6, 6, 5)), (257, (12, 11)), (61, (5, 0, 9)), _TWO_RANGES[0]):
             for eager in (False, True):
                 with self.subTest(rows=rows, widths=getattr(widths, 'parts', widths), eager=eager):
                     settings = self._pipelined_settings(rows, 1, dict(PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS='2'))
-                    former = self._step(rows, widths, 1, eager=eager, roomy=True, **settings)
-                    self.assertEqual((former.group.pipeline, former.group.exchange_copies), ('off', 'packed'))
-                    run = self._step(rows, widths, 1, eager=eager, roomy=True, **settings, **unset)
+                    default = self._step(rows, widths, 1, eager=eager, roomy=True, **settings, **unset)
+                    self._assert_ritz_pairs(default)
+                    self.assertEqual((default.group.pipeline, default.group.stage_clock, default.group.exchange_copies),
+                                     ('off', 'host', 'packed'))
+                    self.assertGreater(default.group.exchange_buffer_bytes, 0)
+                    named = self._step(rows, widths, 1, eager=eager, roomy=True, **settings)
+                    run = self._step(rows, widths, 1, eager=eager, roomy=True, **settings,
+                                     PARSEC_CUPY_RITZ_PIPELINE='p2', PARSEC_CUPY_EXCHANGE_STRIDED='1')
                     self._assert_ritz_pairs(run)
                     self.assertEqual((run.group.pipeline, run.group.stage_clock, run.group.exchange_copies,
                                       run.group.exchange_buffer_bytes), ('p2', 'events', 'strided', 0))
-                    for one, other in zip(run.gram + (run.values, run.rotated),
-                                          former.gram + (former.values, former.rotated), strict=True):
-                        np.testing.assert_array_equal(one, other)
+                    for step in (named, run):
+                        for one, other in zip(step.gram + (step.values, step.rotated),
+                                              default.gram + (default.values, default.rotated), strict=True):
+                            np.testing.assert_array_equal(one, other)
 
     def test_a_wait_left_out_of_the_pipelined_rounds_leaves_values_that_were_not_there_yet(self):
         # The exchange stream of a device waits for the leave of the slab before it sends it and for the apply

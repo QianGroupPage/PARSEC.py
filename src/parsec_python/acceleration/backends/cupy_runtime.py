@@ -609,6 +609,9 @@ class CuPyHamiltonianBackend(HamiltonianBackend):
         self.statistics.subspace_ritz_rotation_seconds = (
             self.timing_stats.subspace_ritz_rotation_seconds
         )
+        self.statistics.subspace_ritz_handover_seconds = (
+            self.timing_stats.subspace_ritz_handover_seconds
+        )
         self.statistics.eigensolver_download_seconds = (
             self.timing_stats.download_seconds
         )

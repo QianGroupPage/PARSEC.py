@@ -12,6 +12,7 @@ from parsec_python.Eigensolvers.subspace import SubspaceSettings
 
 from ..backends.cupy import device_stage
 from .chebyshev import FilterBlock, subspace_filter, subspace_filter_blocks
+from .handover import RitzHandover, release_coefficients
 from .orthogonalize import orthonormalize_complete_subspace
 from .rayleigh_ritz import (
     DeviceRayleighRitzResult,
@@ -37,6 +38,10 @@ class DeviceSubspaceState:
     filters_completed: int = 0
     ritz_workspace: Any | None = None
     generalized_ritz_failed: bool = False
+    # None: the columns are Ritz vectors.  Otherwise the basis that a later
+    # pass handed over, X L^-T, with the eigenvectors that make its Ritz
+    # vectors (:class:`handover.RitzHandover`, PARSEC_CUPY_RITZ_HANDOVER).
+    handover: RitzHandover | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,31 @@ class DeviceSubspaceResult:
     polynomial_degree_used: int
     filter_blocks: tuple[FilterBlock, ...]
     rayleigh_ritz: DeviceRayleighRitzResult
+    # What the Ritz step of the pass handed over where a hand-over was asked
+    # for or a trim was pending (:meth:`handover.HandoverStep.summary`).
+    handover_pass: dict | None = None
+
+
+def as_ritz_state(state: DeviceSubspaceState) -> DeviceSubspaceState:
+    """The state of a basis whose memory holds Ritz vectors again, a pending trim applied.
+
+    For a hand-over record that was rotated in place since
+    (:attr:`handover.RitzHandover.rotated`): the trim that was pending, or
+    else the present width, is the view of the leading columns that a trim
+    of Ritz vectors takes, and the state has no record.
+    """
+
+    record = state.handover
+    if record is None:
+        return state
+    count = state.working_states if record.pending_count is None else int(record.pending_count)
+    return replace(
+        state,
+        working_states=count,
+        eigenvalues=state.eigenvalues[:count],
+        vectors=state.vectors[:, :count],
+        handover=None,
+    )
 
 
 def _validate_state(operator: Any, state: DeviceSubspaceState) -> None:
@@ -117,6 +147,7 @@ def run_subspace_filter(
     compute_residuals: bool = True,
     spectral_bound: LanczosBoundResult | None = None,
     consume_state: bool = False,
+    handover: str = "rotation",
 ) -> DeviceSubspaceResult:
     """Perform one filter/orthogonalization/Ritz pass on the GPU.
 
@@ -128,8 +159,26 @@ def run_subspace_filter(
     ``consume_state`` explicitly transfers ownership of the old vectors.
     After filtering they may be overwritten by HX and the rotated result.
     Callers must not retain snapshots/views of the input state when enabled.
+
+    ``handover="triangular"`` hands the next pass ``X L^-T`` and keeps the
+    eigenvectors that make its Ritz vectors in the state
+    (``PARSEC_CUPY_RITZ_HANDOVER``, :mod:`handover`), where the generalized
+    step streams one array.  A state that holds a hand-over with a pending
+    trim filters all its columns, rotates, and keeps the Ritz pairs of the
+    trim: the trim of a hand-over is carried out here.
     """
 
+    record_in = state.handover
+    if record_in is not None and record_in.rotated:
+        # Rotated in place since the pass that handed it over: Ritz vectors.
+        state = as_ritz_state(state)
+    pending = None if state.handover is None else state.handover.pending_count
+    # The filter overwrites the basis that they describe.
+    release_coefficients(state.handover)
+    mode = "triangular" if handover == "triangular" and pending is None else "rotation"
+    note = None
+    if handover != "rotation" and mode == "rotation":
+        note = "deferred trim"
     _validate_state(operator, state)
     lower_bound = _next_filter_lower_bound(state)
     generator = np.random.default_rng(
@@ -185,12 +234,14 @@ def run_subspace_filter(
                                else state.ritz_workspace),
                     compute_residuals=bool(compute_residuals),
                     consume_basis=True,
+                    handover=mode,
                 )
         except GeneralizedRitzStabilityError:
             # An ill-conditioned overlap is not an SCF failure.  Householder
             # QR is the robust complete-basis fallback and remains selected
             # for subsequent iterations of this eigensolver state.
             generalized_ritz_failed = True
+            note = "QR fallback"
             with device_stage(operator, "subspace_orthogonalization_seconds"):
                 basis = orthonormalize_complete_subspace(
                     filtered, rng=generator
@@ -202,6 +253,7 @@ def run_subspace_filter(
                     compute_residuals=bool(compute_residuals),
                 )
     else:
+        note = "QR route"
         with device_stage(operator, "subspace_orthogonalization_seconds"):
             basis = orthonormalize_complete_subspace(filtered, rng=generator).basis
         with device_stage(operator, "subspace_ritz_seconds"):
@@ -222,26 +274,55 @@ def run_subspace_filter(
         # The consumed old input supplies next iteration's scratch. Retaining
         # a second persistent tall workspace defeats the ownership transfer.
         ritz = replace(ritz, workspace=None)
+    step = ritz.handover
+    record = None
+    if step is not None and step.mode == "triangular":
+        record = RitzHandover(
+            step.coefficients,
+            int(step.coefficients.device.id),
+            state.working_states,
+        )
+    eigenvalues, vectors, working = ritz.eigenvalues, ritz.wavefunctions, state.working_states
+    residual_norms = ritz.residual_norms
+    if pending is not None:
+        # The trim of the pass before, on the Ritz vectors of this one: the
+        # view of the leading columns, as a trim of Ritz vectors takes it.
+        pending = int(pending)
+        eigenvalues, vectors, working = eigenvalues[:pending], vectors[:, :pending], pending
+        if residual_norms is not None:
+            residual_norms = residual_norms[:pending]
+    handover_pass = None
+    if handover != "rotation" or pending is not None:
+        handover_pass = (
+            step.summary()
+            if step is not None
+            else dict(mode="rotation", condition=None, note=note, band=None, product=None)
+        )
+        if step is not None and step.mode == "rotation" and note is not None:
+            handover_pass["note"] = note
+        handover_pass["deferred_trim"] = pending
     next_state = DeviceSubspaceState(
         operator_dimension=state.operator_dimension,
-        working_states=state.working_states,
-        eigenvalues=ritz.eigenvalues,
-        vectors=ritz.wavefunctions,
+        working_states=working,
+        eigenvalues=eigenvalues,
+        vectors=vectors,
         filter_lower_bound=lower_bound,
         first_filter=False,
         filters_completed=state.filters_completed + 1,
         ritz_workspace=ritz.workspace,
         generalized_ritz_failed=generalized_ritz_failed,
+        handover=record,
     )
     return DeviceSubspaceResult(
-        eigenvalues=ritz.eigenvalues,
-        vectors=ritz.wavefunctions,
-        residual_norms=ritz.residual_norms,
+        eigenvalues=eigenvalues,
+        vectors=vectors,
+        residual_norms=residual_norms,
         state=next_state,
         lanczos_bound=bound,
         polynomial_degree_used=degree,
         filter_blocks=blocks,
         rayleigh_ritz=ritz,
+        handover_pass=handover_pass,
     )
 
 
@@ -250,6 +331,7 @@ __all__ = [
     "DeviceSubspaceState",
     "SubspaceSettings",
     "adapt_polynomial_degree",
+    "as_ritz_state",
     "filter_degree",
     "run_subspace_filter",
 ]

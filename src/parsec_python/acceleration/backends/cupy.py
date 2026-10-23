@@ -166,6 +166,9 @@ class CuPyTimingStats:
     subspace_ritz_hamiltonian_seconds: float = 0.0
     subspace_ritz_projection_seconds: float = 0.0
     subspace_ritz_rotation_seconds: float = 0.0
+    # The triangular product of a Ritz hand-over (PARSEC_CUPY_RITZ_HANDOVER);
+    # the rotation key above counts full rotations only.
+    subspace_ritz_handover_seconds: float = 0.0
     initial_bound_seconds: float = 0.0
     initial_filter_seconds: float = 0.0
     initial_orthogonalization_seconds: float = 0.0

@@ -46,6 +46,13 @@ from ..backends.implicit_stencil import (
 from .distributed_state import shared_basis_devices, shared_block_bytes
 from .eigval import CuPyEigvalResult, CuPyEigvalSolver, spill_download_order
 from .filter_graph import graph_route_name
+from .handover import (
+    CORRECTION_BYTES,
+    correction_column_limit,
+    correction_set,
+    ritz_columns,
+    validate_handover_settings,
+)
 from .rayleigh_ritz import (
     gram_multiple,
     one_array_buffer_limit,
@@ -127,6 +134,11 @@ class CuPySymmetryOrbitals:
     sector_scales: tuple[np.ndarray | None, ...] | None = None
     wedge_size: int | None = None
     remote_sectors: bool = False
+    # Per sector, the hand-over that the columns of ``sector_vectors`` hold
+    # (:class:`handover.RitzHandover`), or None where they are Ritz vectors
+    # (PARSEC_CUPY_RITZ_HANDOVER).  The density reads it; an export takes
+    # the Ritz vectors that ensure_ritz_vectors of the solver formed first.
+    sector_handovers: tuple[Any, ...] | None = None
 
     def to_full_host(self, block_states: int = 8) -> np.ndarray:
         """Export orbitals in bounded host blocks, without a primary-GPU gather.
@@ -141,6 +153,7 @@ class CuPySymmetryOrbitals:
             raise RuntimeError("MPI symmetry orbitals require distributed export; disable final materialization")
         if any(hasattr(item, "group") for item in self.sector_vectors or ()):
             raise RuntimeError("a sector basis shared by several devices cannot be exported as one host array here")
+        self._require_ritz_vectors()
         cp, _ = require_cupy()
         full = np.empty(self.shape, dtype=np.float64, order="F")
         for representation in range(int(self.phases.shape[0])):
@@ -191,6 +204,17 @@ class CuPySymmetryOrbitals:
 
         if self.scaled_wedge_vectors is None:
             object.__setattr__(self, "sector_vectors", None)
+            object.__setattr__(self, "sector_handovers", None)
+
+    def _require_ritz_vectors(self) -> None:
+        """Refuse sector columns that still hold a hand-over: they are no Ritz vectors to export."""
+
+        for record in self.sector_handovers or ():
+            if record is not None and not record.rotated:
+                raise RuntimeError(
+                    "the sector orbitals hold the triangular Ritz hand-over; the eigensolver's "
+                    "ensure_ritz_vectors forms the Ritz vectors before an export"
+                )
 
     def to_full_device(self):
         """Expand signed orbitals once, preserving global eigenvalue order."""
@@ -199,6 +223,7 @@ class CuPySymmetryOrbitals:
             raise RuntimeError("MPI symmetry orbitals cannot be materialized on one device")
         if any(hasattr(item, "group") for item in self.sector_vectors or ()):
             raise RuntimeError("a sector basis shared by several devices cannot be materialized on one device")
+        self._require_ritz_vectors()
         cp, _ = require_cupy()
         wedge = self.scaled_wedge_vectors
         if wedge is None:
@@ -419,6 +444,11 @@ class CuPySymmetrySCFEigensolver:
         self._mpi_latest_results = {}
         # Sector -> [later passes, later passes that filtered in FP32].
         self._later_filter_passes: dict[int, list[int]] = {}
+        # PARSEC_CUPY_RITZ_HANDOVER and its knobs, read when the solver is
+        # built so that a value they do not know stops the run here; and,
+        # per sector, what its Ritz steps handed over (_record_handover).
+        self.ritz_handover_policy = validate_handover_settings()
+        self._handover_passes: dict[int, dict] = {}
 
         cp, _ = require_cupy()
         self._primary_device_id = int(cp.cuda.Device().id)
@@ -707,6 +737,10 @@ class CuPySymmetrySCFEigensolver:
                         timing_stats=sector_timing,
                         retain_vectors_on_device=True,
                         compute_subspace_residuals=False,
+                        # The density and the forces of the sectors know
+                        # the hand-over; a basis that MPI ranks share does
+                        # not hold one (mpi_shared_basis), see _record_handover.
+                        handover_capable=getattr(operator, "_mpi_shared_group", None) is None,
                     )
                 )
         self._sector_local_potentials = tuple(sector_local_potentials)
@@ -1004,6 +1038,46 @@ class CuPySymmetrySCFEigensolver:
         return "; ".join(graph_route_name(reuse) for reuse in sorted(routes, reverse=True))
 
     @property
+    def ritz_pipeline(self) -> str | None:
+        """What the rounds of the latest Ritz steps of the shared sector bases of this process ran side by side.
+
+        Reports what ran, so it is read after a solve: ``pipeline`` of the
+        device group of every sector that has taken a step
+        (:func:`distributed_state.ritz_pipeline`: ``off``, ``p1`` or ``p2``;
+        ``off`` for a step with two or three tall blocks), one value where
+        all of them give the same, else each with its sectors.  None where no
+        basis of this process is shared or none has taken a step.
+        """
+
+        return self._shared_group_record("pipeline")
+
+    @property
+    def exchange_copies(self) -> str | None:
+        """How the pieces of the latest conversions of the shared sector bases of this process travelled.
+
+        ``packed`` or ``strided`` (:func:`distributed_state.strided_exchange_requested`),
+        read after a solve like :attr:`ritz_pipeline`; None where no basis of
+        this process is shared or none has been converted.
+        """
+
+        return self._shared_group_record("exchange_copies")
+
+    def _shared_group_record(self, name: str) -> str | None:
+        sectors: dict[str, list[int]] = {}
+        for sector, operator in enumerate(self._operators):
+            group = getattr(operator, "_sector_device_group", None) if operator is not None else None
+            value = getattr(group, name, None) if group is not None else None
+            if value is not None:
+                sectors.setdefault(str(value), []).append(sector)
+        if not sectors:
+            return None
+        if len(sectors) == 1:
+            return next(iter(sectors))
+        return "; ".join(
+            f"{value} (sectors {' '.join(map(str, indices))})" for value, indices in sectors.items()
+        )
+
+    @property
     def low_memory_ritz_sectors(self) -> tuple[int, ...]:
         """Sectors of this process that keep their basis as one array.
 
@@ -1161,8 +1235,16 @@ class CuPySymmetrySCFEigensolver:
             occupied = np.flatnonzero(weights != 0.0)
             if not occupied.size:
                 continue
-            weights = weights[: int(occupied[-1]) + 1]
             state = self._solvers[representation].device_state
+            record = None if state is None else state.subspace.handover
+            if record is not None and not record.rotated:
+                # A hand-over basis: all its columns, minus the Ritz vectors
+                # whose occupation is not one (the identity of the density).
+                total += self._handover_force_terms(
+                    representation, state.subspace.vectors, record, weights, transposes[representation]
+                )
+                continue
+            weights = weights[: int(occupied[-1]) + 1]
             if state is None or int(state.subspace.vectors.shape[1]) < weights.size:
                 raise RuntimeError(
                     "a sector no longer holds the orbitals of the last SCF iteration"
@@ -1179,6 +1261,39 @@ class CuPySymmetrySCFEigensolver:
             **phases,
             "contraction": perf_counter() - reduced_at,
         }
+        return total
+
+    def _handover_force_terms(self, representation, vectors, record, weights, transposes) -> np.ndarray:
+        """The nonlocal force terms of a sector whose saved basis holds a hand-over.
+
+        The terms are linear in the occupied density matrix, so they are
+        those of all ``m`` columns ``q_j`` with weight one less those of the
+        Ritz vectors ``y_n`` whose occupation is not one, weighted ``1 -
+        f_n`` (:func:`handover.correction_set`): ``sum_n f_n B(v_n, v_n) =
+        sum_j B(q_j, q_j) - sum_S (1 - f_n) B(y_n, y_n)``, which needs no
+        rotation.  ``weights`` are the occupations of the leading Ritz
+        vectors of the sector; the rest of its columns are empty.  The
+        corrections are formed a few at a time, at most
+        :data:`handover.CORRECTION_BYTES` of them in all rows, so that the
+        forces take no memory beside that of the SCF.
+        """
+
+        from ..Forces.nonlocal_device import projector_force_terms
+
+        width = int(vectors.shape[1])
+        if weights.size > width:
+            raise RuntimeError("a sector no longer holds the orbitals of the last SCF iteration")
+        _full, correction, corrections = correction_set(weights, np.arange(weights.size), width)
+        operator = self._operators[representation]
+        total = projector_force_terms(operator, vectors, np.ones(width, dtype=np.float64), transposes)
+        # A few columns at a time, at most CORRECTION_BYTES of Ritz vectors
+        # of all rows: the forces take no memory beside the SCF.
+        step = max(1, CORRECTION_BYTES // (8 * max(1, int(vectors.shape[0]))))
+        for start in range(0, correction.size, step):
+            chunk = slice(start, start + step)
+            ritz = ritz_columns(vectors, record, correction[chunk])
+            total = total + projector_force_terms(operator, ritz, -corrections[chunk], transposes)
+            del ritz
         return total
 
     def _sector_force_gradients(self):
@@ -1697,6 +1812,7 @@ class CuPySymmetrySCFEigensolver:
             result = solved[representation]
             results.append(result)
             self._record_filter_precision(representation, result)
+            self._record_handover(representation, result)
             restarted = restarted or result.restarted
             if result.restart_reason is not None:
                 reasons.append(
@@ -1721,6 +1837,138 @@ class CuPySymmetrySCFEigensolver:
         count = passes.setdefault(representation, [0, 0])
         count[0] += 1
         count[1] += result.filter_precision == "float32"
+
+    def _record_handover(self, representation: int, result: CuPyEigvalResult) -> None:
+        """Count what the Ritz steps of one solve of one sector handed over.
+
+        From the plain record of the solve (``handover_step``), which MPI
+        brings from the rank that solved the sector.  Nothing is counted
+        under ``PARSEC_CUPY_RITZ_HANDOVER=rotation``; under ``triangular`` a
+        solve without such a record rotated because its sector has no
+        hand-over route (a basis that MPI ranks share).
+        """
+
+        if getattr(self, "ritz_handover_policy", "rotation") == "rotation":
+            return
+        passes = getattr(self, "_handover_passes", None)
+        if passes is None:
+            passes = self._handover_passes = {}
+        entry = passes.setdefault(representation, dict(
+            first={}, later={}, first_conditions=[], later_condition_max=None, bands=[],
+            products={}, holds=False, deferred_trims=0))
+        step = getattr(result, "handover_step", None)
+        if step is None:
+            why = ("basis shared by MPI ranks"
+                   if getattr(getattr(self, "mpi_context", None), "shared", False)
+                   else "no hand-over route")
+            steps = [dict(mode="rotation", note=why, condition=None, band=None, product=None)]
+            path = result.solver_path
+        else:
+            steps, path = list(step.get("steps") or ()), step.get("path", result.solver_path)
+            entry["holds"] = bool(step.get("holds", False))
+        kind = "later" if path == "subspace" else "first"
+        if kind == "first":
+            entry["first_conditions"] = [item.get("condition") for item in steps]
+        for item in steps:
+            label = item["mode"] if not item.get("note") else f"{item['mode']} ({item['note']})"
+            entry[kind][label] = entry[kind].get(label, 0) + 1
+            condition = item.get("condition")
+            if kind == "later" and condition is not None:
+                previous = entry["later_condition_max"]
+                entry["later_condition_max"] = condition if previous is None else max(previous, condition)
+            if item.get("band") is not None:
+                entry["bands"] = [list(item["band"])]
+            if item.get("product") is not None:
+                entry["products"][item["product"]] = entry["products"].get(item["product"], 0) + 1
+
+    @property
+    def ritz_handover(self) -> str:
+        """What the Ritz steps of the sectors handed over (``PARSEC_CUPY_RITZ_HANDOVER``), for the backend details.
+
+        ``rotation`` under that policy.  Under ``triangular`` the counts of
+        the steps by what they handed over, for the first solves and the
+        later passes of all sectors (also those of other MPI ranks), with
+        the reasons where a step rotated; the trims that a later pass
+        carried out; the products; and, of this process, the Ritz vectors
+        formed for an export and the corrections of the density.  Before a
+        solve ``triangular (prepared)``.
+        """
+
+        policy = getattr(self, "ritz_handover_policy", "rotation")
+        if policy == "rotation":
+            return "rotation"
+        passes = getattr(self, "_handover_passes", None) or {}
+        if not passes:
+            return f"{policy} (prepared)"
+
+        def counted(kind):
+            total: dict[str, int] = {}
+            for entry in passes.values():
+                for label, count in entry[kind].items():
+                    total[label] = total.get(label, 0) + count
+            return ", ".join(f"{label} {count}" for label, count in sorted(total.items())) or "none"
+
+        sectors = " ".join(map(str, sorted(passes)))
+        parts = [f"{policy}: first solve {counted('first')}", f"later passes {counted('later')}",
+                 f"sectors {sectors}"]
+        trims = sum(entry["deferred_trims"] for entry in passes.values())
+        if trims:
+            parts.append(f"deferred trims {trims}")
+        products: dict[str, int] = {}
+        for entry in passes.values():
+            for name, count in entry["products"].items():
+                products[name] = products.get(name, 0) + count
+        if products:
+            parts.append("products " + ", ".join(f"{name} {count}" for name, count in sorted(products.items())))
+        rotations = sum(
+            solver.handover_record["ensure_rotations"]
+            for solver in self._solvers if solver is not None
+        )
+        if rotations:
+            parts.append(f"Ritz vectors formed {rotations}")
+        density = getattr(self, "density_handover_record", None)
+        if density and density.get("calls"):
+            parts.append(
+                f"density corrections |S| <= {density['largest']} in {density['calls']} sector densities, "
+                f"fallbacks {density['fallbacks']}"
+            )
+        return "; ".join(parts)
+
+    @property
+    def ritz_handover_record(self) -> dict:
+        """The record of the hand-over for timing.json: the policy, per sector what its steps handed over, and of the sectors of this process the counts of their solvers."""
+
+        return dict(
+            policy=getattr(self, "ritz_handover_policy", "rotation"),
+            sectors={int(sector): dict(entry) for sector, entry in (getattr(self, "_handover_passes", None) or {}).items()},
+            solvers={
+                int(sector): dict(solver.handover_record)
+                for sector, solver in enumerate(self._solvers)
+                if solver is not None and hasattr(solver, "handover_record")
+            },
+        )
+
+    def ensure_ritz_vectors(self) -> int:
+        """Rotate the hand-over bases of the sectors of this process into their Ritz vectors, once.
+
+        The one place where Ritz vectors are formed outside a pass
+        (:meth:`eigval.CuPyEigvalSolver.ensure_ritz_vectors`), for the export
+        of the orbitals and what reads them (``materialize_wavefunctions``:
+        the archive, ``Output_All_States``, ``Energy_Refinement``).  Each
+        sector on its device and stream.  Returns how many sectors were
+        rotated; 0 under ``PARSEC_CUPY_RITZ_HANDOVER=rotation``.
+        """
+
+        cp, _ = require_cupy()
+        rotated = 0
+        for representation in self._owned_representations:
+            solver = self._solvers[representation]
+            if solver is None:
+                continue
+            with cp.cuda.Device(self._sector_device_ids[representation]):
+                with self._streams[representation]:
+                    rotated += bool(solver.ensure_ritz_vectors())
+        return rotated
 
     def _run_one_sector(
         self,
@@ -2095,6 +2343,7 @@ class CuPySymmetrySCFEigensolver:
                 self._record_filter_precision(
                     representation, grown[representation]
                 )
+                self._record_handover(representation, grown[representation])
         raise RuntimeError(
             "symmetry representation state allocation did not bracket the "
             "global requested eigenspectrum"
@@ -2136,6 +2385,13 @@ class CuPySymmetrySCFEigensolver:
         for representation, solver in enumerate(self._solvers):
             new_count = min(counts[representation], int(desired[representation]))
             if new_count < counts[representation]:
+                step = getattr(results[representation], "handover_step", None)
+                if step is not None and step.get("holds"):
+                    # The state holds a hand-over: its next pass carries the
+                    # trim out (CuPyEigvalSolver.truncate_state).
+                    entry = (getattr(self, "_handover_passes", None) or {}).get(representation)
+                    if entry is not None:
+                        entry["deferred_trims"] += 1
                 # truncate_state creates only leading-column views; it does
                 # not launch a kernel and is therefore device-context neutral.
                 if context is None:
@@ -2177,6 +2433,9 @@ class CuPySymmetrySCFEigensolver:
                 selected_columns, dtype=np.int32
             ),
             sector_vectors=tuple(result.vectors for result in results),
+            # What the columns of each sector hold where a later pass handed
+            # over X L^-T; results that MPI sent carry none.
+            sector_handovers=tuple(getattr(result, "handover", None) for result in results),
             # The static orbit lists and scales formed at construction are
             # handed out as they are.  Sectors solved by another MPI rank
             # have none: a rank's density command selects only its own

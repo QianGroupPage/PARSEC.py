@@ -12,6 +12,7 @@ import numpy as np
 from parsec_python.Eigensolvers.chebff import ChebFFCycle, ChebFFSettings
 from ..backends.cupy import device_stage, require_cupy
 from .chebyshev import chebff_filter
+from .handover import first_cycle_condition_limit
 from .lapack_random import LapackRandom
 from .orthogonalize import orthonormalize_complete_subspace
 from .rayleigh_ritz import (
@@ -55,6 +56,28 @@ class DeviceChebFFResult:
     lanczos_bound: LanczosBoundResult
     cycles: tuple[ChebFFCycle, ...]
     last_rayleigh_ritz: DeviceRayleighRitzResult
+    # What the Ritz step of each cycle handed over where a hand-over was
+    # asked for (PARSEC_CUPY_RITZ_HANDOVER): plain records, else empty.
+    handover_cycles: tuple = ()
+
+
+def first_solve_modes(handover: str, cycles: int) -> tuple[str, ...]:
+    """What the Ritz step of each CHEBFF cycle is asked to hand over.
+
+    ``rotation`` everywhere under that policy.  Under ``triangular`` the
+    first cycle hands on its filtered columns (``values``, guarded by
+    :func:`handover.first_cycle_condition_limit`), the cycles before the
+    last ``X L^-T`` (``factor``), and the last one rotates: the first solve
+    ends with Ritz vectors.
+    """
+
+    cycles = int(cycles)
+    if handover != "triangular":
+        return ("rotation",) * cycles
+    return tuple(
+        "rotation" if number == cycles else "values" if number == 1 else "factor"
+        for number in range(1, cycles + 1)
+    )
 
 
 def _initial_filter_lower_bound(lowest: float, upper: float) -> float:
@@ -84,12 +107,16 @@ def run_chebff(
     *,
     settings: ChebFFSettings = ChebFFSettings(),
     spectral_bound: LanczosBoundResult | None = None,
+    handover: str = "rotation",
 ) -> DeviceChebFFResult:
     """Build the initial buffered eigensubspace without host round trips.
 
     The initial trial basis retains PARSEC's DLARNV stream. With
     ``PARSEC_CUPY_DEVICE_RANDOM=1`` the identical sequence is generated directly
     on the GPU; otherwise it is generated on the host and uploaded as float64.
+
+    ``handover="triangular"`` gives the cycles the modes of
+    :func:`first_solve_modes`; a cycle on the QR route rotates.
     """
 
     cp, _ = require_cupy()
@@ -128,11 +155,15 @@ def run_chebff(
     records: list[ChebFFCycle] = []
     last_ritz: DeviceRayleighRitzResult | None = None
     generalized = _generalized_cycles_requested()
+    modes = first_solve_modes(handover, settings.filter_cycles)
+    handover_cycles: list[dict] = []
 
     for cycle_number in range(1, settings.filter_cycles + 1):
         lower_in = lower_bound
         upper_in = upper_bound
         last_ritz = None
+        asked = modes[cycle_number - 1]
+        note = None
         with device_stage(operator, "initial_filter_seconds"):
             vectors = chebff_filter(
                 operator,
@@ -163,11 +194,18 @@ def run_chebff(
                         vectors,
                         compute_residuals=False,
                         consume_basis=True,
+                        handover=asked,
+                        values_condition_limit=(
+                            first_cycle_condition_limit() if asked == "values" else 0.0
+                        ),
                     )
                 # Do not hold a second tall buffer through the next filter.
                 last_ritz = replace(last_ritz, workspace=None)
             except GeneralizedRitzStabilityError:
                 last_ritz = None
+                note = "QR fallback"
+        elif handover != "rotation":
+            note = "QR cycles"
         if last_ritz is None:
             # CHEBFF orthogonalizes the complete filtered trial space.  Route
             # it through the same size-adaptive implementation as later
@@ -187,6 +225,18 @@ def run_chebff(
                 last_ritz = rayleigh_ritz(operator, vectors, compute_residuals=False)
         eigenvalues = last_ritz.eigenvalues
         vectors = last_ritz.wavefunctions
+        if handover != "rotation":
+            step = last_ritz.handover
+            summary = (
+                step.summary()
+                if step is not None
+                else dict(mode="rotation", condition=None, note=None, band=None, product=None)
+            )
+            if note is not None:
+                summary["note"] = note
+            elif asked == "rotation" and summary["note"] is None:
+                summary["note"] = "last cycle"
+            handover_cycles.append(summary)
         if eigenvalues.shape != (wanted_states,):
             raise RuntimeError("Rayleigh--Ritz changed the working state count")
         smallest_ritz = float(eigenvalues[0].item())
@@ -226,6 +276,7 @@ def run_chebff(
         lanczos_bound=bound,
         cycles=tuple(records),
         last_rayleigh_ritz=last_ritz,
+        handover_cycles=tuple(handover_cycles),
     )
 
 
@@ -234,5 +285,6 @@ __all__ = [
     "ChebFFSettings",
     "DeviceChebFFResult",
     "DeviceChebFFState",
+    "first_solve_modes",
     "run_chebff",
 ]

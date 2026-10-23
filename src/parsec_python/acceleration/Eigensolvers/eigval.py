@@ -27,9 +27,11 @@ from .distributed_state import (
     run_distributed_subspace,
     sector_device_group,
 )
+from .handover import ritz_handover_policy
 from .subspace import (
     DeviceSubspaceResult,
     DeviceSubspaceState,
+    as_ritz_state,
     run_subspace_filter,
 )
 from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
@@ -68,6 +70,16 @@ class CuPyEigvalResult:
     # What the Chebyshev recurrence of this solve ran in: ``float32`` for a
     # later pass that took the opt-in FP32 filter, ``float64`` otherwise.
     filter_precision: str = "float64"
+    # The hand-over that the saved state holds (PARSEC_CUPY_RITZ_HANDOVER):
+    # the record that makes Ritz vectors of the columns ``vectors`` views,
+    # None where they are Ritz vectors.  It holds a device array, so the
+    # results that MPI sends carry None here.
+    handover: Any | None = None
+    # What the Ritz steps of this solve handed over, as plain data that MPI
+    # may send: ``path``, ``steps`` (mode, condition, note, band, product of
+    # each step) and ``holds`` (whether the state now holds a hand-over).
+    # None where no hand-over was asked for.
+    handover_step: dict | None = None
 
     @property
     def wavefunctions(self) -> np.ndarray:
@@ -129,11 +141,22 @@ class CuPyEigvalSolver:
         timing_stats: CuPyTimingStats | None = None,
         retain_vectors_on_device: bool = False,
         compute_subspace_residuals: bool = True,
+        handover_capable: bool = False,
     ) -> None:
         _reject_unsupported_settings(settings)
         self.settings = settings
         self.retain_vectors_on_device = bool(retain_vectors_on_device)
         self.compute_subspace_residuals = bool(compute_subspace_residuals)
+        # Whether the Ritz steps of this solver may hand over X L^-T
+        # (PARSEC_CUPY_RITZ_HANDOVER): the solvers of symmetry sectors, whose
+        # density and forces know the hand-over.  The full grid and spin
+        # keep the rotation.
+        self.handover_capable = bool(handover_capable)
+        self._handover_disabled = False
+        # Of this solver: Ritz-vector rotations that ensure_ritz_vectors
+        # formed, trims that a later pass carries out, and whether a density
+        # turned the hand-over off (see RitzHandover.disable).
+        self.handover_record = dict(ensure_rotations=0, deferred_trims=0, disabled=False)
         self.timing_stats = timing_stats or CuPyTimingStats()
         if isinstance(negative_laplacian, CuPyHamiltonian):
             if effective_potential is not None or nonlocal_operator is not None:
@@ -182,6 +205,67 @@ class CuPyEigvalSolver:
         """Discard the reusable GPU eigensubspace."""
 
         self._state = None
+
+    def _handover(self) -> str:
+        """What the Ritz steps of the next solve are asked to hand over: ``rotation`` or ``triangular``."""
+
+        # Read with defaults: a solver made without its constructor, as some
+        # tests make one, is not capable and keeps the rotation.
+        if not getattr(self, "handover_capable", False) or getattr(self, "_handover_disabled", False):
+            return "rotation"
+        return ritz_handover_policy()
+
+    def ensure_ritz_vectors(self) -> bool:
+        """Rotate a hand-over basis into its Ritz vectors in place, once; True if it did.
+
+        The one place where a full rotation is formed outside a pass (see
+        :class:`handover.RitzHandover`): for the export of the orbitals and
+        what reads them.  The memory of the saved basis is rotated, which
+        the views of the results of the last solve read too, and the record
+        is marked rotated; a trim that was pending is then the view of the
+        leading columns.  A basis on the device is rotated tile by tile in
+        place, one spilled to the host a tile of rows at a time through the
+        device.  A basis that several devices share holds the hand-over
+        outside a pass, which nothing needs to rotate; it is refused.
+        """
+
+        state = self._state
+        if state is None or getattr(state.subspace, "handover", None) is None:
+            return False
+        saved = state.subspace
+        record = saved.handover
+        if record.rotated:
+            self._state = replace(state, subspace=as_ritz_state(saved))
+            return False
+        if hasattr(saved.vectors, "group"):
+            raise RuntimeError(
+                "a shared sector basis holds the triangular hand-over and forms no Ritz "
+                "vectors outside a pass; run with PARSEC_CUPY_RITZ_HANDOVER=rotation"
+            )
+        from .rayleigh_ritz import _rotate_in_place
+
+        cp, _ = require_cupy()
+        with cp.cuda.Device(record.device):
+            coefficients = cp.asarray(record.coefficients, dtype=cp.float64)
+            if record.rows is not None:
+                coefficients = coefficients[cp.asarray(record.rows)]
+            vectors = saved.vectors
+            if isinstance(vectors, np.ndarray):
+                # Rows of all columns through the device, back into the
+                # same host array, which the results of the solve view.
+                rows, columns = map(int, vectors.shape)
+                tile = max(1, min(rows, (1 << 30) // max(1, 8 * columns)))
+                for start in range(0, rows, tile):
+                    stop = min(rows, start + tile)
+                    block = cp.asarray(vectors[start:stop, :], dtype=cp.float64)
+                    vectors[start:stop, :] = cp.asnumpy(block @ coefficients)
+            else:
+                _rotate_in_place(vectors, coefficients)
+            cp.cuda.get_current_stream().synchronize()
+        record.rotated = True
+        self._state = replace(state, subspace=as_ritz_state(saved))
+        self.handover_record["ensure_rotations"] += 1
+        return True
 
     def start_new_scf_loop(self) -> CuPyEigvalDeviceState | None:
         """Mark the saved subspace as the start of another SCF loop.
@@ -308,6 +392,23 @@ class CuPyEigvalSolver:
         ):
             return state
         saved = state.subspace
+        record = getattr(saved, "handover", None)
+        if record is not None and not record.rotated:
+            # The leading columns of a hand-over basis are no Ritz vectors,
+            # and the density of this step still reads all of them: nothing
+            # is launched and nothing changes in the subspace.  The next pass
+            # rotates and keeps this many Ritz pairs (run_subspace_filter).
+            record.pending_count = working_states
+            self.handover_record["deferred_trims"] += 1
+            self._state = replace(
+                state,
+                requested_states=requested_states,
+                working_states=working_states,
+            )
+            return self._state
+        if record is not None:
+            # Rotated in place since: Ritz vectors, which the view below trims.
+            saved = replace(saved, handover=None)
         subspace = replace(
             saved,
             working_states=working_states,
@@ -401,6 +502,15 @@ class CuPyEigvalSolver:
         saved = state.subspace
         if saved.operator_dimension != dimension:
             return "saved_subspace_dimension_changed"
+        record = getattr(saved, "handover", None)
+        if (
+            record is not None
+            and not record.rotated
+            and record.pending_count == working_states
+        ):
+            # A hand-over whose trim the next pass carries out keeps all its
+            # columns until then (truncate_state).
+            working_states = saved.working_states
         if saved.working_states != working_states:
             return "saved_subspace_state_count_changed"
         if saved.eigenvalues.shape != (working_states,):
@@ -452,6 +562,13 @@ class CuPyEigvalSolver:
         fallback_reason = None
         # A first solve filters in FP64 whatever the later filter is set to.
         filter_precision = "float64"
+        held = None if previous_state is None else getattr(previous_state.subspace, "handover", None)
+        if held is not None and held.disable and not self._handover_disabled:
+            # A density needed more corrections than the hand-over allows.
+            self._handover_disabled = True
+            self.handover_record["disabled"] = True
+        handover = self._handover()
+        handover_steps = None
 
         if previous_state is None or reason is not None:
             if self.settings.initial_method == "chebff":
@@ -470,6 +587,8 @@ class CuPyEigvalSolver:
                 first_options["group"] = group
             if spectral_bound is not None:
                 first_options["spectral_bound"] = spectral_bound
+            if handover != "rotation" and first_solver is not run_chebdav:
+                first_options["handover"] = handover
             try:
                 first, solve_seconds = synchronized_call(
                     first_solver,
@@ -526,10 +645,18 @@ class CuPyEigvalSolver:
             )
             self.timing_stats.first_solve_seconds += solve_seconds
             self.timing_stats.first_solve_calls += 1
+            if handover != "rotation":
+                handover_steps = list(getattr(first, "handover_cycles", ()) or ())
+                if not handover_steps:
+                    # CHEBDAV, or its CHEBFF fallback: no hand-over.
+                    handover_steps = [dict(mode="rotation", condition=None, note=f"{solver_path} first solve",
+                                           band=None, product=None)]
         else:
             subspace_options = {"settings": self.settings.subspace}
             if spectral_bound is not None:
                 subspace_options["spectral_bound"] = spectral_bound
+            if handover != "rotation":
+                subspace_options["handover"] = handover
             if not self.compute_subspace_residuals:
                 subspace_options["compute_residuals"] = False
                 if os.environ.get("PARSEC_CUPY_RECYCLE_STATE", "0") == "1":
@@ -572,6 +699,13 @@ class CuPyEigvalSolver:
             residual_device = later.residual_norms
             self.timing_stats.subspace_solve_seconds += solve_seconds
             self.timing_stats.subspace_solve_calls += 1
+            later_pass = getattr(later, "handover_pass", None)
+            if later_pass is not None:
+                handover_steps = [later_pass]
+            elif (getattr(self, "handover_capable", False) and getattr(self, "_handover_disabled", False)
+                  and ritz_handover_policy() != "rotation"):
+                handover_steps = [dict(mode="rotation", condition=None, note="hand-over turned off by a density",
+                                       band=None, product=None)]
 
         self.timing_stats.solve_calls += 1
         assert self._state is not None
@@ -621,6 +755,16 @@ class CuPyEigvalSolver:
             working_states=working_states,
             solve_seconds=float(solve_seconds),
             filter_precision=filter_precision,
+            handover=getattr(self._state.subspace, "handover", None),
+            handover_step=(
+                None
+                if handover_steps is None
+                else dict(
+                    path=solver_path,
+                    steps=handover_steps,
+                    holds=getattr(self._state.subspace, "handover", None) is not None,
+                )
+            ),
         )
 
 

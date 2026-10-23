@@ -2425,6 +2425,12 @@ def _prepare_single_point(
     # Read here for the same reason: the first filter that records a graph
     # comes after the whole preparation, on every rank.
     shared_filter_graphs = graph_reuse_requested()
+    from .Eigensolvers.distributed_state import ritz_pipeline, strided_exchange_requested
+
+    # And so are the switches of the Ritz step of a sector basis that several
+    # devices share: its first step comes after the preparation too.
+    shared_ritz_pipeline = ritz_pipeline()
+    shared_exchange_copies = "strided" if strided_exchange_requested() else "packed"
     if is_periodic or symmetry_mode == "off":
         # No symmetry is looked for: nobody waits for a reduction.
         preparation.symmetry_reduction.publish(None)
@@ -3808,12 +3814,29 @@ def _prepare_single_point(
                 symmetry_eigensolver.later_filter_precision,
             ),
             (
+                # PARSEC_CUPY_RITZ_HANDOVER, an unset variable included: what
+                # the Ritz steps hand over.  A result says what they did
+                # (SCF/single_point.py).
+                "orbital_sector_ritz_handover",
+                getattr(symmetry_eigensolver, "ritz_handover", "rotation"),
+            ),
+            (
                 # PARSEC_CUPY_FILTER_GRAPH_REUSE, for a filter that records
                 # graphs: none has run yet.  A result says what the filters
                 # of its sectors recorded (SCF/single_point.py).
                 "orbital_sector_filter_graphs",
                 graph_route_name(shared_filter_graphs),
             ),
+            (
+                # PARSEC_CUPY_RITZ_PIPELINE and PARSEC_CUPY_EXCHANGE_STRIDED
+                # as the Ritz steps of a shared sector basis will read them,
+                # unset variables included: none has run yet.  A result says
+                # what the steps of its shared sectors ran
+                # (SCF/single_point.py).
+                "orbital_sector_ritz_pipeline",
+                shared_ritz_pipeline,
+            ),
+            ("orbital_sector_exchange_copies", shared_exchange_copies),
             (
                 "orbital_sector_local_potential_storage",
                 symmetry_eigensolver.local_potential_storage,

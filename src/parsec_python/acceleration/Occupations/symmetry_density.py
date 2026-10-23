@@ -13,6 +13,7 @@ import numpy as np
 
 from ..Eigensolvers.distributed_filter import _pool
 from ..Eigensolvers.distributed_state import DistributedBasis, shared_pool_release_requested
+from ..Eigensolvers.handover import correction_column_limit, correction_density, correction_set, slot_coefficients
 from ..Eigensolvers.spill_buffers import spill_pinned_pool
 from ..Eigensolvers.symmetry import (
     CuPySymmetryOrbitals,
@@ -184,6 +185,12 @@ class CuPySymmetryDensityBuilder:
         self.caller_joins_release = False
         self._releasing = ()
         self._held = None
+        # Of the sector densities from a hand-over basis
+        # (PARSEC_CUPY_RITZ_HANDOVER): how many, the largest number of Ritz
+        # vectors one corrected, those that needed more than the limit
+        # (rotated in place where the basis is one array on its device),
+        # and their wall seconds.
+        self.handover_record = dict(calls=0, largest=0, fallbacks=0, rotations=0, seconds=0.0)
 
     def __call__(
         self,
@@ -223,6 +230,7 @@ class CuPySymmetryDensityBuilder:
             #           f_n |q_{r,w,n}|^2 / |O_w|.
             # This is algebraically identical to first scattering all scaled
             # orbitals into a dense wedge matrix, but avoids that large copy.
+            handovers = getattr(wavefunctions, "sector_handovers", None) or ()
             for representation, vectors in enumerate(
                 wavefunctions.sector_vectors
             ):
@@ -234,6 +242,21 @@ class CuPySymmetryDensityBuilder:
                 source_columns = wavefunctions.representation_columns[
                     output_columns
                 ]
+                record = handovers[representation] if representation < len(handovers) else None
+                if record is not None and not record.rotated:
+                    sector_density = self._handover_density(
+                        vectors,
+                        record,
+                        occupations[output_columns],
+                        source_columns,
+                        volume_element,
+                    )
+                    if sector_density is not None:
+                        scales = wavefunctions.sector_scales[representation]
+                        wedge_density[
+                            wavefunctions.sector_orbits[representation]
+                        ] += sector_density * scales * scales
+                        continue
                 # Eigenvalues within each representation are sorted, so the
                 # globally selected states form a prefix.  Preserve a
                 # zero-copy view in the common case; retain exact advanced
@@ -294,6 +317,67 @@ class CuPySymmetryDensityBuilder:
                 perf_counter() - expansion_started
             )
         return density
+
+    def _handover_density(self, vectors, record, occupations, columns, volume_element):
+        """The density of a sector whose columns hold a hand-over, or None once they are rotated.
+
+        ``vectors`` are the ``m`` columns of ``Q = X L^-T`` and ``record`` the
+        eigenvectors ``Z`` that make its Ritz vectors (:class:`handover.RitzHandover`);
+        ``occupations`` belong to the Ritz vectors ``columns``, the other
+        Ritz vectors are empty.  Since ``Z Z.T = I`` the density of the Ritz
+        vectors is that of all columns with weight one less that of the Ritz
+        vectors ``y_n = Q z_n`` whose occupation is not exactly one, each
+        weighted ``1 - f_n``:
+
+        ``rho = (2/h^3) [ sum_j |q_j|^2 - sum_S (1 - f_n) |y_n|^2 ]``.
+
+        The difference is taken on the host.  Where more Ritz vectors than
+        :func:`handover.correction_column_limit` need a correction, a basis
+        that is one array on its device is rotated in place into its Ritz
+        vectors (the record says so, and the later passes of the sector
+        rotate), and None hands the sector back to the density of Ritz
+        vectors; any other basis is corrected as below, and its later passes
+        rotate too.  The corrections are formed a piece of rows at a time
+        (:func:`handover.correction_density`), so that they take no array
+        of all rows of the corrected Ritz vectors.
+        """
+
+        cp_module = getattr(self.device_builder, "cp", None)
+        started = perf_counter()
+        width = int(vectors.shape[1])
+        _full, correction, weights = correction_set(occupations, columns, width)
+        limit = correction_column_limit(width)
+        record_counts = self.handover_record
+        record_counts["calls"] += 1
+        record_counts["largest"] = max(record_counts["largest"], int(correction.size))
+        try:
+            if correction.size > limit:
+                record_counts["fallbacks"] += 1
+                record.disable = True
+                if cp_module is not None and isinstance(vectors, getattr(cp_module, "ndarray", ())) and not hasattr(vectors, "group"):
+                    from ..Eigensolvers.rayleigh_ritz import _rotate_in_place
+
+                    with vectors.device:
+                        _rotate_in_place(vectors, slot_coefficients(cp_module, record, np.arange(width)))
+                    record.rotated = True
+                    record_counts["rotations"] += 1
+                    return None
+            ones = np.ones(width, dtype=np.float64)
+            if isinstance(vectors, DistributedBasis):
+                total = vectors.density(self.device_builder, ones, volume_element)
+            else:
+                device = getattr(vectors, "device", None)
+                context = device if hasattr(device, "__enter__") else nullcontext()
+                with context:
+                    total = self.device_builder(vectors, ones, volume_element)
+            if correction.size:
+                # A piece of rows at a time: no array of all rows of the
+                # corrected Ritz vectors is formed (handover.correction_density).
+                total = total - correction_density(
+                    self.device_builder, vectors, record, correction, weights, volume_element)
+            return total
+        finally:
+            record_counts["seconds"] += perf_counter() - started
 
     def _release_large_unused_pool(
         self,

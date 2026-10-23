@@ -56,6 +56,7 @@ from concurrent.futures import wait
 from dataclasses import dataclass
 from math import gcd
 import os
+from threading import Lock
 from time import perf_counter
 from typing import Any
 from weakref import ref
@@ -98,6 +99,7 @@ from .rayleigh_ritz import (
     solve_whitened_ritz_on_device,
 )
 from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
+from .tall_product import transposed_product
 from .subspace import (
     DeviceSubspaceResult,
     DeviceSubspaceState,
@@ -105,6 +107,14 @@ from .subspace import (
     _validate_state,
     filter_degree,
 )
+# The triangular hand-over of the Ritz step (PARSEC_CUPY_RITZ_HANDOVER).
+from .handover import (
+    HandoverStep, RitzHandover, first_cycle_condition_limit, handover_order, handover_slab_columns, handover_slabs,
+    release_coefficients,
+)
+from .chebff import first_solve_modes
+from .rayleigh_ritz import _triangular_in_place, solve_whitened_handover, solve_whitened_handover_on_device
+from .subspace import as_ritz_state
 
 
 _ALGORITHM = "distributed_generalized_cholesky_rayleigh_ritz"
@@ -378,6 +388,10 @@ def column_copies_requested() -> bool:
 def exchange_chunk_bytes() -> int:
     """Bytes of the one buffer through which a device exchanges its columns.
 
+    Only the packed exchange takes the buffer, which
+    ``PARSEC_CUPY_EXCHANGE_STRIDED=0`` selects; the pitched one of the
+    default takes none (:func:`strided_exchange_requested`).
+
     ``PARSEC_CUPY_EXCHANGE_CHUNK_BYTES`` sets it; the default is 1 GiB.  The
     part of a column block that lies in the rows of the other devices is
     packed and shipped a chunk of columns at a time, so a device needs room
@@ -601,6 +615,184 @@ def paired_exchange_requested() -> bool:
     if value not in {"0", "1", "on", "off", "true", "false"}:
         raise ValueError("PARSEC_CUPY_EXCHANGE_PAIRS must be on or off")
     return value in {"1", "on", "true"}
+
+
+def strided_exchange_requested() -> bool:
+    """Whether the copies between the devices of a shared basis take a row range of a column block as it lies.
+
+    The default since 2026-10-22: every piece goes in one
+    ``cudaMemcpy2DAsync`` between the devices, a line per column, of the
+    rows of the piece, with the distance between the columns of each array
+    as its pitch.  No pack or unpack kernel runs, no chunk is cut and no
+    exchange buffer is taken: a piece is all the rows of one device of a
+    column range of a block, and four devices take them in the turns of
+    :func:`paired_exchange_requested`.  Every byte arrives where it did, so
+    the results are those of the former exchange bit for bit.  Every
+    conversion reads it, in every step of a shared basis, and the rule that
+    shares a basis counts no buffer for it (:func:`shared_block_bytes`).
+
+    ``PARSEC_CUPY_EXCHANGE_STRIDED=0`` restores the former exchange: a
+    device packs the rows of its columns that belong to each other device
+    into its exchange buffer with a copy kernel, the others pull each piece
+    as one contiguous copy, and on the way back a device pulls the rows of
+    its columns from all the others into its buffer and unpacks them with
+    another kernel (:meth:`SectorDeviceGroup._to_rows`,
+    :meth:`SectorDeviceGroup._to_columns`), and the rule counts the buffer.
+
+    Measured on the four A100 of one node (2026-10-21, a probe at the slabs
+    of the step, 32 to 128 columns of 2.9 to 5.7 million rows):
+    a pitched copy over one link ran at 86.3 to 86.9 GiB/s against 87.0 to
+    87.5 for a contiguous one of the same bytes, the three turns of four
+    devices to their rows took 0.89 to 0.90 of the time of the packed
+    turns with their pack (13.27 against 14.80 ms for 32 columns of
+    5,660,200 rows), and the way back from all peers at once 0.92 to 0.93
+    of the time of the pulls into the buffer and the unpack (17.90 against
+    19.34 ms); every byte was checked.  Complete runs took it as a default
+    together with ``PARSEC_CUPY_RITZ_PIPELINE=p2``: see :func:`ritz_pipeline`.
+    """
+
+    value = os.environ.get("PARSEC_CUPY_EXCHANGE_STRIDED", "1").strip().lower()
+    if value not in {"0", "1", "on", "off", "true", "false"}:
+        raise ValueError("PARSEC_CUPY_EXCHANGE_STRIDED must be on or off")
+    return value in {"1", "on", "true"}
+
+
+_RITZ_PIPELINE_MODES = ("off", "p1", "p2")
+
+
+def ritz_pipeline() -> str:
+    """``off``, ``p1`` or ``p2`` from ``PARSEC_CUPY_RITZ_PIPELINE``: what the rounds of the step with one tall block run side by side.
+
+    ``p2`` is the default since 2026-10-22, also where the variable is
+    unset or empty.  ``off`` restores the former step exactly
+    (:meth:`SectorDeviceGroup._ritz_one_block`): in every round each device
+    applies ``H`` to its slab, moves the slab into the workspace, sends it
+    and then ``H`` times it to the row layout, and projects, and every one
+    of these waits for all devices; the overlap is formed after the rounds.
+    Meanwhile either the multiprocessors of a device or its links wait.
+
+    ``p1`` sends the slab on a second stream of each device, its exchange
+    stream, while ``H`` is applied on the compute stream to the copy that
+    has already left the block, which holds the same values with the same
+    strides.  ``p2`` also forms every slab of the overlap as soon as the
+    round that holds its first column has arrived, beside the sending of
+    ``H`` times the slab of that round: the rows arrive from the end of the
+    row block, and a slab is multiplied by the columns from its own first
+    one on.  Where the overlap has no slabs (``PARSEC_CUPY_RITZ_SYRK`` on
+    or off, or a basis that is one slab) ``p2`` forms it after the rounds as
+    ``p1`` does.  The steps with two and three tall blocks do not read it.
+
+    The prepare and pack kernels of a conversion are queued before the
+    kernel that runs beside it, so that only the copies between the devices
+    run beside a stencil or a product.  A probe of 2026-10-10 measured that
+    order on four A100 for a pass of 39,368 electrons on 16 GPUs: with the pack queued
+    beside a product the pack got almost no multiprocessors and the exchange
+    took 3.8 times as long; with the pack first 87 % of the apply hid behind
+    the exchange of the slab (0.35 s per pass).  A probe of 2026-10-21
+    replayed a pass of that shape on one node: the 39
+    products of the overlap took 2.03 s alone and the exchange of ``H``
+    times the slabs 0.57 s; side by side, pack first, 70 % of the exchange
+    hid behind the products, 0.40 s per pass, the products 2.5 % slower and
+    with the same bits.  On two devices (29,576 electrons on 8 GPUs) 0.28 s
+    per pass.  A pitched exchange (:func:`strided_exchange_requested`) runs
+    no pack kernel at all and hid 79 % there.
+
+    Both values give the bits of ``off``.  Every write that the other stream
+    reads is behind an event of the stream that made it or behind a wait of
+    the host for all devices.  The slabs of the overlap are the products of
+    :func:`rayleigh_ritz._lower_triangle_product`, with the same operands,
+    on the same stream, and the exchange stream calls no cuBLAS.  Nothing is
+    allocated under the exchange stream: CuPy's pool keeps a free list per
+    stream, and blocks taken under a second one would stay out of the reach
+    of the compute stream, which returns what a step outgrows.  The stage
+    seconds of the step are then device events: the host no longer waits
+    for the apply, the products and the leave, so its clock would put them
+    into the exchange (:attr:`SectorDeviceGroup.stage_clock`).
+
+    Complete first calculations on A100 nodes (2026-10-22, the launch
+    profile of the measured series, runs in the order ABBA), the former
+    ``off`` with the packed exchange against ``p2`` with the pitched one
+    (:func:`strided_exchange_requested`): the same total energies and SCF
+    steps, the SCF 4.4 % shorter for 23,768 electrons and 3.6 % for 29,576
+    on 8 GPUs, 6.4 % for 23,768 and 5.4 % for 39,368 on 16 GPUs (231.1
+    against 218.8 s), and the fullest devices 1.0 to 1.2 GiB lower.
+    """
+
+    value = os.environ.get("PARSEC_CUPY_RITZ_PIPELINE", "p2").strip().lower() or "p2"
+    if value not in _RITZ_PIPELINE_MODES:
+        raise ValueError("PARSEC_CUPY_RITZ_PIPELINE must be off, p1 or p2")
+    return value
+
+
+# Pairs of devices (device, peer) whose access has been asked for by a
+# pitched copy (:func:`_peer_access`).
+_PEER_ACCESS: set = set()
+_PEER_LOCK = Lock()
+# What the runtime says to a second request for the access of a device to a
+# peer: cudaErrorPeerAccessAlreadyEnabled.
+_PEER_ACCESS_ALREADY_ENABLED = 704
+
+
+def _peer_access(cp, device: int, peer: int) -> None:
+    """Let ``device`` reach the memory of ``peer`` directly, once per pair and process.
+
+    What CuPy does before it copies between two devices
+    (``MemoryPointer.copy_from_device_async``), which a pitched copy does not
+    pass through.  Nothing where the two are one device or have no link.
+    """
+
+    device, peer = int(device), int(peer)
+    if device == peer:
+        return
+    # The lock is held across the enable, and a pair counts as done only once
+    # access is on (or cannot be): no thread copies before it, and an error is
+    # tried again by the next copy.
+    with _PEER_LOCK:
+        if (device, peer) in _PEER_ACCESS:
+            return
+        runtime = cp.cuda.runtime
+        if runtime.deviceCanAccessPeer(device, peer):
+            with cp.cuda.Device(device):
+                try:
+                    runtime.deviceEnablePeerAccess(peer)
+                except runtime.CUDARuntimeError as error:
+                    if getattr(error, "status", None) != _PEER_ACCESS_ALREADY_ENABLED:
+                        raise
+        _PEER_ACCESS.add((device, peer))
+
+
+def _pitched_copy(cp, target, source, stream) -> None:
+    """Copy a column-major view into another of its shape with one ``cudaMemcpy2DAsync`` on ``stream``.
+
+    A line is a column, the rows of the view, and the pitch of each view is
+    the distance between its columns, so a row range of a column block goes
+    as it lies.  The two views may be on two devices.
+    """
+
+    rows, columns = map(int, target.shape)
+    if tuple(map(int, source.shape)) != (rows, columns) or source.itemsize != target.itemsize:
+        raise ValueError("a pitched copy joins two views of one shape and type")
+    if not rows or not columns:
+        return
+    width = rows * int(target.itemsize)
+    pitches = []
+    for view in (target, source):
+        if rows > 1 and int(view.strides[0]) != int(view.itemsize):
+            raise ValueError("a pitched copy takes column-major views")
+        pitch = int(view.strides[1]) if columns > 1 else width
+        if pitch < width:
+            raise ValueError("the columns of a view of a pitched copy overlap")
+        pitches.append(pitch)
+    cp.cuda.runtime.memcpy2DAsync(
+        int(target.data.ptr),
+        pitches[0],
+        int(source.data.ptr),
+        pitches[1],
+        width,
+        columns,
+        cp.cuda.runtime.memcpyDefault,
+        int(stream.ptr),
+    )
 
 
 def condition_helper_policy() -> str:
@@ -1388,6 +1580,19 @@ def shared_basis_fits(rows: int, columns: int, devices: int) -> bool:
     61,162,425,024.  ``PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=1073741824`` gives
     the former count.
 
+    The pitched exchange, the default since 2026-10-22
+    (:func:`strided_exchange_requested`), takes no buffer, and the rule
+    counts none for it: up to 1.125 GiB less on every device.  That changes
+    no decision of the measured series on A100 80 GB nodes, 3,480 to
+    39,368 electrons on 8 and 16 GPUs, by the code of then: the count closest
+    to the share below went from 0.760 to 0.748 of a device (29,576
+    electrons on two devices), and 39,368 electrons on two, 1.363 and 1.350
+    of a device, share no basis either way.  The rule of the state storage,
+    which counts a shared basis by these bytes, decides alike, and the
+    counts in its records are that much lower.
+    ``PARSEC_CUPY_EXCHANGE_STRIDED=0`` counts the buffer again with the
+    exchange that takes it.
+
     They fit if they take no more of the current device's memory than
     ``PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION``, 0.85 by default.  The
     rest is for the operators, the filter buffers, the Gram matrices and the
@@ -1451,7 +1656,8 @@ def shared_block_bytes(rows: int, columns: int, devices: int, wide: bool = False
     if blocks != 3:
         slab = slab_columns(rows, columns, devices, wide, blocks)
         limit = max(limit, exchange_chunk_limit(away * slab, narrower=True))
-    chunk = min(whole, max(limit, away))
+    # None where the pieces go as they lie, which takes no buffer.
+    chunk = 0 if strided_exchange_requested() else min(whole, max(limit, away))
     needed = 8 * ((blocks if fixed else blocks + 1) * tall + chunk)
     if blocks != 3:
         needed += 8 * slab_workspace(rows, columns, devices, blocks, wide)
@@ -1606,11 +1812,127 @@ class DistributedBasis:
             raise ValueError("no occupied column was selected")
         return total
 
+    def _held_coefficients(self, coefficients, columns, rows):
+        """Per device, the rows of ``coefficients[:, columns]`` of the columns it holds: ``n x k`` arrays of the devices.
+
+        ``rows`` is the row of ``coefficients`` of every slot (None: the
+        slot itself).  The ``m x k`` selection is made on the owner, on the
+        stream of its device thread, and copied to the others.
+        """
+
+        cp, _ = require_cupy()
+        group = self.group
+        with cp.cuda.Device(group.owner), group._stream(group.owner):
+            chosen = coefficients[:, cp.asarray(columns)]
+            if rows is not None:
+                chosen = chosen[cp.asarray(np.asarray(rows, dtype=np.int64))]
+            chosen = cp.asfortranarray(chosen)
+            group._stream(group.owner).synchronize()
+
+        def held(index, device):
+            spans = self.layout.spans(index)
+            if not spans:
+                return None
+            local = group._from_owner(cp, chosen, device)
+            where = np.concatenate([np.arange(column, column + width) for column, _offset, width in spans])
+            return cp.asfortranarray(local[cp.asarray(where)])
+
+        return group.map(held)
+
+    def ritz_columns(self, coefficients, columns, rows=None):
+        """``Y = basis @ coefficients[:, columns]``: a Fortran-ordered ``N x k`` array on the owner.
+
+        ``coefficients`` are an ``m x m`` array of the owner whose rows
+        follow the columns of the basis, or those of ``rows`` (the
+        eigenvectors that a hand-over keeps, :class:`handover.RitzHandover`).
+        Every device multiplies the rows of the columns it holds into a
+        partial product of all rows, and the owner sums the partials in
+        device order.  Every array is taken on the stream of a device thread,
+        whose pool holds the workspace of the Ritz step between passes, so a
+        caller that asks for a few columns at a time takes no memory beside
+        it.  Timed as the ``correction`` stage of the group
+        (PARSEC_CUPY_RITZ_HANDOVER).
+        """
+
+        cp, _ = require_cupy()
+        group = self.group
+        columns = np.asarray(columns, dtype=np.int64)
+        count, total_rows = int(columns.size), int(self.shape[0])
+        started = perf_counter()
+        try:
+            local = self._held_coefficients(coefficients, columns, rows)
+
+            def part(index, device):
+                block = self.blocks[index]
+                if local[index] is None or not block.shape[1] or not count:
+                    return cp.zeros((count, total_rows), dtype=cp.float64)
+                # (k x n)(n x N): C-ordered k x N, whose transpose is Y in F order.
+                return cp.ascontiguousarray(cp.matmul(local[index].T, block.T))
+
+            parts = group.map(part)
+            with cp.cuda.Device(group.owner), group._stream(group.owner):
+                total = group._sum_on_owner(parts)
+        finally:
+            group.seconds["correction"] += perf_counter() - started
+        return total.T
+
+    def correction_density(self, builder, coefficients, columns, weights, volume_element, rows=None):
+        """The density of the Ritz vectors ``columns`` with ``weights``, a piece of rows at a time, on the host.
+
+        As :meth:`ritz_columns`, but every device multiplies only a piece of
+        its rows, at most :data:`handover.CORRECTION_BYTES` of Ritz vectors,
+        into a buffer it keeps for the call; the owner sums the pieces and
+        hands them to ``builder``.  The arrays are those of the streams of
+        the device threads, which hold the workspace of the Ritz step
+        between passes: the correction takes no memory beside the pass.
+        """
+
+        from .handover import CORRECTION_BYTES, rows_times
+
+        cp, _ = require_cupy()
+        group = self.group
+        columns = np.asarray(columns, dtype=np.int64)
+        weights = np.asarray(weights, dtype=np.float64)
+        count, total_rows = int(columns.size), int(self.shape[0])
+        density = np.zeros(total_rows, dtype=np.float64)
+        if not count:
+            return density
+        started = perf_counter()
+        try:
+            local = self._held_coefficients(coefficients, columns, rows)
+            tile = max(1, min(total_rows, CORRECTION_BYTES // (8 * count)))
+            buffers = group.map(lambda index, device: cp.empty(tile * count, dtype=cp.float64))
+            for start in range(0, total_rows, tile):
+                stop = min(total_rows, start + tile)
+
+                def part(index, device):
+                    # The rows of the piece of every Ritz vector, Fortran-ordered: its transpose is C-ordered.
+                    out = cp.ndarray((stop - start, count), dtype=cp.float64, memptr=buffers[index].data, order="F")
+                    block = self.blocks[index]
+                    if local[index] is None or not block.shape[1]:
+                        out[...] = 0.0
+                    else:
+                        rows_times(cp, block, start, stop, local[index], out)
+                    return out.T
+
+                parts = group.map(part)
+                with cp.cuda.Device(group.owner), group._stream(group.owner):
+                    total = group._sum_on_owner(parts)
+                    density[start:stop] = builder(total.T, weights, volume_element)
+                del parts, total
+        finally:
+            group.seconds["correction"] += perf_counter() - started
+        return density
+
 
 class SectorDeviceGroup:
     """Devices, replicated operators and filter graphs serving one sector."""
 
-    STAGES = ("filter", "apply", "to_rows", "gram", "dense", "rotate", "to_columns", "repartition")
+    # ``handover`` is the triangular product of a Ritz hand-over with its
+    # factor and the gather of its coefficients, ``correction`` the Ritz
+    # vectors that its density and forces form (PARSEC_CUPY_RITZ_HANDOVER).
+    STAGES = ("filter", "apply", "to_rows", "gram", "dense", "rotate", "to_columns", "repartition",
+              "handover", "correction")
 
     def __init__(self, operator: Any, devices: tuple[int, ...]) -> None:
         worker = getattr(operator, "_distributed_filter", None)
@@ -1667,6 +1989,30 @@ class SectorDeviceGroup:
         # count of slabs where one is named.  None before the first step and
         # where the overlap has no slabs (``PARSEC_CUPY_RITZ_SYRK`` on or off).
         self.overlap_columns = None
+        # What ran beside what in the rounds of the latest Ritz step, for
+        # reports: ``off``, ``p1`` or ``p2`` (:func:`ritz_pipeline`); ``off``
+        # for a step with two or three tall blocks, which do not read the
+        # switch, and None before the first step.
+        self.pipeline = None
+        # The host seconds of the rounds of the steps with one tall block,
+        # from the first round to the end of the overlap, summed over the
+        # passes, for reports.  They are the seconds to compare between the
+        # values of the switch: under ``p1`` and ``p2`` the stage seconds
+        # are device time, which a stage may spend beside another.
+        self.rounds_seconds = 0.0
+        # How the latest Ritz step timed its stages, for reports: ``host``,
+        # the waits of the host for all devices as before, or ``events``,
+        # device events around every stage of a round under ``p1`` and
+        # ``p2`` (summed over the rounds per device, the most of a device
+        # taken).
+        self.stage_clock = None
+        # How the copies between the devices of the latest conversion went,
+        # for reports: ``packed`` (pack kernels, buffers, contiguous copies)
+        # or ``strided`` (one pitched copy per piece,
+        # :func:`strided_exchange_requested`); None before the first.
+        self.exchange_copies = None
+        # The exchange stream of every device (:meth:`_exchange_streams`).
+        self._exchange = {}
         self._tall = self._chunk = self._work = 0
         # The devices that still hold, in the free list of their stream, a
         # slab workspace that a later pass has outgrown.
@@ -1675,6 +2021,20 @@ class SectorDeviceGroup:
         # taken so far (:meth:`_exchange_buffer`).
         self._buffers = {}
         self._inbound = {}
+        # Of the hand-over (PARSEC_CUPY_RITZ_HANDOVER), for reports: the Ritz
+        # steps by what they handed over (with the reason where one asked
+        # for a hand-over rotated), the row positions where the halves met
+        # in the latest one, the columns of its widest output slab, and the
+        # product that ran (:func:`rayleigh_ritz._triangular_in_place`).
+        self.handover_counts = {}
+        self.handover_band = None
+        self.handover_slab_columns = None
+        self.handover_product = None
+
+    def count_handover(self, label: str) -> None:
+        """Count one Ritz step under ``label``, what it handed over (see ``handover_counts``)."""
+
+        self.handover_counts[label] = self.handover_counts.get(label, 0) + 1
 
     # ----- plumbing -----------------------------------------------------
 
@@ -1686,21 +2046,28 @@ class SectorDeviceGroup:
             return operator
         return self._worker.replicas[device]
 
-    def map(self, function):
+    def map(self, function, streams=None, synchronize: bool = True):
         """Run ``function(index, device)`` on each device's thread and stream.
 
         Every stream is synchronized before this returns, so results may be
         read from any other device or stream afterwards.  The first failure
         is raised only after all devices have finished.
+
+        ``streams`` maps a device to the stream to run under in place of its
+        compute stream (the exchange streams of :meth:`_exchange_streams`).
+        Without ``synchronize`` the work is only queued: whatever reads it
+        later must wait for it on the device (an event) or on the host.
         """
 
         cp, _ = require_cupy()
+        table = self._worker.streams if streams is None else streams
 
         def call(index, device):
-            stream = self._worker.streams[device]
+            stream = table[device]
             with cp.cuda.Device(device), stream:
                 value = function(index, device)
-                stream.synchronize()
+                if synchronize:
+                    stream.synchronize()
                 return value
 
         futures = [
@@ -1789,15 +2156,58 @@ class SectorDeviceGroup:
 
         Indexed like ``self.devices``, with ``None`` for the device itself.
         Created on first use, on the thread of ``device`` while it is current.
+        A group that names one device several times, as the tests on one GPU
+        do, gives each of those names a stream too: the device receives from
+        its other names as from peers (its own name never sends to itself).
+        A group of distinct devices is not changed by that.
         """
 
         streams = self._inbound.get(device)
         if streams is None:
             cp, _ = require_cupy()
+            named = self.devices.count(device) > 1
             streams = self._inbound[device] = [
-                None if other == device else cp.cuda.Stream(non_blocking=True) for other in self.devices
+                None if other == device and not named else cp.cuda.Stream(non_blocking=True)
+                for other in self.devices
             ]
         return streams
+
+    def _exchange_streams(self) -> dict:
+        """The exchange stream of every device, by device: a second stream beside its compute stream.
+
+        Created on first use and kept for the life of the group.  Keyed by
+        device like the compute streams, so a device named twice has one.
+        The pipelined rounds of :meth:`_ritz_one_block` send their slabs on
+        it (:func:`ritz_pipeline`); nothing is ever allocated under it.
+        """
+
+        cp, _ = require_cupy()
+        for device in self.devices:
+            if device not in self._exchange:
+                with cp.cuda.Device(device):
+                    self._exchange[device] = cp.cuda.Stream(non_blocking=True)
+        return self._exchange
+
+    def _quiesce(self) -> None:
+        """Wait for the compute, exchange and inbound streams of every device.
+
+        For a step that fails while work of several streams of a device may
+        still run: nothing of it may outlive the arrays it uses.  An error
+        of a wait is left to the error that is raised already.
+        """
+
+        cp, _ = require_cupy()
+        for device in dict.fromkeys(self.devices):
+            streams = [self._worker.streams.get(device), self._exchange.get(device)]
+            streams.extend(self._inbound.get(device) or ())
+            for stream in streams:
+                if stream is None:
+                    continue
+                try:
+                    with cp.cuda.Device(device):
+                        stream.synchronize()
+                except Exception:  # noqa: BLE001 - the error of the step is the one to raise
+                    pass
 
     def column_ranges(self, blocks: tuple[FilterBlock, ...]) -> tuple[tuple[int, int], ...]:
         """Contiguous column range per device, balanced by filter work."""
@@ -1863,6 +2273,8 @@ class SectorDeviceGroup:
         concurrent_exchange_requested()
         paired_exchange_requested()
         column_copies_requested()
+        strided_exchange_requested()
+        ritz_pipeline()
         condition_helper_policy()
         gram_multiple()
         overlap_slab_width(1)
@@ -2209,7 +2621,7 @@ class SectorDeviceGroup:
 
         return DistributedBasis(self, self.map(take), layout)
 
-    def _pull(self, device: int, arriving, concurrent: bool) -> None:
+    def _pull(self, device: int, arriving, concurrent: bool, stream=None, pitched: bool = False) -> None:
         """Copy contiguous pieces from other devices into arrays of ``device``.
 
         ``arriving`` lists ``(other, target, source)``: the index of the
@@ -2219,12 +2631,33 @@ class SectorDeviceGroup:
         If ``concurrent`` (see :func:`concurrent_exchange_requested`) each
         source has its own stream instead, and the copies have completed on
         return.
+
+        ``stream`` is the stream of the device to queue on, and to wait for
+        before concurrent copies: its compute stream by default, its
+        exchange stream in the pipelined rounds (:func:`ritz_pipeline`).
+        ``pitched`` copies two column-major views of one shape, which need
+        not be contiguous, with one ``cudaMemcpy2DAsync`` each
+        (:func:`strided_exchange_requested`).
         """
 
-        stream = self._stream(device)
+        stream = self._stream(device) if stream is None else stream
+        if pitched:
+            cp, _ = require_cupy()
+            for _other, target, source in arriving:
+                # Both ways, as a contiguous copy between them would have asked.
+                _peer_access(cp, source.device.id, target.device.id)
+                _peer_access(cp, target.device.id, source.device.id)
+
+            def copy(target, source, on):
+                _pitched_copy(cp, target, source, on)
+        else:
+
+            def copy(target, source, on):
+                target.data.copy_from_device_async(source.data, source.nbytes, on)
+
         if not concurrent:
             for _other, target, source in arriving:
-                target.data.copy_from_device_async(source.data, source.nbytes, stream)
+                copy(target, source, stream)
             return
         # Nothing orders the other streams behind work that still uses the
         # targets on the device's own stream, or ahead of what the caller
@@ -2232,7 +2665,7 @@ class SectorDeviceGroup:
         stream.synchronize()
         inbound = self._inbound_streams(device)
         for other, target, source in arriving:
-            target.data.copy_from_device_async(source.data, source.nbytes, inbound[other])
+            copy(target, source, inbound[other])
         for other, _target, _source in arriving:
             inbound[other].synchronize()
 
@@ -2245,6 +2678,10 @@ class SectorDeviceGroup:
         keep: bool = False,
         targets: list | None = None,
         buffers: list | None = None,
+        streams: dict | None = None,
+        after: list | None = None,
+        between=None,
+        marks: list | None = None,
     ) -> list:
         """Column blocks -> one row block of all columns per device.
 
@@ -2268,6 +2705,25 @@ class SectorDeviceGroup:
         A caller that holds the buffers sized them for what most of its
         conversions send (:func:`followed_slabs`): blocks that they do not
         hold whole travel in chunks of the default.
+
+        By default since 2026-10-22 (:func:`strided_exchange_requested`)
+        nothing is packed: every device receives the rows of each block of
+        another device as they lie in it, one pitched copy per column range,
+        in the same turns and in one step, since no buffer limits a step.
+        No buffer is taken and ``buffers`` is not read.  What the paragraphs
+        above say of chunks and buffers is the packed exchange, which
+        ``PARSEC_CUPY_EXCHANGE_STRIDED=0`` restores.
+
+        For the pipelined rounds of :meth:`_ritz_one_block`: ``streams``
+        maps every device to the stream that runs the conversion, its
+        exchange stream, and ``after`` gives per device an event that this
+        stream waits for before it reads the block.  ``between`` is called
+        on the host once, after the pack of the first chunk (after the own
+        rows where nothing is packed) and before any copy between devices,
+        so that what it queues on the compute streams runs beside those
+        copies only.  ``marks`` gives per device two events, recorded on the
+        stream of the conversion at its start, behind the wait, and at its
+        end.
         """
 
         cp, _ = require_cupy()
@@ -2277,34 +2733,54 @@ class SectorDeviceGroup:
         # A caller that holds the buffers has sized them: its conversions size none.
         tall, capacity = self._capacities(layout, edges, sent=None if buffers is None else ())
         aways = [total - (high - low) for low, high in zip(edges[:-1], edges[1:])]
-        limit = exchange_chunk_limit(max(aways) * max(layout.widths))
-        if buffers is not None and any(
-            width * away > buffer.size for width, away, buffer in zip(layout.widths, aways, buffers)
-        ):
-            limit = min(limit, exchange_chunk_bytes() // 8)
         # Read once, on the calling thread, for every chunk.
         concurrent = concurrent_exchange_requested()
         paired = concurrent and count == 4 and paired_exchange_requested()
         self.to_rows_copies = "pairs" if paired else "together" if concurrent else "queued"
         by_column = column_copies_requested()
-        chunks = [
-            exchange_chunks(width, total - (edges[index + 1] - edges[index]), limit)
-            for index, width in enumerate(layout.widths)
-        ]
+        strided = strided_exchange_requested()
+        self.exchange_copies = "strided" if strided else "packed"
+        if strided:
+            # A device sends all of its columns in one step, where it has
+            # any and another device has rows.
+            chunks = [((0, width),) if width and away else () for width, away in zip(layout.widths, aways)]
+        else:
+            limit = exchange_chunk_limit(max(aways) * max(layout.widths))
+            if buffers is not None and any(
+                width * away > buffer.size for width, away, buffer in zip(layout.widths, aways, buffers)
+            ):
+                limit = min(limit, exchange_chunk_bytes() // 8)
+            chunks = [
+                exchange_chunks(width, total - (edges[index + 1] - edges[index]), limit)
+                for index, width in enumerate(layout.widths)
+            ]
         # The chunks that take the turns of the pairs: those that every
         # device sends to every other one, which is what was timed.  Once a
         # device has no chunk left, or where one has no rows to receive, a
         # device receives from all the others in one turn, as without pairs.
         whole = min(map(len, chunks)) if paired and all(low < high for low, high in zip(edges[:-1], edges[1:])) else 0
-        if buffers is not None:
+        if buffers is not None and not strided:
             # A buffer that the caller holds was sized for what it sends
             # (:meth:`_capacities`): a chunk never lies beyond its end.
             for index, cut in enumerate(chunks):
                 widest = max((last - first for first, last in cut), default=0)
                 if widest * (total - (edges[index + 1] - edges[index])) > buffers[index].size:
                     raise ValueError("an exchange buffer is smaller than a chunk of its device")
+        steps = max(map(len, chunks))
+
+        def run(function):
+            # On the exchange streams where they are given, else as before.
+            return self.map(function) if streams is None else self.map(function, streams=streams)
+
+        # The last map of the conversion, which records its end where
+        # ``marks`` are given: the last turn of the last step.
+        final = (steps - 1, len(_PAIR_TURNS) - 1 if steps - 1 < whole else 0) if steps else None
 
         def prepare(index, device):
+            if after is not None and after[index] is not None:
+                cp.cuda.get_current_stream().wait_event(after[index])
+            if marks is not None:
+                marks[index][0].record(cp.cuda.get_current_stream())
             low, high = edges[index], edges[index + 1]
             target = self._block(cp, (high - low, columns), tall) if targets is None else targets[index]
             for column, offset, size in layout.spans(index):
@@ -2312,11 +2788,15 @@ class SectorDeviceGroup:
                 self._copy(
                     target[:, column : column + size], blocks[index][low:high, offset : offset + size], by_column
                 )
+            if marks is not None and final is None:
+                marks[index][1].record(cp.cuda.get_current_stream())
+            if strided:
+                return target, None
             if buffers is not None:
                 return target, buffers[index]
             return target, self._exchange_buffer(cp, device, capacity if chunks[index] else 0)
 
-        row_blocks, held = zip(*self.map(prepare))
+        row_blocks, held = zip(*run(prepare))
 
         def pack(index, step):
             if step >= len(chunks[index]):
@@ -2327,9 +2807,21 @@ class SectorDeviceGroup:
                 self._copy(piece, blocks[index][edges[other] : edges[other + 1], first:last], by_column)
             return packed
 
-        def receive(index, device, step, packed, partners):
+        def receive(index, device, step, packed, partners, closing):
             arriving = []
+            low, high = edges[index], edges[index + 1]
             for other in range(count) if partners is None else (partners[index],):
+                if strided:
+                    if other == index or step >= len(chunks[other]) or low == high:
+                        continue
+                    first, last = chunks[other][step]
+                    # The rows of this device of every column range of the
+                    # other one, where its block holds them.
+                    for column, offset, size in layout.spans(other, first, last):
+                        arriving.append(
+                            (other, row_blocks[index][:, column : column + size], blocks[other][low:high, offset : offset + size])
+                        )
+                    continue
                 piece = packed[other].get(index)
                 if piece is not None:
                     first, last = chunks[other][step]
@@ -2344,16 +2836,29 @@ class SectorDeviceGroup:
                             )
                         )
             # The one source of a turn needs no stream beside the device's own.
-            self._pull(device, arriving, concurrent and partners is None)
+            self._pull(
+                device,
+                arriving,
+                concurrent and partners is None,
+                stream=None if streams is None else streams[device],
+                pitched=strided,
+            )
+            if closing and marks is not None:
+                marks[index][1].record(cp.cuda.get_current_stream())
 
-        for step in range(max(map(len, chunks))):
+        for step in range(steps):
             # A buffer is packed completely before any device reads it, and
             # read by all of them before it is packed again.
-            packed = self.map(lambda index, device: pack(index, step))
-            for partners in _PAIR_TURNS if step < whole else (None,):
+            packed = None if strided else run(lambda index, device: pack(index, step))
+            if step == 0 and between is not None:
+                between()
+            for turn, partners in enumerate(_PAIR_TURNS if step < whole else (None,)):
                 # Every device has received from its partner of a turn
                 # before any device turns to the next one.
-                self.map(lambda index, device: receive(index, device, step, packed, partners))
+                closing = (step, turn) == final
+                run(lambda index, device: receive(index, device, step, packed, partners, closing))
+        if not steps and between is not None:
+            between()
         # Every copy has completed.  The pieces are dropped here and not with
         # the function that received them, which the thread of a device may
         # still hold when the next conversion asks the pool for its buffer.
@@ -2384,6 +2889,12 @@ class SectorDeviceGroup:
         blocks: this way has no step that all devices take together, and
         its seconds were higher with one chunk for a slab that is little
         wider (:func:`exchange_chunk_limit`).
+
+        By default since 2026-10-22 (:func:`strided_exchange_requested`) a
+        device copies the rows of its columns from every other device
+        straight into its block, one pitched copy per column range and
+        device, with no buffer and no unpack kernel; the chunks and the
+        buffer above are those of the packed exchange.
         """
 
         cp, _ = require_cupy()
@@ -2394,6 +2905,36 @@ class SectorDeviceGroup:
         limit = exchange_chunk_bytes() // 8
         concurrent = concurrent_exchange_requested()
         by_column = column_copies_requested()
+        strided = strided_exchange_requested()
+        self.exchange_copies = "strided" if strided else "packed"
+
+        def fetch(index, device):
+            low, high = edges[index], edges[index + 1]
+            block = self._block(cp, (total, layout.widths[index]), tall) if targets is None else targets[index]
+            spans = layout.spans(index)
+            for column, offset, size in spans:
+                # The rows this device already holds.
+                self._copy(block[low:high, offset : offset + size], rows[index][:, column : column + size], by_column)
+            self._pull(
+                device,
+                [
+                    (
+                        other,
+                        block[edges[other] : edges[other + 1], offset : offset + size],
+                        rows[other][:, column : column + size],
+                    )
+                    for other in range(len(self.devices))
+                    if other != index and edges[other] < edges[other + 1]
+                    for column, offset, size in spans
+                ],
+                concurrent,
+                pitched=True,
+            )
+            return block
+
+        if strided:
+            # The sources are released only after every stream has been synchronized.
+            return self.map(fetch)
 
         def unpack(index, device):
             width = layout.widths[index]
@@ -2590,7 +3131,8 @@ class SectorDeviceGroup:
 
         return start
 
-    def _small_solve(self, packed, on_device: bool, rows: int):
+    def _small_solve(self, packed, on_device: bool, rows: int, handover: str | None = None,
+                     values_condition_limit: float = 0.0):
         """Solve the small generalized problem of a summed Gram pair.
 
         On the owner if the pair is an array of it, else on the host.
@@ -2600,6 +3142,11 @@ class SectorDeviceGroup:
         device of the sector estimates the condition number of the overlap
         meanwhile where :meth:`_condition_helper` names one for a basis of
         ``rows`` rows.
+
+        ``handover`` (``triangular``, ``factor`` or ``values``) solves for a
+        hand-over instead (:func:`rayleigh_ritz.solve_whitened_handover_on_device`)
+        and returns its :class:`rayleigh_ritz.WhitenedHandover`, with host
+        Ritz values and the other arrays where the solve ran.
         """
 
         cp, _ = require_cupy()
@@ -2609,6 +3156,16 @@ class SectorDeviceGroup:
                 helper = self._condition_helper(rows, int(packed.shape[-1]))
                 self.condition_device = self.owner if helper is None else helper
                 beside = {} if helper is None else {"condition": self._condition_beside(helper)}
+                if handover is not None:
+                    with cp.cuda.Device(self.owner):
+                        solution = solve_whitened_handover_on_device(
+                            packed[0], packed[1], mode=handover,
+                            values_condition_limit=values_condition_limit, **beside)
+                        eigenvalues = cp.asnumpy(solution.eigenvalues)
+                        cp.cuda.get_current_stream().synchronize()
+                    from dataclasses import replace
+
+                    return replace(solution, eigenvalues=eigenvalues)
                 with cp.cuda.Device(self.owner):
                     eigenvalues, coefficients, whitened = solve_whitened_ritz_on_device(packed[0], packed[1], **beside)
                     eigenvalues = cp.asnumpy(eigenvalues)
@@ -2616,6 +3173,9 @@ class SectorDeviceGroup:
                     coefficients = cp.asfortranarray(coefficients)
                     cp.cuda.get_current_stream().synchronize()
                 return eigenvalues, coefficients, whitened
+            if handover is not None:
+                return solve_whitened_handover(
+                    packed[0], packed[1], mode=handover, values_condition_limit=values_condition_limit)
             return solve_whitened_ritz(packed[0], packed[1])
         finally:
             self.seconds["dense"] += perf_counter() - started
@@ -2640,6 +3200,64 @@ class SectorDeviceGroup:
         """The lower triangle of the overlap of a row block: in slabs of ``width`` columns, or cut by the named count."""
 
         return _symmetric_overlap(block) if width is None else _symmetric_overlap(block, width)
+
+    @staticmethod
+    def _overlap_by_round(states: int, width: int | None, spots) -> dict:
+        """The slabs that :meth:`_overlap` forms of a row block, by the round after which each can be formed.
+
+        ``width`` is what :meth:`_overlap_width` gave, ``spots`` the columns
+        of the row block that each round fills, in the order of the rounds.
+        A slab ``[a, b)`` is the product of the columns from ``a`` on with
+        those of the slab (:func:`rayleigh_ritz._lower_triangle_product`),
+        and the rows of a round are stored in front of those of the rounds
+        before it: once the round whose spot holds column ``a`` has arrived,
+        every column that the slab reads has, and none of them changes
+        before the rotation.  Empty where the overlap has no slabs:
+        ``PARSEC_CUPY_RITZ_SYRK`` names another form, or the basis is one
+        slab, the full product.
+        """
+
+        if _overlap_policy() != "slabs":
+            return {}
+        cut = _gram_slab_width(states) if width is None else max(1, int(width))
+        if cut >= states:
+            return {}
+        slabs = {}
+        for first in range(0, states, cut):
+            step = next(index for index, (low, high) in enumerate(spots) if low <= first < high)
+            slabs.setdefault(step, []).append((first, min(states, first + cut)))
+        return slabs
+
+    def ritz_handover(self, operator: Any, filtered: DistributedBasis, *, stages: bool, handover: str,
+                      halves: int | None = None, leading: int | None = None, values_condition_limit: float = 0.0):
+        """:meth:`ritz` with a hand-over (``PARSEC_CUPY_RITZ_HANDOVER``); consumes ``filtered``.
+
+        Returns host Ritz values, the basis, the whitened matrix and what the
+        step handed over (:class:`handover.HandoverStep`).  ``handover`` is
+        ``triangular``, ``factor`` or ``values`` (see
+        :func:`rayleigh_ritz.generalized_rayleigh_ritz`).  Only the step with
+        one tall block (the default) hands over; with two or three tall
+        blocks the step rotates and says so.  ``halves`` is the lower half of
+        the next filter's degree split (a later pass), which the factor keeps
+        apart from the upper one (:func:`handover.handover_order`); None for
+        a CHEBFF cycle, whose first ``leading`` columns, the first filter
+        block, are to stay the first row positions or the step rotates.
+        """
+
+        blocks = tall_blocks_per_device()
+        if handover == "rotation" or blocks != 1:
+            eigenvalues, basis, whitened = self.ritz(operator, filtered, stages=stages)
+            note = None if handover == "rotation" else f"{blocks} tall blocks"
+            self.count_handover("rotation" if note is None else f"rotation ({note})")
+            return eigenvalues, basis, whitened, HandoverStep(mode="rotation", note=note)
+        self.tall_blocks = blocks
+        self.slab_cut = self.slab_columns = self.projection_columns = None
+        # As ritz: the step with one tall block says what its rounds ran.
+        self.pipeline, self.stage_clock = "off", "host"
+        return self._ritz_one_block(
+            operator, filtered, stages=stages, handover=handover, halves=halves, leading=leading,
+            values_condition_limit=values_condition_limit,
+        )
 
     def ritz(self, operator: Any, filtered: DistributedBasis, *, stages: bool):
         """Generalized Rayleigh--Ritz of a filtered basis; consumes ``filtered``.
@@ -2670,6 +3288,9 @@ class SectorDeviceGroup:
         blocks = tall_blocks_per_device()
         self.tall_blocks = blocks
         self.slab_cut = self.slab_columns = self.projection_columns = None
+        # The steps with two and three tall blocks do not read the switch of
+        # the pipelined rounds and time their stages on the host.
+        self.pipeline, self.stage_clock = "off", "host"
         if blocks == 1:
             return self._ritz_one_block(operator, filtered, stages=stages)
         if blocks == 2:
@@ -2801,6 +3422,7 @@ class SectorDeviceGroup:
 
         cp, _ = require_cupy()
         on_device = dense_solve_on_device()
+        strided = strided_exchange_requested()
         rows, states = filtered.shape
         layout = filtered.layout
         widths = layout.widths
@@ -2851,8 +3473,9 @@ class SectorDeviceGroup:
                 self._view(cp, backing, rows * width, (height, widest)),
                 # The rotation tile lies where the slab was, which is done with by then.
                 self._view(cp, backing, 0, (min(height, rows * width // states), states)),
-                # As the exchanges allocate it: no buffer where no column leaves the device.
-                self._exchange_buffer(cp, device, chunk if widths[index] and rows > height else 0),
+                # As the exchanges allocate it: no buffer where no column leaves the device,
+                # and none where the pieces go as they lie (strided_exchange_requested).
+                self._exchange_buffer(cp, device, chunk if widths[index] and rows > height and not strided else 0),
             )
 
         with stage("subspace_ritz_projection_seconds"):
@@ -2994,7 +3617,8 @@ class SectorDeviceGroup:
             cp.cuda.get_current_stream().synchronize()
         return permuted
 
-    def _ritz_one_block(self, operator: Any, filtered: DistributedBasis, *, stages: bool):
+    def _ritz_one_block(self, operator: Any, filtered: DistributedBasis, *, stages: bool, handover: str = "rotation",
+                        halves: int | None = None, leading: int | None = None, values_condition_limit: float = 0.0):
         """:meth:`ritz` with the row block of a device in the memory of its columns.
 
         A column block and a row block of an even share of the basis have
@@ -3051,11 +3675,50 @@ class SectorDeviceGroup:
         blocks by round-off: the projection is cut into rounds instead of
         slabs of one device, and overlap and rotation meet the columns in
         another order.
+
+        :func:`ritz_pipeline` lets the stages of a round run side by side,
+        ``p2`` by default; ``off`` keeps them one after another as above.
+        Under ``p1`` every device moves its slab into the workspace on its
+        compute stream, sends it from there on its exchange stream
+        (:meth:`_exchange_streams`) and applies ``H`` to that copy on the
+        compute stream meanwhile: the rows that arrive are written over the
+        slab in the block, which nothing reads any more.  Under ``p2`` each
+        slab of the overlap is also formed on the compute stream as soon as
+        the round whose spot holds its first column has arrived, while ``H``
+        times the slab of that round is sent.  The exchange stream waits for
+        the leave and for the apply of its device by events; the steps of a
+        conversion wait for all devices on the host as before, and the
+        compute streams once after the last round.  The pack of a
+        conversion is queued before the kernel that is to run beside it.
+        The values are those of ``off``, bit for bit.
+
+        ``handover`` other than ``rotation`` (:meth:`ritz_handover`) hands
+        over instead of rotating and returns what it handed over as a fourth
+        value.  The pair is factorized in the order of
+        :func:`handover.handover_order`: the row order, with the lower-half
+        columns of the band where the halves of ``halves`` meet put first.
+        ``U = L^-T`` in that order is block upper triangular in row order,
+        the band one dense block, so every device multiplies its row block
+        by it in output slabs of whole rounds that do not cut the band
+        (:func:`handover.handover_slabs`, :func:`rayleigh_ritz._triangular_in_place`)
+        in the workspace of the slabs, which the rounds no longer use.  The
+        way back is that of the rotation.  ``values`` runs it without a
+        product: the filtered columns return as they are.  The
+        eigenvectors of ``triangular`` stay on the owner in the order of the
+        factorization, with the row of every slot.  Under every value of
+        :func:`ritz_pipeline` the product runs after the rounds, once every
+        stream of the step has done what they queued.
         """
 
         cp, _ = require_cupy()
         on_device = dense_solve_on_device()
         by_column = column_copies_requested()
+        # Read once for the step: what its rounds run side by side, and
+        # whether its pieces travel as they lie.
+        mode = ritz_pipeline()
+        strided = strided_exchange_requested()
+        self.pipeline = mode
+        self.stage_clock = "host" if mode == "off" else "events"
         rows, states = filtered.shape
         layout = filtered.layout
         widths = layout.widths
@@ -3093,6 +3756,8 @@ class SectorDeviceGroup:
         self.slab_columns, self.projection_columns = width, max(place[-1][1] for place in places)
         work = self._cut_capacity(rows, width, self.projection_columns, 1)
         overlap_width = self._overlap_width(states)
+        # Under p2, the slabs of the overlap by the round after which each is formed.
+        early = self._overlap_by_round(states, overlap_width, spots) if mode == "p2" else {}
         columns = filtered.take()
 
         def stage(name):
@@ -3124,8 +3789,9 @@ class SectorDeviceGroup:
                 row_block,
                 # The rotation tile lies where H times a slab was, which is done with by then.
                 self._view(cp, backing, 0, (min(height, rows * width // states), states)),
-                # As the exchanges allocate it: no buffer where no column leaves the device.
-                self._exchange_buffer(cp, device, chunk if widths[index] and rows > height else 0),
+                # As the exchanges allocate it: no buffer where no column leaves the device,
+                # and none where the pieces go as they lie (strided_exchange_requested).
+                self._exchange_buffer(cp, device, chunk if widths[index] and rows > height and not strided else 0),
                 slabs, applied, leaving, arriving, resident, inside,
             )
 
@@ -3177,49 +3843,192 @@ class SectorDeviceGroup:
                     buffers=buffers,
                 )
 
-        for step in range(len(rounds)):
-            with stage("subspace_ritz_hamiltonian_seconds"):
-                self._timed("apply", lambda index, device: apply(index, device, step))
-            with stage("subspace_ritz_projection_seconds"):
-                started = perf_counter()
-                self.map(lambda index, device: leave(index, device, step))
-                self._to_rows(
-                    [views[step] for views in leaving],
-                    places[step],
-                    edges,
-                    keep=True,
-                    targets=[views[step] for views in resident],
-                    buffers=buffers,
-                )
-                self._to_rows(
-                    [views[step] for views in applied],
-                    places[step],
-                    edges,
-                    keep=True,
-                    targets=[views[step] for views in arriving],
-                    buffers=buffers,
-                )
-                self.seconds["to_rows"] += perf_counter() - started
-                self._timed("gram", lambda index, device: project(index, device, step))
+        # The order in which the summed pair is factorized: that of the basis
+        # for a rotation, that of handover_order for a hand-over
+        # (PARSEC_CUPY_RITZ_HANDOVER).  ``mode`` is the pipeline of the rounds.
+        handing, note = handover, None
+        if handing != "rotation" and handing != "values" and halves is None and leading:
+            # A CHEBFF cycle: the first filter block gets a polynomial of
+            # its own, so its span must stay the leading one.
+            if not np.array_equal(order[: int(leading)], np.arange(min(int(leading), order.size))):
+                handing, note = "rotation", "first filter block not leading in row order"
+        ordering = order
+        if handing != "rotation":
+            hand, band = handover_order(order, halves)
+            # Row position -> place in the order of the factorization.
+            hpos = np.empty_like(hand)
+            hpos[hand] = np.arange(hand.size)
+            # The pair as the rows and columns of ``hand``: what the basis
+            # order is to the rotation, the inverse of ``hpos`` is here.
+            ordering = hpos
 
-        with stage("subspace_ritz_projection_seconds"):
-            before = self.seconds["gram"]
-            self._timed("gram", overlap)
-            self.overlap_seconds += self.seconds["gram"] - before
-            if on_device:
-                parts = pairs
-            else:
-                parts = self._timed(
-                    "gram", lambda index, device: np.asarray(cp.asnumpy(pairs[index]), dtype=np.float64)
-                )
-            packed = self._summed(parts, on_device)
-            del parts, pairs
-            started = perf_counter()
-            packed = self._in_basis_order(packed, order, on_device)
-            self.seconds["gram"] += perf_counter() - started
+        rounds_started = perf_counter()
+        if mode == "off":
+            for step in range(len(rounds)):
+                with stage("subspace_ritz_hamiltonian_seconds"):
+                    self._timed("apply", lambda index, device: apply(index, device, step))
+                with stage("subspace_ritz_projection_seconds"):
+                    started = perf_counter()
+                    self.map(lambda index, device: leave(index, device, step))
+                    self._to_rows(
+                        [views[step] for views in leaving],
+                        places[step],
+                        edges,
+                        keep=True,
+                        targets=[views[step] for views in resident],
+                        buffers=buffers,
+                    )
+                    self._to_rows(
+                        [views[step] for views in applied],
+                        places[step],
+                        edges,
+                        keep=True,
+                        targets=[views[step] for views in arriving],
+                        buffers=buffers,
+                    )
+                    self.seconds["to_rows"] += perf_counter() - started
+                    self._timed("gram", lambda index, device: project(index, device, step))
+
+            with stage("subspace_ritz_projection_seconds"):
+                before = self.seconds["gram"]
+                self._timed("gram", overlap)
+                self.overlap_seconds += self.seconds["gram"] - before
+                self.rounds_seconds += perf_counter() - rounds_started
+                if on_device:
+                    parts = pairs
+                else:
+                    parts = self._timed(
+                        "gram", lambda index, device: np.asarray(cp.asnumpy(pairs[index]), dtype=np.float64)
+                    )
+                packed = self._summed(parts, on_device)
+                del parts, pairs
+                started = perf_counter()
+                packed = self._in_basis_order(packed, ordering, on_device)
+                self.seconds["gram"] += perf_counter() - started
+        else:
+            exchange = self._exchange_streams()
+            # The events of every device: waits between its two streams and the clocks of the stages.
+            clocks = self.map(lambda index, device: _RoundClock(cp, len(rounds)))
+
+            def depart(index, device, step):
+                stream = cp.cuda.get_current_stream()
+                start, left = clocks[index].leave[step]
+                start.record(stream)
+                leave(index, device, step)
+                # The exchange stream sends the slab from the workspace once this has passed.
+                left.record(stream)
+
+            def apply_departed(index, device, step):
+                stream = cp.cuda.get_current_stream()
+                start, done = clocks[index].apply[step]
+                start.record(stream)
+                if slabs[index][step].shape[1]:
+                    # H times the copy that has left, with the strides of the slab: the rows that
+                    # arrive meanwhile are written over the slab in the block.
+                    self._operator(device).apply_into(leaving[index][step], applied[index][step])
+                # The exchange stream sends H times the slab once this has passed.
+                done.record(stream)
+
+            def overlap_early(index, device, step):
+                stream = cp.cuda.get_current_stream()
+                start, end = clocks[index].overlap[step]
+                start.record(stream)
+                block = row_basis[index]
+                if block.shape[0]:
+                    for first, last in early.get(step, ()):
+                        # The product that _lower_triangle_product forms for this slab, into the pair
+                        # whose zeros it would have given above the slabs.
+                        pairs[index][0][first:, first:last] = transposed_product(
+                            cp, block[:, first:], block[:, first:last]
+                        )
+                end.record(stream)
+
+            def project_timed(index, device, step):
+                stream = cp.cuda.get_current_stream()
+                start, end = clocks[index].project[step]
+                start.record(stream)
+                project(index, device, step)
+                end.record(stream)
+
+            with stage("subspace_ritz_projection_seconds"):
+                try:
+                    for step in range(len(rounds)):
+                        self.map(lambda index, device: depart(index, device, step), synchronize=False)
+                        self._to_rows(
+                            [views[step] for views in leaving],
+                            places[step],
+                            edges,
+                            keep=True,
+                            targets=[views[step] for views in resident],
+                            buffers=buffers,
+                            streams=exchange,
+                            after=[clock.leave[step][1] for clock in clocks],
+                            marks=[clock.rows[step] for clock in clocks],
+                            # Behind the pack, beside the copies of the slab.
+                            between=lambda: self.map(
+                                lambda index, device: apply_departed(index, device, step), synchronize=False
+                            ),
+                        )
+                        self._to_rows(
+                            [views[step] for views in applied],
+                            places[step],
+                            edges,
+                            keep=True,
+                            targets=[views[step] for views in arriving],
+                            buffers=buffers,
+                            streams=exchange,
+                            after=[clock.apply[step][1] for clock in clocks],
+                            marks=[clock.applied_rows[step] for clock in clocks],
+                            # Behind the pack, beside the copies of H times the slab.
+                            between=(
+                                lambda: self.map(
+                                    lambda index, device: overlap_early(index, device, step), synchronize=False
+                                )
+                            )
+                            if early
+                            else None,
+                        )
+                        # The rows of H times the slab have arrived: the host waited for every copy.
+                        self.map(lambda index, device: project_timed(index, device, step), synchronize=False)
+                    if early:
+                        # Every compute stream has done what the rounds queued on it.
+                        self._timed("gram", lambda index, device: None)
+                    else:
+                        before = self.seconds["gram"]
+                        self._timed("gram", overlap)
+                        self.overlap_seconds += self.seconds["gram"] - before
+                except BaseException:
+                    self._quiesce()
+                    raise
+                self.rounds_seconds += perf_counter() - rounds_started
+                # Device seconds of the stages, summed over the rounds on every device: the most of a device.
+                spent = self.map(lambda index, device: clocks[index].seconds(cp, bool(early)))
+                del clocks
+                for name in ("apply", "to_rows", "gram"):
+                    self.seconds[name] += max(seconds[name] for seconds in spent)
+                self.overlap_seconds += max(seconds["overlap"] for seconds in spent)
+                if on_device:
+                    parts = pairs
+                else:
+                    parts = self._timed(
+                        "gram", lambda index, device: np.asarray(cp.asnumpy(pairs[index]), dtype=np.float64)
+                    )
+                packed = self._summed(parts, on_device)
+                del parts, pairs
+                started = perf_counter()
+                packed = self._in_basis_order(packed, ordering, on_device)
+                self.seconds["gram"] += perf_counter() - started
 
         try:
-            eigenvalues, coefficients, whitened = self._small_solve(packed, on_device, rows)
+            if handing == "rotation":
+                eigenvalues, coefficients, whitened = self._small_solve(packed, on_device, rows)
+            else:
+                solution = self._small_solve(
+                    packed, on_device, rows, handover=handing, values_condition_limit=values_condition_limit)
+                # Held apart, so that U can go as soon as it has been applied.
+                from dataclasses import replace
+
+                factor_h, solution = solution.factor, replace(solution, factor=None)
         except GeneralizedRitzStabilityError as error:
             del packed
             started = perf_counter()
@@ -3231,6 +4040,68 @@ class SectorDeviceGroup:
             error.filtered = DistributedBasis(self, columns, layout)
             raise
         del packed
+
+        if handing != "rotation":
+            product = None
+            with stage("subspace_ritz_handover_seconds"):
+                if solution.mode != "values":
+                    started = perf_counter()
+                    # U of the order of the factorization on row positions:
+                    # row p of a row block multiplies place hpos[p].
+                    factor = self._in_row_order(factor_h, hpos, on_device)
+                    del factor_h
+                    output_slabs = handover_slabs(spots, band, handover_slab_columns())
+
+                    def multiply(index, device):
+                        block = row_basis[index]
+                        if not block.shape[0]:
+                            return None
+                        if on_device:
+                            local = self._from_owner(cp, factor, device)
+                        else:
+                            local = cp.asarray(factor, dtype=cp.float64)
+                        # The whole slab workspace, which no round reads
+                        # any more (the tile of the rotation is its start).
+                        if tiles[index].size:
+                            buffer = cp.ndarray((work,), dtype=cp.float64, memptr=tiles[index].data)
+                        else:
+                            buffer = cp.empty(int(block.shape[0]) * max(b - a for a, b in output_slabs), dtype=cp.float64)
+                        return _triangular_in_place(block, local, buffer, output_slabs)
+
+                    ran = [item for item in self.map(multiply) if item is not None]
+                    product = ran[0] if ran else None
+                    del factor
+                    self.handover_slab_columns = max(b - a for a, b in output_slabs)
+                    self.handover_product = product
+                    self.seconds["handover"] += perf_counter() - started
+                else:
+                    del factor_h
+                started = perf_counter()
+                back()
+                self.seconds["to_columns"] += perf_counter() - started
+            coefficients = select = None
+            if solution.mode == "triangular":
+                # After the way back slot j holds the column of place
+                # hpos[positions[j]]: Z keeps the order of the factorization,
+                # and the record the row of Z of every slot, which spares a
+                # permuted copy of Z on the owner.
+                positions = np.empty_like(order)
+                positions[order] = np.arange(order.size)
+                select = hpos[positions]
+                with cp.cuda.Device(self.owner):
+                    coefficients = cp.asarray(solution.eigenvectors, dtype=cp.float64)
+            self.passes += 1
+            self.handover_band = band
+            self.count_handover(solution.mode if solution.note is None else f"{solution.mode} ({solution.note})")
+            return (
+                np.asarray(solution.eigenvalues, dtype=np.float64),
+                DistributedBasis(self, columns, layout),
+                solution.whitened,
+                HandoverStep(
+                    mode=solution.mode, coefficients=coefficients, condition=solution.condition,
+                    note=solution.note, band=band, product=product, rows=select,
+                ),
+            )
 
         with stage("subspace_ritz_rotation_seconds"):
             started = perf_counter()
@@ -3252,6 +4123,11 @@ class SectorDeviceGroup:
             back()
             self.seconds["to_columns"] += perf_counter() - started
         self.passes += 1
+        if handover != "rotation":
+            # A hand-over was asked for and the step rotated (a CHEBFF cycle
+            # whose first filter block is not leading in row order).
+            self.count_handover(f"rotation ({note})")
+            return eigenvalues, DistributedBasis(self, columns, layout), whitened, HandoverStep("rotation", note=note)
         return eigenvalues, DistributedBasis(self, columns, layout), whitened
 
     def orthonormal_ritz(self, operator: Any, filtered: DistributedBasis, generator):
@@ -3275,6 +4151,45 @@ class SectorDeviceGroup:
             cp.asnumpy(result.eigenvalues),
             self.scatter(result.wavefunctions, layout),
             cp.asnumpy(result.projected_hamiltonian),
+        )
+
+
+class _RoundClock:
+    """The events of the pipelined rounds of one device (:meth:`SectorDeviceGroup._ritz_one_block`).
+
+    Two per stage and round, recorded before and after the stage on the
+    stream that runs it: the leave, the apply, the slabs of the overlap and
+    the projection on the compute stream, the two conversions to the rows on
+    the exchange stream, each from behind its wait to its last copy.  The
+    end of the leave is also what the exchange stream waits for before it
+    sends the slab, and the end of the apply what it waits for before it
+    sends ``H`` times the slab.  Twelve events per round, created with the
+    step and never recorded twice.
+    """
+
+    STAGES = ("leave", "apply", "rows", "applied_rows", "overlap", "project")
+
+    def __init__(self, cp, rounds: int) -> None:
+        for name in self.STAGES:
+            setattr(self, name, [(cp.cuda.Event(), cp.cuda.Event()) for _ in range(rounds)])
+
+    def seconds(self, cp, overlap: bool) -> dict:
+        """The seconds of the stages over all rounds, once every event has completed.
+
+        ``to_rows`` holds the leave and both conversions, ``gram`` the
+        projection and, where the rounds formed them (``overlap``), the
+        slabs of the overlap, which ``overlap`` holds alone.
+        """
+
+        def spent(name):
+            return 1e-3 * sum(float(cp.cuda.get_elapsed_time(start, end)) for start, end in getattr(self, name))
+
+        early = spent("overlap") if overlap else 0.0
+        return dict(
+            apply=spent("apply"),
+            to_rows=spent("leave") + spent("rows") + spent("applied_rows"),
+            gram=spent("project") + early,
+            overlap=early,
         )
 
 
@@ -3379,12 +4294,15 @@ def run_distributed_chebff(
     settings: ChebFFSettings = ChebFFSettings(),
     spectral_bound: LanczosBoundResult | None = None,
     group: SectorDeviceGroup,
+    handover: str = "rotation",
 ) -> DeviceChebFFResult:
     """CHEBFF first solve with the trial basis spread over ``group``.
 
     Bounds, cycle count, degrees, sigma carry and the random stream are those
     of :func:`chebff.run_chebff`.  Every cycle uses the generalized Ritz
     solve; a failed stability audit falls back to QR on the owner.
+    ``handover="triangular"`` gives the cycles the modes of
+    :func:`chebff.first_solve_modes` (:meth:`SectorDeviceGroup.ritz_handover`).
     """
 
     cp, _ = require_cupy()
@@ -3410,9 +4328,13 @@ def run_distributed_chebff(
     lower_bound = _initial_filter_lower_bound(smallest_ritz, upper_bound)
     records: list[ChebFFCycle] = []
     host_eigenvalues = whitened = None
+    modes = first_solve_modes(handover, settings.filter_cycles)
+    handover_cycles: list[dict] = []
 
     for cycle_number in range(1, settings.filter_cycles + 1):
         lower_in, upper_in = lower_bound, upper_bound
+        asked = modes[cycle_number - 1]
+        step = None
         with device_stage(operator, "initial_filter_seconds"):
             filtered = group.filter(
                 basis, blocks, lower_bound, upper_bound, smallest_ritz,
@@ -3421,7 +4343,14 @@ def run_distributed_chebff(
         basis = None
         try:
             with device_stage(operator, "initial_projection_seconds"):
-                host_eigenvalues, basis, whitened = group.ritz(operator, filtered, stages=False)
+                if asked == "rotation":
+                    host_eigenvalues, basis, whitened = group.ritz(operator, filtered, stages=False)
+                else:
+                    host_eigenvalues, basis, whitened, step = group.ritz_handover(
+                        operator, filtered, stages=False, handover=asked, halves=None,
+                        leading=settings.block_size,
+                        values_condition_limit=first_cycle_condition_limit() if asked == "values" else 0.0,
+                    )
         except GeneralizedRitzStabilityError as error:
             filtered = error.filtered
         if basis is None:
@@ -3431,7 +4360,13 @@ def run_distributed_chebff(
                 host_eigenvalues, basis, whitened = group.orthonormal_ritz(
                     operator, filtered, basis_generator
                 )
+            step = HandoverStep("rotation", note="QR fallback")
         del filtered
+        if handover != "rotation":
+            if asked == "rotation" and step is None:
+                group.count_handover("rotation (last cycle)")
+                step = HandoverStep("rotation", note="last cycle")
+            handover_cycles.append(step.summary())
         if host_eigenvalues.shape != (wanted_states,):
             raise RuntimeError("Rayleigh--Ritz changed the working state count")
         smallest_ritz = float(host_eigenvalues[0])
@@ -3468,6 +4403,7 @@ def run_distributed_chebff(
         lanczos_bound=bound,
         cycles=tuple(records),
         last_rayleigh_ritz=_ritz_result(cp, eigenvalues, basis, whitened),
+        handover_cycles=tuple(handover_cycles),
     )
 
 
@@ -3480,11 +4416,16 @@ def run_distributed_subspace(
     spectral_bound: LanczosBoundResult | None = None,
     consume_state: bool = True,
     group: SectorDeviceGroup,
+    handover: str = "rotation",
 ) -> DeviceSubspaceResult:
     """One later-SCF filter and Ritz pass on a :class:`DistributedBasis`.
 
     Bounds, degree adaptation and block layout are those of
     :func:`subspace.run_subspace_filter`.  The saved basis is always consumed.
+    ``handover="triangular"`` hands over ``X L^-T`` with the lower half of
+    the degree split kept apart (:meth:`SectorDeviceGroup.ritz_handover`);
+    a pending trim of a hand-over is carried out as in
+    :func:`subspace.run_subspace_filter`.
     """
 
     if compute_residuals:
@@ -3492,6 +4433,12 @@ def run_distributed_subspace(
     if not isinstance(state.vectors, DistributedBasis):
         raise TypeError("saved vectors are not a distributed basis")
     cp, _ = require_cupy()
+    if state.handover is not None and state.handover.rotated:
+        state = as_ritz_state(state)
+    pending = None if state.handover is None else state.handover.pending_count
+    # The filter overwrites the basis that they describe.
+    release_coefficients(state.handover)
+    mode = "triangular" if handover == "triangular" and pending is None else "rotation"
     _validate_state(operator, state)
     lower_bound = _next_filter_lower_bound(state)
     generator = np.random.default_rng(settings.random_seed + state.filters_completed)
@@ -3513,13 +4460,27 @@ def run_distributed_subspace(
         )
     generalized_ritz_failed = state.generalized_ritz_failed
     host_eigenvalues = basis = whitened = None
+    step, note = None, None
     if not generalized_ritz_failed:
         try:
             with device_stage(operator, "subspace_ritz_seconds"):
-                host_eigenvalues, basis, whitened = group.ritz(operator, filtered, stages=True)
+                if mode == "rotation":
+                    host_eigenvalues, basis, whitened = group.ritz(operator, filtered, stages=True)
+                else:
+                    # The lower half of the degree split of the next filter.
+                    halves = (
+                        sum(b.stop - b.start for b in blocks if b.degree == degree - settings.degree_delta)
+                        if settings.degree_delta
+                        else None
+                    )
+                    host_eigenvalues, basis, whitened, step = group.ritz_handover(
+                        operator, filtered, stages=True, handover=mode, halves=halves)
         except GeneralizedRitzStabilityError as error:
             generalized_ritz_failed = True
             filtered = error.filtered
+            note = "QR fallback"
+    else:
+        note = "QR route"
     if basis is None:
         with device_stage(operator, "subspace_orthogonalization_seconds"):
             host_eigenvalues, basis, whitened = group.orthonormal_ritz(operator, filtered, generator)
@@ -3527,9 +4488,25 @@ def run_distributed_subspace(
     if host_eigenvalues.shape != (state.working_states,):
         raise RuntimeError("Rayleigh--Ritz changed the working state count")
     eigenvalues = cp.asarray(host_eigenvalues, dtype=cp.float64)
+    record = None
+    if step is not None and step.mode == "triangular":
+        record = RitzHandover(step.coefficients, group.owner, state.working_states, rows=step.rows)
+    working = state.working_states
+    if pending is not None:
+        # The trim that the hand-over before deferred, on Ritz vectors.
+        working = int(pending)
+        eigenvalues, basis = eigenvalues[:working], basis[:, :working]
+    handover_pass = None
+    if handover != "rotation" or pending is not None:
+        if step is None:
+            note = note or ("deferred trim" if pending is not None else None)
+            step = HandoverStep("rotation", note=note)
+            if handover != "rotation":
+                group.count_handover(f"rotation ({note})" if note else "rotation")
+        handover_pass = dict(step.summary(), deferred_trim=pending)
     next_state = DeviceSubspaceState(
         operator_dimension=state.operator_dimension,
-        working_states=state.working_states,
+        working_states=working,
         eigenvalues=eigenvalues,
         vectors=basis,
         filter_lower_bound=lower_bound,
@@ -3537,6 +4514,7 @@ def run_distributed_subspace(
         filters_completed=state.filters_completed + 1,
         ritz_workspace=None,
         generalized_ritz_failed=generalized_ritz_failed,
+        handover=record,
     )
     return DeviceSubspaceResult(
         eigenvalues=eigenvalues,
@@ -3547,6 +4525,7 @@ def run_distributed_subspace(
         polynomial_degree_used=degree,
         filter_blocks=blocks,
         rayleigh_ritz=_ritz_result(cp, eigenvalues, basis, whitened),
+        handover_pass=handover_pass,
     )
 
 

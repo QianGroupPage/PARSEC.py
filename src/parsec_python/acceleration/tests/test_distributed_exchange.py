@@ -32,11 +32,41 @@ from parsec_python.acceleration.Eigensolvers.lapack_random import LapackRandom
 # The package also exports a function named like this submodule.
 rayleigh_ritz = importlib.import_module('parsec_python.acceleration.Eigensolvers.rayleigh_ritz')
 
+# The tests of this module were written for the packed exchange (buffers, chunks, pack and unpack kernels) and
+# for the rounds of the Ritz step one stage after another, the defaults before 2026-10-22 and the values that
+# restore them: the module names those.  The tests of the pipelined rounds and of pitched copies name the
+# values they take, and those of the defaults remove both.
+_FORMER_STEP = dict(PARSEC_CUPY_EXCHANGE_STRIDED='0', PARSEC_CUPY_RITZ_PIPELINE='off')
+_FORMER_ENVIRONMENT = patch.dict(os.environ, _FORMER_STEP)
+
+
+def setUpModule():
+    _FORMER_ENVIRONMENT.start()
+
+
+def tearDownModule():
+    _FORMER_ENVIRONMENT.stop()
+
 
 class _Stream:
     def __init__(self, runtime, device):
         self.runtime, self.device_id, self.pending = runtime, device, []
         runtime.streams.append(self)
+        # A handle of its own, by which a pitched copy names it.
+        self.ptr = len(runtime.streams)
+        runtime.by_handle[self.ptr] = self
+
+    def wait_event(self, event):
+        # What is queued here after the wait runs after what the recording stream had queued before the record:
+        # the wait brings that stream's work up to the record about, when this stream gets to it.
+        if event.stream is None:
+            raise AssertionError('a stream waits for an event that was never recorded')
+        source, marker = event.stream, event.marker
+        self.queue(lambda: source.run_until(marker))
+
+    def run_until(self, marker):
+        while any(work is marker for work in self.pending):
+            self.pending.pop(0)()
 
     def __enter__(self):
         self.runtime.local.streams.append(self)
@@ -58,6 +88,26 @@ class _Stream:
         pending, self.pending = self.pending, []
         for work in pending:
             work()
+
+
+class _Event:
+    """Stands for a CUDA event: a mark in the work of the stream that recorded it."""
+
+    def __init__(self, runtime):
+        self.runtime, self.stream, self.marker = runtime, None, None
+
+    def record(self, stream=None):
+        stream = self.runtime.local.streams[-1] if stream is None else stream
+
+        def marker():
+            return None
+
+        self.stream, self.marker = stream, marker
+        stream.queue(marker)
+
+    @property
+    def done(self):
+        return self.stream is not None and not any(work is self.marker for work in self.stream.pending)
 
 
 class _Device:
@@ -163,12 +213,16 @@ def _stand_in(eager=False, total_bytes=0):
     # live, peak: elements per device in arrays that something still refers to, now and at most.
     # returned: (device, stream, sizes that the device had allocated by then) of every release of the free blocks
     # of one stream.
+    # by_handle: every stream by its handle; allocations: (start, stop, device) of every live array by its start;
+    # allocation_streams: the current stream of every new array, in the order of ``allocated``.
     runtime = SimpleNamespace(local=threading.local(), eager=eager, streams=[], allocated=[], copies=[], kernels=[],
-                              live={}, peak={}, lock=threading.Lock(), returned=[])
+                              live={}, peak={}, lock=threading.Lock(), returned=[], by_handle={}, allocations={},
+                              allocation_streams=[])
 
-    def release(device, size):
+    def release(device, size, start):
         with runtime.lock:
             runtime.live[device] -= size
+            runtime.allocations.pop(start, None)
 
     def empty(shape, dtype=np.float64, order='C'):
         # NaN stands for whatever a device block holds before it is written, and the least integer in an
@@ -178,12 +232,47 @@ def _stand_in(eager=False, total_bytes=0):
         start = array.__array_interface__['data'][0]
         array.runtime, array.device_id, array.allocation = runtime, runtime.local.device, (start, start + array.nbytes)
         runtime.allocated.append((array.device_id, array.size))
+        runtime.allocation_streams.append(runtime.local.streams[-1])
         with runtime.lock:
             live = runtime.live[array.device_id] = runtime.live.get(array.device_id, 0) + array.size
             runtime.peak[array.device_id] = max(runtime.peak.get(array.device_id, 0), live)
+            if array.nbytes:
+                runtime.allocations[start] = (start, start + array.nbytes, array.device_id)
         # Views keep the array they were taken from, so this runs when the last of them is gone.
-        weakref.finalize(array, release, array.device_id, array.size).atexit = False
+        weakref.finalize(array, release, array.device_id, array.size, start if array.nbytes else None).atexit = False
         return array
+
+    def allocation(first, last):
+        """The device of the live array whose memory holds the bytes ``first`` to ``last``, or None."""
+        with runtime.lock:
+            for start, stop, device in runtime.allocations.values():
+                if start <= first and last <= stop:
+                    return device
+        return None
+
+    def memcpy2d(target, target_pitch, source, source_pitch, width, height, _kind, handle):
+        # cudaMemcpy2DAsync: ``height`` lines of ``width`` bytes, each line ``pitch`` bytes after the one before.
+        stream = runtime.by_handle[handle]
+        written = allocation(target, target + (height - 1) * target_pitch + width)
+        read = allocation(source, source + (height - 1) * source_pitch + width)
+        if written is None or read is None:
+            raise AssertionError('a pitched copy leaves its allocation')
+        if written != stream.device_id:
+            raise AssertionError('an arriving copy must use a stream of the device it writes to')
+        if width > min(target_pitch, source_pitch):
+            raise AssertionError('the lines of a pitched copy overlap')
+        runtime.copies.append((written, read, stream))
+
+        def copy():
+            for line in range(height):
+                ctypes.memmove(target + line * target_pitch, source + line * source_pitch, width)
+
+        stream.queue(copy)
+
+    def elapsed(start, end):
+        if not (start.done and end.done):
+            raise AssertionError('the time between two events is read before both have passed')
+        return 1.0
 
     def ndarray(shape, dtype=np.float64, memptr=None, order='C'):
         count = int(np.prod(shape))
@@ -271,8 +360,12 @@ def _stand_in(eager=False, total_bytes=0):
     cuda = SimpleNamespace(
         Device=lambda device: _Device(runtime, device),
         Stream=lambda non_blocking=False: _Stream(runtime, runtime.local.device),
+        Event=lambda block=False, disable_timing=False, interprocess=False: _Event(runtime),
+        get_elapsed_time=elapsed,
         get_current_stream=lambda: runtime.local.streams[-1],
-        runtime=SimpleNamespace(memGetInfo=lambda: (total_bytes, total_bytes)),
+        runtime=SimpleNamespace(memGetInfo=lambda: (total_bytes, total_bytes), memcpyDefault=4, memcpy2DAsync=memcpy2d,
+                                deviceCanAccessPeer=lambda device, peer: 1, deviceEnablePeerAccess=lambda peer: None,
+                                CUDARuntimeError=RuntimeError),
     )
     return SimpleNamespace(
         empty=empty, ndarray=ndarray, float64=np.float64, dtype=np.dtype, cuda=cuda, zeros=zeros, asarray=asarray,
@@ -2301,6 +2394,27 @@ class ExchangePlanTests(unittest.TestCase):
         self.assertEqual(ends, [68, 68, 68, 97])
         self.assertGreater(max(ends), max(rows * 5, 5 * 17))
 
+    def test_fit_counts_no_buffer_for_the_pitched_exchange_of_the_default(self):
+        # The pitched exchange, the default since 2026-10-22, takes no buffer and the rule counts none: what the
+        # packed one counts less its chunk, at most 1 GiB and an eighth, with every count of tall blocks.  On
+        # the sectors of 23,768 to 39,368 electrons of the measured series, on two devices and on four.
+        gib = 1 << 30
+        with patch.dict(os.environ):
+            for name in ('PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES',
+                         'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS',
+                         'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS'):
+                os.environ.pop(name, None)
+            for blocks in ('1', '2', '3'):
+                os.environ['PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS'] = blocks
+                for rows, columns in ((3_786_832, 2978), (4_130_510, 3704), (5_660_200, 4928)):
+                    for devices in (2, 4):
+                        with self.subTest(blocks=blocks, rows=rows, devices=devices):
+                            os.environ.pop('PARSEC_CUPY_EXCHANGE_STRIDED', None)
+                            pitched = distributed_state.shared_block_bytes(rows, columns, devices)
+                            os.environ['PARSEC_CUPY_EXCHANGE_STRIDED'] = '0'
+                            packed = distributed_state.shared_block_bytes(rows, columns, devices)
+                            self.assertTrue(gib <= packed - pitched <= gib + gib // 8, packed - pitched)
+
     def test_fit_counts_one_tall_block_and_the_slab_workspace_unless_two_or_three_are_named(self):
         gib = 1 << 30
         cp, _runtime = _stand_in(total_bytes=160 * gib)
@@ -2810,7 +2924,9 @@ class ExchangeStandInTests(unittest.TestCase):
         # Blocks that follow each other are named by their ranges, as most callers name them.
         ranges = layout if layout is widths else _columns(widths)
         host = np.random.default_rng(53).normal(size=(rows, layout.columns))
-        with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)), patch.dict(os.environ, environment):
+        # Pitched copies ask for peer access once per pair and process: the stand-in's devices are not the GPUs'.
+        with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)), patch.dict(os.environ, environment), \
+             patch.object(distributed_state, '_PEER_ACCESS', set()):
             owner = _Owner(cp, devices)
             group = distributed_state.SectorDeviceGroup(owner, devices)
             edges = group.row_edges(rows)
@@ -2892,6 +3008,30 @@ class ExchangeStandInTests(unittest.TestCase):
                 fetched = [sum((owner, source) == (device, other) for owner, source, _stream in to_columns.copies)
                            for other in range(4) if other != device]
                 self.assertEqual((sent, fetched), ([runs[device]] * 3,) * 2)
+
+    def test_pitched_copies_move_every_entry_one_copy_per_piece_with_no_kernel_and_no_buffer(self):
+        # PARSEC_CUPY_EXCHANGE_STRIDED=1, with the switches of the exchange as they are by default and all off;
+        # a chunk size that is named changes nothing, since no buffer limits a step.
+        strided = dict(PARSEC_CUPY_EXCHANGE_STRIDED='1')
+        self._every_layout(**strided)
+        self._every_layout(PARSEC_CUPY_EXCHANGE_CONCURRENT='0', PARSEC_CUPY_EXCHANGE_COLUMN_COPIES='0',
+                           PARSEC_CUPY_EXCHANGE_PAIRS='0', **strided)
+        for rows, layout, runs in ((257, (6, 6, 6, 5), 1), (*_TWO_RANGES[0], 2)):
+            for switches in ({}, dict(PARSEC_CUPY_EXCHANGE_PAIRS='0'), dict(PARSEC_CUPY_EXCHANGE_CONCURRENT='0')):
+                with self.subTest(layout=getattr(layout, 'parts', layout), switches=switches):
+                    group, to_rows, to_columns = self._round_trip(rows, layout, **strided, **switches)
+                    self.assertEqual((group.exchange_copies, group.exchange_buffer_bytes), ('strided', 0))
+                    # One copy from every peer per column range of the sender (to the rows) or of the receiver
+                    # (back), whatever the chunk; the only kernels copy the rows that stay on a device.
+                    for asked in (to_rows, to_columns):
+                        for device in range(4):
+                            sources = sorted(source for owner, source, _stream in asked.copies if owner == device)
+                            self.assertEqual(sources, sorted([other for other in range(4) if other != device] * runs))
+                        self.assertEqual(len(asked.kernels), 4 * runs)
+                    # No buffer, and to the rows nothing but the row blocks.
+                    self.assertEqual(len(to_rows.allocated), 4)
+                    self.assertEqual(group.to_rows_copies, 'queued' if switches.get('PARSEC_CUPY_EXCHANGE_CONCURRENT') == '0'
+                                     else 'together' if switches else 'pairs')
 
     def test_concurrent_receives_use_one_stream_per_source(self):
         # Four devices that take no turns on the way to their rows: every device receives from all at once.
@@ -3297,13 +3437,14 @@ class RitzStandInTests(unittest.TestCase):
     # The host solve with its defaults, whatever the calling shell exports.
     settings = dict(PARSEC_CUPY_RITZ_DENSE_BACKEND='host', PARSEC_CUPY_RITZ_EIGH_BACKEND='host', PARSEC_CUPY_RITZ_SYRK='auto',
                     PARSEC_CUPY_RITZ_GRAM_SLABS='8', PARSEC_CUPY_GENERALIZED_RITZ_CONDITION_MAX='1e8',
-                    PARSEC_CUPY_DISTRIBUTED_STATE_RANGES='fixed')
+                    PARSEC_CUPY_DISTRIBUTED_STATE_RANGES='fixed', **_FORMER_STEP)
     unset = ('PARSEC_CUPY_RITZ_CONDITION', 'PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_ROTATE_COLUMN_COPY',
              'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES', 'PARSEC_CUPY_EXCHANGE_CONCURRENT', 'PARSEC_CUPY_EXCHANGE_COLUMN_COPIES',
              'PARSEC_CUPY_EXCHANGE_PAIRS', 'PARSEC_CUPY_DISTRIBUTED_STATE_SLABS', 'PARSEC_CUPY_RITZ_CONDITION_HELPER',
              'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_RITZ_GRAM_MULTIPLE',
              'PARSEC_CUPY_DISTRIBUTED_STATE_POOL_RELEASE', 'PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS',
-             'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS')
+             'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS',
+             'PARSEC_CUPY_RITZ_PIPELINE', 'PARSEC_CUPY_EXCHANGE_STRIDED')
 
     def _step(self, rows, widths, blocks, *, eager=False, unstable=False, roomy=False, hartree_device=None,
               device_bytes=0, **environment):
@@ -3380,7 +3521,8 @@ class RitzStandInTests(unittest.TestCase):
              patch.object(rayleigh_ritz, 'require_cupy', lambda: (cp, None)), \
              patch.object(distributed_state, 'solve_whitened_ritz', small_solve), \
              patch.object(distributed_state, 'solve_whitened_ritz_on_device', device_solve), \
-             patch.object(distributed_state, '_device_overlap_condition', estimate), patch.dict(os.environ):
+             patch.object(distributed_state, '_device_overlap_condition', estimate), patch.dict(os.environ), \
+             patch.object(distributed_state, '_PEER_ACCESS', set()):
             for name in self.unset + ('PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',):
                 os.environ.pop(name, None)
             os.environ.update(self.settings, **{name: value for name, value in environment.items() if value is not None})
@@ -4172,6 +4314,114 @@ class RitzStandInTests(unittest.TestCase):
                         self.assertTrue(0 < on_own < len(paired.copies) if turns else on_own == 0)
                         own = {together.group._stream(device) for device in range(4)}
                         self.assertFalse(any(stream in own for _device, _source, stream in together.copies))
+
+    # ----- the pipelined rounds (PARSEC_CUPY_RITZ_PIPELINE) and pitched copies (PARSEC_CUPY_EXCHANGE_STRIDED) -----
+
+    _PIPELINED = (('p1', '0'), ('p2', '0'), ('off', '1'), ('p1', '1'), ('p2', '1'))
+
+    def _pipelined_settings(self, rows, slab, cut):
+        """Slabs of ``slab`` columns, so that a step takes many rounds, a few columns per chunk, and the overlap cut by ``cut``."""
+        return dict(cut, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8 * rows * slab), PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * 193))
+
+    def test_the_pipelined_rounds_and_pitched_copies_give_the_bits_of_the_step_as_it_was(self):
+        # Two, three and four devices, devices without columns, fewer rows than devices and two column ranges per
+        # device; slabs of one and two columns; the overlap in slabs of two columns, then as a count of three
+        # slabs; both stream orders.  Lazy streams run their work only when something waits for it, so a write
+        # that another stream reads without a wait would show as NaN or as values of an earlier round.
+        cases = ((257, (6, 6, 6, 5)), (257, (23, 0, 0, 0)), (257, (12, 11)), (61, (5, 0, 9)), (3, (1, 1, 0, 1)),
+                 _TWO_RANGES[0])
+        for rows, widths in cases:
+            for slab, cut in ((1, dict(PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS='2')),
+                              (2, dict(PARSEC_CUPY_RITZ_GRAM_SLABS='3'))):
+                for eager in (False, True):
+                    settings = self._pipelined_settings(rows, slab, cut)
+                    reference = self._step(rows, widths, 1, eager=eager, roomy=True, **settings)
+                    self._assert_ritz_pairs(reference)
+                    self.assertEqual((reference.group.pipeline, reference.group.stage_clock), ('off', 'host'))
+                    for mode, strided in self._PIPELINED:
+                        with self.subTest(rows=rows, widths=getattr(widths, 'parts', widths), slab=slab, cut=cut,
+                                          eager=eager, mode=mode, strided=strided):
+                            run = self._step(rows, widths, 1, eager=eager, roomy=True, PARSEC_CUPY_RITZ_PIPELINE=mode,
+                                             PARSEC_CUPY_EXCHANGE_STRIDED=strided, **settings)
+                            self._assert_ritz_pairs(run)
+                            # The Gram pair that the small solve was given, the Ritz values and the rotated basis.
+                            for one, other in zip(run.gram + (run.values, run.rotated),
+                                                  reference.gram + (reference.values, reference.rotated), strict=True):
+                                np.testing.assert_array_equal(one, other)
+                            group = run.group
+                            self.assertEqual((group.pipeline, group.stage_clock, group.exchange_copies),
+                                             (mode, 'host' if mode == 'off' else 'events',
+                                              'strided' if strided == '1' else 'packed'))
+                            self.assertGreater(group.rounds_seconds, 0.)
+                            # Pieces crossed between the same devices; pitched ones need no buffer.
+                            self.assertEqual({(device, source) for device, source, _stream in run.copies},
+                                             {(device, source) for device, source, _stream in reference.copies})
+                            self.assertEqual(group.exchange_buffer_bytes == 0, strided == '1' or not any(
+                                rows > height and width for height, width in zip(self._heights(rows, len(run.layout.parts)),
+                                                                                  run.layout.widths)))
+                            # Only where the rounds run side by side is there an exchange stream, and nothing
+                            # was allocated under it.
+                            exchange = {id(stream) for stream in group._exchange.values()}
+                            self.assertEqual(len(exchange), 0 if mode == 'off' else len(run.layout.parts))
+                            self.assertFalse(any(id(stream) in exchange for stream in run.runtime.allocation_streams))
+
+    def test_the_defaults_take_the_pipelined_rounds_and_pitched_copies_with_the_bits_of_the_former_step(self):
+        # Both switches unset, as since 2026-10-22: p2 and pitched copies, with the bits of the former step that
+        # the class names (off and the packed exchange); lazy and eager streams.
+        unset = dict(PARSEC_CUPY_RITZ_PIPELINE=None, PARSEC_CUPY_EXCHANGE_STRIDED=None)
+        for rows, widths in ((257, (6, 6, 6, 5)), (257, (12, 11)), (61, (5, 0, 9)), _TWO_RANGES[0]):
+            for eager in (False, True):
+                with self.subTest(rows=rows, widths=getattr(widths, 'parts', widths), eager=eager):
+                    settings = self._pipelined_settings(rows, 1, dict(PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS='2'))
+                    former = self._step(rows, widths, 1, eager=eager, roomy=True, **settings)
+                    self.assertEqual((former.group.pipeline, former.group.exchange_copies), ('off', 'packed'))
+                    run = self._step(rows, widths, 1, eager=eager, roomy=True, **settings, **unset)
+                    self._assert_ritz_pairs(run)
+                    self.assertEqual((run.group.pipeline, run.group.stage_clock, run.group.exchange_copies,
+                                      run.group.exchange_buffer_bytes), ('p2', 'events', 'strided', 0))
+                    for one, other in zip(run.gram + (run.values, run.rotated),
+                                          former.gram + (former.values, former.rotated), strict=True):
+                        np.testing.assert_array_equal(one, other)
+
+    def test_a_wait_left_out_of_the_pipelined_rounds_leaves_values_that_were_not_there_yet(self):
+        # The exchange stream of a device waits for the leave of the slab before it sends it and for the apply
+        # before it sends H times the slab.  Without either wait, lazy streams send the workspace before the
+        # compute stream has written it: the comparison of the test above sees that.
+        original = distributed_state.SectorDeviceGroup._to_rows
+        settings = self._pipelined_settings(257, 1, dict(PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS='2'))
+        reference = self._step(257, (6, 6, 6, 5), 1, roomy=True, **settings)
+        for dropped in ('leave', 'apply'):
+            for mode, strided in self._PIPELINED[:2] + self._PIPELINED[3:]:
+                calls = itertools.count()
+
+                def without_the_wait(group, *args, after=None, **options):
+                    # The conversions of a round alternate: the slab, then H times it.
+                    if after is not None and next(calls) % 2 == (dropped == 'apply'):
+                        after = None
+                    return original(group, *args, after=after, **options)
+
+                with self.subTest(dropped=dropped, mode=mode, strided=strided), \
+                     patch.object(distributed_state.SectorDeviceGroup, '_to_rows', without_the_wait):
+                    run = self._step(257, (6, 6, 6, 5), 1, roomy=True, PARSEC_CUPY_RITZ_PIPELINE=mode,
+                                     PARSEC_CUPY_EXCHANGE_STRIDED=strided, **settings)
+                    self.assertFalse(all(np.array_equal(one, other) for one, other in zip(run.gram, reference.gram)))
+
+    def test_the_steps_with_two_and_three_tall_blocks_do_not_pipeline_and_take_pitched_copies_with_the_same_bits(self):
+        for rows, widths in ((257, (6, 6, 6, 5)), (61, (5, 0, 9)), _TWO_RANGES[0]):
+            for blocks in (2, 3):
+                for eager in (False, True):
+                    settings = dict(PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8 * 193), PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8 * rows * 2))
+                    reference = self._step(rows, widths, blocks, eager=eager, **settings)
+                    for mode, strided in self._PIPELINED:
+                        with self.subTest(rows=rows, blocks=blocks, eager=eager, mode=mode, strided=strided):
+                            run = self._step(rows, widths, blocks, eager=eager, PARSEC_CUPY_RITZ_PIPELINE=mode,
+                                             PARSEC_CUPY_EXCHANGE_STRIDED=strided, **settings)
+                            self._assert_ritz_pairs(run)
+                            for one, other in zip(run.gram + (run.values, run.rotated),
+                                                  reference.gram + (reference.values, reference.rotated), strict=True):
+                                np.testing.assert_array_equal(one, other)
+                            self.assertEqual((run.group.pipeline, run.group.stage_clock), ('off', 'host'))
+                            self.assertEqual(run.group._exchange, {})
 
     def test_the_slab_limit_of_two_devices_and_the_turns_of_four_leave_each_other_alone(self):
         # The two switches of a shared basis that came together, in the step with one tall block.  A

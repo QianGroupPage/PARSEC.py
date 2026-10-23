@@ -28,8 +28,9 @@ from ..models import AcceleratedSinglePointResult
 # memory; reference_static_cache and orbital_operator_cache of the detailed
 # report do. So is the recurrence kernel of the filter that the stencils were
 # built with (PARSEC_CUPY_STENCIL_KERNEL), which an unset variable does not
-# show. Everything remains in backend_info; this allowlist controls text
-# presentation only.
+# show, and what the Ritz steps of the sectors handed over
+# (PARSEC_CUPY_RITZ_HANDOVER). Everything remains in backend_info; this
+# allowlist controls text presentation only.
 _SUMMARY_DETAIL_KEYS = frozenset({
     "symmetry_cache_directory",
     "finite_difference_builder",
@@ -40,6 +41,7 @@ _SUMMARY_DETAIL_KEYS = frozenset({
     "orbital_sector_later_filter_precision",
     "gpu_stencil_kernel",
     "orbital_sector_stencil_kernel",
+    "orbital_sector_ritz_handover",
     "orbital_symmetry",
     "hartree_symmetry",
 })
@@ -475,6 +477,11 @@ class AcceleratedTextReporter:
                     f"     Ritz rotation      = {stats.subspace_ritz_rotation_seconds:12.6f}",
                 ]
             )
+            # Only where a hand-over ran (PARSEC_CUPY_RITZ_HANDOVER): its
+            # triangular products, beside the full rotations above.
+            handover_seconds = getattr(stats, "subspace_ritz_handover_seconds", 0.0)
+            if handover_seconds:
+                lines.append(f"     Ritz hand-over     = {handover_seconds:12.6f}")
         if stats.eigensolver_scheduler_batches:
             lines.extend(
                 [

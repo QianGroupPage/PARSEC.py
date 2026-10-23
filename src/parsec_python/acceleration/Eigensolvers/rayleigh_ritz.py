@@ -10,6 +10,13 @@ import numpy as np
 from scipy.linalg import solve_triangular
 
 from ..backends.cupy import device_stage, require_cupy
+from .handover import (
+    HANDOVER_MODES,
+    HandoverStep,
+    handover_product,
+    handover_slab_columns,
+    uniform_slabs,
+)
 from .small_dense import symmetric_eigh
 from .tall_product import transposed_product
 
@@ -41,6 +48,9 @@ class DeviceRayleighRitzResult:
     residual_norms: Any | None
     workspace: Any | None = None
     algorithm: str = "orthonormal_rayleigh_ritz"
+    # What the step handed over where a hand-over was asked for
+    # (:class:`handover.HandoverStep`); None for the rotation that was asked.
+    handover: Any | None = None
 
 
 def generalized_ritz_requested(row_count: int, column_count: int) -> bool:
@@ -714,6 +724,143 @@ def _rotate_in_place(
             matrix[start:stop, :] = product
 
 
+def _triangular_in_place(
+    matrix: Any,
+    factor: Any,
+    buffer: Any,
+    slabs,
+    product: str | None = None,
+) -> str:
+    """Overwrite ``matrix`` with ``matrix @ factor`` where ``factor[b:, a:b]`` is zero for every slab ``(a, b)``.
+
+    ``slabs`` are consecutive output slabs that cover the columns; the
+    factor of a hand-over is upper triangular in the order of the columns,
+    or upper triangular but for dense diagonal blocks that lie inside one
+    slab each (:func:`handover.handover_slabs`).  Output slab ``(a, b)`` is
+    then ``matrix[:, :b] @ factor[:b, a:b]``: every product runs over the
+    leading ``b`` columns only, which is about half of the flops of a
+    rotation by a full matrix.
+
+    ``buffer`` is the workspace of the step, a contiguous float64 array that
+    shares no memory with ``matrix``.  :func:`handover.handover_product`
+    says how the product is cut.  ``columns``: the slabs from the last to
+    the first, each one DGEMM over all rows into the buffer and copied into
+    its columns; a slab reads only columns before its end, which no slab
+    after it in this order has written.  ``tiles``, and wherever the buffer
+    cannot hold the widest slab in all rows: per tile of rows of all
+    columns, as many as the buffer holds, one DGEMM per slab into the tile,
+    which goes back as in :func:`_rotate_in_place`.  Returns the product
+    that ran.
+    """
+
+    cp, _ = require_cupy()
+    rows, columns = map(int, matrix.shape)
+    if tuple(factor.shape) != (columns, columns):
+        raise ValueError("a triangular hand-over needs a square factor")
+    slabs = tuple((int(first), int(last)) for first, last in slabs)
+    if (
+        not slabs
+        or slabs[0][0] != 0
+        or slabs[-1][1] != columns
+        or any(last <= first for first, last in slabs)
+        or any(earlier[1] != later[0] for earlier, later in zip(slabs[:-1], slabs[1:]))
+    ):
+        raise ValueError("the output slabs must cover the columns in order")
+    if buffer.dtype != cp.dtype(cp.float64) or not (
+        buffer.flags.c_contiguous or buffer.flags.f_contiguous
+    ):
+        raise ValueError("the buffer of a triangular product must be contiguous float64")
+    elements = int(buffer.size)
+    widest = max(last - first for first, last in slabs)
+    kind = handover_product() if product is None else str(product)
+    if kind not in ("columns", "tiles"):
+        raise ValueError("a triangular product is cut by columns or by tiles")
+    if kind == "columns" and rows * widest > elements:
+        kind = "tiles"
+    if kind == "tiles" and elements < columns:
+        raise ValueError("the buffer of a triangular product holds no row of all columns")
+    if not rows:
+        return kind
+    factors = cp.asfortranarray(factor, dtype=cp.float64)
+    direct = bool(matrix.flags.f_contiguous and matrix.dtype == cp.dtype(cp.float64))
+    if direct:
+        try:
+            from cupy.cuda import cublas
+
+            one = np.asarray(1.0, dtype=np.float64)
+            zero = np.asarray(0.0, dtype=np.float64)
+            handle = cp.cuda.device.get_cublas_handle()
+            cublas.setStream(handle, cp.cuda.get_current_stream().ptr)
+        except Exception:
+            direct = False
+    stream = cp.cuda.get_current_stream()
+    if kind == "columns":
+        for first, last in reversed(slabs):
+            width = last - first
+            out = cp.ndarray(
+                (rows, width), dtype=cp.float64, memptr=buffer.data, order="F"
+            )
+            if direct:
+                cublas.dgemm(
+                    handle,
+                    cublas.CUBLAS_OP_N,
+                    cublas.CUBLAS_OP_N,
+                    rows,
+                    width,
+                    last,
+                    one.ctypes.data,
+                    matrix.data.ptr,
+                    rows,
+                    factors.data.ptr + 8 * first * columns,
+                    columns,
+                    zero.ctypes.data,
+                    out.data.ptr,
+                    rows,
+                )
+                # The columns of a slab are one piece of a column-major array.
+                (matrix.data + 8 * first * rows).copy_from_device_async(
+                    out.data, 8 * rows * width, stream
+                )
+            else:
+                out[...] = matrix[:, :last] @ factors[:last, first:last]
+                matrix[:, first:last] = out
+        return kind
+    tile = min(rows, elements // columns)
+    rotated = cp.ndarray((tile, columns), dtype=cp.float64, memptr=buffer.data, order="F")
+    column_copy = _column_copy_requested()
+    for start in range(0, rows, tile):
+        stop = min(rows, start + tile)
+        product_rows = rotated[: stop - start]
+        for first, last in slabs:
+            if direct:
+                cublas.dgemm(
+                    handle,
+                    cublas.CUBLAS_OP_N,
+                    cublas.CUBLAS_OP_N,
+                    stop - start,
+                    last - first,
+                    last,
+                    one.ctypes.data,
+                    matrix.data.ptr + 8 * start,
+                    rows,
+                    factors.data.ptr + 8 * first * columns,
+                    columns,
+                    zero.ctypes.data,
+                    rotated.data.ptr + 8 * first * tile,
+                    tile,
+                )
+            else:
+                product_rows[:, first:last] = (
+                    cp.ascontiguousarray(matrix[start:stop, :last]) @ factors[:last, first:last]
+                )
+        # Each tile is read completely before any of its rows is rewritten.
+        if column_copy:
+            matrix[start:stop, :].T[...] = product_rows.T
+        else:
+            matrix[start:stop, :] = product_rows
+    return kind
+
+
 def solve_whitened_ritz(
     raw_overlap: np.ndarray,
     raw_projection: np.ndarray,
@@ -847,11 +994,12 @@ def _device_overlap_condition(overlap: Any) -> float:
     return float(np.linalg.cond(cp.asnumpy(overlap)))
 
 
-def _judge_condition(estimate, *arguments) -> None:
+def _judge_condition(estimate, *arguments) -> float:
     """Raise unless ``estimate(*arguments)`` is a safe condition number of the overlap.
 
     The first two audits of the device solve: an estimate that fails, then
-    a number that is not finite or beyond the limit.
+    a number that is not finite or beyond the limit.  Returns the number,
+    which the hand-over judges once more (:func:`solve_whitened_handover_on_device`).
     """
 
     try:
@@ -870,6 +1018,7 @@ def _judge_condition(estimate, *arguments) -> None:
         raise GeneralizedRitzStabilityError(
             f"filtered overlap condition number {condition:.3e} is unsafe"
         )
+    return float(condition)
 
 
 def solve_whitened_ritz_on_device(
@@ -981,6 +1130,230 @@ def solve_whitened_ritz_on_device(
     return eigenvalues, coefficients, whitened
 
 
+@dataclass(frozen=True)
+class WhitenedHandover:
+    """The small solve of a hand-over (:func:`solve_whitened_handover_on_device`).
+
+    ``mode`` is what ran: ``triangular``, ``factor`` or ``values`` (which
+    becomes ``factor`` above its condition limit, ``note`` says so).
+    ``eigenvalues`` are ascending; ``factor`` is ``U = L^-T``, upper
+    triangular and Fortran-ordered in the order of the given pair (None for
+    ``values``); ``eigenvectors`` the ``Z`` of the whitened matrix
+    (``triangular`` only); ``whitened`` that matrix; ``condition`` the
+    estimate of the overlap that the solve judged.
+    """
+
+    mode: str
+    eigenvalues: Any
+    factor: Any | None
+    eigenvectors: Any | None
+    whitened: Any
+    condition: float
+    note: str | None = None
+
+
+def _values_note(mode: str, condition: float, limit: float) -> tuple[str, str | None]:
+    """``values`` within its limit, else ``factor`` and why."""
+
+    if mode != "values":
+        return mode, None
+    limit = float(limit)
+    if limit > 0.0 and condition <= limit:
+        return mode, None
+    if limit <= 0.0:
+        return "factor", "values not allowed"
+    # The number itself is the condition of the step.
+    return "factor", "condition above the values limit"
+
+
+def _handover_mode(mode: str) -> str:
+    mode = str(mode)
+    if mode not in HANDOVER_MODES or mode == "rotation":
+        raise ValueError("a hand-over solve is triangular, factor or values")
+    return mode
+
+
+def solve_whitened_handover_on_device(
+    raw_overlap: Any,
+    raw_projection: Any,
+    condition: Any | None = None,
+    *,
+    mode: str,
+    values_condition_limit: float = 0.0,
+) -> WhitenedHandover:
+    """The small solve of a hand-over on the current device.
+
+    Mirror, condition number, Cholesky factorization, both triangular solves
+    and the finiteness check are those of :func:`solve_whitened_ritz_on_device`,
+    statement for statement, with its errors in their order, so that the Ritz
+    values of ``triangular`` (``eigh`` of the same whitened matrix) are those
+    of the rotation, bit for bit.  ``factor`` and ``values`` take the values
+    alone (``eigvalsh``).  No ``C`` is formed: unless ``values`` ran, ``U =
+    L^-T`` is, and audited as the coefficients are,
+    ``max |U.T S U - I| <= 5e-10``.  ``values`` asked where the condition
+    number exceeds ``values_condition_limit`` (always with 0) runs as
+    ``factor``.  ``condition`` is that of the rotation's solve.
+    """
+
+    import cupyx
+    from cupyx.scipy.linalg import solve_triangular as device_solve_triangular
+
+    mode = _handover_mode(mode)
+    cp, _ = require_cupy()
+    lower = cp.tril(raw_overlap)
+    overlap = lower + cp.tril(lower, -1).T
+    lower = cp.tril(raw_projection)
+    projected = lower + cp.tril(lower, -1).T
+    del lower
+    waiting = []
+    judged = None
+    if condition is None:
+        judged = _judge_condition(_device_overlap_condition, overlap)
+    else:
+        cp.cuda.get_current_stream().synchronize()
+        waiting.append(condition(overlap))
+    try:
+        with cupyx.errstate(linalg="raise"):
+            cholesky = cp.asfortranarray(cp.linalg.cholesky(overlap))
+            left_projected = device_solve_triangular(
+                cholesky,
+                projected,
+                lower=True,
+            )
+            whitened = device_solve_triangular(
+                cholesky,
+                left_projected.T,
+                lower=True,
+            ).T
+            if not bool(cp.isfinite(whitened).all().item()):
+                raise np.linalg.LinAlgError("whitened projection is not finite")
+            if mode == "triangular":
+                eigenvalues, whitened_vectors = cp.linalg.eigh(whitened)
+            else:
+                eigenvalues = cp.linalg.eigvalsh(whitened)
+                whitened_vectors = None
+    except np.linalg.LinAlgError as error:
+        if waiting:
+            _judge_condition(waiting.pop())
+        raise GeneralizedRitzStabilityError(
+            "filtered overlap Cholesky/Ritz solve failed"
+        ) from error
+    except BaseException:
+        if waiting:
+            _judge_condition(waiting.pop())
+        raise
+    if waiting:
+        judged = _judge_condition(waiting.pop())
+    mode, note = _values_note(mode, judged, values_condition_limit)
+    factor = None
+    if mode != "values":
+        columns = int(overlap.shape[0])
+        factor = cp.asfortranarray(
+            device_solve_triangular(
+                cp.asfortranarray(cholesky.T),
+                cp.eye(columns, dtype=cp.float64),
+                lower=False,
+            )
+        )
+        factor_overlap = factor.T @ overlap @ factor
+        audit_error = float(
+            cp.abs(factor_overlap - cp.eye(columns, dtype=cp.float64)).max().item()
+        )
+        if not np.isfinite(audit_error) or audit_error > 5.0e-10:
+            raise GeneralizedRitzStabilityError(
+                f"generalized Ritz orthogonality audit failed ({audit_error:.3e})"
+            )
+    return WhitenedHandover(mode, eigenvalues, factor, whitened_vectors, whitened, float(judged), note)
+
+
+def solve_whitened_handover(
+    raw_overlap: np.ndarray,
+    raw_projection: np.ndarray,
+    *,
+    mode: str,
+    values_condition_limit: float = 0.0,
+) -> WhitenedHandover:
+    """The host counterpart of :func:`solve_whitened_handover_on_device`.
+
+    The algebra of :func:`solve_whitened_ritz` on the downloaded pair, with
+    its condition number and its errors.  The eigensolve of ``triangular``
+    follows ``PARSEC_CUPY_RITZ_EIGH_BACKEND`` as that of the rotation does;
+    ``factor`` and ``values`` take the values alone from the same place.
+    The arrays returned are host arrays.
+    """
+
+    mode = _handover_mode(mode)
+    overlap = _mirrored_lower(raw_overlap)
+    projected = _mirrored_lower(raw_projection)
+    try:
+        condition = _overlap_condition(overlap)
+    except np.linalg.LinAlgError as error:
+        raise GeneralizedRitzStabilityError(
+            "filtered overlap condition estimate failed"
+        ) from error
+    if not np.isfinite(condition) or condition > _generalized_condition_limit():
+        raise GeneralizedRitzStabilityError(
+            f"filtered overlap condition number {condition:.3e} is unsafe"
+        )
+    try:
+        cholesky = np.linalg.cholesky(overlap)
+        left_projected = solve_triangular(
+            cholesky,
+            projected,
+            lower=True,
+            check_finite=False,
+        )
+        whitened = solve_triangular(
+            cholesky,
+            left_projected.T,
+            lower=True,
+            check_finite=False,
+        ).T
+        dense_backend = os.environ.get("PARSEC_CUPY_RITZ_EIGH_BACKEND", "host").strip().lower()
+        whitened_vectors = None
+        if dense_backend == "cupy":
+            import cupyx
+
+            cp, _ = require_cupy()
+            with cupyx.errstate(linalg="raise"):
+                if mode == "triangular":
+                    device_values, device_vectors = cp.linalg.eigh(cp.asarray(whitened))
+                    whitened_vectors = cp.asnumpy(device_vectors)
+                else:
+                    device_values = cp.linalg.eigvalsh(cp.asarray(whitened))
+            host_eigenvalues = cp.asnumpy(device_values)
+        elif dense_backend == "host":
+            if mode == "triangular":
+                host_eigenvalues, whitened_vectors = np.linalg.eigh(whitened)
+            else:
+                host_eigenvalues = np.linalg.eigvalsh(whitened)
+        else:
+            raise ValueError("PARSEC_CUPY_RITZ_EIGH_BACKEND must be host or cupy")
+    except np.linalg.LinAlgError as error:
+        raise GeneralizedRitzStabilityError(
+            "filtered overlap Cholesky/Ritz solve failed"
+        ) from error
+    mode, note = _values_note(mode, float(condition), values_condition_limit)
+    factor = None
+    if mode != "values":
+        factor = np.asfortranarray(
+            solve_triangular(
+                cholesky.T,
+                np.eye(int(overlap.shape[0])),
+                lower=False,
+                check_finite=False,
+            )
+        )
+        audit_error = _orthogonality_error(factor, overlap)
+        if not np.isfinite(audit_error) or audit_error > 5.0e-10:
+            raise GeneralizedRitzStabilityError(
+                f"generalized Ritz orthogonality audit failed ({audit_error:.3e})"
+            )
+    return WhitenedHandover(
+        mode, host_eigenvalues, factor, whitened_vectors, whitened, float(condition), note
+    )
+
+
 def generalized_rayleigh_ritz(
     operator: Any,
     basis: Any,
@@ -988,6 +1361,8 @@ def generalized_rayleigh_ritz(
     workspace: Any | None = None,
     compute_residuals: bool = False,
     consume_basis: bool = False,
+    handover: str = "rotation",
+    values_condition_limit: float = 0.0,
 ) -> DeviceRayleighRitzResult:
     """Solve Rayleigh--Ritz directly in a non-orthogonal filtered basis.
 
@@ -1015,8 +1390,19 @@ def generalized_rayleigh_ritz(
     the consumed basis becomes the next HX workspace. The two buffers are
     distinct, so no GEMM has overlapping inputs and output. Callers must not
     retain the consumed basis for subsequent use.
+
+    ``handover`` other than ``rotation`` asks for a hand-over
+    (``PARSEC_CUPY_RITZ_HANDOVER``, :mod:`handover`): ``triangular`` hands
+    back ``X L^-T`` and the eigenvectors of the whitened matrix,
+    ``factor`` ``X L^-T`` alone, ``values`` the filtered columns as they are
+    (``factor`` above ``values_condition_limit``), each in the memory of the
+    basis.  Only the streaming route, one array that the step owns, hands
+    over; elsewhere the step rotates.  ``result.handover`` says what ran
+    (:class:`handover.HandoverStep`); it is None where nothing else was asked.
     """
 
+    if handover not in HANDOVER_MODES:
+        raise ValueError(f"unknown Ritz hand-over {handover!r}")
     cp, _ = require_cupy()
     matrix = cp.asarray(basis, dtype=cp.float64)
     if matrix.ndim != 2 or matrix.shape[1] < 1:
@@ -1073,6 +1459,63 @@ def generalized_rayleigh_ritz(
         if not dense_on_device:
             packed = np.asarray(cp.asnumpy(packed), dtype=np.float64)
     del raw_overlap, raw_projection
+    if handover != "rotation" and streaming:
+        # The hand-over: the same pair, a small solve without C, and a
+        # triangular product (or none) in place of the rotation.
+        handover_solve = (
+            solve_whitened_handover_on_device if dense_on_device else solve_whitened_handover
+        )
+        try:
+            solution = handover_solve(
+                packed[0],
+                packed[1],
+                mode=handover,
+                values_condition_limit=values_condition_limit,
+            )
+        except GeneralizedRitzStabilityError:
+            del slab, tile
+            raise
+        del packed
+        product = None
+        if solution.mode == "values":
+            del slab, tile
+        else:
+            # The buffer of the slab and the tile, whole: the product needs
+            # all its bytes, columns of all rows or tiles of all columns.
+            buffer = cp.ndarray(
+                (max(int(slab.size), int(tile.size)),), dtype=cp.float64, memptr=slab.data
+            )
+            del slab, tile
+            factor = cp.asarray(solution.factor, dtype=cp.float64)
+            rows, columns = map(int, matrix.shape)
+            width = handover_slab_columns()
+            if handover_product() == "columns":
+                width = max(1, min(width, int(buffer.size) // max(1, rows)))
+            with device_stage(operator, "subspace_ritz_handover_seconds"):
+                product = _triangular_in_place(
+                    matrix, factor, buffer, uniform_slabs(columns, width)
+                )
+            del buffer, factor
+        return DeviceRayleighRitzResult(
+            eigenvalues=cp.asarray(solution.eigenvalues, dtype=cp.float64),
+            wavefunctions=matrix,
+            applied_wavefunctions=None,
+            projected_hamiltonian=cp.asarray(solution.whitened, dtype=cp.float64),
+            residual_norms=None,
+            workspace=None,
+            algorithm="streaming_generalized_cholesky_rayleigh_ritz",
+            handover=HandoverStep(
+                mode=solution.mode,
+                coefficients=(
+                    None
+                    if solution.eigenvectors is None
+                    else cp.asfortranarray(cp.asarray(solution.eigenvectors, dtype=cp.float64))
+                ),
+                condition=solution.condition,
+                note=solution.note,
+                product=product,
+            ),
+        )
     # The host solve returns host arrays, which are uploaded below; the
     # device solve returns device arrays, which are used as they are.
     solve = solve_whitened_ritz_on_device if dense_on_device else solve_whitened_ritz
@@ -1125,6 +1568,11 @@ def generalized_rayleigh_ritz(
             "streaming_generalized_cholesky_rayleigh_ritz"
             if streaming
             else "generalized_cholesky_rayleigh_ritz"
+        ),
+        handover=(
+            None
+            if handover == "rotation"
+            else HandoverStep(mode="rotation", note="two arrays: no hand-over off the streaming route")
         ),
     )
 

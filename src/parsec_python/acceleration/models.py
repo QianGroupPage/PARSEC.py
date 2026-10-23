@@ -84,6 +84,7 @@ class BackendStatistics:
     subspace_ritz_hamiltonian_seconds: float = 0.0
     subspace_ritz_projection_seconds: float = 0.0
     subspace_ritz_rotation_seconds: float = 0.0
+    subspace_ritz_handover_seconds: float = 0.0
     eigensolver_download_seconds: float = 0.0
     eigensolver_scheduler_batches: int = 0
     eigensolver_scheduler_wall_seconds: float = 0.0
@@ -140,6 +141,9 @@ class BackendStatistics:
             ),
             subspace_ritz_rotation_seconds=float(
                 self.subspace_ritz_rotation_seconds
+            ),
+            subspace_ritz_handover_seconds=float(
+                self.subspace_ritz_handover_seconds
             ),
             eigensolver_download_seconds=float(self.eigensolver_download_seconds),
             eigensolver_scheduler_batches=int(self.eigensolver_scheduler_batches),

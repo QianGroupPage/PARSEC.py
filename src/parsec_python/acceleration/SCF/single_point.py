@@ -134,6 +134,16 @@ def materialize_wavefunctions(system, result) -> None:
         if callable(materialize) or isinstance(wavefunctions, cp.ndarray):
             synchronize()
             started = perf_counter()
+            # Sector bases that hold the Ritz hand-over are rotated into
+            # their Ritz vectors first (PARSEC_CUPY_RITZ_HANDOVER), in the
+            # memory that these orbitals view; nothing happens otherwise.
+            ensure = getattr(
+                getattr(system.backend, "symmetry_eigensolver", None),
+                "ensure_ritz_vectors",
+                None,
+            )
+            if callable(ensure) and getattr(wavefunctions, "sector_handovers", None):
+                ensure()
             if callable(materialize_host):
                 result.wavefunctions = materialize_host()
             elif callable(materialize):
@@ -179,12 +189,30 @@ def _finalize_result(system, result, symmetry_eigensolver):
         # Written at preparation from what the sectors held and from the
         # switch of the filter graphs; now from the later passes that ran
         # and from the graphs that the filters of the sectors recorded.
+        # The corrections of the densities of this process, for the record
+        # of the hand-over (PARSEC_CUPY_RITZ_HANDOVER).
+        builder = getattr(system, "orbital_density_builder", None)
+        builder = getattr(builder, "local_builder", builder)
+        if hasattr(symmetry_eigensolver, "ritz_handover"):
+            symmetry_eigensolver.density_handover_record = getattr(builder, "handover_record", None)
         ran = {
             "orbital_sector_later_filter_precision": getattr(
                 symmetry_eigensolver, "later_filter_precision", None
             ),
             "orbital_sector_filter_graphs": getattr(
                 symmetry_eigensolver, "recorded_filter_graphs", None
+            ),
+            # Written at preparation from the switches; now what the Ritz
+            # steps of the shared sector bases of this process ran, where
+            # any did.
+            "orbital_sector_ritz_pipeline": getattr(
+                symmetry_eigensolver, "ritz_pipeline", None
+            ),
+            "orbital_sector_exchange_copies": getattr(
+                symmetry_eigensolver, "exchange_copies", None
+            ),
+            "orbital_sector_ritz_handover": getattr(
+                symmetry_eigensolver, "ritz_handover", None
             ),
         }
         details = tuple(

@@ -143,8 +143,9 @@ class MPISectorContext:
         try:
             value = self._apply(solver, command, payload, density_builder)
             if command == 'solve':
-                # Strip both orbital arrays AND saved eigensolver states.
-                packed = {sector: replace(result, vectors=None, state=None)
+                # Strip both orbital arrays AND saved eigensolver states, and the record of a
+                # hand-over (a device array); its plain summary, handover_step, travels.
+                packed = {sector: replace(result, vectors=None, state=None, handover=None)
                           for sector, result in value.items()}
             elif command == 'density':
                 value = np.ascontiguousarray(value, dtype=np.float64)
@@ -235,6 +236,12 @@ class MPISectorContext:
             result = solver._run_local_sector_jobs(requested, payload['counts'], payload['settings'],
                                                    reset=payload['reset'])
             latest.update(result)
+            if self.rank != self.root:
+                # The root counts every sector from the records it gathers; a worker its own.
+                record = getattr(solver, '_record_handover', None)
+                if callable(record):
+                    for sector, item in result.items():
+                        record(sector, item)
             return result
         elif command == 'trim':
             for sector, count in payload:

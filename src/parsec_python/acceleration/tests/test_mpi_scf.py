@@ -1601,11 +1601,19 @@ class FullSCFRunnerContextTests(unittest.TestCase):
         # The bytes of the largest exchange buffer that a device of the sector has taken: here one that
         # follows a slab of 1,086,758,400 bytes, 12 MiB more than the chunk of 1 GiB.
         shared.exchange_buffer_bytes, idle.exchange_buffer_bytes = 1086758400, 0
+        # What the rounds of the last step ran side by side (PARSEC_CUPY_RITZ_PIPELINE), the clock of its stages,
+        # the host seconds of the rounds of all steps, and how the pieces travelled (PARSEC_CUPY_EXCHANGE_STRIDED);
+        # a group without a step has what a group has from its start.
+        shared.pipeline, shared.stage_clock, shared.rounds_seconds, shared.exchange_copies = 'p2', 'events', 1.25, 'strided'
+        idle.pipeline, idle.stage_clock, idle.rounds_seconds, idle.exchange_copies = None, None, 0., None
         record, _created = self.run_worker_rank(self.cupy(count=2), threading.Event(), operators)
         self.assertEqual([(entry.pop('stencil_storage'), entry.pop('replica_seconds'))
                           for entry in record['distributed_state']],
                          [('implicit_affine_tile_16', 0.25), ('slot-major', 0.5)])
         self.assertEqual([entry.pop('exchange_buffer_bytes') for entry in record['distributed_state']], [1086758400, 0])
+        self.assertEqual([tuple(entry.pop(name) for name in ('pipeline', 'stage_clock', 'rounds_seconds', 'exchange_copies'))
+                          for entry in record['distributed_state']],
+                         [('p2', 'events', 1.25, 'strided'), (None, None, 0., None)])
         self.assertEqual(record['distributed_state'], [
             dict(sector=1, devices=[0, 1], ritz_passes=3, seconds=seconds, overlap_seconds=.5, tall_blocks=1, slab_cut='equal',
                  slab_columns=2, projection_columns=4, overlap_columns=10, separate_row_blocks=0, condition_device=1,
@@ -1626,6 +1634,18 @@ class FullSCFRunnerContextTests(unittest.TestCase):
                           group.separate_row_blocks, group.layout), (0, None, None, None, None, 0, None))
         self.assertEqual((group.condition_device, group.condition_seconds, group.to_rows_copies), (None, 0., None))
         self.assertEqual((group.overlap_seconds, group.overlap_columns, group.exchange_buffer_bytes), (0., None, 0))
+        self.assertEqual((group.pipeline, group.stage_clock, group.rounds_seconds, group.exchange_copies),
+                         (None, None, 0., None))
+        # The serial control takes no step of a shared basis: it names neither switch of its rounds, whose
+        # defaults since 2026-10-22 are p2 and pitched copies.
+        import os
+        from parsec_python.acceleration.benchmarks import mpi_full_scf
+        self.assertFalse({'PARSEC_CUPY_RITZ_PIPELINE', 'PARSEC_CUPY_EXCHANGE_STRIDED'} & set(mpi_full_scf._SERIAL_CONTROL_SETTINGS))
+        with patch.dict(os.environ):
+            for name in ('PARSEC_CUPY_RITZ_PIPELINE', 'PARSEC_CUPY_EXCHANGE_STRIDED'):
+                os.environ.pop(name, None)
+            self.assertEqual((distributed_state.ritz_pipeline(), distributed_state.strided_exchange_requested()),
+                             ('p2', True))
 
     def test_rank_record_names_the_pool_releases_of_finished_sectors(self):
         # What ``sector_pool_releases`` of the rank's solver says; a solver without it released nothing.
@@ -1913,7 +1933,8 @@ class FullSCFRunnerContextTests(unittest.TestCase):
         # the states and the shared sectors: what one rank and the result record of them.
         for name in ('domain_rule_seconds', 'cuda_context_driver_devices', 'cuda_context_driver_seconds',
                      'density_pool_release', 'orbital_sector_state_storage', 'orbital_memory_allocator',
-                     'sector_state_fit_bytes', 'distributed_state', 'spill_staging'):
+                     'sector_state_fit_bytes', 'distributed_state', 'spill_staging', 'orbital_sector_ritz_pipeline',
+                     'orbital_sector_exchange_copies'):
             self.assertIn(name, rank)
         # The staging of a spill: nothing for a rank whose states stay on their devices, and in the record of
         # the release whether the pinned pool is kept where they do not.
@@ -1968,11 +1989,16 @@ class FullSCFRunnerContextTests(unittest.TestCase):
                       'spill_staging of a rank says how sector states that it keeps on the host went there and back',
                       'PARSEC_CUPY_SPILL_BUFFERS', 'PARSEC_CUPY_SPILL_PINNED_BYTES', 'PARSEC_CUPY_SPILL_PINNED_POOL',
                       'host_uploads counts the orbitals that the device builder was handed on the host',
-                      'A serial control names fresh and release where its launcher names neither'):
+                      'A serial control names fresh and release where its launcher names neither',
+                      'orbital_sector_ritz_pipeline of a rank says', 'PARSEC_CUPY_RITZ_PIPELINE',
+                      'orbital_sector_exchange_copies says how the pieces',
+                      'stage_clock, how its last step timed the stages', 'rounds_seconds, the host seconds'):
             with self.subTest(words=words):
                 self.assertEqual(sum(words in note for note in record['notes']), 1)
         # The slab limit of two devices is named where the slabs are and where the storage rule counts them.
         self.assertEqual(sum('PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES' in note for note in record['notes']), 2)
+        # The pitched exchange is named where the pieces are and where the buffer it does not take is.
+        self.assertEqual(sum('PARSEC_CUPY_EXCHANGE_STRIDED' in note for note in record['notes']), 2)
         self.assertEqual(len(set(record['notes'])), len(record['notes']))
 
     def test_timing_record_holds_the_stages_of_the_preparation_of_a_rank(self):

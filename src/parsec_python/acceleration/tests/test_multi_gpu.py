@@ -640,6 +640,9 @@ class SectorStateStorageTests(unittest.TestCase):
     def test_a_shared_basis_is_counted_by_the_blocks_of_its_devices(self):
         from parsec_python.acceleration.Eigensolvers import distributed_state
         gib = 1 << 30
+        # The counts of the exchange that the measured series took and whose buffer they hold, the packed one
+        # (PARSEC_CUPY_EXCHANGE_STRIDED=0).  The pitched exchange of the default takes none: end of the test.
+        packed = dict(PARSEC_CUPY_EXCHANGE_STRIDED="0")
         # 29,576 electrons: a sector on two devices (a rank of 8 GPUs has two of them) or on four (16
         # GPUs, one).  The whole sector, 114 GiB, was counted on its owner: more than a device has.
         whole = self.vectors(self.K13)
@@ -647,7 +650,7 @@ class SectorStateStorageTests(unittest.TestCase):
         self.assertGreater(whole, self.TOTAL)
         for groups, owned in ((((0, 1), (9,), (2, 3), (9,)), (0, 2)), (((9,), (0, 1, 2, 3), (9,), (9,)), (1,))):
             with self.subTest(groups=groups):
-                solver, events = self.decide(self.K13, groups, owned)
+                solver, events = self.decide(self.K13, groups, owned, **packed)
                 self.assertEqual((solver._host_spill_sector_states, solver.sector_state_storage, events),
                                  (False, self.KEPT, []))
                 self.assertTrue(solver.memory_allocator_policy.startswith("cupy default pool; "))
@@ -656,6 +659,7 @@ class SectorStateStorageTests(unittest.TestCase):
                     for name in tuple(os.environ):
                         if name.startswith("PARSEC_CUPY_"):
                             del os.environ[name]
+                    os.environ.update(packed)
                     blocks = distributed_state.shared_block_bytes(*self.K13, devices)
                 self.assertEqual(solver.state_fit_bytes, dict.fromkeys((0, 1, 2, 3), blocks))
                 # What the rule that shares the basis lets it take: 0.85 of the device.
@@ -670,33 +674,35 @@ class SectorStateStorageTests(unittest.TestCase):
                     # it was.
                     self.assertAlmostEqual(blocks / gib, 60.24, delta=.01)
                     pair, events = self.decide(self.K13, groups, owned,
-                                               PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(2 * gib))
+                                               PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(2 * gib), **packed)
                     self.assertEqual((pair._host_spill_sector_states, events), (False, []))
                     self.assertEqual(set(pair.state_fit_bytes.values()), {66_534_064_304})
                     self.assertAlmostEqual((66_534_064_304 - blocks) / gib, 1.72, delta=.01)
                     slabs = dict(PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(4 * gib))
                     for chunk, count in ((dict(PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib)), 70_829_794_704),
                                          ({}, 70_829_794_704 + gib // 8)):
-                        former, events = self.decide(self.K13, groups, owned, **slabs, **chunk)
+                        former, events = self.decide(self.K13, groups, owned, **slabs, **chunk, **packed)
                         self.assertEqual((former._host_spill_sector_states, events), (False, []))
                         self.assertEqual(set(former.state_fit_bytes.values()), {count})
                         self.assertLess(count, .85 * self.TOTAL)
                     self.assertAlmostEqual(70_829_794_704 / gib, 65.97, delta=.01)
                     self.assertAlmostEqual((70_829_794_704 - blocks) / gib, 5.72, delta=.01)
                     # The slabs of 36 columns, 1.1 GiB, lie within a chunk: the count of two devices names none.
-                    named, events = self.decide(self.K13, groups, owned, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib))
+                    named, events = self.decide(self.K13, groups, owned, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib),
+                                                **packed)
                     self.assertEqual(named.state_fit_bytes, solver.state_fit_bytes)
                 else:
                     # Four devices cut slabs of 36 columns, 1.11 GiB by the floor, of which 0.83 GiB leave a
                     # device: within a chunk, so the count names none.  The former round of 8 GiB cut slabs of
                     # 2 GiB, of which 1.5 GiB leave a device: 128 MiB more than with the chunk named.
-                    named, events = self.decide(self.K13, groups, owned, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib))
+                    named, events = self.decide(self.K13, groups, owned, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib),
+                                                **packed)
                     self.assertEqual(named.state_fit_bytes, solver.state_fit_bytes)
                     self.assertEqual(blocks, 34_084_778_336)
                     rounds = dict(PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES=str(8 * gib))
-                    former, events = self.decide(self.K13, groups, owned, **rounds)
+                    former, events = self.decide(self.K13, groups, owned, **rounds, **packed)
                     named, events = self.decide(self.K13, groups, owned, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib),
-                                                **rounds)
+                                                **rounds, **packed)
                     self.assertEqual(former.state_fit_bytes, dict.fromkeys((0, 1, 2, 3), 36_069_464_992))
                     self.assertEqual(named.state_fit_bytes, dict.fromkeys((0, 1, 2, 3), 36_069_464_992 - gib // 8))
         # The report of the allocator still names the whole sector on its owner, as with both values named.
@@ -711,16 +717,26 @@ class SectorStateStorageTests(unittest.TestCase):
         # more: 10,073 MiB.
         rounds = dict(PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES=str(8 * gib))
         for chunk, count in ((dict(PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib)), 10_428_230_944), ({}, 10_562_448_672)):
-            solver, events = self.decide(self.K09, ((9,), (0, 1, 2, 3), (9,), (9,)), (1,), **chunk, **rounds)
+            solver, events = self.decide(self.K09, ((9,), (0, 1, 2, 3), (9,), (9,)), (1,), **chunk, **rounds, **packed)
             self.assertEqual(solver.state_fit_bytes, dict.fromkeys((0, 1, 2, 3), count))
             self.assertEqual((solver._host_spill_sector_states, events), (False, []))
         self.assertEqual((round(10_428_230_944 / 2 ** 20), round(10_562_448_672 / 2 ** 20)), (9_945, 10_073))
         self.assertGreater(10_428_230_944, (10_005 - 426) << 20)
         self.assertLess(10_428_230_944, 10_005 << 20)
+        # The pitched exchange, the default since 2026-10-22, takes no buffer, and the count holds none: 1 GiB
+        # less for 29,576 electrons on two devices and on four, whose slabs lie within a chunk, and the same
+        # decisions.
+        for groups, owned in ((((0, 1), (9,), (2, 3), (9,)), (0, 2)), (((9,), (0, 1, 2, 3), (9,), (9,)), (1,))):
+            default, events = self.decide(self.K13, groups, owned)
+            self.assertEqual((default._host_spill_sector_states, default.sector_state_storage, events),
+                             (False, self.KEPT, []))
+            former, events = self.decide(self.K13, groups, owned, **packed)
+            self.assertEqual({device: former.state_fit_bytes[device] - count
+                              for device, count in default.state_fit_bytes.items()}, dict.fromkeys((0, 1, 2, 3), gib))
         # The slabs of 1 GiB of the default, 69 columns, are counted 2 GiB lower, 7,889 MiB, and lie within a
         # chunk whether one is named or not.
         for chunk in (dict(PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(gib)), {}):
-            solver, events = self.decide(self.K09, ((9,), (0, 1, 2, 3), (9,), (9,)), (1,), **chunk)
+            solver, events = self.decide(self.K09, ((9,), (0, 1, 2, 3), (9,), (9,)), (1,), **chunk, **packed)
             self.assertEqual(solver.state_fit_bytes, dict.fromkeys((0, 1, 2, 3), 8_272_463_904))
             self.assertEqual((solver._host_spill_sector_states, events), (False, []))
         self.assertEqual(round(8_272_463_904 / 2 ** 20), 7_889)
@@ -881,13 +897,15 @@ class SectorStateStorageTests(unittest.TestCase):
                          {0: 81_064_975_872, 1: 81_064_975_872})
         self.assertEqual(self.decide(self.K10, ((0,), (1,), (0,), (1,)))[0].state_fit_bytes,
                          {0: 78_917_498_592, 1: 78_917_498_592})
-        chunk = dict(PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(1 << 30))
+        # The series ran the packed exchange, whose buffer the counts hold (PARSEC_CUPY_EXCHANGE_STRIDED=0).
+        packed = dict(PARSEC_CUPY_EXCHANGE_STRIDED="0")
+        chunk = dict(packed, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(1 << 30))
         series = dict(chunk, PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(4 << 30))
-        rounds = dict(PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES=str(8 << 30))
+        rounds = dict(packed, PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES=str(8 << 30))
         # The same sectors of two devices with the slabs of 2 GiB that were the default then, which the former
         # limit of two devices gives back: peaks of later runs, 3.7 to 3.8 GiB below those of the series,
         # where 4 GiB less are counted.
-        pair = dict(PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(2 << 30))
+        pair = dict(packed, PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES=str(2 << 30))
         pair_peaks = {2_873_400: 33643, 3_786_832: 50859, 4_130_510: 67031}
         # And sectors on one device with the buffer of 2 GiB that is the default: peaks of later runs with
         # that budget, 2.0 GiB below those with 4 GiB in the same allocation, where 2 GiB less are counted.
@@ -921,10 +939,16 @@ class SectorStateStorageTests(unittest.TestCase):
                 if ranks > 1:
                     # The slabs of 1 GiB of the default, and of the 36 columns of the budget of the floor where
                     # 1 GiB holds fewer, are counted lower than the slabs of 2 GiB, the chunk unnamed in both.
-                    now, left = self.decide((rows, columns), groups, tuple(mine))
+                    now, left = self.decide((rows, columns), groups, tuple(mine), **packed)
                     self.assertEqual((now._host_spill_sector_states, left), (False, []))
                     self.assertLess(max(now.state_fit_bytes.values()),
                                     max((unnamed if ranks == 4 else default).state_fit_bytes.values()))
+                    # The pitched exchange of the default since takes no buffer: 1 GiB less, or up to 1.125
+                    # GiB where the buffer follows a slab, and the same route.
+                    pitched, left = self.decide((rows, columns), groups, tuple(mine))
+                    self.assertEqual((pitched._host_spill_sector_states, left), (False, []))
+                    less = max(now.state_fit_bytes.values()) - max(pitched.state_fit_bytes.values())
+                    self.assertTrue(1 << 30 <= less <= (1 << 30) + (1 << 27), less)
                 if (rows, columns, devices) in buffer_peaks and ranks == 1:
                     default, events = self.decide((rows, columns), groups, tuple(mine))
                     self.assertEqual((default._host_spill_sector_states, events), (False, []))

@@ -298,7 +298,13 @@ budget allows, and the slabs that are cut can be narrower. It also counts
 the most that an exchange buffer can take which follows a slab, where no
 chunk size is named: up to 128 MiB above the chunk of 1 GiB on four devices,
 from 10.7 GiB of basis and all of it from 12 GiB
-(`PARSEC_CUPY_EXCHANGE_CHUNK_BYTES` in `README.md`). The devices
+(`PARSEC_CUPY_EXCHANGE_CHUNK_BYTES` in `README.md`). Since 2026-10-22 the
+pieces between the devices go as pitched copies by default, which take no
+buffer, and the rule counts none: up to 1.125 GiB less per device (about
+1 GiB for the large sectors), with the
+same decisions for every case of the measured series
+(`PARSEC_CUPY_EXCHANGE_STRIDED=0` counts the buffer with the exchange that
+takes it). The figures that follow are counts with the buffer. The devices
 of 10,456 electrons on 16 GPUs counted 9,945 MiB each with the chunk of 1 GiB
 that they had (10,073 MiB where none is named) and sampled as little as
 10,005 MiB, 426 of them the CUDA context: 366 MiB less than the count
@@ -903,6 +909,39 @@ energies and the fullest device at 47.87 against 47.67 GiB and at 63.52 GiB
 with either (2026-10-16): it would have stayed the default for at least
 0.4 % less SCF time in either case (`README.md`).
 
+The rounds of the Ritz step of a shared basis run their stages side by side
+by default since 2026-10-22 (`PARSEC_CUPY_RITZ_PIPELINE=p2`; `off` restores
+the former step; `README.md`). Under `p1` and `p2` every device of the group
+gets a second stream, its exchange
+stream, which the group keeps for its life: the slabs and `H` times them go
+to the row layout on it while the compute stream applies `H` (`p1`) and
+forms the slabs of the overlap (`p2`). It runs on the thread of its device,
+which takes no other thread and no other cuBLAS handle, and nothing is
+allocated under it: blocks taken under a second stream would lie in a free
+list of their own, out of the reach of the compute stream that returns what
+a step outgrows, and the pools of a shared basis are not emptied between
+steps (above). The exchange stream waits for the leave and the apply of its
+device by events, the host for all devices between the steps of a
+conversion and once after the last round, and a step that fails waits for
+every stream of its devices before the error leaves it. The workspace, the
+buffer and the Gram arrays are those of `off`; `p2` forms the overlap into
+the Gram pair directly, without the temporary `m x m` product of before.
+The pitched exchange, the default since then as well
+(`PARSEC_CUPY_EXCHANGE_STRIDED=1`; `0` restores the packed one), sends every
+piece with one pitched copy and takes no exchange buffer
+(`exchange_buffer_bytes` 0), about 1 GiB less on every device of a large
+sector. Both give the bits of the former step. They were compared on a
+laptop GPU named twice and four times as the devices of a group, on the four
+A100 of a node, and in complete calculations of 3,480 electrons on 8 A100
+GPUs with every value and on 16 with `off`, `p2` and `p2` with pitched
+copies, whose archives were the same bit for bit apart from timings and
+backend details. On
+dedicated A100 nodes (2026-10-22, ABBA) the two defaults together took 4.4
+and 3.6 % less SCF time for 23,768 and 29,576 electrons on 8 GPUs and 6.4
+and 5.4 % less for 23,768 and 39,368 on 16 (231.1 against 218.8 s), with the
+same totals and steps, and the fullest devices peaked 1.0 to 1.2 GiB lower
+(`README.md`).
+
 ## Optional FP64 initialization and filter submission improvements
 
 Two independent switches address host overhead without changing the physical
@@ -1006,9 +1045,97 @@ compute capability 8.0 alone, `README.md`), also for stencils of 2 to 61 slots i
 every tile size, records which kernel each launch of a graph took, filters a
 sector shared by two devices with either kernel, and checks the entry of the
 backend details that names the kernel (`orbital_sector_stencil_kernel`).
+The rounds of a shared basis with `PARSEC_CUPY_RITZ_PIPELINE` and
+`PARSEC_CUPY_EXCHANGE_STRIDED` are checked with
+
+```bash
+PYTHONPATH=src python -m unittest \
+  parsec_python.acceleration.tests.test_ritz_pipeline \
+  parsec_python.acceleration.tests.test_distributed_state \
+  parsec_python.acceleration.tests.test_distributed_exchange
+```
+
+The first module compares every value with the former step (`off`, packed
+exchange) to the last bit, the defaults among them, on
+one GPU named twice and four times and on the distinct GPUs of the node,
+and sees a wait of the exchange stream that is left out; the last runs the
+same step on a host stand-in whose streams hold their work until something
+waits for it.
 Use complete converged SCF runs to select performance options; increasing batch
 size or CPU/stream concurrency is not automatically beneficial. Compare total
 SCF time separately from the eigensolver and program startup/preparation time.
+
+## Optional triangular Ritz hand-over
+
+```bash
+export PARSEC_CUPY_RITZ_HANDOVER=triangular
+```
+
+By default (`rotation`, also unset) every Ritz step rotates the filtered basis
+`X` of a sector into its Ritz vectors `X C`, a full `m x m` product on the
+rows of every device. With `triangular` a later pass hands the next filter
+`Q = X L^-T` instead (`L` the Cholesky factor of the overlap), a triangular
+product of about half the flops, and keeps the eigenvectors `Z` of the small
+problem on the owner of the sector: the Ritz vectors are `Q Z`. The first
+solve hands on the filtered columns in its first cycle where their overlap
+is well conditioned, `X L^-T` in the cycles before the last, and rotates in
+the last. The Ritz values are those of the rotation; the bases differ, so the
+SCF path moves beyond round-off, by a step at the default criterion and up to
+two at 2e-6 Ry in the cases run so far, with totals up to 2.1e-5 Ry apart
+(`README.md`). On dedicated A100 nodes (2026-10-22, with the defaults of the
+rounds) it took 6.3 to 9.3 % less SCF time on 8 and 16 GPUs (198.7 against
+219.0 s for 39,368 electrons on 16) and 2.6 to 9.5 % less with one array per
+sector.
+
+On a basis shared by two or four devices the factor is formed in the row
+order of the row blocks, with the lower-half columns of the band where the
+rounds bring the two halves of the degree split together put first. Every
+device multiplies its own rows, in output slabs of whole rounds that do not
+cut the band, in the slab workspace of the step; nothing more crosses the
+links than in the rotation, the way back is the same, and the next filter
+finds the lower half of its degree split spanning the filtered lower half, as
+on one device. The density of such a basis is that of all its columns less
+the few Ritz vectors whose occupation is not one (`|S|` about 15 at 39,368
+electrons): every device multiplies a piece of its rows by those eigenvectors
+and the owner sums the pieces, at most 128 MiB at a time, on the streams of the
+device threads, whose pools hold the workspace of the Ritz step between
+passes. So the hand-over takes no memory beside the pass: the fullest GPU of
+39,368 electrons on 16 GPUs peaked at 62,707 MiB against 62,699 MiB with the
+rotation (A100, 2026-10-22, under the former step, `PARSEC_CUPY_RITZ_PIPELINE=off`
+with the packed exchange), where a first form that summed all rows of the
+corrected vectors at once in a buffer of the calling thread had reached
+65,605 MiB. The nonlocal forces use the same identity, and the trim of a
+sector after a later pass is carried out by the next pass with a full
+rotation. A shared basis is never rotated outside a
+pass; the export of its orbitals is refused as before.
+
+The hand-over is taken on one array per sector (1 to 4 GPUs) and on a basis
+shared by the devices of one rank (8 and 16 GPUs) with one tall block, the
+default, under every value of `PARSEC_CUPY_RITZ_PIPELINE` and
+`PARSEC_CUPY_EXCHANGE_STRIDED` (above), which it leaves as they are: its
+product follows the rounds, and its corrections use the compute streams of
+the devices and no exchange buffer. With both at their defaults (p2, strided),
+39,368 electrons on 16 GPUs peaked at 61,483 MiB against 61,475 MiB with the
+rotation (A100, 2026-10-22). A basis that MPI ranks share (`--rank-per-gpu`, MD across nodes),
+two or three tall blocks, CHEBDAV, the full grid and spin keep the rotation.
+What every step took is in the backend detail
+`orbital_sector_ritz_handover` and per rank in `timing.json`
+(`orbital_sector_ritz_handover`, `ritz_handover`); a shared sector also has
+the stages `handover` and `correction` and the counts `handover_counts` in
+`per_rank[].distributed_state`. `seconds.rotate` then counts full rotations
+only, so the two settings are compared on `rotate` plus `handover`; both, and
+`correction`, are host seconds under every value of the pipeline, whose
+event clocks cover the rounds alone.
+
+Validate with:
+
+```bash
+PYTHONPATH=src python -m unittest \
+  parsec_python.acceleration.tests.test_ritz_handover \
+  parsec_python.acceleration.tests.test_ritz_handover_passes
+```
+
+The shared-basis tests run on one GPU named two and four times.
 
 ## Interpretation and limits
 

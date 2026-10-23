@@ -6,7 +6,7 @@ GPUs. They are the measurements behind the two GPU tables of `../README.md`.
 
 ## How they were measured
 
-- Code: `master` 224a876 of 21 October 2026, default settings, double
+- Code: `master` 5fc7363 of 22 October 2026, default settings, double
   precision, first calculations (no symmetry cache), the inputs of
   `gpu_benchmark/` (sphere 5 Angstrom beyond the outermost atom). Besides the
   settings of the launch script, 30 of the 32 runs set
@@ -17,7 +17,8 @@ GPUs. They are the measurements behind the two GPU tables of `../README.md`.
 - Hardware: Perlmutter at NERSC, nodes of four A100-SXM4-80GB and one AMD EPYC
   7763; one MPI rank per node with 32 CPUs and 16 OpenMP threads, launched with
   `scripts/run_multi_gpu_scf.sh`. 1, 2 and 4 GPUs use one node; 8 and 16 GPUs
-  use two and four nodes.
+  use two and four nodes, the four nodes of the 16-GPU runs under one network
+  switch.
 - One measured run per configuration after a warm-up run (k09 on 1 GPU and k10
   on 2 GPUs: one run, with the storage of the basis left to the code). Every
   run converged in the same number of SCF steps as the outputs in
@@ -46,26 +47,33 @@ Each figure is in `figures/` as PNG and PDF.
 
 ## What they show
 
-- **Time.** With the basis in GPU memory a complete calculation takes 6.0 s
-  (k06 on 16 GPUs) to 239 s (k14 on 16 GPUs). At a fixed number of GPUs the
-  program time grows as N^1.52 (16 GPUs) to N^1.78 (2 GPUs) in the number of
-  electrons N, and as N^1.76 above 10,000 electrons on 16 GPUs.
-- **Where the time goes.** The Chebyshev filter (sparse) grows as N^1.80. The
-  dense products of the Rayleigh-Ritz step grow faster (Gram matrices N^2.35,
-  rotation N^2.65, on 16 GPUs), so their share of the program time rises from
-  4 % for k06 to 43 % for k14. Copies of the basis between the GPUs of a sector
-  take 9 to 14 % of the program time on 16 GPUs (11 to 14 % above 10,000
-  electrons).
+- **Time.** With the basis in GPU memory a complete calculation takes 6.5 s
+  (k06 on 8 GPUs) to 229 s (k14 on 16 GPUs). At a fixed number of GPUs the
+  program time grows as N^1.30 (16 GPUs) to N^1.77 (2 GPUs) in the number of
+  electrons N, and as N^1.64 above 10,000 electrons on 16 GPUs. The 16-GPU
+  line is flatter than before because its smallest clusters take about 2 s
+  longer since the Perlmutter maintenance of 21 October 2026, with this code
+  and with the code measured before it alike (k06 on 16 GPUs, the same four
+  nodes: 5.5 to 5.6 s of SCF against 5.9 to 6.2 s with the code of 21
+  October; 4.2 s before the maintenance).
+- **Where the time goes.** The Chebyshev filter (sparse) grows as N^1.79. The
+  dense products of the Rayleigh-Ritz step grow faster (Gram matrices N^2.14,
+  rotation N^2.61, on 16 GPUs), so their share of the program time rises from
+  5 % for k06 to 46 % for k14. Copies of the basis between the GPUs of a sector
+  take 7 to 13 % of the program time on 16 GPUs (11 to 13 % above 10,000
+  electrons). Part of these copies now runs beside the Gram products; the
+  stage seconds count both in full, so for the largest clusters the shares add
+  up to about the whole program time.
 - **Memory.** The dense basis (grid points by states, per symmetry sector) must
   stay in GPU memory and grows as N^1.86. The measured peak of a GPU is about
-  2.7 GiB plus 1.06 times the part of the basis it holds. The peak grows as
-  N^1.32 (16 GPUs) to N^1.72 (2 GPUs).
+  2.1 GiB plus 1.06 times the part of the basis it holds. The peak grows as
+  N^1.43 (16 GPUs) to N^1.72 (2 GPUs).
 - **The limit is GPU memory.** At every GPU count the largest cluster that fits
   finishes in under four minutes. A sector is shared by at most the four GPUs
   of one node, so a
   system with four sectors stops at 16 GPUs: on 80 GB cards at about 43,400
   electrons, 10 % above k14. By extrapolation a cluster of 100,000 electrons
-  would take about 36 minutes on 16 GPUs, but needs 293 GiB of basis per GPU,
+  would take about 37 minutes on 16 GPUs, but needs 293 GiB of basis per GPU,
   3.7 times what an 80 GB card has.
 - **Basis in host memory.** k09 does not fit on one card with this input: the
   code keeps its basis in page-locked host memory and moves one sector at a

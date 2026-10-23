@@ -49,7 +49,7 @@
 # The A100 columns are the references: 4 x A100-SXM4-80GB per node, one MPI
 # rank per node (NERSC Perlmutter), first calculation without symmetry cache,
 # double precision. For gpu_benchmark/ the times and memory peaks come from
-# the series of 21 October 2026 (master 224a876) and the total energies and
+# the series of 22 October 2026 (master 5fc7363) and the total energies and
 # step counts from parsec_reference.out (code of 10 October 2026), both
 # measured with the runner; a blank means that the case did not fit on that
 # many 80 GB GPUs. For fortran_comparison/ the reference is the
@@ -171,17 +171,17 @@ compare() {  # compare <case folder> <run folder> <exit status>
 import csv, json, re, sys
 from pathlib import Path
 case_folder, run, status, launcher, total, summary = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4], int(sys.argv[5]), sys.argv[6]
-# A100-SXM4-80GB, code of 21 October 2026 (master 224a876): "GPUs:program seconds:peak GiB of the fullest GPU"
+# A100-SXM4-80GB, code of 22 October 2026 (master 5fc7363): "GPUs:program seconds:peak GiB of the fullest GPU"
 A100 = {
-    'k06': '1:22.0:11.2 2:14.5:6.5 4:9.9:4.3 8:6.9:3.2 16:6.0:2.2',
-    'k07': '1:43.6:23.1 2:25.5:12.5 4:16.8:7.3 8:11.2:6.0 16:8.5:4.0',
-    'k08': '1:68.6:34.8 2:38.7:18.5 4:23.5:10.3 8:15.5:7.3 16:11.4:5.3',
-    'k09': '1:355.4:23.6 2:91.0:41.7 4:51.8:22.6 8:32.8:13.8 16:22.0:9.1',
-    'k10': '2:182.4:76.3 4:98.5:40.1 8:61.2:22.0 16:38.5:13.1',
-    'k11': '4:145.3:56.8 8:87.3:30.6 16:52.7:17.7',
-    'k12': '8:145.9:47.6 16:84.8:26.7',
-    'k13': '8:211.4:63.5 16:119.5:35.2',
-    'k14': '16:239.4:61.2',
+    'k06': '1:21.6:11.2 2:14.5:6.5 4:10.2:4.2 8:6.5:2.6 16:9.4:1.7',
+    'k07': '1:43.2:23.1 2:25.7:12.5 4:16.2:7.3 8:10.7:5.0 16:12.6:3.0',
+    'k08': '1:68.1:34.8 2:38.0:18.5 4:23.1:10.3 8:14.5:6.3 16:14.5:4.3',
+    'k09': '1:354.5:23.6 2:91.3:41.7 4:51.9:22.6 8:30.8:12.8 16:25.0:8.1',
+    'k10': '2:182.0:76.3 4:98.9:40.1 8:58.2:21.0 16:40.3:12.0',
+    'k11': '4:145.3:56.8 8:82.6:29.6 16:53.4:16.7',
+    'k12': '8:139.6:46.6 16:83.3:25.6',
+    'k13': '8:201.5:62.4 16:116.2:34.1',
+    'k14': '16:229.3:60.0',
 }
 def energies(path):
     return [float(value) for value in re.findall(r'Total Energy =\s+(-?[0-9.]+)', path.read_text(errors='replace'))] if path.exists() else []

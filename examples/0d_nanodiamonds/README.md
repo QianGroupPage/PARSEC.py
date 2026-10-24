@@ -82,7 +82,7 @@ It checks these at the start, and `--check` prints the commands without
 running them; `--help` lists every option. Each line of the table looks like:
 
 ```text
-  k06 C795H300: ok, 10 steps (reference 10), E = -9437.81995096 Ry (difference 0.0e+00), 9.9 s (A100 9.9), peak 4.3 GiB (A100 4.3)
+  k06 C795H300: ok, 10 steps (reference 10), E = -9437.81995096 Ry (difference 0.0e+00), 10.1 s (A100 10.1), peak 4.2 GiB (A100 4.2)
 ```
 
 A run whose total energy is within 1e-5 Ry of the reference is reported as
@@ -162,21 +162,23 @@ took 7.5 s).
 
 | Case | Formula | Valence electrons | Grid points | States computed | SCF steps | Total energy (Ry) | 1 GPU | 2 GPUs | 4 GPUs | 8 GPUs | 16 GPUs |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| k06 | C795H300 | 3,480 | 2,710,168 | 1,767 | 10 | -9437.81995096 | 22.0 | 14.5 | 9.9 | 6.9 | 6.0 |
-| k07 | C1213H412 | 5,264 | 4,125,288 | 2,659 | 10 | -14346.75097475 | 43.6 | 25.5 | 16.8 | 11.2 | 8.5 |
-| k08 | C1653H508 | 7,120 | 4,778,880 | 3,588 | 10 | -19488.31721372 | 68.6 | 38.7 | 23.5 | 15.5 | 11.4 |
-| k09 | C2455H636 | 10,456 | 7,699,168 | 5,256 | 11 | -28808.04029769 | 355.4 (a) | 91.0 | 51.8 | 32.8 | 22.0 |
-| k10 | C3469H804 | 14,680 | 10,419,384 | 7,367 | 11 | -40596.27462396 |  | 182.4 | 98.5 | 61.2 | 38.5 |
-| k11 | C4601H988 | 19,392 | 11,493,600 | 9,724 | 10 | -53752.09127639 |  |  | 145.3 | 87.3 | 52.7 |
-| k12 | C5659H1132 | 23,768 | 15,147,328 | 11,911 | 10 | -66016.14132692 |  |  |  | 145.9 | 84.8 |
-| k13 | C7067H1308 | 29,576 | 16,522,040 | 14,815 | 10 | -82319.08242217 |  |  |  | 211.4 | 119.5 |
-| k14 | C9449H1572 | 39,368 | 22,640,800 | 19,711 | 10 | -109862.37143299 |  |  |  |  | 239.4 |
+| k06 | C795H300 | 3,480 | 2,710,168 | 1,767 | 10 | -9437.81995096 | 21.8 | 14.4 | 10.1 | 6.4 | 5.7 |
+| k07 | C1213H412 | 5,264 | 4,125,288 | 2,659 | 10 | -14346.75097475 | 43.3 | 25.4 | 16.4 | 10.7 | 8.0 |
+| k08 | C1653H508 | 7,120 | 4,778,880 | 3,588 | 10 | -19488.31721372 | 68.7 | 38.6 | 23.3 | 14.5 | 10.4 |
+| k09 | C2455H636 | 10,456 | 7,699,168 | 5,256 | 11 | -28808.04029769 | 348.4 (a) | 90.8 | 51.5 | 31.0 | 21.0 |
+| k10 | C3469H804 | 14,680 | 10,419,384 | 7,367 | 11 | -40596.27462396 |  | 180.9 | 98.5 | 57.8 | 35.6 |
+| k11 | C4601H988 | 19,392 | 11,493,600 | 9,724 | 10 | -53752.09127639 |  |  | 145.7 | 82.5 | 48.5 |
+| k12 | C5659H1132 | 23,768 | 15,147,328 | 11,911 | 10 | -66016.14132692 |  |  |  | 138.6 | 78.9 |
+| k13 | C7067H1308 | 29,576 | 16,522,040 | 14,815 | 10 | -82319.08242217 |  |  |  | 201.1 | 111.8 |
+| k14 | C9449H1572 | 39,368 | 22,640,800 | 19,711 | 10 | -109862.37143299 |  |  |  |  | 224.6 |
 
 Measured on Perlmutter at NERSC: nodes of four A100-SXM4-80GB, one MPI rank
 per node, launched with `scripts/run_multi_gpu_scf.sh`. Runs on 1, 2 and
 4 GPUs use one node; runs on 8 and 16 GPUs use two and four nodes. One run per
-cell after a warm-up run (k09 on 1 GPU and k10 on 2 GPUs: one run). Measured on
-21 October 2026 with `master` 224a876. Blank cells: the basis does not fit in
+cell after a warm-up run (k09 on 1 GPU and k10 on 2 GPUs: the second of two
+runs on a node). Measured on 23 October 2026 with `master` 0f47a3f, with the
+Python environment, the sources and the CuPy kernel cache on node-local
+storage (`performance/README.md`). Blank cells: the basis does not fit in
 the memory of that many 80 GB GPUs. (a) With this input the basis of k09 does
 not fit on one card, so the code keeps it in page-locked host buffers (78 GiB
 of host memory in all) and moves one sector at a time to the GPU. Without the
@@ -189,15 +191,15 @@ with the size of the system.
 
 | Case | 1 GPU | 2 GPUs | 4 GPUs | 8 GPUs | 16 GPUs |
 |---|---:|---:|---:|---:|---:|
-| k06 | 11.2 | 6.5 | 4.3 | 3.2 | 2.2 |
-| k07 | 23.1 | 12.5 | 7.3 | 6.0 | 4.0 |
-| k08 | 34.8 | 18.5 | 10.3 | 7.3 | 5.3 |
-| k09 | 23.6 (a) | 41.7 | 22.6 | 13.8 | 9.1 |
-| k10 |  | 76.3 | 40.1 | 22.0 | 13.1 |
-| k11 |  |  | 56.8 | 30.6 | 17.7 |
-| k12 |  |  |  | 47.6 | 26.7 |
-| k13 |  |  |  | 63.5 | 35.2 |
-| k14 |  |  |  |  | 61.2 |
+| k06 | 11.2 | 6.5 | 4.2 | 2.6 | 1.7 |
+| k07 | 23.1 | 12.5 | 7.3 | 5.0 | 3.0 |
+| k08 | 34.8 | 18.5 | 10.3 | 6.3 | 4.3 |
+| k09 | 23.6 (a) | 41.7 | 22.6 | 12.8 | 8.1 |
+| k10 |  | 76.3 | 40.1 | 21.0 | 12.0 |
+| k11 |  |  | 56.8 | 29.6 | 16.7 |
+| k12 |  |  |  | 46.6 | 25.6 |
+| k13 |  |  |  | 62.5 | 34.1 |
+| k14 |  |  |  |  | 60.0 |
 
 The peak memory is the largest value that `nvidia-smi`, sampled every 200 ms,
 showed on the fullest GPU. It includes the CUDA context and the cache of the
@@ -224,13 +226,21 @@ Notes:
   to the final report and includes CUDA initialization.
 - **Version of the benchmark references.** The times and memory peaks of the
   two GPU tables (and the references of `run_benchmark.sh`) were measured with
-  `master` 224a876 of 21 October 2026. The `gpu_benchmark/` outputs and the
+  `master` 0f47a3f of 23 October 2026. The `gpu_benchmark/` outputs and the
   total energies in the table come from the code published on 10 October 2026;
-  the code of 21 October gives the same SCF step counts in all 32 cells and
-  total energies within 2e-7 Ry of them. Its stencil kernel keeps more loads in
-  flight than that of the code of 17 October, with the same total energies to
-  the last bit: the SCF time is 3 to 24 % lower (10 % for k14 on 16 GPUs) and
-  the memory peaks are the same within 0.05 GiB. Against the code of 10
+  the code of 23 October gives the same SCF step counts in all 32 cells and
+  total energies within 2e-7 Ry of them. Its Rayleigh-Ritz step on 8 and 16
+  GPUs copies between the GPUs of a sector beside its products and without
+  pack kernels: with the same totals to the last bit as the code of 21
+  October, the SCF time is 5 to 9 % lower on 8 GPUs and 5 to 8 % lower on 16
+  GPUs (k14: 232.9 against 218.0 s), and the fullest GPU holds 0.4 to 1.2 GiB
+  less; on 1 to 4 GPUs the SCF time stays within 3 % of it. These runs read
+  the software from node-local storage: on Perlmutter a Python environment and
+  CuPy kernel cache on the project file system (CFS) added 1 to 3 s to the
+  first SCF step of runs on four nodes, at times, since the maintenance of 21
+  October 2026. The code of 21 October had cut the SCF time against that of 17
+  October by 3 to 24 % (its stencil kernel keeps more loads in flight). Against
+  the code of 10
   October the code of 17 October had changed the program time by -7 to +1 % on
   1 to 16 GPUs (-46 % for k09 on one GPU, whose basis lives in host memory) and
   lowered the peak of the fullest GPU by up to 2.5 GiB.

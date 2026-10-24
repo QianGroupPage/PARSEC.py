@@ -1637,7 +1637,7 @@ class FullSCFRunnerContextTests(unittest.TestCase):
         self.assertEqual((group.pipeline, group.stage_clock, group.rounds_seconds, group.exchange_copies),
                          (None, None, 0., None))
         # The serial control takes no step of a shared basis: it names neither switch of its rounds, whose
-        # defaults are off and the packed exchange, the step of the code of 21 October.
+        # defaults since 2026-10-22 are p2 and pitched copies.
         import os
         from parsec_python.acceleration.benchmarks import mpi_full_scf
         self.assertFalse({'PARSEC_CUPY_RITZ_PIPELINE', 'PARSEC_CUPY_EXCHANGE_STRIDED'} & set(mpi_full_scf._SERIAL_CONTROL_SETTINGS))
@@ -1645,7 +1645,7 @@ class FullSCFRunnerContextTests(unittest.TestCase):
             for name in ('PARSEC_CUPY_RITZ_PIPELINE', 'PARSEC_CUPY_EXCHANGE_STRIDED'):
                 os.environ.pop(name, None)
             self.assertEqual((distributed_state.ritz_pipeline(), distributed_state.strided_exchange_requested()),
-                             ('off', False))
+                             ('p2', True))
 
     def test_rank_record_names_the_pool_releases_of_finished_sectors(self):
         # What ``sector_pool_releases`` of the rank's solver says; a solver without it released nothing.

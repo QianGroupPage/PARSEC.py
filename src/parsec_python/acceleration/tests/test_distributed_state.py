@@ -366,8 +366,8 @@ class DistributedStateTests(unittest.TestCase):
         rows = columns = None
         cp.cuda.set_allocator(pool.malloc)
         try:
-            # The packed exchange of the default, whose buffer this is, named (PARSEC_CUPY_EXCHANGE_STRIDED=0);
-            # the pitched one takes none (test_ritz_pipeline).
+            # The packed exchange, whose buffer this is (PARSEC_CUPY_EXCHANGE_STRIDED=0); the pitched one of
+            # the default takes none (test_ritz_pipeline).
             with patch.dict(os.environ, PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8*512),
                             PARSEC_CUPY_EXCHANGE_STRIDED='0'):
                 rows = group._to_rows(blocks, ranges, edges, keep=True)
@@ -698,8 +698,8 @@ class DistributedStateTests(unittest.TestCase):
     def test_every_device_forms_the_overlap_from_trailing_columns(self):
         # The DSYRK overlap of a row block and 4 slabs on trailing columns, both against the dense overlap.
         former, dsyrk = self._recorded_pass('_symmetric_overlap', PARSEC_CUPY_RITZ_SYRK='on', PARSEC_CUPY_RITZ_GRAM_SLABS='4')
-        # The slabs of the function itself: the default step (off), named, calls it after the rounds, where p2
-        # forms its very slabs round by round with the same bits (test_ritz_pipeline).
+        # The slabs of the function itself: the former step (off) calls it after the rounds, where p2, the
+        # default, forms its very slabs round by round with the same bits (test_ritz_pipeline).
         values, slabs = self._recorded_pass('_symmetric_overlap', PARSEC_CUPY_RITZ_SYRK='slabs', PARSEC_CUPY_RITZ_GRAM_SLABS='4',
                                             PARSEC_CUPY_RITZ_PIPELINE='off')
         for calls in (dsyrk, slabs):
@@ -926,7 +926,7 @@ class DistributedStateTests(unittest.TestCase):
         # itself, as in the solve that is measured alone below: a helper would take a copy of the overlap and
         # the work arrays of its spectrum on another device.
         sizes = dict(PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8*rows), PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8*512),
-                     # The packed exchange of the default, whose buffer is counted, named: the pitched one takes none.
+                     # The packed exchange, whose buffer is counted: the pitched one of the default takes none.
                      PARSEC_CUPY_EXCHANGE_STRIDED='0',
                      PARSEC_CUPY_DISTRIBUTED_STATE_RANGES='fixed', PARSEC_CUPY_RITZ_EIGH_BACKEND='host',
                      PARSEC_CUPY_RITZ_CONDITION_HELPER='off')
@@ -1189,7 +1189,7 @@ class DistributedStateTests(unittest.TestCase):
         # itself, as in the solve that is measured alone below: a helper would take a copy of the overlap and
         # the work arrays of its spectrum on another device.
         sizes = dict(PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8*rows), PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8*512),
-                     # The packed exchange of the default, whose buffer is counted, named: the pitched one takes none.
+                     # The packed exchange, whose buffer is counted: the pitched one of the default takes none.
                      PARSEC_CUPY_EXCHANGE_STRIDED='0',
                      PARSEC_CUPY_DISTRIBUTED_STATE_RANGES='fixed', PARSEC_CUPY_RITZ_EIGH_BACKEND='host',
                      PARSEC_CUPY_RITZ_CONDITION_HELPER='off')
@@ -1304,7 +1304,7 @@ class DistributedStateTests(unittest.TestCase):
         ranges = group.column_ranges(blocks)
         basis = self._filtered(group, blocks, ranges, 43)
         sizes = dict(PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8*rows), PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=str(8*512),
-                     # The packed exchange of the default, whose buffer is counted, named: the pitched one takes none.
+                     # The packed exchange, whose buffer is counted: the pitched one of the default takes none.
                      PARSEC_CUPY_EXCHANGE_STRIDED='0',
                      PARSEC_CUPY_DISTRIBUTED_STATE_RANGES='fixed', PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS='1',
                      PARSEC_CUPY_RITZ_DENSE_BACKEND='device', PARSEC_CUPY_RITZ_CONDITION='symmetric')

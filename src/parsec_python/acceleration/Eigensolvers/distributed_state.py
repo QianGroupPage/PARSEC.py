@@ -388,9 +388,9 @@ def column_copies_requested() -> bool:
 def exchange_chunk_bytes() -> int:
     """Bytes of the one buffer through which a device exchanges its columns.
 
-    Only the packed exchange takes the buffer, the default
-    (``PARSEC_CUPY_EXCHANGE_STRIDED=0``); the pitched one that ``1`` names
-    takes none (:func:`strided_exchange_requested`).
+    Only the packed exchange takes the buffer, which
+    ``PARSEC_CUPY_EXCHANGE_STRIDED=0`` selects; the pitched one of the
+    default takes none (:func:`strided_exchange_requested`).
 
     ``PARSEC_CUPY_EXCHANGE_CHUNK_BYTES`` sets it; the default is 1 GiB.  The
     part of a column block that lies in the rows of the other devices is
@@ -620,34 +620,24 @@ def paired_exchange_requested() -> bool:
 def strided_exchange_requested() -> bool:
     """Whether the copies between the devices of a shared basis take a row range of a column block as it lies.
 
-    ``0``, the default, is the packed exchange of the code of 21 October
-    2026: a device packs the rows of its columns that belong to each other
-    device into its exchange buffer with a copy kernel, the others pull
-    each piece as one contiguous copy, and on the way back a device pulls
-    the rows of its columns from all the others into its buffer and unpacks
-    them with another kernel (:meth:`SectorDeviceGroup._to_rows`,
-    :meth:`SectorDeviceGroup._to_columns`); the rule that shares a basis
-    counts the buffer (:func:`shared_block_bytes`).
-
-    ``PARSEC_CUPY_EXCHANGE_STRIDED=1`` sends every piece in one
+    The default since 2026-10-22: every piece goes in one
     ``cudaMemcpy2DAsync`` between the devices, a line per column, of the
     rows of the piece, with the distance between the columns of each array
     as its pitch.  No pack or unpack kernel runs, no chunk is cut and no
     exchange buffer is taken: a piece is all the rows of one device of a
     column range of a block, and four devices take them in the turns of
     :func:`paired_exchange_requested`.  Every byte arrives where it did, so
-    the results are those of the packed exchange bit for bit.  Every
-    conversion reads it, in every step of a shared basis, and the rule
-    counts no buffer for it.
+    the results are those of the former exchange bit for bit.  Every
+    conversion reads it, in every step of a shared basis, and the rule that
+    shares a basis counts no buffer for it (:func:`shared_block_bytes`).
 
-    The code published on 2026-10-22 took ``1`` by default, with
-    ``PARSEC_CUPY_RITZ_PIPELINE=p2`` (:func:`ritz_pipeline`).  The owner
-    made ``0`` and ``off`` the defaults again, to keep the default behaviour
-    of the code of 21 October: after the maintenance of Perlmutter on
-    2026-10-21 small calculations on four nodes ran slower, which was the
-    machine and not the code (on the same nodes the published code was 5 to
-    8 % faster than that of 21 October, 3,480 electrons on 16 GPUs in 5.5
-    to 5.6 s against 5.9 to 6.2 s).
+    ``PARSEC_CUPY_EXCHANGE_STRIDED=0`` restores the former exchange: a
+    device packs the rows of its columns that belong to each other device
+    into its exchange buffer with a copy kernel, the others pull each piece
+    as one contiguous copy, and on the way back a device pulls the rows of
+    its columns from all the others into its buffer and unpacks them with
+    another kernel (:meth:`SectorDeviceGroup._to_rows`,
+    :meth:`SectorDeviceGroup._to_columns`), and the rule counts the buffer.
 
     Measured on the four A100 of one node (2026-10-21, a probe at the slabs
     of the step, 32 to 128 columns of 2.9 to 5.7 million rows):
@@ -657,11 +647,11 @@ def strided_exchange_requested() -> bool:
     turns with their pack (13.27 against 14.80 ms for 32 columns of
     5,660,200 rows), and the way back from all peers at once 0.92 to 0.93
     of the time of the pulls into the buffer and the unpack (17.90 against
-    19.34 ms); every byte was checked.  Complete runs of it with
-    ``PARSEC_CUPY_RITZ_PIPELINE=p2``: see :func:`ritz_pipeline`.
+    19.34 ms); every byte was checked.  Complete runs took it as a default
+    together with ``PARSEC_CUPY_RITZ_PIPELINE=p2``: see :func:`ritz_pipeline`.
     """
 
-    value = os.environ.get("PARSEC_CUPY_EXCHANGE_STRIDED", "0").strip().lower()
+    value = os.environ.get("PARSEC_CUPY_EXCHANGE_STRIDED", "1").strip().lower()
     if value not in {"0", "1", "on", "off", "true", "false"}:
         raise ValueError("PARSEC_CUPY_EXCHANGE_STRIDED must be on or off")
     return value in {"1", "on", "true"}
@@ -673,8 +663,8 @@ _RITZ_PIPELINE_MODES = ("off", "p1", "p2")
 def ritz_pipeline() -> str:
     """``off``, ``p1`` or ``p2`` from ``PARSEC_CUPY_RITZ_PIPELINE``: what the rounds of the step with one tall block run side by side.
 
-    ``off``, the default, also where the variable is unset or empty, is the
-    step of the code of 21 October 2026
+    ``p2`` is the default since 2026-10-22, also where the variable is
+    unset or empty.  ``off`` restores the former step exactly
     (:meth:`SectorDeviceGroup._ritz_one_block`): in every round each device
     applies ``H`` to its slab, moves the slab into the workspace, sends it
     and then ``H`` times it to the row layout, and projects, and every one
@@ -719,20 +709,16 @@ def ritz_pipeline() -> str:
     for the apply, the products and the leave, so its clock would put them
     into the exchange (:attr:`SectorDeviceGroup.stage_clock`).
 
-    Complete first calculations on dedicated A100 nodes (2026-10-22, the
-    launch profile of the measured series, runs in the order ABBA), ``off``
-    with the packed exchange against ``p2`` with the pitched one
+    Complete first calculations on A100 nodes (2026-10-22, the launch
+    profile of the measured series, runs in the order ABBA), the former
+    ``off`` with the packed exchange against ``p2`` with the pitched one
     (:func:`strided_exchange_requested`): the same total energies and SCF
-    steps, the SCF 4.1 to 6.4 % shorter on 8 and 16 GPUs (231.1 and 231.2
-    against 218.8 and 219.0 s for 39,368 electrons on 16 GPUs), and the
-    fullest devices 1.0 to 1.2 GiB lower; the series F12, with both, took 4
-    to 7 % less than F11 on 8 GPUs and 3 to 6 % less on 16 from 19,392
-    electrons on.  The code published on 2026-10-22 took ``p2`` by default;
-    ``off`` is the default again by decision of the owner, for the reason
-    that :func:`strided_exchange_requested` gives.
+    steps, the SCF 4.4 % shorter for 23,768 electrons and 3.6 % for 29,576
+    on 8 GPUs, 6.4 % for 23,768 and 5.4 % for 39,368 on 16 GPUs (231.1
+    against 218.8 s), and the fullest devices 1.0 to 1.2 GiB lower.
     """
 
-    value = os.environ.get("PARSEC_CUPY_RITZ_PIPELINE", "off").strip().lower() or "off"
+    value = os.environ.get("PARSEC_CUPY_RITZ_PIPELINE", "p2").strip().lower() or "p2"
     if value not in _RITZ_PIPELINE_MODES:
         raise ValueError("PARSEC_CUPY_RITZ_PIPELINE must be off, p1 or p2")
     return value
@@ -1594,17 +1580,18 @@ def shared_basis_fits(rows: int, columns: int, devices: int) -> bool:
     61,162,425,024.  ``PARSEC_CUPY_EXCHANGE_CHUNK_BYTES=1073741824`` gives
     the former count.
 
-    The pitched exchange (``PARSEC_CUPY_EXCHANGE_STRIDED=1``,
-    :func:`strided_exchange_requested`) takes no buffer, and the rule
+    The pitched exchange, the default since 2026-10-22
+    (:func:`strided_exchange_requested`), takes no buffer, and the rule
     counts none for it: up to 1.125 GiB less on every device.  That changes
     no decision of the measured series on A100 80 GB nodes, 3,480 to
-    39,368 electrons on 8 and 16 GPUs: the count closest to the share below
-    goes from 0.760 to 0.748 of a device (29,576 electrons on two devices),
-    and 39,368 electrons on two, 1.363 and 1.350 of a device, share no basis
-    either way.  The rule of the state storage, which counts a shared basis
-    by these bytes, decides alike, and the counts in its records are that
-    much lower.  The packed exchange of the default, ``0``, takes the buffer
-    and is counted with it, as by the code of 21 October.
+    39,368 electrons on 8 and 16 GPUs, by the code of then: the count closest
+    to the share below went from 0.760 to 0.748 of a device (29,576
+    electrons on two devices), and 39,368 electrons on two, 1.363 and 1.350
+    of a device, share no basis either way.  The rule of the state storage,
+    which counts a shared basis by these bytes, decides alike, and the
+    counts in its records are that much lower.
+    ``PARSEC_CUPY_EXCHANGE_STRIDED=0`` counts the buffer again with the
+    exchange that takes it.
 
     They fit if they take no more of the current device's memory than
     ``PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION``, 0.85 by default.  The
@@ -2719,13 +2706,13 @@ class SectorDeviceGroup:
         conversions send (:func:`followed_slabs`): blocks that they do not
         hold whole travel in chunks of the default.
 
-        Where :func:`strided_exchange_requested` says so
-        (``PARSEC_CUPY_EXCHANGE_STRIDED=1``) nothing is packed: every device
-        receives the rows of each block of another device as they lie in
-        it, one pitched copy per column range, in the same turns and in one
-        step, since no buffer limits a step.  No buffer is taken and
-        ``buffers`` is not read.  What the paragraphs above say of chunks
-        and buffers is the packed exchange, the default.
+        By default since 2026-10-22 (:func:`strided_exchange_requested`)
+        nothing is packed: every device receives the rows of each block of
+        another device as they lie in it, one pitched copy per column range,
+        in the same turns and in one step, since no buffer limits a step.
+        No buffer is taken and ``buffers`` is not read.  What the paragraphs
+        above say of chunks and buffers is the packed exchange, which
+        ``PARSEC_CUPY_EXCHANGE_STRIDED=0`` restores.
 
         For the pipelined rounds of :meth:`_ritz_one_block`: ``streams``
         maps every device to the stream that runs the conversion, its
@@ -2903,12 +2890,11 @@ class SectorDeviceGroup:
         its seconds were higher with one chunk for a slab that is little
         wider (:func:`exchange_chunk_limit`).
 
-        Where :func:`strided_exchange_requested` says so
-        (``PARSEC_CUPY_EXCHANGE_STRIDED=1``) a device copies the rows of its
-        columns from every other device straight into its block, one
-        pitched copy per column range and device, with no buffer and no
-        unpack kernel; the chunks and the buffer above are those of the
-        packed exchange, the default.
+        By default since 2026-10-22 (:func:`strided_exchange_requested`) a
+        device copies the rows of its columns from every other device
+        straight into its block, one pitched copy per column range and
+        device, with no buffer and no unpack kernel; the chunks and the
+        buffer above are those of the packed exchange.
         """
 
         cp, _ = require_cupy()
@@ -3690,9 +3676,8 @@ class SectorDeviceGroup:
         slabs of one device, and overlap and rotation meet the columns in
         another order.
 
-        :func:`ritz_pipeline` lets the stages of a round run side by side
-        under ``p1`` and ``p2``; ``off``, the default, keeps them one after
-        another as above.
+        :func:`ritz_pipeline` lets the stages of a round run side by side,
+        ``p2`` by default; ``off`` keeps them one after another as above.
         Under ``p1`` every device moves its slab into the workspace on its
         compute stream, sends it from there on its exchange stream
         (:meth:`_exchange_streams`) and applies ``H`` to that copy on the

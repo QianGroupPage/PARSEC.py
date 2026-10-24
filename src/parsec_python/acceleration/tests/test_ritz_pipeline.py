@@ -50,13 +50,12 @@ _VALUES = (('off', '0'), ('p1', '0'), ('p2', '0'), ('off', '1'), ('p1', '1'), ('
 class SwitchTests(unittest.TestCase):
     """What the two switches accept, and what the rounds and the pitched copies are cut into: on the host."""
 
-    def test_the_pipeline_is_off_unless_p1_or_p2_is_named(self):
-        # off, the step of the code of 21 October, is the default, also where the variable is empty; p2 was the
-        # default of the code published on 2026-10-22.
+    def test_the_pipeline_is_p2_unless_off_or_p1_is_named(self):
+        # p2 is the default since 2026-10-22, also where the variable is empty; off is the former step.
         with patch.dict(os.environ):
             os.environ.pop('PARSEC_CUPY_RITZ_PIPELINE', None)
-            self.assertEqual(distributed_state.ritz_pipeline(), 'off')
-            for value, expected in (('', 'off'), ('off', 'off'), (' P1 ', 'p1'), ('p2', 'p2'), ('OFF', 'off')):
+            self.assertEqual(distributed_state.ritz_pipeline(), 'p2')
+            for value, expected in (('', 'p2'), ('off', 'off'), (' P1 ', 'p1'), ('p2', 'p2'), ('OFF', 'off')):
                 os.environ['PARSEC_CUPY_RITZ_PIPELINE'] = value
                 self.assertEqual(distributed_state.ritz_pipeline(), expected, value)
             for value in ('on', '1', 'p3', 'pipelined'):
@@ -64,12 +63,11 @@ class SwitchTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'off, p1 or p2'):
                     distributed_state.ritz_pipeline()
 
-    def test_the_exchange_is_packed_unless_pitched_copies_are_named(self):
-        # The packed exchange of the code of 21 October is the default; pitched copies (1) were the default of
-        # the code published on 2026-10-22.
+    def test_the_exchange_is_pitched_unless_the_packed_one_is_named(self):
+        # Pitched copies are the default since 2026-10-22; 0 is the former, packed exchange.
         with patch.dict(os.environ):
             os.environ.pop('PARSEC_CUPY_EXCHANGE_STRIDED', None)
-            self.assertFalse(distributed_state.strided_exchange_requested())
+            self.assertTrue(distributed_state.strided_exchange_requested())
             for value, expected in (('1', True), ('on', True), ('TRUE', True), ('0', False), ('off', False), ('false', False)):
                 os.environ['PARSEC_CUPY_EXCHANGE_STRIDED'] = value
                 self.assertEqual(distributed_state.strided_exchange_requested(), expected, value)
@@ -326,9 +324,9 @@ class PipelineDeviceTests(unittest.TestCase):
                 self.assertGreater(group.seconds[stage], 0., stage)
             self.assertGreater(group.overlap_seconds, 0.)
 
-    def test_the_defaults_are_the_former_step_and_p2_with_pitched_copies_gives_its_bits(self):
-        # Both switches unset: the rounds one after another and the packed exchange of the code of 21 October.
-        # p2 with pitched copies, the defaults of the code published on 2026-10-22, gives the same bits.
+    def test_the_defaults_are_p2_with_pitched_copies_and_give_the_bits_of_the_former_step(self):
+        # Both switches unset since 2026-10-22: the rounds side by side and pitched copies, with the bits of
+        # off and of the packed exchange, which restore the former step.
         basis = self._basis(self.rows, self.states)
         for devices in _named_groups():
             op, group = self._group(devices)
@@ -336,16 +334,16 @@ class PipelineDeviceTests(unittest.TestCase):
             for cut in ({'PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS': '8'}, {}):
                 settings = dict(cut, PARSEC_CUPY_STREAMING_RITZ_BYTES=str(8 * self.rows * 2))
                 with self.subTest(devices=devices, cut=cut):
-                    default = self._step(group, basis, layout, None, None, **settings)
+                    former = self._step(group, basis, layout, 'off', '0', **settings)
                     self.assertEqual((group.pipeline, group.stage_clock, group.exchange_copies), ('off', 'host', 'packed'))
                     self.assertGreater(group.exchange_buffer_bytes, 0)
-                    # A group of its own, which has taken no exchange buffer.
+                    # A group of its own, whose exchange buffer is not that of the former step.
                     fresh_op, fresh = self._group(devices)
-                    opted = self._step(fresh, basis, layout, 'p2', '1', **settings)
+                    default = self._step(fresh, basis, layout, None, None, **settings)
                     del fresh_op
                     self.assertEqual((fresh.pipeline, fresh.stage_clock, fresh.exchange_copies), ('p2', 'events', 'strided'))
                     self.assertEqual(fresh.exchange_buffer_bytes, 0)
-                    self._assert_same(opted, default, f'devices {devices}, {cut}: p2 with pitched copies against the defaults')
+                    self._assert_same(default, former, f'devices {devices}, {cut}: the defaults against the former step')
 
     def test_a_strided_exchange_takes_no_buffer(self):
         basis = self._basis(self.rows, self.states)

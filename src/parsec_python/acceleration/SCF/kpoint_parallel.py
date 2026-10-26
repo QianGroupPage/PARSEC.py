@@ -484,7 +484,8 @@ def describe() -> list[str]:
             lines.append(
                 " GPU-aware MPI     = "
                 + (
-                    "on: halo rows and sums go between the GPUs, the halo overlaps the local product"
+                    "on: halo rows go between the GPUs and overlap the local product; the sums go "
+                    + ("between the GPUs" if context.cuda_aware_reduce else "through the host")
                     if context.cuda_aware
                     else "off: halo rows and sums go through the host (PARSEC_MPI_CUDA_AWARE=1 for GPU buffers)"
                 )

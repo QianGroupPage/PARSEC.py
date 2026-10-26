@@ -11,7 +11,10 @@ and the formation of the density are collective.  ``PARSEC_MPI=1`` (or ``--mpi``
 ``mpirun``/``srun`` start the ranks, one per GPU.
 
 Arrays move through the host unless the MPI library is CUDA aware and
-``PARSEC_MPI_CUDA_AWARE=1`` says to hand it device buffers.
+``PARSEC_MPI_CUDA_AWARE=1`` says to hand it device buffers.  That is for the halo rows, which are large
+point-to-point messages.  The sums over the ranks (a few MB, one per operator application) stay on the host
+unless ``PARSEC_MPI_CUDA_AWARE_REDUCE=1``: on Cray MPICH a GPU-buffer Allreduce of that size cost three times
+what the host-staged one did (131 s against 44 s over the same 6,791 applications on 8 GPUs).
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import numpy as np
 
 MPI_ENV = "PARSEC_MPI"
 CUDA_AWARE_ENV = "PARSEC_MPI_CUDA_AWARE"
+CUDA_AWARE_REDUCE_ENV = "PARSEC_MPI_CUDA_AWARE_REDUCE"
 _MESSAGE_ELEMENTS = 1 << 26  # elements per MPI call: stays far below the 2**31 count limit
 
 
@@ -64,6 +68,7 @@ class MPIContext:
         self.ranks_per_node = int(node.Get_size())
         node.Free()
         self.cuda_aware = os.environ.get(CUDA_AWARE_ENV, "").strip().lower() in ("1", "true", "on", "yes")
+        self.cuda_aware_reduce = os.environ.get(CUDA_AWARE_REDUCE_ENV, "").strip().lower() in ("1", "true", "on", "yes")
         self.allsum_seconds = 0.0  # time of the sums over the ranks (``allsum``), for the report
 
     @property
@@ -98,7 +103,7 @@ class MPIContext:
         if backend is None:
             raise ValueError("a device array needs the backend that owns it")
         backend.synchronize()
-        if self.cuda_aware:
+        if self.cuda_aware and self.cuda_aware_reduce:
             flat = array.reshape(-1)
             for start in range(0, flat.size, _MESSAGE_ELEMENTS):
                 self.comm.Allreduce(self.MPI.IN_PLACE, flat[start : start + _MESSAGE_ELEMENTS], op=self.MPI.SUM)

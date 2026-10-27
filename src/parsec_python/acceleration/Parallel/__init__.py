@@ -1,5 +1,6 @@
 """Worker pools for k-point and band-path parallelism."""
 
+from . import mpi
 from .blas import set_blas_threads
 from .pool import (
     WORKERS_ENV,

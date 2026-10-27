@@ -68,3 +68,15 @@ __all__ = [
     "solve_scipy_hartree",
     "summarize_translation",
 ]
+
+# The k-point drivers and band paths of the reference SCF package run serially
+# unless this parallel backend is installed.
+from .SCF.kpoint_parallel import install as _install_kpoint_parallelism  # noqa: E402
+
+_install_kpoint_parallelism()
+
+# Preparing a periodic cell scans the whole grid for every atom image unless the fast
+# replacements are installed.
+from .V_ion.periodic_setup import install as _install_periodic_setup  # noqa: E402
+
+_install_periodic_setup()

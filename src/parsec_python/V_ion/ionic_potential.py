@@ -255,23 +255,24 @@ def superpose_atomic_density(
                 )
 
         for translation in translations:
-            radius = np.linalg.norm(grid.coordinates - (position + translation), axis=1)
-            if not np.any(radius < potential.interpolation_cutoff):
+            rows, _, radius = _support_finder(
+                grid, position + translation, potential.interpolation_cutoff
+            )
+            inside = radius < potential.interpolation_cutoff
+            if not np.any(inside):
                 continue
+            rows, radius = rows[inside], radius[inside]
             if reconstruct_from_wavefunctions:
-                contribution = np.zeros_like(radius)
-                inside = radius < potential.interpolation_cutoff
-                contribution[inside] = np.interp(
-                    radius[inside],
+                density[rows] += np.interp(
+                    radius,
                     potential.radii,
                     radial_density,
                     left=radial_density[0],
                 )
-                density += contribution
             else:
                 # PARSEC's initial valence-density path is linear even when
                 # the optional spline is used for other radial quantities.
-                density += potential.interpolate_density(
+                density[rows] += potential.interpolate_density(
                     radius,
                     core=core,
                     # ``initchrg.f90`` always uses linear interpolation.
@@ -515,6 +516,32 @@ def _projector_support_radius(potential: ParsecPseudopotential) -> float:
     return potential.projector_support_radius
 
 
+def dense_support(grid, center: np.ndarray, radius: float):
+    """Grid points within ``radius`` of ``center``: ``(rows, relative, distances)``.
+
+    ``relative = grid.coordinates[rows] - center``.  This is the readable definition: it measures the
+    distance of every grid point.  ``center`` may lie outside the cell (a periodic image).
+    """
+    relative = grid.coordinates - center
+    distances = np.linalg.norm(relative, axis=1)
+    rows = np.flatnonzero(distances <= radius)
+    return rows, relative[rows], distances[rows]
+
+
+_support_finder = dense_support
+
+
+def set_support_finder(finder=None) -> None:
+    """Install a faster ``finder(grid, center, radius)`` with the result of :func:`dense_support`.
+
+    ``None`` restores :func:`dense_support`.  The performance counterpart lives in
+    ``parsec_python.acceleration.V_ion.periodic_setup`` and installs itself when the acceleration
+    package is imported.
+    """
+    global _support_finder
+    _support_finder = dense_support if finder is None else finder
+
+
 def _periodic_image_translations(
     lattice_vectors: np.ndarray, support_radius: float
 ) -> np.ndarray:
@@ -639,10 +666,9 @@ def build_nonlocal_projectors(
         # and harmonic work to grid points within their radial support.
         images: list[tuple[np.ndarray, np.ndarray, np.ndarray, complex]] = []
         for translation in translations:
-            relative = grid.coordinates - (position + translation)
-            radius = np.linalg.norm(relative, axis=1)
-            support = radius <= support_radius
-            support_rows = np.flatnonzero(support)
+            support_rows, relative_support, radius_support = _support_finder(
+                grid, position + translation, support_radius
+            )
             if support_rows.size:
                 # Bloch factor of this image's projector in the periodic-u
                 # picture (psi = e^{ik.r} u, the picture the k-point kinetic
@@ -654,10 +680,10 @@ def build_nonlocal_projectors(
                     1.0
                     if k_point is None
                     else np.exp(
-                        -1j * ((grid.coordinates[support] - translation) @ k_point)
+                        -1j * ((grid.coordinates[support_rows] - translation) @ k_point)
                     )
                 )
-                images.append((support_rows, relative[support], radius[support], phase))
+                images.append((support_rows, relative_support, radius_support, phase))
         if not images:
             continue
 

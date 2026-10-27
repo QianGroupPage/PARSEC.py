@@ -51,6 +51,7 @@ from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
 from ..SCF.single_point import PreparedSinglePointSystem
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
+from .stage_timer import StageTimer
 
 
 def spinor_density_from_orbitals(
@@ -78,6 +79,9 @@ def spinor_density_from_orbitals(
     psi_down = spinors[n_grid:, :]
     weighted = (np.abs(psi_up) ** 2 + np.abs(psi_down) ** 2) * occupations[None, :]
     return np.sum(weighted, axis=1) / volume_element
+
+
+_StageTimer = StageTimer
 
 
 def _number_of_states(system: PreparedSinglePointSystem) -> int:
@@ -147,6 +151,8 @@ def run_self_consistent_soc(
     orbital_density_builder: Callable[..., np.ndarray] | None = None,
     mixer_factory: Callable[..., object] | None = None,
     total_energy_evaluator: Callable[..., object] | None = None,
+    synchronize: Callable[[], None] | None = None,
+    to_host: Callable[[object], np.ndarray] | None = None,
 ) -> SelfConsistentSOCResult:
     """Run self-consistent-SOC PARSEC-style potential mixing.
 
@@ -177,8 +183,15 @@ def run_self_consistent_soc(
     :class:`~parsec_python.Mixer.AndersonMixer` (called as
     ``mixer_factory(system.input.mixing)``); ``total_energy_evaluator``
     replaces :func:`~parsec_python.Energy.total_energy_no_degeneracy`.
+
+    ``synchronize`` is a device barrier called around every timed stage, and
+    ``to_host`` converts the final spinors if the eigensolver keeps them on a
+    device; the intermediate spinors then never leave it (``orbital_density_builder``
+    reads them where they are).  The seconds per stage are returned in
+    ``result.timings``.
     """
     settings = system.input.scf
+    timer = _StageTimer(synchronize)
     number_of_states = _number_of_states(system)
     ionic_potential = system.ionic_potential
     solve_eigenproblem = (
@@ -201,12 +214,13 @@ def run_self_consistent_soc(
         else total_energy_evaluator
     )
 
-    initial_hartree = system.solve_hartree(
-        system.initial_density, initial_potential=-ionic_potential
-    )
-    hartree_potential = initial_hartree.potential
-    xc = system.evaluate_xc(system.initial_density)
-    input_potential = ionic_potential + hartree_potential + xc.potential
+    with timer.stage("setup_potentials"):
+        initial_hartree = system.solve_hartree(
+            system.initial_density, initial_potential=-ionic_potential
+        )
+        hartree_potential = initial_hartree.potential
+        xc = system.evaluate_xc(system.initial_density)
+        input_potential = ionic_potential + hartree_potential + xc.potential
 
     eigval_state: EigvalState | None = None
     mixer = build_mixer(system.input.mixing)
@@ -224,27 +238,32 @@ def run_self_consistent_soc(
     for iteration in range(1, settings.max_iterations + 1):
         eigval_settings = _eigval_settings(system, filter_degree)
 
-        scalar_hamiltonian = system.hamiltonian(input_potential)
-        hamiltonian = build_spinor_hamiltonian(scalar_hamiltonian, soc_projectors)
-        # getattr's default argument is evaluated eagerly, so
-        # getattr(hamiltonian, "as_eigensolver_operator", hamiltonian.as_linear_operator)
-        # would raise AttributeError on any hamiltonian lacking
-        # as_linear_operator even when it has as_eigensolver_operator (as
-        # CuPySpinorHamiltonian does, by design -- it has no need for a
-        # scipy LinearOperator wrapper).  Branch explicitly instead.
-        if hasattr(hamiltonian, "as_eigensolver_operator"):
-            operator = hamiltonian.as_eigensolver_operator()
-        else:
-            operator = hamiltonian.as_linear_operator()
-        solution = solve_eigenproblem(
-            operator,
-            number_of_states,
-            settings=eigval_settings,
-            state=eigval_state,
-        )
+        with timer.stage("hamiltonian"):
+            scalar_hamiltonian = system.hamiltonian(input_potential)
+            hamiltonian = build_spinor_hamiltonian(scalar_hamiltonian, soc_projectors)
+            # getattr's default argument is evaluated eagerly, so
+            # getattr(hamiltonian, "as_eigensolver_operator", hamiltonian.as_linear_operator)
+            # would raise AttributeError on any hamiltonian lacking
+            # as_linear_operator even when it has as_eigensolver_operator (as
+            # the device spinor operators do, by design).  Branch explicitly instead.
+            if hasattr(hamiltonian, "as_eigensolver_operator"):
+                operator = hamiltonian.as_eigensolver_operator()
+            else:
+                operator = hamiltonian.as_linear_operator()
+        # the previous iteration's orbitals are not needed again: free them before the
+        # eigensolver allocates the next ones
+        spinors = None
+        with timer.stage("diagonalization"):
+            solution = solve_eigenproblem(
+                operator,
+                number_of_states,
+                settings=eigval_settings,
+                state=eigval_state,
+            )
+        timer.add_counters("eig_", getattr(solution, "stats", None))
         eigval_state = solution.state
         eigenvalues = np.asarray(solution.eigenvalues, dtype=float)
-        spinors = np.asarray(solution.vectors)
+        spinors = solution.vectors if to_host is not None else np.asarray(solution.vectors)
 
         occupation_result = fermi_occupations(
             eigenvalues,
@@ -255,39 +274,42 @@ def run_self_consistent_soc(
         occupations = occupation_result.occupations
         fermi_level = occupation_result.fermi_level
 
-        density = build_orbital_density(
-            spinors, occupations, system.grid.volume_element
-        )
+        with timer.stage("density"):
+            density = build_orbital_density(
+                spinors, occupations, system.grid.volume_element
+            )
 
-        hartree = system.solve_hartree(density, initial_potential=hartree_potential)
-        hartree_potential = hartree.potential
-        xc = system.evaluate_xc(density)
-        output_potential = ionic_potential + hartree_potential + xc.potential
+        with timer.stage("hartree"):
+            hartree = system.solve_hartree(density, initial_potential=hartree_potential)
+            hartree_potential = hartree.potential
+        with timer.stage("xc"):
+            xc = system.evaluate_xc(density)
+            output_potential = ionic_potential + hartree_potential + xc.potential
 
-        metrics = potential_residual_metrics(
-            input_potential,
-            output_potential,
-            density,
-            system.grid.volume_element,
-            system.electron_count,
-        )
+        with timer.stage("mixing_energy"):
+            metrics = potential_residual_metrics(
+                input_potential,
+                output_potential,
+                density,
+                system.grid.volume_element,
+                system.electron_count,
+            )
 
-        energies = evaluate_total_energy(
-            eigenvalues,
-            occupations,
-            density,
-            input_potential,
-            ionic_potential,
-            hartree_potential,
-            xc.potential,
-            xc.total_energy,
-            system.ion_ion_energy,
-            system.grid.volume_element,
-            alpha_z_energy=system.alpha_z_energy,
-        )
+            energies = evaluate_total_energy(
+                eigenvalues,
+                occupations,
+                density,
+                input_potential,
+                ionic_potential,
+                hartree_potential,
+                xc.potential,
+                xc.total_energy,
+                system.ion_ion_energy,
+                system.grid.volume_element,
+                alpha_z_energy=system.alpha_z_energy,
+            )
 
-        mixed_potential = mixer.mix(input_potential, output_potential, iteration=iteration)
-
+            mixed_potential = mixer.mix(input_potential, output_potential, iteration=iteration)
         selected_residual = (
             metrics.plain if settings.use_plain_residual else metrics.weighted
         )
@@ -314,6 +336,9 @@ def run_self_consistent_soc(
             converged = True
             break
 
+    if to_host is not None:
+        with timer.stage("final_download"):
+            spinors = np.asarray(to_host(spinors))
     return SelfConsistentSOCResult(
         converged=converged,
         iterations=iteration,
@@ -325,6 +350,7 @@ def run_self_consistent_soc(
         fermi_level=fermi_level,
         density=density,
         energies=energies,
+        timings=dict(timer.seconds),
     )
 
 

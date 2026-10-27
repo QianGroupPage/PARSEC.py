@@ -47,6 +47,28 @@ reference_main.py
   -> cli.py -> driver.py -> SCF
 ```
 
+K-point and band-path parallelism follows the same rule. The readable
+definition is serial: `SCF/kpoint_solver.py` (`SerialKPointSolver`, `map_tasks`)
+is all the k-point, spin-orbit, non-collinear and band-path drivers import.
+`acceleration/SCF/kpoint_parallel.py` and `acceleration/Parallel/` (worker
+threads, BLAS control, GPU device workers, `acceleration/Hamiltonian/device_bloch.py`)
+are the performance counterpart; importing `parsec_python.acceleration` installs
+it with `set_parallel_backend`. `acceleration/tests/test_kpoint_parallel.py`
+checks it against the serial definition.
+
+A basis too large for one GPU is split over MPI ranks by blocks of grid rows:
+`acceleration/Parallel/mpi.py` (the communicator and its collectives), `acceleration/Hamiltonian/distributed_bloch.py`
+(row-sliced operators with halo exchange and projector sums) and `acceleration/SCF/kpoint_mpi.py` (the solver that the
+drivers get from `make_kpoint_solver` when `PARSEC_MPI=1`). The eigensolver in `chebff_spinor.py` is the same code
+with its reductions routed through the operator; the drivers stay replicated and unaware of MPI.
+
+Preparing a periodic cell follows the same rule. `V_ion` keeps the direct definitions: the Ewald local
+potential and the projector and atomic-density builders measure the distance of every grid point to every atom
+image. `acceleration/V_ion/periodic_setup.py` supplies a grid-ball query (integer index boxes, identical
+rows and distances) through `V_ion.ionic_potential.set_support_finder`, and the local potential as one FFT
+through `V_ion.ewald.set_local_potential_provider`; importing `parsec_python.acceleration` installs both.
+`acceleration/tests/test_periodic_setup.py` checks them against the definitions.
+
 The flow is a dependency direction, not permission for lower-level modules to
 import the SCF driver. Physics components must remain independently callable.
 

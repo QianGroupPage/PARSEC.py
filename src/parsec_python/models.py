@@ -1090,6 +1090,9 @@ class RunTimings:
     xc_seconds: float = 0.0
     mixing_energy_seconds: float = 0.0
     total_seconds: float = 0.0
+    detail: dict[str, float] = field(default_factory=dict)
+    """Seconds and counters of the parts of a stage that a driver measures inside its eigensolver
+    workers (k-point drivers); worker seconds are summed over the workers."""
 
 
 @dataclass(frozen=True)
@@ -1181,6 +1184,9 @@ class SpinPolarizedSCFIteration:
     occupations_up: tuple[float, ...] = ()
     occupations_down: tuple[float, ...] = ()
     fermi_level: float = float("nan")
+    diagonalization_seconds: float = 0.0
+    total_seconds: float = 0.0
+    eigen_residual_max: float = float("nan")
 
 
 @dataclass
@@ -1303,6 +1309,8 @@ class SpinPolarizedSinglePointResult:
     k-major: entries ``i*n_states:(i+1)*n_states`` belong to ``k_points[i]``."""
     k_weights: np.ndarray | None = None
     """Normalized k-point weights, shape ``(n_k,)``."""
+    timings: RunTimings | None = None
+    """Stage timings, recorded by the k-point driver (``None`` where not measured)."""
 
     @property
     def magnetic_moment(self) -> float:
@@ -1331,6 +1339,11 @@ class SelfConsistentSOCIteration:
     eigenvalues: tuple[float, ...] = ()
     occupations: tuple[float, ...] = ()
     fermi_level: float = float("nan")
+    eigen_residual_max: float = float("nan")
+    """Largest ``||H x - e x||`` of the requested pairs after this iteration's solve (NaN if not measured)."""
+    diagonalization_seconds: float = 0.0
+    total_seconds: float = 0.0
+    """Seconds of this iteration's diagonalization and of the whole iteration (0 where not measured)."""
 
 
 @dataclass
@@ -1379,6 +1392,10 @@ class SelfConsistentSOCResult:
     state_moments: np.ndarray | None = None
     """``<S_z>`` of every pooled state (same k-major layout as ``eigenvalues``)
     for k-point runs, where ``spinors`` only holds the first k-point."""
+    timings: dict[str, float] | None = None
+    """Seconds per SCF stage (``hamiltonian``, ``diagonalization``, ``density``,
+    ``hartree``, ``xc``, ``mixing_energy``) plus the eigensolver's own counters
+    (``eig_*``), for the single-point driver; ``None`` where not recorded."""
 
     @property
     def magnetic_moment_per_state(self) -> np.ndarray:

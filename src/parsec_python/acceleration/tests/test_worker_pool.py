@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import unittest
 
-from parsec_python.Parallel import WorkerError, make_pool, resolve_workers
+from parsec_python.acceleration.Parallel import WorkerError, make_pool, resolve_workers
 
 
 class _Worker:

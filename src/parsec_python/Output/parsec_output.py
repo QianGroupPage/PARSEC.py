@@ -820,6 +820,32 @@ class ParsecTextReporter:
         # Two spin channels change the header and the report of every step.
         self._spin = bool(getattr(self.problem.scf, "spin_polarized", False))
 
+    def _complex_wavefunctions(self) -> bool:
+        scf = self.problem.scf
+        return bool(
+            getattr(scf, "self_consistent_spin_orbit", False)
+            or getattr(scf, "noncollinear", False)
+            or getattr(self.problem, "has_kpoint_sampling", False)
+        )
+
+    def _boundary_lines(self, shape_name: str, domain_line: str) -> list[str]:
+        """The boundary conditions and the domain: the wording of usrinputfile.F90 for each."""
+        cell = getattr(self.problem, "periodic_cell", None)
+        if cell is None:
+            return [
+                " Confined system (cluster) with zero boundary condition!",
+                f"  {shape_name} domain shape:",
+                domain_line,
+                *domain_header_lines(self.translation),
+            ]
+        vectors = np.asarray(cell.lattice_vectors, dtype=float)
+        return [
+            " Periodic boundary conditions!",
+            " System is fully periodic ",
+            " Unit lattice vectors [bohr] : ",
+            *(" ".join(f"{value:15.10f}" for value in row) for row in vectors),
+        ]
+
     def header(self) -> None:
         grid = self.problem.grid
         scf = self.problem.scf
@@ -868,10 +894,7 @@ class ParsecTextReporter:
             " Grid data:",
             " ~~------~~",
             "",
-            " Confined system (cluster) with zero boundary condition!",
-            f"  {shape_name} domain shape:",
-            domain_line,
-            *domain_header_lines(self.translation),
+            *self._boundary_lines(shape_name, domain_line),
             f" Grid spacing is {grid.spacing:9.6f} bohrs",
             " Order of double grid is    1",
             (
@@ -884,7 +907,13 @@ class ParsecTextReporter:
                 + " ".join(f"{value:8.4f}" for value in grid.shift)
                 + "   [units of grid spacing]"
             ),
-            " WAVEFUNCTIONS ARE REAL!",
+            # usrinputfile.F90: complex with k-point sampling, a magnetic field or complex_wfn; here also
+            # the two-component spinors of spin-orbit coupling and non-collinear magnetism
+            (
+                " WAVEFUNCTIONS ARE COMPLEX!"
+                if self._complex_wavefunctions()
+                else " WAVEFUNCTIONS ARE REAL!"
+            ),
             (
                 " The Finite-difference expansion is of order "
                 f"{grid.expansion_order:2d}"
@@ -1251,7 +1280,13 @@ class ParsecTextReporter:
                 f"{step.diagonalization_seconds:10.2f},"
                 f"      tdiag_sum = {self._diagonalization_total:11.2f}"
             ),
+            *(
+                (f" Iteration time [sec]       : {step.total_seconds:10.2f}",)
+                if getattr(step, "total_seconds", 0.0) > 0.0
+                else ()
+            ),
             "",
+            *self._residual_lines(step),
         ]
         if getattr(step, "spin_polarized", False):
             # flevel.f90 and rho_hart.F90 report each channel.
@@ -1552,6 +1587,7 @@ class ParsecTextReporter:
                     " --------------------------------------------------",
                 ]
             )
+            lines.extend(self._kpoint_detail_lines(timings))
         lines.extend(self._final_k_tables(result))
         if forces is None:
             lines.extend(
@@ -1612,6 +1648,16 @@ class ParsecTextReporter:
         lines = [
             f" Spin-polarized SCF iter # {step.iteration:3d}",
             "",
+            *(
+                (
+                    f" Diagonalization time [sec] : {step.diagonalization_seconds:10.2f},"
+                    f"      iteration time = {step.total_seconds:10.2f}",
+                    "",
+                )
+                if getattr(step, "total_seconds", 0.0) > 0.0
+                else ()
+            ),
+            *self._residual_lines(step),
             f" Fermi level at {step.fermi_level:10.4f} [Ry]",
             "",
             *self._kpoint_note(),
@@ -1681,6 +1727,90 @@ class ParsecTextReporter:
             )
         return lines
 
+    @staticmethod
+    def _residual_lines(step) -> list[str]:
+        """The largest eigenpair residual ``||H x - e x||`` of an iteration, where one was measured."""
+        value = getattr(step, "eigen_residual_max", float("nan"))
+        if value != value:  # NaN
+            return []
+        return [f" Eigensolver residual max [Ry] : {value:12.4e}", ""]
+
+    @staticmethod
+    def _kpoint_stage_lines(timings) -> list[str]:
+        """Stage table of a k-point SCF that carries no ``SinglePointResult`` table (spin)."""
+        if timings is None or timings.total_seconds <= 0.0:
+            return []
+        lines = [
+            " SCF timing analysis [sec]",
+            " --------------------------------------------------",
+            f" Initial Hartree potential      : {timings.initial_hartree_seconds:12.6f}",
+            f" Initial exchange-correlation   : {timings.initial_xc_seconds:12.6f}",
+            f" Diagonalization subtotal       : {timings.diagonalization_seconds:12.6f}",
+            f" Occupation/density subtotal    : {timings.occupations_density_seconds:12.6f}",
+            f" Hartree potential subtotal     : {timings.hartree_seconds:12.6f}",
+            f" Exchange-correlation subtotal  : {timings.xc_seconds:12.6f}",
+            f" Mixing/energy subtotal         : {timings.mixing_energy_seconds:12.6f}",
+            f" SCF wall time                   : {timings.total_seconds:12.6f}",
+            " --------------------------------------------------",
+        ]
+        lines.extend(ParsecTextReporter._kpoint_detail_lines(timings))
+        lines.append("")
+        return lines
+
+    @staticmethod
+    def _kpoint_detail_lines(timings) -> list[str]:
+        """What the k-point solver measured: its set-up and the seconds inside its workers."""
+        detail = getattr(timings, "detail", None)
+        if not detail:
+            return []
+        lines = ["", " K-point solver detail", " --------------------------------------------------"]
+        if "workers" in detail:
+            lines.append(f" {'Workers':30s} : {int(detail['workers']):12d}")
+        lines.append(f" {'Solver and worker start-up':30s} : {detail.get('solver_setup', 0.0):12.6f}")
+        worker = (
+            ("worker_hamiltonian_seconds", "Bloch Hamiltonian (projectors)"),
+            ("worker_upload_seconds", "Operator upload"),
+            ("worker_solve_seconds", "Eigensolver"),
+            ("worker_spill_seconds", "Subspace to the host"),
+            ("worker_download_seconds", "Eigenvectors to the host"),
+            ("worker_density_seconds", "Density of the k-points"),
+            ("worker_gather_seconds", "Density joined over the MPI ranks"),
+            ("worker_halo_begin_seconds", "Halo rows packed and sent (rank 0)"),
+            ("worker_halo_wait_seconds", "Waiting for the halo rows (rank 0)"),
+            ("worker_allsum_seconds", "Projector overlaps summed over ranks (rank 0)"),
+        )
+        present = [(key, label) for key, label in worker if key in detail]
+        if present:
+            lines.append(" Summed over the workers [worker-sec]")
+            for key, label in present:
+                lines.append(f"   {label:28s} : {detail[key]:12.6f}")
+        solver = (
+            ("lanczos_seconds", "Lanczos bounds"),
+            ("filter_seconds", "Chebyshev filter"),
+            ("orthonormalize_seconds", "Orthonormalization"),
+            ("ritz_seconds", "Rayleigh-Ritz"),
+            ("residual_seconds", "Residuals"),
+        )
+        present = [(key, label) for key, label in solver if key in detail]
+        if present:
+            lines.append(" Device eigensolver [worker-sec]")
+            for key, label in present:
+                lines.append(f"   {label:28s} : {detail[key]:12.6f}")
+        counters = (
+            ("first_solves", "First solves"),
+            ("subspace_steps", "Subspace steps"),
+            ("extra_cycles", "Extra CHEBFF cycles"),
+            ("applications", "Operator applications"),
+            ("application_columns", "Application columns"),
+        )
+        present = [(key, label) for key, label in counters if key in detail]
+        if present:
+            lines.append(" Eigensolver counters")
+            for key, label in present:
+                lines.append(f"   {label:28s} : {int(detail[key]):12d}")
+        lines.append(" --------------------------------------------------")
+        return lines
+
     def finish_spin_polarized(
         self, result: "SpinPolarizedSinglePointResult", elapsed_seconds: float
     ) -> None:
@@ -1694,6 +1824,7 @@ class ParsecTextReporter:
             "",
             f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
             "",
+            *self._kpoint_stage_lines(getattr(result, "timings", None)),
             f"Converged magnetic moment N_up - N_down = {result.magnetic_moment:12.4f}",
             f"Total Energy = {result.energies.total:22.8f} [Ry]",
             (
@@ -1749,6 +1880,16 @@ class ParsecTextReporter:
         lines = [
             f" Self-consistent SOC iter # {step.iteration:3d}",
             "",
+            *(
+                (
+                    f" Diagonalization time [sec] : {step.diagonalization_seconds:10.2f},"
+                    f"      iteration time = {step.total_seconds:10.2f}",
+                    "",
+                )
+                if getattr(step, "total_seconds", 0.0) > 0.0
+                else ()
+            ),
+            *self._residual_lines(step),
             f" Fermi level at {step.fermi_level:10.4f} [Ry]",
             "",
             *self._kpoint_note(),
@@ -1796,6 +1937,68 @@ class ParsecTextReporter:
         )
         self.write("\n".join(lines))
 
+    @staticmethod
+    def _soc_timing_lines(result: "SelfConsistentSOCResult") -> list[str]:
+        """The stage table of a self-consistent SOC or non-collinear run (``result.timings``)."""
+        timings = getattr(result, "timings", None)
+        if not timings:
+            return []
+        stages = (
+            ("initial_magnetization", "Initial magnetization"),
+            ("setup_potentials", "Initial Hartree + exchange-correlation"),
+            ("solver_setup", "Solver and worker start-up"),
+            ("hamiltonian", "Hamiltonian binding subtotal"),
+            ("diagonalization", "Diagonalization subtotal"),
+            ("density", "Occupation/density subtotal"),
+            ("hartree", "Hartree potential subtotal"),
+            ("xc", "Exchange-correlation subtotal"),
+            ("mixing_energy", "Mixing/energy subtotal"),
+            ("final_download", "Orbitals to the host"),
+        )
+        lines = [" SCF timing analysis [sec]", " " + "-" * 50]
+        total = 0.0
+        for key, label in stages:
+            if key in timings:
+                lines.append(f" {label:30s} : {timings[key]:12.6f}")
+                total += timings[key]
+        lines.append(f" {'Sum of the stages':30s} : {total:12.6f}")
+        lines.append(" " + "-" * 50)
+        counters = {k[4:]: v for k, v in timings.items() if k.startswith("eig_")}
+        if counters:
+            lines.append(" Eigensolver detail")
+            lines.append(" " + "-" * 50)
+            for key, label in (
+                ("workers", "workers"),
+                ("first_solves", "first_solves"),
+                ("subspace_steps", "subspace_steps"),
+                ("extra_cycles", "extra CHEBFF cycles"),
+                ("applications", "applications"),
+                ("application_columns", "application_columns"),
+                ("lanczos_seconds", "lanczos_seconds"),
+                ("filter_seconds", "filter_seconds"),
+                ("orthonormalize_seconds", "orthonormalize_seconds"),
+                ("ritz_seconds", "ritz_seconds"),
+                ("residual_seconds", "residual_seconds"),
+                ("worker_hamiltonian_seconds", "worker: Bloch Hamiltonian"),
+                ("worker_upload_seconds", "worker: operator upload"),
+                ("worker_solve_seconds", "worker: eigensolver"),
+                ("worker_spill_seconds", "worker: subspace to the host"),
+                ("worker_download_seconds", "worker: eigenvectors to the host"),
+                ("worker_density_seconds", "worker: density of the states"),
+                ("worker_gather_seconds", "worker: density joined over ranks"),
+                ("worker_halo_begin_seconds", "rank 0: halo rows packed and sent"),
+                ("worker_halo_wait_seconds", "rank 0: waiting for halo rows"),
+                ("worker_allsum_seconds", "rank 0: sums over the ranks"),
+            ):
+                if key in counters:
+                    value = counters[key]
+                    text = f"{value:12.6f}" if key.endswith("seconds") else f"{int(value):12d}"
+                    lines.append(f" {label:34s} : {text}")
+            lines.append(" " + "-" * 50)
+            lines.append(" (worker rows are seconds summed over the workers)")
+        lines.append("")
+        return lines
+
     def finish_self_consistent_soc(
         self, result: "SelfConsistentSOCResult", elapsed_seconds: float
     ) -> None:
@@ -1809,9 +2012,14 @@ class ParsecTextReporter:
             "",
             f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
             "",
-            "Converged spin-orbit-split spinor states",
-            "",
         ]
+        lines.extend(self._soc_timing_lines(result))
+        lines.extend(
+            [
+                "Converged spin-orbit-split spinor states",
+                "",
+            ]
+        )
         moments = np.asarray(result.magnetic_moment_per_state)
         eigenvalues = np.asarray(result.eigenvalues)
         occupations = np.asarray(result.occupations)

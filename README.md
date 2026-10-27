@@ -570,11 +570,24 @@ The Hamiltonian and nonlocal potential remain matrix-free during iterative
 eigensolution. Static terms are prepared once; only density-dependent local
 fields change during SCF.
 
+## Preparing a large periodic cell
+
+The reference preparation of a periodic cell (local ionic potential, Kleinman-Bylander projectors, atomic
+densities) measures the distance of every grid point to every atom image, so it costs atoms x grid points x
+images: about 35 s for 64 atoms (47k points) and, extrapolated, almost two hours for 864 atoms (630k points).
+With `parsec_python.acceleration` imported (the `parsec_python.main` entry point does) the projectors and
+densities visit only the grid points inside the support radius of an atom (same rows and values as the scan),
+and the local potential is evaluated as an Ewald split whose reciprocal part is one FFT of the structure
+factor (the Gaussian width is chosen so the series ends below the Nyquist frequency of the grid, which makes
+it exact on the grid). The 864-atom cell is prepared in about a minute. The potential equals the direct sum
+once that sum is converged; the direct sum at its default tolerance leaves out images that still contribute a
+few 1e-6 Ry, so the two differ by that much (`acceleration/tests/test_periodic_setup.py`).
+
 ## Parallel k-points, band paths and GPUs (periodic systems)
 
 The eigenproblems of different k-points (and spin channels) are independent: only the Fermi
 level and the density couple them. A periodic SCF with k-points, and every point of a band path,
-is therefore spread over workers that each keep the Bloch projectors, eigenvectors and Ritz
+is therefore spread over workers (`src/parsec_python/acceleration/Parallel`, installed into the serial reference drivers of `SCF/kpoint_solver.py`) that each keep the Bloch projectors, eigenvectors and Ritz
 subspaces of their own k-points; only potentials, eigenvalues and summed densities cross between
 them. This covers the scalar, spin-polarized, spin-orbit, spin-orbit + collinear-spin and
 non-collinear drivers and the `bandstruc` calculation. The results are the serial ones up to
@@ -602,9 +615,24 @@ each worker's own k-points.
 never does; `--gpus`/`--gpu-ids` choose the devices) puts the Bloch Hamiltonian, including the spin-orbit and Zeeman terms, and the whole
 Chebyshev filter on the GPU, which is where almost all the matrix-vector products are. One worker
 thread drives each CUDA device (`PARSEC_CUPY_DEVICES=auto|current|0,1,...` as in the multi-GPU
-solver), the k-points are dealt out round-robin, and the eigensolver itself (CHEBFF, CHEBDAV,
-SUBSPACE: orthonormalization, Rayleigh-Ritz) is the unchanged CPU code, so a filter call costs one
-upload and one download of a block of vectors. Static matrices (Laplacian, projectors) are uploaded
+solver), and the k-points are dealt out round-robin. In an SCF the Ritz subspace of every k-point
+stays on its device and each later SCF step (the SUBSPACE step: filter, QR, Rayleigh-Ritz) runs
+there; the first solve is CHEBFF on the device, and for `Eigensolver: chebdav` it is CHEBFF with extra cycles
+until CHEBDAV's residual test (`Diag_Tolerance`, relative to the largest Ritz value) is met or
+`PARSEC_KPOINT_EXTRA_CYCLES` (default 24) extra cycles were made: the device counterpart of CHEBDAV
+(`PARSEC_KPOINT_FIRST_SOLVE=chebdav` runs the host CHEBDAV with the device filter instead). The same
+converged first solve serves every k-point of a band path, with the existing retry from another random
+start when the residual stays above the band tolerance. The eigenvectors come to the host only to form
+the density. If the subspaces of a worker's k-points would take more than 75% of the device memory they
+stay on the host between solves (`PARSEC_KPOINT_STATE_STORAGE=auto|device|host`).
+`PARSEC_KPOINT_SOLVER=host` restores the former route (host eigensolver, only the filter on the
+device). The k-point drivers print an `SCF timing analysis` (initial potentials, diagonalization,
+density, Hartree, XC, mixing), the diagonalization time of every iteration and a `K-point solver detail`
+block (worker start-up, Bloch projectors, operator upload, eigensolver, eigenvector download and the
+device eigensolver's own seconds and counters, summed over the workers). A Gamma-only periodic
+spin-polarized run (no `Kpoint_Method`) goes through the 1x1x1 k-point driver when the k-points run on a
+device, because the Gamma-point spin driver has no device path; `python -m parsec_python.acceleration.benchmarks.check_kpoint_solver` times the two routes on
+an input. Static matrices (Laplacian, projectors) are uploaded
 once per device; an SCF step uploads only the local potential and fields. The host BLAS runs one thread per device worker.
 `python -m parsec_python.acceleration.benchmarks.check_gpu_kpoints` compares the device operator, the filter, a short non-collinear
 spin-orbit SCF and a short band path against the CPU and times them; run it first on a GPU node.
@@ -612,6 +640,43 @@ It needs `cupy`; `--backend numpy-device` runs the same device code on the host.
 version of the GPU path: `check_gpu_kpoints` passes on an NVIDIA A100-SXM4-80GB with CuPy 14.2.0
 (operator, filter, a short non-collinear spin-orbit SCF and a band path against the CPU); other
 devices and multi-GPU runs have not been checked yet.
+
+### Several GPUs and nodes for one large eigenproblem (MPI)
+
+A k-point or non-collinear basis that does not fit one GPU (a two-component basis of a few thousand
+states on a few million grid points is hundreds of GB) is split by blocks of grid rows over the GPUs of
+several nodes. Start one MPI rank per GPU and add `--mpi` (or `PARSEC_MPI=1`; needs `mpi4py`):
+
+```bash
+srun --nodes=3 --ntasks=12 --ntasks-per-node=4 --gpus-per-node=4 --gpu-bind=none \
+    python -m parsec_python.main parsec.in --mpi --device gpu --gpus 4
+```
+
+Rank `r` holds rows `[start_r, stop_r)` of every orbital, of the finite-difference matrices, of the
+projectors and of the local fields, and picks the GPU of its local index. Applying the Hamiltonian
+exchanges the halo rows of the stencil with the neighbouring ranks and sums the overlaps with the
+projectors (and the spin-orbit projectors) over the ranks. Each stencil matrix is split into the part on
+the local rows and the part on the halo rows: the exchange is started, the local part is applied while it
+runs, and the halo part is added when the rows have arrived. The two spin components are applied as one
+block, so a spinor application makes one exchange and one projector sum. Orthonormalization is a shifted Cholesky QR
+of the summed Gram matrix, the Rayleigh-Ritz projection and the residuals are summed `states x states`
+matrices, and the root's eigenvalues and rotations go to every rank. The SCF driver is replicated on
+every rank (the ranks compare a checksum of the potentials every iteration and stop with a message
+should they ever diverge); the density is formed from the local rows and joined on every rank, and only
+rank 0 writes the log and the archive. Wavefunctions are not gathered. The tasks of a job (k-points,
+spin channels) are solved one after the other, each over all the ranks; the independent points of a band
+path are dealt out to the ranks instead.
+
+A GPU needs about twice the local rows of one subspace plus a few `states x states` matrices, so a basis
+of `B` GB needs at least `2B/(0.92 x GPU memory)` GPUs; the run stops with that number if the GPUs are
+too few. The halo rows and the sums go through the host unless the MPI library is CUDA aware and
+`PARSEC_MPI_CUDA_AWARE=1` (Cray MPICH also needs `MPICH_GPU_SUPPORT_ENABLED=1`): then they go between the GPUs and
+the halo exchange overlaps the local product. Without GPU-aware MPI the exchange cannot overlap much, because
+the copy to the host is synchronous. The log's eigensolver detail gives the time rank 0 spent packing,
+waiting for halo rows and summing over the ranks.
+`acceleration/tests/test_kpoint_mpi.py` runs the distributed operator, the drivers and the command line
+on 2 and 3 ranks (the device code on the host) against the single-process solver; it has not been run on
+GPUs or on more than one node.
 
 ## Band structures (periodic systems)
 
@@ -663,7 +728,27 @@ Outputs (written next to `parsec.in`):
 * `bands.dat` and `bands_plot.dat` in Fortran's formats (eigenvalues in Ry / eV, not shifted by
   the Fermi level; `bands.dat` carries the SCF Fermi level),
 * `parsec_python_bands.npz` with the k-points, segment names, eigenvalues, residuals and (for
-  spinor Hamiltonians) `<sigma>` of every state.
+  spinor Hamiltonians) `<sigma>` of every state,
+* `bands_spin.dat` for spinor bands (spin-orbit, non-collinear): for every band a gnuplot block of
+  `k index, path length [1/bohr], E [eV], <S_x>, <S_y>, <S_z>, level size`, with the spin in units of
+  hbar/2 (the Pauli expectation, between -1 and 1) in the axes of the cell. Only the *sum* of the spin over a
+  degenerate level is determined (Kramers pairs, every level of an inversion-symmetric crystal): any mixture
+  of the states of a level is an eigenvector. So states within `1e-4 Ry` of each other show the mean spin of
+  their level, and the last column is the level's size; the archive keeps the spin of each state as the
+  eigensolver returned it. For a Rashba or Dresselhaus system the bands are non-degenerate away from the
+  time-reversal-invariant points and carry a well-defined spin texture.
+
+Plot the spin texture (bands coloured by `<S_x>`, `<S_y>`, `<S_z>`, energies relative to the Fermi level):
+
+```bash
+python -m parsec_python.Output.bands --spin parsec_python_bands.npz --components xyz \
+    --names "G-X,X-M,M-G" --window -2 2 -o bands_spin.png
+```
+
+(`gnuplot`: `plot 'bands_spin.dat' using 2:3:4 with lines lc palette` for `S_x`.) A surface Rashba state needs
+a slab (non-periodic along the surface normal), which the periodic cells here do not have yet; bulk examples
+are the Dresselhaus splitting of a zinc-blende crystal off the high-symmetry lines and non-centrosymmetric
+Rashba-type semiconductors.
 
 Overlay several runs, e.g. without and with spin-orbit coupling:
 

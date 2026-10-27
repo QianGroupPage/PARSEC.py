@@ -220,6 +220,13 @@ class AcceleratedCliDelegationTests(unittest.TestCase):
         self.assertTrue(bool(archive["converged"]))
 
     @unittest.skipIf(GPU_AVAILABLE, "this check targets the no-GPU fallback")
+    def test_device_gpu_does_not_fall_back_to_the_cpu_reference_solver(self) -> None:
+        # a run that asked for the GPU must not be timed on the CPU
+        exit_code = accelerated_main([str(self.input_path), "--device", "gpu", "--quiet"])
+        self.assertEqual(exit_code, 2)
+        self.assertFalse((self.directory / "parsec_python_results.npz").exists())
+
+    @unittest.skipIf(GPU_AVAILABLE, "this check targets the no-GPU fallback")
     def test_backend_cupy_explicit_is_refused_cleanly(self) -> None:
         exit_code = accelerated_main(
             [str(self.input_path), "--backend", "cupy", "--dry-run"]

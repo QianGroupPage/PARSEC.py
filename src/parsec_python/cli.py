@@ -43,7 +43,7 @@ from .models import (
 )
 from .Grid import kpoint_sampling
 from .Output import ParsecTextReporter
-from .Output.bands import save_band_structure_archive, write_bands_files
+from .Output.bands import save_band_structure_archive, write_bands_files, write_spin_file
 from .SCF.bands import (
     band_mode,
     band_potentials,
@@ -51,6 +51,7 @@ from .SCF.bands import (
     run_band_structure,
 )
 from .SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_polarized
+from .SCF.kpoint_solver import parallel_backend_report, parallel_backend_uses_device
 from .SCF.noncollinear import (
     run_self_consistent_noncollinear,
     run_self_consistent_noncollinear_kpoints,
@@ -652,6 +653,9 @@ def _band_progress(reporter):
 
 def _write_band_outputs(band_result, reporter, directory: Path, start: float) -> None:
     files = list(write_bands_files(directory, band_result))
+    spin_file = write_spin_file(directory, band_result)  # spinor bands only
+    if spin_file is not None:
+        files.append(spin_file)
     files.append(
         save_band_structure_archive(directory / "parsec_python_bands.npz", band_result)
     )
@@ -810,6 +814,15 @@ def _run_extended_drivers(
         return 0 if result.converged else 3
 
     if spin_polarized:  # periodic or with spin-orbit (isolated and plain: main's run_spin_scf)
+        if (
+            k_sampling is None
+            and is_periodic
+            and not has_soc_species
+            and parallel_backend_uses_device()
+        ):
+            # A Gamma-only periodic spin run is the 1x1x1 k-point run.  Through the k-point driver
+            # it runs on the device; the Gamma driver has no device path.
+            k_sampling = (np.zeros((1, 3)), np.ones(1))
         if k_sampling is not None:
             k_points, k_weights = k_sampling
             result = run_scf_kpoints_spin_polarized(
@@ -1184,6 +1197,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             for note in restart_notes:
                 log.write(note)
             log.write()
+            if (
+                noncollinear
+                or (is_periodic and (self_consistent_spin_orbit or k_sampling is not None))
+                or (is_periodic and spin_polarized and not has_soc_species and parallel_backend_uses_device())
+            ):
+                # these drivers hand their eigenproblems to the k-point solver: say where it runs
+                for line in parallel_backend_report():
+                    log.write(line)
+                log.write()
             if translation.relaxation is not None:
                 log.write("\n".join(relaxation_header_lines(translation)))
             if is_periodic:

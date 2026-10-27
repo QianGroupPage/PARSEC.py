@@ -41,6 +41,17 @@ DEVICES_ENV = "PARSEC_CUPY_DEVICES"  # auto | current | 0,1,...
 
 
 # ---------------------------------------------------------------- array backends
+def _cast_matrix(host_matrix: sp.spmatrix, dtype=None) -> sp.csr_matrix:
+    """``host_matrix`` as CSR of ``dtype``; a complex matrix with no imaginary part becomes real
+    through ``.real`` (a plain ``astype`` would warn about discarding the imaginary part)."""
+    matrix = host_matrix.tocsr()
+    if dtype is None:
+        return matrix
+    if np.issubdtype(np.dtype(dtype), np.floating) and np.iscomplexobj(matrix.data):
+        return matrix.real.tocsr().astype(dtype)
+    return matrix.astype(dtype)
+
+
 class NumpyArrayBackend:
     """Host arrays through the device interface (reference and test double)."""
 
@@ -54,8 +65,7 @@ class NumpyArrayBackend:
         return None
 
     def matrix(self, host_matrix: sp.spmatrix, dtype=None):
-        matrix = host_matrix.tocsr()
-        return matrix.astype(dtype) if dtype is not None else matrix
+        return _cast_matrix(host_matrix, dtype)
 
     def asarray(self, host_array):
         return np.ascontiguousarray(host_array)
@@ -84,10 +94,7 @@ class CupyArrayBackend:
         self.cp.cuda.Device(self.device_id).use()
 
     def matrix(self, host_matrix: sp.spmatrix, dtype=None):
-        matrix = host_matrix.tocsr()
-        if dtype is not None:
-            matrix = matrix.astype(dtype)
-        return self.cpsparse.csr_matrix(matrix)
+        return self.cpsparse.csr_matrix(_cast_matrix(host_matrix, dtype))
 
     def asarray(self, host_array):
         return self.cp.asarray(np.ascontiguousarray(host_array))
@@ -113,11 +120,23 @@ def _ladder_and_lz():
 
 
 @dataclass
-class _DeviceAtomSOC:
-    rows: Any  # device int array of the support rows
-    stacked: Any  # (n_support, 16) complex: [v_ion | v_so]
-    stacked_h: Any  # (16, n_support) complex: its conjugate transpose
-    sign: Any  # (8, 1) real: KB sign per harmonic
+class _BatchedSOC:
+    """The spin-orbit projector pairs of every atom as two sparse matrices.
+
+    ``forward`` is ``(n, 16*atoms)``: the columns ``16*a : 16*a + 16`` of atom
+    ``a`` hold ``[v_ion | v_so]`` on its support rows.  ``adjoint`` is its
+    conjugate transpose.  One sparse product then gives the overlaps of every
+    atom with a block, the ladder algebra runs on ``(atoms, 8, vectors)``
+    arrays, and one more sparse product (which also sums the overlapping
+    supports) adds the result back: a handful of kernels per application in
+    place of a Python loop over the atoms.
+    """
+
+    forward: Any
+    adjoint: Any
+    sign: Any  # (atoms, 8, 1) real: KB sign per harmonic
+    atoms: int
+    real: bool  # forward/adjoint are real: apply them to the real view
 
 
 class DeviceBlochOperator:
@@ -141,9 +160,18 @@ class DeviceBlochOperator:
         projector_forward,
         projector_adjoint,
         projector_signs,
-        soc: list[_DeviceAtomSOC],
+        soc: "_BatchedSOC | None",
         delta=None,
         field=None,
+        projector_real: bool = False,
+        halo_begin=None,
+        halo_finish=None,
+        laplacian_halo=None,
+        k_gradient_halo=None,
+        allsum=None,
+        global_grid_size: int | None = None,
+        mpi=None,
+        row_bounds: tuple[int, int] | None = None,
     ) -> None:
         self.backend = backend
         self.xp = backend.xp
@@ -156,14 +184,29 @@ class DeviceBlochOperator:
         self.projector_adjoint = projector_adjoint
         self.projector_signs = projector_signs
         self.soc = soc
+        self.projector_real = projector_real
         self.delta = delta
         self.field = field
+        # A basis distributed over MPI ranks by blocks of grid rows: ``grid_size`` counts the rows of
+        # this rank.  The stencils reach rows of the neighbours: ``halo_begin(block)`` starts the exchange
+        # of those rows, ``halo_finish(pending)`` returns them, and ``laplacian_halo`` / ``k_gradient_halo``
+        # are the parts of the stencil matrices on those rows; the part on the local rows is applied while
+        # the exchange is under way.  ``allsum(array)`` sums the overlaps with the projectors over the
+        # ranks.  Serially none of these exists.
+        self.halo_begin = halo_begin
+        self.halo_finish = halo_finish
+        self.laplacian_halo = laplacian_halo
+        self.k_gradient_halo = k_gradient_halo
+        self.allsum = allsum
+        self.mpi = mpi  # the MPI context of a distributed basis, None serially
+        self.row_bounds = row_bounds  # rows [start, stop) of the grid held here
+        self.global_grid_size = grid_size if global_grid_size is None else int(global_grid_size)
         xp = self.xp
         if field is not None:
             self._bz = field[2][:, None]
             self._b_minus = (field[0] - 1j * field[1])[:, None]
             self._b_plus = (field[0] + 1j * field[1])[:, None]
-        if soc:
+        if soc is not None:
             ladder_down, ladder_up, lz_half, quarter_ll1, lm_to_l = _ladder_and_lz()
             # complex so every matmul below is complex @ complex
             self._ladder_from_down = xp.asarray(ladder_down).astype(xp.complex128)
@@ -173,23 +216,74 @@ class DeviceBlochOperator:
 
     @property
     def dimension(self) -> int:
+        """Rows of the whole operator (of the whole grid, whichever rows this rank holds)."""
+        return (2 if self.spinor else 1) * self.global_grid_size
+
+    @property
+    def local_dimension(self) -> int:
+        """Rows of the blocks this operator is applied to."""
         return (2 if self.spinor else 1) * self.grid_size
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.dimension, self.dimension)
+
+    def local_vector(self, global_vector: np.ndarray) -> np.ndarray:
+        """The entries of a host vector of the whole operator (spinor: up then down) held here."""
+        if self.row_bounds is None:
+            return global_vector
+        start, stop = self.row_bounds
+        n = self.global_grid_size
+        if not self.spinor:
+            return global_vector[start:stop]
+        return np.concatenate((global_vector[start:stop], global_vector[n + start : n + stop]))
+
+    def as_eigensolver_operator(self) -> "DeviceBlochOperator":
+        """The device-resident operator itself (``apply`` on device blocks)."""
+        return self
+
+    def _real_product(self, matrix, block):
+        """``matrix @ block`` for a real sparse ``matrix`` and a complex block.
+
+        The real view ``(rows, 2*vectors)`` halves the work of a complex product;
+        cuSPARSE returns a column-major result, which the complex view needs
+        row-major (a no-op for NumPy).
+        """
+        xp = self.xp
+        return xp.ascontiguousarray(matrix @ block.view(xp.float64)).view(xp.complex128)
 
     # ------------------------------------------------------------ the operator
     def _scalar(self, block):
         """``H_k`` on one ``(n, vectors)`` complex block."""
         xp = self.xp
+        # the stencils reach rows of the neighbouring ranks when the basis is distributed: start the
+        # exchange, apply the stencils to the local rows meanwhile, then add the part on the halo rows
+        pending = None if self.halo_begin is None else self.halo_begin(block)
         real = block.view(xp.float64)
         # cuSPARSE returns a column-major product; the complex view below needs
         # row-major data, so make it so (a no-op for NumPy, which already is).
         result = xp.ascontiguousarray(self.laplacian @ real).view(xp.complex128)
         if self.k_gradient is not None:
             result -= 2j * xp.ascontiguousarray(self.k_gradient @ real).view(xp.complex128)
+        if pending is not None:
+            halo_real = self.halo_finish(pending).view(xp.float64)
+            if self.laplacian_halo is not None:
+                result += xp.ascontiguousarray(self.laplacian_halo @ halo_real).view(xp.complex128)
+            if self.k_gradient_halo is not None:
+                result -= 2j * xp.ascontiguousarray(self.k_gradient_halo @ halo_real).view(xp.complex128)
         result += self.diagonal[:, None] * block
         if self.projector_forward is not None:
-            coefficients = self.projector_adjoint @ block
+            if self.projector_real:
+                coefficients = self._real_product(self.projector_adjoint, block)
+            else:
+                coefficients = self.projector_adjoint @ block
+            if self.allsum is not None:
+                coefficients = self.allsum(coefficients)
             coefficients *= self.projector_signs[:, None]
-            result += self.projector_forward @ coefficients
+            if self.projector_real:
+                result += self._real_product(self.projector_forward, coefficients)
+            else:
+                result += self.projector_forward @ coefficients
         return result
 
     def _spin_orbit(self, block):
@@ -197,30 +291,36 @@ class DeviceBlochOperator:
         xp = self.xp
         n = self.grid_size
         vectors = block.shape[1]
-        output = xp.zeros_like(block)
-        for atom in self.soc:
-            gathered = xp.stack((block[atom.rows], block[atom.rows + n]))
-            overlaps = atom.stacked_h @ gathered  # (2, 16, vectors)
-            io_up, so_up = atom.sign * overlaps[0, :8], atom.sign * overlaps[0, 8:]
-            io_dn, so_dn = atom.sign * overlaps[1, :8], atom.sign * overlaps[1, 8:]
-            coefficients = xp.empty((2, 16, vectors), dtype=xp.complex128)
-            for spin, (sigma, io_same, so_same, ladder, io_other, so_other) in enumerate(
-                (
-                    (1.0, io_up, so_up, self._ladder_from_down, io_dn, so_dn),
-                    (-1.0, io_dn, so_dn, self._ladder_from_up, io_up, so_up),
-                )
-            ):
-                lz = sigma * self._lz_half
-                coefficients[spin, :8] = lz * so_same + ladder @ so_other
-                coefficients[spin, 8:] = (
-                    lz * io_same
-                    + (self._quarter_ll1 - 0.5 * lz) * so_same
-                    + ladder @ (io_other - 0.5 * so_other)
-                )
-            contribution = atom.stacked @ coefficients  # (2, n_support, vectors)
-            output[atom.rows] += contribution[0]
-            output[atom.rows + n] += contribution[1]
-        return output
+        soc = self.soc
+        atoms = soc.atoms
+        both = xp.concatenate((block[:n], block[n:]), axis=1)  # (n, 2*vectors): [up | down]
+        overlaps = (
+            self._real_product(soc.adjoint, both) if soc.real else soc.adjoint @ both
+        )  # (16*atoms, 2*vectors)
+        if self.allsum is not None:
+            overlaps = self.allsum(overlaps)
+        overlaps = overlaps.reshape(atoms, 16, 2, vectors)
+        io_up, so_up = soc.sign * overlaps[:, :8, 0], soc.sign * overlaps[:, 8:, 0]
+        io_dn, so_dn = soc.sign * overlaps[:, :8, 1], soc.sign * overlaps[:, 8:, 1]
+        coefficients = xp.empty((atoms, 16, 2, vectors), dtype=xp.complex128)
+        for spin, (sigma, io_same, so_same, ladder, io_other, so_other) in enumerate(
+            (
+                (1.0, io_up, so_up, self._ladder_from_down, io_dn, so_dn),
+                (-1.0, io_dn, so_dn, self._ladder_from_up, io_up, so_up),
+            )
+        ):
+            lz = sigma * self._lz_half
+            coefficients[:, :8, spin] = lz * so_same + xp.matmul(ladder, so_other)
+            coefficients[:, 8:, spin] = (
+                lz * io_same
+                + (self._quarter_ll1 - 0.5 * lz) * so_same
+                + xp.matmul(ladder, io_other - 0.5 * so_other)
+            )
+        coefficients = coefficients.reshape(16 * atoms, 2 * vectors)
+        contribution = (
+            self._real_product(soc.forward, coefficients) if soc.real else soc.forward @ coefficients
+        )  # (n, 2*vectors)
+        return xp.concatenate((contribution[:, :vectors], contribution[:, vectors:]), axis=0)
 
     def apply(self, block):
         """``H`` applied to a device block ``(dim, vectors)``."""
@@ -228,8 +328,12 @@ class DeviceBlochOperator:
             return self._scalar(block)
         n = self.grid_size
         up, down = block[:n], block[n:]
-        q_up = self._scalar(up)
-        q_down = self._scalar(down)
+        # the two components see the same scalar operator: apply it to both as one block of twice the
+        # columns (one stencil product, one halo exchange, one projector sum instead of two of each)
+        both = self.xp.concatenate((up, down), axis=1)
+        scalar_part = self._scalar(both)
+        vectors = block.shape[1]
+        q_up, q_down = scalar_part[:, :vectors], scalar_part[:, vectors:]
         if self.delta is not None:
             q_up += self.delta[:, None] * up
             q_down -= self.delta[:, None] * down
@@ -237,7 +341,7 @@ class DeviceBlochOperator:
             q_up += self._bz * up + self._b_minus * down
             q_down += self._b_plus * up - self._bz * down
         result = self.xp.concatenate([q_up, q_down], axis=0)
-        if self.soc:
+        if self.soc is not None:
             result += self._spin_orbit(block)
         return result
 
@@ -311,6 +415,42 @@ class DeviceBlochConverter:
         self.backend = backend
         backend.use()
         self._static: dict[int, tuple[Any, Any]] = {}  # id(host object) -> (host ref, device data)
+        # PARSEC_KPOINT_SOLVER=host keeps the host eigensolver (only the filter on the device)
+        self.device_solver = os.environ.get("PARSEC_KPOINT_SOLVER", "device").strip().lower() != "host"
+
+    def eigensolve(self, hamiltonian, number_of_states: int, settings, attempt: int = 0):
+        """Lowest ``number_of_states`` pairs of a host Hamiltonian with the device-resident solver.
+
+        The first solve of :func:`~parsec_python.acceleration.Eigensolvers.chebff_spinor.solve_spinor_eigval`
+        from a random start: CHEBFF, and for ``initial_method == "chebdav"`` extra CHEBFF cycles to
+        CHEBDAV's residual test.  A later ``attempt`` draws another start.  Returns the eigenvalues,
+        the host eigenvectors and the largest residual ``||H x - e x||`` of the pairs.  Used by the
+        band paths, where every k-point is a first solve.
+        """
+        import dataclasses
+
+        from ..Eigensolvers.chebff_spinor import solve_spinor_eigval
+
+        if attempt:
+            settings = dataclasses.replace(
+                settings,
+                chebff=dataclasses.replace(
+                    settings.chebff, random_seed=settings.chebff.random_seed + attempt
+                ),
+            )
+        operator = self.operator(hamiltonian)
+        result = solve_spinor_eigval(
+            operator,
+            number_of_states,
+            settings=settings,
+            state=None,
+            xp=self.backend.xp,
+            sync=self.backend.synchronize,
+            converge_first=settings.initial_method == "chebdav",
+        )
+        residual = float(np.max(result.residual_norms)) if result.residual_norms is not None else float("nan")
+        vectors = np.asarray(self.backend.asnumpy(result.vectors))
+        return np.asarray(result.eigenvalues, dtype=float), vectors, residual
 
     def _cached(self, host_object, build):
         entry = self._static.get(id(host_object))
@@ -319,67 +459,123 @@ class DeviceBlochConverter:
             self._static[id(host_object)] = entry
         return entry[1]
 
-    def _scalar_parts(self, hamiltonian):
+    # Hooks a row-distributed converter overrides (here: the whole grid on one device).
+    def _rows(self, host_matrix):
+        """The rows of a ``(grid, columns)`` host matrix this device holds."""
+        return host_matrix
+
+    def _local(self, host_array):
+        """The entries (last axis) of a per-grid-point host array this device holds."""
+        return np.asarray(host_array)
+
+    def _derivative_parts(self, hamiltonian):
+        """Device ``(laplacian, k_gradient)``: the stencil matrices, ``k_gradient`` None without Bloch term."""
         backend = self.backend
         laplacian = self._cached(
             hamiltonian.negative_laplacian,
             lambda: backend.matrix(hamiltonian.negative_laplacian, dtype=np.float64),
         )
+        # an isolated Hamiltonian has no Bloch term
+        host_gradient = getattr(hamiltonian, "_k_gradient", None)
         k_gradient = None
-        if hamiltonian._k_gradient is not None:
+        if host_gradient is not None:
             k_gradient = self._cached(
-                hamiltonian._k_gradient,
-                lambda: backend.matrix(hamiltonian._k_gradient, dtype=np.float64),
+                host_gradient,
+                lambda: backend.matrix(host_gradient, dtype=np.float64),
             )
-        diagonal = backend.asarray(np.asarray(hamiltonian._diagonal, dtype=np.float64))
-        nonlocal_operator = hamiltonian.nonlocal_operator
-        if nonlocal_operator.projectors.shape[1] == 0:
-            forward = adjoint = signs = None
-        else:
-            forward, adjoint, signs = self._cached(
-                nonlocal_operator,
-                lambda: (
-                    backend.matrix(nonlocal_operator.projectors, dtype=np.complex128),
-                    backend.matrix(nonlocal_operator.projectors.conj().T, dtype=np.complex128),
-                    backend.asarray(np.asarray(nonlocal_operator.signs, dtype=np.float64)),
-                ),
-            )
-        return laplacian, k_gradient, diagonal, forward, adjoint, signs
+        return laplacian, k_gradient
 
-    def _soc_parts(self, soc_projectors) -> list[_DeviceAtomSOC]:
+    def _projector_parts(self, nonlocal_operator):
+        """Device ``(forward, adjoint, signs, real)`` of the Kleinman-Bylander projectors."""
         backend = self.backend
-        parts = []
-        for atom in soc_projectors:
+        if nonlocal_operator.projectors.shape[1] == 0:
+            return None, None, None, False
+        # Gamma-point and cluster projectors are real: keep them real so that the
+        # products run on the real view of the block (half the work of complex ones).
+        projector_real = not np.iscomplexobj(nonlocal_operator.projectors) or bool(
+            np.all(nonlocal_operator.projectors.data.imag == 0)
+        )
+        matrix_dtype = np.float64 if projector_real else np.complex128
 
-            def build(atom=atom):
-                sign = np.where(
-                    np.asarray([1, 1, 1, 2, 2, 2, 2, 2]) == 1, atom.sign[0], atom.sign[1]
-                ).astype(np.float64)[:, None]
-                return _DeviceAtomSOC(
-                    rows=backend.asarray(np.asarray(atom.support_rows, dtype=np.int64)),
-                    stacked=backend.asarray(atom.stacked),
-                    stacked_h=backend.asarray(atom.stacked_conj_transpose),
-                    sign=backend.asarray(sign),
+        def build():
+            rows = self._rows(nonlocal_operator.projectors)
+            return (
+                backend.matrix(rows, dtype=matrix_dtype),
+                backend.matrix(rows.conj().T, dtype=matrix_dtype),
+                backend.asarray(np.asarray(nonlocal_operator.signs, dtype=np.float64)),
+            )
+
+        forward, adjoint, signs = self._cached(nonlocal_operator, build)
+        return forward, adjoint, signs, projector_real
+
+    def _scalar_parts(self, hamiltonian):
+        backend = self.backend
+        laplacian, k_gradient = self._derivative_parts(hamiltonian)
+        # an isolated Hamiltonian keeps its potential as ``effective_potential``
+        host_diagonal = getattr(hamiltonian, "_diagonal", None)
+        if host_diagonal is None:
+            host_diagonal = hamiltonian.effective_potential
+        diagonal = backend.asarray(np.asarray(self._local(np.asarray(host_diagonal, dtype=np.float64))))
+        forward, adjoint, signs, projector_real = self._projector_parts(hamiltonian.nonlocal_operator)
+        return laplacian, k_gradient, diagonal, forward, adjoint, signs, projector_real
+
+    def _soc_parts(self, soc_projectors, grid_size: int) -> "_BatchedSOC | None":
+        """All atoms' spin-orbit projectors as one pair of sparse matrices (cached)."""
+        if not len(soc_projectors):
+            return None
+        backend = self.backend
+
+        def build():
+            rows, cols, data, signs = [], [], [], []
+            for index, atom in enumerate(soc_projectors):
+                support = np.asarray(atom.support_rows, dtype=np.int64)
+                stacked = np.asarray(atom.stacked)
+                rows.append(np.repeat(support, 16))
+                cols.append(np.tile(np.arange(16) + 16 * index, support.size))
+                data.append(stacked.reshape(-1))
+                signs.append(
+                    np.where(np.asarray([1, 1, 1, 2, 2, 2, 2, 2]) == 1, atom.sign[0], atom.sign[1])
                 )
+            values = np.concatenate(data)
+            real = not np.iscomplexobj(values) or bool(np.all(values.imag == 0))
+            dtype = np.float64 if real else np.complex128
+            forward = self._rows(
+                sp.coo_matrix(
+                    (values.real if real else values, (np.concatenate(rows), np.concatenate(cols))),
+                    shape=(grid_size, 16 * len(soc_projectors)),
+                ).tocsr()
+            )
+            return _BatchedSOC(
+                forward=backend.matrix(forward, dtype=dtype),
+                adjoint=backend.matrix(forward.conj().T, dtype=dtype),
+                sign=backend.asarray(np.asarray(signs, dtype=np.float64)[:, :, None]),
+                atoms=len(soc_projectors),
+                real=real,
+            )
 
-            parts.append(self._cached(atom, build))
-        return parts
+        return self._cached(soc_projectors, build)
 
     def operator(self, hamiltonian) -> DeviceBlochOperator:
-        """Device operator for a host ``KPointKohnShamHamiltonian`` or spinor one."""
+        """Device operator for a host ``KPointKohnShamHamiltonian`` or spinor one.
+
+        A k-point spinor Hamiltonian carries its scalar part as ``scalar_hamiltonian``; the spinor
+        Hamiltonian of an isolated system (``SpinorKohnShamHamiltonian``) is its own scalar part.
+        """
         backend = self.backend
         backend.use()
         scalar = getattr(hamiltonian, "scalar_hamiltonian", None)
-        spinor = scalar is not None
-        parts = self._scalar_parts(scalar if spinor else hamiltonian)
-        soc, delta, field = [], None, None
+        spinor = scalar is not None or hasattr(hamiltonian, "soc_projectors")
+        parts = self._scalar_parts(scalar if scalar is not None else hamiltonian)
+        laplacian, k_gradient, diagonal, forward, adjoint, signs, projector_real = parts
+        host_scalar = scalar if scalar is not None else hamiltonian
+        global_size = int(host_scalar.negative_laplacian.shape[0])
+        soc, delta, field = None, None, None
         if spinor:
-            soc = self._soc_parts(hamiltonian.soc_projectors)
+            soc = self._soc_parts(hamiltonian.soc_projectors, global_size)
             if hamiltonian.xc_delta is not None:
-                delta = backend.asarray(np.asarray(hamiltonian.xc_delta, dtype=np.float64))
+                delta = backend.asarray(np.asarray(self._local(np.asarray(hamiltonian.xc_delta, dtype=np.float64))))
             if hamiltonian.xc_field is not None:
-                field = backend.asarray(np.asarray(hamiltonian.xc_field, dtype=np.float64))
-        laplacian, k_gradient, diagonal, forward, adjoint, signs = parts
+                field = backend.asarray(np.asarray(self._local(np.asarray(hamiltonian.xc_field, dtype=np.float64))))
         return DeviceBlochOperator(
             backend,
             grid_size=int(diagonal.shape[0]),
@@ -393,7 +589,14 @@ class DeviceBlochConverter:
             soc=soc,
             delta=delta,
             field=field,
+            projector_real=projector_real,
+            global_grid_size=global_size,
+            **self._operator_extras(),
         )
+
+    def _operator_extras(self) -> dict:
+        """Keyword arguments for the operator that only a distributed converter has."""
+        return {}
 
 
 # --------------------------------------------------------------- backend choice

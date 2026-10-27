@@ -10,6 +10,7 @@ through the device code gives the CPU result.
 
 from __future__ import annotations
 
+import functools
 import os
 import unittest
 from unittest import mock
@@ -30,7 +31,7 @@ from parsec_python.tests.unit.test_hamiltonian_fast_paths import (
     _PeriodicFixture,
     _random_spinor,
 )
-from parsec_python.tests.unit import test_kpoint_parallel as parallel_tests
+from parsec_python.acceleration.tests import test_kpoint_parallel as parallel_tests
 
 
 class DeviceOperatorTests(_PeriodicFixture):
@@ -68,6 +69,28 @@ class DeviceOperatorTests(_PeriodicFixture):
         spinor = _random_spinor(self.grid.size, 4, seed=3)
         for name, host in self._spinors().items():
             with self.subTest(name):
+                device = self.converter.operator(host)
+                np.testing.assert_allclose(device.matmat(spinor), host.apply(spinor), atol=1e-10)
+                self.assertEqual(device.dimension, 2 * self.grid.size)
+
+    def test_isolated_spinor_operator_matches_the_host(self) -> None:
+        """The spinor Hamiltonian of an isolated system (no ``scalar_hamiltonian``, no Bloch term)."""
+        from parsec_python.Hamiltonian.spinor_operator import SpinorKohnShamHamiltonian
+        from parsec_python.V_ion import build_nonlocal_projectors
+
+        gamma_nonlocal = build_nonlocal_projectors(
+            self.grid, self.atoms, self.pots, self.specs, self.cell.lattice_vectors
+        )
+        spinor = _random_spinor(self.grid.size, 4, seed=5)
+        for name, extra in (
+            ("noncollinear", dict(soc_projectors=(), xc_field=self.field)),
+            ("collinear", dict(soc_projectors=(), xc_delta=self.delta)),
+            ("noncollinear with soc", dict(soc_projectors=self.soc, xc_field=self.field)),
+        ):
+            with self.subTest(name):
+                host = SpinorKohnShamHamiltonian(
+                    self.laplacian, self.potential, gamma_nonlocal, **extra
+                )
                 device = self.converter.operator(host)
                 np.testing.assert_allclose(device.matmat(spinor), host.apply(spinor), atol=1e-10)
                 self.assertEqual(device.dimension, 2 * self.grid.size)
@@ -178,16 +201,24 @@ class BackendSelectionTests(unittest.TestCase):
 
 
 class DeviceBackendDriversTests(unittest.TestCase):
-    """Whole SCF runs through the device code (host double, two worker threads)."""
+    """Whole SCF runs through the device code (host double, two worker threads).
 
-    def test_scf_drivers_match_the_cpu(self) -> None:
+    ``PARSEC_KPOINT_SOLVER=host`` is the former route (host eigensolver, device filter): the same
+    computation as the CPU, so it matches to round-off.
+    """
+
+    def test_scf_drivers_match_the_cpu_with_the_host_solver(self) -> None:
         for name in ("spin_polarized", "soc", "noncollinear"):
             with self.subTest(driver=name):
                 serial = parallel_tests._run(name, "1")
                 driver, flags, soc = parallel_tests.DRIVERS[name]
                 with mock.patch.dict(
                     os.environ,
-                    {"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "2"},
+                    {
+                        "PARSEC_KPOINT_BACKEND": "numpy-device",
+                        "PARSEC_KPOINT_SOLVER": "host",
+                        "PARSEC_KPOINT_WORKERS": "2",
+                    },
                 ):
                     device = driver(
                         parallel_tests._system(soc=soc, **flags),
@@ -195,6 +226,91 @@ class DeviceBackendDriversTests(unittest.TestCase):
                         parallel_tests._WEIGHTS,
                     )
                 parallel_tests._assert_same(self, serial, device)
+
+
+def _converged(name: str, environment: dict, **overrides):
+    """A tightly converged run; the same run (the CPU baselines mostly) is made once for all the tests."""
+    return _converged_cached(name, tuple(sorted(environment.items())), tuple(sorted(overrides.items())))
+
+
+@functools.lru_cache(maxsize=None)
+def _converged_cached(name: str, environment: tuple, overrides: tuple):
+    driver, flags, soc = parallel_tests.DRIVERS[name]
+    with mock.patch.dict(os.environ, dict(environment)):
+        return driver(
+            parallel_tests._system(soc=soc, criterion=2.0e-5, **flags, **dict(overrides)),
+            parallel_tests._K,
+            parallel_tests._WEIGHTS,
+        )
+
+
+class DeviceResidentSolverTests(unittest.TestCase):
+    """The device-resident eigensolver (CHEBFF or CHEBDAV first solve, then SUBSPACE steps on the
+    device) is a different path to the same converged SCF: compare tightly converged runs."""
+
+    CPU = {"PARSEC_KPOINT_BACKEND": "cpu", "PARSEC_KPOINT_WORKERS": "1"}
+    DEVICE = {"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "2"}
+
+    def _compare(self, name: str, device_environment: dict, **overrides) -> None:
+        serial = _converged(name, self.CPU, **overrides)
+        device = _converged(name, device_environment, **overrides)
+        self.assertTrue(serial.converged and device.converged)
+        self.assertAlmostEqual(device.energies.total, serial.energies.total, delta=5.0e-5)
+        self.assertAlmostEqual(device.fermi_level, serial.fermi_level, delta=5.0e-4)
+        if getattr(serial, "eigenvalues", None) is not None:
+            np.testing.assert_allclose(device.eigenvalues, serial.eigenvalues, atol=1.0e-3)
+
+    def test_chebff_first_solve(self) -> None:
+        for name in ("scalar", "soc", "noncollinear"):
+            with self.subTest(driver=name):
+                self._compare(name, self.DEVICE)
+
+    def test_chebdav_first_solve(self) -> None:
+        for name in ("scalar", "soc"):
+            with self.subTest(driver=name):
+                self._compare(name, self.DEVICE, method="chebdav")
+
+    def test_host_chebdav_first_solve_option(self) -> None:
+        for name in ("scalar", "soc"):
+            with self.subTest(driver=name):
+                self._compare(name, {**self.DEVICE, "PARSEC_KPOINT_FIRST_SOLVE": "chebdav"}, method="chebdav")
+
+    def test_subspaces_kept_on_the_host_between_solves(self) -> None:
+        for name in ("scalar", "soc"):
+            with self.subTest(driver=name):
+                self._compare(name, {**self.DEVICE, "PARSEC_KPOINT_STATE_STORAGE": "host"})
+
+    def test_solver_stats_are_collected(self) -> None:
+        from parsec_python.SCF import kpoint_solver
+
+        with mock.patch.dict(os.environ, self.DEVICE):
+            system = parallel_tests._system(criterion=2.0e-3)
+            seen = {}
+            original = kpoint_solver._parallel_solver
+
+            def capture(job, **options):
+                solver = original(job, **options)
+                close = solver.close
+
+                def close_after_stats():
+                    seen["stats"] = solver.stats()  # the pool is gone after close
+                    close()
+
+                solver.close = close_after_stats
+                return solver
+
+            kpoint_solver.set_parallel_backend(capture, kpoint_solver._parallel_mapper)
+            try:
+                from parsec_python.SCF.kpoints import run_scf_kpoints
+
+                run_scf_kpoints(system, parallel_tests._K, parallel_tests._WEIGHTS)
+                stats = seen["stats"]
+            finally:
+                from parsec_python.acceleration.SCF.kpoint_parallel import install
+
+                install()
+        self.assertGreater(stats.get("subspace_steps", 0), 0)
+        self.assertEqual(stats["first_solves"], len(parallel_tests._K))
 
 
 if __name__ == "__main__":

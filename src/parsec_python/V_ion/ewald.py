@@ -152,6 +152,20 @@ def _erf_over_r(charge: float, radius: np.ndarray, eta: float) -> np.ndarray:
     return values
 
 
+_local_potential_provider = None
+
+
+def set_local_potential_provider(provider=None) -> None:
+    """Install (or, with ``None``, remove) a faster :func:`ewald_local_ionic_potential`.
+
+    ``provider(grid, atoms, potentials, specifications, lattice_vectors, eta, tolerance)`` returns the
+    potential, or ``None`` for an input it does not handle (the direct sum below then runs).  The
+    performance counterpart lives in ``parsec_python.acceleration.V_ion.periodic_setup``.
+    """
+    global _local_potential_provider
+    _local_potential_provider = provider
+
+
 def ewald_local_ionic_potential(
     grid,
     atoms: Sequence[Atom],
@@ -198,6 +212,13 @@ def ewald_local_ionic_potential(
     total = np.zeros(grid.size, dtype=np.float64)
     if not atoms:
         return total
+
+    if _local_potential_provider is not None:
+        provided = _local_potential_provider(
+            grid, atoms, potentials, specifications, lattice_vectors, eta, tolerance
+        )
+        if provided is not None:
+            return provided
 
     eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
     reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
@@ -276,4 +297,5 @@ __all__ = [
     "ewald_alpha_z_energy",
     "ewald_ion_ion_energy",
     "ewald_local_ionic_potential",
+    "set_local_potential_provider",
 ]

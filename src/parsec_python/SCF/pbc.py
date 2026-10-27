@@ -176,13 +176,26 @@ def prepare_periodic_single_point(
     stage_start = time.perf_counter()
     grid = build_periodic_grid(problem.periodic_cell, problem.grid)
     grid_seconds = time.perf_counter() - stage_start
-    side_lengths = np.diag(problem.periodic_cell.lattice_vectors)
+    lattice_vectors = problem.periodic_cell.lattice_vectors
+    orthorhombic = np.allclose(lattice_vectors, np.diag(np.diag(lattice_vectors)), atol=1.0e-10)
+    side_lengths = np.diag(lattice_vectors)
+    inverse_lattice = None if orthorhombic else np.linalg.inv(lattice_vectors)
     for atom in atoms:
         position = np.asarray(atom.position, dtype=float)
-        if np.any(position < 0.0) or np.any(position >= side_lengths):
+        if orthorhombic:
+            outside = np.any(position < 0.0) or np.any(position >= side_lengths)
+        else:
+            fraction = position @ inverse_lattice
+            outside = np.any(fraction < -1.0e-12) or np.any(fraction >= 1.0 + 1.0e-12)
+        if outside:
+            where = (
+                f"cell [0, {side_lengths.tolist()})"
+                if orthorhombic
+                else "the cell (fractional coordinates in [0, 1))"
+            )
             raise ValueError(
                 f"atom {atom.symbol} at {position} lies outside the periodic "
-                f"cell [0, {side_lengths.tolist()}); this path does not "
+                f"{where}; this path does not "
                 "recenter geometry the way the isolated path does"
             )
 

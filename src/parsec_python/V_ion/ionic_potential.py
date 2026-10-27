@@ -554,28 +554,23 @@ def _periodic_image_translations(
     plain, exact finite sum; an image whose support ball cannot reach any grid
     point contributes exactly zero, not approximately.
 
-    Restricted to an orthorhombic cell (diagonal ``lattice_vectors``),
-    matching :func:`~..Grid.pbc.build_periodic_grid`'s own restriction --
-    there is no orthorhombic-only grid to call this for otherwise.  For each
-    axis, an image ``n`` cells away is offset by at least ``(n-1)`` times that
-    axis's side length from a point already inside the cell (every atom
-    position is validated to lie in ``[0, side_length)``), so translations
-    with ``n`` beyond ``ceil(support_radius/side_length) + 1`` cannot reach
-    the cell and are excluded.
+    Every atom position lies inside the cell (validated by the caller), so in
+    fractional coordinates an image ``n`` cells away along lattice vector ``i``
+    is offset by at least ``|n_i|-1`` from any point of the cell, and the
+    fractional coordinate along ``i`` of a point at distance ``R`` changes by
+    at most ``R/d_i`` with ``d_i`` the distance between the lattice planes
+    ``i`` (``1/|b_i|``, ``b`` the reciprocal vectors without ``2 pi``).
+    Translations with ``|n_i|`` beyond ``ceil(R/d_i) + 1`` cannot reach the
+    cell and are excluded.  For an orthorhombic cell ``d_i`` is the side length.
     """
 
-    off_diagonal = lattice_vectors - np.diag(np.diag(lattice_vectors))
-    if not np.allclose(off_diagonal, 0.0, atol=1.0e-10):
-        raise ValueError(
-            "periodic KB projector images only support an orthorhombic cell "
-            "(diagonal lattice_vectors), matching build_periodic_grid"
-        )
-    side_lengths = np.diag(lattice_vectors)
-    max_index = np.ceil(support_radius / side_lengths).astype(int) + 1
+    lattice_vectors = np.asarray(lattice_vectors, dtype=float)
+    plane_spacing = 1.0 / np.linalg.norm(np.linalg.inv(lattice_vectors), axis=0)
+    max_index = np.ceil(support_radius / plane_spacing).astype(int) + 1
     ranges = [np.arange(-m, m + 1) for m in max_index]
     grid = np.meshgrid(*ranges, indexing="ij")
     integer_combinations = np.column_stack([axis.reshape(-1) for axis in grid])
-    return integer_combinations * side_lengths
+    return integer_combinations @ lattice_vectors
 
 
 def build_nonlocal_projectors(

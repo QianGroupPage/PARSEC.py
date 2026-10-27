@@ -7,8 +7,10 @@ single-point calculation:
 * the Rydberg-unit kinetic operator is ``T = -nabla**2 = A``;
 * the Rydberg-unit Hartree equation is ``A V_H = 8*pi*rho``.
 
-Only axial neighbors are used.  There are no mixed-derivative or diagonal
-neighbors such as ``(i+1, j+1, k)``.
+Only axial neighbors are used on a cluster grid and on an orthorhombic periodic cell.  There are no
+mixed-derivative or diagonal neighbors such as ``(i+1, j+1, k)`` there.  An oblique periodic cell has
+mixed derivatives, which are written as pure second derivatives along a few extra lattice directions
+(:mod:`.lattice_metric`) and add those diagonal neighbors.
 """
 
 from __future__ import annotations
@@ -20,6 +22,12 @@ import numpy as np
 import scipy.sparse as sp
 
 from ..Grid import RealSpaceGrid
+from .lattice_metric import cartesian_derivative_matrix, second_derivative_plan
+
+
+def _is_oblique(grid) -> bool:
+    """A periodic grid whose axes are not the Cartesian axes: its derivatives carry the cell's metric."""
+    return getattr(grid, "is_orthorhombic", True) is False
 
 
 def first_derivative_coefficients(expansion_order: int) -> np.ndarray:
@@ -177,6 +185,8 @@ def build_negative_laplacian(grid: RealSpaceGrid) -> sp.csr_matrix:
     assembled once and reused as the kinetic operator and as the interior
     Poisson operator.
     """
+    if _is_oblique(grid):
+        return _build_oblique_negative_laplacian(grid)
     coeff = second_derivative_coefficients(grid.settings.expansion_order)
     width = grid.settings.stencil_half_width
     inv_h2 = 1.0 / grid.spacing**2
@@ -205,6 +215,44 @@ def build_negative_laplacian(grid: RealSpaceGrid) -> sp.csr_matrix:
 
     # COO is convenient while appending neighbor contributions; CSR is more
     # efficient for the repeated matrix-vector products used by the solver.
+    matrix = sp.coo_matrix(
+        (np.concatenate(value_parts), (np.concatenate(row_parts), np.concatenate(col_parts))),
+        shape=(n, n),
+    ).tocsr()
+    matrix.sum_duplicates()
+    return matrix
+
+
+def _build_oblique_negative_laplacian(grid) -> sp.csr_matrix:
+    """``-nabla^2`` on a periodic grid with oblique axes: axial plus extra-direction second derivatives.
+
+    ``-nabla^2 = -sum_i p_i d^2/du_i^2 - sum_k w_k d^2/dt^2 (along d_k)`` with the weights of
+    :func:`~.lattice_metric.second_derivative_plan`; each second derivative is the centered stencil
+    ``sum_j c_j f(u + j d)`` in index units (the steps are inside ``p`` and ``w``).
+    """
+    coeff = second_derivative_coefficients(grid.settings.expansion_order)
+    width = grid.settings.stencil_half_width
+    plan = second_derivative_plan(grid.step_vectors)
+    n = grid.size
+    base = grid.integer_coordinates
+
+    total = float(np.sum(plan.axial)) + float(np.sum(plan.weights))
+    row_parts: list[np.ndarray] = [np.arange(n, dtype=np.int64)]
+    col_parts: list[np.ndarray] = [np.arange(n, dtype=np.int64)]
+    value_parts: list[np.ndarray] = [np.full(n, -total * coeff[width], dtype=float)]
+
+    unit_axes = [tuple(int(v) for v in row) for row in np.eye(3, dtype=int)]
+    lines = [(axis, weight) for axis, weight in zip(unit_axes, plan.axial)]
+    lines += list(zip(plan.directions, plan.weights))
+    for direction, weight in lines:
+        step = np.asarray(direction, dtype=np.int64)
+        for shell in range(1, width + 1):
+            for sign in (-1, 1):
+                rows = grid.rows_for_integer_coordinates(base + sign * shell * step)
+                row_parts.append(np.arange(n, dtype=np.int64))
+                col_parts.append(rows)
+                value_parts.append(np.full(n, -weight * coeff[width + shell], dtype=float))
+
     matrix = sp.coo_matrix(
         (np.concatenate(value_parts), (np.concatenate(row_parts), np.concatenate(col_parts))),
         shape=(n, n),
@@ -285,7 +333,9 @@ def build_gradient(grid: RealSpaceGrid) -> tuple[sp.csr_matrix, sp.csr_matrix, s
     """
     coeff = first_derivative_coefficients(grid.settings.expansion_order)
     width = grid.settings.stencil_half_width
-    inv_h = 1.0 / grid.spacing
+    oblique = _is_oblique(grid)
+    # An oblique cell differentiates along its grid axes (unit index steps) and mixes them afterwards.
+    inv_h = 1.0 if oblique else 1.0 / grid.spacing
     n = grid.size
 
     axis_parts: list[list[np.ndarray]] = [[], [], []]
@@ -310,6 +360,10 @@ def build_gradient(grid: RealSpaceGrid) -> tuple[sp.csr_matrix, sp.csr_matrix, s
         matrix = sp.coo_matrix((values, (rows, cols)), shape=(n, n)).tocsr()
         matrix.sum_duplicates()
         matrices.append(matrix)
+    if oblique:
+        # d/dx_k = sum_i C[k, i] d/du_i, C = S^{-1}
+        mix = cartesian_derivative_matrix(grid.step_vectors)
+        matrices = [sum(mix[k, i] * matrices[i] for i in range(3)).tocsr() for k in range(3)]
     return tuple(matrices)
 
 

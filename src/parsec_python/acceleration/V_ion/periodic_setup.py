@@ -68,9 +68,10 @@ def grid_ball(grid, centre: np.ndarray, radius: float):
     """``(rows, relative, distances)`` of the grid points within ``radius`` of ``centre``.
 
     The result of :func:`parsec_python.V_ion.ionic_potential.dense_support` for a periodic grid,
-    from the index box around the centre.  Other grids use the dense scan.
+    from the index box around the centre.  Other grids (and oblique cells) use the dense scan.
     """
-    if not isinstance(grid, PeriodicRealSpaceGrid):
+    if not isinstance(grid, PeriodicRealSpaceGrid) or not grid.is_orthorhombic:
+        # an oblique cell has no index box around a centre: the dense scan
         return _ionic.dense_support(grid, centre, radius)
     n, _, spacing = _axis_spacing(grid)
     ranges = []

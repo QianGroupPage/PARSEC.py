@@ -15,9 +15,14 @@ from typing import Sequence
 
 import numpy as np
 
-from .ion_ion import ion_ion_forces
+from .ion_ion import ewald_ion_ion_forces, ion_ion_forces
 from .local import LocalForceTerms, local_forces
-from .nonlocal_force import build_nonlocal_projector_gradients, nonlocal_forces
+from .nonlocal_force import (
+    build_nonlocal_projector_gradients,
+    build_periodic_projector_gradients,
+    nonlocal_forces,
+)
+from .periodic_local import periodic_local_forces
 from .symmetry import (
     AtomSymmetryOperation,
     atom_symmetry_operations,
@@ -72,8 +77,12 @@ def assemble_forces(
     *,
     seconds: float = 0.0,
     phase_seconds: dict | None = None,
+    periodic: bool = False,
 ) -> ForceResult:
-    """Combine the force terms as ``forcnloc.f90`` does at its end."""
+    """Combine the force terms as ``forcnloc.f90`` does at its end.
+
+    ``periodic`` is for a crystal: the torque, which has no meaning in a periodic cell, is reported as zero.
+    """
 
     unsymmetrized = ion_ion + local.total + nonlocal_pseudopotential
     symmetrized = (
@@ -90,7 +99,7 @@ def assemble_forces(
         unsymmetrized=unsymmetrized,
         symmetrized=symmetrized,
         net_force=net,
-        torque=total_torque(positions, symmetrized),
+        torque=np.zeros(3) if periodic else total_torque(positions, symmetrized),
         total=total,
         symmetry_operations=1 if operations is None else len(operations),
         seconds=seconds,
@@ -169,4 +178,53 @@ def compute_forces(
     )
 
 
-__all__ = ["ForceResult", "assemble_forces", "compute_forces"]
+def compute_periodic_forces(
+    system,
+    result,
+    *,
+    operations: Sequence[AtomSymmetryOperation] | None = None,
+) -> ForceResult:
+    """Forces of a finished Gamma-point calculation of a periodic cell on the full grid.
+
+    ``system`` is the prepared periodic system and ``result`` the outcome of its SCF loop with full-grid orbitals.
+    The terms are those of ``forpbc.f90``, ``force_loc_pb.f90`` and ``forcnloc.f90``: the Ewald ion-ion force, the
+    local ionic and core-correction forces (there is no term for the SCF residual in the periodic path) and the
+    nonlocal force with the periodic projectors; then the net force is removed.  ``operations`` are optional
+    symmetry operations of the atoms to average over (none by default: the Gamma-only periodic path does not
+    reduce the grid by symmetry).
+    """
+
+    from time import perf_counter
+
+    started = perf_counter()
+    atoms = system.atoms
+    specifications = system.input.pseudopotentials
+    lattice = np.asarray(system.input.periodic_cell.lattice_vectors, dtype=np.float64)
+    positions = np.array([atom.position for atom in atoms], dtype=np.float64)
+
+    repulsion = ewald_ion_ion_forces(atoms, system.pseudopotentials, lattice)
+    local = periodic_local_forces(
+        system.grid, atoms, system.pseudopotentials, specifications, lattice, result.density, result.xc_potential
+    )
+    gradients = build_periodic_projector_gradients(
+        system.grid, atoms, system.pseudopotentials, specifications, lattice
+    )
+    separable = nonlocal_forces(
+        system.nonlocal_operator,
+        gradients,
+        result.wavefunctions,
+        result.occupations if getattr(result, "spin", None) is None else 0.5 * np.asarray(result.occupations),
+        len(atoms),
+    )
+    return assemble_forces(
+        positions,
+        repulsion,
+        local,
+        separable,
+        operations,
+        seconds=perf_counter() - started,
+        periodic=True,
+    )
+
+
+__all__ = ["ForceResult", "assemble_forces", "compute_forces", "compute_periodic_forces"]

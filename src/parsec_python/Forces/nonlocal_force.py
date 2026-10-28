@@ -34,6 +34,7 @@ from ..Pseudopotential.radial_derivatives import (
     spline_derivative,
 )
 from ..V_ion import NonlocalProjectorOperator
+from ..V_ion import ionic_potential as _ionic
 from ..V_ion.ionic_potential import _projector_support_radius
 
 
@@ -266,6 +267,135 @@ def build_nonlocal_projector_gradients(
     )
 
 
+# Below this distance (bohr) from an atom the radial gradient of a projector is taken at this distance.  The first samples of
+# a POTRE table (r from 1e-6 bohr on) are rounding noise: u_l(r)/r flattens to a constant there instead of growing as r**l,
+# and ``nonloc.F90``'s replacement of a shorter distance by the first sample then multiplies noise by 1/r for the
+# gradient of the grid point of an atom that sits on a grid point (a p projector's gradient there came out 3 times
+# too large at 1e-4 bohr and 800 times at the first sample).  From 1e-3 bohr the tables are smooth.
+_PROJECTOR_GRADIENT_FLOOR = 1.0e-3
+
+
+def build_periodic_projector_gradients(
+    grid,
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    specifications: Mapping[str, SpeciesPotential],
+    lattice_vectors: np.ndarray,
+    k_point: np.ndarray | None = None,
+) -> NonlocalProjectorGradients:
+    """Gradients of the periodic projectors of :func:`parsec_python.V_ion.build_nonlocal_projectors`.
+
+    Column ``q`` is ``G_q(r) = e^{-ik.r} sum_T e^{ik.T} grad beta_q(r - R_a - T)``: the gradient of the projector
+    with respect to the electron coordinate, with the Bloch factor of the projector but not differentiated
+    (``e^{-ik.r}`` does not depend on the atom position).  Then ``d beta_q/d R_a = -G_q``, and the nonlocal energy
+    ``E = sum_k w_k 2 sum_n f_n sum_q s_q |<beta_q|u_n>|**2`` has the force
+
+    ``F_a = 4 sum_k w_k sum_n f_n sum_q s_q Re[conj(<beta_q|u_n>) <G_q|u_n>]``.
+
+    The images, support radius, radial interpolation (spline or PARSEC's table) and column order are those of the
+    projector builder; with ``k_point=None`` the columns are real (the Gamma point).  Within
+    ``_PROJECTOR_GRADIENT_FLOOR`` of an atom the gradient is evaluated at that distance (see there).
+
+    Known limitation: the projector of an atom that sits exactly on a grid point has no defined value at that point
+    (the direction of a zero displacement; the harmonics of ``l >= 2`` evaluate to nonzero constants there), so the
+    nonlocal energy has a small jump as the atom crosses the grid point.  The force is the derivative of the energy at
+    the point, not of its smooth neighbours: for a hydrogen pair on a 0.7 bohr grid they differ by about 3 %.
+    """
+
+    complex_valued = k_point is not None
+    value_dtype = complex if complex_valued else float
+    k_point = None if k_point is None else np.asarray(k_point, dtype=float)
+    lattice_vectors = np.asarray(lattice_vectors, dtype=float)
+    rows: list[np.ndarray] = []
+    columns: list[np.ndarray] = []
+    values: tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]] = ([], [], [])
+    signs: list[float] = []
+    labels: list[tuple[int, int, int]] = []
+    column = 0
+    sqrt_dv = np.sqrt(grid.volume_element)
+    tables: dict[tuple[str, int], tuple] = {}
+
+    for atom_index, atom in enumerate(atoms):
+        potential = potentials[atom.symbol]
+        specification = specifications[atom.symbol]
+        local_l = specification.local_angular_momentum
+        position = np.asarray(atom.position, dtype=np.float64)
+
+        support_radius = _projector_support_radius(potential)
+        images = []
+        for translation in _ionic._periodic_image_translations(lattice_vectors, support_radius):
+            support_rows, relative, radius = _ionic._support_finder(grid, position + translation, support_radius)
+            if not support_rows.size:
+                continue
+            phase = (
+                1.0
+                if k_point is None
+                else np.exp(-1j * ((grid.coordinates[support_rows] - translation) @ k_point))
+            )
+            clamped = np.maximum(radius, max(potential.radii[0], _PROJECTOR_GRADIENT_FLOOR))
+            inverse = 1.0 / clamped
+            images.append((support_rows, relative * inverse[:, None], clamped, inverse, phase))
+        if not images:
+            continue
+
+        for angular_momentum in sorted(potential.radial_wavefunctions):
+            if angular_momentum == local_l:
+                continue
+            key = (atom.symbol, angular_momentum)
+            if key not in tables:
+                radial_grid, radial_slope, sign = radial_projector_with_derivative(
+                    potential, angular_momentum, local_l
+                )
+                spline = (
+                    ParsecRadialSpline.from_positive_grid(
+                        potential.radii, radial_grid, grid.settings.stencil_half_width
+                    )
+                    if specification.use_spline
+                    else None
+                )
+                tables[key] = (radial_grid, radial_slope, sign, spline)
+            radial_grid, radial_slope, sign, spline = tables[key]
+            channel_columns = list(range(column, column + 2 * angular_momentum + 1))
+            column += len(channel_columns)
+            for harmonic_index in range(len(channel_columns)):
+                signs.append(sign)
+                labels.append((atom_index, angular_momentum, harmonic_index))
+
+            for support_rows, unit, clamped, inverse, phase in images:
+                if spline is not None:
+                    radial = spline(clamped)
+                    slope = spline_derivative(spline, clamped)
+                else:
+                    radial = np.interp(clamped, potential.radii, radial_grid, right=0.0)
+                    slope = np.interp(clamped, potential.radii, radial_slope, right=0.0)
+                harmonics, harmonic_gradients = real_harmonics_with_gradients(angular_momentum, unit, inverse)
+                for harmonic_index, target in enumerate(channel_columns):
+                    scale = sqrt_dv if k_point is None else (phase * sqrt_dv)[:, None]
+                    gradient = scale * (
+                        radial[:, None] * harmonic_gradients[:, harmonic_index, :]
+                        + (slope * harmonics[:, harmonic_index])[:, None] * unit
+                    )
+                    rows.append(support_rows)
+                    columns.append(np.full(support_rows.size, target, dtype=np.int64))
+                    for component in range(3):
+                        values[component].append(gradient[:, component].astype(value_dtype, copy=False))
+
+    def assemble(component: int) -> sp.csc_matrix:
+        if column == 0:
+            return sp.csc_matrix((grid.size, 0), dtype=value_dtype)
+        return sp.coo_matrix(
+            (np.concatenate(values[component]), (np.concatenate(rows), np.concatenate(columns))),
+            shape=(grid.size, column),
+            dtype=value_dtype,
+        ).tocsc()
+
+    return NonlocalProjectorGradients(
+        components=(assemble(0), assemble(1), assemble(2)),
+        signs=np.asarray(signs, dtype=float),
+        labels=tuple(labels),
+    )
+
+
 def contract_nonlocal_forces(
     projector_overlaps: np.ndarray,
     gradient_overlaps: Sequence[np.ndarray],
@@ -278,12 +408,23 @@ def contract_nonlocal_forces(
 
     ``projector_overlaps`` and each of the three ``gradient_overlaps`` have
     shape ``(projectors, states)``.  The result is ``(atoms, 3)`` in Ry/bohr.
+    Complex overlaps (Bloch orbitals) contribute ``4*f_n*s_q*Re[conj(<beta_q|u_n>)*<grad beta_q|u_n>]``; for
+    real overlaps this is the product above.
     """
 
-    overlaps = np.asarray(projector_overlaps, dtype=np.float64)
-    weights = 4.0 * np.asarray(signs)[:, None] * overlaps * np.asarray(occupations)[None, :]
+    occupation = np.asarray(occupations)
     owners = np.fromiter((label[0] for label in labels), dtype=np.int64, count=len(labels))
     forces = np.zeros((atom_count, 3), dtype=np.float64)
+    if np.iscomplexobj(projector_overlaps) or any(np.iscomplexobj(component) for component in gradient_overlaps):
+        # Bloch orbitals: 4 f s Re[conj(<beta|u>) <G|u>]
+        overlaps = np.asarray(projector_overlaps)
+        for component in range(3):
+            coupling = np.real(np.conj(overlaps) * np.asarray(gradient_overlaps[component]))
+            per_projector = 4.0 * np.asarray(signs) * (coupling @ occupation)
+            forces[:, component] = np.bincount(owners, weights=per_projector, minlength=atom_count)
+        return forces
+    overlaps = np.asarray(projector_overlaps, dtype=np.float64)
+    weights = 4.0 * np.asarray(signs)[:, None] * overlaps * occupation[None, :]
     for component in range(3):
         per_projector = np.einsum(
             "qn,qn->q", weights, np.asarray(gradient_overlaps[component])
@@ -332,7 +473,8 @@ def nonlocal_forces(
 
     ``wavefunctions`` holds one Euclidean-normalized grid vector per column
     and ``occupations`` the matching spatial-orbital occupations in
-    ``[0, 1]``.  Empty states are skipped.
+    ``[0, 1]`` (times the k-point weight for Bloch orbitals, which may be
+    complex).  Empty states are skipped.
     """
 
     occupations = np.asarray(occupations, dtype=np.float64)
@@ -340,12 +482,16 @@ def nonlocal_forces(
         return np.zeros((atom_count, 3), dtype=np.float64)
     columns = gradient_columns_for(operator.labels, gradients.labels)
     occupied = np.flatnonzero(occupations != 0.0)
-    orbitals = np.asarray(wavefunctions, dtype=np.float64)[:, occupied]
-    overlaps = np.asarray(operator.projectors.T @ orbitals)
-    gradient_overlaps = [
-        np.asarray(component.T @ orbitals)[columns]
-        for component in gradients.components
-    ]
+    orbitals = np.asarray(wavefunctions)[:, occupied]
+    if not np.iscomplexobj(orbitals):
+        orbitals = orbitals.astype(np.float64, copy=False)
+
+    def overlap(matrix: sp.spmatrix) -> np.ndarray:
+        # <beta|u> = beta^H u; for real projectors and orbitals the plain transpose
+        return np.asarray((matrix.conj().T if np.iscomplexobj(matrix.data) else matrix.T) @ orbitals)
+
+    overlaps = overlap(operator.projectors)
+    gradient_overlaps = [overlap(component)[columns] for component in gradients.components]
     return contract_nonlocal_forces(
         overlaps,
         gradient_overlaps,
@@ -359,6 +505,7 @@ def nonlocal_forces(
 __all__ = [
     "NonlocalProjectorGradients",
     "build_nonlocal_projector_gradients",
+    "build_periodic_projector_gradients",
     "contract_nonlocal_forces",
     "gradient_columns_for",
     "nonlocal_forces",

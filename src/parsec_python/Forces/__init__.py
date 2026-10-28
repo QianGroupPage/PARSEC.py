@@ -6,6 +6,7 @@ from .periodic_local import periodic_local_forces
 from .nonlocal_force import (
     NonlocalProjectorGradients,
     build_nonlocal_projector_gradients,
+    build_periodic_projector_gradients,
     contract_nonlocal_forces,
     gradient_columns_for,
     nonlocal_forces,
@@ -21,7 +22,7 @@ from .symmetry import (
     symmetrize_positions,
     total_torque,
 )
-from .total import ForceResult, assemble_forces, compute_forces
+from .total import ForceResult, assemble_forces, compute_forces, compute_periodic_forces
 
 __all__ = [
     "AtomSymmetryOperation",
@@ -31,7 +32,9 @@ __all__ = [
     "assemble_forces",
     "atom_symmetry_operations",
     "build_nonlocal_projector_gradients",
+    "build_periodic_projector_gradients",
     "compute_forces",
+    "compute_periodic_forces",
     "contract_nonlocal_forces",
     "cubic_point_operations",
     "ewald_ion_ion_forces",

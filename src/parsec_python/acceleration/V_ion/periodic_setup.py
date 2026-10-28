@@ -33,13 +33,18 @@ from typing import Sequence
 import numpy as np
 from scipy.special import erfcinv
 
-from parsec_python.Grid.pbc import PeriodicRealSpaceGrid
+from parsec_python.Grid.pbc import PeriodicRealSpaceGrid, SlabRealSpaceGrid
 from parsec_python.V_ion import ewald as _ewald
 from parsec_python.V_ion import ionic_potential as _ionic
 
 _NYQUIST_FRACTION = 0.85  # the reciprocal series ends at this fraction of the grid's Nyquist frequency
 _POINTS_PER_CALL = 1_000_000  # grid points evaluated together (the radial spline is built once per call)
 _STRUCTURE_FACTOR_ELEMENTS = 4_000_000  # complex numbers of one structure-factor block
+
+
+def _is_full_periodic(grid) -> bool:
+    """A grid periodic in all three lattice vectors (a slab has a box along z at an offset: the dense scan)."""
+    return isinstance(grid, PeriodicRealSpaceGrid) and not isinstance(grid, SlabRealSpaceGrid)
 
 
 def _cell_geometry(grid: PeriodicRealSpaceGrid, lattice_vectors=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -77,7 +82,7 @@ def grid_ball(grid, centre: np.ndarray, radius: float):
     centre along fractional axis ``m``, in an oblique cell as well as a rectangular one.  Other grids use
     the dense scan.
     """
-    if not isinstance(grid, PeriodicRealSpaceGrid):
+    if not _is_full_periodic(grid):
         return _ionic.dense_support(grid, centre, radius)
     n, _, inverse = _cell_geometry(grid)
     fractional = np.asarray(centre, dtype=float) @ inverse
@@ -178,7 +183,7 @@ def fft_local_ionic_potential(
     grid, atoms: Sequence, potentials, specifications, lattice_vectors, eta, tolerance
 ):
     """The local ionic potential of :func:`~parsec_python.V_ion.ewald.ewald_local_ionic_potential`."""
-    if not isinstance(grid, PeriodicRealSpaceGrid):
+    if not _is_full_periodic(grid):
         return None
     n, lattice, _ = _cell_geometry(grid, lattice_vectors)
     volume = abs(float(np.linalg.det(lattice)))

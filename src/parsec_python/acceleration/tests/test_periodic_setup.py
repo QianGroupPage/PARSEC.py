@@ -24,6 +24,7 @@ from parsec_python import (
     SpeciesPotential,
 )
 from parsec_python.acceleration.V_ion import periodic_setup
+from parsec_python.Grid.pbc import build_periodic_grid
 from parsec_python.SCF.pbc import prepare_periodic_single_point
 from parsec_python.V_ion import (
     build_nonlocal_projectors,
@@ -84,6 +85,21 @@ class GridBallTests(unittest.TestCase):
                     np.testing.assert_array_equal(rows, expected[0])
                     np.testing.assert_array_equal(relative, expected[1])
                     np.testing.assert_array_equal(distances, expected[2])
+
+    def test_a_slab_grid_uses_the_dense_scan(self) -> None:
+        # the z planes of a slab are offset from the origin and its third lattice vector is a placeholder
+        lattice = np.array([[8.0, 0.0, 0.0], [2.0, 7.0, 0.0], [0.0, 0.0, 14.0]])
+        grid = build_periodic_grid(
+            PeriodicCell(lattice, dimensions=2), PeriodicGridSettings(spacing=0.6, expansion_order=6)
+        )
+        generator = np.random.default_rng(5)
+        for _ in range(20):
+            centre = np.array([*generator.uniform(-4.0, 12.0, size=2), generator.uniform(-6.0, 6.0)])
+            radius = float(generator.uniform(0.5, 6.0))
+            fast = periodic_setup.grid_ball(grid, centre, radius)
+            expected = dense_support(grid, centre, radius)
+            for found, wanted in zip(fast, expected):
+                np.testing.assert_array_equal(found, wanted)
 
     def test_other_grids_use_the_dense_scan(self) -> None:
         class Plain:

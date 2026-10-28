@@ -265,6 +265,45 @@ def _from_box(box: np.ndarray, grid) -> np.ndarray:
     return _gather_active(box, grid)
 
 
+def _oblique_mix(grid) -> np.ndarray | None:
+    """``C`` with ``d/dx_k = sum_i C[k, i] d/du_i`` on a periodic grid with oblique axes, else ``None``.
+
+    Such a grid differentiates along its own axes with unit index steps (the steps are inside ``C``);
+    every other grid keeps the Cartesian axes and the weights divided by the spacing.
+    """
+
+    if _is_periodic(grid) and not grid.is_orthorhombic:
+        from ..Laplacian.lattice_metric import cartesian_derivative_matrix
+
+        return cartesian_derivative_matrix(grid.step_vectors)
+    return None
+
+
+def _oblique_gradient(field: np.ndarray, grid, weights: np.ndarray, mix: np.ndarray) -> np.ndarray:
+    """Cartesian gradient ``(3, size)`` of a periodic field on an oblique grid (unit-step ``weights``)."""
+
+    box = _to_box(field, grid)
+    along_axes = [
+        _from_box(correlate1d(box, weights, axis=axis, mode="wrap"), grid) for axis in range(3)
+    ]
+    return np.einsum("ki,ij->kj", mix, np.asarray(along_axes))
+
+
+def _oblique_divergence_adjoint(fluxes, grid, weights: np.ndarray, mix: np.ndarray) -> np.ndarray:
+    """Transpose of the Cartesian gradient applied to Cartesian ``fluxes``: ``sum_k G_k^T flux_k``.
+
+    ``G_k = sum_i C[k, i] D_i`` and the periodic centered ``D_i`` is antisymmetric, so
+    ``G_k^T = -sum_i C[k, i] D_i``.
+    """
+
+    index_fluxes = np.einsum("ki,kj->ij", mix, np.asarray(fluxes))
+    total = np.zeros(grid.size, dtype=np.float64)
+    for axis in range(3):
+        adjoint_box = correlate1d(_to_box(index_fluxes[axis], grid), -weights, axis=axis, mode="wrap")
+        total += _from_box(adjoint_box, grid)
+    return total
+
+
 def _embed_active(values: np.ndarray, grid: RealSpaceGrid) -> np.ndarray:
     """Embed one active-grid vector into its zero-valued Cartesian box."""
 
@@ -314,40 +353,48 @@ def pbe(
         raise ValueError("PBE requires a nonnegative density")
 
     weights = first_derivative_coefficients(grid.settings.expansion_order)
-    weights = weights / grid.spacing
+    mix = _oblique_mix(grid)
     # Periodic cells wrap the stencil around; clusters zero-pad outside.
     boundary = "wrap" if _is_periodic(grid) else "constant"
-    full_density = _to_box(density, grid)
     gradients = np.empty((3, grid.size), dtype=np.float64)
     sigma = np.zeros(grid.size, dtype=np.float64)
-    for axis in range(3):
-        derivative_box = correlate1d(
-            full_density,
-            weights,
-            axis=axis,
-            mode=boundary,
-            cval=0.0,
-        )
-        gradient = _from_box(derivative_box, grid)
-        gradients[axis] = gradient
-        sigma += gradient * gradient
+    if mix is not None:
+        gradients[:] = _oblique_gradient(density, grid, weights, mix)
+        sigma = np.einsum("kj,kj->j", gradients, gradients)
+    else:
+        weights = weights / grid.spacing
+        full_density = _to_box(density, grid)
+        for axis in range(3):
+            derivative_box = correlate1d(
+                full_density,
+                weights,
+                axis=axis,
+                mode=boundary,
+                cval=0.0,
+            )
+            gradient = _from_box(derivative_box, grid)
+            gradients[axis] = gradient
+            sigma += gradient * gradient
 
     energy_hartree, fn_hartree, fsigma_hartree = pbe_energy_partials(
         density, sigma
     )
     potential_hartree = fn_hartree.copy()
-    for axis in range(3):
-        flux_box = _to_box(2.0 * fsigma_hartree * gradients[axis], grid)
-        # For the antisymmetric centered stencil D.T = -D.  Applying the
-        # reversed weights is the exact transpose of the zero-padded action.
-        adjoint_box = correlate1d(
-            flux_box,
-            -weights,
-            axis=axis,
-            mode=boundary,
-            cval=0.0,
-        )
-        potential_hartree += _from_box(adjoint_box, grid)
+    if mix is not None:
+        potential_hartree += _oblique_divergence_adjoint(2.0 * fsigma_hartree * gradients, grid, weights, mix)
+    else:
+        for axis in range(3):
+            flux_box = _to_box(2.0 * fsigma_hartree * gradients[axis], grid)
+            # For the antisymmetric centered stencil D.T = -D.  Applying the
+            # reversed weights is the exact transpose of the zero-padded action.
+            adjoint_box = correlate1d(
+                flux_box,
+                -weights,
+                axis=axis,
+                mode=boundary,
+                cval=0.0,
+            )
+            potential_hartree += _from_box(adjoint_box, grid)
 
     # Convert Hartree -> Rydberg only at the public boundary.
     energy_density = 2.0 * energy_hartree
@@ -523,10 +570,14 @@ def pbe_spin_polarized(
         raise ValueError("PBE requires nonnegative spin densities")
 
     weights = first_derivative_coefficients(grid.settings.expansion_order)
-    weights = weights / grid.spacing
+    mix = _oblique_mix(grid)
+    if mix is None:
+        weights = weights / grid.spacing
     boundary = "wrap" if _is_periodic(grid) else "constant"
 
     def gradient(field):
+        if mix is not None:
+            return list(_oblique_gradient(field, grid, weights, mix))
         box = _to_box(field, grid)
         return [
             _from_box(
@@ -547,6 +598,8 @@ def pbe_spin_polarized(
     )
 
     def divergence_adjoint(fluxes):
+        if mix is not None:
+            return _oblique_divergence_adjoint(fluxes, grid, weights, mix)
         total = np.zeros(grid.size, dtype=np.float64)
         for axis in range(3):
             adjoint_box = correlate1d(

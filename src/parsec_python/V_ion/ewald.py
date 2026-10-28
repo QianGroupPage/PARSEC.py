@@ -44,6 +44,15 @@ def _lattice_points(
     return points[within_cutoff]
 
 
+def _cell_center_and_radius(lattice_vectors: np.ndarray) -> tuple[np.ndarray, float]:
+    """Center of the unit cell and the largest distance from it to a corner (the circumscribed radius)."""
+
+    signs = np.array(np.meshgrid([0.0, 1.0], [0.0, 1.0], [0.0, 1.0], indexing="ij")).reshape(3, -1).T
+    corners = signs @ lattice_vectors
+    center = 0.5 * np.sum(lattice_vectors, axis=0)
+    return center, float(np.max(np.linalg.norm(corners - center, axis=1)))
+
+
 def _ewald_cutoffs(
     volume: float, eta: float | None, tolerance: float
 ) -> tuple[float, float, float]:
@@ -99,7 +108,10 @@ def ewald_ion_ion_energy(
     eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
     reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
 
-    translations = _lattice_points(lattice_vectors, reciprocal_vectors, real_cutoff)
+    # A translation T matters when some pair separation r_a - r_b + T is within the cutoff, i.e.
+    # |T| <= cutoff + |r_a - r_b|; the pair separations are bounded by the diameter of the atoms.
+    pair_reach = 2.0 * float(np.max(np.linalg.norm(positions - positions.mean(axis=0), axis=1)))
+    translations = _lattice_points(lattice_vectors, reciprocal_vectors, real_cutoff + pair_reach)
     reciprocal_points = _lattice_points(
         reciprocal_vectors, lattice_vectors, reciprocal_cutoff
     )
@@ -110,7 +122,10 @@ def ewald_ion_ion_energy(
     # contributes an (n_atoms, n_atoms) block of pair separations.
     real_space_energy = 0.0
     charge_products = charges[:, None] * charges[None, :]
+    extent = positions.max(axis=0) - positions.min(axis=0)  # every |r_a - r_b| component is within it
     for translation in translations:
+        if np.linalg.norm(np.maximum(np.abs(translation) - extent, 0.0)) > real_cutoff:
+            continue  # no pair of atoms comes within the cutoff of this image
         is_origin = bool(np.all(translation == 0.0))
         displacement = (
             positions[:, None, :] - positions[None, :, :] + translation[None, None, :]
@@ -118,6 +133,8 @@ def ewald_ion_ion_energy(
         distance = np.linalg.norm(displacement, axis=2)
         if is_origin:
             np.fill_diagonal(distance, np.inf)
+        if float(np.min(distance)) > real_cutoff:
+            continue
         real_space_energy += 0.5 * np.sum(charge_products * erfc(eta * distance) / distance)
 
     # Reciprocal-space sum: (2*pi/V) * sum_{G!=0} exp(-G^2/(4*eta^2))/G^2 * |S(G)|^2.
@@ -222,7 +239,14 @@ def ewald_local_ionic_potential(
 
     eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
     reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
-    translations = _lattice_points(lattice_vectors, reciprocal_vectors, real_cutoff)
+    # The short-ranged piece of an atom image at ``position + T`` reaches the grid point ``r`` when
+    # ``|r - position - T| <= real_cutoff``.  Grid points lie anywhere in the cell, so an image counts
+    # when its center is within ``real_cutoff + radius`` of the cell center (``radius``: circumscribed
+    # radius of the cell); ``position`` itself is inside the cell, which bounds ``|T|``.
+    cell_center, cell_radius = _cell_center_and_radius(lattice_vectors)
+    all_translations = _lattice_points(
+        lattice_vectors, reciprocal_vectors, real_cutoff + 2.0 * cell_radius
+    )
     reciprocal_points = _lattice_points(
         reciprocal_vectors, lattice_vectors, reciprocal_cutoff
     )
@@ -243,7 +267,8 @@ def ewald_local_ionic_potential(
         position = np.asarray(atom.position, dtype=np.float64)
 
         # Short-range piece: sum over the few nearby periodic images.
-        for translation in translations:
+        reaching = np.linalg.norm(position + all_translations - cell_center, axis=1) <= real_cutoff + cell_radius
+        for translation in all_translations[reaching]:
             displaced = position + translation
             radius = np.linalg.norm(grid.coordinates - displaced, axis=1)
             total += potential.local_potential(

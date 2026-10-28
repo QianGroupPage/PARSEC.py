@@ -757,9 +757,42 @@ python -m parsec_python.Output.bands noso/bands.dat soc/bands.dat \
     --labels "no SOC" "with SOC" --names "G-X,X-M,M-G" -o bands.png
 ```
 
-PARSEC.py needs an orthorhombic cell, so cubic conventional cells are used for fcc/bcc
-crystals and their bands are folded into the simple-cubic Brillouin zone. Fortran's
-`nscf_kpoints` (an explicit k-point list read from a `parsec.dat` restart) is not implemented.
+The cell may have any shape (see "Periodic cells of any shape" below): fcc, bcc and hexagonal crystals can
+use their primitive cells, and the k-points of a path are given in the primitive reciprocal-lattice
+coordinates. Fortran's `nscf_kpoints` (an explicit k-point list read from a `parsec.dat` restart) is not
+implemented.
+
+## Periodic cells of any shape
+
+`Boundary_Conditions: bulk` takes the three lattice vectors of a `Cell_Shape` block (one line with three
+numbers still means an orthorhombic box), so primitive fcc, bcc, hexagonal and triclinic cells work like the
+Fortran code's:
+
+```
+begin Cell_Shape
+   0.0  0.5  0.5
+   0.5  0.0  0.5
+   0.5  0.5  0.0
+end Cell_Shape
+Lattice_Vector_Scale: 3.567 ang
+Coordinate_Unit: lattice_vectors      # fractional coordinates, folded into the cell
+```
+
+The grid axes follow the lattice vectors, each with an even number of points `2*nint(|a_i|/(2h))` as in
+Fortran, so the steps along the three axes may differ. The Laplacian carries the metric of the cell: its mixed
+second derivatives are written as pure second derivatives along the shortest extra lattice directions (one
+diagonal `u+v` for hexagonal cells, three for fcc, one body diagonal for bcc), after the Fortran `pbc_grid_coefs`
+(Natan et al.); the gradient used by the Bloch term and by PBE follows from the same metric
+(`Laplacian/lattice_metric.py`). The periodic Ewald sums, the nonlocal projector images, the
+Monkhorst-Pack grid and the band paths use the lattice and reciprocal vectors directly. Atoms must lie in the
+cell (fractional coordinates `[0, 1)`), which `Coordinate_Unit: lattice_vectors` does by folding.
+
+Checked against the Fortran code on diamond in the fcc primitive cell (same grid, linear interpolation of the
+tables): the band energies agree to 1e-5 Ry (a constant shift of the zero of the potential removed) and the total
+energy to 7e-5 Ry for the two atoms on a 24-point grid; two descriptions of one crystal (cubic cell and sheared
+cell on the same grid points) give the same energy to 1e-8 Ry. The GPU solvers use the same sparse operators; the
+fast neighbour search and local-potential routines of the acceleration package fall back to the exact direct
+sums for such cells, which is slower for large cells.
 
 ## Modular Python API
 

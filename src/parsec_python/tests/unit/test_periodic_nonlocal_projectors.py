@@ -107,11 +107,52 @@ class PeriodicNonlocalProjectorTests(unittest.TestCase):
             operator.apply(probe), operator.as_sparse() @ probe, atol=1.0e-12
         )
 
-    def test_rejects_oblique_cell(self) -> None:
-        grid, atoms, potentials, specifications, _cell = _setup(20.0)
-        oblique = np.array([[20.0, 0.0, 0.0], [1.0, 20.0, 0.0], [0.0, 0.0, 20.0]])
-        with self.assertRaises(ValueError):
-            build_nonlocal_projectors(grid, atoms, potentials, specifications, oblique)
+    def test_oblique_cell_matches_independent_brute_force_image_sum(self) -> None:
+        # An oblique cell smaller than twice the support radius: the images follow the lattice vectors.
+        specifications = {"H": SpeciesPotential(_H_POTRE, 0)}
+        potentials = load_pseudopotentials(specifications, xc_functional="ca")
+        lattice = np.array([[3.0, 0.0, 0.0], [1.3, 2.8, 0.0], [0.6, 0.9, 3.0]])
+        grid = build_periodic_grid(
+            PeriodicCell(lattice_vectors=lattice), PeriodicGridSettings(spacing=0.2, expansion_order=4)
+        )
+        self.assertFalse(grid.is_orthorhombic)
+        atoms = [Atom("H", [2.2, 1.5, 1.2])]
+        support_radius = _projector_support_radius(potentials["H"])
+        self.assertLess(np.min(np.linalg.norm(lattice, axis=1)), 2.0 * support_radius)
+
+        operator = build_nonlocal_projectors(grid, atoms, potentials, specifications, lattice)
+
+        potential = potentials["H"]
+        local_l = specifications["H"].local_angular_momentum
+        angular_momentum = sorted(set(potential.radial_wavefunctions) - {local_l})[0]
+        radial_grid, _sign = potential.radial_projector(angular_momentum, local_l)
+        sqrt_dv = np.sqrt(grid.volume_element)
+        column = next(
+            index
+            for index, (_atom, l, m) in enumerate(operator.labels)
+            if l == angular_momentum and m == 0
+        )
+        computed = np.asarray(operator.projectors[:, column].todense()).ravel()
+
+        brute_force = np.zeros(grid.size)
+        shells = range(-4, 5)
+        for i in shells:
+            for j in shells:
+                for k in shells:
+                    position = np.asarray(atoms[0].position) + np.array([i, j, k]) @ lattice
+                    relative = grid.coordinates - position
+                    radius = np.linalg.norm(relative, axis=1)
+                    support = radius <= support_radius
+                    if not np.any(support):
+                        continue
+                    radial = np.interp(
+                        radius[support], potential.radii, radial_grid, left=radial_grid[0], right=0.0
+                    )
+                    harmonics = real_spherical_harmonics(angular_momentum, relative[support])
+                    brute_force[support] += sqrt_dv * radial * harmonics[:, 0]
+
+        np.testing.assert_allclose(computed, brute_force, rtol=0.0, atol=1.0e-13)
+        self.assertGreater(np.max(np.abs(computed)), 0.0)
 
 
 if __name__ == "__main__":

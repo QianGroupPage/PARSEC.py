@@ -48,14 +48,12 @@ def monkhorst_pack_grid(
     dims = tuple(int(value) for value in dimensions)
     if len(dims) != 3 or any(value < 1 for value in dims):
         raise ValueError("dimensions must be three positive integers")
-    off_diagonal = cell.lattice_vectors - np.diag(np.diag(cell.lattice_vectors))
-    if not np.allclose(off_diagonal, 0.0, atol=1.0e-10):
-        raise ValueError(
-            "Monkhorst-Pack sampling only supports an orthorhombic cell "
-            "(diagonal lattice_vectors)"
-        )
-    side_lengths = np.diag(cell.lattice_vectors)
-    reciprocal = 2.0 * np.pi / side_lengths
+    if np.allclose(cell.lattice_vectors, np.diag(np.diag(cell.lattice_vectors)), atol=1.0e-10):
+        side_lengths = np.diag(cell.lattice_vectors)
+        reciprocal = 2.0 * np.pi / side_lengths
+    else:
+        # rows b_i of 2 pi A^{-T}: k = sum_i f_i b_i
+        reciprocal = 2.0 * np.pi * np.linalg.inv(np.asarray(cell.lattice_vectors)).T
     shift = np.asarray(shift, dtype=float)
     if shift.shape != (3,):
         raise ValueError("shift must have shape (3,)")
@@ -65,7 +63,10 @@ def monkhorst_pack_grid(
     ]
     grids = np.meshgrid(*fractional_axes, indexing="ij")
     fractional = np.column_stack([axis.reshape(-1) for axis in grids])
-    k_points = fractional * reciprocal[None, :] + shift[None, :]
+    if reciprocal.ndim == 2:
+        k_points = fractional @ reciprocal + shift[None, :]
+    else:
+        k_points = fractional * reciprocal[None, :] + shift[None, :]
     n_total = int(np.prod(dims))
     weights = np.full(n_total, 1.0 / n_total, dtype=float)
     return k_points, weights

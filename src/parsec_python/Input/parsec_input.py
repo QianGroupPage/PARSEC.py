@@ -507,9 +507,18 @@ def _coordinate_factor(value: str) -> float:
     }:
         return 1.0
     raise UnsupportedParsecOptionError(
-        "Coordinate_Unit must be Cartesian_Ang or Cartesian_Bohr "
-        "for this isolated solver"
+        "Coordinate_Unit must be Cartesian_Ang, Cartesian_Bohr, or (periodic "
+        "cells) lattice_vectors"
     )
+
+
+def _lattice_is_diagonal(lattice_vectors: np.ndarray) -> bool:
+    return bool(np.allclose(lattice_vectors, np.diag(np.diag(lattice_vectors)), atol=1.0e-10))
+
+
+def _is_lattice_coordinate_unit(value: str) -> bool:
+    """``Coordinate_Unit: lattice_vectors``: coordinates in units of the lattice vectors (fractional)."""
+    return _normalize_label(value) in {"lattice_vectors", "latticevectors"}
 
 
 def _martins_old_input(
@@ -828,7 +837,7 @@ def _parse_parsec_input(
     if boundary not in {"cluster", "0d", "bulk", "3d", "pbc"}:
         raise UnsupportedParsecOptionError(
             f"Boundary_Conditions={boundary!r}; only cluster (isolated) and "
-            "bulk (periodic, Gamma-point, orthorhombic cell) are supported "
+            "bulk (periodic, any cell shape) are supported "
             "-- wire and slab are not"
         )
     periodic_flag = optional_bool("periodic_system")
@@ -900,7 +909,11 @@ def _parse_parsec_input(
             expansion_order=_integer(
                 one("expansion_order", "12"), label="Expansion_Order"
             ),
-            box_lengths=tuple(np.diag(periodic_cell.lattice_vectors))
+            box_lengths=tuple(
+                np.diag(periodic_cell.lattice_vectors)
+                if _lattice_is_diagonal(periodic_cell.lattice_vectors)
+                else np.linalg.norm(periodic_cell.lattice_vectors, axis=1)
+            ),
         )
         kpoint_method = _normalize_label(one("kpoint_method", "none"))
         if kpoint_method == "mp":
@@ -1039,8 +1052,17 @@ def _parse_parsec_input(
             box_lengths=box_lengths,
         )
 
-    coordinate_factor = _coordinate_factor(
+    fractional_coordinates = _is_lattice_coordinate_unit(
         one("coordinate_unit", "cartesian_bohr")
+    )
+    if fractional_coordinates and periodic_cell is None:
+        raise UnsupportedParsecOptionError(
+            "Coordinate_Unit: lattice_vectors needs a periodic cell"
+        )
+    coordinate_factor = (
+        1.0
+        if fractional_coordinates
+        else _coordinate_factor(one("coordinate_unit", "cartesian_bohr"))
     )
     symbols = [str(item.value).strip() for item in scalar.get("atom_type", [])]
     declared_types = _integer(one("atom_types_num"), label="Atom_Types_Num")
@@ -1257,10 +1279,15 @@ def _parse_parsec_input(
                     )
                 moves = values[3] == 1.0
             movable.append(moves)
+            position = np.asarray(values[:3], dtype=float) * coordinate_factor
+            if fractional_coordinates:
+                # fractional coordinates are folded into the cell, as the Fortran code does
+                fraction = position - np.floor(position)
+                position = fraction @ periodic_cell.lattice_vectors
             atoms.append(
                 Atom(
                     symbol,
-                    np.asarray(values[:3], dtype=float) * coordinate_factor,
+                    position,
                     initial_moment=species_moments[row_index],
                 )
             )
@@ -1794,10 +1821,6 @@ def _parse_parsec_input(
             band_settings = BandStructureSettings(segments=tuple(segments), points=points)
         except ValueError as error:
             raise ParsecInputError(f"bandstruc: {error}") from error
-        if periodic_cell is not None and not np.allclose(
-            periodic_cell.lattice_vectors, np.diag(np.diag(periodic_cell.lattice_vectors))
-        ):
-            raise UnsupportedParsecOptionError("bandstruc needs an orthorhombic cell")
 
     domain_energy_tolerance = _energy_rydberg(
         one("domain_energy_tolerance", "1e-3 Ry"), label="Domain_Energy_Tolerance"
@@ -1963,7 +1986,12 @@ def summarize_translation(translation: ParsecInputTranslation) -> str:
             f"order={problem.grid.expansion_order}, shift={problem.grid.shift}"
         )
     else:
-        side_lengths = np.diag(problem.periodic_cell.lattice_vectors)
+        vectors = problem.periodic_cell.lattice_vectors
+        side_lengths = (
+            np.diag(vectors)
+            if _lattice_is_diagonal(vectors)
+            else np.linalg.norm(vectors, axis=1)
+        )
         grid_summary = (
             f"Grid: periodic, cell={list(side_lengths)} bohr, "
             f"h_target={problem.grid.spacing:.12g} bohr, "

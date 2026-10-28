@@ -8,13 +8,15 @@ from .kpoints import (
     monkhorst_pack_grid,
     read_kpoint_file,
 )
-from .pbc import PeriodicRealSpaceGrid, build_periodic_grid
+from .pbc import PeriodicRealSpaceGrid, SlabRealSpaceGrid, build_periodic_grid, build_slab_grid
 
 __all__ = [
     "PeriodicRealSpaceGrid",
     "RealSpaceGrid",
+    "SlabRealSpaceGrid",
     "build_cluster_grid",
     "build_periodic_grid",
+    "build_slab_grid",
     "band_path_kpoints",
     "explicit_kpoints",
     "kpoint_sampling",

@@ -289,6 +289,10 @@ class PeriodicCell:
     lattice_vectors: np.ndarray
     """Rows are the lattice vectors ``a1``, ``a2``, ``a3``."""
 
+    dimensions: int = 3
+    """Periodic directions: 3 (bulk) or 2 (slab: ``a1``, ``a2`` periodic in the xy plane, ``a3 = (0, 0, 2R)`` the
+    height of the non-periodic z direction, where the wavefunctions vanish beyond the box)."""
+
     def __post_init__(self) -> None:
         vectors = np.asarray(self.lattice_vectors, dtype=np.float64)
         if vectors.shape != (3, 3):
@@ -297,6 +301,14 @@ class PeriodicCell:
             raise ValueError("lattice_vectors must be finite")
         if abs(float(np.linalg.det(vectors))) <= 0.0:
             raise ValueError("lattice_vectors must span a nondegenerate cell")
+        if self.dimensions not in (2, 3):
+            raise ValueError("a periodic cell has 2 (slab) or 3 (bulk) periodic dimensions")
+        if self.dimensions == 2:
+            in_plane = vectors[:2]
+            if np.any(np.abs(in_plane[:, 2]) > 1.0e-12) or np.any(np.abs(vectors[2, :2]) > 1.0e-12) or vectors[2, 2] <= 0.0:
+                raise ValueError(
+                    "a slab cell needs two lattice vectors in the xy plane and a third (0, 0, 2R) along z"
+                )
         object.__setattr__(self, "lattice_vectors", vectors)
 
     @property

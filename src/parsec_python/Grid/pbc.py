@@ -32,6 +32,11 @@ class PeriodicRealSpaceGrid:
     lookup: np.ndarray
 
     @property
+    def boundary_modes(self) -> tuple[str, str, str]:
+        """How a finite-difference stencil treats each grid axis beyond the grid: ``wrap`` (periodic) or ``constant`` (zero)."""
+        return ("wrap", "wrap", "wrap")
+
+    @property
     def is_orthorhombic(self) -> bool:
         """Whether the lattice vectors lie along the Cartesian axes (no mixed derivatives)."""
         return _is_diagonal(self.cell.lattice_vectors)
@@ -107,6 +112,8 @@ def build_periodic_grid(
     """
 
     lattice_vectors = cell.lattice_vectors
+    if cell.dimensions == 2:
+        return build_slab_grid(cell, settings)
     if not _is_diagonal(lattice_vectors):
         return _build_oblique_grid(cell, settings)
     side_lengths = np.diag(lattice_vectors)
@@ -176,4 +183,110 @@ def _build_oblique_grid(cell: PeriodicCell, settings: PeriodicGridSettings) -> P
     )
 
 
-__all__ = ["PeriodicRealSpaceGrid", "build_periodic_grid"]
+@dataclass(frozen=True)
+class SlabRealSpaceGrid(PeriodicRealSpaceGrid):
+    """A slab: periodic in the two lattice vectors of the xy plane, a finite box along z.
+
+    Points are ``i*s1 + j*s2 + (z0 + k*hz) e_z`` with ``i, j`` periodic and ``k = 0 ... n3-1`` the planes of the box,
+    which are symmetric about ``z = 0`` (``z0 = -(n3 - 1) hz / 2``, the Fortran code's half-step shift).  A neighbor
+    beyond the first or last plane is outside the box (row ``-1``): wavefunctions vanish there, and the Hartree
+    potential takes the values of the sheet expansion (:mod:`parsec_python.Hartree.slab`).
+    """
+
+    z_step: float = 0.0
+    z_origin: float = 0.0
+
+    @property
+    def boundary_modes(self) -> tuple[str, str, str]:
+        return ("wrap", "wrap", "constant")
+
+    @property
+    def is_orthorhombic(self) -> bool:
+        return False  # the in-plane axes and the metric always go through the general (oblique) stencil
+
+    @property
+    def step_vectors(self) -> np.ndarray:
+        vectors = np.zeros((3, 3))
+        vectors[:2] = self.cell.lattice_vectors[:2] / self.points_per_axis[:2, None]
+        vectors[2, 2] = self.z_step
+        return vectors
+
+    @property
+    def spacing(self) -> float:
+        return float(np.min(np.linalg.norm(self.step_vectors, axis=1)))
+
+    @property
+    def cell_area(self) -> float:
+        in_plane = self.cell.lattice_vectors[:2, :2]
+        return float(abs(in_plane[0, 0] * in_plane[1, 1] - in_plane[0, 1] * in_plane[1, 0]))
+
+    @property
+    def volume_element(self) -> float:
+        return self.cell_area * self.z_step / float(self.points_per_axis[0] * self.points_per_axis[1])
+
+    def rows_for_integer_coordinates(self, points: np.ndarray) -> np.ndarray:
+        points = np.asarray(points, dtype=int)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("integer grid points must have shape (n, 3)")
+        n = self.points_per_axis
+        rows = np.full(points.shape[0], -1, dtype=np.int64)
+        inside = (points[:, 2] >= 0) & (points[:, 2] < n[2])
+        wrapped = points[inside] % n
+        rows[inside] = self.lookup[wrapped[:, 0], wrapped[:, 1], points[inside, 2]]
+        return rows
+
+    def physical_coordinates(self, integer_points: np.ndarray) -> np.ndarray:
+        integer_points = np.asarray(integer_points, dtype=float)
+        coordinates = np.empty_like(integer_points)
+        coordinates[:, :2] = (integer_points[:, :2] % self.points_per_axis[:2]) @ self.step_vectors[:2, :2]
+        coordinates[:, 2] = self.z_origin + integer_points[:, 2] * self.z_step
+        return coordinates
+
+    def integrate(self, values: np.ndarray) -> float:
+        values = np.asarray(values)
+        if values.shape[0] != self.size:
+            raise ValueError("values do not match the active grid")
+        return float(np.sum(values) * self.volume_element)
+
+
+def build_slab_grid(cell: PeriodicCell, settings: PeriodicGridSettings) -> SlabRealSpaceGrid:
+    """Grid of a slab cell: Fortran's ``2*nint(|a_i|/(2h))`` points along the lattice vectors of the plane and
+    ``int(2R/h) + 2`` planes of spacing ``h`` along z, with ``2R`` the third lattice vector (``Boundary_Sphere_Radius``)."""
+
+    lattice = cell.lattice_vectors
+    height = float(lattice[2, 2])
+    in_plane = (2 * np.round(np.linalg.norm(lattice[:2], axis=1) / (2.0 * settings.spacing))).astype(np.int64)
+    planes = int(height / settings.spacing) + 2
+    points_per_axis = np.array([in_plane[0], in_plane[1], planes], dtype=np.int64)
+    half_width = settings.stencil_half_width
+    # With exactly 2*half_width points the neighbors +-half_width are the same point; their weights simply add (the
+    # periodic operator is still the exact one for the sampled field), as in the Fortran code.
+    if np.any(points_per_axis[:2] < 2 * half_width):
+        raise ValueError(
+            "the slab cell is too small for this stencil: each in-plane axis needs at least "
+            f"{2 * half_width} grid points (expansion_order={settings.expansion_order}), got {points_per_axis[:2].tolist()}"
+        )
+    n0, n1, n2 = (int(value) for value in points_per_axis)
+    mesh = np.meshgrid(*[np.arange(n) for n in (n0, n1, n2)], indexing="ij")
+    integer_coordinates = np.column_stack([component.reshape(-1) for component in mesh])
+    z_step = float(settings.spacing)
+    z_origin = -0.5 * (n2 - 1) * z_step
+    steps = np.zeros((3, 3))
+    steps[:2] = lattice[:2] / points_per_axis[:2, None]
+    steps[2, 2] = z_step
+    coordinates = integer_coordinates.astype(np.float64) @ steps
+    coordinates[:, 2] += z_origin
+    lookup = np.arange(n0 * n1 * n2, dtype=np.int64).reshape(n0, n1, n2)
+    return SlabRealSpaceGrid(
+        cell=cell,
+        settings=settings,
+        points_per_axis=points_per_axis,
+        integer_coordinates=integer_coordinates,
+        coordinates=coordinates,
+        lookup=lookup,
+        z_step=z_step,
+        z_origin=z_origin,
+    )
+
+
+__all__ = ["PeriodicRealSpaceGrid", "SlabRealSpaceGrid", "build_periodic_grid", "build_slab_grid"]

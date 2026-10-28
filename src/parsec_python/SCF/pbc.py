@@ -14,6 +14,7 @@ import scipy.sparse as sp
 from ..Grid.pbc import PeriodicRealSpaceGrid, build_periodic_grid
 from ..Hamiltonian import KohnShamHamiltonian
 from ..Hartree.pbc import PeriodicHartreeResult, solve_periodic_hartree
+from ..Hartree.slab import solve_slab_hartree
 from ..Laplacian import build_gradient, build_negative_laplacian
 from ..models import (
     PreparationTimings,
@@ -22,6 +23,7 @@ from ..models import (
     SinglePointResult,
 )
 from ..Pseudopotential import ParsecPseudopotential
+from ..V_ion.slab import slab_ewald_energy, slab_local_ionic_potential
 from ..V_ion import (
     NonlocalProjectorOperator,
     build_nonlocal_projectors,
@@ -92,6 +94,15 @@ class PeriodicPreparedSinglePointSystem:
         *,
         raise_on_nonconvergence: bool = True,
     ) -> PeriodicHartreeResult:
+        if self.input.periodic_cell.dimensions == 2:
+            return solve_slab_hartree(
+                density,
+                self.grid,
+                self.negative_laplacian,
+                self.input.hartree,
+                initial_potential,
+                raise_on_nonconvergence=raise_on_nonconvergence,
+            )
         return solve_periodic_hartree(
             density,
             self.grid,
@@ -177,22 +188,26 @@ def prepare_periodic_single_point(
     grid = build_periodic_grid(problem.periodic_cell, problem.grid)
     grid_seconds = time.perf_counter() - stage_start
     lattice_vectors = problem.periodic_cell.lattice_vectors
+    dimensions = problem.periodic_cell.dimensions
     orthorhombic = np.allclose(lattice_vectors, np.diag(np.diag(lattice_vectors)), atol=1.0e-10)
     side_lengths = np.diag(lattice_vectors)
     inverse_lattice = None if orthorhombic else np.linalg.inv(lattice_vectors)
     for atom in atoms:
         position = np.asarray(atom.position, dtype=float)
-        if orthorhombic:
+        if dimensions == 2:
+            # in-plane fractional coordinates in [0, 1); along z the atom must sit inside the box
+            fraction = position[:2] @ np.linalg.inv(lattice_vectors[:2, :2])
+            outside = np.any(fraction < -1.0e-12) or np.any(fraction >= 1.0 + 1.0e-12)
+            outside = outside or abs(position[2]) >= 0.5 * lattice_vectors[2, 2]
+            where = "the slab cell (in-plane fractional coordinates in [0, 1), |z| < R)"
+        elif orthorhombic:
             outside = np.any(position < 0.0) or np.any(position >= side_lengths)
+            where = f"cell [0, {side_lengths.tolist()})"
         else:
             fraction = position @ inverse_lattice
             outside = np.any(fraction < -1.0e-12) or np.any(fraction >= 1.0 + 1.0e-12)
+            where = "the cell (fractional coordinates in [0, 1))"
         if outside:
-            where = (
-                f"cell [0, {side_lengths.tolist()})"
-                if orthorhombic
-                else "the cell (fractional coordinates in [0, 1))"
-            )
             raise ValueError(
                 f"atom {atom.symbol} at {position} lies outside the periodic "
                 f"{where}; this path does not "
@@ -210,13 +225,18 @@ def prepare_periodic_single_point(
 
     # 3. Local and Kleinman--Bylander nonlocal ionic terms.
     stage_start = time.perf_counter()
-    ionic_potential = ewald_local_ionic_potential(
-        grid,
-        atoms,
-        pseudopotentials,
-        problem.pseudopotentials,
-        problem.periodic_cell.lattice_vectors,
-    )
+    if dimensions == 2:
+        ionic_potential = slab_local_ionic_potential(
+            grid, atoms, pseudopotentials, problem.pseudopotentials, negative_laplacian, problem.hartree
+        )
+    else:
+        ionic_potential = ewald_local_ionic_potential(
+            grid,
+            atoms,
+            pseudopotentials,
+            problem.pseudopotentials,
+            problem.periodic_cell.lattice_vectors,
+        )
     local_ionic_seconds = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
     nonlocal_operator = build_nonlocal_projectors(
@@ -225,6 +245,7 @@ def prepare_periodic_single_point(
         pseudopotentials,
         problem.pseudopotentials,
         problem.periodic_cell.lattice_vectors,
+        periodic_dimensions=dimensions,
     )
     nonlocal_ionic_seconds = time.perf_counter() - stage_start
 
@@ -242,6 +263,7 @@ def prepare_periodic_single_point(
         pseudopotentials,
         problem.pseudopotentials,
         problem.periodic_cell.lattice_vectors,
+        periodic_dimensions=dimensions,
     )
     if problem.scf.normalize_initial_density:
         initial_density = normalize_density(initial_density, grid, electron_count)
@@ -254,20 +276,25 @@ def prepare_periodic_single_point(
         problem.pseudopotentials,
         problem.periodic_cell.lattice_vectors,
         core=True,
+        periodic_dimensions=dimensions,
     )
     core_density_seconds = time.perf_counter() - stage_start
 
     # 5. Geometry-only ion--ion contribution to the total energy.
     stage_start = time.perf_counter()
-    repulsion = ewald_ion_ion_energy(
-        atoms, pseudopotentials, problem.periodic_cell.lattice_vectors
-    )
-    alpha_z_energy = ewald_alpha_z_energy(
-        atoms,
-        pseudopotentials,
-        problem.periodic_cell.lattice_vectors,
-        electron_count,
-    )
+    if dimensions == 2:
+        repulsion = slab_ewald_energy(atoms, pseudopotentials, problem.periodic_cell.lattice_vectors)
+        alpha_z_energy = 0.0  # the slab's local potential is summed in real space: no G = 0 correction
+    else:
+        repulsion = ewald_ion_ion_energy(
+            atoms, pseudopotentials, problem.periodic_cell.lattice_vectors
+        )
+        alpha_z_energy = ewald_alpha_z_energy(
+            atoms,
+            pseudopotentials,
+            problem.periodic_cell.lattice_vectors,
+            electron_count,
+        )
     atomic_reference_correction = float(
         sum(
             problem.pseudopotentials[atom.symbol].atomic_energy_correction

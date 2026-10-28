@@ -197,6 +197,7 @@ def superpose_atomic_density(
     lattice_vectors: np.ndarray | None = None,
     *,
     core: bool = False,
+    periodic_dimensions: int = 3,
 ) -> np.ndarray:
     """Superpose spherical atomic densities on the molecular grid.
 
@@ -237,7 +238,7 @@ def superpose_atomic_density(
             np.zeros((1, 3))  # No translations if 0D
             if lattice_vectors is None
             else _periodic_image_translations(
-                lattice_vectors, potential.interpolation_cutoff
+                lattice_vectors, potential.interpolation_cutoff, periodic_dimensions
             )
         )
         reconstruct_from_wavefunctions = not core and not specification.read_valence_density
@@ -543,7 +544,7 @@ def set_support_finder(finder=None) -> None:
 
 
 def _periodic_image_translations(
-    lattice_vectors: np.ndarray, support_radius: float
+    lattice_vectors: np.ndarray, support_radius: float, dimensions: int = 3
 ) -> np.ndarray:
     """Enumerate periodic translations whose projector image can reach the cell.
 
@@ -567,6 +568,7 @@ def _periodic_image_translations(
     lattice_vectors = np.asarray(lattice_vectors, dtype=float)
     plane_spacing = 1.0 / np.linalg.norm(np.linalg.inv(lattice_vectors), axis=0)
     max_index = np.ceil(support_radius / plane_spacing).astype(int) + 1
+    max_index[dimensions:] = 0  # a slab repeats only along its in-plane lattice vectors
     ranges = [np.arange(-m, m + 1) for m in max_index]
     grid = np.meshgrid(*ranges, indexing="ij")
     integer_combinations = np.column_stack([axis.reshape(-1) for axis in grid])
@@ -580,6 +582,7 @@ def build_nonlocal_projectors(
     specifications: Mapping[str, SpeciesPotential],
     lattice_vectors: np.ndarray | None = None,
     k_point: np.ndarray | None = None,
+    periodic_dimensions: int = 3,
 ) -> NonlocalProjectorOperator:
     """Construct the separable nonlocal pseudopotential on the active grid.
 
@@ -654,7 +657,7 @@ def build_nonlocal_projectors(
         translations = (
             np.zeros((1, 3))  # No translations if 0D
             if lattice_vectors is None
-            else _periodic_image_translations(lattice_vectors, support_radius)
+            else _periodic_image_translations(lattice_vectors, support_radius, periodic_dimensions)
         )
 
         # KB projectors are localized.  Restrict all following interpolation

@@ -284,7 +284,8 @@ def _oblique_gradient(field: np.ndarray, grid, weights: np.ndarray, mix: np.ndar
 
     box = _to_box(field, grid)
     along_axes = [
-        _from_box(correlate1d(box, weights, axis=axis, mode="wrap"), grid) for axis in range(3)
+        _from_box(correlate1d(box, weights, axis=axis, mode=grid.boundary_modes[axis]), grid)
+        for axis in range(3)
     ]
     return np.einsum("ki,ij->kj", mix, np.asarray(along_axes))
 
@@ -299,7 +300,9 @@ def _oblique_divergence_adjoint(fluxes, grid, weights: np.ndarray, mix: np.ndarr
     index_fluxes = np.einsum("ki,kj->ij", mix, np.asarray(fluxes))
     total = np.zeros(grid.size, dtype=np.float64)
     for axis in range(3):
-        adjoint_box = correlate1d(_to_box(index_fluxes[axis], grid), -weights, axis=axis, mode="wrap")
+        adjoint_box = correlate1d(
+            _to_box(index_fluxes[axis], grid), -weights, axis=axis, mode=grid.boundary_modes[axis]
+        )
         total += _from_box(adjoint_box, grid)
     return total
 

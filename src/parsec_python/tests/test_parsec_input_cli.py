@@ -426,8 +426,8 @@ class PeriodicAndClusterInputTests(unittest.TestCase):
             ),
             (
                 "Boundary_Conditions: bulk",
-                "Boundary_Conditions: slab",
-                "wire and slab are not",
+                "Boundary_Conditions: wire",
+                "wire is not",
             ),
             (
                 "begin Cell_Shape\n  6.0  6.0  6.0\nend Cell_Shape\n",

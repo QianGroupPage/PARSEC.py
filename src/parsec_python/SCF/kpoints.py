@@ -162,6 +162,7 @@ def run_scf_kpoints(
                 system.input.pseudopotentials,
                 lattice_vectors,
                 k_point=k_points[task],
+                periodic_dimensions=system.input.periodic_cell.dimensions,
             )
         return KPointKohnShamHamiltonian(
             system.negative_laplacian,
@@ -421,6 +422,7 @@ def run_scf_kpoints_spin_polarized(
                 system.input.pseudopotentials,
                 lattice_vectors,
                 k_point=k_points[k_index],
+                periodic_dimensions=system.input.periodic_cell.dimensions,
             )
         return KPointKohnShamHamiltonian(
             system.negative_laplacian,

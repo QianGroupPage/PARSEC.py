@@ -95,13 +95,23 @@ class KPointSamplingCliTests(unittest.TestCase):
         exit_code = cli_main([str(input_path), "--dry-run"])
         self.assertEqual(exit_code, 2)
 
-    def test_monkhorst_pack_shift_is_rejected(self) -> None:
+    def test_monkhorst_pack_shift_gives_the_fortran_mesh(self) -> None:
+        # Fortran (irrbz.f90): k = (i + shift)/n in reciprocal-lattice coordinates, i = 0 ... n-1
+        from parsec_python.Input.parsec_input import parse_parsec_input
+
         input_path = self._write_input(
             "parsec.in",
-            extra="begin Monkhorst_Pack_Shift\n0.5 0.5 0.5\nend Monkhorst_Pack_Shift\n",
+            extra="begin Monkhorst_Pack_Shift\n0.5 0.0 0.0\nend Monkhorst_Pack_Shift\n",
         )
-        exit_code = cli_main([str(input_path), "--dry-run"])
-        self.assertEqual(exit_code, 2)
+        problem = parse_parsec_input(input_path).problem
+        dims = (2, 2, 2)
+        self.assertIsNone(problem.monkhorst_pack_dimensions)
+        self.assertEqual(len(problem.kpoints), int(np.prod(dims)))
+        np.testing.assert_allclose(problem.kpoint_weights, 1.0 / np.prod(dims))
+        reciprocal = 2.0 * np.pi * np.linalg.inv(problem.periodic_cell.lattice_vectors).T
+        fractions = problem.kpoints @ np.linalg.inv(reciprocal)
+        np.testing.assert_allclose(np.unique(np.round(fractions[:, 0], 12)), (np.arange(dims[0]) + 0.5) / dims[0])
+        np.testing.assert_allclose(np.unique(np.round(fractions[:, 1], 12)), np.arange(dims[1]) / dims[1])
 
 
 if __name__ == "__main__":

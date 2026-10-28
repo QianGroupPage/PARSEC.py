@@ -448,9 +448,14 @@ def _block_numbers(lines: tuple[str, ...], *, label: str) -> tuple[list[float], 
 def _parse_cell_shape(
     scalar: dict[str, list["_InputItem"]],
     blocks: dict[str, list["_InputItem"]],
+    *,
+    slab: bool = False,
 ) -> PeriodicCell:
     """Parse a ``Cell_Shape`` block into a :class:`PeriodicCell`.
 
+    A bulk cell takes one line (orthorhombic side lengths) or three lines (lattice vectors).  A slab takes the two
+    lattice vectors of the xy plane (two or three components each) and the height ``2R`` of its box along z from
+    ``Boundary_Sphere_Radius``.
     """
 
     label = "Cell_Shape"
@@ -458,7 +463,24 @@ def _parse_cell_shape(
     if len(cell_blocks) != 1:
         raise ParsecInputError("a periodic cell requires exactly one Cell_Shape block")
     lines = cell_blocks[0].value
-    if len(lines) == 1:
+    if slab:
+        if len(lines) != 2:
+            raise ParsecInputError(f"a slab Cell_Shape block has 2 lines (the in-plane lattice vectors), not {len(lines)}")
+        rows = []
+        for row_index, line in enumerate(lines, start=1):
+            row_values, unit = _block_numbers((line,), label=label)
+            if unit or len(row_values) not in (2, 3) or (len(row_values) == 3 and row_values[2] != 0.0):
+                raise ParsecInputError(
+                    f"slab Cell_Shape line {row_index} must be an in-plane vector: two components, or three with z = 0"
+                )
+            rows.append([row_values[0], row_values[1]])
+        radius_occurrences = scalar.get("boundary_sphere_radius", [])
+        if len(radius_occurrences) != 1:
+            raise ParsecInputError("a slab needs Boundary_Sphere_Radius, the half height of its box along z")
+        height = 2.0 * _physical_length(str(radius_occurrences[0].value), label="Boundary_Sphere_Radius")
+        vectors = np.zeros((3, 3))
+        vectors[:2, :2] = np.array(rows, dtype=np.float64)
+    elif len(lines) == 1:
         values, unit = _block_numbers(lines, label=label)
         if len(values) != 3 or unit:
             raise ParsecInputError(
@@ -492,6 +514,10 @@ def _parse_cell_shape(
         str(scale_occurrences[0].value) if scale_occurrences else "1 bohr"
     )
     scale = _physical_length(scale_text, label="Lattice_Vector_Scale")
+    if slab:
+        vectors = vectors * scale
+        vectors[2, 2] = height  # Boundary_Sphere_Radius is a length of its own, not scaled
+        return PeriodicCell(lattice_vectors=vectors, dimensions=2)
     return PeriodicCell(lattice_vectors=vectors * scale)
 
 
@@ -833,18 +859,19 @@ def _parse_parsec_input(
             "new Martins pseudopotential format"
         )
     boundary = _normalize_label(one("boundary_conditions", "cluster"))
-    is_periodic = boundary in {"bulk", "3d", "pbc"}
-    if boundary not in {"cluster", "0d", "bulk", "3d", "pbc"}:
+    is_slab = boundary in {"slab", "2d"}
+    is_periodic = boundary in {"bulk", "3d", "pbc"} or is_slab
+    if boundary not in {"cluster", "0d", "bulk", "3d", "pbc", "slab", "2d"}:
         raise UnsupportedParsecOptionError(
-            f"Boundary_Conditions={boundary!r}; only cluster (isolated) and "
+            f"Boundary_Conditions={boundary!r}; cluster (isolated), slab (periodic in the xy plane) and "
             "bulk (periodic, any cell shape) are supported "
-            "-- wire and slab are not"
+            "-- wire is not"
         )
     periodic_flag = optional_bool("periodic_system")
     if periodic_flag != is_periodic:
         raise UnsupportedParsecOptionError(
             "Periodic_System and Boundary_Conditions disagree: "
-            "Periodic_System=true requires Boundary_Conditions=bulk, and "
+            "Periodic_System=true requires Boundary_Conditions=bulk or slab, and "
             "Boundary_Conditions=cluster requires Periodic_System=false"
         )
     spin_polarized = optional_bool("spin_polarization")
@@ -903,7 +930,7 @@ def _parse_parsec_input(
     if is_periodic:
         spacing = _physical_length(one("grid_spacing"), label="Grid_Spacing")
         ignore_symmetry = optional_bool("ignore_symmetry")
-        periodic_cell = _parse_cell_shape(scalar, blocks)
+        periodic_cell = _parse_cell_shape(scalar, blocks, slab=is_slab)
         grid = PeriodicGridSettings(
             spacing=spacing,
             expansion_order=_integer(
@@ -924,18 +951,41 @@ def _parse_parsec_input(
                     "block with exactly one line of three integers"
                 )
             values, unit = _block_numbers(mp_blocks[0].value, label="Monkhorst_Pack_Grid")
+            if is_slab and len(values) == 2:
+                values = [*values, 1.0]  # a slab samples its two periodic directions
             if len(values) != 3 or unit or any(value <= 0 for value in values):
                 raise ParsecInputError(
-                    "Monkhorst_Pack_Grid must contain exactly three positive integers"
+                    "Monkhorst_Pack_Grid must contain exactly "
+                    + ("two (slab) or three" if is_slab else "three")
+                    + " positive integers"
                 )
+            if is_slab and values[2] != 1.0:
+                raise ParsecInputError("a slab has one k-point along z: the third Monkhorst_Pack_Grid number must be 1")
             monkhorst_pack_dimensions = tuple(int(value) for value in values)
             if any(value != original for value, original in zip(monkhorst_pack_dimensions, values)):
                 raise ParsecInputError("Monkhorst_Pack_Grid values must be integers")
             if "monkhorst_pack_shift" in blocks:
-                raise UnsupportedParsecOptionError(
-                    "Monkhorst_Pack_Shift is not supported; only an unshifted "
-                    "Monkhorst-Pack grid is implemented"
-                )
+                # Fortran (irrbz.f90): the points are k = (i + shift)/n, i = 0 ... n-1, in coordinates of the
+                # reciprocal lattice vectors, so a zero shift gives a Gamma-centred mesh.  The mesh is kept as an
+                # explicit list of equally weighted points.
+                shift_blocks = blocks["monkhorst_pack_shift"]
+                if len(shift_blocks) != 1 or len(shift_blocks[0].value) != 1:
+                    raise ParsecInputError("Monkhorst_Pack_Shift needs one line of numbers")
+                shift_values, shift_unit = _block_numbers(shift_blocks[0].value, label="Monkhorst_Pack_Shift")
+                if is_slab and len(shift_values) == 2:
+                    shift_values = [*shift_values, 0.0]
+                if len(shift_values) != 3 or shift_unit:
+                    raise ParsecInputError("Monkhorst_Pack_Shift must contain " + ("two (slab) or three" if is_slab else "three") + " numbers")
+                axes = [
+                    (np.arange(count) + offset) / count
+                    for count, offset in zip(monkhorst_pack_dimensions, shift_values)
+                ]
+                mesh = np.meshgrid(*axes, indexing="ij")
+                fractions = np.column_stack([m.reshape(-1) for m in mesh])
+                reciprocal = 2.0 * np.pi * np.linalg.inv(periodic_cell.lattice_vectors).T
+                explicit_kpoint_array = fractions @ reciprocal
+                explicit_kpoint_weights = np.full(len(fractions), 1.0 / len(fractions))
+                monkhorst_pack_dimensions = None
         elif kpoint_method == "manual":
             list_blocks = blocks.get("kpoint_list", [])
             file_path = input_relative_path("kpoint_file")
@@ -1910,6 +1960,38 @@ def _parse_parsec_input(
             )
             boundary_tolerance_from = "rule"
         domain_rule_seconds = perf_counter() - rule_started
+
+    if is_slab:
+        if (
+            self_consistent_spin_orbit
+            or noncollinear
+            or any(specification.spin_orbit for specification in specifications.values())
+        ):
+            raise UnsupportedParsecOptionError(
+                "spin-orbit coupling and non-collinear magnetism are not implemented for Boundary_Conditions=slab"
+            )
+        # in-plane positions are folded into the cell (they are periodic)
+        inverse_plane = np.linalg.inv(periodic_cell.lattice_vectors[:2, :2])
+        folded = []
+        for atom in atoms:
+            position = np.array(atom.position, dtype=float)
+            fraction = position[:2] @ inverse_plane
+            fraction -= np.floor(fraction + 1.0e-12)
+            position[:2] = fraction @ periodic_cell.lattice_vectors[:2, :2]
+            folded.append(replace(atom, position=position))
+        atoms = folded
+        if recenter and atoms:
+            # Fortran (initial.f90) centres a slab along z when the atoms are off centre by more than 0.1 bohr
+            z_values = [float(atom.position[2]) for atom in atoms]
+            shift = 0.5 * (min(z_values) + max(z_values))
+            if abs(shift) > 0.1:
+                warnings.append(
+                    f"atom coordinates were shifted by {-shift:.6f} bohr along z so that the slab is centred at the origin"
+                )
+                atoms = [
+                    replace(atom, position=np.asarray(atom.position, dtype=float) - np.array([0.0, 0.0, shift]))
+                    for atom in atoms
+                ]
 
     problem = SinglePointInput(
         atoms=atoms,

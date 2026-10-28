@@ -249,9 +249,12 @@ def _build_oblique_negative_laplacian(grid) -> sp.csr_matrix:
         for shell in range(1, width + 1):
             for sign in (-1, 1):
                 rows = grid.rows_for_integer_coordinates(base + sign * shell * step)
-                row_parts.append(np.arange(n, dtype=np.int64))
-                col_parts.append(rows)
-                value_parts.append(np.full(n, -weight * coeff[width + shell], dtype=float))
+                valid = rows >= 0  # a neighbor outside a slab box is a zero wavefunction value
+                if not np.any(valid):
+                    continue
+                row_parts.append(np.flatnonzero(valid))
+                col_parts.append(rows[valid])
+                value_parts.append(np.full(int(np.count_nonzero(valid)), -weight * coeff[width + shell], dtype=float))
 
     matrix = sp.coo_matrix(
         (np.concatenate(value_parts), (np.concatenate(row_parts), np.concatenate(col_parts))),

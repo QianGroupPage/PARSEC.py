@@ -839,6 +839,17 @@ class ParsecTextReporter:
                 *domain_header_lines(self.translation),
             ]
         vectors = np.asarray(cell.lattice_vectors, dtype=float)
+        if getattr(cell, "dimensions", 3) == 2:
+            return [
+                " Periodic boundary conditions!",
+                " System is periodic on the xy plane",
+                " and non-periodic on the z direction.",
+                "",
+                " Unit lattice vectors [bohr] : ",
+                *(" ".join(f"{value:15.10f}" for value in row) for row in vectors[:2]),
+                "",
+                f" Boundary slab height is {0.5 * vectors[2, 2]:12.6f} bohrs",
+            ]
         return [
             " Periodic boundary conditions!",
             " System is fully periodic ",

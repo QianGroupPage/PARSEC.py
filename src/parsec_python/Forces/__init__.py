@@ -1,7 +1,8 @@
 """Atomic forces of an isolated pseudopotential calculation, in Ry/bohr."""
 
-from .ion_ion import ion_ion_forces
+from .ion_ion import ewald_ion_ion_forces, ion_ion_forces
 from .local import LocalForceTerms, local_forces, species_force_tables
+from .periodic_local import periodic_local_forces
 from .nonlocal_force import (
     NonlocalProjectorGradients,
     build_nonlocal_projector_gradients,
@@ -33,11 +34,13 @@ __all__ = [
     "compute_forces",
     "contract_nonlocal_forces",
     "cubic_point_operations",
+    "ewald_ion_ion_forces",
     "gradient_columns_for",
     "ion_ion_forces",
     "local_forces",
     "nonlocal_forces",
     "operations_preserving",
+    "periodic_local_forces",
     "real_harmonics_with_gradients",
     "remove_net_force",
     "species_force_tables",

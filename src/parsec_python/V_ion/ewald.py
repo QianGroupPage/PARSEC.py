@@ -75,6 +75,28 @@ def _ewald_cutoffs(
     return eta, real_cutoff, reciprocal_cutoff
 
 
+def ewald_image_sets(
+    positions: np.ndarray, lattice_vectors: np.ndarray, eta: float | None, tolerance: float
+) -> tuple[float, float, np.ndarray, np.ndarray]:
+    """Return ``(eta, real_cutoff, translations, reciprocal_points)`` of the Ewald sums of one cell.
+
+    The real-space translations ``T`` with some pair separation ``r_a - r_b + T`` possibly within the cutoff
+    (``|T| <= cutoff + |r_a - r_b|``, the pair separations being bounded by the diameter of the atoms), and the
+    reciprocal-lattice vectors ``G != 0`` with ``|G|`` within the reciprocal cutoff.  The energy and its forces
+    (:func:`parsec_python.Forces.ion_ion.ewald_ion_ion_forces`) both enumerate them here, so the force is the
+    derivative of exactly the sum that the energy evaluates.
+    """
+
+    volume = float(abs(np.linalg.det(lattice_vectors)))
+    eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
+    reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
+    pair_reach = 2.0 * float(np.max(np.linalg.norm(positions - positions.mean(axis=0), axis=1)))
+    translations = _lattice_points(lattice_vectors, reciprocal_vectors, real_cutoff + pair_reach)
+    reciprocal_points = _lattice_points(reciprocal_vectors, lattice_vectors, reciprocal_cutoff)
+    reciprocal_points = reciprocal_points[np.any(reciprocal_points != 0.0, axis=1)]
+    return eta, real_cutoff, translations, reciprocal_points
+
+
 def ewald_ion_ion_energy(
     atoms: Sequence[Atom],
     potentials: Mapping[str, ParsecPseudopotential],
@@ -105,17 +127,9 @@ def ewald_ion_ion_energy(
         [potentials[atom.symbol].ionic_charge for atom in atoms], dtype=np.float64
     )
 
-    eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
-    reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
-
-    # A translation T matters when some pair separation r_a - r_b + T is within the cutoff, i.e.
-    # |T| <= cutoff + |r_a - r_b|; the pair separations are bounded by the diameter of the atoms.
-    pair_reach = 2.0 * float(np.max(np.linalg.norm(positions - positions.mean(axis=0), axis=1)))
-    translations = _lattice_points(lattice_vectors, reciprocal_vectors, real_cutoff + pair_reach)
-    reciprocal_points = _lattice_points(
-        reciprocal_vectors, lattice_vectors, reciprocal_cutoff
+    eta, real_cutoff, translations, reciprocal_points = ewald_image_sets(
+        positions, lattice_vectors, eta, tolerance
     )
-    reciprocal_points = reciprocal_points[np.any(reciprocal_points != 0.0, axis=1)]
 
     # Real-space sum: (1/2) * sum_{a,b} sum'_R Z_a*Z_b*erfc(eta*d)/d, the
     # prime excluding the singular (a=b, R=0) term.  Each translation R
@@ -183,6 +197,30 @@ def set_local_potential_provider(provider=None) -> None:
     _local_potential_provider = provider
 
 
+def ewald_local_image_sets(
+    lattice_vectors: np.ndarray, eta: float | None, tolerance: float
+) -> tuple[float, float, np.ndarray, float, np.ndarray, np.ndarray]:
+    """Return ``(eta, real_cutoff, cell_center, cell_radius, translations, reciprocal_points)`` of the local potential.
+
+    The short-ranged piece of an atom image at ``position + T`` reaches the grid point ``r`` when
+    ``|r - position - T| <= real_cutoff``.  Grid points lie anywhere in the cell, so an image counts
+    when its center is within ``real_cutoff + radius`` of the cell center (``radius``: circumscribed
+    radius of the cell); ``position`` itself is inside the cell, which bounds ``|T|``.  ``translations`` holds
+    the candidates (the caller keeps those within ``real_cutoff + radius`` of ``cell_center`` for its atom) and
+    ``reciprocal_points`` the vectors ``G != 0`` of the series.  The potential and its forces
+    (:func:`parsec_python.Forces.periodic_local.periodic_local_forces`) both enumerate them here.
+    """
+
+    volume = float(abs(np.linalg.det(lattice_vectors)))
+    eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
+    reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
+    cell_center, cell_radius = _cell_center_and_radius(lattice_vectors)
+    translations = _lattice_points(lattice_vectors, reciprocal_vectors, real_cutoff + 2.0 * cell_radius)
+    reciprocal_points = _lattice_points(reciprocal_vectors, lattice_vectors, reciprocal_cutoff)
+    reciprocal_points = reciprocal_points[np.any(reciprocal_points != 0.0, axis=1)]
+    return eta, real_cutoff, cell_center, cell_radius, translations, reciprocal_points
+
+
 def ewald_local_ionic_potential(
     grid,
     atoms: Sequence[Atom],
@@ -237,20 +275,9 @@ def ewald_local_ionic_potential(
         if provided is not None:
             return provided
 
-    eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
-    reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
-    # The short-ranged piece of an atom image at ``position + T`` reaches the grid point ``r`` when
-    # ``|r - position - T| <= real_cutoff``.  Grid points lie anywhere in the cell, so an image counts
-    # when its center is within ``real_cutoff + radius`` of the cell center (``radius``: circumscribed
-    # radius of the cell); ``position`` itself is inside the cell, which bounds ``|T|``.
-    cell_center, cell_radius = _cell_center_and_radius(lattice_vectors)
-    all_translations = _lattice_points(
-        lattice_vectors, reciprocal_vectors, real_cutoff + 2.0 * cell_radius
+    eta, real_cutoff, cell_center, cell_radius, all_translations, reciprocal_points = ewald_local_image_sets(
+        lattice_vectors, eta, tolerance
     )
-    reciprocal_points = _lattice_points(
-        reciprocal_vectors, lattice_vectors, reciprocal_cutoff
-    )
-    reciprocal_points = reciprocal_points[np.any(reciprocal_points != 0.0, axis=1)]
     g_squared = (
         np.sum(reciprocal_points**2, axis=1) if reciprocal_points.size else None
     )

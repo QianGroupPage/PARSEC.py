@@ -191,7 +191,9 @@ class FFTLocalPotentialTests(unittest.TestCase):
         fast = periodic_setup.fft_local_ionic_potential(
             *self.arguments, None, 1.0e-14
         )
-        np.testing.assert_allclose(fast, converged, atol=1.0e-9)
+        # beyond the Coulomb onset the fast version adds the exact -2 Z erfc(eta r)/r of every image; the direct sum
+        # evaluates the cubic spline of the table there, which is off 1/r by about 1e-8 per image (4e-7 Ry in all)
+        np.testing.assert_allclose(fast, converged, atol=1.0e-6)
 
     def test_stays_within_the_accuracy_of_the_default_direct_sum(self) -> None:
         periodic_setup.uninstall()

@@ -192,9 +192,13 @@ sums stop where the tables end: the local potential tables are `-2Z/r` to 1e-14 
 densities are below 1e-16 beyond 12 (core) to 35 (valence) bohr, so a move of a small cell takes a fraction of a second
 instead of the minute the 118-bohr tables needed.
 
-`Cubic_Spline` does not change the periodic local potential, as Fortran's (the potential is a sum of form factors there;
-`V_ion.ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE` restores it for tests that differentiate exactly). The projectors and the
-core density follow it.
+`Cubic_Spline` does not change the periodic local potential, as Fortran's: there the potential is a sum of form factors
+that integrate the table to high order, so it is the accurate potential whatever the flag says. The periodic local
+potential and its force therefore always use the cubic spline of the table (`V_ion.ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE`
+set to `False` gives linear interpolation). Linear interpolation of the logarithmic table (1 % steps) shifted the Ge3
+total energy by +0.6 to +0.9 mRy against Fortran at every grid from 24 points per side up; with the spline the difference
+is 0.003 to 0.09 mRy, the remainder being Fortran's own finite-difference estimate of the `alpha` energy (+0.064 mRy) and,
+on a coarse grid, aliasing. The projectors and the core density follow `Cubic_Spline`.
 
 **Grid of an input file.** An input file gets the Fortran grid: half a step off the origin along vectors orthogonal to the
 others (zero with `Ignore_Symmetry` and for non-orthogonal vectors) and the largest even number of points per vector whose

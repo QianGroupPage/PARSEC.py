@@ -102,7 +102,8 @@ class PeriodicLocalForceTests(unittest.TestCase):
         # the dense reference potential: another test may have installed the FFT provider of the acceleration package
         self.addCleanup(setattr, ewald, "_local_potential_provider", ewald._local_potential_provider)
         ewald.set_local_potential_provider(None)
-        # the periodic local potential ignores Cubic_Spline as Fortran's does; the exact-derivative checks turn it on
+        # the periodic local potential always uses the cubic spline of its table (the default); the tests below that
+        # compare the linear mode switch it off themselves
         self.addCleanup(setattr, ewald, "LOCAL_POTENTIAL_USES_CUBIC_SPLINE", ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE)
         ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE = True
 
@@ -155,15 +156,30 @@ class PeriodicLocalForceTests(unittest.TestCase):
         # Fortran's periodic local potential (ionpbc.f90, from the form factors of fourier_f.f90) never reads Cubic_Spline
         from parsec_python.acceleration.V_ion import periodic_setup
 
-        ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE = False
+        ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE = True  # the default
         linear, spline = _Case("fcc", False), _Case("fcc", True)
         args = lambda case: (case.grid, case.atoms(), case.potentials, case.specifications, case.lattice)  # noqa: E731
-        reference = ewald_local_ionic_potential(*args(linear))
-        np.testing.assert_array_equal(ewald_local_ionic_potential(*args(spline)), reference)
-        # the FFT provider of the acceleration package is the same potential in either mode (it was not with the spline)
+        reference = ewald_local_ionic_potential(*args(spline))
+        np.testing.assert_array_equal(ewald_local_ionic_potential(*args(linear)), reference)
+        # the FFT provider of the acceleration package is the same potential in either mode, to the 1e-8 Ry by which the
+        # spline of the table differs from the exact Coulomb tail that the provider adds beyond the Coulomb onset
         for case in (linear, spline):
             fast = periodic_setup.fft_local_ionic_potential(*args(case), None, 1.0e-14)
-            np.testing.assert_allclose(fast, reference, atol=1.0e-9)
+            np.testing.assert_allclose(fast, reference, atol=1.0e-6)
+
+    def test_the_linear_table_interpolation_is_not_what_the_periodic_potential_uses(self) -> None:
+        # linear interpolation of the logarithmic table (1 % steps) is off by about 2e-5 of the Coulomb-like potential,
+        # +0.7 mRy in the Ge3 total energy against Fortran's form factors, which integrate the table to high order
+        spline, linear = _Case("fcc", True), _Case("fcc", True)
+        args = lambda case: (case.grid, case.atoms(), case.potentials, case.specifications, case.lattice)  # noqa: E731
+        ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE = False
+        biased = ewald_local_ionic_potential(*args(linear))
+        ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE = True
+        accurate = ewald_local_ionic_potential(*args(spline))
+        # 2e-4 Ry at the largest (near an atom, where the table is stiffest) on this grid, 8e-6 on average
+        largest = float(np.max(np.abs(biased - accurate)))
+        self.assertGreater(largest, 1.0e-5)
+        self.assertLess(largest, 1.0e-2)
 
     def test_the_self_consistency_term_is_absent(self) -> None:
         terms = _Case("rectangular", False).forces()

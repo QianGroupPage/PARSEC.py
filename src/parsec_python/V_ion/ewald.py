@@ -185,16 +185,18 @@ def _erf_over_r(charge: float, radius: np.ndarray, eta: float) -> np.ndarray:
 
 # The Fortran periodic local potential (``ionpbc.f90``) is the reciprocal-space sum of the form factors ``vql(G)`` of
 # ``fourier_f.f90``: it never reads ``Cubic_Spline`` (``uspline`` is used for the cluster potential, the projectors, the
-# core density and the cluster forces).  The periodic local potential and its force therefore interpolate the table
-# linearly whatever the flag says.  Tests that differentiate the potential exactly set this to ``True`` (the derivative
-# of the cubic spline is exact; the derivative table of the linear mode is PARSEC's approximation).
-LOCAL_POTENTIAL_USES_CUBIC_SPLINE = False
+# core density and the cluster forces), and the form factors integrate the table with an eight-point rule, so the
+# potential is the accurate one whatever the flag says.  Linear interpolation of the table in real space is not: its
+# error (Delta r / r = 1 % on the logarithmic grid) shifts the Ge3 total energy by +0.7 mRy against Fortran.  The periodic
+# local potential and its force therefore use the cubic spline of the table whatever ``Cubic_Spline`` says.  Setting this
+# to ``False`` gives the linear mode (PARSEC's derivative table, a few percent off the interpolant's derivative).
+LOCAL_POTENTIAL_USES_CUBIC_SPLINE = True
 
 
 def local_potential_uses_spline(specification: SpeciesPotential) -> bool:
     """Whether the periodic local potential of a species is evaluated with the cubic spline of its table."""
 
-    return bool(specification.use_spline) and LOCAL_POTENTIAL_USES_CUBIC_SPLINE
+    return LOCAL_POTENTIAL_USES_CUBIC_SPLINE
 
 
 _local_potential_provider = None

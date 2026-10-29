@@ -6,8 +6,8 @@ first atom sits on a grid point and the coarse grid makes the egg-box force abou
 energy is not smooth on that scale, so its derivative is Richardson-extrapolated from steps of 0.005 and 0.01 bohr.
 
 The forces differentiate the reference local potential of ``ewald_local_ionic_potential``, so these tests run with the FFT
-provider of the acceleration package switched off, and with the periodic local potential following ``Cubic_Spline``
-(``ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE``; by default it ignores it as Fortran's does) so that its derivative is exact.
+provider of the acceleration package switched off, and with the cubic spline for the periodic local potential
+(``ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE``, the default), the derivative of which is exact.
 
 The five SCF runs take about two minutes (the setup of the reference periodic path, not the SCF, with the 118-bohr
 hydrogen table), so the test runs when ``PARSEC_SLOW_TESTS`` is set; each force term has its own fast finite-difference
@@ -62,7 +62,7 @@ class PeriodicForceSCFTests(unittest.TestCase):
     def setUp(self) -> None:
         self.addCleanup(setattr, ewald, "_local_potential_provider", ewald._local_potential_provider)
         ewald.set_local_potential_provider(None)
-        # exact derivative of the spline (the periodic local potential otherwise ignores Cubic_Spline, as Fortran's)
+        # exact derivative of the spline (the default for the periodic local potential)
         self.addCleanup(setattr, ewald, "LOCAL_POTENTIAL_USES_CUBIC_SPLINE", ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE)
         ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE = True
 
@@ -103,7 +103,7 @@ class PeriodicKPointForceSCFTests(unittest.TestCase):
     def setUp(self) -> None:
         self.addCleanup(setattr, ewald, "_local_potential_provider", ewald._local_potential_provider)
         ewald.set_local_potential_provider(None)
-        # exact derivative of the spline (the periodic local potential otherwise ignores Cubic_Spline, as Fortran's)
+        # exact derivative of the spline (the default for the periodic local potential)
         self.addCleanup(setattr, ewald, "LOCAL_POTENTIAL_USES_CUBIC_SPLINE", ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE)
         ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE = True
 

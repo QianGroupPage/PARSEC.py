@@ -147,7 +147,10 @@ class EwaldLocalIonicPotentialTests(unittest.TestCase):
             periodic = ewald_local_ionic_potential(
                 grid, atoms, potentials, specifications, cell.lattice_vectors
             )
-            isolated = build_local_ionic_potential(grid, atoms, potentials, specifications)
+            # the periodic potential always uses the cubic spline of the table (a coarse one here), so the single
+            # copy it is compared with does too
+            spline_specifications = {"H": SpeciesPotential(_H_POTRE, 0, use_spline=True)}
+            isolated = build_local_ionic_potential(grid, atoms, potentials, spline_specifications)
             distance = np.linalg.norm(
                 grid.coordinates - np.asarray(atoms[0].position), axis=1
             )

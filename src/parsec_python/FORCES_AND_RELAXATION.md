@@ -1,6 +1,6 @@
 # Forces, structural relaxation and molecular dynamics
 
-This document describes what moves the atoms of an isolated system in
+This document describes what moves the atoms of an isolated system or a periodic cell in
 `parsec_python`: the atomic forces, the three minimization schemes of PARSEC
 (`Minimization: bfgs | simple | manual`) and its molecular dynamics. It says
 how to run them, which Fortran routine each part follows, where the package
@@ -13,7 +13,10 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 - Isolated systems (`Boundary_Conditions: cluster`), sphere or box domain,
   CA/PZ LDA or PBE, without or with spin polarization, with or without
   nonlinear core correction, projectors through `l = 3`.
-- Periodic cells are refused for relaxation, molecular dynamics and forces.
+- Periodic cells (`Boundary_Conditions: bulk`), without spin polarization and without spin-orbit coupling, at the Gamma
+  point or with a Monkhorst-Pack k-point sampling: forces, `Minimization: bfgs | simple | manual` and molecular dynamics.
+  See "Periodic cells" below. A spin-polarized or spin-orbit periodic calculation, and the accelerated (GPU) path, do not
+  have them yet.
 - A spin-polarized calculation uses the same routines: `forcloc.f90` reads
   the total density and the averages over the two channels of the potential
   difference and of the exchange-correlation potential, and `forcnloc.f90`
@@ -149,6 +152,65 @@ out, as in PARSEC.
 `parsec.out` prints the tables PARSEC prints: the ion-ion, local, SCF
 correction, core correction and nonlocal forces, the total before and after
 symmetrization, the net force that was removed and the torque.
+
+## Periodic cells
+
+A periodic cell has forces, relaxation and molecular dynamics through the periodic backend
+(`Relaxation.periodic_backend`) of the readable solver. `main.py` hands such an input to `parsec_python.cli`
+(`NOTE: ... running the reference parsec_python.cli solver instead`): the accelerated path moves isolated structures only.
+
+Forces (`Forces.compute_periodic_forces`; the Fortran routines are `forpbc.f90`, `force_loc_pb.f90`, `ewald_sum.f90` and
+`forcnloc.f90`):
+
+1. **Ion-ion**: the exact derivative of the Ewald energy (`Forces/ion_ion.py: ewald_ion_ion_forces`): the real-space sum
+   over images and the reciprocal sum.
+2. **Local pseudopotential** (`Forces/periodic_local.py`): `integral rho(r) grad V_a(r - R_a)` over the images of the local
+   potential as it is built (the short-ranged `V_a(d) + 2 Z erf(eta d)/d` and the reciprocal series), and
+   `integral V_xc(r) rho_core'(d) d/|d|` over the images of the core density. There is no SCF-residual term, as in
+   Fortran's periodic path.
+3. **Nonlocal projectors** (`Forces/nonlocal_force.py`): the same formula with the Bloch projectors of the k-point,
+   `F_a = 4 sum_k w_k sum_n f_nk sum_q s_q Re[conj(<beta_q|u_nk>) <grad beta_q|u_nk>]`. A k-point run keeps no eigenvectors,
+   so `run_scf_kpoints(..., compute_forces=True)` accumulates the term from them at the end of the SCF loop
+   (`result.nonlocal_forces`). The row-distributed MPI k-point solver does not support it.
+4. The **net force is removed**, as Fortran does for a crystal. The forces are **not symmetrized** (no space-group
+   operations are found) and no torque is reported; the force report prints `(Ewald forces included)` as Fortran's.
+
+The terms are exact derivatives of the energies the SCF evaluates (`Forces` tests: finite differences of each energy and of the
+SCF total energy, 1e-5 Ry/bohr or better), with one exception: the local potential and the nonlocal projectors use PARSEC's
+derivative tables, which differ from the exact derivative of their linear interpolation by about 1e-4 Ry/bohr in the
+test systems.
+
+Atoms leave the cell as they move. The coordinates of the optimizer and the integrator are kept continuous (they are never
+wrapped), and every image sum is built for the atoms folded into the cell (`PeriodicPreparedSinglePointSystem.cell_atoms`).
+Fortran's `back_to_cell` wraps the positions in the state; the physics is the same, the positions in `atom.cor` and
+`movie.xyz` are the unwrapped ones.
+
+A move rebuilds the local potential, the projectors, the densities and the Ewald energy for the new positions
+(`SCF.update_periodic_geometry`) and the SCF loop continues from the last mixed potential. The Gamma-point loop also carries
+its eigensubspace; the k-point loops start their eigenproblems cold (`Potential_Extrapolation` applies to both). The image
+sums stop where the tables end: the local potential tables are `-2Z/r` to 1e-14 Ry beyond 2 to 7 bohr and the atomic
+densities are below 1e-16 beyond 12 (core) to 35 (valence) bohr, so a move of a small cell takes a fraction of a second
+instead of the minute the 118-bohr tables needed.
+
+`Cubic_Spline` does not change the periodic local potential, as Fortran's (the potential is a sum of form factors there;
+`V_ion.ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE` restores it for tests that differentiate exactly). The projectors and the
+core density follow it.
+
+**Grid of an input file.** An input file gets the Fortran grid: half a step off the origin along vectors orthogonal to the
+others (zero with `Ignore_Symmetry` and for non-orthogonal vectors) and the largest even number of points per vector whose
+step is not below `Grid_Spacing` (`adjust_step`; steps may differ between the axes of a rectangular cell). The
+`PeriodicGridSettings` of the API keep `shift=0` and `points_rule="round"`.
+
+**A caveat for hard pseudopotentials.** On a coarse grid the energy of a hard pseudopotential (the hydrogen of
+`examples/0d_AuH` at 0.6 bohr) changes by Ry with the offset of the grid, and the energy of a rigid translation by tens of
+mRy at 0.3 bohr. The forces are consistent with that energy (net force removed, as in Fortran, but then a relaxation can
+slide a molecule over the grid) and Fortran's reciprocal-space potential has much less of it.
+
+Validated against Fortran PARSEC (`parsec_tests/pbc_forces`; three Ge atoms, Gamma point, forces up to 2.5 Ry/bohr, the same
+grid in both codes): the largest force difference is 3e-4 Ry/bohr at 32^3 points (1.2e-3 at 24^3), the nonlocal term agrees
+to 1.6e-5, and a constant energy offset of +0.8 mRy remains (the local potential is sampled on the grid here, a sum of form
+factors there). The relaxation and dynamics loops are tested on a hydrogen pair at the Gamma point and with two k-points
+(`tests/unit/test_periodic_ionic.py`); the energy of a short NVE run is conserved to 1e-3 eV/atom.
 
 ## Structural relaxation
 
@@ -358,6 +420,9 @@ those exchanges was measured slower and left out (see the module).
 | Subject | Fortran PARSEC | This package | Why |
 |---|---|---|---|
 | Forces of a single point | Always computed | Only with `Skip_Force: false` | Existing inputs keep their cost. |
+| Periodic forces | Reciprocal-space form factors (`force_loc_pb.f90`) | Real-space sums over images, with an FFT version for the potential | The same terms; the grid-sampled potential has egg-box effects the form-factor one has not (see "Periodic cells"). |
+| Periodic forces and symmetry | Symmetrized with the space group | Not symmetrized | No space-group operations are found. |
+| Positions of a periodic run | Wrapped into the cell (`back_to_cell`) | Continuous; the builders fold them | The optimizer needs continuous coordinates. |
 | SCF-correction force with `Cubic_Spline` | Uses the derivative table together with the spline coefficients of the density | Interpolates the atomic valence density linearly in that term | The combination in `forcloc.f90` mixes two tables; the term vanishes at SCF convergence. |
 | `atom.cor` of a restarted run | "Step # 0" shows the coordinates of the input file | Shows the restart structure, which is the one computed | The file then describes the run. |
 | Movable flags that break the symmetry | Symmetrizes regardless | Runs without symmetry | The relaxation would leave the group it started in. |

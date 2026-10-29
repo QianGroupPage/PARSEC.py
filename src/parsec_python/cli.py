@@ -23,7 +23,7 @@ from .MolecularDynamics.run import (
     restart_structure as dynamics_restart_structure,
     run_recorded_molecular_dynamics,
 )
-from .Relaxation.backend import reference_backend
+from .Relaxation.backend import periodic_backend, reference_backend
 from .Relaxation.run import (
     relaxation_header_lines,
     restart_structure,
@@ -1158,7 +1158,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     # non-collinear).  An isolated spin-polarized input without spin-orbit coupling
     # runs run_scf -> run_spin_scf, like every other isolated input, so it keeps
     # forces, relaxation, molecular dynamics and energy refinement.
-    uses_extended_drivers = bool(
+    ionic_requested = bool(
+        translation.relaxation is not None
+        or translation.molecular_dynamics is not None
+        or translation.compute_forces
+    )
+    # A scalar periodic cell (Gamma point or Monkhorst-Pack points, no spin, no spin-orbit coupling) that asks for forces,
+    # a relaxation or molecular dynamics runs the ionic loops of the isolated path with the periodic backend.
+    periodic_ionic = bool(
+        is_periodic
+        and ionic_requested
+        and not (self_consistent_spin_orbit or noncollinear or spin_polarized)
+    )
+    uses_extended_drivers = not periodic_ionic and bool(
         self_consistent_spin_orbit
         or noncollinear
         or k_sampling is not None
@@ -1172,9 +1184,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         print(
             "Input error: Minimization, Molecular_Dynamics, Skip_Force: false and "
-            "Energy_Refinement are not implemented together with k-point sampling, "
-            "spin-orbit coupling, non-collinear magnetism or a periodic or "
-            "spin-orbit spin-polarized calculation",
+            "Energy_Refinement are not implemented together with spin-orbit coupling, "
+            "non-collinear magnetism or a spin-polarized periodic or spin-orbit "
+            "calculation (a spin-unpolarized periodic cell, at the Gamma point or with "
+            "k-points, has forces, relaxation and molecular dynamics)",
             file=sys.stderr,
         )
         return 2
@@ -1240,11 +1253,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             forces = None
             outcome = None
             dynamics = None
+            if is_periodic:
+                backend_factory = lambda extrapolation="none": periodic_backend(  # noqa: E731
+                    *(k_sampling if k_sampling is not None else (None, None)), extrapolation
+                )
+            else:
+                backend_factory = reference_backend
             if translation.relaxation is not None:
                 outcome = run_recorded_relaxation(
                     translation,
                     system,
-                    reference_backend(translation.potential_extrapolation),
+                    backend_factory(translation.potential_extrapolation),
                     reporter,
                     log.write,
                     directory=input_directory,
@@ -1257,7 +1276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dynamics = run_recorded_molecular_dynamics(
                     translation,
                     system,
-                    reference_backend(translation.potential_extrapolation),
+                    backend_factory(translation.potential_extrapolation),
                     reporter,
                     log.write,
                     directory=input_directory,
@@ -1266,7 +1285,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result, forces = dynamics.result, dynamics.forces
             elif translation.compute_forces:
                 result, forces = run_single_point_with_forces(
-                    system, reference_backend(), reporter, symmetrize=use_symmetry
+                    system, backend_factory(), reporter, symmetrize=use_symmetry
                 )
             else:
                 scf_start = time.perf_counter()

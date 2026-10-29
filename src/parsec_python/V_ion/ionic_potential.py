@@ -189,6 +189,62 @@ def build_local_ionic_potential(
     return total
 
 
+_DENSITY_SUPPORT_TOLERANCE = 1.0e-16  # electrons/bohr^3: the atomic density tables are below it beyond their support
+_COULOMB_ONSET_TOLERANCE = 1.0e-14  # Ry: the local potential tables are -2 Z/r to this beyond their onset
+
+
+def _valence_density_table(potential: ParsecPseudopotential, specification: SpeciesPotential) -> np.ndarray:
+    """The spherical atomic valence density on the radial grid of the table, as ``superpose_atomic_density`` uses it."""
+
+    if specification.read_valence_density:
+        return np.asarray(potential.valence_density, dtype=float)
+    # u_l is the reduced radial function: the normalized spherical orbital is u_l(r)Y_lm(Omega)/r.  Spherical
+    # occupation averaging produces f_l*u_l(r)**2/(4*pi*r**2).
+    radial_density = np.zeros_like(potential.radii)
+    for angular_momentum, wavefunction in potential.radial_wavefunctions.items():
+        radial_density += (
+            potential.channel_occupations.get(angular_momentum, 0.0)
+            * wavefunction
+            * wavefunction
+            / (4.0 * np.pi * potential.radii * potential.radii)
+        )
+    return radial_density
+
+
+def atomic_density_support_radius(
+    potential: ParsecPseudopotential, specification: SpeciesPotential, *, core: bool
+) -> float:
+    """Radius beyond which the atomic valence (or core) density of a table is below ``1e-16`` electrons/bohr^3.
+
+    The tables run to 118 bohr or more, but the densities vanish within 12 bohr (core) to 35 bohr (valence): a sum
+    over periodic images needs no atom farther from a point than that.  The next table point is included, so that
+    the interpolation between the last significant one and the next stays inside; never more than the table's own
+    cutoff.
+    """
+
+    table = np.asarray(potential.core_density if core else _valence_density_table(potential, specification), dtype=float)
+    significant = np.flatnonzero(np.abs(table) > _DENSITY_SUPPORT_TOLERANCE)
+    if significant.size == 0:
+        return float(potential.radii[1])
+    index = min(int(significant[-1]) + 1, potential.radii.size - 1)
+    return float(min(potential.radii[index], potential.interpolation_cutoff))
+
+
+def coulomb_onset_radius(potential: ParsecPseudopotential, local_l: int) -> float:
+    """Radius beyond which the local potential table is ``-2 Z/r`` to ``1e-14`` Ry (2 to 7 bohr for the tables in use).
+
+    Beyond it a periodic image of the atom adds, to the Ewald split of the local potential, only the short-ranged
+    ``-2 Z erfc(eta r)/r``; the tables themselves run to 118 bohr or more.
+    """
+
+    radii = np.asarray(potential.radii, dtype=float)
+    deviation = np.abs(np.asarray(potential.channel_potentials[local_l], dtype=float) + 2.0 * potential.ionic_charge / radii)
+    significant = np.flatnonzero(deviation > _COULOMB_ONSET_TOLERANCE)
+    if significant.size == 0:
+        return float(radii[1])
+    return float(min(radii[min(int(significant[-1]) + 1, radii.size - 1)], potential.interpolation_cutoff))
+
+
 def superpose_atomic_density(
     grid: RealSpaceGrid,
     atoms: Sequence[Atom],
@@ -233,32 +289,25 @@ def superpose_atomic_density(
             continue
 
         position = np.asarray(atom.position, dtype=np.float64)
+        # A periodic cell sums images of the atom out to where its density is below 1e-16; an isolated system has
+        # one center and keeps the cutoff of the table.
+        support = (
+            potential.interpolation_cutoff
+            if lattice_vectors is None
+            else atomic_density_support_radius(potential, specification, core=core)
+        )
         translations = (
             np.zeros((1, 3))  # No translations if 0D
             if lattice_vectors is None
-            else _periodic_image_translations(
-                lattice_vectors, potential.interpolation_cutoff
-            )
+            else _periodic_image_translations(lattice_vectors, support)
         )
         reconstruct_from_wavefunctions = not core and not specification.read_valence_density
         if reconstruct_from_wavefunctions:
-            # u_l is the reduced radial function: the normalized spherical
-            # orbital is u_l(r)Y_lm(Omega)/r.  Spherical occupation averaging
-            # produces f_l*u_l(r)**2/(4*pi*r**2).
-            radial_density = np.zeros_like(potential.radii)
-            for angular_momentum, wavefunction in potential.radial_wavefunctions.items():
-                radial_density += (
-                    potential.channel_occupations.get(angular_momentum, 0.0)
-                    * wavefunction
-                    * wavefunction
-                    / (4.0 * np.pi * potential.radii * potential.radii)
-                )
+            radial_density = _valence_density_table(potential, specification)
 
         for translation in translations:
-            rows, _, radius = _support_finder(
-                grid, position + translation, potential.interpolation_cutoff
-            )
-            inside = radius < potential.interpolation_cutoff
+            rows, _, radius = _support_finder(grid, position + translation, support)
+            inside = radius < support
             if not np.any(inside):
                 continue
             rows, radius = rows[inside], radius[inside]

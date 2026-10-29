@@ -32,15 +32,16 @@ def _table(positions: np.ndarray, forces: np.ndarray) -> list[str]:
     return lines
 
 
-def force_report_lines(forces, output_level: int = 1) -> list[str]:
+def force_report_lines(forces, output_level: int = 1, *, periodic: bool = False) -> list[str]:
     """Lines of the force section for one structure.
 
-    ``forces`` is a :class:`parsec_python.Forces.ForceResult`.
+    ``forces`` is a :class:`parsec_python.Forces.ForceResult`.  For a periodic cell the report is Fortran's: the local
+    forces say that the Ewald forces are included (there is no separate ion-ion table), and no torque is reported.
     """
 
     positions = forces.positions
     lines: list[str] = []
-    if output_level >= 1:
+    if output_level >= 1 and not periodic:
         lines += [
             "",
             " Forces from ion-ion interaction:",
@@ -69,6 +70,7 @@ def force_report_lines(forces, output_level: int = 1) -> list[str]:
         lines += [
             " Coordinates and local force components",
             " ======================================",
+            *([" (Ewald forces included)"] if periodic else []),
             *_table(positions, forces.local_with_ion_ion),
             "",
             "",
@@ -99,10 +101,12 @@ def force_report_lines(forces, output_level: int = 1) -> list[str]:
         " coordinates and tot. forces (after setting net force to zero)",
         *_table(positions, forces.total),
         "",
-        " tot. torque [Ry/radian] :  "
-        + "".join(f"{value:11.6f} " for value in forces.torque),
-        "",
     ]
+    if not periodic:
+        lines += [
+            " tot. torque [Ry/radian] :  " + "".join(f"{value:11.6f} " for value in forces.torque),
+            "",
+        ]
     return lines
 
 

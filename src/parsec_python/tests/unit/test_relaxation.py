@@ -3574,19 +3574,22 @@ class RelaxationInputTests(_ScratchCase):
             with self.assertRaisesRegex(ParsecInputError, message):
                 self.parse(_water_lines(f"Minimization: bfgs\nRelaxation_SCF_Upscale: {value}"))
 
-    def test_periodic_relaxation_is_refused(self) -> None:
-        """Relaxation is implemented for isolated systems only."""
+    def test_periodic_relaxation_is_accepted_without_symmetry(self) -> None:
+        """A periodic cell relaxes (forces: Forces.compute_periodic_forces), with no point-group symmetrization."""
 
         for scheme in ("BFGS", "simple", "manual"):
             with self.subTest(scheme=scheme):
-                with self.assertRaisesRegex(
-                    UnsupportedParsecOptionError,
-                    "structural relaxation is implemented for isolated systems",
-                ):
-                    self.parse(
-                        _water_lines(f"Minimization: {scheme}", domain=PERIODIC_DOMAIN)
-                    )
-        # The same cell without a relaxation is accepted.
+                translation = self.parse(
+                    _water_lines(f"Minimization: {scheme}", domain=PERIODIC_DOMAIN)
+                )
+                self.assertIsNotNone(translation.relaxation)
+                self.assertEqual(translation.relaxation.method, scheme.lower())
+                self.assertFalse(translation.use_symmetry)  # the cluster's point group does not apply to a crystal
+        # forces on request and molecular dynamics are accepted as well
+        forces = self.parse(_water_lines("Skip_Force: .false.", domain=PERIODIC_DOMAIN))
+        self.assertTrue(forces.compute_forces)
+        self.assertNotIn("energies only", "\n".join(forces.warnings))
+        # the same cell without a relaxation is accepted
         translation = self.parse(_water_lines(domain=PERIODIC_DOMAIN))
         self.assertIsNotNone(translation.problem.periodic_cell)
         self.assertIsNone(translation.relaxation)
@@ -3670,13 +3673,6 @@ class CommandLineTests(_ScratchCase):
     def test_input_errors_end_before_any_calculation(self) -> None:
         """Exit code 2 and one line on standard error; no file is written."""
 
-        periodic = _water_lines("Minimization: BFGS", domain=PERIODIC_DOMAIN)
-        code, _, error = _run_cli([self.write_input(periodic), "--quiet"])
-        self.assertEqual(code, 2)
-        self.assertIn(
-            "Input error: Minimization='bfgs' with Boundary_Conditions=bulk", error
-        )
-
         source = self.write_input(CASES["water_coarse_bfgs_part1"]["input"])
         code, _, error = _run_cli([source, "--quiet", "--restart-from", "missing.dat"])
         self.assertEqual(code, 2)
@@ -3726,10 +3722,6 @@ class CommandLineTests(_ScratchCase):
             refused(relaxation, "--restart-from", "two.xyz"),
         )
         self.assertIn("missing.dat", refused(relaxation, "--restart-from", "missing.dat"))
-        self.assertIn(
-            "structural relaxation is implemented for isolated systems",
-            refused(_water_lines("Minimization: BFGS", domain=PERIODIC_DOMAIN)),
-        )
         one_fixed = _water_lines("Minimization: BFGS", oxygen_flag="0", hydrogen_flag="1")
         self.assertIn(
             "--symmetry on cannot be used here: Move_Flag fixes atoms",

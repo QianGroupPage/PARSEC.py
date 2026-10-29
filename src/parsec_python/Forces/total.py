@@ -199,10 +199,10 @@ def compute_periodic_forces(
     from time import perf_counter
 
     started = perf_counter()
-    atoms = system.atoms
+    positions = np.array([atom.position for atom in system.atoms], dtype=np.float64)  # as the caller moves them
+    atoms = system.cell_atoms  # inside the cell, where the image sums are made
     specifications = system.input.pseudopotentials
     lattice = np.asarray(system.input.periodic_cell.lattice_vectors, dtype=np.float64)
-    positions = np.array([atom.position for atom in atoms], dtype=np.float64)
 
     repulsion = ewald_ion_ion_forces(atoms, system.pseudopotentials, lattice)
     local = periodic_local_forces(

@@ -65,6 +65,63 @@ def reference_backend(potential_extrapolation: str = "none") -> IonicBackend:
     )
 
 
+def periodic_backend(
+    k_points=None, k_weights=None, potential_extrapolation: str = "none"
+) -> IonicBackend:
+    """The readable path for a periodic cell: the Gamma point, or a uniform k-point sampling.
+
+    ``k_points`` and ``k_weights`` (the Monkhorst-Pack points of the input, equal weights) select the k-point driver
+    :func:`parsec_python.SCF.kpoints.run_scf_kpoints`, which keeps no eigenvectors, so its SCF step also accumulates
+    the nonlocal force from them; without them the Gamma-point loop runs and the forces are built from its orbitals.
+    The forces are those of :func:`parsec_python.Forces.compute_periodic_forces`: no symmetrization (the structure is
+    not reduced by space-group operations) and the net force removed, which is what Fortran does for a crystal.  The
+    k-point loops start their eigenproblems cold after a move; the Gamma loop carries its eigensubspace over.
+    """
+
+    from functools import partial
+
+    import numpy as np
+
+    from ..Forces import compute_periodic_forces
+    from ..SCF import run_scf, update_periodic_geometry, warm_start_for_moved_atoms
+    from ..SCF.kpoints import run_scf_kpoints
+    from ..SCF.single_point import extrapolation_keywords
+
+    sampled = k_points is not None
+    if sampled:
+        k_points = np.asarray(k_points, dtype=float)
+        k_weights = np.asarray(k_weights, dtype=float)
+
+    def solve(system, *, callback=None, warm_start=None, convergence_criterion=None):
+        if sampled:
+            return run_scf_kpoints(
+                system,
+                k_points,
+                k_weights,
+                callback=callback,
+                compute_forces=True,
+                warm_start=warm_start,
+                convergence_criterion=convergence_criterion,
+            )
+        return run_scf(
+            system, callback=callback, warm_start=warm_start, convergence_criterion=convergence_criterion
+        )
+
+    def forces(system, result, *, symmetrize=False, operations=None):
+        if symmetrize or operations is not None:
+            raise ValueError("a periodic cell has no point-group symmetrization of its forces here")
+        return compute_periodic_forces(system, result)
+
+    keywords = extrapolation_keywords(potential_extrapolation)
+    return IonicBackend(
+        run_scf=solve,
+        compute_forces=forces,
+        update_geometry=update_periodic_geometry,
+        warm_start=partial(warm_start_for_moved_atoms, **keywords),
+        restart_scf=lambda system, result: warm_start_for_moved_atoms(system, result, system),
+    )
+
+
 def release_orbitals(result) -> None:
     """Drop the views a finished result holds on the eigensolver subspace.
 
@@ -80,4 +137,4 @@ def release_orbitals(result) -> None:
         release()
 
 
-__all__ = ["IonicBackend", "reference_backend", "release_orbitals"]
+__all__ = ["IonicBackend", "periodic_backend", "reference_backend", "release_orbitals"]

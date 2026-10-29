@@ -112,12 +112,20 @@ def run_scf_kpoints(
     *,
     callback: Callable[[SCFIteration], None] | None = None,
     compute_forces: bool = False,
+    warm_start=None,
+    convergence_criterion: float | None = None,
 ) -> SinglePointResult:
     """Run k-point-sampled periodic SCF on an already-prepared system.
 
     ``weights`` must all be equal (see the module docstring); this is
     validated here rather than silently mixing unevenly-weighted k-points
     into one scalar-degeneracy Fermi bisection.
+
+    ``warm_start`` (:class:`~parsec_python.SCF.single_point.SCFWarmStart`) continues from the loop of the previous
+    structure of a relaxation or a dynamics run: its input potential, the starting vector of the first Poisson solve and,
+    with the atomic extrapolation, the Hartree and exchange-correlation potentials of the guessed density.  The k-point
+    eigenproblems start cold (the saved eigensubspaces of the previous structure are not carried over).
+    ``convergence_criterion`` replaces the ``Convergence_Criterion`` of the input for this loop (Ry).
 
     ``compute_forces`` also returns the nonlocal force (``result.nonlocal_forces``): the eigenvectors of a k-point
     run are not kept, so after the last SCF step each k-point's contribution
@@ -144,16 +152,37 @@ def run_scf_kpoints(
     number_of_states = _number_of_states(system)
     ionic_potential = system.ionic_potential
     lattice_vectors = system.input.periodic_cell.lattice_vectors
+    cell_atoms = system.cell_atoms  # the atoms folded into the cell: the image sums assume them inside
+    criterion = settings.convergence_criterion if convergence_criterion is None else float(convergence_criterion)
 
     started = time.perf_counter()
     timer = StageTimer()
     density = system.initial_density
-    with timer.stage("initial_hartree"):
-        initial_hartree = system.solve_hartree(density, initial_potential=-ionic_potential)
-    hartree_potential = initial_hartree.potential
-    with timer.stage("initial_xc"):
-        xc = system.evaluate_xc(density)
-    input_potential = ionic_potential + hartree_potential + xc.potential
+    if warm_start is None:
+        with timer.stage("initial_hartree"):
+            initial_hartree = system.solve_hartree(density, initial_potential=-ionic_potential)
+        hartree_potential = initial_hartree.potential
+        with timer.stage("initial_xc"):
+            xc = system.evaluate_xc(density)
+        input_potential = ionic_potential + hartree_potential + xc.potential
+    else:
+        # the structure before the move supplies the first input potential and the starting vector of the first
+        # Poisson solve; no density is needed before the first eigensolve
+        hartree_potential = np.array(warm_start.hartree_potential, dtype=np.float64)
+        input_potential = np.array(warm_start.input_potential, dtype=np.float64)
+        if warm_start.density_guess is not None:
+            # atomic extrapolation: the Hartree and exchange-correlation potentials of the guessed density replace
+            # those of the last output density
+            guess = np.array(warm_start.density_guess, dtype=np.float64)
+            with timer.stage("initial_hartree"):
+                hartree_potential = system.solve_hartree(guess, initial_potential=hartree_potential).potential
+            with timer.stage("initial_xc"):
+                moved_xc = system.evaluate_xc(guess)
+            input_potential = (
+                input_potential
+                + (hartree_potential + moved_xc.potential)
+                - np.array(warm_start.hxc_reference, dtype=np.float64)
+            )
 
     # Bloch-phase projectors depend only on geometry and k: built once per k-point
     # (in the worker that owns it) and reused by every SCF step.
@@ -163,7 +192,7 @@ def run_scf_kpoints(
         if task not in projector_cache:
             projector_cache[task] = build_nonlocal_projectors(
                 system.grid,
-                system.atoms,
+                cell_atoms,
                 system.pseudopotentials,
                 system.input.pseudopotentials,
                 lattice_vectors,
@@ -194,7 +223,7 @@ def run_scf_kpoints(
             make_hamiltonian(task, {"V": ionic_potential})
         gradients = build_periodic_projector_gradients(
             system.grid,
-            system.atoms,
+            cell_atoms,
             system.pseudopotentials,
             system.input.pseudopotentials,
             lattice_vectors,
@@ -205,7 +234,7 @@ def run_scf_kpoints(
             gradients,
             np.asarray(vectors),
             weight * final_occupations[task],
-            len(system.atoms),
+            len(cell_atoms),
         )
 
     with timer.stage("solver_setup"):
@@ -338,11 +367,11 @@ def run_scf_kpoints(
             input_potential = mixed_potential
             if (
                 iteration > 5
-                and metrics.weighted < 100.0 * settings.convergence_criterion
+                and metrics.weighted < 100.0 * criterion
                 and filter_degree > minimum_filter_degree
             ):
                 filter_degree -= 1
-            if selected_residual < settings.convergence_criterion:
+            if selected_residual < criterion:
                 converged = True
                 break
         if compute_forces:

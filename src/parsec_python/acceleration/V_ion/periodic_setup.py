@@ -231,9 +231,12 @@ def fft_local_ionic_potential(
         if atom.symbol != batch_symbol:
             flush()
             batch_symbol = atom.symbol
-        # beyond the table of the pseudopotential V_a is exactly -2 Z/r, but inside it V_a differs from
-        # the Coulomb tail, so the ball reaches the larger of the two radii
-        reach = max(erfc_cutoff, float(potentials[atom.symbol].interpolation_cutoff))
+        # beyond its Coulomb onset (2 to 7 bohr; the table runs to 118) V_a is -2 Z/r to 1e-14 Ry, but inside it V_a
+        # differs from the Coulomb tail, so the ball reaches the larger of the onset and the Gaussian tail
+        reach = max(
+            erfc_cutoff,
+            _ionic.coulomb_onset_radius(potentials[atom.symbol], specifications[atom.symbol].local_angular_momentum),
+        )
         for rows, distances in _atom_balls(grid, position, reach):
             pending_rows.append(rows)
             pending_distances.append(distances)

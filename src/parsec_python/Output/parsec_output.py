@@ -1602,7 +1602,7 @@ class ParsecTextReporter:
         else:
             lines.extend(
                 [
-                    *force_report_lines(forces, self.translation.output_level),
+                    *force_report_lines(forces, self.translation.output_level, periodic=self._periodic),
                     f"Time for forces [sec] : {forces.seconds:11.2f}",
                     "",
                     "Dipoles and MPI statistics",

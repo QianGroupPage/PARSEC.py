@@ -1666,12 +1666,6 @@ def _parse_parsec_input(
     # they are; every other calculation recentres the cluster.
     recenter = minimization != "manual"
     if minimization != "none":
-        if is_periodic:
-            raise UnsupportedParsecOptionError(
-                f"Minimization={minimization!r} with Boundary_Conditions=bulk: "
-                "structural relaxation is implemented for isolated systems "
-                "(Boundary_Conditions: cluster) only"
-            )
         relaxation = RelaxationSettings(
             method=minimization,
             max_movements=500 if movement_count is None else movement_count,
@@ -1704,12 +1698,6 @@ def _parse_parsec_input(
                 "Relax_Restart is set without Minimization and is ignored."
             )
     if molecular_dynamics.enabled:
-        if is_periodic:
-            raise UnsupportedParsecOptionError(
-                "Molecular_Dynamics with Boundary_Conditions=bulk: molecular "
-                "dynamics is implemented for isolated systems "
-                "(Boundary_Conditions: cluster) only"
-            )
         if not any(movable):
             raise ParsecInputError(
                 "Molecular_Dynamics is requested, but Move_Flag leaves no atom movable"
@@ -1726,12 +1714,10 @@ def _parse_parsec_input(
             "Molecular dynamics controls are present without "
             "Molecular_Dynamics: true and are ignored."
         )
-    if compute_forces and is_periodic:
-        compute_forces = False
-        warnings.append(
-            "Skip_force=false requests forces, which are implemented for "
-            "isolated systems only; this periodic run reports energies only."
-        )
+    if is_periodic:
+        # A crystal's forces are not symmetrized: PARSEC.py finds no space-group operations (the point-group
+        # operations of a cluster do not apply), and the structure is relaxed as it is.
+        use_symmetry = False
 
     potential_extrapolation = "none"
     if "potential_extrapolation" in scalar:

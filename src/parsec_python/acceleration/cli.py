@@ -463,7 +463,8 @@ def _reference_only_features(
 ) -> list[str]:
     """Input features only the reference :mod:`parsec_python.cli` dispatches.
 
-    The accelerated driver runs a scalar Gamma-point SCF, spin-polarized
+    The accelerated driver runs a scalar Gamma-point SCF (forces, relaxation and molecular dynamics of isolated
+    systems only), spin-polarized
     where the system is isolated and carries no spin-orbit species, plus (when ``accelerated_backend_selected`` and the input is
     Gamma-point-only self-consistent SOC without spin polarization --
     :func:`_accelerated_self_consistent_soc_eligible`) the CuPy spinor
@@ -506,6 +507,14 @@ def _reference_only_features(
         and problem.periodic_cell is not None
     ):
         features.append("k-point sampling (Monkhorst-Pack or explicit list)")
+    if problem.periodic_cell is not None and (
+        translation.relaxation is not None
+        or translation.molecular_dynamics is not None
+        or translation.compute_forces
+    ):
+        # the ionic loops of the accelerated driver move isolated structures; a periodic cell has the forces of
+        # parsec_python.Forces.compute_periodic_forces and the periodic backend of the reference solver
+        features.append("forces, relaxation and molecular dynamics of a periodic cell")
     if problem.bands is not None:
         features.append("band structure along a k-path (bandstruc)")
     return features

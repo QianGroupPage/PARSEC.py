@@ -4,7 +4,7 @@ Periodic (Gamma-point) SCF preparation, reusing the isolated SCF loop.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import time
 from typing import Callable
 
@@ -16,6 +16,7 @@ from ..Hamiltonian import KohnShamHamiltonian
 from ..Hartree.pbc import PeriodicHartreeResult, solve_periodic_hartree
 from ..Laplacian import build_gradient, build_negative_laplacian
 from ..models import (
+    Atom,
     PreparationTimings,
     SCFIteration,
     SinglePointInput,
@@ -66,6 +67,16 @@ class PeriodicPreparedSinglePointSystem:
     atomic_reference_correction: float = 0.0
     alpha_z_energy: float = 0.0
     timings: PreparationTimings = field(default_factory=PreparationTimings)
+
+    @property
+    def cell_atoms(self) -> tuple:
+        """The atoms folded into the cell, in the order of ``atoms`` (see :func:`fold_atoms_into_cell`).
+
+        ``atoms`` keeps the coordinates a relaxation or a dynamics run moves them to, which leave the cell; every
+        builder of an image sum (local potential, projectors, densities, Ewald sums, forces) assumes atoms inside
+        it and gets these.
+        """
+        return fold_atoms_into_cell(self.atoms, self.input.periodic_cell.lattice_vectors)
 
     def hamiltonian(self, effective_potential: np.ndarray) -> KohnShamHamiltonian:
         """Compose the current SCF Hamiltonian without forming a dense matrix.
@@ -140,6 +151,117 @@ class PeriodicPreparedSinglePointSystem:
         return noncollinear_xc(density, magnetization, self.evaluate_xc_spin_polarized)
 
 
+def fold_atoms_into_cell(atoms, lattice_vectors: np.ndarray) -> tuple:
+    """Atoms with their positions moved by lattice vectors into the cell (fractional coordinates in ``[0, 1)``).
+
+    A periodic image of an atom is the same atom: the energy and the forces do not depend on which one the
+    coordinates name, but the builders of image sums are written for atoms inside the cell.  Atoms already inside are
+    returned as they are, bit for bit.
+    """
+
+    lattice = np.asarray(lattice_vectors, dtype=np.float64)
+    inverse = np.linalg.inv(lattice)
+    folded = []
+    for atom in atoms:
+        position = np.asarray(atom.position, dtype=np.float64)
+        fraction = position @ inverse
+        inside = np.all(fraction >= -1.0e-12) and np.all(fraction < 1.0 + 1.0e-12)
+        if inside:
+            folded.append(atom)
+            continue
+        wrapped = fraction - np.floor(fraction)
+        folded.append(Atom(atom.symbol, wrapped @ lattice))
+    return tuple(folded)
+
+
+def _geometry_terms(problem: SinglePointInput, grid, atoms, pseudopotentials, electron_count: float) -> dict:
+    """Everything of a periodic system that depends on the atom positions, for atoms inside the cell.
+
+    The local ionic potential, the projectors with their images, the atomic starting density and the core density, the
+    Ewald ion-ion energy and the alpha-Z term, with the seconds of each stage (``PreparationTimings`` fields).
+    """
+
+    lattice_vectors = problem.periodic_cell.lattice_vectors
+    stage_start = time.perf_counter()
+    ionic_potential = ewald_local_ionic_potential(
+        grid, atoms, pseudopotentials, problem.pseudopotentials, lattice_vectors
+    )
+    local_ionic_seconds = time.perf_counter() - stage_start
+    stage_start = time.perf_counter()
+    nonlocal_operator = build_nonlocal_projectors(
+        grid, atoms, pseudopotentials, problem.pseudopotentials, lattice_vectors
+    )
+    nonlocal_ionic_seconds = time.perf_counter() - stage_start
+
+    # Initial valence density and nonlinear core-correction density.  SAD
+    # remains the PARSEC-compatible default. A file/ML provider is not implemented yet
+    stage_start = time.perf_counter()
+    if problem.initial_density_settings.method != "sad":
+        raise NotImplementedError(
+            "the periodic path only supports "
+            "initial_density_settings.method='sad'"
+        )
+    initial_density = superpose_atomic_density(
+        grid, atoms, pseudopotentials, problem.pseudopotentials, lattice_vectors
+    )
+    if problem.scf.normalize_initial_density:
+        initial_density = normalize_density(initial_density, grid, electron_count)
+    initial_density_seconds = time.perf_counter() - stage_start
+    stage_start = time.perf_counter()
+    core_density = superpose_atomic_density(
+        grid, atoms, pseudopotentials, problem.pseudopotentials, lattice_vectors, core=True
+    )
+    core_density_seconds = time.perf_counter() - stage_start
+
+    # Geometry-only ion--ion contribution to the total energy.
+    stage_start = time.perf_counter()
+    repulsion = ewald_ion_ion_energy(atoms, pseudopotentials, lattice_vectors)
+    alpha_z_energy = ewald_alpha_z_energy(atoms, pseudopotentials, lattice_vectors, electron_count)
+    ion_ion_seconds = time.perf_counter() - stage_start
+    return {
+        "fields": dict(
+            ionic_potential=ionic_potential,
+            nonlocal_operator=nonlocal_operator,
+            initial_density=initial_density,
+            core_density=core_density,
+            ion_ion_energy=repulsion,
+            alpha_z_energy=alpha_z_energy,
+        ),
+        "seconds": dict(
+            local_ionic_seconds=local_ionic_seconds,
+            nonlocal_ionic_seconds=nonlocal_ionic_seconds,
+            initial_density_seconds=initial_density_seconds,
+            core_density_seconds=core_density_seconds,
+            ion_ion_seconds=ion_ion_seconds,
+        ),
+    }
+
+
+def update_periodic_geometry(system: PeriodicPreparedSinglePointSystem, atoms) -> PeriodicPreparedSinglePointSystem:
+    """``system`` with its atoms at new positions, on the same grid (what a relaxation or dynamics step rebuilds).
+
+    The local ionic potential, the projectors, the starting and core densities and the ion-ion energy are made for
+    the new positions; the grid, the kinetic operator, the pseudopotentials and the electron count are shared.  The
+    positions are kept as given, also outside the cell (so that an optimizer or an integrator sees continuous
+    coordinates); the builders get them folded into the cell (:attr:`PeriodicPreparedSinglePointSystem.cell_atoms`).
+    """
+
+    started = time.perf_counter()
+    atoms = tuple(atoms)
+    if len(atoms) != len(system.atoms) or any(new.symbol != old.symbol for new, old in zip(atoms, system.atoms)):
+        raise ValueError("moved atoms must keep their number, order and species")
+    problem = replace(system.input, atoms=atoms)
+    folded = fold_atoms_into_cell(atoms, problem.periodic_cell.lattice_vectors)
+    terms = _geometry_terms(problem, system.grid, folded, system.pseudopotentials, system.electron_count)
+    return replace(
+        system,
+        input=problem,
+        atoms=atoms,
+        **terms["fields"],
+        timings=PreparationTimings(**terms["seconds"], total_seconds=time.perf_counter() - started),
+    )
+
+
 def prepare_periodic_single_point(
     problem: SinglePointInput,
 ) -> PeriodicPreparedSinglePointSystem:
@@ -208,83 +330,21 @@ def prepare_periodic_single_point(
     gradient = build_gradient(grid)
     finite_difference_seconds = time.perf_counter() - stage_start
 
-    # 3. Local and Kleinman--Bylander nonlocal ionic terms.
-    stage_start = time.perf_counter()
-    ionic_potential = ewald_local_ionic_potential(
-        grid,
-        atoms,
-        pseudopotentials,
-        problem.pseudopotentials,
-        problem.periodic_cell.lattice_vectors,
-    )
-    local_ionic_seconds = time.perf_counter() - stage_start
-    stage_start = time.perf_counter()
-    nonlocal_operator = build_nonlocal_projectors(
-        grid,
-        atoms,
-        pseudopotentials,
-        problem.pseudopotentials,
-        problem.periodic_cell.lattice_vectors,
-    )
-    nonlocal_ionic_seconds = time.perf_counter() - stage_start
-
-    # 4. Initial valence density and nonlinear core-correction density.  SAD
-    # remains the PARSEC-compatible default. A file/ML provider is not implemented yet
-    stage_start = time.perf_counter()
-    if problem.initial_density_settings.method != "sad":
-        raise NotImplementedError(
-            "the periodic path only supports "
-            "initial_density_settings.method='sad'"
-        )
-    initial_density = superpose_atomic_density(
-        grid,
-        atoms,
-        pseudopotentials,
-        problem.pseudopotentials,
-        problem.periodic_cell.lattice_vectors,
-    )
-    if problem.scf.normalize_initial_density:
-        initial_density = normalize_density(initial_density, grid, electron_count)
-    initial_density_seconds = time.perf_counter() - stage_start
-    stage_start = time.perf_counter()
-    core_density = superpose_atomic_density(
-        grid,
-        atoms,
-        pseudopotentials,
-        problem.pseudopotentials,
-        problem.periodic_cell.lattice_vectors,
-        core=True,
-    )
-    core_density_seconds = time.perf_counter() - stage_start
-
-    # 5. Geometry-only ion--ion contribution to the total energy.
-    stage_start = time.perf_counter()
-    repulsion = ewald_ion_ion_energy(
-        atoms, pseudopotentials, problem.periodic_cell.lattice_vectors
-    )
-    alpha_z_energy = ewald_alpha_z_energy(
-        atoms,
-        pseudopotentials,
-        problem.periodic_cell.lattice_vectors,
-        electron_count,
-    )
+    # 3. The terms that depend on the positions: local and Kleinman--Bylander nonlocal ionic terms, the starting and
+    # core densities, the ion--ion energy.
+    terms = _geometry_terms(problem, grid, atoms, pseudopotentials, electron_count)
     atomic_reference_correction = float(
         sum(
             problem.pseudopotentials[atom.symbol].atomic_energy_correction
             for atom in atoms
         )
     )
-    ion_ion_seconds = time.perf_counter() - stage_start
 
     preparation_timings = PreparationTimings(
         pseudopotential_loading_seconds=pseudopotential_loading_seconds,
         grid_seconds=grid_seconds,
         finite_difference_seconds=finite_difference_seconds,
-        local_ionic_seconds=local_ionic_seconds,
-        nonlocal_ionic_seconds=nonlocal_ionic_seconds,
-        initial_density_seconds=initial_density_seconds,
-        core_density_seconds=core_density_seconds,
-        ion_ion_seconds=ion_ion_seconds,
+        **terms["seconds"],
         total_seconds=time.perf_counter() - preparation_start,
     )
     return PeriodicPreparedSinglePointSystem(
@@ -295,18 +355,15 @@ def prepare_periodic_single_point(
         grid=grid,
         negative_laplacian=negative_laplacian,
         gradient=gradient,
-        ionic_potential=ionic_potential,
-        nonlocal_operator=nonlocal_operator,
-        initial_density=initial_density,
-        core_density=core_density,
-        ion_ion_energy=repulsion,
+        **terms["fields"],
         atomic_reference_correction=atomic_reference_correction,
-        alpha_z_energy=alpha_z_energy,
         timings=preparation_timings,
     )
 
 
 __all__ = [
     "PeriodicPreparedSinglePointSystem",
+    "fold_atoms_into_cell",
     "prepare_periodic_single_point",
+    "update_periodic_geometry",
 ]

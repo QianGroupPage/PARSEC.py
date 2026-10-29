@@ -125,7 +125,7 @@ def periodic_local_forces(
             ionic[index] += 2.0 * charge * (4.0 * np.pi / volume) * ((weight * sine_density) @ reciprocal_points)
 
         if species.core_density_derivative is not None:
-            support = potential.interpolation_cutoff
+            support = _ionic.atomic_density_support_radius(potential, specification, core=True)
             for translation in _ionic._periodic_image_translations(lattice_vectors, support):
                 rows, relative, radius = _ionic._support_finder(grid, position + translation, support)
                 inside = radius < support

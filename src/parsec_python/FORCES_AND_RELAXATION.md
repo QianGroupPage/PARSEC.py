@@ -210,11 +210,25 @@ step is not below `Grid_Spacing` (`adjust_step`; steps may differ between the ax
 mRy at 0.3 bohr. The forces are consistent with that energy (net force removed, as in Fortran, but then a relaxation can
 slide a molecule over the grid) and Fortran's reciprocal-space potential has much less of it.
 
-Validated against Fortran PARSEC (`parsec_tests/pbc_forces`; three Ge atoms, Gamma point, forces up to 2.5 Ry/bohr, the same
-grid in both codes): the largest force difference is 3e-4 Ry/bohr at 32^3 points (1.2e-3 at 24^3), the nonlocal term agrees
-to 1.6e-5, and a constant energy offset of +0.8 mRy remains (the local potential is sampled on the grid here, a sum of form
-factors there). The relaxation and dynamics loops are tested on a hydrogen pair at the Gamma point and with two k-points
-(`tests/unit/test_periodic_ionic.py`); the energy of a short NVE run is conserved to 1e-3 eV/atom.
+Validated against Fortran PARSEC (`parsec_tests/pbc_forces`; three Ge atoms with a nonlinear core correction, forces up to
+2.5 Ry/bohr, the same grid in both codes). Largest difference of the total force after the net force is removed, and of the
+nonlocal term, in Ry/bohr, with the total-energy difference (Python minus Fortran) in Ry:
+
+| cell | k-points | points per side | total force | nonlocal | energy |
+|---|---|---|---:|---:|---:|
+| cubic, 9.6 bohr | Gamma | 24 / 32 / 40 | 2.0e-3 / 6.1e-4 / 4.1e-4 | 3e-5 / 6e-6 / 3e-6 | -4.5e-5 / +8.5e-5 / +7.2e-5 |
+| cubic, 9.6 bohr | 2, generic | 24 | 2.0e-3 | 3.4e-5 | -9.3e-6 |
+| fcc primitive, 10.2 bohr | Gamma | 20 / 26 / 32 / 40 | 3.3e-4 / 2.7e-4 / 2.3e-4 / 1.5e-4 | 1.5e-5 / 4e-6 / 9e-7 / 9e-7 | +2.2e-4 / +1.9e-4 / +2.0e-4 / +2.0e-4 |
+| fcc primitive, 10.2 bohr | 2, generic | 20 | 2.4e-4 | 8.7e-6 | +2.1e-4 |
+
+The k-point forces are as close to Fortran as the Gamma ones at the same grid, and the oblique cell is as close as the cubic
+one. The energy offset is Fortran's: its `alpha` energy is a finite difference in q (spacing 0.015) and is low by 6.4e-5 Ry
+for the 885 bohr^3 cubic cell, by 2.1e-4 Ry for the 265 bohr^3 fcc cell (it scales as 1/volume), which is the whole offset
+at 32 points and above. The residual force difference falls with the grid: Fortran's local and core forces are reciprocal
+sums over form factors (they equal ion-ion plus the numerical derivative of that functional to 2e-5 on PARSEC.py's density),
+PARSEC.py's are the exact derivatives of the grid-sampled energy. The relaxation and dynamics loops are tested on a
+hydrogen pair at the Gamma point and with two k-points (`tests/unit/test_periodic_ionic.py`); the energy of a short NVE run
+is conserved to 1e-3 eV/atom.
 
 ## Structural relaxation
 

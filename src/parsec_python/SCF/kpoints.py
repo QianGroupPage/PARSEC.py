@@ -55,6 +55,7 @@ from ..SCF.spin_polarized import (
     _number_of_states_per_channel,
     _weighted_initial_polarization,
 )
+from ..Forces.nonlocal_force import build_periodic_projector_gradients, nonlocal_forces
 from ..V_ion import build_nonlocal_projectors
 from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
 from .kpoints_soc import _eigval_settings
@@ -110,12 +111,17 @@ def run_scf_kpoints(
     weights: np.ndarray,
     *,
     callback: Callable[[SCFIteration], None] | None = None,
+    compute_forces: bool = False,
 ) -> SinglePointResult:
     """Run k-point-sampled periodic SCF on an already-prepared system.
 
     ``weights`` must all be equal (see the module docstring); this is
     validated here rather than silently mixing unevenly-weighted k-points
     into one scalar-degeneracy Fermi bisection.
+
+    ``compute_forces`` also returns the nonlocal force (``result.nonlocal_forces``): the eigenvectors of a k-point
+    run are not kept, so after the last SCF step each k-point's contribution
+    ``4 w_k sum_n f_nk sum_q s_q Re[conj(<beta_q|u_nk>) <grad beta_q|u_nk>]`` is computed from them and summed.
     """
     settings = system.input.scf
     k_points = np.asarray(k_points, dtype=float)
@@ -179,6 +185,29 @@ def run_scf_kpoints(
             * weighted_square_sum(vectors, occupations, xp)
         }
 
+    # Occupations of the last SCF step by k-point, set before the force pass (the job's ``extras`` sees only vectors).
+    final_occupations: dict[int, np.ndarray] = {}
+
+    def kpoint_nonlocal_force(task, vectors, xp=np):
+        vectors = vectors.get() if hasattr(vectors, "get") else vectors  # a device array: to the host
+        if task not in projector_cache:
+            make_hamiltonian(task, {"V": ionic_potential})
+        gradients = build_periodic_projector_gradients(
+            system.grid,
+            system.atoms,
+            system.pseudopotentials,
+            system.input.pseudopotentials,
+            lattice_vectors,
+            k_points[task],
+        )
+        return nonlocal_forces(
+            projector_cache[task],
+            gradients,
+            np.asarray(vectors),
+            weight * final_occupations[task],
+            len(system.atoms),
+        )
+
     with timer.stage("solver_setup"):
         solver = make_kpoint_solver(
             KPointJob(
@@ -187,13 +216,20 @@ def run_scf_kpoints(
                 lambda degree: _eigval_settings(system, degree),
                 make_hamiltonian,
                 accumulate,
+                extras=kpoint_nonlocal_force if compute_forces else None,
             ),
             problem_size=system.grid.size,
+        )
+    if compute_forces and type(solver).__name__ == "MPIKPointSolver":
+        raise NotImplementedError(
+            "the nonlocal force of the row-distributed MPI k-point solver is not implemented: its extras are "
+            "sums over row blocks, which does not apply to a product of overlaps"
         )
     mixer = AndersonMixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
 
+    nonlocal_force = None
     pooled_eigenvalues = np.empty(0)
     pooled_occupations = np.empty(0)
     fermi_level = float("nan")
@@ -309,6 +345,10 @@ def run_scf_kpoints(
             if selected_residual < settings.convergence_criterion:
                 converged = True
                 break
+        if compute_forces:
+            # the eigenvectors and occupations of the last step belong together
+            final_occupations.update(enumerate(split_pooled(pooled_occupations, eigenvalues_by_k)))
+            nonlocal_force = np.sum(solver.extras(), axis=0)
         timings = _run_timings(system, timer, solver, started)
 
     return SinglePointResult(
@@ -337,6 +377,7 @@ def run_scf_kpoints(
         atomic_reference_correction=system.atomic_reference_correction,
         k_points=k_points,
         k_weights=weights,
+        nonlocal_forces=nonlocal_force,
     )
 
 

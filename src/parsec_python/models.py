@@ -315,12 +315,24 @@ class PeriodicGridSettings:
     spacing: float
     expansion_order: int = 12
     shift: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Offset of the first grid point along each lattice axis, in grid steps (Fortran's ``grid%shift``): point
+    ``(i, j, k)`` is at ``(i + shift_0) a_0/n_0 + (j + shift_1) a_1/n_1 + (k + shift_2) a_2/n_2``."""
     domain_shape: DomainShape = "PBC_Orthorhombic"
     box_lengths: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    points_rule: str = "round"
+    """How the number of points along a lattice vector follows from ``spacing``.  ``"round"``: the nearest integer
+    (an orthorhombic cell then needs one common spacing) or the nearest even integer (an oblique cell).  ``"fortran"``:
+    the largest even number of points whose step is not below ``spacing``, per direction (Fortran's ``adjust_step``),
+    so the steps of a cell may differ.  The input-file parser selects ``"fortran"``."""
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.spacing) or self.spacing <= 0:
             raise ValueError("grid spacing must be positive")
+        if self.points_rule not in ("round", "fortran"):
+            raise ValueError("points_rule must be 'round' or 'fortran'")
+        if len(self.shift) != 3 or not np.all(np.isfinite(self.shift)):
+            raise ValueError("grid shift must have three finite entries")
+        object.__setattr__(self, "shift", tuple(float(value) for value in self.shift))
         order = int(self.expansion_order)
         if order != self.expansion_order:
             raise ValueError("PARSEC expansion_order must be an integer")
@@ -1245,6 +1257,10 @@ class SinglePointResult:
     eigensolver_state: object | None = None
     # The two channels of a spin-polarized calculation, up first.
     spin: tuple[SpinChannelResult, SpinChannelResult] | None = None
+    nonlocal_forces: np.ndarray | None = None
+    """``(atoms, 3)`` nonlocal (Kleinman-Bylander) forces in Ry/bohr, summed over the k-points from the converged
+    eigenvectors of the last SCF step.  A k-point run does not keep its eigenvectors, so it accumulates this term
+    while they exist (``run_scf_kpoints(..., compute_forces=True)``); ``None`` when not requested."""
 
     @property
     def all_electron_total(self) -> float:

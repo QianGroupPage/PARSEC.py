@@ -29,6 +29,7 @@ from ..models import (
     PeriodicCell,
     PeriodicGridSettings,
 )
+from ..Grid.pbc import fortran_grid_shift
 from ..Grid.kpoints import explicit_kpoints, read_kpoint_file
 from ..MLDensity.field import normalize_density_units
 from ..MolecularDynamics.settings import MolecularDynamicsSettings
@@ -909,6 +910,10 @@ def _parse_parsec_input(
             expansion_order=_integer(
                 one("expansion_order", "12"), label="Expansion_Order"
             ),
+            # the Fortran grid: half a step off the origin along vectors orthogonal to the others (zero with
+            # Ignore_Symmetry), and ``adjust_step``'s even number of points per direction
+            shift=fortran_grid_shift(periodic_cell.lattice_vectors, ignore_symmetry),
+            points_rule="fortran",
             box_lengths=tuple(
                 np.diag(periodic_cell.lattice_vectors)
                 if _lattice_is_diagonal(periodic_cell.lattice_vectors)

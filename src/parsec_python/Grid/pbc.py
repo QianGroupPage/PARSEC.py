@@ -33,8 +33,17 @@ class PeriodicRealSpaceGrid:
 
     @property
     def is_orthorhombic(self) -> bool:
-        """Whether the lattice vectors lie along the Cartesian axes (no mixed derivatives)."""
-        return _is_diagonal(self.cell.lattice_vectors)
+        """Whether the lattice vectors lie along the Cartesian axes with one common step (no mixed derivatives,
+        one grid spacing).  A rectangular cell whose steps differ goes through the general (metric) code."""
+        if not _is_diagonal(self.cell.lattice_vectors):
+            return False
+        steps = np.diag(self.cell.lattice_vectors) / self.points_per_axis
+        return bool(np.allclose(steps, steps[0], rtol=1.0e-9, atol=0.0))
+
+    @property
+    def shift(self) -> np.ndarray:
+        """Offset of the first point along each lattice axis, in grid steps."""
+        return np.asarray(self.settings.shift, dtype=np.float64)
 
     @property
     def step_vectors(self) -> np.ndarray:
@@ -73,8 +82,8 @@ class PeriodicRealSpaceGrid:
         integer_points = np.asarray(integer_points, dtype=float)
         wrapped = integer_points % self.points_per_axis
         if not self.is_orthorhombic:
-            return wrapped @ self.step_vectors
-        return wrapped * self.spacing
+            return (wrapped + self.shift) @ self.step_vectors
+        return (wrapped + self.shift) * self.spacing
 
     def integrate(self, values: np.ndarray) -> float:
         values = np.asarray(values)
@@ -88,6 +97,48 @@ def _is_diagonal(lattice_vectors: np.ndarray) -> bool:
     return bool(np.allclose(off_diagonal, 0.0, atol=1.0e-10))
 
 
+def fortran_points_per_axis(lengths: np.ndarray, spacing: float) -> np.ndarray:
+    """Points along each lattice vector as Fortran's ``adjust_step`` (``inipbc.f90``) chooses them.
+
+    The loop counts ``n = 1, 2, ...`` while ``1/n`` is not below ``spacing/length`` and keeps the last ``n`` for which
+    ``0.5*n`` is an integer: the largest even ``n`` whose step ``length/n`` is not below ``spacing``.  (Symmetry
+    operations with fractional translations would add commensurability conditions; PARSEC.py finds none.)  The
+    comparison is made on ``1/n`` and ``spacing/length`` in double precision, as Fortran does, so a spacing that is
+    within round-off of ``length/n`` falls on the same side: ``9.6/0.4`` gives 22 points, ``9.6/(9.6/24)`` gives 24.
+    """
+
+    counts = []
+    for length in np.asarray(lengths, dtype=float):
+        chosen = 0
+        ratio = spacing / float(length)
+        for n in range(1, 1001):
+            if 1.0 / n < ratio:
+                break
+            ytest = 0.5 * n - round(0.5 * n)  # the even-n condition: (1/2)/(1/n) is an integer
+            if abs(ytest) <= 1.0e-8:
+                chosen = n
+        else:
+            raise ValueError("no commensurate grid spacing found (Fortran's adjust_step error 266)")
+        if chosen == 0:
+            raise ValueError(f"the cell side {length} is shorter than two grid steps of {spacing}")
+        counts.append(chosen)
+    return np.array(counts, dtype=np.int64)
+
+
+def fortran_grid_shift(lattice_vectors: np.ndarray, ignore_symmetry: bool) -> tuple[float, float, float]:
+    """The grid shift of ``usrinputfile.F90``: half a step along every lattice vector, except zero when
+    ``Ignore_Symmetry`` is set and along vectors that are not orthogonal to another one."""
+
+    lattice = np.asarray(lattice_vectors, dtype=float)
+    shift = np.zeros(3) if ignore_symmetry else np.full(3, 0.5)
+    lengths = np.linalg.norm(lattice, axis=1)
+    for i in range(3):
+        for j in range(3):
+            if i != j and abs(float(lattice[i] @ lattice[j])) > 1.0e-9 * lengths[i] * lengths[j]:
+                shift[i] = 0.0
+    return tuple(float(value) for value in shift)
+
+
 def build_periodic_grid(
     cell: PeriodicCell,
     settings: PeriodicGridSettings,
@@ -98,17 +149,23 @@ def build_periodic_grid(
     Made to mirror build_cluster_grid in cluster.py (Potentially make abstract class for Grids)
     Build a periodic grid over one unit cell.
 
-    ``spacing`` is a target.  In an orthorhombic cell the achieved spacing is
-    ``side_length[i] / round(side_length[i] / spacing)`` for each axis, and
-    must agree between axes to within ``tolerance``.  In an oblique cell the
-    grid axes follow the lattice vectors, each with the even number of points
-    ``2*round(|a_i| / (2*spacing))`` of the Fortran code; the steps along the three axes may differ (the Laplacian then
-    carries the metric of the cell, see ``Laplacian.lattice_metric``).
+    ``spacing`` is a target, turned into points per lattice vector by ``settings.points_rule``.  ``"round"``: in an
+    orthorhombic cell the achieved spacing is ``side_length[i] / round(side_length[i] / spacing)`` for each axis, and
+    must agree between axes to within ``tolerance``; in an oblique cell the grid axes follow the lattice vectors, each
+    with the nearest even number of points.  ``"fortran"``: Fortran's ``adjust_step`` (:func:`fortran_points_per_axis`)
+    for any cell, with steps that may differ between axes (the Laplacian then carries the metric of the cell, see
+    ``Laplacian.lattice_metric``).  Point ``(i, j, k)`` is at ``(i + shift_0, j + shift_1, k + shift_2)`` steps along
+    the lattice vectors (``settings.shift``).
     """
 
     lattice_vectors = cell.lattice_vectors
+    if settings.points_rule == "fortran":
+        lengths = np.linalg.norm(lattice_vectors, axis=1)
+        return _build_general_grid(cell, settings, fortran_points_per_axis(lengths, settings.spacing))
     if not _is_diagonal(lattice_vectors):
-        return _build_oblique_grid(cell, settings)
+        lengths = np.linalg.norm(lattice_vectors, axis=1)
+        # an even number of points per axis, the nearest to |a_i|/h
+        return _build_general_grid(cell, settings, (2 * np.round(lengths / (2.0 * settings.spacing))).astype(np.int64))
     side_lengths = np.diag(lattice_vectors)
     if np.any(side_lengths <= 0.0):
         raise ValueError("lattice_vectors must have positive diagonal side lengths")
@@ -136,7 +193,7 @@ def build_periodic_grid(
     mesh = np.meshgrid(*axes, indexing="ij")
     integer_coordinates = np.column_stack([component.reshape(-1) for component in mesh])
     achieved_spacing = float(achieved_spacings[0])
-    coordinates = integer_coordinates.astype(np.float64) * achieved_spacing
+    coordinates = (integer_coordinates.astype(np.float64) + np.asarray(settings.shift)) * achieved_spacing
     lookup = np.arange(n0 * n1 * n2, dtype=np.int64).reshape(n0, n1, n2)
 
     return PeriodicRealSpaceGrid(
@@ -149,11 +206,12 @@ def build_periodic_grid(
     )
 
 
-def _build_oblique_grid(cell: PeriodicCell, settings: PeriodicGridSettings) -> PeriodicRealSpaceGrid:
+def _build_general_grid(
+    cell: PeriodicCell, settings: PeriodicGridSettings, points_per_axis: np.ndarray
+) -> PeriodicRealSpaceGrid:
+    """Grid along the lattice vectors with ``points_per_axis`` points (any cell, steps that may differ)."""
+
     lattice_vectors = cell.lattice_vectors
-    lengths = np.linalg.norm(lattice_vectors, axis=1)
-    # an even number of points per axis, the nearest to |a_i|/h (the Fortran code's 2*nint(L/(2h)))
-    points_per_axis = (2 * np.round(lengths / (2.0 * settings.spacing))).astype(np.int64)
     half_width = settings.stencil_half_width
     if np.any(points_per_axis <= 2 * half_width):
         raise ValueError(
@@ -164,16 +222,17 @@ def _build_oblique_grid(cell: PeriodicCell, settings: PeriodicGridSettings) -> P
     n0, n1, n2 = (int(value) for value in points_per_axis)
     mesh = np.meshgrid(*[np.arange(n) for n in (n0, n1, n2)], indexing="ij")
     integer_coordinates = np.column_stack([component.reshape(-1) for component in mesh])
-    coordinates = integer_coordinates.astype(np.float64) @ (lattice_vectors / points_per_axis[:, None])
+    steps = lattice_vectors / points_per_axis[:, None]
+    coordinates = (integer_coordinates.astype(np.float64) + np.asarray(settings.shift)) @ steps
     lookup = np.arange(n0 * n1 * n2, dtype=np.int64).reshape(n0, n1, n2)
     return PeriodicRealSpaceGrid(
         cell=cell,
         settings=settings,
-        points_per_axis=points_per_axis,
+        points_per_axis=np.asarray(points_per_axis, dtype=np.int64),
         integer_coordinates=integer_coordinates,
         coordinates=coordinates,
         lookup=lookup,
     )
 
 
-__all__ = ["PeriodicRealSpaceGrid", "build_periodic_grid"]
+__all__ = ["PeriodicRealSpaceGrid", "build_periodic_grid", "fortran_grid_shift", "fortran_points_per_axis"]

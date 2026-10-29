@@ -102,6 +102,9 @@ class PeriodicLocalForceTests(unittest.TestCase):
         # the dense reference potential: another test may have installed the FFT provider of the acceleration package
         self.addCleanup(setattr, ewald, "_local_potential_provider", ewald._local_potential_provider)
         ewald.set_local_potential_provider(None)
+        # the periodic local potential ignores Cubic_Spline as Fortran's does; the exact-derivative checks turn it on
+        self.addCleanup(setattr, ewald, "LOCAL_POTENTIAL_USES_CUBIC_SPLINE", ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE)
+        ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE = True
 
     def test_ionic_force_is_the_derivative_of_the_electron_ion_energy(self) -> None:
         for name in _CELLS:
@@ -109,6 +112,7 @@ class PeriodicLocalForceTests(unittest.TestCase):
             # instead of the piecewise-linear interpolant (a few percent of the largest component)
             for use_spline, relative in ((True, 1.0e-5), (False, 3.0e-2)):
                 with self.subTest(cell=name, spline=use_spline):
+                    ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE = use_spline
                     case = _Case(name, use_spline)
                     ionic = case.forces().ionic
                     scale = float(np.max(np.abs(ionic)))
@@ -146,6 +150,20 @@ class PeriodicLocalForceTests(unittest.TestCase):
         reference, shifted = case.forces(), case.forces(moved)
         np.testing.assert_allclose(shifted.ionic, reference.ionic, atol=1.0e-8)
         np.testing.assert_allclose(shifted.core_correction, reference.core_correction, atol=1.0e-8)
+
+    def test_cubic_spline_does_not_change_the_periodic_local_potential(self) -> None:
+        # Fortran's periodic local potential (ionpbc.f90, from the form factors of fourier_f.f90) never reads Cubic_Spline
+        from parsec_python.acceleration.V_ion import periodic_setup
+
+        ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE = False
+        linear, spline = _Case("fcc", False), _Case("fcc", True)
+        args = lambda case: (case.grid, case.atoms(), case.potentials, case.specifications, case.lattice)  # noqa: E731
+        reference = ewald_local_ionic_potential(*args(linear))
+        np.testing.assert_array_equal(ewald_local_ionic_potential(*args(spline)), reference)
+        # the FFT provider of the acceleration package is the same potential in either mode (it was not with the spline)
+        for case in (linear, spline):
+            fast = periodic_setup.fft_local_ionic_potential(*args(case), None, 1.0e-14)
+            np.testing.assert_allclose(fast, reference, atol=1.0e-9)
 
     def test_the_self_consistency_term_is_absent(self) -> None:
         terms = _Case("rectangular", False).forces()

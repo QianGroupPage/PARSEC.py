@@ -12,6 +12,9 @@ term by term: the short-ranged ``V_a(d) + 2 Z erf(eta d)/d`` over the image ball
 positions.  ``F_core`` is the derivative of the exchange-correlation energy through the frozen core density of a
 nonlinear core correction, over the image balls of :func:`parsec_python.V_ion.ionic_potential.superpose_atomic_density`.
 
+The local potential ignores ``Cubic_Spline`` as the Fortran periodic one does (see
+:data:`parsec_python.V_ion.ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE`); the core density follows it, as ``corecd.f90``.
+
 Fortran's periodic path (``force_loc_pb.f90``) has no term for the SCF residual, so ``self_consistency`` is zero here;
 the forces are first-order accurate in the density, as the Hellmann-Feynman forces need a converged SCF.
 
@@ -34,7 +37,7 @@ from ..Pseudopotential.radial_derivatives import (
     evaluate_local_potential_derivative,
 )
 from ..V_ion import ionic_potential as _ionic
-from ..V_ion.ewald import ewald_local_image_sets
+from ..V_ion.ewald import ewald_local_image_sets, local_potential_uses_spline
 from .local import LocalForceTerms, species_force_tables
 
 
@@ -108,7 +111,7 @@ def periodic_local_forces(
                 radius,
                 specification.local_angular_momentum,
                 table=species.local_potential_derivative,
-                use_spline=specification.use_spline,
+                use_spline=local_potential_uses_spline(specification),
                 spline_padding_width=half_width,
             ) + _erf_over_r_slope(charge, radius, eta)
             inverse = np.zeros_like(radius)

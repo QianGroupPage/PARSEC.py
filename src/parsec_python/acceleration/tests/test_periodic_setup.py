@@ -42,8 +42,11 @@ def _lattice(oblique: bool) -> np.ndarray:
     return _FCC if oblique else np.diag(_SIDES)
 
 
+_SHIFT = (0.5, 0.3, 0.8)  # grid points off the origin by a fraction of a step along each lattice vector
+
+
 @functools.lru_cache(maxsize=None)
-def _system(oblique: bool = False):
+def _system(oblique: bool = False, shifted: bool = False):
     if oblique:
         positions = _FRACTIONAL @ _FCC
     else:
@@ -58,7 +61,7 @@ def _system(oblique: bool = False):
             "Au": SpeciesPotential(_EXAMPLES / "Au_POTRE.DAT", 0),
             "H": SpeciesPotential(_EXAMPLES / "H_POTRE.DAT", 0),
         },
-        grid=PeriodicGridSettings(spacing=0.6, expansion_order=6),
+        grid=PeriodicGridSettings(spacing=0.6, expansion_order=6, shift=_SHIFT if shifted else (0.0, 0.0, 0.0)),
         periodic_cell=PeriodicCell(lattice_vectors=_lattice(oblique)),
         scf=SCFSettings(max_iterations=5, number_of_states=8),
         hartree=HartreeSettings(multipole_order=4),
@@ -72,13 +75,13 @@ def _system(oblique: bool = False):
 
 class GridBallTests(unittest.TestCase):
     def test_equals_the_dense_scan_inside_and_outside_the_cell(self) -> None:
-        for oblique in (False, True):
-            _, system = _system(oblique)
+        for oblique, shifted in ((False, False), (True, False), (False, True), (True, True)):
+            _, system = _system(oblique, shifted)
             generator = np.random.default_rng(3)
             for _ in range(60):
                 centre = generator.uniform(-9.0, 17.0, size=3)
                 radius = float(generator.uniform(0.2, 9.0))
-                with self.subTest(oblique=oblique):
+                with self.subTest(oblique=oblique, shifted=shifted):
                     rows, relative, distances = periodic_setup.grid_ball(system.grid, centre, radius)
                     expected = dense_support(system.grid, centre, radius)
                     np.testing.assert_array_equal(rows, expected[0])
@@ -95,9 +98,10 @@ class GridBallTests(unittest.TestCase):
 
 class SupportBuildersTests(unittest.TestCase):
     oblique = False
+    shifted = False
 
     def setUp(self) -> None:
-        self.problem, self.system = _system(self.oblique)
+        self.problem, self.system = _system(self.oblique, self.shifted)
         self.addCleanup(periodic_setup.install)
 
     def _build(self, fast: bool, k_point=None):
@@ -146,20 +150,32 @@ class ObliqueSupportBuildersTests(SupportBuildersTests):
     oblique = True
 
 
-_CONVERGED: dict[bool, np.ndarray] = {}
+class ShiftedSupportBuildersTests(SupportBuildersTests):
+    """The same builders on a grid whose points are off the origin by a fraction of a step."""
+
+    shifted = True
 
 
-def _converged_direct_sum(arguments, oblique: bool = False) -> np.ndarray:
-    if oblique not in _CONVERGED:
-        _CONVERGED[oblique] = ewald_local_ionic_potential(*arguments, tolerance=1.0e-26)
-    return _CONVERGED[oblique]
+class ShiftedObliqueSupportBuildersTests(SupportBuildersTests):
+    oblique = True
+    shifted = True
+
+
+_CONVERGED: dict[tuple[bool, bool], np.ndarray] = {}
+
+
+def _converged_direct_sum(arguments, oblique: bool = False, shifted: bool = False) -> np.ndarray:
+    if (oblique, shifted) not in _CONVERGED:
+        _CONVERGED[(oblique, shifted)] = ewald_local_ionic_potential(*arguments, tolerance=1.0e-26)
+    return _CONVERGED[(oblique, shifted)]
 
 
 class FFTLocalPotentialTests(unittest.TestCase):
     oblique = False
+    shifted = False
 
     def setUp(self) -> None:
-        self.problem, self.system = _system(self.oblique)
+        self.problem, self.system = _system(self.oblique, self.shifted)
         self.addCleanup(periodic_setup.install)
         self.arguments = (
             self.system.grid,
@@ -171,7 +187,7 @@ class FFTLocalPotentialTests(unittest.TestCase):
 
     def test_matches_the_converged_direct_sum(self) -> None:
         periodic_setup.uninstall()
-        converged = _converged_direct_sum(self.arguments, self.oblique)
+        converged = _converged_direct_sum(self.arguments, self.oblique, self.shifted)
         fast = periodic_setup.fft_local_ionic_potential(
             *self.arguments, None, 1.0e-14
         )
@@ -191,6 +207,17 @@ class ObliqueFFTLocalPotentialTests(FFTLocalPotentialTests):
     """The Ewald split with the reciprocal series on the oblique reciprocal lattice."""
 
     oblique = True
+
+
+class ShiftedFFTLocalPotentialTests(FFTLocalPotentialTests):
+    """The reciprocal series on points ``(i + s)/n`` of the lattice vectors."""
+
+    shifted = True
+
+
+class ShiftedObliqueFFTLocalPotentialTests(FFTLocalPotentialTests):
+    oblique = True
+    shifted = True
 
 
 if __name__ == "__main__":

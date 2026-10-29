@@ -183,6 +183,20 @@ def _erf_over_r(charge: float, radius: np.ndarray, eta: float) -> np.ndarray:
     return values
 
 
+# The Fortran periodic local potential (``ionpbc.f90``) is the reciprocal-space sum of the form factors ``vql(G)`` of
+# ``fourier_f.f90``: it never reads ``Cubic_Spline`` (``uspline`` is used for the cluster potential, the projectors, the
+# core density and the cluster forces).  The periodic local potential and its force therefore interpolate the table
+# linearly whatever the flag says.  Tests that differentiate the potential exactly set this to ``True`` (the derivative
+# of the cubic spline is exact; the derivative table of the linear mode is PARSEC's approximation).
+LOCAL_POTENTIAL_USES_CUBIC_SPLINE = False
+
+
+def local_potential_uses_spline(specification: SpeciesPotential) -> bool:
+    """Whether the periodic local potential of a species is evaluated with the cubic spline of its table."""
+
+    return bool(specification.use_spline) and LOCAL_POTENTIAL_USES_CUBIC_SPLINE
+
+
 _local_potential_provider = None
 
 
@@ -301,7 +315,7 @@ def ewald_local_ionic_potential(
             total += potential.local_potential(
                 radius,
                 specification.local_angular_momentum,
-                use_spline=specification.use_spline,
+                use_spline=local_potential_uses_spline(specification),
                 spline_padding_width=grid.settings.stencil_half_width,
             )
             total += _erf_over_r(charge, radius, eta)
@@ -346,8 +360,10 @@ def ewald_alpha_z_energy(
 
 
 __all__ = [
+    "LOCAL_POTENTIAL_USES_CUBIC_SPLINE",
     "ewald_alpha_z_energy",
     "ewald_ion_ion_energy",
     "ewald_local_ionic_potential",
+    "local_potential_uses_spline",
     "set_local_potential_provider",
 ]

@@ -45,19 +45,20 @@ _STRUCTURE_FACTOR_ELEMENTS = 4_000_000  # complex numbers of one structure-facto
 def _cell_geometry(grid: PeriodicRealSpaceGrid, lattice_vectors=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """``(n, lattice, inverse)``: points per axis, the rows ``a_m`` and their inverse.
 
-    ``build_periodic_grid`` places point ``(i, j, k)`` at ``i a_0/n_0 + j a_1/n_1 + k a_2/n_2``, so the fractional
-    coordinate along axis ``m`` of a point ``x`` is ``x . inverse[:, m]`` and its grid index ``n_m`` times that.
+    ``build_periodic_grid`` places point ``(i, j, k)`` at ``(i + s_0) a_0/n_0 + (j + s_1) a_1/n_1 + (k + s_2) a_2/n_2``
+    (``s = grid.shift``), so the fractional coordinate along axis ``m`` of a point ``x`` is ``x . inverse[:, m]`` and its
+    grid index ``n_m`` times that, minus ``s_m``.
     """
     n = np.asarray(grid.points_per_axis, dtype=np.int64)
     lattice = np.asarray(grid.cell.lattice_vectors if lattice_vectors is None else lattice_vectors, dtype=float)
     return n, lattice, np.linalg.inv(lattice)
 
 
-def _index_range(centre: float, half_width: float, count: int):
+def _index_range(centre: float, half_width: float, count: int, shift: float = 0.0):
     """Inclusive grid index range of the fractional interval ``centre +- half_width`` (one index of margin for
-    round-off), or ``None``."""
-    low = max(math.ceil(count * (centre - half_width)) - 1, 0)
-    high = min(math.floor(count * (centre + half_width)) + 1, count - 1)
+    round-off), or ``None``; the grid point ``i`` is at fractional position ``(i + shift)/count``."""
+    low = max(math.ceil(count * (centre - half_width) - shift) - 1, 0)
+    high = min(math.floor(count * (centre + half_width) - shift) + 1, count - 1)
     return (low, high) if low <= high else None
 
 
@@ -84,7 +85,7 @@ def grid_ball(grid, centre: np.ndarray, radius: float):
     half_width = radius * np.linalg.norm(inverse, axis=0)
     ranges = []
     for axis in range(3):
-        found = _index_range(float(fractional[axis]), float(half_width[axis]), int(n[axis]))
+        found = _index_range(float(fractional[axis]), float(half_width[axis]), int(n[axis]), float(grid.shift[axis]))
         if found is None:
             empty = np.empty(0, dtype=np.int64)
             return empty, np.empty((0, 3)), np.empty(0)
@@ -110,7 +111,9 @@ def _atom_balls(grid, position: np.ndarray, radius: float):
         reach = int(math.ceil(half_width[axis])) + 1
         found = []
         for image in range(-reach, reach + 1):
-            index_range = _index_range(float(fractional[axis]) + image, float(half_width[axis]), int(n[axis]))
+            index_range = _index_range(
+                float(fractional[axis]) + image, float(half_width[axis]), int(n[axis]), float(grid.shift[axis])
+            )
             if index_range is not None:
                 found.append((image, index_range))
         axis_images.append(found)
@@ -167,6 +170,12 @@ def _structure_factor_series(
         structure += ((charges[start:stop, None] * phases[0]).T @ yz).reshape(shape)
 
     coefficients = (-8.0 * np.pi / volume) * weight * structure
+    # the points are at (i + s)/n of the lattice vectors: exp(2 pi i m.(i + s)/n) = exp(2 pi i m.i/n) exp(2 pi i m.s/n)
+    shifts = np.asarray(grid.shift, dtype=float)
+    if np.any(shifts != 0.0):
+        coefficients = coefficients * np.exp(
+            2.0j * np.pi * (m0 * shifts[0] / n[0] + m1 * shifts[1] / n[1] + m2 * shifts[2] / n[2])
+        )
     spectrum = np.zeros(tuple(int(v) for v in n), dtype=np.complex128)
     index = [np.mod(frequencies[axis], n[axis]) for axis in range(3)]
     spectrum[np.ix_(index[0], index[1], index[2])] = coefficients
@@ -211,7 +220,7 @@ def fft_local_ionic_potential(
         values = potential.local_potential(
             distances,
             specification.local_angular_momentum,
-            use_spline=specification.use_spline,
+            use_spline=_ewald.local_potential_uses_spline(specification),
             spline_padding_width=grid.settings.stencil_half_width,
         ) + _ewald._erf_over_r(potential.ionic_charge, distances, fast_eta)
         total_view[:] += np.bincount(rows, weights=values, minlength=total_view.size)

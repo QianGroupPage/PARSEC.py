@@ -184,9 +184,11 @@ def compute_periodic_forces(
     *,
     operations: Sequence[AtomSymmetryOperation] | None = None,
 ) -> ForceResult:
-    """Forces of a finished Gamma-point calculation of a periodic cell on the full grid.
+    """Forces of a finished calculation of a periodic cell on the full grid.
 
-    ``system`` is the prepared periodic system and ``result`` the outcome of its SCF loop with full-grid orbitals.
+    ``system`` is the prepared periodic system and ``result`` the outcome of its SCF loop: a Gamma-point run with
+    full-grid orbitals, or a k-point run (:func:`parsec_python.SCF.kpoints.run_scf_kpoints` with
+    ``compute_forces=True``), whose nonlocal force was accumulated during its last step.
     The terms are those of ``forpbc.f90``, ``force_loc_pb.f90`` and ``forcnloc.f90``: the Ewald ion-ion force, the
     local ionic and core-correction forces (there is no term for the SCF residual in the periodic path) and the
     nonlocal force with the periodic projectors; then the net force is removed.  ``operations`` are optional
@@ -206,16 +208,24 @@ def compute_periodic_forces(
     local = periodic_local_forces(
         system.grid, atoms, system.pseudopotentials, specifications, lattice, result.density, result.xc_potential
     )
-    gradients = build_periodic_projector_gradients(
-        system.grid, atoms, system.pseudopotentials, specifications, lattice
-    )
-    separable = nonlocal_forces(
-        system.nonlocal_operator,
-        gradients,
-        result.wavefunctions,
-        result.occupations if getattr(result, "spin", None) is None else 0.5 * np.asarray(result.occupations),
-        len(atoms),
-    )
+    if getattr(result, "k_points", None) is not None:
+        # a k-point run does not keep its eigenvectors: the term was accumulated from them at the end of the SCF
+        if result.nonlocal_forces is None:
+            raise ValueError(
+                "a k-point result needs its nonlocal forces from the SCF step: run it with compute_forces=True"
+            )
+        separable = np.asarray(result.nonlocal_forces, dtype=np.float64)
+    else:
+        gradients = build_periodic_projector_gradients(
+            system.grid, atoms, system.pseudopotentials, specifications, lattice
+        )
+        separable = nonlocal_forces(
+            system.nonlocal_operator,
+            gradients,
+            result.wavefunctions,
+            result.occupations if getattr(result, "spin", None) is None else 0.5 * np.asarray(result.occupations),
+            len(atoms),
+        )
     return assemble_forces(
         positions,
         repulsion,

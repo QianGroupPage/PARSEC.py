@@ -13,10 +13,10 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 - Isolated systems (`Boundary_Conditions: cluster`), sphere or box domain,
   CA/PZ LDA or PBE, without or with spin polarization, with or without
   nonlinear core correction, projectors through `l = 3`.
-- Periodic cells (`Boundary_Conditions: bulk`), without spin polarization and without spin-orbit coupling, at the Gamma
-  point or with a Monkhorst-Pack k-point sampling: forces, `Minimization: bfgs | simple | manual` and molecular dynamics.
-  See "Periodic cells" below. A spin-polarized or spin-orbit periodic calculation, and the accelerated (GPU) path, do not
-  have them yet.
+- Periodic cells (`Boundary_Conditions: bulk`), without spin-orbit coupling, at the Gamma point or with a Monkhorst-Pack
+  k-point sampling (collinear spin polarization at the Gamma point only): forces, `Minimization: bfgs | simple | manual`
+  and molecular dynamics. See "Periodic cells" below. A spin-orbit periodic calculation, a spin-polarized one with
+  k-points, and the accelerated (GPU) path, do not have them yet.
 - A spin-polarized calculation uses the same routines: `forcloc.f90` reads
   the total density and the averages over the two channels of the potential
   difference and of the exchange-correlation potential, and `forcnloc.f90`
@@ -229,6 +229,23 @@ sums over form factors (they equal ion-ion plus the numerical derivative of that
 PARSEC.py's are the exact derivatives of the grid-sampled energy. The relaxation and dynamics loops are tested on a
 hydrogen pair at the Gamma point and with two k-points (`tests/unit/test_periodic_ionic.py`); the energy of a short NVE run
 is conserved to 1e-3 eV/atom.
+
+**Spin polarization (Gamma point).** A spin-polarized periodic cell that asks for forces, a relaxation or molecular
+dynamics runs the loop of the isolated spin-polarized path (`run_spin_scf`, which `run_scf` selects; the periodic system
+supplies its starting spin densities, spin-polarized XC and the `alpha` energy). The forces are the unpolarized ones on the
+total density, the average of the two channels' exchange-correlation potential and the orbitals of both channels at one
+electron per state; there is no term for the SCF residual. A spin-polarized input with k-points, spin-orbit coupling or
+non-collinear magnetism has no forces. Checked three ways (`tests/unit/test_periodic_spin_forces.py`): a non-magnetic spin run
+has the energy and forces of the unpolarized run (2e-6); each term is the derivative of the spin energy functional at the
+converged orbitals (ion-ion 1e-12, local ionic 1e-7, nonlocal 1e-8 Ry/bohr with the cubic spline; the core term as in the
+unpolarized case); and against Fortran with the same fixed occupations (`occup.in`, 6 up and 5 down states, three Ge atoms
+with one electron removed): total force 2.0e-3 / 6.3e-4 at 24 / 32 points (2.0e-3 / 6.1e-4 unpolarized), nonlocal
+3.2e-5 / 5.2e-6. Two Fortran conventions show in such a comparison. Its `alpha` energy is multiplied by the total ionic
+charge, not by the number of electrons, so a charged cell differs by a constant (0.191 Ry per electron of charge for this
+cell; forces are not affected). And `rho_har.F90` shifts the exchange-correlation potential of each spin channel to zero
+average in a periodic cell, which removes the average exchange splitting between the channels: with Fermi smearing, where
+both channels share one Fermi level, Fortran settles at a smaller moment (0.69 against 0.94 Bohr magnetons for that cell at
+1000 K) than the LSDA solution that PARSEC.py keeps; with fixed occupations the two agree.
 
 ## Structural relaxation
 

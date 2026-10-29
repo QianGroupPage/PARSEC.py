@@ -416,6 +416,7 @@ def spin_total_energy(
     exchange_correlation_energy: float,
     ion_ion_energy: float,
     volume_element: float,
+    alpha_z_energy: float = 0.0,
 ) -> EnergyBreakdown:
     """Evaluate ``totnrg.f90`` for two spin channels, up first.
 
@@ -423,7 +424,8 @@ def spin_total_energy(
     ``sum_s sum_i f_s,i e_s,i`` without the factor two of the unpolarized
     expression.  The Hartree and the electron-ion terms read the total
     density; the input-potential and the ``V_xc`` integrals are summed over
-    the channels, each with its own density and potential.
+    the channels, each with its own density and potential.  ``alpha_z_energy``
+    is the periodic cell's constant (zero for an isolated system).
     """
 
     ionic_potential = np.asarray(ionic_potential, dtype=float)
@@ -454,6 +456,8 @@ def spin_total_energy(
             * np.dot(density, np.asarray(input_potential) - ionic_potential)
         )
         vxc_integral += float(volume_element * np.dot(density, xc_potential))
+    # a periodic cell carries the alpha-Z term in its band energy, as in the unpolarized total_energy
+    band_energy += float(alpha_z_energy)
     total_density = np.asarray(densities[0], dtype=float) + np.asarray(
         densities[1], dtype=float
     )

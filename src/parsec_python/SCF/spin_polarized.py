@@ -413,6 +413,7 @@ def run_spin_scf(
             xc.total_energy,
             system.ion_ion_energy,
             volume_element,
+            alpha_z_energy=getattr(system, "alpha_z_energy", 0.0),
         )
 
         # 6. Mix the two potentials as one vector, up first, and test the

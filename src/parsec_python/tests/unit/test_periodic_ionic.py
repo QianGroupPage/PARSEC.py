@@ -7,6 +7,8 @@ fraction of a second since the image sums stop where the tables are Coulomb or z
 
 from __future__ import annotations
 
+import re
+
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from io import StringIO
@@ -229,7 +231,7 @@ Max_Iter: 80
 Eigensolver: chebdav
 Diag_Tolerance: 1e-9
 Fermi_Temp: 300 K
-Mixing_Param: 0.1
+Mixing_Param: {mixing}
 Memory_Param: 6
 Mixing_Safeguard: true
 {extra}
@@ -247,11 +249,11 @@ end Atom_Coord
 
 
 class CommandLineTests(unittest.TestCase):
-    def _run(self, extra: str, main=reference_main, *options: str):
+    def _run(self, extra: str, main=reference_main, *options: str, mixing: str = "0.1"):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         folder = Path(directory.name)
-        (folder / "parsec.in").write_text(_INPUT.format(extra=extra))
+        (folder / "parsec.in").write_text(_INPUT.format(extra=extra, mixing=mixing))
         (folder / "H_POTRE.DAT").write_bytes(_H.read_bytes())
         output, error = StringIO(), StringIO()
         previous = os.getcwd()
@@ -299,6 +301,42 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(len(rows), 1 + 4)  # the header and steps 0 to 3
         total = [float(row.split()[4]) for row in rows[1:]]
         self.assertLess(max(total) - min(total), 5.0e-3)  # eV per atom: the kinetic and potential energies move by ~0.03
+
+    _SPIN = "Net_Charges: 1 e\nSpin_Polarization: .true.\n"
+
+    def test_forces_of_a_spin_polarized_cell(self) -> None:
+        code, _, folder = self._run(self._SPIN + "Skip_Force: .false.", mixing="0.3")
+        self.assertEqual(code, 0)
+        text = (folder / "parsec.out").read_text()
+        self.assertIn("Net magnetic moment", text)
+        for line in ("(Ewald forces included)", "Reporting non-local force components", "after setting net force to zero"):
+            self.assertIn(line, text)
+
+    def test_relaxation_of_a_spin_polarized_cell(self) -> None:
+        code, _, folder = self._run(
+            self._SPIN + "Minimization: bfgs\nMovement_Num: 4\nForce_Min: 1e-3 Ry/bohr", mixing="0.3"
+        )
+        self.assertIn(code, (0, 4))
+        energies = [float(value) for value in re.findall(r"energy_Ry=(-?\d+\.\d+)", (folder / "relaxation.xyz").read_text())]
+        self.assertGreaterEqual(len(energies), 3)
+        self.assertLess(energies[-1], energies[0])
+
+    def test_molecular_dynamics_of_a_spin_polarized_cell(self) -> None:
+        code, _, folder = self._run(
+            self._SPIN + "Molecular_Dynamics: .true.\nTinit: 300\nT_Final: 200\nT_Step: 10\nTime_Step: 20\nStep_Num: 3\nRng_Seed: 7",
+            mixing="0.3",
+        )
+        self.assertEqual(code, 0)
+        rows = (folder / "md_nrg.dat").read_text().strip().splitlines()
+        self.assertEqual(len(rows), 1 + 4)
+        total = [float(row.split()[4]) for row in rows[1:]]
+        self.assertLess(max(total) - min(total), 5.0e-3)
+
+    def test_a_spin_polarized_cell_with_kpoints_has_no_forces(self) -> None:
+        extra = self._SPIN + "Skip_Force: .false.\nKpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 1 1\nend Monkhorst_Pack_Grid"
+        code, error, _ = self._run(extra)
+        self.assertEqual(code, 2)
+        self.assertIn("spin-polarized periodic calculation with k-points", error)
 
 
 if __name__ == "__main__":

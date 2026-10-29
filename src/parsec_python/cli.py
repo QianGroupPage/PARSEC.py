@@ -1163,12 +1163,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         or translation.molecular_dynamics is not None
         or translation.compute_forces
     )
-    # A scalar periodic cell (Gamma point or Monkhorst-Pack points, no spin, no spin-orbit coupling) that asks for forces,
-    # a relaxation or molecular dynamics runs the ionic loops of the isolated path with the periodic backend.
+    # A periodic cell that asks for forces, a relaxation or molecular dynamics runs the ionic loops of the isolated path
+    # with the periodic backend: scalar, at the Gamma point or with Monkhorst-Pack points, or collinear spin-polarized
+    # at the Gamma point (no spin-orbit coupling, no non-collinear magnetism).
+    gamma_only = k_sampling is None or (len(k_sampling[0]) == 1 and not np.any(k_sampling[0]))
     periodic_ionic = bool(
         is_periodic
         and ionic_requested
-        and not (self_consistent_spin_orbit or noncollinear or spin_polarized)
+        and not (self_consistent_spin_orbit or noncollinear)
+        and (not spin_polarized or (gamma_only and not has_soc_species))
     )
     uses_extended_drivers = not periodic_ionic and bool(
         self_consistent_spin_orbit
@@ -1185,9 +1188,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "Input error: Minimization, Molecular_Dynamics, Skip_Force: false and "
             "Energy_Refinement are not implemented together with spin-orbit coupling, "
-            "non-collinear magnetism or a spin-polarized periodic or spin-orbit "
-            "calculation (a spin-unpolarized periodic cell, at the Gamma point or with "
-            "k-points, has forces, relaxation and molecular dynamics)",
+            "non-collinear magnetism or a spin-polarized periodic calculation with "
+            "k-points (a periodic cell without spin-orbit coupling has forces, relaxation "
+            "and molecular dynamics: spin-unpolarized at the Gamma point or with k-points, "
+            "spin-polarized at the Gamma point)",
             file=sys.stderr,
         )
         return 2
@@ -1213,7 +1217,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if (
                 noncollinear
                 or (is_periodic and (self_consistent_spin_orbit or k_sampling is not None))
-                or (is_periodic and spin_polarized and not has_soc_species and parallel_backend_uses_device())
+                or (
+                    is_periodic
+                    and spin_polarized
+                    and not has_soc_species
+                    and not periodic_ionic
+                    and parallel_backend_uses_device()
+                )
             ):
                 # these drivers hand their eigenproblems to the k-point solver: say where it runs
                 for line in parallel_backend_report():
@@ -1254,8 +1264,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             outcome = None
             dynamics = None
             if is_periodic:
+                # the spin-polarized loop is the Gamma-point one, whatever Monkhorst-Pack grid of one point the input names
+                backend_k_sampling = None if spin_polarized else k_sampling
                 backend_factory = lambda extrapolation="none": periodic_backend(  # noqa: E731
-                    *(k_sampling if k_sampling is not None else (None, None)), extrapolation
+                    *(backend_k_sampling if backend_k_sampling is not None else (None, None)), extrapolation
                 )
             else:
                 backend_factory = reference_backend

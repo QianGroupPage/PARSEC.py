@@ -560,9 +560,10 @@ class SCFSettings:
     section of ``occup.in``) and ``fixed_occupations_down`` those of the
     down channel (its second section).
 
-    For an isolated input without spin-orbit coupling, ``spin_polarized`` is
-    run by :func:`~parsec_python.SCF.spin_polarized.run_spin_scf`; periodic
-    cells, spin-orbit coupling and non-collinear magnetism use
+    For an isolated input without spin-orbit coupling, and for a periodic cell at the Gamma point whose
+    forces, relaxation or dynamics are asked for, ``spin_polarized`` is run by
+    :func:`~parsec_python.SCF.spin_polarized.run_spin_scf`; the periodic energy-only runs, spin-orbit coupling and
+    non-collinear magnetism use
     :func:`~parsec_python.SCF.spin_polarized.run_scf_spin_polarized` and the
     k-point drivers.
 

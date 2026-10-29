@@ -37,13 +37,17 @@ from ..V_ion import (
 from ..V_xc import (
     NoncollinearXCResult,
     SpinPolarizedXCResult,
+    SpinXCResult,
     XCResult,
     ca_lda,
+    ca_lda_spin,
     ca_lda_spin_polarized,
     pbe,
     noncollinear_xc,
+    pbe_spin,
     pbe_spin_polarized,
 )
+from .single_point import _species_densities, initial_spin_densities
 from .single_point import run_scf as _run_scf
 
 
@@ -67,6 +71,8 @@ class PeriodicPreparedSinglePointSystem:
     atomic_reference_correction: float = 0.0
     alpha_z_energy: float = 0.0
     timings: PreparationTimings = field(default_factory=PreparationTimings)
+    initial_spin_densities: tuple[np.ndarray, np.ndarray] | None = None
+    """Starting densities of the up and the down channel of a ``Spin_Polarization`` calculation (``initchrg.f90``)."""
 
     @property
     def cell_atoms(self) -> tuple:
@@ -123,6 +129,16 @@ class PeriodicPreparedSinglePointSystem:
             f"xc_functional={self.input.scf.xc_functional!r} is not supported for "
             "the periodic path"
         )
+
+    def evaluate_spin_xc(self, density_up: np.ndarray, density_down: np.ndarray) -> SpinXCResult:
+        """The spin-polarized XC functional of the loop of :func:`parsec_python.SCF.spin_polarized.run_spin_scf`."""
+
+        functional = self.input.scf.xc_functional
+        if functional == "ca":
+            return ca_lda_spin(density_up, density_down, self.grid.volume_element, self.core_density)
+        if functional == "pbe":
+            return pbe_spin(density_up, density_down, self.grid, self.core_density)
+        raise ValueError(f"unsupported XC functional {functional!r}")
 
     def evaluate_xc_spin_polarized(
         self, density_up: np.ndarray, density_down: np.ndarray
@@ -204,6 +220,18 @@ def _geometry_terms(problem: SinglePointInput, grid, atoms, pseudopotentials, el
     initial_density = superpose_atomic_density(
         grid, atoms, pseudopotentials, problem.pseudopotentials, lattice_vectors
     )
+    spin_densities = None
+    if problem.scf.spin_polarized:
+        # initchrg.f90: the two channels carry the factor that normalizes the total density (see initial_spin_densities)
+        def superpose(grid_, atoms_, pseudopotentials_, specifications_):
+            return superpose_atomic_density(grid_, atoms_, pseudopotentials_, specifications_, lattice_vectors)
+
+        spin_densities = initial_spin_densities(
+            initial_density,
+            _species_densities(initial_density, superpose, grid, atoms, pseudopotentials, problem.pseudopotentials),
+            {symbol: specification.initial_spin_polarization for symbol, specification in problem.pseudopotentials.items()},
+            electron_count / grid.integrate(initial_density) if problem.scf.normalize_initial_density else 1.0,
+        )
     if problem.scf.normalize_initial_density:
         initial_density = normalize_density(initial_density, grid, electron_count)
     initial_density_seconds = time.perf_counter() - stage_start
@@ -226,6 +254,7 @@ def _geometry_terms(problem: SinglePointInput, grid, atoms, pseudopotentials, el
             core_density=core_density,
             ion_ion_energy=repulsion,
             alpha_z_energy=alpha_z_energy,
+            initial_spin_densities=spin_densities,
         ),
         "seconds": dict(
             local_ionic_seconds=local_ionic_seconds,

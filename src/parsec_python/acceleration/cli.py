@@ -10,6 +10,8 @@ import sys
 import time
 from typing import Sequence
 
+import numpy as np
+
 from parsec_python.Eigensolvers.perturbative_soc import build_spin_orbit_projectors
 from parsec_python.Input import (
     ParsecInputError,
@@ -17,6 +19,7 @@ from parsec_python.Input import (
     summarize_translation,
 )
 from parsec_python.Output.parsec_output import domain_dry_run_lines
+from parsec_python.models import SinglePointInput
 from parsec_python.V_ion import load_pseudopotentials
 from parsec_python.MolecularDynamics.run import (
     restart_structure as dynamics_restart_structure,
@@ -502,22 +505,30 @@ def _reference_only_features(
         features.append(
             "spin polarization of a periodic system or of spin-orbit species"
         )
-    if problem.has_kpoint_sampling and not (
-        (problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear)
-        and problem.periodic_cell is not None
+    if (
+        problem.has_kpoint_sampling
+        and not _gamma_point_only(problem)
+        and not (
+            (problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear)
+            and problem.periodic_cell is not None
+        )
     ):
         features.append("k-point sampling (Monkhorst-Pack or explicit list)")
-    if problem.periodic_cell is not None and (
-        translation.relaxation is not None
-        or translation.molecular_dynamics is not None
-        or translation.compute_forces
-    ):
-        # the ionic loops of the accelerated driver move isolated structures; a periodic cell has the forces of
-        # parsec_python.Forces.compute_periodic_forces and the periodic backend of the reference solver
-        features.append("forces, relaxation and molecular dynamics of a periodic cell")
     if problem.bands is not None:
         features.append("band structure along a k-path (bandstruc)")
     return features
+
+
+def _gamma_point_only(problem: SinglePointInput) -> bool:
+    """Whether the k-point sampling of the input is the Gamma point alone (``mp 1 1 1``, or a list of one k = 0).
+
+    That is the Gamma-point calculation of the accelerated path, not a k-point sampling.
+    """
+
+    from parsec_python.Grid import kpoint_sampling
+
+    sampling = kpoint_sampling(problem)
+    return sampling is not None and len(sampling[0]) == 1 and not np.any(sampling[0])
 
 
 def _reference_argv(arguments: argparse.Namespace) -> list[str]:

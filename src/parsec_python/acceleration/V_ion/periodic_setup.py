@@ -97,11 +97,13 @@ def grid_ball(grid, centre: np.ndarray, radius: float):
     return rows[keep], relative[keep], distances[keep]
 
 
-def _atom_balls(grid, position: np.ndarray, radius: float):
+def _atom_balls(grid, position: np.ndarray, radius: float, *, vectors: bool = False):
     """Yield ``(rows, distances)`` of the grid points within ``radius`` of each periodic image of an atom.
 
     One item per image box, so a cell much smaller than ``radius`` (thousands of overlapping images) is
-    never held in memory at once; rows repeat across images and the caller sums over them.
+    never held in memory at once; rows repeat across images and the caller sums over them.  With
+    ``vectors=True`` each item is ``(rows, distances, relative)``, ``relative`` being the displacements from
+    the image of the atom (what a force needs).
     """
     n, lattice, inverse = _cell_geometry(grid)
     fractional = np.asarray(position, dtype=float) @ inverse
@@ -126,7 +128,10 @@ def _atom_balls(grid, position: np.ndarray, radius: float):
                 distance = np.linalg.norm(relative, axis=1)
                 keep = distance <= radius
                 if np.any(keep):
-                    yield box[keep], distance[keep]
+                    if vectors:
+                        yield box[keep], distance[keep], relative[keep]
+                    else:
+                        yield box[keep], distance[keep]
 
 
 def _structure_factor_series(
@@ -183,6 +188,20 @@ def _structure_factor_series(
     return (np.fft.ifftn(spectrum) * spectrum.size).real.reshape(-1)
 
 
+def fast_splitting(grid, lattice_vectors, tolerance: float) -> tuple[float, float, float]:
+    """``(eta, erfc_cutoff, g_cutoff)`` of the fast Ewald split on this grid.
+
+    ``eta`` is the largest one whose reciprocal series (``|G| <= g_cutoff = 2 eta sqrt(-ln tolerance)``) ends below
+    ``_NYQUIST_FRACTION`` of the grid's Nyquist frequency, so the series is represented exactly on the grid;
+    ``erfc_cutoff`` is the radius beyond which ``erfc(eta r)`` is below ``tolerance``.
+    """
+    _, lattice, _ = _cell_geometry(grid, lattice_vectors)
+    n = np.asarray(grid.points_per_axis, dtype=np.int64)
+    nyquist = math.pi / float(np.max(np.linalg.norm(lattice, axis=1) / n))
+    eta = _NYQUIST_FRACTION * nyquist / (2.0 * math.sqrt(-math.log(tolerance)))
+    return eta, float(erfcinv(tolerance) / eta), 2.0 * eta * math.sqrt(-math.log(tolerance))
+
+
 def fft_local_ionic_potential(
     grid, atoms: Sequence, potentials, specifications, lattice_vectors, eta, tolerance
 ):
@@ -194,9 +213,7 @@ def fft_local_ionic_potential(
     reference_eta, _, _ = _ewald._ewald_cutoffs(volume, eta, tolerance)
 
     # the series has |m_i| <= cutoff |a_i|/(2 pi), below n_i/2 when cutoff < pi/step_i for every axis
-    nyquist = math.pi / float(np.max(np.linalg.norm(lattice, axis=1) / n))
-    fast_eta = _NYQUIST_FRACTION * nyquist / (2.0 * math.sqrt(-math.log(tolerance)))
-    erfc_cutoff = float(erfcinv(tolerance) / fast_eta)
+    fast_eta, erfc_cutoff, _ = fast_splitting(grid, lattice_vectors, tolerance)
 
     positions = np.array([np.asarray(atom.position, dtype=np.float64) for atom in atoms])
     charges = np.array([potentials[atom.symbol].ionic_charge for atom in atoms], dtype=np.float64)
@@ -263,4 +280,4 @@ def uninstall() -> None:
     _ewald.set_local_potential_provider(None)
 
 
-__all__ = ["fft_local_ionic_potential", "grid_ball", "install", "uninstall"]
+__all__ = ["fast_splitting", "fft_local_ionic_potential", "grid_ball", "install", "uninstall"]

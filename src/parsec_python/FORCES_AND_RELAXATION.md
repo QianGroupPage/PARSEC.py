@@ -15,8 +15,8 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
   nonlinear core correction, projectors through `l = 3`.
 - Periodic cells (`Boundary_Conditions: bulk`), without spin-orbit coupling, at the Gamma point or with a Monkhorst-Pack
   k-point sampling (collinear spin polarization at the Gamma point only): forces, `Minimization: bfgs | simple | manual`
-  and molecular dynamics. See "Periodic cells" below. A spin-orbit periodic calculation, a spin-polarized one with
-  k-points, and the accelerated (GPU) path, do not have them yet.
+  and molecular dynamics. See "Periodic cells" below; the spin-unpolarized Gamma-point cell also runs on the accelerated
+  path (see "On GPUs"). A spin-orbit periodic calculation and a spin-polarized one with k-points do not have them yet.
 - A spin-polarized calculation uses the same routines: `forcloc.f90` reads
   the total density and the averages over the two channels of the potential
   difference and of the exchange-correlation potential, and `forcnloc.f90`
@@ -157,7 +157,8 @@ symmetrization, the net force that was removed and the torque.
 
 A periodic cell has forces, relaxation and molecular dynamics through the periodic backend
 (`Relaxation.periodic_backend`) of the readable solver. `main.py` hands such an input to `parsec_python.cli`
-(`NOTE: ... running the reference parsec_python.cli solver instead`): the accelerated path moves isolated structures only.
+(`NOTE: ... running the reference parsec_python.cli solver instead`) when it has k-points or spin; a spin-unpolarized
+Gamma-point cell stays on the accelerated path.
 
 Forces (`Forces.compute_periodic_forces`; the Fortran routines are `forpbc.f90`, `force_loc_pb.f90`, `ewald_sum.f90` and
 `forcnloc.f90`):
@@ -413,6 +414,19 @@ Nothing leaves the devices that a single point keeps there.
 - **Several nodes**: the rank of each node rebuilds the projectors of its own
   sectors (command `geometry`), restarts its solvers (`new_scf_loop`) and
   contracts its part of the nonlocal force (`forces`); the root sums them.
+- **Periodic cells (Gamma point, no spin)**: forces, relaxation and molecular dynamics run on the accelerated path.
+  Moving the atoms replaces the projectors on the device operator and rebuilds the ionic potential, the densities and the
+  Ewald terms from the folded positions (`update_periodic_geometry`); the Hartree solve of a periodic cell is the readable
+  one. The nonlocal force is contracted on the device that holds the orbitals with the gradients of the periodic
+  projectors, as for an isolated structure. The local ionic and core-correction forces
+  (`acceleration/Forces/periodic_local.py`) replace the scan of the whole grid for every image and the grid-by-G phase matrix
+  of the readable routine with a ball around each image of each atom and one FFT of the density, read at the reciprocal
+  vectors of the Ewald series, with the Gaussian width chosen so that the series ends below the Nyquist frequency of the grid
+  (the way the fast ionic potential is made). The sums are written against an array module: NumPy on the host, CuPy
+  (with `cupyx.scipy.special.erf`) when the calculation ran on a GPU, which then forms the radial slopes, products and sums
+  and the FFT; the balls themselves are generated on the host from index ranges. The forces are those of the readable routine
+  to 1e-7 Ry/bohr (the splitting of the Ewald sum; 1e-13 for a table cut at 14 bohr). Not accelerated: k-points, spin,
+  several nodes (an MPI context is refused for a periodic cell), and the Ewald ion-ion force, which stays on the host.
 
 The multi-node runner divides the symmetry sectors of the structure among its
 ranks, one per node. A structure without point-group symmetry, a relaxation

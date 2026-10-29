@@ -280,8 +280,54 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("after setting net force to zero", (folder / "parsec.out").read_text())
 
-    def test_the_accelerated_driver_hands_a_periodic_cell_with_forces_to_the_reference_solver(self) -> None:
+    @staticmethod
+    def _final_forces(folder: Path) -> np.ndarray:
+        """The last table of forces after the net force is removed, from ``parsec.out`` (six decimals)."""
+        lines = (folder / "parsec.out").read_text().splitlines()
+        start = max(i for i, line in enumerate(lines) if "after setting net force to zero" in line)
+        rows = [line.split() for line in lines[start:] if re.match(r"^\s*\d+(\s+-?\d+\.\d+){6}\s*$", line)]
+        return np.array([[float(value) for value in row[4:7]] for row in rows])
+
+    def test_the_accelerated_driver_runs_a_periodic_cell_with_forces(self) -> None:
         code, error, folder = self._run("Skip_Force: .false.", accelerated_main)
+        self.assertEqual(code, 0)
+        self.assertNotIn("running the reference parsec_python.cli solver instead", error)
+        reference_code, _, reference_folder = self._run("Skip_Force: .false.")
+        self.assertEqual(reference_code, 0)
+        np.testing.assert_allclose(self._final_forces(folder), self._final_forces(reference_folder), atol=2.0e-6)
+
+    def test_the_accelerated_driver_relaxes_a_periodic_cell_like_the_reference(self) -> None:
+        extra = "Minimization: bfgs\nMovement_Num: 4\nForce_Min: 1e-3 Ry/bohr"
+        code, error, folder = self._run(extra, accelerated_main)
+        self.assertIn(code, (0, 4))
+        self.assertNotIn("running the reference parsec_python.cli solver instead", error)
+        _, _, reference_folder = self._run(extra)
+        energies = [re.findall(r"energy_Ry=(-?\d+\.\d+)", (f / "relaxation.xyz").read_text()) for f in (folder, reference_folder)]
+        self.assertGreaterEqual(len(energies[0]), 3)
+        self.assertEqual(len(energies[0]), len(energies[1]))
+        np.testing.assert_allclose([float(v) for v in energies[0]], [float(v) for v in energies[1]], atol=1.0e-5)
+
+    def test_the_accelerated_driver_runs_molecular_dynamics_of_a_periodic_cell(self) -> None:
+        extra = "Molecular_Dynamics: .true.\nTinit: 300\nT_Final: 200\nT_Step: 10\nTime_Step: 20\nStep_Num: 3\nRng_Seed: 7"
+        code, error, folder = self._run(extra, accelerated_main)
+        self.assertEqual(code, 0)
+        self.assertNotIn("running the reference parsec_python.cli solver instead", error)
+        rows = (folder / "md_nrg.dat").read_text().strip().splitlines()
+        self.assertEqual(len(rows), 1 + 4)
+        total = [float(row.split()[4]) for row in rows[1:]]
+        self.assertLess(max(total) - min(total), 5.0e-3)
+
+    def test_a_gamma_only_kpoint_block_is_the_gamma_point_of_the_accelerated_path(self) -> None:
+        extra = "Skip_Force: .false.\nKpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n1 1 1\nend Monkhorst_Pack_Grid"
+        code, error, folder = self._run(extra, accelerated_main)
+        self.assertEqual(code, 0)
+        self.assertNotIn("running the reference parsec_python.cli solver instead", error)
+        _, _, plain = self._run("Skip_Force: .false.", accelerated_main)
+        np.testing.assert_allclose(self._final_forces(folder), self._final_forces(plain), atol=2.0e-6)
+
+    def test_the_accelerated_driver_hands_kpoints_with_forces_to_the_reference_solver(self) -> None:
+        extra = "Skip_Force: .false.\nKpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 1 1\nend Monkhorst_Pack_Grid"
+        code, error, folder = self._run(extra, accelerated_main)
         self.assertEqual(code, 0)
         self.assertIn("running the reference parsec_python.cli solver instead", error)
         self.assertIn("after setting net force to zero", (folder / "parsec.out").read_text())

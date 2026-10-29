@@ -22,6 +22,7 @@ from parsec_python.Forces import (
     ForceResult,
     assemble_forces,
     atom_symmetry_operations,
+    ewald_ion_ion_forces,
     ion_ion_forces,
     local_forces,
     nonlocal_forces,
@@ -143,6 +144,76 @@ def _spin_nonlocal_forces(system, channels, operator, atom_count: int) -> np.nda
     return forces
 
 
+def _array_module(system):
+    """``(xp, erf, device)`` of the sums of a periodic cell: CuPy on the current device when the calculation ran on a GPU."""
+
+    if system.backend_info.selected != "cupy":
+        return np, None, None
+    from cupyx.scipy.special import erf
+
+    from ..backends.cupy import require_cupy
+    from .local_device import local_force_device_ids
+
+    cp, _ = require_cupy()
+    return cp, erf, local_force_device_ids(system)[0]
+
+
+def compute_periodic_forces(
+    system,
+    result,
+    *,
+    symmetrize: bool = False,
+    operations: Sequence[AtomSymmetryOperation] | None = None,
+) -> ForceResult:
+    """Forces of a finished accelerated SCF calculation of a periodic cell at the Gamma point.
+
+    The terms are those of :func:`parsec_python.Forces.compute_periodic_forces`.  The Ewald ion-ion force is formed on
+    the host.  The local ionic and core-correction forces are the ball sums and the one FFT of
+    :func:`.periodic_local.fast_periodic_local_forces`, on the GPU when the calculation ran on one.  The nonlocal term is
+    contracted where the orbitals are, as for an isolated structure, with the gradients of the periodic projectors.
+    A crystal has no symmetrization here, no torque, and its net force is removed.
+    """
+
+    if symmetrize or operations:
+        raise ValueError(
+            "a periodic cell has no symmetrized forces: its structure is not reduced by space-group operations"
+        )
+    from .periodic_local import fast_periodic_local_forces
+
+    started = perf_counter()
+    clock: dict[str, float] = {}
+    reference = system.reference
+    atoms = reference.cell_atoms
+    positions = np.array([atom.position for atom in reference.atoms], dtype=np.float64)
+    lattice = np.asarray(system.input.periodic_cell.lattice_vectors, dtype=np.float64)
+    repulsion = ewald_ion_ion_forces(atoms, system.pseudopotentials, lattice)
+    clock["ion_ion"] = perf_counter() - started
+    mark = perf_counter()
+    xp, erf, device = _array_module(system)
+    arguments = (
+        system.grid,
+        atoms,
+        system.pseudopotentials,
+        system.input.pseudopotentials,
+        lattice,
+        result.density,
+        result.xc_potential,
+    )
+    if device is None:
+        local = fast_periodic_local_forces(*arguments)
+    else:
+        with xp.cuda.Device(device):
+            local = fast_periodic_local_forces(*arguments, xp=xp, erf=erf)
+    clock["local"] = perf_counter() - mark
+    mark = perf_counter()
+    separable = _nonlocal_forces(system, result, clock)
+    clock["nonlocal"] = perf_counter() - mark
+    forces = assemble_forces(
+        positions, repulsion, local, separable, None, phase_seconds=clock, periodic=True
+    )
+    return replace(forces, seconds=perf_counter() - started)
+
+
 def compute_forces(
     system,
     result,
@@ -159,6 +230,8 @@ def compute_forces(
     on the root rank.
     """
 
+    if getattr(system.input, "periodic_cell", None) is not None:
+        return compute_periodic_forces(system, result, symmetrize=symmetrize, operations=operations)
     started = perf_counter()
     clock: dict[str, float] = {}
     atoms = system.atoms
@@ -223,4 +296,4 @@ def compute_forces(
     return replace(forces, seconds=perf_counter() - started)
 
 
-__all__ = ["compute_forces", "sector_columns"]
+__all__ = ["compute_forces", "compute_periodic_forces", "sector_columns"]

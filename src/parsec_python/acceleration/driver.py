@@ -4055,12 +4055,26 @@ def _prepare_single_point(
         )
 
         operator = reference.nonlocal_operator
-        gradients = build_nonlocal_projector_gradients(
-            reference.grid,
-            reference.atoms,
-            reference.pseudopotentials,
-            reference.input.pseudopotentials,
-        )
+        if is_periodic:
+            from parsec_python.Forces.nonlocal_force import (
+                build_periodic_projector_gradients,
+            )
+
+            # images and the folded atoms of the projector builder
+            gradients = build_periodic_projector_gradients(
+                reference.grid,
+                reference.cell_atoms,
+                reference.pseudopotentials,
+                reference.input.pseudopotentials,
+                reference.input.periodic_cell.lattice_vectors,
+            )
+        else:
+            gradients = build_nonlocal_projector_gradients(
+                reference.grid,
+                reference.atoms,
+                reference.pseudopotentials,
+                reference.input.pseudopotentials,
+            )
         columns = gradient_columns_for(operator.labels, gradients.labels)
         if isinstance(columns, slice):
             return gradients
@@ -4091,6 +4105,16 @@ def _prepare_single_point(
             Atom(atom.symbol, position)
             for atom, position in zip(reference.atoms, positions)
         )
+        if is_periodic:
+            # No Hartree boundary, symmetry sectors or native XC evaluator: the projectors are replaced on the device
+            # operator and the reference system (ionic potential, densities, Ewald terms) is rebuilt for the new
+            # positions; the Hartree closure reads the rebound ``reference``.
+            from parsec_python.SCF import update_periodic_geometry
+
+            moved = update_periodic_geometry(reference, atoms)
+            implementation.replace_nonlocal_operator(moved.nonlocal_operator)
+            reference = moved
+            return
         if symmetry_reduction is not None:
             # Sectors, wedge fields and wedge sums hold for this group only.
             from .Forces.local_device import sector_atom_images
@@ -4172,8 +4196,8 @@ def _prepare_single_point(
         ),
         hartree_solver=accelerated_hartree,
         boundary_tail_maximum=tail_maximum(),
-        geometry_updater=None if is_periodic else update_system,
-        projector_gradients=None if is_periodic else projector_gradients,
+        geometry_updater=update_system,
+        projector_gradients=projector_gradients,
         orbital_density_builder=getattr(
             implementation, "orbital_density_builder", None
         ),

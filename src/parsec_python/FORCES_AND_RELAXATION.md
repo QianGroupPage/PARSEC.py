@@ -16,7 +16,8 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 - Periodic cells (`Boundary_Conditions: bulk`), without spin-orbit coupling, at the Gamma point or with a Monkhorst-Pack
   k-point sampling (collinear spin polarization at the Gamma point only): forces, `Minimization: bfgs | simple | manual`
   and molecular dynamics. See "Periodic cells" below; the spin-unpolarized Gamma-point cell also runs on the accelerated
-  path (see "On GPUs"). A spin-orbit periodic calculation and a spin-polarized one with k-points do not have them yet.
+  path, and a cell with k-points on the GPUs of the k-point solver (see "On GPUs"). A spin-orbit periodic calculation and a
+  spin-polarized one with k-points do not have them yet.
 - A spin-polarized calculation uses the same routines: `forcloc.f90` reads
   the total density and the averages over the two channels of the potential
   difference and of the exchange-correlation potential, and `forcnloc.f90`
@@ -427,6 +428,16 @@ Nothing leaves the devices that a single point keeps there.
   and the FFT; the balls themselves are generated on the host from index ranges. The forces are those of the readable routine
   to 1e-7 Ry/bohr (the splitting of the Ewald sum; 1e-13 for a table cut at 14 bohr). Not accelerated: k-points, spin,
   several nodes (an MPI context is refused for a periodic cell), and the Ewald ion-ion force, which stays on the host.
+- **Periodic cells with k-points**: the accelerated command line hands such an input to the reference driver, whose k-point
+  solver puts one worker thread on each CUDA device (the output names the device under "Execution resources"). Its
+  eigenproblems, the density of each k-point and now the forces run there: the nonlocal force of a k-point is contracted on
+  the device that holds its orbitals (`acceleration/Forces/kpoint_nonlocal_device.py`: the overlaps with the complex Bloch
+  projectors and their gradients are sparse products on the device, a block of orbitals at a time, and only the `(atoms, 3)`
+  array returns; a k-point whose subspace was spilled to the host contracts there), and the local ionic and core-correction
+  forces are the ball sums and one FFT of the density of the Gamma-point path, with CuPy when the k-point plan uses a GPU
+  (the reference `periodic_local_forces` hands its sums to them once the acceleration package is imported). Not done: the
+  row-distributed MPI k-point solver, which has no nonlocal force; and the Ritz subspaces of the k-points, which restart
+  from scratch after an ionic move (the Gamma-point loop carries its subspace over), so a relaxation step costs a first solve.
 
 The multi-node runner divides the symmetry sectors of the structure among its
 ranks, one per node. A structure without point-group symmetry, a relaxation

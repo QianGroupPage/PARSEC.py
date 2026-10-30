@@ -766,7 +766,13 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
             return 2
         print(
             f"NOTE: {features} is not implemented on the accelerated path; "
-            "running the reference parsec_python.cli solver instead",
+            "running the reference parsec_python.cli solver instead"
+            + (
+                " (its k-point eigensolvers, and the force sums of a periodic cell, use the GPUs when CuPy and a device "
+                "are available; the output names the device)"
+                if reference_uses_gpu and resources.device != "cpu"
+                else ""
+            ),
             file=sys.stderr,
         )
         return reference_main(_reference_argv(arguments))

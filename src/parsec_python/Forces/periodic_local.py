@@ -53,6 +53,24 @@ def _erf_over_r_slope(charge: float, radius: np.ndarray, eta: float) -> np.ndarr
     return result
 
 
+# Like the local ionic potential (:func:`parsec_python.V_ion.ewald.set_local_potential_provider`), the sums can be made
+# by a faster routine with the same result: the acceleration package installs the ball sums and the one FFT of
+# :mod:`parsec_python.acceleration.Forces.periodic_local` when it is imported.  ``dense_periodic_local_forces`` is the
+# readable definition they are tested against.
+_local_force_provider = None
+
+
+def set_local_force_provider(provider) -> None:
+    """Install (or, with ``None``, remove) the routine that :func:`periodic_local_forces` hands the sums to.
+
+    The provider takes the arguments of :func:`periodic_local_forces` after ``eta`` is left out and returns its
+    :class:`LocalForceTerms`, or ``None`` to decline.
+    """
+
+    global _local_force_provider
+    _local_force_provider = provider
+
+
 def periodic_local_forces(
     grid,
     atoms: Sequence[Atom],
@@ -68,8 +86,34 @@ def periodic_local_forces(
     """Local-pseudopotential force terms of a periodic cell, ``(atoms, 3)`` in Ry/bohr.
 
     ``density`` is the valence density of the last SCF step in electrons/bohr**3 and ``xc_potential`` the
-    exchange-correlation potential made from it plus the frozen core density.
+    exchange-correlation potential made from it plus the frozen core density.  An installed provider forms the sums
+    (unless the splitting parameter ``eta`` is given, which only the readable routine takes).
     """
+
+    if _local_force_provider is not None and eta is None:
+        provided = _local_force_provider(
+            grid, atoms, potentials, specifications, lattice_vectors, density, xc_potential, tolerance=tolerance
+        )
+        if provided is not None:
+            return provided
+    return dense_periodic_local_forces(
+        grid, atoms, potentials, specifications, lattice_vectors, density, xc_potential, eta=eta, tolerance=tolerance
+    )
+
+
+def dense_periodic_local_forces(
+    grid,
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    specifications: Mapping[str, SpeciesPotential],
+    lattice_vectors: np.ndarray,
+    density: np.ndarray,
+    xc_potential: np.ndarray,
+    *,
+    eta: float | None = None,
+    tolerance: float = 1.0e-14,
+) -> LocalForceTerms:
+    """The sums of :func:`periodic_local_forces` as defined: over every grid point and image, and every reciprocal vector."""
 
     lattice_vectors = np.asarray(lattice_vectors, dtype=np.float64)
     if lattice_vectors.shape != (3, 3):
@@ -154,4 +198,4 @@ def periodic_local_forces(
     )
 
 
-__all__ = ["periodic_local_forces"]
+__all__ = ["dense_periodic_local_forces", "periodic_local_forces", "set_local_force_provider"]

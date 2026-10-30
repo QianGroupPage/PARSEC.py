@@ -271,13 +271,21 @@ def fft_local_ionic_potential(
 
 def install() -> None:
     """Make the fast replacements the ones the reference drivers use."""
+    from parsec_python.Forces import periodic_local as _force_sums
+
+    from ..Forces.periodic_local import local_force_provider
+
     _ionic.set_support_finder(grid_ball)
     _ewald.set_local_potential_provider(fft_local_ionic_potential)
+    _force_sums.set_local_force_provider(local_force_provider)
 
 
 def uninstall() -> None:
+    from parsec_python.Forces import periodic_local as _force_sums
+
     _ionic.set_support_finder(None)
     _ewald.set_local_potential_provider(None)
+    _force_sums.set_local_force_provider(None)
 
 
 __all__ = ["fast_splitting", "fft_local_ionic_potential", "grid_ball", "install", "uninstall"]

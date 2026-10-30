@@ -9,8 +9,10 @@ the reference system, keep them when its atoms move, and refuse symmetrization, 
 from __future__ import annotations
 
 import dataclasses
+import os
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -27,14 +29,18 @@ from parsec_python import (
     SpeciesPotential,
 )
 from parsec_python.acceleration import driver
-from parsec_python.acceleration.Forces.periodic_local import fast_periodic_local_forces
+from parsec_python.acceleration.Forces.kpoint_nonlocal_device import device_nonlocal_forces
+from parsec_python.acceleration.Forces.periodic_local import fast_periodic_local_forces, local_force_provider
 from parsec_python.Forces import compute_periodic_forces
-from parsec_python.Forces.periodic_local import periodic_local_forces
+from parsec_python.Forces.nonlocal_force import build_periodic_projector_gradients, nonlocal_forces
+from parsec_python.Forces import periodic_local as force_sums
+from parsec_python.Forces.periodic_local import dense_periodic_local_forces as periodic_local_forces
 from parsec_python.Grid import build_periodic_grid
 from parsec_python.Pseudopotential import read_parsec_pseudopotential
 from parsec_python.Relaxation import run_relaxation
 from parsec_python.SCF import prepare_periodic_single_point, run_scf
-from parsec_python.V_ion import ewald
+from parsec_python.SCF.kpoints import run_scf_kpoints
+from parsec_python.V_ion import build_nonlocal_projectors, ewald
 from parsec_python.models import RelaxationSettings
 
 _DATA = Path(__file__).resolve().parents[2] / "tests" / "data"
@@ -231,6 +237,78 @@ class AcceleratedPeriodicSystemTests(unittest.TestCase):
         self.assertGreaterEqual(len(energies), 3)
         self.assertLess(energies[-1], energies[0])
         self.assertTrue(all(record.converged for record in outcome.records))
+
+
+_K_POINTS = np.array([[0.21, -0.37, 0.11], [-0.40, 0.15, 0.30]])
+
+
+class KPointDeviceForceTests(unittest.TestCase):
+    def test_the_device_contraction_equals_the_host_one(self) -> None:
+        # CuPy cannot be run here: the contraction runs on a module with only CuPy's operations, over several blocks
+        system = prepare_periodic_single_point(_problem())
+        lattice = system.input.periodic_cell.lattice_vectors
+        generator = np.random.default_rng(5)
+        allowed = {"asarray", "ascontiguousarray", "conj", "real", "complex128"}
+
+        class Restricted:
+            def __getattr__(self, name):
+                if name not in allowed:
+                    raise AttributeError(f"{name} is not on the list of CuPy operations of the force sums")
+                return getattr(np, name)
+
+        import scipy.sparse as sp
+
+        for k_point in (_K_POINTS[0], _K_POINTS[1], np.zeros(3)):
+            with self.subTest(k=k_point.tolist()):
+                operator = build_nonlocal_projectors(
+                    system.grid, system.cell_atoms, system.pseudopotentials, system.input.pseudopotentials, lattice, k_point
+                )
+                gradients = build_periodic_projector_gradients(
+                    system.grid, system.cell_atoms, system.pseudopotentials, system.input.pseudopotentials, lattice, k_point
+                )
+                states = 7
+                raw = generator.standard_normal((system.grid.size, states)) + 1j * generator.standard_normal((system.grid.size, states))
+                orbitals, _ = np.linalg.qr(raw)
+                occupations = np.array([0.5, 0.4, 0.3, 0.0, 0.2, 0.1, 0.0])
+                host = nonlocal_forces(operator, gradients, orbitals, occupations, len(system.atoms))
+                blocks = 16 * (system.grid.size + 4 * operator.projectors.shape[1]) * 2  # two orbitals per block
+                device = device_nonlocal_forces(
+                    Restricted(), operator, gradients, orbitals, occupations, len(system.atoms), sparse=sp, block_bytes=blocks
+                )
+                self.assertGreater(float(np.max(np.abs(host))), 1.0e-3)
+                np.testing.assert_allclose(device, host, atol=1.0e-12)
+
+    def test_the_forces_of_a_kpoint_run_come_from_the_fast_sums(self) -> None:
+        problem = _problem()
+        system = prepare_periodic_single_point(problem)
+        weights = np.full(2, 0.5)
+        result = run_scf_kpoints(system, _K_POINTS, weights, compute_forces=True)
+        self.assertTrue(result.converged)
+        self.addCleanup(force_sums.set_local_force_provider, force_sums._local_force_provider)
+        force_sums.set_local_force_provider(local_force_provider)
+        with mock.patch(
+            "parsec_python.acceleration.Forces.periodic_local.fast_periodic_local_forces", wraps=fast_periodic_local_forces
+        ) as fast:
+            provided = compute_periodic_forces(system, result)
+        fast.assert_called_once()
+        force_sums.set_local_force_provider(None)
+        dense = compute_periodic_forces(system, result)
+        np.testing.assert_allclose(provided.total, dense.total, atol=1.0e-6)
+        np.testing.assert_allclose(provided.local.ionic, dense.local.ionic, atol=1.0e-6)
+        np.testing.assert_allclose(provided.local.core_correction, dense.local.core_correction, atol=1.0e-8)
+        self.assertGreater(float(np.max(np.abs(provided.total))), 0.1)
+
+    def test_the_provider_uses_the_host_for_a_plan_without_a_gpu(self) -> None:
+        potential = read_parsec_pseudopotential(_NA)
+        lattice = _CELLS["rectangular"]
+        grid = build_periodic_grid(PeriodicCell(lattice), PeriodicGridSettings(spacing=0.7, expansion_order=6))
+        density, xc = _fields(grid, lattice)
+        atoms = [Atom("Na", position) for position in _FRACTIONAL @ lattice]
+        arguments = (grid, atoms, {"Na": potential}, {"Na": SpeciesPotential(_NA, 0)}, lattice, density, xc)
+        with mock.patch.dict(os.environ, {"PARSEC_KPOINT_BACKEND": "numpy-device"}):  # the device code on the host
+            np.testing.assert_array_equal(
+                local_force_provider(*arguments).ionic, fast_periodic_local_forces(*arguments).ionic
+            )
 
 
 if __name__ == "__main__":

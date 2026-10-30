@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from parsec_python import Atom, PeriodicCell, PeriodicGridSettings, SpeciesPotential
+from parsec_python.Forces import periodic_local as force_sums
 from parsec_python.Forces.periodic_local import periodic_local_forces
 from parsec_python.Grid import build_periodic_grid
 from parsec_python.Pseudopotential import read_parsec_pseudopotential
@@ -102,6 +103,9 @@ class PeriodicLocalForceTests(unittest.TestCase):
         # the dense reference potential: another test may have installed the FFT provider of the acceleration package
         self.addCleanup(setattr, ewald, "_local_potential_provider", ewald._local_potential_provider)
         ewald.set_local_potential_provider(None)
+        # the dense sums are the definition these tests differentiate: no faster provider of the acceleration package
+        self.addCleanup(force_sums.set_local_force_provider, force_sums._local_force_provider)
+        force_sums.set_local_force_provider(None)
         # the periodic local potential always uses the cubic spline of its table (the default); the tests below that
         # compare the linear mode switch it off themselves
         self.addCleanup(setattr, ewald, "LOCAL_POTENTIAL_USES_CUBIC_SPLINE", ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE)

@@ -29,7 +29,7 @@ import numpy as np
 from scipy.special import erf as _host_erf
 
 from parsec_python.Forces import LocalForceTerms, species_force_tables
-from parsec_python.Forces.periodic_local import periodic_local_forces as reference_periodic_local_forces
+from parsec_python.Forces.periodic_local import dense_periodic_local_forces as reference_periodic_local_forces
 from parsec_python.models import Atom, SpeciesPotential
 from parsec_python.Pseudopotential import ParsecPseudopotential, ParsecRadialSpline
 from parsec_python.Pseudopotential.radial_derivatives import tail_start_radius
@@ -283,4 +283,35 @@ def fast_periodic_local_forces(
     )
 
 
-__all__ = ["fast_periodic_local_forces"]
+def _device_module():
+    """``(xp, erf, device)`` for the forces of a calculation run through the reference drivers: CuPy on the first device of
+    the k-point plan when that plan uses a GPU, else NumPy."""
+
+    from ..SCF.kpoint_parallel import resolve_backend
+
+    plan = resolve_backend()
+    if plan is None or plan.name != "cupy":
+        return np, None, None
+    from cupyx.scipy.special import erf
+
+    from ..backends.cupy import require_cupy
+
+    cp, _ = require_cupy()
+    return cp, erf, int(plan.device_ids[0])
+
+
+def local_force_provider(
+    grid, atoms, potentials, specifications, lattice_vectors, density, xc_potential, *, tolerance: float = 1.0e-14
+) -> LocalForceTerms:
+    """What :func:`parsec_python.Forces.periodic_local.periodic_local_forces` hands its sums to once the acceleration
+    package is imported: :func:`fast_periodic_local_forces` on the device the k-point solver uses, or on the host."""
+
+    xp, erf, device = _device_module()
+    arguments = (grid, atoms, potentials, specifications, lattice_vectors, density, xc_potential)
+    if device is None:
+        return fast_periodic_local_forces(*arguments, tolerance=tolerance)
+    with xp.cuda.Device(device):
+        return fast_periodic_local_forces(*arguments, xp=xp, erf=erf, tolerance=tolerance)
+
+
+__all__ = ["fast_periodic_local_forces", "local_force_provider"]

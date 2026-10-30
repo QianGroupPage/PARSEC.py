@@ -218,7 +218,6 @@ def run_scf_kpoints(
     final_occupations: dict[int, np.ndarray] = {}
 
     def kpoint_nonlocal_force(task, vectors, xp=np):
-        vectors = vectors.get() if hasattr(vectors, "get") else vectors  # a device array: to the host
         if task not in projector_cache:
             make_hamiltonian(task, {"V": ionic_potential})
         gradients = build_periodic_projector_gradients(
@@ -229,6 +228,14 @@ def run_scf_kpoints(
             lattice_vectors,
             k_points[task],
         )
+        if xp is not np and not isinstance(vectors, np.ndarray):
+            # the orbitals of a device stay there: the overlaps are formed on it (the acceleration package, which
+            # supplied the device array, supplies the contraction)
+            from ..acceleration.Forces.kpoint_nonlocal_device import device_nonlocal_forces
+
+            return device_nonlocal_forces(
+                xp, projector_cache[task], gradients, vectors, weight * final_occupations[task], len(cell_atoms)
+            )
         return nonlocal_forces(
             projector_cache[task],
             gradients,

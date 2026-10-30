@@ -166,16 +166,16 @@ Currently supported:
   PARSEC in both directions; see
   [FORCES_AND_RELAXATION.md](FORCES_AND_RELAXATION.md);
 - the same for periodic cells without spin-orbit coupling, at the Gamma point or with k-points (spin-polarized ones at the
-  Gamma point): on the readable solver (`main.py` hands such an input to it) and, for a spin-unpolarized Gamma-point cell,
-  on the accelerated path, see "Periodic cells" and "On GPUs" in that document.
+  Gamma point): on the readable solver (`main.py` hands such an input to it), for a spin-unpolarized Gamma-point cell on the
+  accelerated path, and with k-points on the GPUs of the k-point solver, see "Periodic cells" and "On GPUs" in that document.
 
 Not currently supported as production physics:
 
 - periodic boundary conditions;
 - spin polarization of periodic cells, spin--orbit coupling and
   non-collinear magnetism;
-- forces, relaxation and molecular dynamics of spin--orbit periodic cells, of spin-polarized ones with k-points, and of
-  periodic cells with spin or k-points on the GPUs;
+- forces, relaxation and molecular dynamics of spin--orbit periodic cells, of spin-polarized ones with k-points, of
+  spin-polarized periodic cells on the GPUs, and of periodic k-point cells on several nodes;
 - self-consistent hybrid functionals, meta-GGA functionals and DFT+U;
 - PARSEC restart files other than `relax_restart.dat` and `mdinit.dat`;
 - Ono--Hirose double-grid order greater than one.

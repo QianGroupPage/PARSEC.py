@@ -23,6 +23,7 @@ from .nonlocal_force import (
     nonlocal_forces,
 )
 from .periodic_local import periodic_local_forces
+from .spin_orbit import build_spin_orbit_force_operator, spinor_nonlocal_forces
 from .symmetry import (
     AtomSymmetryOperation,
     atom_symmetry_operations,
@@ -178,6 +179,79 @@ def compute_forces(
     )
 
 
+def compute_spinor_forces(
+    system,
+    result,
+    *,
+    symmetrize: bool = False,
+    operations: Sequence[AtomSymmetryOperation] | None = None,
+) -> ForceResult:
+    """Forces of a finished isolated calculation with spinor orbitals (self-consistent spin-orbit or non-collinear).
+
+    ``result`` is a :class:`parsec_python.models.SelfConsistentSOCResult` of
+    :func:`~parsec_python.SCF.self_consistent_soc.run_self_consistent_soc`,
+    :func:`~parsec_python.SCF.self_consistent_soc_spin_polarized.run_self_consistent_soc_spin_polarized` or
+    :func:`~parsec_python.SCF.noncollinear.run_self_consistent_noncollinear`.  The local terms are those of the
+    spin-polarized case: the total density, the spin-averaged exchange-correlation potential for the core correction and
+    the last ``V_out - V_in`` of the spin-averaged potential for the SCF residual.  The nonlocal term is the force of
+    the Kleinman-Bylander projectors on both spin components plus that of the spin-orbit projectors
+    (:mod:`parsec_python.Forces.spin_orbit`); each spinor state holds ``occupation`` electrons.
+
+    Averaging over the point group of the atoms (``symmetrize``) is valid only where the magnetization does not break
+    that symmetry, so it is off unless asked for; the net force is removed in any case.
+    """
+
+    from time import perf_counter
+
+    from ..Eigensolvers.perturbative_soc import build_spin_orbit_projectors
+
+    for name in ("xc_potential", "input_effective_potential", "output_effective_potential"):
+        if getattr(result, name, None) is None:
+            raise ValueError(f"the result does not carry {name}: it is not that of a spinor SCF driver of this package")
+    started = perf_counter()
+    atoms = system.atoms
+    specifications = system.input.pseudopotentials
+    positions = np.array([atom.position for atom in atoms], dtype=np.float64)
+
+    repulsion = ion_ion_forces(atoms, system.pseudopotentials)
+    local = local_forces(
+        system.grid,
+        atoms,
+        system.pseudopotentials,
+        specifications,
+        result.density,
+        np.asarray(result.output_effective_potential) - np.asarray(result.input_effective_potential),
+        result.xc_potential,
+    )
+    gradients = build_nonlocal_projector_gradients(system.grid, atoms, system.pseudopotentials, specifications)
+    projectors = build_spin_orbit_projectors(system.grid, atoms, system.pseudopotentials, specifications)
+    spin_orbit = (
+        build_spin_orbit_force_operator(system.grid, atoms, system.pseudopotentials, specifications, projectors)
+        if projectors
+        else None
+    )
+    separable = spinor_nonlocal_forces(
+        system.nonlocal_operator,
+        gradients,
+        spin_orbit,
+        np.asarray(result.spinors),
+        np.asarray(result.occupations, dtype=np.float64),
+        len(atoms),
+    )
+    if not symmetrize:
+        operations = None
+    elif operations is None:
+        operations = atom_symmetry_operations(atoms)
+    return assemble_forces(
+        positions,
+        repulsion,
+        local,
+        separable,
+        operations,
+        seconds=perf_counter() - started,
+    )
+
+
 def compute_periodic_forces(
     system,
     result,
@@ -237,4 +311,10 @@ def compute_periodic_forces(
     )
 
 
-__all__ = ["ForceResult", "assemble_forces", "compute_forces", "compute_periodic_forces"]
+__all__ = [
+    "ForceResult",
+    "assemble_forces",
+    "compute_forces",
+    "compute_periodic_forces",
+    "compute_spinor_forces",
+]

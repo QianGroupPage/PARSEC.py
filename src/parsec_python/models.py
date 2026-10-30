@@ -1413,6 +1413,16 @@ class SelfConsistentSOCResult:
     """Seconds per SCF stage (``hamiltonian``, ``diagonalization``, ``density``,
     ``hartree``, ``xc``, ``mixing_energy``) plus the eigensolver's own counters
     (``eig_*``), for the single-point driver; ``None`` where not recorded."""
+    xc_potential: np.ndarray | None = None
+    """Spin-averaged exchange-correlation potential (``V_avg``) made from the last density plus the frozen core density:
+    what the core-correction force integrates.  ``None`` where a driver does not record it."""
+    input_effective_potential: np.ndarray | None = None
+    """Spin-averaged local potential that entered the last eigenproblem (``V_in`` of the force term for the SCF residual)."""
+    output_effective_potential: np.ndarray | None = None
+    """Spin-averaged local potential made from the last density (``V_out``)."""
+    nonlocal_forces: np.ndarray | None = None
+    """``(atoms, 3)`` nonlocal force (projectors and spin-orbit term) of a k-point run, which keeps no orbitals but the
+    first k-point's: accumulated from every k-point's orbitals at the end of the SCF loop (``compute_forces=True``)."""
 
     @property
     def magnetic_moment_per_state(self) -> np.ndarray:

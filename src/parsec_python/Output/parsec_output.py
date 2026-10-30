@@ -2000,7 +2000,11 @@ class ParsecTextReporter:
         return lines
 
     def finish_self_consistent_soc(
-        self, result: "SelfConsistentSOCResult", elapsed_seconds: float
+        self,
+        result: "SelfConsistentSOCResult",
+        elapsed_seconds: float,
+        *,
+        forces=None,
     ) -> None:
         status = (
             "Self-consistency convergence achieved."
@@ -2065,14 +2069,31 @@ class ParsecTextReporter:
                     f"{result.energies.total * RYDBERG_TO_EV / max(len(result.atoms), 1):22.8f} [eV]"
                 ),
                 "",
-                (
-                    "Forces, dipoles, and MPI statistics are not calculated by "
-                    "this Python single-point implementation."
-                ),
-                "",
-                " =================================================================",
             ]
         )
+        if forces is None:
+            lines.extend(
+                [
+                    (
+                        "Forces, dipoles, and MPI statistics are not calculated by "
+                        "this Python single-point implementation."
+                    ),
+                    "",
+                    " =================================================================",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    *force_report_lines(forces, self.translation.output_level, periodic=self._periodic),
+                    f"Time for forces [sec] : {forces.seconds:11.2f}",
+                    "",
+                    "Dipoles and MPI statistics",
+                    "are not calculated by this Python implementation.",
+                    "",
+                    " =================================================================",
+                ]
+            )
         self.write("\n".join(lines))
 
 

@@ -235,8 +235,10 @@ def run_self_consistent_soc(
     energies = None
     converged = False
 
+    used_potential = input_potential
     for iteration in range(1, settings.max_iterations + 1):
         eigval_settings = _eigval_settings(system, filter_degree)
+        used_potential = input_potential  # what enters this eigenproblem (the mixed one replaces it below)
 
         with timer.stage("hamiltonian"):
             scalar_hamiltonian = system.hamiltonian(input_potential)
@@ -351,6 +353,9 @@ def run_self_consistent_soc(
         density=density,
         energies=energies,
         timings=dict(timer.seconds),
+        xc_potential=xc.potential,
+        input_effective_potential=used_potential,
+        output_effective_potential=output_potential,
     )
 
 

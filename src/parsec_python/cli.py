@@ -23,7 +23,7 @@ from .MolecularDynamics.run import (
     restart_structure as dynamics_restart_structure,
     run_recorded_molecular_dynamics,
 )
-from .Relaxation.backend import periodic_backend, reference_backend
+from .Relaxation.backend import periodic_backend, reference_backend, spinor_backend
 from .Relaxation.run import (
     relaxation_header_lines,
     restart_structure,
@@ -185,6 +185,51 @@ def _scf_potential_payload(result) -> dict[str, np.ndarray]:
     """Converged local potentials of a periodic run (inputs of a band calculation)."""
     potentials = getattr(result, "scf_potentials", None) or {}
     return {f"scf_potential_{name}": np.asarray(value) for name, value in potentials.items()}
+
+
+def _ionic_payload(forces, relaxation, dynamics) -> dict[str, np.ndarray]:
+    """Archive entries of the forces of a structure, a relaxation and a molecular dynamics run."""
+
+    payload: dict[str, np.ndarray] = {}
+    if forces is not None:
+        payload["forces_positions"] = np.asarray(forces.positions)
+        payload["forces_total"] = np.asarray(forces.total)
+        payload["forces_ion_ion"] = np.asarray(forces.ion_ion)
+        payload["forces_local_ionic"] = np.asarray(forces.local.ionic)
+        payload["forces_self_consistency"] = np.asarray(forces.local.self_consistency)
+        payload["forces_core_correction"] = np.asarray(forces.local.core_correction)
+        payload["forces_nonlocal"] = np.asarray(forces.nonlocal_pseudopotential)
+        payload["forces_net"] = np.asarray(forces.net_force)
+        payload["forces_torque"] = np.asarray(forces.torque)
+    if relaxation is not None and relaxation.records:
+        records = relaxation.records
+        payload["relaxation_positions"] = np.asarray([item.positions for item in records])
+        payload["relaxation_energies"] = np.asarray([item.energy for item in records])
+        payload["relaxation_forces"] = np.asarray([item.forces.total for item in records])
+        payload["relaxation_maximum_forces"] = np.asarray(
+            [item.maximum_force for item in records]
+        )
+        payload["relaxation_scf_iterations"] = np.asarray(
+            [item.scf_iterations for item in records]
+        )
+        payload["relaxation_final_positions"] = np.asarray(relaxation.positions)
+        payload["relaxation_minimum_force_found"] = np.asarray(
+            relaxation.minimum_force_found
+        )
+    if dynamics is not None and dynamics.records:
+        records = dynamics.records
+        payload["dynamics_positions"] = np.asarray([item.positions for item in records])
+        payload["dynamics_energies"] = np.asarray([item.energy for item in records])
+        steps = [item.step for item in records if item.step is not None]
+        payload["dynamics_temperatures"] = np.asarray([item.temperature for item in steps])
+        payload["dynamics_kinetic_energies"] = np.asarray(
+            [item.kinetic_energy for item in steps]
+        )
+        payload["dynamics_conserved_energies"] = np.asarray(
+            [item.conserved_energy for item in steps]
+        )
+        payload["dynamics_next_positions"] = np.asarray(dynamics.positions)
+    return payload
 
 
 def save_result_archive(
@@ -430,44 +475,7 @@ def save_result_archive(
                 payload[f"backend_statistic_{name}"] = np.asarray(value)
     if include_wavefunctions:
         payload["wavefunctions"] = result.wavefunctions
-    if forces is not None:
-        payload["forces_positions"] = np.asarray(forces.positions)
-        payload["forces_total"] = np.asarray(forces.total)
-        payload["forces_ion_ion"] = np.asarray(forces.ion_ion)
-        payload["forces_local_ionic"] = np.asarray(forces.local.ionic)
-        payload["forces_self_consistency"] = np.asarray(forces.local.self_consistency)
-        payload["forces_core_correction"] = np.asarray(forces.local.core_correction)
-        payload["forces_nonlocal"] = np.asarray(forces.nonlocal_pseudopotential)
-        payload["forces_net"] = np.asarray(forces.net_force)
-        payload["forces_torque"] = np.asarray(forces.torque)
-    if relaxation is not None and relaxation.records:
-        records = relaxation.records
-        payload["relaxation_positions"] = np.asarray([item.positions for item in records])
-        payload["relaxation_energies"] = np.asarray([item.energy for item in records])
-        payload["relaxation_forces"] = np.asarray([item.forces.total for item in records])
-        payload["relaxation_maximum_forces"] = np.asarray(
-            [item.maximum_force for item in records]
-        )
-        payload["relaxation_scf_iterations"] = np.asarray(
-            [item.scf_iterations for item in records]
-        )
-        payload["relaxation_final_positions"] = np.asarray(relaxation.positions)
-        payload["relaxation_minimum_force_found"] = np.asarray(
-            relaxation.minimum_force_found
-        )
-    if dynamics is not None and dynamics.records:
-        records = dynamics.records
-        payload["dynamics_positions"] = np.asarray([item.positions for item in records])
-        payload["dynamics_energies"] = np.asarray([item.energy for item in records])
-        steps = [item.step for item in records if item.step is not None]
-        payload["dynamics_temperatures"] = np.asarray([item.temperature for item in steps])
-        payload["dynamics_kinetic_energies"] = np.asarray(
-            [item.kinetic_energy for item in steps]
-        )
-        payload["dynamics_conserved_energies"] = np.asarray(
-            [item.conserved_energy for item in steps]
-        )
-        payload["dynamics_next_positions"] = np.asarray(dynamics.positions)
+    payload.update(_ionic_payload(forces, relaxation, dynamics))
     if refinement is not None:
         payload["refinement_functional"] = np.asarray(refinement.functional)
         for name in (
@@ -595,13 +603,40 @@ def save_spin_polarized_result_archive(
     return output
 
 
+class _SpinorReporter:
+    """Presents the spin-orbit and non-collinear report methods under the names the ionic loops call.
+
+    The loops of a relaxation and of a molecular dynamics run report each SCF iteration with ``iteration`` and each
+    finished structure, with its forces, with ``finish``; a spinor result has its own tables for both.
+    """
+
+    def __init__(self, reporter) -> None:
+        self._reporter = reporter
+
+    def iteration(self, step) -> None:
+        self._reporter.iteration_self_consistent_soc(step)
+
+    def finish(self, result, elapsed_seconds: float, *, forces=None) -> None:
+        self._reporter.finish_self_consistent_soc(result, elapsed_seconds, forces=forces)
+
+    def __getattr__(self, name: str):
+        return getattr(self._reporter, name)
+
+
 def save_self_consistent_soc_result_archive(
     path: str | Path,
     result: SelfConsistentSOCResult,
     *,
     include_wavefunctions: bool = False,
+    forces=None,
+    relaxation=None,
+    dynamics=None,
 ) -> Path:
-    """Save a portable NumPy archive for a self-consistent-SOC result."""
+    """Save a portable NumPy archive for a self-consistent-SOC result.
+
+    ``forces``, ``relaxation`` and ``dynamics`` add the force tables, structures and energies as
+    :func:`save_result_archive` does.
+    """
     output = _npz_path(Path(path).expanduser().resolve())
     output.parent.mkdir(parents=True, exist_ok=True)
     energy = asdict(result.energies)
@@ -629,6 +664,7 @@ def save_self_consistent_soc_result_archive(
         payload["magnetization_mu_b_per_bohr3"] = result.magnetization
     if include_wavefunctions:
         payload["spinors"] = result.spinors
+    payload.update(_ionic_payload(forces, relaxation, dynamics))
     payload.update(_k_point_payload(result))
     payload.update(_scf_potential_payload(result))
     np.savez_compressed(output, **payload)
@@ -1157,7 +1193,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # magnetism run the drivers of parsec_python.SCF (k-point solver, spin-orbit,
     # non-collinear).  An isolated spin-polarized input without spin-orbit coupling
     # runs run_scf -> run_spin_scf, like every other isolated input, so it keeps
-    # forces, relaxation, molecular dynamics and energy refinement.
+    # forces, relaxation, molecular dynamics and energy refinement; self-consistent
+    # spin-orbit and non-collinear inputs keep all but the energy refinement (below).
     ionic_requested = bool(
         translation.relaxation is not None
         or translation.molecular_dynamics is not None
@@ -1173,7 +1210,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         and not (self_consistent_spin_orbit or noncollinear)
         and (not spin_polarized or (gamma_only and not has_soc_species))
     )
-    uses_extended_drivers = not periodic_ionic and bool(
+    # Self-consistent spin-orbit coupling and non-collinear magnetism, isolated or periodic (Gamma point or k-points),
+    # run their own SCF drivers and, asked for forces, a relaxation or molecular dynamics, the ionic loops of the spinor
+    # backend.
+    spinor_ionic = bool(ionic_requested and (self_consistent_spin_orbit or noncollinear))
+    uses_extended_drivers = not periodic_ionic and not spinor_ionic and bool(
         self_consistent_spin_orbit
         or noncollinear
         or k_sampling is not None
@@ -1187,14 +1228,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         print(
             "Input error: Minimization, Molecular_Dynamics, Skip_Force: false and "
-            "Energy_Refinement are not implemented together with spin-orbit coupling, "
-            "non-collinear magnetism or a spin-polarized periodic calculation with "
-            "k-points (a periodic cell without spin-orbit coupling has forces, relaxation "
-            "and molecular dynamics: spin-unpolarized at the Gamma point or with k-points, "
-            "spin-polarized at the Gamma point)",
+            "Energy_Refinement are not implemented together with the perturbative spin-orbit "
+            "correction (use SO_from_scratch for forces with spin-orbit coupling) or a "
+            "spin-polarized periodic calculation with k-points (a periodic cell without "
+            "spin-orbit coupling has forces, relaxation and molecular dynamics: "
+            "spin-unpolarized at the Gamma point or with k-points, spin-polarized at the "
+            "Gamma point)",
             file=sys.stderr,
         )
         return 2
+    if spinor_ionic and getattr(translation, "energy_refinement", None) is not None:
+        print(
+            "Input error: Energy_Refinement is not implemented together with spin-orbit coupling or "
+            "non-collinear magnetism",
+            file=sys.stderr,
+        )
+        return 2
+    if spinor_ionic and not is_periodic and (noncollinear or spin_polarized):
+        # a moment breaks the point group of the atoms: averaging the forces over it would be wrong
+        if use_symmetry:
+            symmetry_note = (
+                "The forces of a spin-polarized or non-collinear spin-orbit calculation are not symmetrized "
+                "over the point group of the atoms: the magnetization need not respect it."
+            )
+        use_symmetry = False
 
     # The default rule of the sphere ran in the parser, before this clock:
     # its seconds belong to the calculation.  None for an input with a radius.
@@ -1263,7 +1320,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             forces = None
             outcome = None
             dynamics = None
-            if is_periodic:
+            ionic_reporter = reporter
+            if spinor_ionic:
+                ionic_reporter = _SpinorReporter(reporter)
+                backend_factory = lambda extrapolation="none": spinor_backend(  # noqa: E731
+                    *(k_sampling if k_sampling is not None else (None, None))
+                )
+            elif is_periodic:
                 # the spin-polarized loop is the Gamma-point one, whatever Monkhorst-Pack grid of one point the input names
                 backend_k_sampling = None if spin_polarized else k_sampling
                 backend_factory = lambda extrapolation="none": periodic_backend(  # noqa: E731
@@ -1276,7 +1339,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     translation,
                     system,
                     backend_factory(translation.potential_extrapolation),
-                    reporter,
+                    ionic_reporter,
                     log.write,
                     directory=input_directory,
                     restart=relax_restart,
@@ -1289,7 +1352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     translation,
                     system,
                     backend_factory(translation.potential_extrapolation),
-                    reporter,
+                    ionic_reporter,
                     log.write,
                     directory=input_directory,
                     restart=dynamics_restart,
@@ -1297,7 +1360,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result, forces = dynamics.result, dynamics.forces
             elif translation.compute_forces:
                 result, forces = run_single_point_with_forces(
-                    system, backend_factory(), reporter, symmetrize=use_symmetry
+                    system, backend_factory(), ionic_reporter, symmetrize=use_symmetry
                 )
             else:
                 scf_start = time.perf_counter()
@@ -1325,7 +1388,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.write(
                     "\n".join(refinement_report_lines(refinement, RYDBERG_TO_EV))
                 )
-            if not arguments.no_archive:
+            if not arguments.no_archive and spinor_ionic:
+                saved = save_self_consistent_soc_result_archive(
+                    archive_path,
+                    result,
+                    include_wavefunctions=(
+                        arguments.save_wavefunctions or translation.output_all_states
+                    ),
+                    forces=forces,
+                    relaxation=outcome,
+                    dynamics=dynamics,
+                )
+                log.write(f"Result archive: {saved}")
+            elif not arguments.no_archive:
                 saved = save_result_archive(
                     archive_path,
                     result,

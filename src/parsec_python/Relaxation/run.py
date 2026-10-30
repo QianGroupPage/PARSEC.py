@@ -17,7 +17,6 @@ import numpy as np
 
 from ..Forces import atom_symmetry_operations, operations_preserving
 from ..V_ion import center_cluster_geometry
-from ..models import Atom
 from .files import (
     RelaxRestart,
     parse_manual_structures,
@@ -89,7 +88,7 @@ def restart_structure(translation, directory: Path, source: Path | None = None):
         positions = restart.positions
         recenter = False
     atoms = tuple(
-        Atom(atom.symbol, position) for atom, position in zip(problem.atoms, positions)
+        replace(atom, position=position) for atom, position in zip(problem.atoms, positions)
     )
     notes.append(
         "WARNING: atom coordinates in input were replaced by coordinates in "
@@ -187,6 +186,7 @@ def run_recorded_relaxation(
         movable=translation.movable,
         directory=directory,
         elements=elements,
+        warm_starts=getattr(backend, "warm_starts", True),
     )
     try:
         return run_relaxation(

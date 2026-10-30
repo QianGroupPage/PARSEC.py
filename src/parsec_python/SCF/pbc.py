@@ -186,7 +186,7 @@ def fold_atoms_into_cell(atoms, lattice_vectors: np.ndarray) -> tuple:
             folded.append(atom)
             continue
         wrapped = fraction - np.floor(fraction)
-        folded.append(Atom(atom.symbol, wrapped @ lattice))
+        folded.append(replace(atom, position=wrapped @ lattice))
     return tuple(folded)
 
 

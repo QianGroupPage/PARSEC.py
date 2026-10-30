@@ -122,6 +122,18 @@ class EligibilityPredicateTests(unittest.TestCase):
         )
         self.assertIn("self-consistent spin-orbit coupling (SO_from_scratch)", features)
 
+    def test_forces_are_not_an_accelerated_shape(self) -> None:
+        # the CuPy spinor driver has no forces: the reference solver, which has, takes the input
+        for extra in ("Skip_Force: .false.\n", "Minimization: bfgs\nMovement_Num: 2\n"):
+            with self.subTest(extra=extra):
+                translation = self._translation(extra=extra)
+                self.assertFalse(_accelerated_self_consistent_soc_eligible(translation))
+                features = _reference_only_features(translation, accelerated_backend_selected=False)
+                self.assertEqual(
+                    features,
+                    ["forces, relaxation or molecular dynamics with self-consistent spin-orbit coupling (SO_from_scratch)"],
+                )
+
     def test_reference_only_features_flags_spin_polarized_combo_regardless(self) -> None:
         translation = self._translation(extra="Spin_Polarization: .true.\n")
         features = _reference_only_features(
@@ -218,6 +230,18 @@ class AcceleratedCliDelegationTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         archive = np.load(self.directory / "parsec_python_results.npz")
         self.assertTrue(bool(archive["converged"]))
+
+    @unittest.skipIf(GPU_AVAILABLE, "this check targets the no-GPU fallback")
+    def test_forces_with_spin_orbit_run_on_the_reference_solver(self) -> None:
+        self.input_path.write_text(_BASE_INPUT + "Skip_Force: .false.\n", encoding="utf-8")
+        exit_code = accelerated_main([str(self.input_path), "--quiet"])
+        self.assertEqual(exit_code, 0)
+        log = (self.directory / "parsec.out").read_text(encoding="utf-8")
+        self.assertIn("Reporting non-local force components", log)
+        archive = np.load(self.directory / "parsec_python_results.npz")
+        self.assertEqual(archive["forces_total"].shape, (1, 3))
+        # asked for explicitly, the accelerated backends cannot run it
+        self.assertEqual(accelerated_main([str(self.input_path), "--backend", "cupy", "--dry-run"]), 2)
 
     @unittest.skipIf(GPU_AVAILABLE, "this check targets the no-GPU fallback")
     def test_device_gpu_does_not_fall_back_to_the_cpu_reference_solver(self) -> None:

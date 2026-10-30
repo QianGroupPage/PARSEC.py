@@ -27,7 +27,6 @@ from ..Forces import (
     operations_preserving,
     symmetrize_positions,
 )
-from ..models import Atom
 from .backend import IonicBackend, reference_backend, release_orbitals
 from .domove import MoveReport, MovementState, RelaxationSettings, domove
 from .files import RYDBERG_TO_EV, RelaxRestart
@@ -380,7 +379,7 @@ def _relaxation_loop(
             break
 
         atoms = tuple(
-            Atom(atom.symbol, position)
+            replace(atom, position=position)  # keeps the initial moment of a non-collinear calculation
             for atom, position in zip(system.atoms, report.positions)
         )
         # The eigensolver keeps the subspace the next loop continues from;

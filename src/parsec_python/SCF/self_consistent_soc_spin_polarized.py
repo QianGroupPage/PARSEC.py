@@ -188,7 +188,7 @@ def run_self_consistent_soc_spin_polarized(
     for iteration in range(1, settings.max_iterations + 1):
         eigval_settings = _eigval_settings(system, filter_degree)
 
-        effective_potential_avg = 0.5 * (input_potential_up + input_potential_down)
+        effective_potential_avg = 0.5 * (input_potential_up + input_potential_down)  # what enters this eigenproblem
         xc_delta = 0.5 * (input_potential_up - input_potential_down)
 
         scalar_hamiltonian = system.hamiltonian(effective_potential_avg)
@@ -300,6 +300,9 @@ def run_self_consistent_soc_spin_polarized(
         magnetic_moment=float(
             system.grid.volume_element * np.sum(density_up_out - density_down_out)
         ),
+        xc_potential=0.5 * (xc.potential_up + xc.potential_down),
+        input_effective_potential=effective_potential_avg,
+        output_effective_potential=0.5 * (output_potential_up + output_potential_down),
     )
 
 

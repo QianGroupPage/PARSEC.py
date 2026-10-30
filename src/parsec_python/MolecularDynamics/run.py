@@ -23,7 +23,6 @@ from typing import Callable, Sequence
 import numpy as np
 
 from ..Relaxation.backend import IonicBackend, release_orbitals
-from ..models import Atom
 from .atomic_masses import atomic_masses
 from .md_files import (
     MD_NRG_HEADER,
@@ -104,7 +103,7 @@ def restart_structure(translation, input_directory: Path):
         path.read_text(encoding="utf-8", errors="replace"), len(problem.atoms)
     )
     atoms = tuple(
-        Atom(atom.symbol, position)
+        replace(atom, position=position)
         for atom, position in zip(problem.atoms, restart.current_positions)
     )
     translation = replace(
@@ -257,7 +256,7 @@ def run_recorded_molecular_dynamics(
         if step.finished:
             break
         atoms = tuple(
-            Atom(atom.symbol, position)
+            replace(atom, position=position)  # keeps the initial moment of a non-collinear calculation
             for atom, position in zip(system.atoms, step.positions)
         )
         release_orbitals(result)

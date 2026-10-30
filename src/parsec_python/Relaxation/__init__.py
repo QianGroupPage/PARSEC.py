@@ -6,7 +6,7 @@ text files of a relaxation, and ``ionic_loop`` the loop of ``parsec.F90``
 around an SCF calculation and its forces.
 """
 
-from .backend import IonicBackend, periodic_backend, reference_backend
+from .backend import IonicBackend, periodic_backend, reference_backend, spinor_backend
 from .domove import (
     MoveReport,
     MovementState,
@@ -67,6 +67,7 @@ __all__ = [
     "parse_xyz_frames",
     "periodic_backend",
     "reference_backend",
+    "spinor_backend",
     "run_relaxation",
     "setulb",
     "steepest_descent_displacement",

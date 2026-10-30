@@ -106,7 +106,9 @@ class RelaxationRecorder(IonicObserver):
         movable: Sequence[bool],
         directory: Path | None,
         elements: Sequence[str] | None = None,
+        warm_starts: bool = True,
     ) -> None:
+        self.warm_starts = warm_starts
         self.reporter = reporter
         self.write = write
         self.settings = settings
@@ -215,8 +217,14 @@ class RelaxationRecorder(IonicObserver):
             "\n".join(
                 [
                     "",
-                    f" Structure of movement {step:4d}: the SCF loop continues from",
-                    " the potential and the wavefunctions of the previous structure.",
+                    *(
+                        (
+                            f" Structure of movement {step:4d}: the SCF loop continues from",
+                            " the potential and the wavefunctions of the previous structure.",
+                        )
+                        if self.warm_starts
+                        else (f" Structure of movement {step:4d}: the SCF loop starts afresh.",)
+                    ),
                     "",
                 ]
             )

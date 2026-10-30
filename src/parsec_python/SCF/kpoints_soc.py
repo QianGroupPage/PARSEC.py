@@ -44,6 +44,8 @@ from ..Eigensolvers import (
     solve_eigval,
 )
 from ..Eigensolvers.perturbative_soc import build_spin_orbit_projectors
+from ..Forces.nonlocal_force import build_periodic_projector_gradients
+from ..Forces.spin_orbit import build_spin_orbit_force_operator, spinor_nonlocal_forces
 from ..Energy import total_energy_no_degeneracy, total_energy_no_degeneracy_spin_polarized
 from ..Hamiltonian.kpoint_operator import KPointKohnShamHamiltonian
 from ..Hamiltonian.kpoint_spinor_operator import KPointSpinorKohnShamHamiltonian
@@ -172,11 +174,12 @@ def _k_point_operators(
     """
     lattice_vectors = system.input.periodic_cell.lattice_vectors
     specifications = system.input.pseudopotentials
+    atoms = system.cell_atoms  # the image sums assume the atoms inside the cell (a relaxation moves them out)
     operators = []
     for k_point in k_points:
         nonlocal_operator_k = build_nonlocal_projectors(
             system.grid,
-            system.atoms,
+            atoms,
             system.pseudopotentials,
             specifications,
             lattice_vectors,
@@ -185,7 +188,7 @@ def _k_point_operators(
         soc_projectors_k = tuple(
             build_spin_orbit_projectors(
                 system.grid,
-                system.atoms,
+                atoms,
                 system.pseudopotentials,
                 specifications,
                 lattice_vectors,
@@ -194,6 +197,73 @@ def _k_point_operators(
         )
         operators.append((nonlocal_operator_k, soc_projectors_k))
     return operators
+
+
+class SpinorForceExtras:
+    """The per-k-point ``extras`` of a spinor k-point job: the ``<S_z>`` of the states and, optionally, the nonlocal force.
+
+    A k-point job keeps no orbitals but those of the first k-point, so the nonlocal force (the scalar projectors on
+    both spin components and the spin-orbit term, :func:`parsec_python.Forces.spin_orbit.spinor_nonlocal_forces`) is
+    accumulated from the orbitals of each k-point by a last pass after the SCF loop, once the occupations of that
+    last step are known (:meth:`set_occupations`).  A device k-point solver calls this with the orbitals on its
+    device; the overlaps are formed there and only the ``(atoms, 3)`` result comes back.
+    """
+
+    def __init__(self, system, k_points: np.ndarray, weight: float, operators_for, compute_forces: bool) -> None:
+        self.system = system
+        self.k_points = k_points
+        self.weight = float(weight)
+        self.operators_for = operators_for
+        self.compute_forces = bool(compute_forces)
+        self.atom_count = len(system.atoms)
+        self.final_occupations: dict[int, np.ndarray] = {}
+
+    def set_occupations(self, occupations_by_k) -> None:
+        self.final_occupations.update(enumerate(occupations_by_k))
+
+    def __call__(self, task, vectors, xp=np) -> np.ndarray:
+        moments = _state_sz([vectors], xp)
+        if not self.compute_forces:
+            return moments
+        return np.concatenate((moments, self._force(task, vectors, xp).ravel()))
+
+    def _force(self, task, vectors, xp) -> np.ndarray:
+        system = self.system
+        nonlocal_k, soc_k = self.operators_for(task)
+        atoms = system.cell_atoms
+        lattice_vectors = system.input.periodic_cell.lattice_vectors
+        specifications = system.input.pseudopotentials
+        k_point = self.k_points[task]
+        gradients = build_periodic_projector_gradients(
+            system.grid, atoms, system.pseudopotentials, specifications, lattice_vectors, k_point
+        )
+        spin_orbit = (
+            build_spin_orbit_force_operator(
+                system.grid, atoms, system.pseudopotentials, specifications, soc_k, lattice_vectors, k_point
+            )
+            if soc_k
+            else None
+        )
+        return spinor_nonlocal_forces(
+            nonlocal_k,
+            gradients,
+            spin_orbit,
+            vectors,
+            self.weight * np.asarray(self.final_occupations[task], dtype=float),
+            self.atom_count,
+            xp=xp,
+        )
+
+    def collect(self, solver) -> tuple[np.ndarray, np.ndarray | None]:
+        """``(state moments of every k-point, nonlocal force or None)`` once the solver has run its last pass."""
+
+        parts = solver.extras()
+        if not self.compute_forces:
+            return np.concatenate(parts), None
+        width = 3 * self.atom_count
+        moments = np.concatenate([part[:-width] for part in parts])
+        forces = np.sum([part[-width:] for part in parts], axis=0).reshape(self.atom_count, 3)
+        return moments, forces
 
 
 def _spinor_hamiltonian(
@@ -224,8 +294,11 @@ def _spinor_solver(
     accumulate,
     *,
     tasks: int | None = None,
-) -> object:
-    """Parallel solver of the spinor Bloch problems, one task per k-point.
+    weight: float = 1.0,
+    compute_forces: bool = False,
+) -> tuple[object, SpinorForceExtras]:
+    """Parallel solver of the spinor Bloch problems, one task per k-point, and its ``extras`` (see
+    :class:`SpinorForceExtras`).
 
     The Bloch-phase nonlocal and spin-orbit projectors of a k-point are built
     once, by the worker that owns it.  ``potentials`` carries ``V`` (the local
@@ -234,10 +307,13 @@ def _spinor_solver(
     """
     cache: dict[int, tuple] = {}
 
-    def make_hamiltonian(task, potentials):
+    def operators_for(task):
         if task not in cache:
             cache[task] = _k_point_operators(system, k_points[task : task + 1])[0]
-        nonlocal_operator_k, soc_projectors_k = cache[task]
+        return cache[task]
+
+    def make_hamiltonian(task, potentials):
+        nonlocal_operator_k, soc_projectors_k = operators_for(task)
         return _spinor_hamiltonian(
             system,
             k_points[task],
@@ -248,17 +324,24 @@ def _spinor_solver(
             xc_field=potentials.get("field"),
         )
 
-    return make_kpoint_solver(
+    extras = SpinorForceExtras(system, k_points, weight, operators_for, compute_forces)
+    solver = make_kpoint_solver(
         KPointJob(
             k_points.shape[0] if tasks is None else tasks,
             number_of_states,
             lambda degree: _eigval_settings(system, degree),
             make_hamiltonian,
             accumulate,
-            extras=lambda task, vectors, xp=np: _state_sz([vectors], xp),
+            extras=extras,
         ),
         problem_size=system.grid.size,
     )
+    if compute_forces and type(solver).__name__ == "MPIKPointSolver":
+        raise NotImplementedError(
+            "the nonlocal force of the row-distributed MPI k-point solver is not implemented: its extras are "
+            "sums over row blocks, which does not apply to a product of overlaps"
+        )
+    return solver, extras
 
 
 def run_self_consistent_soc_kpoints(
@@ -267,8 +350,12 @@ def run_self_consistent_soc_kpoints(
     weights: np.ndarray,
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
+    compute_forces: bool = False,
 ) -> SelfConsistentSOCResult:
     """Run periodic self-consistent-SOC SCF on an already-prepared system.
+
+    ``compute_forces`` also returns the nonlocal force (``result.nonlocal_forces``): the orbitals of a k-point are not
+    kept, so it is accumulated from them in a last pass after the SCF loop (see :class:`SpinorForceExtras`).
 
     ``weights`` must all be equal, exactly as in
     :func:`~parsec_python.SCF.kpoints.run_scf_kpoints`.  At least one
@@ -304,7 +391,9 @@ def run_self_consistent_soc_kpoints(
         rows = weighted.shape[0] // 2  # the rows of this block of the grid (all of it, unless distributed)
         return {"density": (weight / dV) * (weighted[:rows] + weighted[rows:])}
 
-    solver = _spinor_solver(system, k_points, number_of_states, accumulate)
+    solver, extras = _spinor_solver(
+        system, k_points, number_of_states, accumulate, weight=weight, compute_forces=compute_forces
+    )
     mixer = AndersonMixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
@@ -321,6 +410,7 @@ def run_self_consistent_soc_kpoints(
         timer.lap()  # what came before the loop (potentials, solver start-up) is not part of iteration 1
         for iteration in range(1, settings.max_iterations + 1):
             eigval_settings = _eigval_settings(system, filter_degree)
+            used_potential = input_potential  # what enters this eigenproblem (the mixed one replaces it below)
 
             with timer.stage("diagonalization"):
                 eigenvalues_by_k = solver.solve({"V": input_potential}, filter_degree)
@@ -414,6 +504,10 @@ def run_self_consistent_soc_kpoints(
                 converged = True
                 break
 
+        if compute_forces:
+            # the eigenvectors and occupations of the last step belong together
+            extras.set_occupations(split_pooled(pooled_occupations, eigenvalues_by_k))
+        state_moments, nonlocal_forces = extras.collect(solver)
         return SelfConsistentSOCResult(
             converged=converged,
             iterations=iteration,
@@ -427,9 +521,13 @@ def run_self_consistent_soc_kpoints(
             energies=energies,
             k_points=k_points,
             k_weights=np.full(n_kpoints, weight),
-            state_moments=np.concatenate(solver.extras()),
+            state_moments=state_moments,
             timings=solver_timings(timer, solver),
             scf_potentials={"effective_potential": output_potential},
+            xc_potential=xc.potential,
+            input_effective_potential=used_potential,
+            output_effective_potential=output_potential,
+            nonlocal_forces=nonlocal_forces,
         )
 
 
@@ -439,8 +537,11 @@ def run_self_consistent_soc_kpoints_spin_polarized(
     weights: np.ndarray,
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
+    compute_forces: bool = False,
 ) -> SelfConsistentSOCResult:
     """Periodic self-consistent SOC with collinear spin polarization.
+
+    ``compute_forces`` also returns the nonlocal force, as for :func:`run_self_consistent_soc_kpoints`.
 
     Needs ``SCFSettings.spin_polarized`` and
     ``SCFSettings.self_consistent_spin_orbit``.  The spin density is
@@ -502,7 +603,9 @@ def run_self_consistent_soc_kpoints_spin_polarized(
             "down": (weight / dV) * weighted[rows:],
         }
 
-    solver = _spinor_solver(system, k_points, number_of_states, accumulate)
+    solver, extras = _spinor_solver(
+        system, k_points, number_of_states, accumulate, weight=weight, compute_forces=compute_forces
+    )
     mixer = AndersonMixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
@@ -621,6 +724,9 @@ def run_self_consistent_soc_kpoints_spin_polarized(
                 converged = True
                 break
 
+        if compute_forces:
+            extras.set_occupations(split_pooled(pooled_occupations, eigenvalues_by_k))
+        state_moments, nonlocal_forces = extras.collect(solver)
         return SelfConsistentSOCResult(
             converged=converged,
             iterations=iteration,
@@ -637,12 +743,16 @@ def run_self_consistent_soc_kpoints_spin_polarized(
             ),
             k_points=k_points,
             k_weights=np.full(n_kpoints, weight),
-            state_moments=np.concatenate(solver.extras()),
+            state_moments=state_moments,
             timings=solver_timings(timer, solver),
             scf_potentials={
                 "effective_potential": 0.5 * (output_potential_up + output_potential_down),
                 "xc_delta": 0.5 * (output_potential_up - output_potential_down),
             },
+            xc_potential=0.5 * (xc.potential_up + xc.potential_down),
+            input_effective_potential=effective_potential_avg,
+            output_effective_potential=0.5 * (output_potential_up + output_potential_down),
+            nonlocal_forces=nonlocal_forces,
         )
 
 

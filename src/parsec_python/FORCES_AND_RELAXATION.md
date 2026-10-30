@@ -16,14 +16,18 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 - Periodic cells (`Boundary_Conditions: bulk`), without spin-orbit coupling, at the Gamma point or with a Monkhorst-Pack
   k-point sampling (collinear spin polarization at the Gamma point only): forces, `Minimization: bfgs | simple | manual`
   and molecular dynamics. See "Periodic cells" below; the spin-unpolarized Gamma-point cell also runs on the accelerated
-  path, and a cell with k-points on the GPUs of the k-point solver (see "On GPUs"). A spin-orbit periodic calculation and a
-  spin-polarized one with k-points do not have them yet.
+  path, and a cell with k-points on the GPUs of the k-point solver (see "On GPUs"). A spin-polarized one with k-points
+  does not have them yet.
+- Self-consistent spin-orbit coupling (`SO_from_scratch`, alone or with `Spin_Polarization`) and non-collinear magnetism
+  (`Non_Collinear_magnetism`, with or without spin-orbit), isolated or periodic at the Gamma point or with k-points:
+  forces, relaxation and molecular dynamics. See "Spin-orbit coupling and non-collinear magnetism" below. The
+  perturbative spin-orbit correction (`SO_PSP` without `SO_from_scratch`) has none.
 - A spin-polarized calculation uses the same routines: `forcloc.f90` reads
   the total density and the averages over the two channels of the potential
   difference and of the exchange-correlation potential, and `forcnloc.f90`
   sums over the states of both channels with the weight `4/nspin`.
 - Not translated from `forcloc.f90` and `forcnloc.f90`: point charges,
-  LDA+U, van der Waals corrections, spin-orbit and non-collinear terms.
+  LDA+U and van der Waals corrections.
 - Every execution path computes the same numbers: the readable NumPy path
   (`reference_main.py`), the accelerated single-node path (`main.py`, CPU or
   GPUs) and the multi-node GPU runner
@@ -249,6 +253,57 @@ average in a periodic cell, which removes the average exchange splitting between
 both channels share one Fermi level, Fortran settles at a smaller moment (0.69 against 0.94 Bohr magnetons for that cell at
 1000 K) than the LSDA solution that PARSEC.py keeps; with fixed occupations the two agree.
 
+## Spin-orbit coupling and non-collinear magnetism
+
+`SO_from_scratch` and `Non_Collinear_magnetism` solve for two-component spinor states, each holding at most one electron.
+Their forces are the Hellmann-Feynman forces of the energy the SCF loop minimized, in the pieces of the spin-polarized
+case:
+
+- **Ion-ion, local ionic, core correction, SCF residual**: the total density, the exchange-correlation potential averaged
+  over the two spin directions (`V_avg` of the local-rotation form, whose `B_xc.sigma` part does not depend on the
+  positions), and the last `V_out - V_in` of the averaged potential. The result records these (`xc_potential`,
+  `input_effective_potential`, `output_effective_potential`).
+- **Kleinman-Bylander projectors**: they act alike on both spin components, so the force is that of the spin-polarized
+  case on the `2N` components at the weight `f_n/2` (`Forces/spin_orbit.py`, `spinor_nonlocal_forces`).
+- **Spin-orbit projectors**: the spin-orbit term is a bilinear form in the overlaps `<P_j|u_sigma>` of the spinor with the 16
+  projector functions of an atom (`V_ion` and `V_so` for the harmonics of `l = 1, 2`, complex spherical harmonics, KB sign
+  per `l`); `apply_spin_orbit` multiplies the projectors with coefficients linear in these overlaps (`lzsz` on the same
+  spin, the `lsxy` ladders on the other). A projector depends on the atom only through `r - R_a`, so
+  `F_a = 2 sum_n f_n Re sum_(sigma,j) conj(<grad P_j|u_n,sigma>) c_(sigma,j)`. The radial functions are interpolated
+  linearly in the Hamiltonian, so the gradient takes the slope of that interpolant: the force is the derivative of the
+  energy that is minimized, not of a smoother table (Fortran's `dv_ion`/`dv_so` tables).
+
+Isolated runs use `compute_spinor_forces`; a periodic run uses `compute_periodic_forces` on a result whose nonlocal force
+the k-point job accumulated from the orbitals of every k-point in a last pass (`compute_forces=True`, as for the scalar
+k-point driver), with the Bloch phases of the projectors and their gradients and the atoms folded into the cell. Moved
+atoms keep the direction of their initial moment (`Initial_NCL_Moment`), and the SCF loop of every structure starts
+afresh: the spinor drivers take no warm start, and the log says so. The forces are not symmetrized over the point group of
+the atoms for a spin-polarized or non-collinear run, whose magnetization need not respect it; the net force is removed.
+
+Fortran's `forcnloc.f90` has a spin-orbit term (`forcso`, `soforc.F90`) but warns that it "may be inaccurate", and its
+`flsxy` pairs the same harmonic index on both sides where the Hamiltonian pairs `lm` with `lm +- 1`; with the divisor
+`nspin/mxwd` of `forcnloc.f90` for a spinor it is not a reference. These forces are validated against the energy of this
+package instead (`tests/unit/test_spinor_forces.py`, Au dimer with a relativistic pseudopotential, cubic spline):
+
+| Check | Result |
+|---|---|
+| Each term against a finite difference of its energy at the converged spinors (non-collinear, spin-orbit, one unpaired electron) | ion-ion 1e-8, local ionic 1e-6, nonlocal plus spin-orbit 7e-5 Ry/bohr |
+| Spin-orbit term alone, smooth orbitals, step 1e-4 | 1e-5 Ry/bohr; the residue is the kinks of the piecewise-linear radial tables |
+| Total force against the derivative of the converged SCF energy (Richardson, steps 0.01 / 0.005 bohr), isolated, non-collinear with spin-orbit | -9.5720 against -9.5725, 4.9827 against 4.9817 Ry/bohr |
+| The same, collinear spin with spin-orbit (isolated and 2x1x1 k-points), unpolarized spin-orbit (Gamma), non-collinear (2x1x1 k-points, periodic) | 5e-5 to 3e-3 Ry/bohr on forces of 0.7 to 10 Ry/bohr |
+| Without spin-orbit, non-collinear against the collinear spin-polarized driver (whose forces were compared with Fortran) | energy 1e-6 Ry, forces 2e-4 Ry/bohr |
+
+The forces on this dimer are large (10 Ry/bohr, with a net force of the same size before it is removed) because a
+0.7 bohr grid is far too coarse for Au; they show that the forces follow the energy of the grid, which is what the checks
+test, not that the grid is converged.
+
+Not covered: the perturbative correction (`SO_PSP` with an ordinary spin-polarized SCF), which shifts the eigenvalues of that
+SCF to first order and reports no total energy that includes the shift, so a relaxation would have no energy to follow
+(`SO_from_scratch` has forces); `Energy_Refinement`; the row-distributed MPI k-point solver (it raises, as for the scalar k-point forces); the
+accelerated path, which hands every spin-orbit and non-collinear input with forces to the reference solver (the pooled
+k-point solver of that solver runs on the GPUs for periodic and non-collinear inputs and forms the overlaps of the force on the
+device, which has been run on CPU arrays only).
+
 ## Structural relaxation
 
 `Relaxation/domove.py` is one call of `domove.f90`; `Relaxation/ionic_loop.py`
@@ -415,6 +470,12 @@ Nothing leaves the devices that a single point keeps there.
 - **Several nodes**: the rank of each node rebuilds the projectors of its own
   sectors (command `geometry`), restarts its solvers (`new_scf_loop`) and
   contracts its part of the nonlocal force (`forces`); the root sums them.
+- **Spin-orbit coupling and non-collinear magnetism**: the accelerated entry point runs these inputs, when they ask for
+  forces, with the reference solver and says so. Its pooled k-point solver (periodic and non-collinear inputs) hands the
+  orbitals of a k-point to the force pass on the device that solved it: the overlaps with the projectors, the spin-orbit
+  projectors and their gradients are sparse products there and only the `(atoms, 3)` result comes back
+  (`Forces/spin_orbit.py` is written against the array module of the orbitals; it is tested on CPU arrays through a
+  module that offers only CuPy's operations, not yet on a GPU).
 - **Periodic cells (Gamma point, no spin)**: forces, relaxation and molecular dynamics run on the accelerated path.
   Moving the atoms replaces the projectors on the device operator and rebuilds the ionic potential, the densities and the
   Ewald terms from the folded positions (`update_periodic_geometry`); the Hartree solve of a periodic cell is the readable
@@ -482,6 +543,8 @@ those exchanges was measured slower and left out (see the module).
 | Forces of a single point | Always computed | Only with `Skip_Force: false` | Existing inputs keep their cost. |
 | Periodic forces | Reciprocal-space form factors (`force_loc_pb.f90`) | Real-space sums over images, with an FFT version for the potential | The same terms; the grid-sampled potential has egg-box effects the form-factor one has not (see "Periodic cells"). |
 | Periodic forces and symmetry | Symmetrized with the space group | Not symmetrized | No space-group operations are found. |
+| Forces of spin-orbit and non-collinear runs | `forcso`, with a warning that they "may be inaccurate" | The derivative of the energy of the SCF loop, pieces of `forcnloc.f90` and `soforc.F90` rewritten | The spin-flip term of `flsxy` pairs different harmonics than the Hamiltonian; see "Spin-orbit coupling and non-collinear magnetism". |
+| Moved atoms with spin-orbit or non-collinear spinors | SCF restarted from the previous wavefunctions | SCF started afresh, from the initial moments | The spinor drivers take no warm start. |
 | Positions of a periodic run | Wrapped into the cell (`back_to_cell`) | Continuous; the builders fold them | The optimizer needs continuous coordinates. |
 | SCF-correction force with `Cubic_Spline` | Uses the derivative table together with the spline coefficients of the density | Interpolates the atomic valence density linearly in that term | The combination in `forcloc.f90` mixes two tables; the term vanishes at SCF convergence. |
 | `atom.cor` of a restarted run | "Step # 0" shows the coordinates of the input file | Shows the restart structure, which is the one computed | The file then describes the run. |

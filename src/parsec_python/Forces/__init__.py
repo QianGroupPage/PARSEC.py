@@ -22,19 +22,34 @@ from .symmetry import (
     symmetrize_positions,
     total_torque,
 )
-from .total import ForceResult, assemble_forces, compute_forces, compute_periodic_forces
+from .spin_orbit import (
+    SpinOrbitForceOperator,
+    build_spin_orbit_force_operator,
+    spin_orbit_forces,
+    spinor_nonlocal_forces,
+)
+from .total import (
+    ForceResult,
+    assemble_forces,
+    compute_forces,
+    compute_periodic_forces,
+    compute_spinor_forces,
+)
 
 __all__ = [
     "AtomSymmetryOperation",
     "ForceResult",
     "LocalForceTerms",
     "NonlocalProjectorGradients",
+    "SpinOrbitForceOperator",
     "assemble_forces",
     "atom_symmetry_operations",
     "build_nonlocal_projector_gradients",
     "build_periodic_projector_gradients",
+    "build_spin_orbit_force_operator",
     "compute_forces",
     "compute_periodic_forces",
+    "compute_spinor_forces",
     "contract_nonlocal_forces",
     "cubic_point_operations",
     "ewald_ion_ion_forces",
@@ -47,6 +62,8 @@ __all__ = [
     "real_harmonics_with_gradients",
     "remove_net_force",
     "species_force_tables",
+    "spin_orbit_forces",
+    "spinor_nonlocal_forces",
     "symmetrize_forces",
     "symmetrize_positions",
     "total_torque",

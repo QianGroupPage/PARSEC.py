@@ -403,7 +403,7 @@ def _resource_report(resources: Resources, system) -> list[str]:
 def _accelerated_self_consistent_soc_eligible(translation) -> bool:
     """Whether this input matches the one self-consistent-SOC shape the
     accelerated path implements: Gamma-point only, not combined with
-    collinear spin polarization.
+    collinear spin polarization, and without forces, relaxation or molecular dynamics.
 
     See :mod:`parsec_python.acceleration.SCF.self_consistent_soc`'s module
     docstring.  Combined with spin polarization or a periodic
@@ -418,6 +418,20 @@ def _accelerated_self_consistent_soc_eligible(translation) -> bool:
         and not problem.scf.spin_polarized
         and not problem.scf.noncollinear
         and problem.periodic_cell is None
+        and not _asks_for_ionic_motion(translation)
+    )
+
+
+def _asks_for_ionic_motion(translation) -> bool:
+    """Whether the input asks for forces, a relaxation or molecular dynamics.
+
+    The CuPy spinor driver has no forces; the reference solver has them for every spin-orbit and non-collinear input.
+    """
+
+    return bool(
+        translation.relaxation is not None
+        or translation.molecular_dynamics is not None
+        or translation.compute_forces
     )
 
 
@@ -492,7 +506,11 @@ def _reference_only_features(
                 "(SO_from_scratch with a periodic Boundary_Conditions)"
             )
         elif not accelerated_backend_selected:
-            features.append("self-consistent spin-orbit coupling (SO_from_scratch)")
+            features.append(
+                "forces, relaxation or molecular dynamics with self-consistent spin-orbit coupling (SO_from_scratch)"
+                if _asks_for_ionic_motion(translation)
+                else "self-consistent spin-orbit coupling (SO_from_scratch)"
+            )
         # else: Gamma-point-only self-consistent SOC on a resolved CuPy
         # backend -- accelerated, not reference-only.
     elif problem.scf.spin_polarized and (
@@ -777,16 +795,9 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
         )
         return reference_main(_reference_argv(arguments))
 
-    if accelerated_self_consistent_soc and (
-        translation.relaxation is not None
-        or translation.molecular_dynamics is not None
-        or translation.compute_forces
-        or getattr(translation, "energy_refinement", None) is not None
-    ):
+    if accelerated_self_consistent_soc and getattr(translation, "energy_refinement", None) is not None:
         print(
-            "Input error: Minimization, Molecular_Dynamics, Skip_Force: false and "
-            "Energy_Refinement are not implemented together with self-consistent "
-            "spin-orbit coupling",
+            "Input error: Energy_Refinement is not implemented together with self-consistent spin-orbit coupling",
             file=sys.stderr,
         )
         return 2

@@ -45,6 +45,7 @@ from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
 from .orbital_density import spinor_sums
 from .stage_timer import StageTimer, solver_residual_max, solver_timings
 from .kpoints_soc import (
+    SpinorForceExtras,
     _eigval_settings,
     _k_point_operators,
     _number_of_states,
@@ -133,6 +134,7 @@ def _run_noncollinear(
     weight: float,
     callback: Callable[[SelfConsistentSOCIteration], None] | None,
     k_points: np.ndarray | None = None,
+    extras: SpinorForceExtras | None = None,
 ) -> SelfConsistentSOCResult:
     settings = system.input.scf
     n_grid = system.grid.size
@@ -166,10 +168,15 @@ def _run_noncollinear(
                 task, potentials["V"], potentials["field"]
             ),
             accumulate,
-            extras=lambda task, vectors, xp=np: _state_sz([vectors], xp),
+            extras=extras if extras is not None else (lambda task, vectors, xp=np: _state_sz([vectors], xp)),
         ),
         problem_size=system.grid.size,
     )
+    if extras is not None and extras.compute_forces and type(solver).__name__ == "MPIKPointSolver":
+        raise NotImplementedError(
+            "the nonlocal force of the row-distributed MPI k-point solver is not implemented: its extras are "
+            "sums over row blocks, which does not apply to a product of overlaps"
+        )
     mixer = AndersonMixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
@@ -183,6 +190,7 @@ def _run_noncollinear(
         timer.lap()  # what came before the loop (potentials, solver start-up) is not part of iteration 1
         for iteration in range(1, settings.max_iterations + 1):
             eigval_settings = _eigval_settings(system, filter_degree)
+            used_potential = input_potential  # what enters this eigenproblem (the mixed one replaces it below)
 
             with timer.stage("diagonalization"):
                 eigenvalues_by_k = solver.solve({"V": input_potential, "field": input_field}, filter_degree)
@@ -277,6 +285,16 @@ def _run_noncollinear(
                 break
 
         moment_vector = volume_element * np.sum(magnetization, axis=1)
+        nonlocal_forces = None
+        state_moments = None
+        if k_points is not None:
+            if extras is not None and extras.compute_forces:
+                # the eigenvectors and occupations of the last step belong together
+                extras.set_occupations(split_pooled(pooled_occupations, eigenvalues_by_k))
+            if extras is not None:
+                state_moments, nonlocal_forces = extras.collect(solver)
+            else:
+                state_moments = np.concatenate(solver.extras())
         return SelfConsistentSOCResult(
             converged=converged,
             iterations=iteration,
@@ -293,12 +311,16 @@ def _run_noncollinear(
             magnetization=magnetization,
             k_points=k_points,
             k_weights=None if k_points is None else np.full(n_kpoints, weight),
-            state_moments=None if k_points is None else np.concatenate(solver.extras()),
+            state_moments=state_moments,
             timings=solver_timings(timer, solver),
             scf_potentials={
                 "effective_potential": output_potential,
                 "xc_field": output_field,
             },
+            xc_potential=xc.potential,
+            input_effective_potential=used_potential,
+            output_effective_potential=output_potential,
+            nonlocal_forces=nonlocal_forces,
         )
 
 
@@ -340,11 +362,14 @@ def run_self_consistent_noncollinear_kpoints(
     weights: np.ndarray,
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
+    compute_forces: bool = False,
 ) -> SelfConsistentSOCResult:
     """Non-collinear SCF for a periodic cell on an unreduced uniform k grid.
 
     Spin-orbit projectors are built for every k-point from the species with
-    ``SO_PSP`` (none gives plain non-collinear magnetism).
+    ``SO_PSP`` (none gives plain non-collinear magnetism).  ``compute_forces``
+    also returns the nonlocal force (``result.nonlocal_forces``), accumulated from the orbitals of every k-point by
+    a last pass after the SCF loop (see :class:`~parsec_python.SCF.kpoints_soc.SpinorForceExtras`).
     """
 
     if not system.input.scf.noncollinear:
@@ -357,12 +382,15 @@ def run_self_consistent_noncollinear_kpoints(
     )
     operator_cache: dict[int, tuple] = {}
 
-    def hamiltonian_for_k(k_index, potential, field):
+    def operators_for(k_index):
         if k_index not in operator_cache:
             operator_cache[k_index] = _k_point_operators(
                 system, k_points[k_index : k_index + 1]
             )[0]
-        nonlocal_operator_k, soc_projectors_k = operator_cache[k_index]
+        return operator_cache[k_index]
+
+    def hamiltonian_for_k(k_index, potential, field):
+        nonlocal_operator_k, soc_projectors_k = operators_for(k_index)
         return _spinor_hamiltonian(
             system,
             k_points[k_index],
@@ -372,8 +400,9 @@ def run_self_consistent_noncollinear_kpoints(
             xc_field=field,
         )
 
+    extras = SpinorForceExtras(system, k_points, weight, operators_for, compute_forces)
     return _run_noncollinear(
-        system, hamiltonian_for_k, k_points.shape[0], weight, callback, k_points
+        system, hamiltonian_for_k, k_points.shape[0], weight, callback, k_points, extras
     )
 
 

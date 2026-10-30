@@ -141,6 +141,48 @@ def _default_spinor_hamiltonian_builder(scalar_hamiltonian, soc_projectors):
     )
 
 
+def initial_spinor_potentials(system, warm_start, timer):
+    """``(hartree_potential, input_potential)`` of the first iteration.
+
+    Without a warm start these are the Hartree and exchange-correlation potentials of the superposed atomic densities.
+    With one (:class:`~parsec_python.SCF.single_point.SCFWarmStart`, the previous structure of a relaxation or dynamics
+    run) the first input potential is the last mixed one of that structure with its ionic part exchanged, and the
+    previous Hartree potential starts the first Poisson solve; no density is needed before the first eigensolve.  The
+    atomic extrapolation (``density_guess``) replaces the Hartree and exchange-correlation parts by those of the
+    guessed density.  Both spinor components share the potential, so this is the scalar construction of
+    :func:`~parsec_python.SCF.single_point.run_scf`.
+    """
+
+    ionic_potential = system.ionic_potential
+    if warm_start is None:
+        with timer.stage("setup_potentials"):
+            hartree_potential = system.solve_hartree(
+                system.initial_density, initial_potential=-ionic_potential
+            ).potential
+            xc = system.evaluate_xc(system.initial_density)
+        return hartree_potential, ionic_potential + hartree_potential + xc.potential
+    hartree_potential = np.array(warm_start.hartree_potential, dtype=np.float64)
+    input_potential = np.array(warm_start.input_potential, dtype=np.float64)
+    if warm_start.density_guess is not None:
+        guess = np.array(warm_start.density_guess, dtype=np.float64)
+        with timer.stage("setup_potentials"):
+            hartree_potential = system.solve_hartree(guess, initial_potential=hartree_potential).potential
+            moved_xc = system.evaluate_xc(guess)
+        input_potential = (
+            input_potential
+            + (hartree_potential + moved_xc.potential)
+            - np.array(warm_start.hxc_reference, dtype=np.float64)
+        )
+    return hartree_potential, input_potential
+
+
+def first_iteration_degree(warm_start, filter_degree: int, iteration: int) -> int:
+    """The filter degree of an iteration: a warm start with an extrapolated potential filters harder at first."""
+
+    first = getattr(warm_start, "first_iteration_degree", None) if iteration == 1 else None
+    return filter_degree if first is None else max(filter_degree, int(first))
+
+
 def run_self_consistent_soc(
     system: PreparedSinglePointSystem,
     soc_projectors: tuple[AtomSpinOrbitProjectors, ...],
@@ -153,8 +195,13 @@ def run_self_consistent_soc(
     total_energy_evaluator: Callable[..., object] | None = None,
     synchronize: Callable[[], None] | None = None,
     to_host: Callable[[object], np.ndarray] | None = None,
+    warm_start=None,
 ) -> SelfConsistentSOCResult:
     """Run self-consistent-SOC PARSEC-style potential mixing.
+
+    ``warm_start`` (:class:`~parsec_python.SCF.single_point.SCFWarmStart`) continues from the loop of the previous
+    structure of a relaxation or dynamics run: its last mixed potential, its Hartree potential and its eigensubspace,
+    which the first iteration filters instead of solving the eigenproblem from random vectors.
 
     ``soc_projectors`` is
     :func:`~parsec_python.Eigensolvers.perturbative_soc.build_spin_orbit_projectors`'s
@@ -214,15 +261,9 @@ def run_self_consistent_soc(
         else total_energy_evaluator
     )
 
-    with timer.stage("setup_potentials"):
-        initial_hartree = system.solve_hartree(
-            system.initial_density, initial_potential=-ionic_potential
-        )
-        hartree_potential = initial_hartree.potential
-        xc = system.evaluate_xc(system.initial_density)
-        input_potential = ionic_potential + hartree_potential + xc.potential
+    hartree_potential, input_potential = initial_spinor_potentials(system, warm_start, timer)
 
-    eigval_state: EigvalState | None = None
+    eigval_state: EigvalState | None = None if warm_start is None else warm_start.eigensolver_state
     mixer = build_mixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
@@ -237,7 +278,7 @@ def run_self_consistent_soc(
 
     used_potential = input_potential
     for iteration in range(1, settings.max_iterations + 1):
-        eigval_settings = _eigval_settings(system, filter_degree)
+        eigval_settings = _eigval_settings(system, first_iteration_degree(warm_start, filter_degree, iteration))
         used_potential = input_potential  # what enters this eigenproblem (the mixed one replaces it below)
 
         with timer.stage("hamiltonian"):
@@ -356,7 +397,15 @@ def run_self_consistent_soc(
         xc_potential=xc.potential,
         input_effective_potential=used_potential,
         output_effective_potential=output_potential,
+        next_effective_potential=input_potential,
+        hartree_potential=hartree_potential,
+        eigensolver_state=eigval_state,
     )
 
 
-__all__ = ["run_self_consistent_soc", "spinor_density_from_orbitals"]
+__all__ = [
+    "first_iteration_degree",
+    "initial_spinor_potentials",
+    "run_self_consistent_soc",
+    "spinor_density_from_orbitals",
+]

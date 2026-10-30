@@ -1324,7 +1324,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if spinor_ionic:
                 ionic_reporter = _SpinorReporter(reporter)
                 backend_factory = lambda extrapolation="none": spinor_backend(  # noqa: E731
-                    *(k_sampling if k_sampling is not None else (None, None))
+                    *(k_sampling if k_sampling is not None else (None, None)),
+                    extrapolation,
                 )
             elif is_periodic:
                 # the spin-polarized loop is the Gamma-point one, whatever Monkhorst-Pack grid of one point the input names

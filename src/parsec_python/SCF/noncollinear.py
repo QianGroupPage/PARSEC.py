@@ -52,6 +52,8 @@ from .kpoints_soc import (
     _spinor_hamiltonian,
     _state_sz,
     _validated_k_points,
+    export_subspaces,
+    import_subspaces,
 )
 
 
@@ -135,6 +137,7 @@ def _run_noncollinear(
     callback: Callable[[SelfConsistentSOCIteration], None] | None,
     k_points: np.ndarray | None = None,
     extras: SpinorForceExtras | None = None,
+    warm_start=None,
 ) -> SelfConsistentSOCResult:
     settings = system.input.scf
     n_grid = system.grid.size
@@ -144,14 +147,19 @@ def _run_noncollinear(
 
     timer = StageTimer()
     density = system.initial_density
-    with timer.stage("initial_magnetization"):
-        magnetization = _initial_magnetization(system)
-    with timer.stage("setup_potentials"):
-        hartree = system.solve_hartree(density, initial_potential=-ionic_potential)
-        hartree_potential = hartree.potential
-        xc = system.evaluate_xc_noncollinear(density, magnetization)
-    input_potential = ionic_potential + hartree_potential + xc.potential
-    input_field = xc.field
+    if warm_start is None:
+        with timer.stage("initial_magnetization"):
+            magnetization = _initial_magnetization(system)
+        with timer.stage("setup_potentials"):
+            hartree = system.solve_hartree(density, initial_potential=-ionic_potential)
+            hartree_potential = hartree.potential
+            xc = system.evaluate_xc_noncollinear(density, magnetization)
+        input_potential = ionic_potential + hartree_potential + xc.potential
+        input_field = xc.field
+    else:
+        # the exchange-correlation field of the previous structure carries the moments to the moved atoms
+        hartree_potential = np.array(warm_start.hartree_potential, dtype=np.float64)
+        input_potential, input_field = (np.array(part, dtype=np.float64) for part in warm_start.input_potential)
 
     def accumulate(task, vectors, occupations, xp=np):
         density_k, magnetization_k = spinor_density_and_magnetization(
@@ -187,9 +195,9 @@ def _run_noncollinear(
     energies = None
     converged = False
     with solver:
+        import_subspaces(solver, warm_start)
         timer.lap()  # what came before the loop (potentials, solver start-up) is not part of iteration 1
         for iteration in range(1, settings.max_iterations + 1):
-            eigval_settings = _eigval_settings(system, filter_degree)
             used_potential = input_potential  # what enters this eigenproblem (the mixed one replaces it below)
 
             with timer.stage("diagonalization"):
@@ -285,6 +293,7 @@ def _run_noncollinear(
                 break
 
         moment_vector = volume_element * np.sum(magnetization, axis=1)
+        subspaces = export_subspaces(solver)
         nonlocal_forces = None
         state_moments = None
         if k_points is not None:
@@ -321,6 +330,9 @@ def _run_noncollinear(
             input_effective_potential=used_potential,
             output_effective_potential=output_potential,
             nonlocal_forces=nonlocal_forces,
+            next_effective_potential=(input_potential, input_field),
+            hartree_potential=hartree_potential,
+            eigensolver_state=subspaces,
         )
 
 
@@ -329,8 +341,12 @@ def run_self_consistent_noncollinear(
     soc_projectors: tuple = (),
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
+    warm_start=None,
 ) -> SelfConsistentSOCResult:
     """Non-collinear SCF for an isolated system.
+
+    ``warm_start`` (:class:`~parsec_python.SCF.single_point.SCFWarmStart`, whose ``input_potential`` is the pair
+    ``(V, B_xc)``) continues from the loop of the previous structure of a relaxation or dynamics run.
 
     ``soc_projectors`` is
     :func:`~parsec_python.Eigensolvers.perturbative_soc.build_spin_orbit_projectors`'s
@@ -353,7 +369,7 @@ def run_self_consistent_noncollinear(
             xc_field=field,
         )
 
-    return _run_noncollinear(system, hamiltonian_for_k, 1, 1.0, callback)
+    return _run_noncollinear(system, hamiltonian_for_k, 1, 1.0, callback, warm_start=warm_start)
 
 
 def run_self_consistent_noncollinear_kpoints(
@@ -363,8 +379,11 @@ def run_self_consistent_noncollinear_kpoints(
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
     compute_forces: bool = False,
+    warm_start=None,
 ) -> SelfConsistentSOCResult:
     """Non-collinear SCF for a periodic cell on an unreduced uniform k grid.
+
+    ``warm_start`` continues from the loop of the previous structure, as for the isolated driver.
 
     Spin-orbit projectors are built for every k-point from the species with
     ``SO_PSP`` (none gives plain non-collinear magnetism).  ``compute_forces``
@@ -402,7 +421,7 @@ def run_self_consistent_noncollinear_kpoints(
 
     extras = SpinorForceExtras(system, k_points, weight, operators_for, compute_forces)
     return _run_noncollinear(
-        system, hamiltonian_for_k, k_points.shape[0], weight, callback, k_points, extras
+        system, hamiltonian_for_k, k_points.shape[0], weight, callback, k_points, extras, warm_start
     )
 
 

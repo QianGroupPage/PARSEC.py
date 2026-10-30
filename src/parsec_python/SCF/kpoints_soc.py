@@ -55,6 +55,7 @@ from .stage_timer import StageTimer, solver_residual_max, solver_timings
 from ..Mixer import AndersonMixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
 from ..SCF.pbc import PeriodicPreparedSinglePointSystem
+from .self_consistent_soc import first_iteration_degree, initial_spinor_potentials
 from ..SCF.spin_polarized import _weighted_initial_polarization
 from ..V_ion import build_nonlocal_projectors
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
@@ -266,6 +267,22 @@ class SpinorForceExtras:
         return moments, forces
 
 
+def import_subspaces(solver, warm_start) -> None:
+    """Hand the eigensubspaces of a warm start (``{k-point: state}``) to a k-point solver that can take them."""
+
+    states = None if warm_start is None else warm_start.eigensolver_state
+    importer = getattr(solver, "import_states", None)
+    if isinstance(states, dict) and importer is not None:
+        importer(states)
+
+
+def export_subspaces(solver):
+    """The ``{k-point: state}`` eigensubspaces of a k-point solver, or ``None`` where it cannot export them."""
+
+    exporter = getattr(solver, "export_states", None)
+    return exporter() if exporter is not None else None
+
+
 def _spinor_hamiltonian(
     system: PeriodicPreparedSinglePointSystem,
     k_point: np.ndarray,
@@ -351,8 +368,14 @@ def run_self_consistent_soc_kpoints(
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
     compute_forces: bool = False,
+    warm_start=None,
 ) -> SelfConsistentSOCResult:
     """Run periodic self-consistent-SOC SCF on an already-prepared system.
+
+    ``warm_start`` (:class:`~parsec_python.SCF.single_point.SCFWarmStart`) continues from the loop of the previous
+    structure of a relaxation or dynamics run: its last mixed potential, its Hartree potential and the eigensubspace of
+    every k-point (``{k-point: state}``), which the first iteration filters instead of solving from random vectors.
+    A solver that cannot export its subspaces (the row-distributed MPI one) starts the eigenproblems cold.
 
     ``compute_forces`` also returns the nonlocal force (``result.nonlocal_forces``): the orbitals of a k-point are not
     kept, so it is accumulated from them in a last pass after the SCF loop (see :class:`SpinorForceExtras`).
@@ -376,11 +399,7 @@ def run_self_consistent_soc_kpoints(
 
     timer = StageTimer()
     density = system.initial_density
-    with timer.stage("setup_potentials"):
-        initial_hartree = system.solve_hartree(density, initial_potential=-ionic_potential)
-        hartree_potential = initial_hartree.potential
-        xc = system.evaluate_xc(density)
-    input_potential = ionic_potential + hartree_potential + xc.potential
+    hartree_potential, input_potential = initial_spinor_potentials(system, warm_start, timer)
 
     dV = system.grid.volume_element
     n_grid = system.grid.size
@@ -407,13 +426,15 @@ def run_self_consistent_soc_kpoints(
     # spinors (storing all k-points would multiply the memory); the
     # per-state <S_z> of every k-point is stored separately (state_moments).
     with solver:
+        import_subspaces(solver, warm_start)
         timer.lap()  # what came before the loop (potentials, solver start-up) is not part of iteration 1
         for iteration in range(1, settings.max_iterations + 1):
-            eigval_settings = _eigval_settings(system, filter_degree)
             used_potential = input_potential  # what enters this eigenproblem (the mixed one replaces it below)
 
             with timer.stage("diagonalization"):
-                eigenvalues_by_k = solver.solve({"V": input_potential}, filter_degree)
+                eigenvalues_by_k = solver.solve(
+                    {"V": input_potential}, first_iteration_degree(warm_start, filter_degree, iteration)
+                )
             residual_max = solver_residual_max(solver)
 
             # Pool every k-point's already-SOC-split spinor eigenvalues into one
@@ -508,6 +529,7 @@ def run_self_consistent_soc_kpoints(
             # the eigenvectors and occupations of the last step belong together
             extras.set_occupations(split_pooled(pooled_occupations, eigenvalues_by_k))
         state_moments, nonlocal_forces = extras.collect(solver)
+        subspaces = export_subspaces(solver)
         return SelfConsistentSOCResult(
             converged=converged,
             iterations=iteration,
@@ -528,6 +550,9 @@ def run_self_consistent_soc_kpoints(
             input_effective_potential=used_potential,
             output_effective_potential=output_potential,
             nonlocal_forces=nonlocal_forces,
+            next_effective_potential=input_potential,
+            hartree_potential=hartree_potential,
+            eigensolver_state=subspaces,
         )
 
 
@@ -538,8 +563,12 @@ def run_self_consistent_soc_kpoints_spin_polarized(
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
     compute_forces: bool = False,
+    warm_start=None,
 ) -> SelfConsistentSOCResult:
     """Periodic self-consistent SOC with collinear spin polarization.
+
+    ``warm_start`` continues from the loop of the previous structure of a relaxation or dynamics run, as for
+    :func:`run_self_consistent_soc_kpoints`; its ``input_potential`` is the pair ``(V_up, V_down)``.
 
     ``compute_forces`` also returns the nonlocal force, as for :func:`run_self_consistent_soc_kpoints`.
 
@@ -584,14 +613,20 @@ def run_self_consistent_soc_kpoints_spin_polarized(
     polarization = _weighted_initial_polarization(system)
     density_up = 0.5 * (1.0 + polarization) * system.initial_density
     density_down = 0.5 * (1.0 - polarization) * system.initial_density
-    with timer.stage("setup_potentials"):
-        initial_hartree = system.solve_hartree(
-            density_up + density_down, initial_potential=-ionic_potential
+    if warm_start is None:
+        with timer.stage("setup_potentials"):
+            initial_hartree = system.solve_hartree(
+                density_up + density_down, initial_potential=-ionic_potential
+            )
+            hartree_potential = initial_hartree.potential
+            xc = system.evaluate_xc_spin_polarized(density_up, density_down)
+        input_potential_up = ionic_potential + hartree_potential + xc.potential_up
+        input_potential_down = ionic_potential + hartree_potential + xc.potential_down
+    else:
+        hartree_potential = np.array(warm_start.hartree_potential, dtype=np.float64)
+        input_potential_up, input_potential_down = (
+            np.array(potential, dtype=np.float64) for potential in warm_start.input_potential
         )
-        hartree_potential = initial_hartree.potential
-        xc = system.evaluate_xc_spin_polarized(density_up, density_down)
-    input_potential_up = ionic_potential + hartree_potential + xc.potential_up
-    input_potential_down = ionic_potential + hartree_potential + xc.potential_down
 
     dV = system.grid.volume_element
 
@@ -619,9 +654,9 @@ def run_self_consistent_soc_kpoints_spin_polarized(
     density_down_out = density_down
 
     with solver:
+        import_subspaces(solver, warm_start)
         timer.lap()  # what came before the loop (potentials, solver start-up) is not part of iteration 1
         for iteration in range(1, settings.max_iterations + 1):
-            eigval_settings = _eigval_settings(system, filter_degree)
             effective_potential_avg = 0.5 * (input_potential_up + input_potential_down)
             xc_delta = 0.5 * (input_potential_up - input_potential_down)
 
@@ -727,6 +762,7 @@ def run_self_consistent_soc_kpoints_spin_polarized(
         if compute_forces:
             extras.set_occupations(split_pooled(pooled_occupations, eigenvalues_by_k))
         state_moments, nonlocal_forces = extras.collect(solver)
+        subspaces = export_subspaces(solver)
         return SelfConsistentSOCResult(
             converged=converged,
             iterations=iteration,
@@ -753,6 +789,9 @@ def run_self_consistent_soc_kpoints_spin_polarized(
             input_effective_potential=effective_potential_avg,
             output_effective_potential=0.5 * (output_potential_up + output_potential_down),
             nonlocal_forces=nonlocal_forces,
+            next_effective_potential=(input_potential_up, input_potential_down),
+            hartree_potential=hartree_potential,
+            eigensolver_state=subspaces,
         )
 
 

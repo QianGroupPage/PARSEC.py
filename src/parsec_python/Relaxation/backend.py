@@ -123,7 +123,7 @@ def periodic_backend(
     )
 
 
-def spinor_backend(k_points=None, k_weights=None) -> IonicBackend:
+def spinor_backend(k_points=None, k_weights=None, potential_extrapolation: str = "none") -> IonicBackend:
     """The readable path for spinor orbitals: self-consistent spin-orbit coupling and non-collinear magnetism.
 
     The drivers are those of ``SO_from_scratch`` (``run_self_consistent_soc``, with collinear spin
@@ -133,21 +133,27 @@ def spinor_backend(k_points=None, k_weights=None) -> IonicBackend:
     the spin-orbit projectors are built from its atoms at every structure.  The forces are those of
     :func:`parsec_python.Forces.compute_spinor_forces` (isolated, no symmetrization unless asked for) or
     :func:`parsec_python.Forces.compute_periodic_forces` (periodic, whose k-point result carries the nonlocal force
-    accumulated by the SCF step).  The SCF loop of a moved structure starts afresh: the spinor drivers take no warm
-    start, and the starting moments of a non-collinear run are those of the input atoms, which the moved atoms keep.
+    accumulated by the SCF step).
+
+    The SCF loop of a moved structure continues from the previous one: its mixed potential (for spin the two
+    potentials, for a non-collinear run the exchange-correlation field with the moments) and the eigensubspaces of its
+    orbitals.  ``potential_extrapolation`` is as for :func:`reference_backend` for plain spin-orbit coupling; the loops
+    with spin take the carried potentials only.
     """
 
     import copy
+    from functools import partial
 
     import numpy as np
 
     from ..Eigensolvers.perturbative_soc import build_spin_orbit_projectors
     from ..Forces import compute_periodic_forces, compute_spinor_forces
-    from ..SCF import update_geometry, update_periodic_geometry
+    from ..SCF import update_geometry, update_periodic_geometry, warm_start_for_moved_atoms
     from ..SCF.kpoints_soc import run_self_consistent_soc_kpoints, run_self_consistent_soc_kpoints_spin_polarized
     from ..SCF.noncollinear import run_self_consistent_noncollinear, run_self_consistent_noncollinear_kpoints
     from ..SCF.self_consistent_soc import run_self_consistent_soc
     from ..SCF.self_consistent_soc_spin_polarized import run_self_consistent_soc_spin_polarized
+    from ..SCF.single_point import extrapolation_keywords
 
     if k_points is not None:
         k_points = np.asarray(k_points, dtype=float)
@@ -175,17 +181,17 @@ def spinor_backend(k_points=None, k_weights=None) -> IonicBackend:
                 driver = run_self_consistent_soc_kpoints_spin_polarized
             else:
                 driver = run_self_consistent_soc_kpoints
-            return driver(system, points, weights, callback=callback, compute_forces=True)
+            return driver(system, points, weights, callback=callback, compute_forces=True, warm_start=warm_start)
         projectors = tuple(
             build_spin_orbit_projectors(
                 system.grid, system.atoms, system.pseudopotentials, system.input.pseudopotentials
             )
         )
         if scf.noncollinear:
-            return run_self_consistent_noncollinear(system, projectors, callback=callback)
+            return run_self_consistent_noncollinear(system, projectors, callback=callback, warm_start=warm_start)
         if scf.spin_polarized:
-            return run_self_consistent_soc_spin_polarized(system, projectors, callback=callback)
-        return run_self_consistent_soc(system, projectors, callback=callback)
+            return run_self_consistent_soc_spin_polarized(system, projectors, callback=callback, warm_start=warm_start)
+        return run_self_consistent_soc(system, projectors, callback=callback, warm_start=warm_start)
 
     def forces(system, result, *, symmetrize=False, operations=None):
         if is_periodic(system):
@@ -201,9 +207,8 @@ def spinor_backend(k_points=None, k_weights=None) -> IonicBackend:
         run_scf=solve,
         compute_forces=forces,
         update_geometry=update,
-        warm_start=lambda previous_system, previous_result, system: None,
-        restart_scf=lambda system, result: None,
-        warm_starts=False,
+        warm_start=partial(warm_start_for_moved_atoms, **extrapolation_keywords(potential_extrapolation)),
+        restart_scf=lambda system, result: warm_start_for_moved_atoms(system, result, system),
     )
 
 
@@ -222,4 +227,10 @@ def release_orbitals(result) -> None:
         release()
 
 
-__all__ = ["IonicBackend", "periodic_backend", "reference_backend", "release_orbitals", "spinor_backend"]
+__all__ = [
+    "IonicBackend",
+    "periodic_backend",
+    "reference_backend",
+    "release_orbitals",
+    "spinor_backend",
+]

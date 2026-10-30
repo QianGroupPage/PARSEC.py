@@ -94,6 +94,15 @@ class SerialKPointSolver:
     def extras(self) -> list[Any]:
         return [self.job.extras(task, self._vectors[task]) for task in range(self.job.n_tasks)]
 
+    def export_states(self) -> dict[int, Any]:
+        """The Ritz state of every task, on the host: what the SCF loop of the next structure of a relaxation or
+        dynamics run filters instead of solving from random vectors."""
+        return dict(self.states)
+
+    def import_states(self, states: dict[int, Any]) -> None:
+        """Start the tasks from the Ritz states ``states`` (by task) of an earlier loop."""
+        self.states.update(states)
+
     def vectors(self, task: int) -> np.ndarray:
         """The final eigenvectors of one task."""
         return self._vectors[task]

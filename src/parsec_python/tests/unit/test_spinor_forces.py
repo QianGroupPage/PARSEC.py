@@ -514,6 +514,84 @@ Correlation_Type: CA
 """
 
 
+class SpinOrbitWarmStartTests(unittest.TestCase):
+    """Self-consistent spin-orbit coupling continues from the structure before the move."""
+
+    def _compare(self, backend, system, moved, energy_places: int = 6):
+        first = backend.run_scf(system)
+        cold = backend.run_scf(moved)
+        warm = backend.run_scf(moved, warm_start=backend.warm_start(system, first, moved))
+        self.assertTrue(cold.converged and warm.converged)
+        self.assertLess(warm.iterations, cold.iterations)
+        self.assertAlmostEqual(warm.energies.total, cold.energies.total, places=energy_places)
+        return cold, warm
+
+    def _moved_cluster(self, mode: str, net_charge: float, criterion: float = 1.0e-6):
+        problem = _cluster(mode=mode, net_charge=net_charge)
+        problem = replace(problem, scf=replace(problem.scf, convergence_criterion=criterion))
+        system = prepare_single_point(problem)
+        positions = np.array([atom.position for atom in system.atoms])
+        positions[0, 0] += 0.005
+        return system, update_geometry(system, [replace(a, position=p) for a, p in zip(system.atoms, positions)])
+
+    def test_a_cluster_starts_from_the_previous_potential_and_subspace(self) -> None:
+        system, moved = self._moved_cluster("soc", 0.0)
+        for extrapolation in ("none", "atomic"):
+            with self.subTest(extrapolation=extrapolation):
+                self._compare(spinor_backend(None, None, extrapolation), system, moved)
+
+    def test_a_collinear_spin_cluster_carries_both_potentials(self) -> None:
+        system, moved = self._moved_cluster("spin", 1.0)
+        cold, warm = self._compare(spinor_backend(), system, moved)
+        self.assertIsInstance(warm.next_effective_potential, tuple)
+        self.assertAlmostEqual(warm.magnetic_moment, cold.magnetic_moment, places=4)
+
+    def test_a_noncollinear_cluster_carries_the_field_and_so_the_moments(self) -> None:
+        system, moved = self._moved_cluster("ncl", 1.0, 5.0e-5)  # above the noise floor of a spinor loop (1e-5)
+        cold, warm = self._compare(spinor_backend(), system, moved, energy_places=4)
+        # the starting moments are not asked for again: the field of the previous structure leads to the same moments
+        # (their direction is a soft mode: the loops agree to a few 1e-2, not to the criterion)
+        np.testing.assert_allclose(warm.magnetic_moment_vector, cold.magnetic_moment_vector, atol=5.0e-2)
+        self.assertGreater(np.linalg.norm(warm.magnetic_moment_vector), 0.5)
+
+    def test_a_cell_at_one_k_point_starts_from_the_previous_potential_and_subspace(self) -> None:
+        from parsec_python.acceleration.V_ion import periodic_setup
+        from parsec_python.V_ion import ewald
+        from parsec_python.V_ion import ionic_potential as _ionic
+
+        saved = (ewald._local_potential_provider, _ionic._support_finder)
+        periodic_setup.install()
+        self.addCleanup(lambda: setattr(ewald, "_local_potential_provider", saved[0]))
+        self.addCleanup(lambda: setattr(_ionic, "_support_finder", saved[1]))
+        problem = _periodic("soc")
+        problem = replace(problem, scf=replace(problem.scf, convergence_criterion=1.0e-6, net_charge=0.0))
+        system = prepare_periodic_single_point(problem)
+        positions = np.array([atom.position for atom in system.atoms])
+        positions[0, 0] += 0.01
+        moved = update_periodic_geometry(system, [replace(a, position=p) for a, p in zip(system.atoms, positions)])
+        cold, warm = self._compare(spinor_backend(None, None, "atomic"), system, moved)
+        # the forces of the continued loop are those of the converged structure
+        np.testing.assert_allclose(warm.nonlocal_forces, cold.nonlocal_forces, atol=5.0e-5)
+
+    def test_a_noncollinear_cell_continues_too(self) -> None:
+        from parsec_python.acceleration.V_ion import periodic_setup
+        from parsec_python.V_ion import ewald
+        from parsec_python.V_ion import ionic_potential as _ionic
+
+        saved = (ewald._local_potential_provider, _ionic._support_finder)
+        periodic_setup.install()
+        self.addCleanup(lambda: setattr(ewald, "_local_potential_provider", saved[0]))
+        self.addCleanup(lambda: setattr(_ionic, "_support_finder", saved[1]))
+        problem = _periodic("ncl")
+        problem = replace(problem, scf=replace(problem.scf, convergence_criterion=1.0e-5))
+        system = prepare_periodic_single_point(problem)
+        positions = np.array([atom.position for atom in system.atoms])
+        positions[0, 0] += 0.01
+        moved = update_periodic_geometry(system, [replace(a, position=p) for a, p in zip(system.atoms, positions)])
+        cold, warm = self._compare(spinor_backend(), system, moved, energy_places=4)
+        np.testing.assert_allclose(warm.magnetic_moment_vector, cold.magnetic_moment_vector, atol=1.0e-2)
+
+
 class SpinorIonicCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -521,8 +599,12 @@ class SpinorIonicCliTests(unittest.TestCase):
         self.directory = Path(self._tmp.name)
         shutil.copy(_AU, self.directory / "Au_POTRE.DAT")
 
-    def _write(self, ionic: str, extra: str = "", *, periodic: bool = False) -> Path:
+    def _write(self, ionic: str, extra: str = "", *, periodic: bool = False, plain: bool = False) -> Path:
         text = _CLUSTER_INPUT.format(ionic=ionic, extra=extra)
+        if plain:  # self-consistent spin-orbit coupling of a closed shell: no moments
+            text = text.replace("Non_Collinear_magnetism: .true.", "Non_Collinear_magnetism: .false.")
+            text = text.replace("begin Initial_NCL_Moment\n1 0 0\n0 1 0\nend Initial_NCL_Moment\n", "")
+            text = text.replace("Net_Charges: 1\n", "Net_Charges: 0\n")
         if periodic:
             text = text.replace(
                 "Boundary_Sphere_Radius: 8.0\n",
@@ -533,8 +615,8 @@ class SpinorIonicCliTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
-    def _run(self, ionic: str, extra: str = "", *, periodic: bool = False) -> tuple[int, str]:
-        code = cli_main([str(self._write(ionic, extra, periodic=periodic)), "--quiet"])
+    def _run(self, ionic: str, extra: str = "", *, periodic: bool = False, plain: bool = False) -> tuple[int, str]:
+        code = cli_main([str(self._write(ionic, extra, periodic=periodic, plain=plain)), "--quiet"])
         return code, (self.directory / "parsec.out").read_text(encoding="utf-8")
 
     def test_a_single_point_with_forces_reports_and_archives_them(self) -> None:
@@ -552,8 +634,8 @@ class SpinorIonicCliTests(unittest.TestCase):
     def test_a_relaxation_moves_the_atoms_and_keeps_their_moments(self) -> None:
         code, log = self._run("Skip_Force: .false.\nMinimization: bfgs\nMovement_Num: 1\nForce_Min: 0.001\n")
         self.assertEqual(code, 4)  # one movement is not enough to relax it
-        self.assertIn("the SCF loop starts afresh", log)
-        self.assertNotIn("the SCF loop continues from", log)
+        self.assertIn("the SCF loop continues from", log)
+        self.assertNotIn("starts afresh", log)
         # the second structure is magnetic too: the moved atoms keep the direction of their initial moments
         self.assertEqual(log.count("Converged magnetic moment vector"), 2)
         archive = np.load(self.directory / "parsec_python_results.npz")
@@ -563,6 +645,14 @@ class SpinorIonicCliTests(unittest.TestCase):
         for line in log.splitlines():
             if line.startswith("Converged magnetic moment vector"):
                 self.assertGreater(float(line.split("|m| =")[1]), 0.5)
+
+    def test_a_plain_spin_orbit_relaxation_continues_from_the_previous_structure(self) -> None:
+        code, log = self._run(
+            "Skip_Force: .false.\nMinimization: bfgs\nMovement_Num: 1\nForce_Min: 0.001\n", plain=True
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("the SCF loop continues from", log)
+        self.assertNotIn("starts afresh", log)
 
     def test_molecular_dynamics_runs_on_the_spinors(self) -> None:
         code, log = self._run(

@@ -1423,6 +1423,15 @@ class SelfConsistentSOCResult:
     nonlocal_forces: np.ndarray | None = None
     """``(atoms, 3)`` nonlocal force (projectors and spin-orbit term) of a k-point run, which keeps no orbitals but the
     first k-point's: accumulated from every k-point's orbitals at the end of the SCF loop (``compute_forces=True``)."""
+    next_effective_potential: np.ndarray | tuple | None = None
+    """The mixed potential the loop would have used for one more iteration (what the next structure of a relaxation
+    or dynamics run starts from, see :func:`parsec_python.SCF.single_point.warm_start_for_moved_atoms`): one array, the
+    pair ``(V_up, V_down)`` of a collinear-spin loop, or ``(V, B_xc)`` of a non-collinear one."""
+    hartree_potential: np.ndarray | None = None
+    """Hartree potential of the last density: the starting vector of the first Poisson solve of the next structure."""
+    eigensolver_state: object | None = None
+    """The eigensubspace the next structure continues from: one state for a cluster, a ``{k-point: state}`` dict for a
+    k-point run (held on the host)."""
 
     @property
     def magnetic_moment_per_state(self) -> np.ndarray:

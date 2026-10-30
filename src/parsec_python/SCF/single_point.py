@@ -17,7 +17,7 @@ eigenpair or energy residual.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, is_dataclass, replace
 import os
 import time
 from typing import Callable, Mapping
@@ -261,7 +261,10 @@ class SCFWarmStart:
 
     A spin-polarized loop takes ``input_potential`` and
     ``eigensolver_state`` as pairs, the up channel first; the Hartree
-    potential is common to both channels.
+    potential is common to both channels.  The spinor loops take one
+    eigensubspace (a ``{k-point: state}`` dict for a k-point run) and, for
+    collinear spin, ``input_potential`` as the pair ``(V_up, V_down)``, for
+    non-collinear magnetism as ``(V, B_xc)`` with ``B_xc`` of shape ``(3, n)``.
 
     ``density_guess`` and ``hxc_reference`` carry the atomic extrapolation
     (:func:`warm_start_for_moved_atoms`): the loop then adds to
@@ -322,7 +325,9 @@ def atomic_density_guess(previous_system, previous_result, system, history=None)
     'second_order'`` of Quantum ESPRESSO), from the second move on.
     """
 
-    if getattr(previous_result, "spin", None) is not None:
+    if getattr(previous_result, "spin", None) is not None or isinstance(
+        getattr(previous_result, "next_effective_potential", None), tuple
+    ):  # spin channels or a magnetization: the guess is a total density only
         return None
     settings = getattr(getattr(previous_system, "input", None), "initial_density_settings", None)
     if settings is not None and getattr(settings, "method", "sad") != "sad":
@@ -399,11 +404,15 @@ def state_for_new_potential(state: object | None) -> object | None:
 
     if state is None:
         return None
+    if isinstance(state, dict):  # the states of the k-points of a periodic run, by k-point
+        return {task: state_for_new_potential(value) for task, value in state.items()}
     restart = getattr(state, "for_new_scf_loop", None)
     if callable(restart):
         return restart()
     if isinstance(state, EigvalState):
         return replace(state, subspace=replace(state.subspace, first_filter=True))
+    if is_dataclass(state) and hasattr(state, "first_filter"):  # the device subspace of a spinor eigensolver
+        return replace(state, first_filter=True)
     return state
 
 
@@ -468,9 +477,21 @@ def _parsec_warm_start(previous_system, previous_result, system) -> SCFWarmStart
                 for channel in channels
             ),
         )
+    potential = previous_result.next_effective_potential
+    if isinstance(potential, tuple):
+        # spinor orbitals with spin: the pair (V_up, V_down) of a collinear loop, or (V, B_xc) of a non-collinear one,
+        # whose field (a 2-D array) belongs to the moments and does not move with the ionic potential
+        swap = np.asarray(system.ionic_potential) - np.asarray(previous_system.ionic_potential)
+        return SCFWarmStart(
+            input_potential=tuple(
+                part if np.ndim(part) > 1 else np.asarray(part) + swap for part in potential
+            ),
+            hartree_potential=np.asarray(previous_result.hartree_potential),
+            eigensolver_state=state_for_new_potential(previous_result.eigensolver_state),
+        )
     return SCFWarmStart(
         input_potential=(
-            np.asarray(previous_result.next_effective_potential)
+            np.asarray(potential)
             - np.asarray(previous_system.ionic_potential)
             + np.asarray(system.ionic_potential)
         ),

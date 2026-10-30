@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import replace
 from typing import Any, Callable
 
 import numpy as np
@@ -273,6 +274,24 @@ class _SolveWorker:
                     total[name] = np.array(value, copy=True)
         yield None, total
 
+    def export_states(self):
+        """``(task, state)`` of every task with a state, its subspace on the host."""
+        for task in self.tasks:
+            state = self.states.get(task)
+            if state is None:
+                continue
+            vectors = getattr(state, "vectors", None)
+            if vectors is not None and not isinstance(vectors, np.ndarray):  # the subspace of a device
+                self.converter.backend.use()
+                state = replace(state, vectors=self._to_host(vectors))
+            yield task, state
+
+    def import_states(self, states: dict[int, Any]):
+        for task in self.tasks:
+            if task in states:
+                self.states[task] = states[task]  # a host subspace goes to the device when it is solved
+        yield None, None
+
     def extras(self):
         for task in self.tasks:
             vectors = self.vectors[task]
@@ -340,6 +359,14 @@ class PooledKPointSolver:
     def extras(self) -> list[Any]:
         by_task = self.pool.by_task("extras")
         return [by_task[task] for task in range(self.job.n_tasks)]
+
+    def export_states(self) -> dict[int, Any]:
+        """The Ritz state of every task, with the subspace on the host (see the serial solver)."""
+        return self.pool.by_task("export_states")
+
+    def import_states(self, states: dict[int, Any]) -> None:
+        """Start the tasks from the Ritz states ``states`` (by task) of an earlier loop."""
+        self.pool.results("import_states", states)
 
     def vectors(self, task: int) -> np.ndarray:
         """The final eigenvectors of one task (fetched from its worker)."""

@@ -276,8 +276,20 @@ case:
 Isolated runs use `compute_spinor_forces`; a periodic run uses `compute_periodic_forces` on a result whose nonlocal force
 the k-point job accumulated from the orbitals of every k-point in a last pass (`compute_forces=True`, as for the scalar
 k-point driver), with the Bloch phases of the projectors and their gradients and the atoms folded into the cell. Moved
-atoms keep the direction of their initial moment (`Initial_NCL_Moment`), and the SCF loop of every structure starts
-afresh: the spinor drivers take no warm start, and the log says so. The forces are not symmetrized over the point group of
+atoms keep the direction of their initial moment (`Initial_NCL_Moment`). The SCF loop of a moved structure continues from the
+previous one, for plain spin-orbit coupling, collinear spin and non-collinear magnetism alike (isolated or periodic, Gamma
+point or k-points): the last mixed potential with the new ionic potential (for spin the pair `V_up`, `V_down`; for
+non-collinear magnetism `V` and the exchange-correlation field `B_xc`, which carries the moments to the moved atoms, so
+`Initial_NCL_Moment` is not asked for again), the Hartree potential as the start of the Poisson solve, and the eigensubspace
+of every k-point (kept on the host between structures; on the GPUs it goes back to the device when the k-point is solved),
+so the first iteration filters the old orbitals instead of solving from random vectors. `Potential_Extrapolation` applies
+to plain spin-orbit coupling only (the atomic density guess is a total density, as for the scalar spin-polarized loop). On
+Au2 in a 9 bohr cell at 0.45 bohr spacing (Gamma point, CPU) a molecular dynamics step took 7 to 9 SCF iterations instead of
+21 to 31 (plain spin-orbit 9 against 31, collinear spin 7 against 24, non-collinear 7 against 23), the wall time of a
+relaxation 111 s instead of 195 s (12 structures, the same path). The gain shrinks as the steps grow: with steps of a few
+tenths of a bohr (a relaxation on a 0.7 bohr grid, whose forces are several Ry/bohr) it vanishes. The direction of a
+non-collinear moment is a soft mode, so a continued and a fresh loop agree on its size and to a few hundredths of a
+Bohr magneton on its components. The forces are not symmetrized over the point group of
 the atoms for a spin-polarized or non-collinear run, whose magnetization need not respect it; the net force is removed.
 
 Fortran's `forcnloc.f90` has a spin-orbit term (`forcso`, `soforc.F90`) but warns that it "may be inaccurate", and its
@@ -544,7 +556,7 @@ those exchanges was measured slower and left out (see the module).
 | Periodic forces | Reciprocal-space form factors (`force_loc_pb.f90`) | Real-space sums over images, with an FFT version for the potential | The same terms; the grid-sampled potential has egg-box effects the form-factor one has not (see "Periodic cells"). |
 | Periodic forces and symmetry | Symmetrized with the space group | Not symmetrized | No space-group operations are found. |
 | Forces of spin-orbit and non-collinear runs | `forcso`, with a warning that they "may be inaccurate" | The derivative of the energy of the SCF loop, pieces of `forcnloc.f90` and `soforc.F90` rewritten | The spin-flip term of `flsxy` pairs different harmonics than the Hamiltonian; see "Spin-orbit coupling and non-collinear magnetism". |
-| Moved atoms with spin-orbit or non-collinear spinors | SCF restarted from the previous wavefunctions | SCF started afresh, from the initial moments | The spinor drivers take no warm start. |
+| Moved atoms with spin-orbit or non-collinear spinors | SCF restarted from the previous wavefunctions | The same: potential (with the field and moments of a non-collinear run) and eigensubspaces | The atomic density extrapolation is for plain spin-orbit coupling only. |
 | Positions of a periodic run | Wrapped into the cell (`back_to_cell`) | Continuous; the builders fold them | The optimizer needs continuous coordinates. |
 | SCF-correction force with `Cubic_Spline` | Uses the derivative table together with the spline coefficients of the density | Interpolates the atomic valence density linearly in that term | The combination in `forcloc.f90` mixes two tables; the term vanishes at SCF convergence. |
 | `atom.cor` of a restarted run | "Step # 0" shows the coordinates of the input file | Shows the restart structure, which is the one computed | The file then describes the run. |

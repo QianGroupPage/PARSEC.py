@@ -135,8 +135,13 @@ def run_self_consistent_soc_spin_polarized(
     soc_projectors: tuple[AtomSpinOrbitProjectors, ...],
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
+    warm_start=None,
 ) -> SelfConsistentSOCResult:
     """Run self-consistent SOC combined with collinear spin polarization.
+
+    ``warm_start`` (:class:`~parsec_python.SCF.single_point.SCFWarmStart`, whose ``input_potential`` is the pair
+    ``(V_up, V_down)``) continues from the loop of the previous structure of a relaxation or dynamics run: its mixed
+    potentials, Hartree potential and eigensubspace.
 
     Requires ``system.input.scf.spin_polarized`` and
     ``system.input.scf.self_consistent_spin_orbit`` both set, and
@@ -163,15 +168,21 @@ def run_self_consistent_soc_spin_polarized(
     density_up = 0.5 * (1.0 + polarization) * system.initial_density
     density_down = 0.5 * (1.0 - polarization) * system.initial_density
 
-    initial_hartree = system.solve_hartree(
-        density_up + density_down, initial_potential=-ionic_potential
-    )
-    hartree_potential = initial_hartree.potential
-    xc = system.evaluate_xc_spin_polarized(density_up, density_down)
-    input_potential_up = ionic_potential + hartree_potential + xc.potential_up
-    input_potential_down = ionic_potential + hartree_potential + xc.potential_down
-
-    eigval_state: EigvalState | None = None
+    if warm_start is None:
+        initial_hartree = system.solve_hartree(
+            density_up + density_down, initial_potential=-ionic_potential
+        )
+        hartree_potential = initial_hartree.potential
+        xc = system.evaluate_xc_spin_polarized(density_up, density_down)
+        input_potential_up = ionic_potential + hartree_potential + xc.potential_up
+        input_potential_down = ionic_potential + hartree_potential + xc.potential_down
+        eigval_state: EigvalState | None = None
+    else:
+        hartree_potential = np.array(warm_start.hartree_potential, dtype=np.float64)
+        input_potential_up, input_potential_down = (
+            np.array(potential, dtype=np.float64) for potential in warm_start.input_potential
+        )
+        eigval_state = warm_start.eigensolver_state
     mixer = AndersonMixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
@@ -303,6 +314,9 @@ def run_self_consistent_soc_spin_polarized(
         xc_potential=0.5 * (xc.potential_up + xc.potential_down),
         input_effective_potential=effective_potential_avg,
         output_effective_potential=0.5 * (output_potential_up + output_potential_down),
+        next_effective_potential=(input_potential_up, input_potential_down),
+        hartree_potential=hartree_potential,
+        eigensolver_state=eigval_state,
     )
 
 

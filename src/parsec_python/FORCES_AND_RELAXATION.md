@@ -314,7 +314,7 @@ SCF to first order and reports no total energy that includes the shift, so a rel
 (`SO_from_scratch` has forces); `Energy_Refinement`; the row-distributed MPI k-point solver (it raises, as for the scalar k-point forces); the
 accelerated path, which hands every spin-orbit and non-collinear input with forces to the reference solver (the pooled
 k-point solver of that solver runs on the GPUs for periodic and non-collinear inputs and forms the overlaps of the force on the
-device, which has been run on CPU arrays only).
+device, which agrees with the CPU to 1e-5 Ry/bohr on four A100 GPUs: `parsec_tests/pbc_forces/gpu_spinor` and `gpu_k`).
 
 ## Structural relaxation
 

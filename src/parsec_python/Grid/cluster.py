@@ -72,6 +72,17 @@ class RealSpaceGrid:
 def _inside_domain(settings: GridSettings, coordinates: np.ndarray) -> np.ndarray:
     if settings.domain_shape == "sphere":
         return np.einsum("ij,ij->i", coordinates, coordinates) <= settings.radius**2
+    if settings.domain_shape == "ellipsoid":
+        # grid_partition.f90 outside_domain, case 1.
+        radii = np.asarray(settings.domain_parameters, dtype=float)
+        return np.sum((coordinates / radii) ** 2, axis=1) <= 1.0
+    if settings.domain_shape == "cylinder":
+        # outside_domain, case 2: the axis coordinate and the two others.
+        radius, length, axis = settings.domain_parameters
+        along = int(axis) - 1
+        across = [index for index in range(3) if index != along]
+        polar = np.sum(coordinates[:, across] ** 2, axis=1)
+        return (polar <= radius**2) & (coordinates[:, along] ** 2 <= (length / 2.0) ** 2)
     lengths = np.asarray(settings.box_lengths, dtype=float)
     return np.all(np.abs(coordinates) <= 0.5 * lengths + 1.0e-14, axis=1)
 

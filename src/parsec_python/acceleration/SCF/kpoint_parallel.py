@@ -32,12 +32,19 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import replace
 from typing import Any, Callable
 
 import numpy as np
 
 from parsec_python.Eigensolvers import solve_eigval
-from parsec_python.SCF.kpoint_solver import KPointJob, residual_max, set_parallel_backend
+from parsec_python.SCF.kpoint_solver import (
+    KPointJob,
+    device_solver_supports,
+    job_eigval_settings,
+    residual_max,
+    set_parallel_backend,
+)
 
 from ..Eigensolvers.chebff_spinor import SpinorEigvalState, solve_spinor_eigval
 from ..Parallel import WORKERS_ENV, make_pool, mpi
@@ -218,13 +225,18 @@ class _SolveWorker:
         return np.asarray(self._to_host(self.vectors[task]))
 
     # ------------------------------------------------------------- SCF steps
-    def solve(self, potentials: dict, filter_degree: int):
-        settings = self.job.eigval_settings(filter_degree)
+    def solve(self, potentials: dict, filter_degree: int, tolerance: float | None = None):
+        # ``tolerance``: the eigensolver tolerance of this SCF iteration
+        # (Dynamic_Diag_Tol); None keeps the job's Diag_Tolerance.
+        settings = job_eigval_settings(self.job, filter_degree, tolerance)
+        # ARPACK and DIAGLA are host eigensolvers: the host route below, with the
+        # device Hamiltonian as their operator.
+        on_device = self.device_solver and device_solver_supports(settings)
         for task in self.tasks:
             start = time.perf_counter()
             hamiltonian = self.job.make_hamiltonian(task, potentials)
             self._tick("hamiltonian", start)  # builds the Bloch projectors of a k-point on first use
-            if self.device_solver:
+            if on_device:
                 yield task, self._solve_on_device(task, hamiltonian, settings)
                 continue
             start = time.perf_counter()
@@ -273,6 +285,24 @@ class _SolveWorker:
                     total[name] = np.array(value, copy=True)
         yield None, total
 
+    def export_states(self):
+        """``(task, state)`` of every task with a state, its subspace on the host."""
+        for task in self.tasks:
+            state = self.states.get(task)
+            if state is None:
+                continue
+            vectors = getattr(state, "vectors", None)
+            if vectors is not None and not isinstance(vectors, np.ndarray):  # the subspace of a device
+                self.converter.backend.use()
+                state = replace(state, vectors=self._to_host(vectors))
+            yield task, state
+
+    def import_states(self, states: dict[int, Any]):
+        for task in self.tasks:
+            if task in states:
+                self.states[task] = states[task]  # a host subspace goes to the device when it is solved
+        yield None, None
+
     def extras(self):
         for task in self.tasks:
             vectors = self.vectors[task]
@@ -320,9 +350,19 @@ class PooledKPointSolver:
     def n_workers(self) -> int:
         return self.pool.n_workers
 
-    def solve(self, potentials: dict, filter_degree: int) -> list[np.ndarray]:
-        """One eigenvalue array per task (task order), vectors kept in the workers."""
-        by_task = self.pool.by_task("solve", potentials, filter_degree)
+    def solve(
+        self, potentials: dict, filter_degree: int, tolerance: float | None = None
+    ) -> list[np.ndarray]:
+        """One eigenvalue array per task (task order), vectors kept in the workers.
+
+        ``tolerance`` replaces ``Diag_Tolerance`` for this call
+        (``Dynamic_Diag_Tol``); the job's ``eigval_settings`` then takes it
+        as a second argument.
+        """
+        if tolerance is None:
+            by_task = self.pool.by_task("solve", potentials, filter_degree)
+        else:
+            by_task = self.pool.by_task("solve", potentials, filter_degree, tolerance)
         return [by_task[task] for task in range(self.job.n_tasks)]
 
     def accumulate(self, occupations: list[np.ndarray]) -> dict[str, np.ndarray]:
@@ -340,6 +380,14 @@ class PooledKPointSolver:
     def extras(self) -> list[Any]:
         by_task = self.pool.by_task("extras")
         return [by_task[task] for task in range(self.job.n_tasks)]
+
+    def export_states(self) -> dict[int, Any]:
+        """The Ritz state of every task, with the subspace on the host (see the serial solver)."""
+        return self.pool.by_task("export_states")
+
+    def import_states(self, states: dict[int, Any]) -> None:
+        """Start the tasks from the Ritz states ``states`` (by task) of an earlier loop."""
+        self.pool.results("import_states", states)
 
     def vectors(self, task: int) -> np.ndarray:
         """The final eigenvectors of one task (fetched from its worker)."""

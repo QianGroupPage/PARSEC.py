@@ -172,6 +172,7 @@ class DeviceBlochOperator:
         global_grid_size: int | None = None,
         mpi=None,
         row_bounds: tuple[int, int] | None = None,
+        hubbard=None,
     ) -> None:
         self.backend = backend
         self.xp = backend.xp
@@ -200,6 +201,10 @@ class DeviceBlochOperator:
         self.allsum = allsum
         self.mpi = mpi  # the MPI context of a distributed basis, None serially
         self.row_bounds = row_bounds  # rows [start, stop) of the grid held here
+        # LDA+U of the channel (plusu.f90z): ``(forward, adjoint, potentials)`` with the Bloch
+        # projectors P_k (grid x 5 atoms), P_k^H and the device ``D`` (atoms, 5, 5); the scalar
+        # operator adds P_k D P_k^H.  None without LDA+U (DeviceBlochConverter._hubbard_parts).
+        self.hubbard = hubbard
         self.global_grid_size = grid_size if global_grid_size is None else int(global_grid_size)
         xp = self.xp
         if field is not None:
@@ -284,6 +289,16 @@ class DeviceBlochOperator:
                 result += self._real_product(self.projector_forward, coefficients)
             else:
                 result += self.projector_forward @ coefficients
+        if self.hubbard is not None:
+            # sum_a sum_(m,m') |phi_a,m> D_(m,m') <phi_a,m'|psi>, the term of
+            # parsec_python.SCF.kpoint_hubbard.BlochHubbardHamiltonian
+            forward, adjoint, potentials = self.hubbard
+            overlaps = adjoint @ block
+            if self.allsum is not None:
+                overlaps = self.allsum(overlaps)
+            atoms = int(potentials.shape[0])
+            mixed = xp.matmul(potentials, overlaps.reshape(atoms, 5, -1))
+            result += forward @ mixed.reshape(5 * atoms, -1)
         return result
 
     def _spin_orbit(self, block):
@@ -555,12 +570,42 @@ class DeviceBlochConverter:
 
         return self._cached(soc_projectors, build)
 
+    def _hubbard_parts(self, term):
+        """Device ``(P_k, P_k^H, D)`` of an LDA+U term (``HubbardOperator``).
+
+        The projectors are cached with the host object that holds them (one per k-point, kept by
+        :class:`parsec_python.SCF.kpoint_hubbard.KPointHubbard`); ``D`` changes every SCF step and
+        is uploaded with the local potential.
+        """
+        backend = self.backend
+        projectors = term.projectors
+
+        def build():
+            rows = self._rows(projectors.projectors)
+            return (
+                backend.matrix(rows, dtype=np.complex128),
+                backend.matrix(rows.conj().T, dtype=np.complex128),
+            )
+
+        forward, adjoint = self._cached(projectors, build)
+        return forward, adjoint, backend.asarray(np.asarray(term.potentials, dtype=np.complex128))
+
     def operator(self, hamiltonian) -> DeviceBlochOperator:
         """Device operator for a host ``KPointKohnShamHamiltonian`` or spinor one.
 
         A k-point spinor Hamiltonian carries its scalar part as ``scalar_hamiltonian``; the spinor
         Hamiltonian of an isolated system (``SpinorKohnShamHamiltonian``) is its own scalar part.
+        A scalar Hamiltonian with LDA+U (``BlochHubbardHamiltonian``: ``base`` and ``hubbard``) is
+        the operator of its base with the term.
         """
+        term = getattr(hamiltonian, "hubbard", None)
+        base = getattr(hamiltonian, "base", None)
+        if term is not None and base is not None:
+            operator = self.operator(base)
+            if operator.spinor:
+                raise NotImplementedError("LDA+U of a spinor Hamiltonian is not implemented")
+            operator.hubbard = self._hubbard_parts(term)
+            return operator
         backend = self.backend
         backend.use()
         scalar = getattr(hamiltonian, "scalar_hamiltonian", None)

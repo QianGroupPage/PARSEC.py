@@ -227,7 +227,9 @@ class PeriodicSelfConsistentSOCSCFTests(unittest.TestCase):
             self.assertAlmostEqual(eigenvalues[i], eigenvalues[i + 1], delta=1.0e-4)
             self.assertAlmostEqual(moments[i] + moments[i + 1], 0.0, delta=0.05)
 
-    def test_rejects_unequal_weights(self) -> None:
+    def test_rejects_weights_that_do_not_sum_to_one(self) -> None:
+        # Unequal weights are accepted (Fortran's irreducible wedge,
+        # test_space_group_kpoints); weights must still be normalized.
         box = 8.0
         cell = PeriodicCell(lattice_vectors=box * np.eye(3))
         problem = SinglePointInput(
@@ -244,7 +246,7 @@ class PeriodicSelfConsistentSOCSCFTests(unittest.TestCase):
             run_self_consistent_soc_kpoints(
                 system,
                 np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]]),
-                np.array([0.7, 0.3]),
+                np.array([0.7, 0.4]),
             )
 
 

@@ -17,7 +17,7 @@ eigenpair or energy residual.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, is_dataclass, replace
 import os
 import time
 from typing import Callable, Mapping
@@ -27,16 +27,34 @@ import numpy as np
 import scipy.sparse as sp
 
 from ..Eigensolvers import (
+    DYNAMIC_TOLERANCE_START,
+    ArpackSettings,
     ChebDavSettings,
     ChebFFSettings,
+    DiaglaSettings,
     EigvalSettings,
     EigvalState,
     SubspaceSettings,
+    dynamic_diagonalization_tolerance,
     solve_eigval,
 )
 from ..Energy import total_energy
-from ..Grid import RealSpaceGrid, build_cluster_grid
+from ..Energy.total_energy import with_dispersion
+from ..Grid import (
+    GridPointGroup,
+    RealSpaceGrid,
+    build_cluster_grid,
+    grid_point_group,
+    nearest_neighbor_rows,
+    symmetrize_density,
+)
 from ..Hamiltonian import KohnShamHamiltonian
+from ..Hamiltonian.hubbard import (
+    HubbardProjectors,
+    build_hubbard_projectors,
+    hubbard_operator,
+    hubbard_terms_from_orbitals,
+)
 from ..Hartree import (
     AtomicTail,
     HartreeBoundaryPlan,
@@ -47,7 +65,7 @@ from ..Hartree import (
     valence_point_charges,
 )
 from ..Laplacian import build_negative_laplacian
-from ..Mixer import AndersonMixer, potential_residual_metrics
+from ..Mixer import make_mixer, potential_residual_metrics
 from ..Occupations import (
     check_fixed_occupations,
     check_spin_fixed_occupations,
@@ -61,10 +79,15 @@ from ..V_ion import (
     build_local_ionic_potential,
     build_nonlocal_projectors,
     center_cluster_geometry,
+    check_core_density,
+    cluster_centering_shift,
     ion_ion_energy,
     ionic_charge,
     load_pseudopotentials,
     normalize_density,
+    point_charge_ion_energy,
+    point_charge_potential,
+    shifted_point_charges,
     superpose_atomic_density,
 )
 from ..models import (
@@ -89,6 +112,11 @@ from ..V_xc import (
     pbe_spin,
     pbe_spin_polarized,
 )
+from ..V_xc.selection import (
+    as_spin_polarized_result,
+    evaluate_spin_xc as evaluate_spin_functional,
+    evaluate_unpolarized_xc,
+)
 
 
 @dataclass(frozen=True)
@@ -109,6 +137,18 @@ class PreparedSinglePointSystem:
     ``initial_spin_densities`` are the starting densities of the up and the
     down channel of a spin-polarized calculation and ``None`` otherwise
     (:func:`initial_spin_densities`).
+
+    ``point_charges`` are the point charges of the input where the atoms
+    are, moved with them when the cluster was recentred (``initial.f90``):
+    their potential is part of ``ionic_potential`` and their energy with the
+    ions part of ``ion_ion_energy`` (:mod:`parsec_python.V_ion.external`).
+    ``density_symmetry`` is, for ``Symmetrize_Charge_Density``, the point
+    group of the atoms as permutations of the grid, which every new density
+    of the SCF loop is averaged over; ``None`` otherwise.
+
+    ``hubbard`` holds the LDA+U projectors of the atoms with ``ldaplusu_u``
+    or ``ldaplusu_j`` (:mod:`parsec_python.Hamiltonian.hubbard`) and is
+    ``None`` without LDA+U.
     """
 
     input: SinglePointInput
@@ -128,6 +168,9 @@ class PreparedSinglePointSystem:
     hartree_boundary: HartreeBoundaryPlan | None = None
     hartree_boundary_tail: AtomicTail | None = None
     initial_spin_densities: tuple[np.ndarray, np.ndarray] | None = None
+    point_charges: tuple = ()
+    density_symmetry: GridPointGroup | None = None
+    hubbard: HubbardProjectors | None = None
 
     @property
     def hartree_boundary_tail_maximum(self) -> float | None:
@@ -136,7 +179,9 @@ class PreparedSinglePointSystem:
         tail = self.hartree_boundary_tail
         return None if tail is None else tail.maximum
 
-    def hamiltonian(self, effective_potential: np.ndarray) -> KohnShamHamiltonian:
+    def hamiltonian(
+        self, effective_potential: np.ndarray, hubbard: object | None = None
+    ) -> KohnShamHamiltonian:
         """Compose the current SCF Hamiltonian without forming a dense matrix.
 
         The supplied array is only the diagonal local field
@@ -146,12 +191,21 @@ class PreparedSinglePointSystem:
         :class:`KohnShamHamiltonian` binds it to the already prepared kinetic
         and nonlocal terms, giving
 
-        ``H = -nabla_FD^2 + diag(V_eff) + V_NL``.
+        ``H = -nabla_FD^2 + diag(V_eff) + V_NL``,
+
+        plus the LDA+U term ``hubbard`` of the channel where it is given.
         """
+        if hubbard is None:
+            return KohnShamHamiltonian(
+                self.negative_laplacian,
+                effective_potential,
+                self.nonlocal_operator,
+            )
         return KohnShamHamiltonian(
             self.negative_laplacian,
             effective_potential,
             self.nonlocal_operator,
+            hubbard,
         )
 
     def solve_hartree(
@@ -194,8 +248,12 @@ class PreparedSinglePointSystem:
             return ca_lda(density, self.grid.volume_element, self.core_density)
         if self.input.scf.xc_functional == "pbe":
             return pbe(density, self.grid, self.core_density)
-        raise ValueError(
-            f"unsupported XC functional {self.input.scf.xc_functional!r}"
+        return evaluate_unpolarized_xc(
+            self.input.scf.xc_functional,
+            density,
+            self.grid,
+            self.core_density,
+            ionization_energy_difference=self.input.scf.ionization_energy_difference,
         )
 
     def evaluate_xc_spin_polarized(
@@ -215,7 +273,16 @@ class PreparedSinglePointSystem:
             return pbe_spin_polarized(
                 density_up, density_down, self.grid, self.core_density
             )
-        raise ValueError(f"unsupported XC functional {functional!r}")
+        return as_spin_polarized_result(
+            evaluate_spin_functional(
+                functional,
+                density_up,
+                density_down,
+                self.grid,
+                self.core_density,
+                ionization_energy_difference=self.input.scf.ionization_energy_difference,
+            )
+        )
 
     def evaluate_xc_noncollinear(
         self, density: np.ndarray, magnetization: np.ndarray
@@ -238,8 +305,13 @@ class PreparedSinglePointSystem:
             )
         if self.input.scf.xc_functional == "pbe":
             return pbe_spin(density_up, density_down, self.grid, self.core_density)
-        raise ValueError(
-            f"unsupported XC functional {self.input.scf.xc_functional!r}"
+        return evaluate_spin_functional(
+            self.input.scf.xc_functional,
+            density_up,
+            density_down,
+            self.grid,
+            self.core_density,
+            ionization_energy_difference=self.input.scf.ionization_energy_difference,
         )
 
 
@@ -261,7 +333,10 @@ class SCFWarmStart:
 
     A spin-polarized loop takes ``input_potential`` and
     ``eigensolver_state`` as pairs, the up channel first; the Hartree
-    potential is common to both channels.
+    potential is common to both channels.  The spinor loops take one
+    eigensubspace (a ``{k-point: state}`` dict for a k-point run) and, for
+    collinear spin, ``input_potential`` as the pair ``(V_up, V_down)``, for
+    non-collinear magnetism as ``(V, B_xc)`` with ``B_xc`` of shape ``(3, n)``.
 
     ``density_guess`` and ``hxc_reference`` carry the atomic extrapolation
     (:func:`warm_start_for_moved_atoms`): the loop then adds to
@@ -282,6 +357,69 @@ class SCFWarmStart:
     density_guess: np.ndarray | None = None
     hxc_reference: np.ndarray | None = None
     first_iteration_degree: int | None = None
+
+
+@dataclass(frozen=True)
+class SCFIterationFields:
+    """The fields of one finished SCF iteration, after mixing.
+
+    What ``parsec.F90`` l.1381-1393 writes to ``parsec.dat`` after every
+    iteration with ``Save_Intermediate_Charge_Density``: the levels and
+    orbitals of the iteration, its output density and the mixed potential
+    of the next iteration (``vnew``), full-grid arrays in Ry and e/bohr^3.
+    ``spin`` holds the two channels of a spin-polarized loop, up first; the
+    other fields then join or average them as
+    :class:`parsec_python.models.SinglePointResult` does.  A k-point loop
+    sets ``k_points`` and ``k_weights``; its levels are then pooled over the
+    k-points (k-major) and it keeps no orbitals.
+    """
+
+    iteration: int
+    eigenvalues: np.ndarray
+    occupations: np.ndarray
+    representations: np.ndarray
+    wavefunctions: object
+    density: np.ndarray
+    next_effective_potential: np.ndarray
+    spin: tuple | None = None
+    k_points: np.ndarray | None = None
+    k_weights: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class IterationChannelFields:
+    """One spin channel of :class:`SCFIterationFields` (levels pooled over
+    k-points where there are any; ``next_effective_potential`` is the mixed
+    potential of the channel, Fortran's ``vnew``)."""
+
+    eigenvalues: np.ndarray
+    occupations: np.ndarray
+    density: np.ndarray
+    next_effective_potential: np.ndarray
+    wavefunctions: object = None
+    representations: tuple = ()
+
+
+@dataclass(frozen=True)
+class SpinorIterationFields:
+    """The fields of one finished iteration of a spin-orbit or non-collinear loop.
+
+    What ``parsec.F90`` l.1381-1402 writes after every iteration of such a
+    loop (``wfnsave.F90`` with ``mxwd = 2``): one set of spinor levels
+    (pooled over k-points, k-major, where ``k_points`` is set), the spinors
+    of an isolated loop (``None`` for a k-point loop, which keeps none) and
+    ``parsec_dat_fields``, the two spin-component potentials (after mixing)
+    and densities in the layout of
+    :class:`parsec_python.models.SelfConsistentSOCResult`.
+    """
+
+    iteration: int
+    eigenvalues: np.ndarray
+    occupations: np.ndarray
+    spinors: object
+    parsec_dat_fields: dict | None
+    k_points: np.ndarray | None = None
+    k_weights: np.ndarray | None = None
 
 
 #: Ways to start the SCF loop of moved atoms (``Potential_Extrapolation``).
@@ -322,7 +460,9 @@ def atomic_density_guess(previous_system, previous_result, system, history=None)
     'second_order'`` of Quantum ESPRESSO), from the second move on.
     """
 
-    if getattr(previous_result, "spin", None) is not None:
+    if getattr(previous_result, "spin", None) is not None or isinstance(
+        getattr(previous_result, "next_effective_potential", None), tuple
+    ):  # spin channels or a magnetization: the guess is a total density only
         return None
     settings = getattr(getattr(previous_system, "input", None), "initial_density_settings", None)
     if settings is not None and getattr(settings, "method", "sad") != "sad":
@@ -399,11 +539,15 @@ def state_for_new_potential(state: object | None) -> object | None:
 
     if state is None:
         return None
+    if isinstance(state, dict):  # the states of the k-points of a periodic run, by k-point
+        return {task: state_for_new_potential(value) for task, value in state.items()}
     restart = getattr(state, "for_new_scf_loop", None)
     if callable(restart):
         return restart()
     if isinstance(state, EigvalState):
         return replace(state, subspace=replace(state.subspace, first_filter=True))
+    if is_dataclass(state) and hasattr(state, "first_filter"):  # the device subspace of a spinor eigensolver
+        return replace(state, first_filter=True)
     return state
 
 
@@ -468,15 +612,72 @@ def _parsec_warm_start(previous_system, previous_result, system) -> SCFWarmStart
                 for channel in channels
             ),
         )
+    potential = previous_result.next_effective_potential
+    if isinstance(potential, tuple):
+        # spinor orbitals with spin: the pair (V_up, V_down) of a collinear loop, or (V, B_xc) of a non-collinear one,
+        # whose field (a 2-D array) belongs to the moments and does not move with the ionic potential
+        swap = np.asarray(system.ionic_potential) - np.asarray(previous_system.ionic_potential)
+        return SCFWarmStart(
+            input_potential=tuple(
+                part if np.ndim(part) > 1 else np.asarray(part) + swap for part in potential
+            ),
+            hartree_potential=np.asarray(previous_result.hartree_potential),
+            eigensolver_state=state_for_new_potential(previous_result.eigensolver_state),
+        )
     return SCFWarmStart(
         input_potential=(
-            np.asarray(previous_result.next_effective_potential)
+            np.asarray(potential)
             - np.asarray(previous_system.ionic_potential)
             + np.asarray(system.ionic_potential)
         ),
         hartree_potential=np.asarray(previous_result.hartree_potential),
         eigensolver_state=state_for_new_potential(previous_result.eigensolver_state),
     )
+
+
+def placed_point_charges(problem: SinglePointInput) -> tuple:
+    """The point charges of ``problem`` moved as its atoms are placed.
+
+    ``initial.f90`` shifts the point charges by the translation that centres
+    the bounding box of the atoms, where it moves the atoms.
+    """
+
+    charges = tuple(getattr(problem, "point_charges", ()))
+    if not charges or not problem.recenter_geometry:
+        return charges
+    shift = cluster_centering_shift(problem.atoms)
+    return charges if shift is None else shifted_point_charges(charges, shift)
+
+
+def _with_point_charge_potential(ionic_potential, grid, point_charges):
+    """``ionic_potential`` plus the potential of the point charges (``ionpot.f90``)."""
+
+    if ionic_potential is None or not point_charges:
+        return ionic_potential
+    return ionic_potential + point_charge_potential(grid.coordinates, point_charges)
+
+
+def _with_point_charge_energy(fields: dict, atoms, pseudopotentials, point_charges) -> dict:
+    """Add ``E_QN`` to the ion-ion energy of ``fields`` (``forceion.f90``)."""
+
+    if point_charges:
+        fields["ion_ion_energy"] = float(fields["ion_ion_energy"]) + point_charge_ion_energy(
+            atoms, pseudopotentials, point_charges
+        )
+    return fields
+
+
+def density_point_group(grid: RealSpaceGrid, atoms, candidates=None) -> GridPointGroup:
+    """The point group of ``atoms`` as permutations of ``grid``.
+
+    The operations are those of :func:`parsec_python.Forces.symmetry.atom_symmetry_operations`,
+    among ``candidates`` (matrices) where they are given.
+    """
+
+    from ..Forces.symmetry import atom_symmetry_operations
+
+    operations = atom_symmetry_operations(atoms, candidates=candidates)
+    return grid_point_group(grid, np.array([operation.matrix for operation in operations]))
 
 
 def _require_atoms_inside_domain(settings: GridSettings, atoms) -> None:
@@ -486,6 +687,10 @@ def _require_atoms_inside_domain(settings: GridSettings, atoms) -> None:
         coordinate = np.asarray(atom.position)
         if settings.domain_shape == "sphere":
             inside = np.dot(coordinate, coordinate) <= settings.radius**2
+        elif settings.domain_shape in ("ellipsoid", "cylinder"):
+            from ..Grid.cluster import _inside_domain
+
+            inside = bool(_inside_domain(settings, coordinate[None, :])[0])
         else:
             inside = np.all(
                 np.abs(coordinate)
@@ -663,6 +868,7 @@ def prepare_single_point(
         if problem.recenter_geometry
         else tuple(problem.atoms)
     )
+    point_charges = placed_point_charges(problem)
     stage_start = time.perf_counter()
     pseudopotentials = load_pseudopotentials(
         problem.pseudopotentials,
@@ -738,6 +944,7 @@ def prepare_single_point(
             grid, atoms, pseudopotentials, problem.pseudopotentials
         )
     )
+    ionic_potential = _with_point_charge_potential(ionic_potential, grid, point_charges)
     local_ionic_seconds = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
     build_nonlocal = (
@@ -752,6 +959,10 @@ def prepare_single_point(
         _require_core_radius_support(
             nonlocal_operator, grid, atoms, pseudopotentials
         )
+    # The LDA+U projectors of upot.F90 (None without ldaplusu_u/j).
+    hubbard = build_hubbard_projectors(
+        grid, atoms, pseudopotentials, problem.pseudopotentials
+    )
     nonlocal_ionic_seconds = time.perf_counter() - stage_start
 
     if orbital_operators_only:
@@ -780,6 +991,8 @@ def prepare_single_point(
                 total_seconds=time.perf_counter() - preparation_start,
             ),
             hartree_boundary=boundary_plan,
+            point_charges=point_charges,
+            hubbard=hubbard,
         )
 
     fields, stage_seconds = _density_and_energy_stages(
@@ -791,6 +1004,10 @@ def prepare_single_point(
         atomic_density_builder,
         boundary_plan,
         build_atomic_tail,
+    )
+    _with_point_charge_energy(fields, atoms, pseudopotentials, point_charges)
+    density_symmetry = (
+        density_point_group(grid, atoms) if problem.scf.symmetrize_density else None
     )
     preparation_timings = PreparationTimings(
         pseudopotential_loading_seconds=pseudopotential_loading_seconds,
@@ -813,6 +1030,9 @@ def prepare_single_point(
         **fields,
         timings=preparation_timings,
         hartree_boundary=boundary_plan,
+        point_charges=point_charges,
+        density_symmetry=density_symmetry,
+        hubbard=hubbard,
     )
 
 
@@ -907,6 +1127,8 @@ def _density_and_energy_stages(
         problem.pseudopotentials,
         core=True,
     )
+    # corecd.f90: small negative values are set to zero, large ones stop.
+    core_density = check_core_density(core_density)
     core_density_seconds = time.perf_counter() - stage_start
 
     # 5. Geometry-only ion--ion contribution to the total energy.
@@ -995,6 +1217,9 @@ def complete_single_point(
     ionic_potential = build_local(
         system.grid, system.atoms, system.pseudopotentials, problem.pseudopotentials
     )
+    ionic_potential = _with_point_charge_potential(
+        ionic_potential, system.grid, system.point_charges
+    )
     local_ionic_seconds = time.perf_counter() - started
     fields, stage_seconds = _density_and_energy_stages(
         problem,
@@ -1007,9 +1232,17 @@ def complete_single_point(
         build_atomic_tail,
         ion_ion_energy_builder,
     )
+    _with_point_charge_energy(
+        fields, system.atoms, system.pseudopotentials, system.point_charges
+    )
     return replace(
         system,
         ionic_potential=ionic_potential,
+        density_symmetry=(
+            density_point_group(system.grid, system.atoms)
+            if problem.scf.symmetrize_density
+            else None
+        ),
         **fields,
         timings=replace(
             system.timings,
@@ -1097,6 +1330,11 @@ def update_geometry(
             _require_core_radius_support(operator, grid, atoms, pseudopotentials)
         return operator, time.perf_counter() - stage_start
 
+    # upot.F90 is called again after every move: new LDA+U projectors.
+    hubbard = build_hubbard_projectors(
+        grid, atoms, pseudopotentials, problem.pseudopotentials
+    )
+
     pending = None
     if system.ionic_potential is not None and geometry_thread_setting() == "on":
         # The projectors are built on the host beside the local potential and
@@ -1121,6 +1359,7 @@ def update_geometry(
                 nonlocal_ionic_seconds=nonlocal_ionic_seconds,
                 total_seconds=time.perf_counter() - started,
             ),
+            hubbard=hubbard,
         )
 
     stage_start = time.perf_counter()
@@ -1131,6 +1370,11 @@ def update_geometry(
     )
     ionic_potential = build_local(
         grid, atoms, pseudopotentials, problem.pseudopotentials
+    )
+    # The point charges stay where they are (parsec.F90 calls ionpot and
+    # forceion again after the move).
+    ionic_potential = _with_point_charge_potential(
+        ionic_potential, grid, system.point_charges
     )
     local_ionic_seconds = time.perf_counter() - stage_start
 
@@ -1148,14 +1392,23 @@ def update_geometry(
         boundary_plan,
         build_atomic_tail,
     )
+    _with_point_charge_energy(fields, atoms, pseudopotentials, system.point_charges)
     if pending is not None:
         nonlocal_operator, nonlocal_ionic_seconds = pending.result()
+    density_symmetry = system.density_symmetry
+    if density_symmetry is not None:
+        # PARSEC keeps the group of the first structure; here it is kept as
+        # far as the moved atoms still have its operations.
+        density_symmetry = density_point_group(
+            grid, atoms, candidates=density_symmetry.matrices
+        )
     return replace(
         system,
         input=problem,
         atoms=atoms,
         ionic_potential=ionic_potential,
         nonlocal_operator=nonlocal_operator,
+        density_symmetry=density_symmetry,
         **fields,
         timings=PreparationTimings(
             local_ionic_seconds=local_ionic_seconds,
@@ -1164,6 +1417,7 @@ def update_geometry(
             total_seconds=time.perf_counter() - started,
         ),
         hartree_boundary=boundary_plan,
+        hubbard=hubbard,
     )
 
 
@@ -1195,15 +1449,120 @@ def _number_of_states(system: PreparedSinglePointSystem) -> int:
     return requested
 
 
-def eigval_settings_for(eigensolver_settings, filter_degree: int) -> EigvalSettings:
+def iterative_solver_fields(
+    eigensolver_settings,
+    tolerance: float,
+    neighbors: np.ndarray | None = None,
+) -> dict:
+    """The ARPACK/DIAGLA part of :class:`EigvalSettings` for one iteration.
+
+    Empty for CHEBFF and CHEBDAV, so their settings are those of every
+    earlier version.  ``tolerance`` is ``Diag_Tolerance`` or the dynamic
+    tolerance of the iteration; ``neighbors`` is the grid neighbour array of
+    DIAGLA's preconditioner (:func:`parsec_python.Grid.nearest_neighbor_rows`).
+    """
+
+    method = eigensolver_settings.method
+    if method == "arpack":
+        return {
+            "arpack": ArpackSettings(
+                tolerance=tolerance,
+                maximum_matvec=eigensolver_settings.maximum_matvec,
+            ),
+            "chebyshev_filtering": eigensolver_settings.filters_later_iterations,
+        }
+    if method == "diagla":
+        return {
+            "diagla": DiaglaSettings(
+                tolerance=tolerance,
+                maximum_matvec=eigensolver_settings.maximum_matvec,
+                neighbors=neighbors,
+            ),
+            "chebyshev_filtering": eigensolver_settings.filters_later_iterations,
+        }
+    if method == "none":
+        raise ValueError(
+            "Eigensolver: none is PARSEC's TEST mode: setup only, no SCF"
+        )
+    return {}
+
+
+def preconditioner_neighbors(system, eigensolver_settings) -> np.ndarray | None:
+    """The first-shell grid neighbours DIAGLA's ``fdo5scl`` needs, else None."""
+
+    if eigensolver_settings.method != "diagla":
+        return None
+    return nearest_neighbor_rows(system.grid)
+
+
+def first_diagonalization_tolerance(eigensolver_settings) -> float:
+    """``Dynamic_Diag_Tol``: 0.1 on the first SCF iteration of a loop."""
+
+    if eigensolver_settings.dynamic_tolerance:
+        return DYNAMIC_TOLERANCE_START
+    return eigensolver_settings.tolerance
+
+
+def next_diagonalization_tolerance(eigensolver_settings, tolerance: float, residuals) -> float:
+    """``Dynamic_Diag_Tol``: the tolerance of the next SCF iteration.
+
+    parsec.F90:1302-1311 after ``getsre`` (one SCF loop for every kind of
+    run in PARSEC): ``min(tol, minval(sre)/10)``, not below
+    ``Diag_Tolerance``.  ``residuals`` are the weighted SRE of the loop's
+    channels (one value for the loops that mix one combined vector).
+    """
+
+    return dynamic_diagonalization_tolerance(
+        tolerance, residuals, eigensolver_settings.tolerance
+    )
+
+
+def iteration_eigensolver_fields(counts, next_tolerance: float | None) -> dict:
+    """Eigensolver fields of an :class:`SCFIteration` record.
+
+    ``counts`` holds ``(nec, maxmvs)`` (or None) per spin channel; the
+    record gets them only where every channel ran ARPACK or DIAGLA, and the
+    tolerance of the next iteration only with ``Dynamic_Diag_Tol``.  Empty
+    otherwise, so earlier calculations keep their records.  ``nec`` and
+    ``maxmvs`` are integers, or tuples of one integer per symmetry
+    representation (the accelerated sectors, as eigval.F90 lists them).
+    """
+
+    def values(count):
+        if isinstance(count, (tuple, list)):
+            return tuple(int(item) for item in count)
+        return int(count)
+
+    fields_ = {}
+    if counts and all(count is not None for count in counts):
+        fields_["eigensolver_counts"] = tuple(
+            (values(converged), values(matvecs)) for converged, matvecs in counts
+        )
+    if next_tolerance is not None:
+        fields_["next_eigensolver_tolerance"] = float(next_tolerance)
+    return fields_
+
+
+def eigval_settings_for(
+    eigensolver_settings,
+    filter_degree: int,
+    *,
+    tolerance: float | None = None,
+    neighbors: np.ndarray | None = None,
+) -> EigvalSettings:
     """Assemble the eigensolver policy of one SCF iteration.
 
     ``filter_degree`` is the present later-SCF SUBSPACE degree, which the
-    SCF loop lowers near convergence; everything else comes from the input.
+    SCF loop lowers near convergence; ``tolerance`` replaces
+    ``Diag_Tolerance`` for ``Dynamic_Diag_Tol``; ``neighbors`` serves
+    DIAGLA's preconditioner.  Everything else comes from the input.
     """
 
+    if tolerance is None:
+        tolerance = eigensolver_settings.tolerance
     return EigvalSettings(
-        safety_buffer=eigensolver_settings.subspace_buffer,
+        **iterative_solver_fields(eigensolver_settings, tolerance, neighbors),
+        safety_buffer=eigensolver_settings.working_buffer,
         initial_method=eigensolver_settings.method,
         chebff=ChebFFSettings(
             polynomial_degree=eigensolver_settings.first_filter_degree,
@@ -1218,7 +1577,7 @@ def eigval_settings_for(eigensolver_settings, filter_degree: int) -> EigvalSetti
         chebdav=(
             ChebDavSettings(
                 polynomial_degree=eigensolver_settings.first_filter_degree,
-                convergence_tolerance=eigensolver_settings.tolerance,
+                convergence_tolerance=tolerance,
                 block_size=eigensolver_settings.matvec_block_size,
                 # create_eigen_solver fixes winsize=12 for CHEBDAV.
                 workspace_window=12,
@@ -1243,6 +1602,104 @@ def eigval_settings_for(eigensolver_settings, filter_degree: int) -> EigvalSetti
     )
 
 
+def refuse_hubbard_and_dispersion(system, driver: str, *, dispersion: bool = True) -> None:
+    """Stop a driver that has neither the LDA+U term nor the TS correction.
+
+    Only :func:`run_scf` and the isolated spin loop
+    :func:`parsec_python.SCF.spin_polarized.run_spin_scf` carry them; every
+    other driver would leave them out without a word.  ``dispersion=False``
+    lets the TS correction pass (a driver that changes no energy).
+    """
+
+    problem = getattr(system, "input", None)
+    hubbard = getattr(system, "hubbard", None) is not None
+    dispersion = dispersion and bool(
+        getattr(getattr(problem, "scf", None), "van_der_waals", False)
+    )
+    if hubbard or dispersion:
+        feature = "LDA+U (ldaplusu_u/ldaplusu_j)" if hubbard else "Van_Der_Waals"
+        raise NotImplementedError(f"{feature} is not implemented in {driver}")
+
+
+def require_reference_hooks(system, **hooks) -> object | None:
+    """Return the LDA+U projectors of ``system``, refusing execution hooks.
+
+    The LDA+U term reads the full-grid orbitals of every iteration and joins
+    the Hamiltonian of :meth:`PreparedSinglePointSystem.hamiltonian`; an
+    accelerated eigensolver or a symmetry-reduced field representation
+    applies a Hamiltonian of its own and would leave the term out, unless
+    the system holds the term in that Hamiltonian itself (``hubbard_device``
+    of the accelerated systems).
+    """
+
+    projectors = getattr(system, "hubbard", None)
+    if projectors is None:
+        return None
+    given = sorted(name for name, hook in hooks.items() if hook is not None)
+    # An accelerated system whose device Hamiltonians hold the term and that
+    # forms the occupation matrices where its orbitals are
+    # (acceleration.Hamiltonian.hubbard_device) takes its hooks along.
+    if given and getattr(system, "hubbard_device", None) is None:
+        raise NotImplementedError(
+            "LDA+U (ldaplusu_u/ldaplusu_j) runs on the reference SCF path only; "
+            f"the execution hooks {', '.join(given)} would drop its term"
+        )
+    return projectors
+
+
+def hubbard_terms_of_iteration(system, projectors, wavefunctions, occupations):
+    """``calcden.f90z`` of the orbitals of each channel, where the system keeps them.
+
+    :func:`parsec_python.Hamiltonian.hubbard.hubbard_terms_from_orbitals`,
+    unless the system forms the occupation matrices itself (the devices of
+    an accelerated system, ``hubbard_device``).
+    """
+
+    device = getattr(system, "hubbard_device", None)
+    if device is not None:
+        return device.terms(wavefunctions, occupations)
+    return hubbard_terms_from_orbitals(projectors, wavefunctions, occupations)
+
+
+def hubbard_iteration_record(terms) -> dict[str, float]:
+    """The :class:`SCFIteration` fields of the LDA+U terms of one iteration."""
+
+    if terms is None:
+        return {}
+    return {
+        "hubbard_first_contribution": float(terms.first_contribution),
+        "hubbard_energy": float(terms.energy),
+    }
+
+
+def dispersion_wanted(settings, converged: bool) -> bool:
+    """Whether the loop ends with the TS correction (``Van_Der_Waals``).
+
+    ``parsec.F90`` calls ``efvdw`` and the second ``totnrg`` only when the
+    residual fell below the criterion: an unconverged loop has neither.
+    """
+
+    return bool(converged and getattr(settings, "van_der_waals", False))
+
+
+def dispersion_after_convergence(system, density, energies):
+    """The TS correction of the converged ``density`` and the energies with it."""
+
+    from ..Energy.dispersion import dispersion_correction
+
+    # An accelerated system forms the grid sums on its devices, and so do the
+    # periodic drivers where their k-point eigenproblems run on one.
+    correction = getattr(system, "dispersion_device", None)
+    if correction is None:
+        from ..Energy.dispersion import device_dispersion_for
+
+        correction = device_dispersion_for(system)
+    dispersion = (dispersion_correction if correction is None else correction)(
+        system, density
+    )
+    return dispersion, with_dispersion(energies, dispersion.energy)
+
+
 def run_scf(
     system: PreparedSinglePointSystem,
     *,
@@ -1255,6 +1712,7 @@ def run_scf(
     scalar_field_adapter: object | None = None,
     warm_start: SCFWarmStart | None = None,
     convergence_criterion: float | None = None,
+    iteration_state_callback: Callable[[SCFIterationFields], None] | None = None,
 ) -> SinglePointResult:
     """Run PARSEC-style potential mixing on a prepared system.
 
@@ -1263,6 +1721,9 @@ def run_scf(
     initial density.  ``convergence_criterion`` replaces the
     ``Convergence_Criterion`` of the input for this loop (Ry), as a
     relaxation with ``Relaxation_SCF_Upscale`` asks.
+    ``iteration_state_callback`` receives the :class:`SCFIterationFields`
+    of every iteration after its ``callback`` (``parsec.dat`` after every
+    iteration); it observes and changes nothing.
 
     A spin-polarized system (``Spin_Polarization``) is handed to
     :func:`parsec_python.SCF.spin_polarized.run_spin_scf`, which runs the
@@ -1294,6 +1755,11 @@ def run_scf(
             scalar_field_adapter=scalar_field_adapter,
             warm_start=warm_start,
             convergence_criterion=convergence_criterion,
+            **(
+                {}
+                if iteration_state_callback is None
+                else {"iteration_state_callback": iteration_state_callback}
+            ),
         )
     scf_start = time.perf_counter()
     # The validated reference path always selects ``solve_eigval`` here.  The
@@ -1311,10 +1777,11 @@ def run_scf(
         else orbital_density_builder
     )
     # These optional execution hooks let a rigorously symmetry-reduced
-    # backend perform scalar-field dot products and Anderson history on one
+    # backend perform scalar-field dot products and mixer history on one
     # value per orbit.  Their default functions are exactly the original
     # full-grid algorithms, so the reference architecture is unchanged.
-    build_mixer = AndersonMixer if mixer_factory is None else mixer_factory
+    # make_mixer builds the mixer of Mixing_Method (Anderson by default).
+    build_mixer = make_mixer if mixer_factory is None else mixer_factory
     evaluate_residual_metrics = (
         potential_residual_metrics
         if residual_metrics_evaluator is None
@@ -1340,6 +1807,18 @@ def run_scf(
         else scalar_field_adapter.to_full
     )
     ionic_potential = to_internal_scalar(system.ionic_potential)
+    hubbard_projectors = require_reference_hooks(
+        system,
+        eigenproblem_solver=eigenproblem_solver,
+        orbital_density_builder=orbital_density_builder,
+        mixer_factory=mixer_factory,
+        residual_metrics_evaluator=residual_metrics_evaluator,
+        total_energy_evaluator=total_energy_evaluator,
+        scalar_field_adapter=scalar_field_adapter,
+    )
+    # LDA+U potential matrices of the present iteration: zero (None) in the
+    # first iteration of every SCF loop, as upot.F90 leaves them.
+    hubbard_state = None
     # 1. Establish the initial Hartree, XC, and effective potentials.  The
     # number below is the state count returned to occupations; solve_eigval
     # internally works with number_of_states + subspace_buffer vectors.
@@ -1348,12 +1827,15 @@ def run_scf(
     if convergence_criterion is not None:
         settings = replace(settings, convergence_criterion=float(convergence_criterion))
     eigensolver_settings = system.input.eigensolver
-    if eigensolver_settings.method not in {"chebff", "chebdav"}:
-        raise NotImplementedError(
-            f"Eigensolver={eigensolver_settings.method!r} is not yet ported "
-            "to the strict native-Python SCF path; no alternate solver will "
-            "be substituted."
+    if eigensolver_settings.method == "none":
+        raise ValueError(
+            "Eigensolver: none is PARSEC's TEST mode: setup only, no SCF"
         )
+    # DIAGLA smooths its residuals over the six grid neighbours (fdo5scl).
+    neighbors = preconditioner_neighbors(system, eigensolver_settings)
+    # Dynamic_Diag_Tol: 0.1 for the first iteration of every SCF loop
+    # (parsec.F90:1106-1111), then the SRE rule after each iteration.
+    diagonalization_tolerance = first_diagonalization_tolerance(eigensolver_settings)
     # PARSEC fixes CHEBFF's cycle count and later SUBSPACE pass count.  CHEBDAV
     # instead uses Diag_Tolerance for residual-prefix locking during this first
     # solve.  Neither selection is silently replaced by another eigensolver.
@@ -1469,13 +1951,26 @@ def run_scf(
         eigval_settings = eigval_settings_for(
             eigensolver_settings,
             filter_degree if first_degree is None else max(filter_degree, int(first_degree)),
+            tolerance=diagonalization_tolerance,
+            neighbors=neighbors,
         )
         # This is the Hamiltonian assembly/handoff point.  The lightweight
         # object combines the current mixed V_in with the static kinetic and
         # KB terms; LinearOperator routes all Lanczos and Chebyshev H@Q calls
         # through that same three-term action.
         binding_start = time.perf_counter()
-        hamiltonian = system.hamiltonian(input_potential)
+        if hubbard_projectors is None:
+            hamiltonian = system.hamiltonian(input_potential)
+        else:
+            if iteration > 1:
+                # calcden.f90z: N and D from the orbitals and occupations of
+                # the iteration before, at the start of this one.
+                hubbard_state = hubbard_terms_of_iteration(
+                    system, hubbard_projectors, [wavefunctions], [occupations]
+                )
+            hamiltonian = system.hamiltonian(
+                input_potential, hubbard_operator(hubbard_projectors, hubbard_state)
+            )
         operator_factory = getattr(
             hamiltonian,
             "as_eigensolver_operator",
@@ -1552,6 +2047,22 @@ def run_scf(
         density = build_orbital_density(
             wavefunctions, occupations, system.grid.volume_element
         )
+        symmetrization = ()
+        density_symmetry = getattr(system, "density_symmetry", None)
+        if density_symmetry is not None:
+            # Symmetrize_Charge_Density: symm_scalar of newrho.F90 after
+            # every new density (parsec.F90 lines 1223-1232).  A group that
+            # brings its own method averages the fields of an accelerated
+            # loop that keeps one value per symmetry orbit.
+            symmetrize = getattr(density_symmetry, "symmetrize_density", None)
+            density, report = (
+                symmetrize(density, system.grid.volume_element)
+                if callable(symmetrize)
+                else symmetrize_density(
+                    density, density_symmetry, system.grid.volume_element
+                )
+            )
+            symmetrization = (report,)
         occupations_density_seconds = (
             time.perf_counter() - occupations_density_start
         )
@@ -1609,6 +2120,16 @@ def run_scf(
             system.ion_ion_energy,
             system.grid.volume_element,
             alpha_z_energy=getattr(system, "alpha_z_energy", 0.0),
+            # totnrg.f90 adds etot_plusu, zero before the first calcden.
+            **(
+                {}
+                if hubbard_projectors is None
+                else {
+                    "hubbard_energy": 0.0
+                    if hubbard_state is None
+                    else hubbard_state.energy
+                }
+            ),
         )
         # 7. Mix the effective potential and apply PARSEC's SCF stop test.
         # Only V_eff is mixed.  T, V_NL, and the fixed local ionic component
@@ -1627,13 +2148,12 @@ def run_scf(
             metrics.plain if settings.use_plain_residual else metrics.weighted
         )
         # PARSEC's approach-to-convergence test always uses weighted SRE even
-        # when plain SRE is selected for the final stop.  The factor 100 is the
-        # current Python/default-PARSEC approach threshold; a separately
-        # configurable Convergence_Criterion_Approach is not yet exposed.
+        # when plain SRE is selected for the final stop.  The threshold is
+        # Convergence_Criterion_Approach, by default 100*vconv.
         approach_residual = metrics.weighted
         if (
             iteration > 5
-            and approach_residual < 100.0 * settings.convergence_criterion
+            and approach_residual < settings.approach_criterion
             and filter_degree > minimum_filter_degree
         ):
             # Once reasonably close (100*vconv), save Hamiltonian applications
@@ -1642,6 +2162,12 @@ def run_scf(
         # The strict inequality is PARSEC's fixed-point stop rule.  Energy,
         # Hartree, and eigenpair residuals remain diagnostics only.
         iteration_converged = selected_residual < settings.convergence_criterion
+        if eigensolver_settings.dynamic_tolerance:
+            diagonalization_tolerance = dynamic_diagonalization_tolerance(
+                diagonalization_tolerance,
+                (metrics.weighted,),
+                eigensolver_settings.tolerance,
+            )
         mixing_energy_seconds = time.perf_counter() - mixing_energy_start
         mixing_energy_total += mixing_energy_seconds
 
@@ -1684,10 +2210,30 @@ def run_scf(
             xc_seconds=xc_seconds,
             mixing_energy_seconds=mixing_energy_seconds,
             total_seconds=iteration_seconds,
+            density_symmetrization=symmetrization,
+            **hubbard_iteration_record(hubbard_state),
+            **iteration_eigensolver_fields(
+                (getattr(eigensolution, "iterative_counts", None),),
+                diagonalization_tolerance
+                if eigensolver_settings.dynamic_tolerance
+                else None,
+            ),
         )
         history.append(diagnostic)
         if callback is not None:
             callback(diagnostic)
+        if iteration_state_callback is not None:
+            iteration_state_callback(
+                SCFIterationFields(
+                    iteration=iteration,
+                    eigenvalues=eigenvalues,
+                    occupations=occupations,
+                    representations=representations,
+                    wavefunctions=wavefunctions,
+                    density=to_public_scalar(density),
+                    next_effective_potential=to_public_scalar(mixed_potential),
+                )
+            )
 
         if iteration_converged:
             converged = True
@@ -1696,6 +2242,11 @@ def run_scf(
 
     if energies is None:
         raise RuntimeError("SCF loop did not execute")
+    dispersion = None
+    if dispersion_wanted(settings, converged):
+        dispersion, energies = dispersion_after_convergence(
+            system, to_public_scalar(density), energies
+        )
     # The result intentionally retains three local fields: the V_in used for
     # the final eigensolve, the V_out generated from its density, and the mixed
     # candidate that would seed one more iteration.  They coincide only at an
@@ -1741,4 +2292,6 @@ def run_scf(
         representations=representations,
         atomic_reference_correction=system.atomic_reference_correction,
         eigensolver_state=eigval_state,
+        hubbard=hubbard_state,
+        dispersion=dispersion,
     )

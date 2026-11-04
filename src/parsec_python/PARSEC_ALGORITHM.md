@@ -339,8 +339,12 @@ default `Double_grid_order=1`, the discrete action is
   [h³ sum_j beta_alm(j) psi_j]
 ```
 
-`Double_grid_order>1` adds Ono-Hirose subgrid averaging. That is separate from
-the kinetic finite-difference order.
+`Double_grid_order>1` adds Ono-Hirose subgrid averaging
+(`V_ion/double_grid.py`): `beta_alm(i)` becomes the average of the projector
+over the `(2N-1)^3` points `r_i + (dx,dy,dz)h/N` with the weights
+`w(dx)w(dy)w(dz)`, `w(d) = (1-|d|/N)/N`, and a point carries a projector when
+any of its fine points lies within the projector radius. That is separate
+from the kinetic finite-difference order.
 
 ### Ion-ion energy
 

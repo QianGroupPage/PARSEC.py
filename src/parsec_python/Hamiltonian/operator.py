@@ -45,11 +45,17 @@ class KohnShamHamiltonian:
     A new lightweight instance is made when that local field changes.  In
     Rydberg units the kinetic operator is ``-nabla^2`` rather than the
     Hartree-unit ``-nabla^2/2``.
+
+    ``hubbard`` is the LDA+U term of the channel being solved
+    (:class:`parsec_python.Hamiltonian.hubbard.HubbardOperator`,
+    ``plusu.f90z``), ``None`` without LDA+U or while its potential matrix is
+    still zero; it is a fourth low-rank term of :meth:`apply`.
     """
 
     negative_laplacian: sp.csr_matrix
     effective_potential: np.ndarray
     nonlocal_operator: NonlocalProjectorOperator
+    hubbard: object | None = None
 
     def __post_init__(self) -> None:
         # This class intentionally represents PARSEC's real scalar path.  The
@@ -63,6 +69,8 @@ class KohnShamHamiltonian:
             raise ValueError("effective potential does not match the kinetic operator")
         if self.nonlocal_operator.shape != (size, size):
             raise ValueError("nonlocal operator does not match the kinetic operator")
+        if self.hubbard is not None and tuple(self.hubbard.shape) != (size, size):
+            raise ValueError("LDA+U term does not match the kinetic operator")
         object.__setattr__(self, "effective_potential", potential)
 
     @property
@@ -90,11 +98,14 @@ class KohnShamHamiltonian:
 
     def apply(self, vectors: np.ndarray) -> np.ndarray:
         """Apply all Hamiltonian terms without constructing their full sum."""
-        return (
+        result = (
             self.apply_kinetic(vectors)
             + self.apply_local(vectors)
             + self.apply_nonlocal(vectors)
         )
+        if self.hubbard is not None:
+            result = result + self.hubbard.apply(vectors)
+        return result
 
     def as_linear_operator(self) -> "LinearOperator":
         """Expose the production matrix-vector/block action to eigensolvers.
@@ -120,8 +131,11 @@ class KohnShamHamiltonian:
         its projector factors.  The SCF/eigensolver path therefore does not
         call this method.
         """
-        return (
+        matrix = (
             self.negative_laplacian
             + sp.diags(self.effective_potential, format="csr")
             + self.nonlocal_operator.as_sparse()
-        ).tocsr()
+        )
+        if self.hubbard is not None:
+            matrix = matrix + self.hubbard.as_sparse()
+        return matrix.tocsr()

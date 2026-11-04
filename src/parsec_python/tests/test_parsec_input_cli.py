@@ -425,9 +425,14 @@ class PeriodicAndClusterInputTests(unittest.TestCase):
                 "Periodic_System and Boundary_Conditions disagree",
             ),
             (
+                # A slab is accepted, but its Cell_Shape has two lines
+                # (usrinputfile.F90 error 106).
                 "Boundary_Conditions: bulk",
-                "Boundary_Conditions: slab",
-                "wire and slab are not",
+                # (the Fortran-derived routines' message: Use_Fortran_Routines; Andrew
+                # Grieder's slab has its own, and a wire, which his parser refused,
+                # runs on the Fortran-derived routines since the merge)
+                "Boundary_Conditions: slab\nUse_Fortran_Routines: .true.",
+                r"Cell_Shape block of a slab has 2 line\(s\), not 1",
             ),
             (
                 "begin Cell_Shape\n  6.0  6.0  6.0\nend Cell_Shape\n",

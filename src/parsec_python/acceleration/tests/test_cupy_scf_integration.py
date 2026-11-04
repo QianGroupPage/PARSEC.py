@@ -58,6 +58,8 @@ def _fake_cupy():
         asarray=np.asarray,
         asnumpy=np.asarray,
         array=np.array,
+        # The reused prefix buffer of the device Gram-Schmidt (orthogonalize.py).
+        empty=np.empty,
         empty_like=np.empty_like,
         zeros_like=np.zeros_like,
         tril=np.tril,

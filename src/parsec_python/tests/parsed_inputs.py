@@ -319,10 +319,14 @@ MALFORMED = {
     ),
     "an output level that is none": (_replace(r"^(Output_Level:).*$", r"\1 many"),),
     "a mixer that is none and a charge with a unit": (
-        _replace(r"^(Mixing_Method:).*$", r"\1 Broyden"),
+        _replace(r"^(Mixing_Method:).*$", r"\1 Pulay"),
         _replace(r"^(Net_Charges:).*$", r"\1 0 coulomb"),
     ),
-    "restart": (_append("Restart_Run: true"),),
+    # Restart_Run and the legacy wfn.dat restart are implemented; wfn.dat
+    # has no k-points, so a restart from it refuses the DOS.
+    "restart": (
+        _append("Restart_Run: true", "Restart_From_Wfndat: true", "Create_DOS: true"),
+    ),
 }
 
 

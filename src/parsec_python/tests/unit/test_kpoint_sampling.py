@@ -6,6 +6,10 @@ Hamiltonian.kpoint_operator.KPointKohnShamHamiltonian, SCF.kpoints) against
 independent analytic and reduction checks rather than only against itself.
 """
 
+
+# With both sets of routines: the periodic grids of this module are those of the Fortran-derived routines
+# (PeriodicGridSettings(fortran_routines=True), as Use_Fortran_Routines: .true. gives); the numbers checked
+# here are those of the Fortran parity round.
 from __future__ import annotations
 
 from pathlib import Path
@@ -55,7 +59,7 @@ class GradientOperatorTests(unittest.TestCase):
         box = 10.0
         cell = PeriodicCell(lattice_vectors=box * np.eye(3))
         grid = build_periodic_grid(
-            cell, PeriodicGridSettings(spacing=0.25, expansion_order=8)
+            cell, PeriodicGridSettings(fortran_routines=True, spacing=0.25, expansion_order=8)
         )
         gx, gy, gz = build_gradient(grid)
         k = 2.0 * np.pi / box
@@ -71,7 +75,7 @@ class GradientOperatorTests(unittest.TestCase):
         box = 10.0
         cell = PeriodicCell(lattice_vectors=box * np.eye(3))
         grid = build_periodic_grid(
-            cell, PeriodicGridSettings(spacing=0.25, expansion_order=8)
+            cell, PeriodicGridSettings(fortran_routines=True, spacing=0.25, expansion_order=8)
         )
         laplacian = build_negative_laplacian(grid)
         k = 2.0 * np.pi / box
@@ -94,7 +98,7 @@ class KPointHamiltonianFreeElectronTests(unittest.TestCase):
         box = 8.0
         cell = PeriodicCell(lattice_vectors=box * np.eye(3))
         grid = build_periodic_grid(
-            cell, PeriodicGridSettings(spacing=0.25, expansion_order=8)
+            cell, PeriodicGridSettings(fortran_routines=True, spacing=0.25, expansion_order=8)
         )
         laplacian = build_negative_laplacian(grid)
         gradient = build_gradient(grid)
@@ -127,7 +131,7 @@ class KPointSCFReductionTests(unittest.TestCase):
         problem = SinglePointInput(
             atoms=[Atom("Au", [box / 2, box / 2, box / 2])],
             pseudopotentials={"Au": SpeciesPotential(_AU_POTRE, 0)},
-            grid=PeriodicGridSettings(spacing=0.6, expansion_order=6),
+            grid=PeriodicGridSettings(fortran_routines=True, spacing=0.6, expansion_order=6),
             periodic_cell=cell,
             scf=SCFSettings(
                 max_iterations=80, number_of_states=10, convergence_criterion=2.0e-3
@@ -150,12 +154,14 @@ class KPointSCFReductionTests(unittest.TestCase):
             5.0e-3,
         )
 
-    def test_rejects_unequal_weights(self) -> None:
+    def test_rejects_weights_that_do_not_sum_to_one(self) -> None:
+        # Unequal weights are accepted (Fortran's irreducible wedge,
+        # test_space_group_kpoints); weights must still be normalized.
         with self.assertRaises(ValueError):
             run_scf_kpoints(
                 self.system,
                 np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]]),
-                np.array([0.7, 0.3]),
+                np.array([0.7, 0.4]),
             )
 
 
@@ -166,7 +172,7 @@ class MultiKPointSmokeTest(unittest.TestCase):
         problem = SinglePointInput(
             atoms=[Atom("Au", [box / 2, box / 2, box / 2])],
             pseudopotentials={"Au": SpeciesPotential(_AU_POTRE, 0)},
-            grid=PeriodicGridSettings(spacing=0.6, expansion_order=6),
+            grid=PeriodicGridSettings(fortran_routines=True, spacing=0.6, expansion_order=6),
             periodic_cell=cell,
             scf=SCFSettings(
                 max_iterations=60, number_of_states=10, convergence_criterion=5.0e-3

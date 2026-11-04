@@ -9,6 +9,7 @@ from typing import Mapping, Sequence
 import numpy as np
 from scipy.special import erf, erfc, erfcinv
 
+from ..Grid.pbc import uses_fortran_routines
 from ..models import Atom, SpeciesPotential
 from ..Pseudopotential import ParsecPseudopotential
 
@@ -75,6 +76,48 @@ def _ewald_cutoffs(
     return eta, real_cutoff, reciprocal_cutoff
 
 
+def _serial_map(function, translations, pairs):
+    return map(function, translations)
+
+
+_translation_map = _serial_map
+
+
+def set_translation_map(mapper=None) -> None:
+    """Install (or, with ``None``, remove) the map of the real-space terms of :func:`ewald_ion_ion_energy`.
+
+    ``mapper(function, translations, pairs)`` yields ``function(T)`` for every translation ``T`` in
+    order (``pairs`` is the number of atom pairs of one term, for a memory budget); the energy adds
+    the terms in that order, so a parallel map that keeps the order gives the same energy bit for
+    bit.  The default is the builtin ``map``; the performance counterpart lives in
+    ``parsec_python.acceleration.V_ion.periodic_setup``.
+    """
+    global _translation_map
+    _translation_map = _serial_map if mapper is None else mapper
+
+
+def ewald_image_sets(
+    positions: np.ndarray, lattice_vectors: np.ndarray, eta: float | None, tolerance: float
+) -> tuple[float, float, np.ndarray, np.ndarray]:
+    """Return ``(eta, real_cutoff, translations, reciprocal_points)`` of the Ewald sums of one cell.
+
+    The real-space translations ``T`` with some pair separation ``r_a - r_b + T`` possibly within the cutoff
+    (``|T| <= cutoff + |r_a - r_b|``, the pair separations being bounded by the diameter of the atoms), and the
+    reciprocal-lattice vectors ``G != 0`` with ``|G|`` within the reciprocal cutoff.  The energy and its forces
+    (:func:`parsec_python.Forces.ion_ion.ewald_ion_ion_forces`) both enumerate them here, so the force is the
+    derivative of exactly the sum that the energy evaluates.
+    """
+
+    volume = float(abs(np.linalg.det(lattice_vectors)))
+    eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
+    reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
+    pair_reach = 2.0 * float(np.max(np.linalg.norm(positions - positions.mean(axis=0), axis=1)))
+    translations = _lattice_points(lattice_vectors, reciprocal_vectors, real_cutoff + pair_reach)
+    reciprocal_points = _lattice_points(reciprocal_vectors, lattice_vectors, reciprocal_cutoff)
+    reciprocal_points = reciprocal_points[np.any(reciprocal_points != 0.0, axis=1)]
+    return eta, real_cutoff, translations, reciprocal_points
+
+
 def ewald_ion_ion_energy(
     atoms: Sequence[Atom],
     potentials: Mapping[str, ParsecPseudopotential],
@@ -105,17 +148,9 @@ def ewald_ion_ion_energy(
         [potentials[atom.symbol].ionic_charge for atom in atoms], dtype=np.float64
     )
 
-    eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
-    reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
-
-    # A translation T matters when some pair separation r_a - r_b + T is within the cutoff, i.e.
-    # |T| <= cutoff + |r_a - r_b|; the pair separations are bounded by the diameter of the atoms.
-    pair_reach = 2.0 * float(np.max(np.linalg.norm(positions - positions.mean(axis=0), axis=1)))
-    translations = _lattice_points(lattice_vectors, reciprocal_vectors, real_cutoff + pair_reach)
-    reciprocal_points = _lattice_points(
-        reciprocal_vectors, lattice_vectors, reciprocal_cutoff
+    eta, real_cutoff, translations, reciprocal_points = ewald_image_sets(
+        positions, lattice_vectors, eta, tolerance
     )
-    reciprocal_points = reciprocal_points[np.any(reciprocal_points != 0.0, axis=1)]
 
     # Real-space sum: (1/2) * sum_{a,b} sum'_R Z_a*Z_b*erfc(eta*d)/d, the
     # prime excluding the singular (a=b, R=0) term.  Each translation R
@@ -123,9 +158,10 @@ def ewald_ion_ion_energy(
     real_space_energy = 0.0
     charge_products = charges[:, None] * charges[None, :]
     extent = positions.max(axis=0) - positions.min(axis=0)  # every |r_a - r_b| component is within it
-    for translation in translations:
+
+    def real_space_term(translation):
         if np.linalg.norm(np.maximum(np.abs(translation) - extent, 0.0)) > real_cutoff:
-            continue  # no pair of atoms comes within the cutoff of this image
+            return None  # no pair of atoms comes within the cutoff of this image
         is_origin = bool(np.all(translation == 0.0))
         displacement = (
             positions[:, None, :] - positions[None, :, :] + translation[None, None, :]
@@ -134,8 +170,13 @@ def ewald_ion_ion_energy(
         if is_origin:
             np.fill_diagonal(distance, np.inf)
         if float(np.min(distance)) > real_cutoff:
-            continue
-        real_space_energy += 0.5 * np.sum(charge_products * erfc(eta * distance) / distance)
+            return None
+        return 0.5 * np.sum(charge_products * erfc(eta * distance) / distance)
+
+    # the terms in the order of the translations (see set_translation_map)
+    for term in _translation_map(real_space_term, translations, len(positions) ** 2):
+        if term is not None:
+            real_space_energy += term
 
     # Reciprocal-space sum: (2*pi/V) * sum_{G!=0} exp(-G^2/(4*eta^2))/G^2 * |S(G)|^2.
     reciprocal_energy = 0.0
@@ -169,18 +210,90 @@ def _erf_over_r(charge: float, radius: np.ndarray, eta: float) -> np.ndarray:
     return values
 
 
+# The Fortran periodic local potential (``ionpbc.f90``) is the reciprocal-space sum of the form factors ``vql(G)`` of
+# ``fourier_f.f90``: it never reads ``Cubic_Spline`` (``uspline`` is used for the cluster potential, the projectors, the
+# core density and the cluster forces), and the form factors integrate the table with an eight-point rule, so the
+# potential is the accurate one whatever the flag says.  Linear interpolation of the table in real space is not: its
+# error (Delta r / r = 1 % on the logarithmic grid) shifts the Ge3 total energy by +0.7 mRy against Fortran.  The periodic
+# local potential and its force therefore use the cubic spline of the table whatever ``Cubic_Spline`` says.  Setting this
+# to ``False`` gives the linear mode (PARSEC's derivative table, a few percent off the interpolant's derivative).
+LOCAL_POTENTIAL_USES_CUBIC_SPLINE = True
+
+
+def local_potential_uses_spline(specification: SpeciesPotential, grid=None) -> bool:
+    """Whether the periodic local potential of a species is evaluated with the cubic spline of its table.
+
+    The grid of a run of the Fortran-derived routines (``Use_Fortran_Routines``,
+    :func:`parsec_python.Grid.pbc.uses_fortran_routines`) follows the species' ``Cubic_Spline``, as the parity round
+    did; every other grid takes :data:`LOCAL_POTENTIAL_USES_CUBIC_SPLINE` (Andrew Grieder's routines).
+    """
+
+    if grid is not None and uses_fortran_routines(grid):
+        return bool(specification.use_spline)
+    return LOCAL_POTENTIAL_USES_CUBIC_SPLINE
+
+
 _local_potential_provider = None
+_provider_converged_for = None
+
+CONVERGED_TOLERANCE = 1.0e-26
+"""Ewald tolerance at which the direct sum is converged (the images it still leaves out are below
+round-off); a provider that returns the converged sum is equal to the direct sum at this tolerance."""
 
 
-def set_local_potential_provider(provider=None) -> None:
+def set_local_potential_provider(provider=None, *, converged_for=None) -> None:
     """Install (or, with ``None``, remove) a faster :func:`ewald_local_ionic_potential`.
 
     ``provider(grid, atoms, potentials, specifications, lattice_vectors, eta, tolerance)`` returns the
     potential, or ``None`` for an input it does not handle (the direct sum below then runs).  The
     performance counterpart lives in ``parsec_python.acceleration.V_ion.periodic_setup``.
+    ``converged_for(grid, lattice_vectors)`` says for which inputs the provider returns the
+    converged sum; :func:`local_potential_tolerance` then reports :data:`CONVERGED_TOLERANCE`, so
+    that the periodic local forces differentiate the potential the SCF used.
     """
-    global _local_potential_provider
+    global _local_potential_provider, _provider_converged_for
     _local_potential_provider = provider
+    _provider_converged_for = None if provider is None else converged_for
+
+
+def local_potential_tolerance(grid, lattice_vectors: np.ndarray, tolerance: float) -> float:
+    """The Ewald tolerance of the sum :func:`ewald_local_ionic_potential` returns for these inputs.
+
+    ``tolerance`` for the direct sum; :data:`CONVERGED_TOLERANCE` where an installed provider
+    returns the converged sum (:func:`set_local_potential_provider`).  The derivative of the
+    potential (:func:`parsec_python.Forces.periodic.periodic_local_forces`) uses it.
+    """
+    if (
+        _local_potential_provider is not None
+        and _provider_converged_for is not None
+        and _provider_converged_for(grid, np.asarray(lattice_vectors, dtype=np.float64))
+    ):
+        return min(float(tolerance), CONVERGED_TOLERANCE)
+    return float(tolerance)
+
+
+def ewald_local_image_sets(
+    lattice_vectors: np.ndarray, eta: float | None, tolerance: float
+) -> tuple[float, float, np.ndarray, float, np.ndarray, np.ndarray]:
+    """Return ``(eta, real_cutoff, cell_center, cell_radius, translations, reciprocal_points)`` of the local potential.
+
+    The short-ranged piece of an atom image at ``position + T`` reaches the grid point ``r`` when
+    ``|r - position - T| <= real_cutoff``.  Grid points lie anywhere in the cell, so an image counts
+    when its center is within ``real_cutoff + radius`` of the cell center (``radius``: circumscribed
+    radius of the cell); ``position`` itself is inside the cell, which bounds ``|T|``.  ``translations`` holds
+    the candidates (the caller keeps those within ``real_cutoff + radius`` of ``cell_center`` for its atom) and
+    ``reciprocal_points`` the vectors ``G != 0`` of the series.  The potential and its forces
+    (:func:`parsec_python.Forces.periodic_local.periodic_local_forces`) both enumerate them here.
+    """
+
+    volume = float(abs(np.linalg.det(lattice_vectors)))
+    eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
+    reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
+    cell_center, cell_radius = _cell_center_and_radius(lattice_vectors)
+    translations = _lattice_points(lattice_vectors, reciprocal_vectors, real_cutoff + 2.0 * cell_radius)
+    reciprocal_points = _lattice_points(reciprocal_vectors, lattice_vectors, reciprocal_cutoff)
+    reciprocal_points = reciprocal_points[np.any(reciprocal_points != 0.0, axis=1)]
+    return eta, real_cutoff, cell_center, cell_radius, translations, reciprocal_points
 
 
 def ewald_local_ionic_potential(
@@ -237,20 +350,29 @@ def ewald_local_ionic_potential(
         if provided is not None:
             return provided
 
-    eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
-    reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
-    # The short-ranged piece of an atom image at ``position + T`` reaches the grid point ``r`` when
-    # ``|r - position - T| <= real_cutoff``.  Grid points lie anywhere in the cell, so an image counts
-    # when its center is within ``real_cutoff + radius`` of the cell center (``radius``: circumscribed
-    # radius of the cell); ``position`` itself is inside the cell, which bounds ``|T|``.
-    cell_center, cell_radius = _cell_center_and_radius(lattice_vectors)
-    all_translations = _lattice_points(
-        lattice_vectors, reciprocal_vectors, real_cutoff + 2.0 * cell_radius
-    )
-    reciprocal_points = _lattice_points(
-        reciprocal_vectors, lattice_vectors, reciprocal_cutoff
-    )
-    reciprocal_points = reciprocal_points[np.any(reciprocal_points != 0.0, axis=1)]
+    if uses_fortran_routines(grid):
+        # The Fortran-derived routines (Use_Fortran_Routines): the images of the parity round, also for an
+        # atom given outside the cell.
+        eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
+        reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
+        # The short-ranged piece of an atom image at ``position + T`` reaches the grid point ``r`` when
+        # ``|r - position - T| <= real_cutoff``.  Grid points lie anywhere in the cell, so an image counts
+        # when its center is within ``real_cutoff + radius`` of the cell center (``radius``: circumscribed
+        # radius of the cell); ``position`` itself is inside the cell, which bounds ``|T|``
+        # (``atom_reach`` keeps the bound for an atom given outside the cell).
+        cell_center, cell_radius = _cell_center_and_radius(lattice_vectors)
+        atom_reach = max([cell_radius] + [float(np.linalg.norm(np.asarray(atom.position) - cell_center)) for atom in atoms])
+        all_translations = _lattice_points(
+            lattice_vectors, reciprocal_vectors, real_cutoff + cell_radius + atom_reach
+        )
+        reciprocal_points = _lattice_points(
+            reciprocal_vectors, lattice_vectors, reciprocal_cutoff
+        )
+        reciprocal_points = reciprocal_points[np.any(reciprocal_points != 0.0, axis=1)]
+    else:
+        eta, real_cutoff, cell_center, cell_radius, all_translations, reciprocal_points = ewald_local_image_sets(
+            lattice_vectors, eta, tolerance
+        )
     g_squared = (
         np.sum(reciprocal_points**2, axis=1) if reciprocal_points.size else None
     )
@@ -274,7 +396,7 @@ def ewald_local_ionic_potential(
             total += potential.local_potential(
                 radius,
                 specification.local_angular_momentum,
-                use_spline=specification.use_spline,
+                use_spline=local_potential_uses_spline(specification, grid),
                 spline_padding_width=grid.settings.stencil_half_width,
             )
             total += _erf_over_r(charge, radius, eta)
@@ -319,8 +441,12 @@ def ewald_alpha_z_energy(
 
 
 __all__ = [
+    "LOCAL_POTENTIAL_USES_CUBIC_SPLINE",
     "ewald_alpha_z_energy",
     "ewald_ion_ion_energy",
     "ewald_local_ionic_potential",
+    "local_potential_tolerance",
+    "local_potential_uses_spline",
     "set_local_potential_provider",
+    "set_translation_map",
 ]

@@ -2,31 +2,60 @@
 
 from .ionic_potential import (
     NonlocalProjectorOperator,
+    apply_fourier_filters,
     build_local_ionic_potential,
     build_nonlocal_projectors,
     center_cluster_geometry,
+    center_slab_geometry,
+    check_core_density,
+    cluster_centering_shift,
     ion_ion_energy,
     ionic_charge,
     load_pseudopotentials,
     normalize_density,
+    pseudopotential_matches_functional,
     real_spherical_harmonics,
     superpose_atomic_density,
+)
+from .external import (
+    POINT_CHARGE_CORE_RADIUS,
+    electric_field_potential,
+    point_charge_ion_energy,
+    point_charge_potential,
+    shifted_point_charges,
 )
 from .ewald import (
     ewald_alpha_z_energy,
     ewald_ion_ion_energy,
     ewald_local_ionic_potential,
 )
+from .gspace_local import (
+    gspace_alpha_energy,
+    gspace_local_forces,
+    gspace_local_ionic_potential,
+    periodic_alpha_energy,
+    periodic_local_ionic_potential,
+)
 
 __all__ = [
     "NonlocalProjectorOperator",
+    "apply_fourier_filters",
     "build_local_ionic_potential",
     "build_nonlocal_projectors",
     "center_cluster_geometry",
+    "center_slab_geometry",
+    "cluster_centering_shift",
+    "POINT_CHARGE_CORE_RADIUS",
+    "electric_field_potential",
+    "point_charge_ion_energy",
+    "point_charge_potential",
+    "shifted_point_charges",
+    "check_core_density",
     "ion_ion_energy",
     "ionic_charge",
     "load_pseudopotentials",
     "normalize_density",
+    "pseudopotential_matches_functional",
     "real_spherical_harmonics",
     "superpose_atomic_density",
     "ewald_ion_ion_energy",
@@ -34,4 +63,9 @@ __all__ = [
     "ewald_alpha_z_energy",
     "ewald_ion_ion_energy",
     "ewald_local_ionic_potential",
+    "gspace_alpha_energy",
+    "gspace_local_forces",
+    "gspace_local_ionic_potential",
+    "periodic_alpha_energy",
+    "periodic_local_ionic_potential",
 ]

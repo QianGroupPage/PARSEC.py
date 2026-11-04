@@ -39,16 +39,15 @@ from typing import Callable, Union
 import numpy as np
 
 from ..Eigensolvers import (
-    ChebDavSettings,
-    ChebFFSettings,
     EigvalSettings,
     EigvalState,
-    SubspaceSettings,
+    dynamic_diagonalization_tolerance,
     solve_eigval,
 )
 from ..Energy import spin_total_energy, total_energy_spin_polarized
+from ..Grid import symmetrize_density
 from ..Mixer import (
-    AndersonMixer,
+    make_mixer,
     potential_residual_metrics,
     spin_potential_residual_metrics,
 )
@@ -67,12 +66,21 @@ from ..models import (
     SpinPolarizedSCFIteration,
     SpinPolarizedSinglePointResult,
 )
+from ..Hamiltonian.hubbard import hubbard_operator, hubbard_terms_from_orbitals
 from .pbc import PeriodicPreparedSinglePointSystem
 from .single_point import (
     PreparedSinglePointSystem,
     SCFWarmStart,
     _number_of_states,
+    dispersion_after_convergence,
+    dispersion_wanted,
     eigval_settings_for,
+    first_diagonalization_tolerance,
+    hubbard_iteration_record,
+    hubbard_terms_of_iteration,
+    iteration_eigensolver_fields,
+    preconditioner_neighbors,
+    require_reference_hooks,
 )
 
 
@@ -173,6 +181,7 @@ def run_spin_scf(
     scalar_field_adapter: object | None = None,
     warm_start: SCFWarmStart | None = None,
     convergence_criterion: float | None = None,
+    iteration_state_callback: Callable[[object], None] | None = None,
 ) -> SinglePointResult:
     """Run PARSEC-style potential mixing with two spin channels.
 
@@ -205,6 +214,13 @@ def run_spin_scf(
             "the system was not prepared for a spin-polarized calculation: "
             "it has no starting spin densities"
         )
+    hubbard_projectors = require_reference_hooks(
+        system,
+        eigenproblem_solver=eigenproblem_solver,
+        orbital_density_builder=orbital_density_builder,
+    )
+    # LDA+U potential matrices of both channels, zero in the first iteration.
+    hubbard_state = None
 
     scf_start = time.perf_counter()
     solvers = _channel_solvers(eigenproblem_solver)
@@ -215,12 +231,12 @@ def run_spin_scf(
     if convergence_criterion is not None:
         settings = replace(settings, convergence_criterion=float(convergence_criterion))
     eigensolver_settings = system.input.eigensolver
-    if eigensolver_settings.method not in {"chebff", "chebdav"}:
-        raise NotImplementedError(
-            f"Eigensolver={eigensolver_settings.method!r} is not yet ported "
-            "to the strict native-Python SCF path; no alternate solver will "
-            "be substituted."
+    if eigensolver_settings.method == "none":
+        raise ValueError(
+            "Eigensolver: none is PARSEC's TEST mode: setup only, no SCF"
         )
+    neighbors = preconditioner_neighbors(system, eigensolver_settings)
+    diagonalization_tolerance = first_diagonalization_tolerance(eigensolver_settings)
 
     # 1. First potentials.  The Hartree potential is that of the normalized
     # total starting density; the exchange-correlation potentials are those
@@ -259,7 +275,7 @@ def run_spin_scf(
         states = warm_start.eigensolver_state
         eigval_states = [None, None] if states is None else list(states)
 
-    mixer = AndersonMixer(system.input.mixing)
+    mixer = make_mixer(system.input.mixing)
     history: list[SCFIteration] = []
     filter_degree = eigensolver_settings.filter_degree
     minimum_filter_degree = max(10, eigensolver_settings.filter_degree_delta + 1)
@@ -289,7 +305,12 @@ def run_spin_scf(
     for iteration in range(1, settings.max_iterations + 1):
         iteration_start = time.perf_counter()
         last_input_potentials = [potential.copy() for potential in input_potentials]
-        eigval_settings = eigval_settings_for(eigensolver_settings, filter_degree)
+        eigval_settings = eigval_settings_for(
+            eigensolver_settings,
+            filter_degree,
+            tolerance=diagonalization_tolerance,
+            neighbors=neighbors,
+        )
 
         # 2. One eigenproblem per channel, each with the potential and the
         # saved subspace of that channel.  A backend binds the potential to
@@ -297,9 +318,22 @@ def run_spin_scf(
         hamiltonian_binding_seconds = 0.0
         diagonalization_seconds = 0.0
         residual_maxima: list[float] = []
+        if hubbard_projectors is not None and iteration > 1:
+            # calcden.f90z: N and D of both channels from the orbitals and
+            # occupations of the iteration before.
+            hubbard_state = hubbard_terms_of_iteration(
+                system, hubbard_projectors, wavefunctions, occupations
+            )
+        solver_counts: list[tuple[int, int] | None] = []
         for spin in range(2):
             binding_start = time.perf_counter()
-            hamiltonian = system.hamiltonian(input_potentials[spin])
+            if hubbard_projectors is None:
+                hamiltonian = system.hamiltonian(input_potentials[spin])
+            else:
+                hamiltonian = system.hamiltonian(
+                    input_potentials[spin],
+                    hubbard_operator(hubbard_projectors, hubbard_state, spin),
+                )
             operator_factory = getattr(
                 hamiltonian,
                 "as_eigensolver_operator",
@@ -315,6 +349,7 @@ def run_spin_scf(
                 state=eigval_states[spin],
             )
             eigval_states[spin] = eigensolution.state
+            solver_counts.append(getattr(eigensolution, "iterative_counts", None))
             diagonalization_seconds += time.perf_counter() - diagonalization_start
             eigenvalues[spin] = np.asarray(eigensolution.eigenvalues, dtype=np.float64)
             wavefunctions[spin] = eigensolution.vectors
@@ -370,6 +405,21 @@ def run_spin_scf(
                     ),
                     dtype=np.float64,
                 )
+        symmetrization = ()
+        density_symmetry = getattr(system, "density_symmetry", None)
+        if density_symmetry is not None:
+            # Symmetrize_Charge_Density: symm_scalar of newrho.F90 for the
+            # total density and for each channel (isp = 1, 2, 3).
+            _, total_report = symmetrize_density(
+                densities[0] + densities[1], density_symmetry, volume_element
+            )
+            reports = [total_report]
+            for spin in range(2):
+                densities[spin], report = symmetrize_density(
+                    densities[spin], density_symmetry, volume_element
+                )
+                reports.append(report)
+            symmetrization = tuple(reports)
         density = densities[0] + densities[1]
         occupations_density_seconds = time.perf_counter() - occupations_density_start
         occupations_density_total += occupations_density_seconds
@@ -413,6 +463,22 @@ def run_spin_scf(
             xc.total_energy,
             system.ion_ion_energy,
             volume_element,
+            **(
+                {}
+                if hubbard_projectors is None
+                else {
+                    "hubbard_energy": 0.0
+                    if hubbard_state is None
+                    else hubbard_state.energy
+                }
+            ),
+            # The alpha term of a periodic cell (forces, relaxation and
+            # molecular dynamics of a spin-polarized bulk cell run here).
+            **(
+                {"alpha_z_energy": system.alpha_z_energy}
+                if getattr(system, "alpha_z_energy", 0.0)
+                else {}
+            ),
         )
 
         # 6. Mix the two potentials as one vector, up first, and test the
@@ -428,11 +494,18 @@ def run_spin_scf(
         )
         if (
             iteration > 5
-            and metrics.weighted < 100.0 * settings.convergence_criterion
+            and metrics.weighted < settings.approach_criterion
             and filter_degree > minimum_filter_degree
         ):
             filter_degree -= 1
         iteration_converged = selected_residual < settings.convergence_criterion
+        if eigensolver_settings.dynamic_tolerance:
+            # The smaller weighted SRE of the two channels (minval(sre)).
+            diagonalization_tolerance = dynamic_diagonalization_tolerance(
+                diagonalization_tolerance,
+                metrics.weighted_by_spin,
+                eigensolver_settings.tolerance,
+            )
         mixing_energy_seconds = time.perf_counter() - mixing_energy_start
         mixing_energy_total += mixing_energy_seconds
 
@@ -467,10 +540,48 @@ def run_spin_scf(
             spin_electrons=(float(electrons[0]), float(electrons[1])),
             spin_density_minimum=tuple(float(np.min(values)) for values in densities),
             spin_density_maximum=tuple(float(np.max(values)) for values in densities),
+            density_symmetrization=symmetrization,
+            **hubbard_iteration_record(hubbard_state),
+            **iteration_eigensolver_fields(
+                tuple(solver_counts),
+                diagonalization_tolerance
+                if eigensolver_settings.dynamic_tolerance
+                else None,
+            ),
         )
         history.append(diagnostic)
         if callback is not None:
             callback(diagnostic)
+        if iteration_state_callback is not None:
+            from .single_point import SCFIterationFields
+
+            iteration_channels = tuple(
+                SpinChannelResult(
+                    eigenvalues=eigenvalues[spin],
+                    occupations=occupations[spin],
+                    wavefunctions=wavefunctions[spin],
+                    representations=representations[spin],
+                    density=densities[spin],
+                    xc_potential=xc_potentials[spin],
+                    input_effective_potential=last_input_potentials[spin],
+                    output_effective_potential=output_potentials[spin],
+                    next_effective_potential=mixed_potentials[spin],
+                    electron_count=float(electrons[spin]),
+                )
+                for spin in range(2)
+            )
+            iteration_state_callback(
+                SCFIterationFields(
+                    iteration=iteration,
+                    eigenvalues=np.concatenate(eigenvalues),
+                    occupations=np.concatenate(occupations),
+                    representations=np.concatenate(representations),
+                    wavefunctions=None,
+                    density=density,
+                    next_effective_potential=0.5 * (mixed_potentials[0] + mixed_potentials[1]),
+                    spin=iteration_channels,
+                )
+            )
 
         if iteration_converged:
             converged = True
@@ -479,6 +590,11 @@ def run_spin_scf(
 
     if energies is None:
         raise RuntimeError("SCF loop did not execute")
+    dispersion = None
+    if dispersion_wanted(settings, converged):
+        dispersion, energies = dispersion_after_convergence(
+            system, densities[0] + densities[1], energies
+        )
 
     run_timings = RunTimings(
         preparation=system.timings,
@@ -544,6 +660,8 @@ def run_spin_scf(
         atomic_reference_correction=system.atomic_reference_correction,
         eigensolver_state=tuple(eigval_states),
         spin=channels,
+        hubbard=hubbard_state,
+        dispersion=dispersion,
     )
 
 
@@ -643,45 +761,20 @@ def _number_of_states_per_channel(system: _PreparedSystem) -> int:
     return requested
 
 
-def _eigval_settings(system: _PreparedSystem, filter_degree: int) -> EigvalSettings:
-    eigensolver_settings = system.input.eigensolver
-    if eigensolver_settings.method not in {"chebff", "chebdav"}:
-        raise NotImplementedError(
-            f"Eigensolver={eigensolver_settings.method!r} is not yet ported "
-            "to the spin-polarized SCF path"
-        )
-    return EigvalSettings(
-        safety_buffer=eigensolver_settings.subspace_buffer,
-        initial_method=eigensolver_settings.method,
-        chebff=ChebFFSettings(
-            polynomial_degree=eigensolver_settings.first_filter_degree,
-            filter_cycles=eigensolver_settings.first_filter_cycles,
-            lanczos_steps=10,
-            block_size=eigensolver_settings.matvec_block_size,
-            reset_recurrence_per_block=False,
-            random_seed=eigensolver_settings.random_seed,
-        ),
-        chebdav=(
-            ChebDavSettings(
-                polynomial_degree=eigensolver_settings.first_filter_degree,
-                convergence_tolerance=eigensolver_settings.tolerance,
-                block_size=eigensolver_settings.matvec_block_size,
-                workspace_window=12,
-                lanczos_steps=5,
-                max_outer_restarts=2,
-                random_seed=eigensolver_settings.random_seed,
-            )
-            if eigensolver_settings.method == "chebdav"
-            else ChebDavSettings()
-        ),
-        subspace=SubspaceSettings(
-            polynomial_degree=filter_degree,
-            degree_delta=eigensolver_settings.filter_degree_delta,
-            lanczos_steps=eigensolver_settings.lanczos_steps,
-            block_size=eigensolver_settings.matvec_block_size,
-            reset_recurrence_per_block=False,
-            random_seed=eigensolver_settings.random_seed,
-        ),
+def _eigval_settings(
+    system: _PreparedSystem,
+    filter_degree: int,
+    *,
+    tolerance: float | None = None,
+    neighbors: np.ndarray | None = None,
+) -> EigvalSettings:
+    """The policy of :func:`eigval_settings_for` (the same for every solver)."""
+
+    return eigval_settings_for(
+        system.input.eigensolver,
+        filter_degree,
+        tolerance=tolerance,
+        neighbors=neighbors,
     )
 
 
@@ -689,18 +782,32 @@ def run_scf_spin_polarized(
     system: _PreparedSystem,
     *,
     callback: Callable[[SpinPolarizedSCFIteration], None] | None = None,
+    iteration_state_callback: Callable[[object], None] | None = None,
 ) -> SpinPolarizedSinglePointResult:
     """Run collinear spin-polarized PARSEC-style potential mixing.
 
     The XC functional is ``system.input.scf.xc_functional``: ``'ca'`` is
     LSDA (``exc_spn.f90``); ``'pbe'`` is collinear spin-polarized PBE
     (:func:`~parsec_python.V_xc.pbe_spin_polarized`).
+
+    LDA+U (``system.hubbard``) enters as in :func:`run_spin_scf`: from the
+    second iteration on, ``D`` of each channel from the orbitals of the
+    iteration before (``calcden.f90z``) joins that channel's Hamiltonian and
+    ``E_U`` the energy; the TS correction (``Van_Der_Waals``) is evaluated on
+    the converged density.
+    ``iteration_state_callback`` receives the fields of every finished
+    iteration (``Save_Intermediate_Charge_Density`` /
+    ``Save_Intermediate_Eigenvalues``, parsec.F90:1381-1402: PARSEC writes
+    ``parsec.dat`` and ``eigen.dat`` after every SCF iteration); it observes
+    only.
     """
     settings = system.input.scf
     if not settings.spin_polarized:
         raise ValueError(
             "run_scf_spin_polarized requires SCFSettings.spin_polarized=True"
         )
+    hubbard_projectors = getattr(system, "hubbard", None)
+    hubbard_state = None
 
     number_of_states = _number_of_states_per_channel(system)
     ionic_potential = system.ionic_potential
@@ -719,12 +826,19 @@ def run_scf_spin_polarized(
 
     eigval_state_up: EigvalState | None = None
     eigval_state_down: EigvalState | None = None
-    # One Anderson history over the concatenated (V_up, V_down) vector, the
+    # One mixer history over the concatenated (V_up, V_down) vector, the
     # spin-polarized analog of mixing a single scalar field -- PARSEC treats
     # vnew(:,1:2) as one combined potential for mixing purposes.
-    mixer = AndersonMixer(system.input.mixing)
+    mixer = make_mixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
+    eigensolver_settings = system.input.eigensolver
+    if eigensolver_settings.method == "none":
+        raise ValueError(
+            "Eigensolver: none is PARSEC's TEST mode: setup only, no SCF"
+        )
+    neighbors = preconditioner_neighbors(system, eigensolver_settings)
+    diagonalization_tolerance = first_diagonalization_tolerance(eigensolver_settings)
 
     eigenvalues_up = eigenvalues_down = np.empty(0)
     occupations_up = occupations_down = np.empty(0)
@@ -734,9 +848,31 @@ def run_scf_spin_polarized(
     converged = False
 
     for iteration in range(1, settings.max_iterations + 1):
-        eigval_settings = _eigval_settings(system, filter_degree)
+        eigval_settings = _eigval_settings(
+            system,
+            filter_degree,
+            tolerance=diagonalization_tolerance,
+            neighbors=neighbors,
+        )
 
-        hamiltonian_up = system.hamiltonian(input_potential_up)
+        hubbard_terms_now = {}
+        if hubbard_projectors is not None:
+            if iteration > 1:
+                # calcden.f90z: N and D of both channels from the orbitals and
+                # occupations of the iteration before.
+                hubbard_state = hubbard_terms_from_orbitals(
+                    hubbard_projectors,
+                    [wavefunctions_up, wavefunctions_down],
+                    [occupations_up, occupations_down],
+                )
+            hubbard_terms_now = {
+                "hubbard_energy": 0.0 if hubbard_state is None else hubbard_state.energy
+            }
+            hamiltonian_up = system.hamiltonian(
+                input_potential_up, hubbard_operator(hubbard_projectors, hubbard_state, 0)
+            )
+        else:
+            hamiltonian_up = system.hamiltonian(input_potential_up)
         solution_up = solve_eigval(
             hamiltonian_up.as_linear_operator(),
             number_of_states,
@@ -747,7 +883,13 @@ def run_scf_spin_polarized(
         eigenvalues_up = solution_up.eigenvalues
         wavefunctions_up = solution_up.vectors
 
-        hamiltonian_down = system.hamiltonian(input_potential_down)
+        if hubbard_projectors is not None:
+            hamiltonian_down = system.hamiltonian(
+                input_potential_down,
+                hubbard_operator(hubbard_projectors, hubbard_state, 1),
+            )
+        else:
+            hamiltonian_down = system.hamiltonian(input_potential_down)
         solution_down = solve_eigval(
             hamiltonian_down.as_linear_operator(),
             number_of_states,
@@ -784,6 +926,22 @@ def run_scf_spin_polarized(
             system.grid.volume_element,
             degeneracy=1.0,
         )
+        symmetrization = ()
+        density_symmetry = getattr(system, "density_symmetry", None)
+        if density_symmetry is not None:
+            # Symmetrize_Charge_Density of a periodic cell: isp = 1 (total,
+            # reported), 2 and 3 (parsec.F90 lines 1223-1232).
+            volume_element = system.grid.volume_element
+            _, total_report = symmetrize_density(
+                density_up + density_down, density_symmetry, volume_element
+            )
+            density_up, up_report = symmetrize_density(
+                density_up, density_symmetry, volume_element
+            )
+            density_down, down_report = symmetrize_density(
+                density_down, density_symmetry, volume_element
+            )
+            symmetrization = (total_report, up_report, down_report)
 
         hartree = system.solve_hartree(
             density_up + density_down, initial_potential=hartree_potential
@@ -821,6 +979,8 @@ def run_scf_spin_polarized(
             system.ion_ion_energy,
             system.grid.volume_element,
             alpha_z_energy=system.alpha_z_energy,
+            # totnrg.f90 adds etot_plusu, zero before the first calcden.
+            **hubbard_terms_now,
         )
 
         mixed_combined = mixer.mix(input_combined, output_combined, iteration=iteration)
@@ -830,6 +990,13 @@ def run_scf_spin_polarized(
         selected_residual = (
             metrics.plain if settings.use_plain_residual else metrics.weighted
         )
+        if eigensolver_settings.dynamic_tolerance:
+            # This loop measures one weighted SRE over both channels.
+            diagonalization_tolerance = dynamic_diagonalization_tolerance(
+                diagonalization_tolerance,
+                (metrics.weighted,),
+                eigensolver_settings.tolerance,
+            )
         if callback is not None:
             callback(
                 SpinPolarizedSCFIteration(
@@ -842,11 +1009,50 @@ def run_scf_spin_polarized(
                     occupations_up=tuple(float(value) for value in occupations_up),
                     occupations_down=tuple(float(value) for value in occupations_down),
                     fermi_level=float(fermi_level),
+                    density_symmetrization=symmetrization,
+                    **hubbard_iteration_record(hubbard_state),
+                    # Dynamic_Diag_Tol: the tolerance of the next iteration.
+                    **(
+                        {"next_eigensolver_tolerance": diagonalization_tolerance}
+                        if eigensolver_settings.dynamic_tolerance
+                        else {}
+                    ),
+                )
+            )
+        if iteration_state_callback is not None:
+            from .single_point import IterationChannelFields, SCFIterationFields
+
+            iteration_state_callback(
+                SCFIterationFields(
+                    iteration=iteration,
+                    eigenvalues=np.concatenate([eigenvalues_up, eigenvalues_down]),
+                    occupations=np.concatenate([occupations_up, occupations_down]),
+                    representations=np.empty(0, dtype=np.int32),
+                    wavefunctions=None,
+                    density=density_up + density_down,
+                    next_effective_potential=0.5
+                    * (input_potential_up + input_potential_down),
+                    spin=(
+                        IterationChannelFields(
+                            eigenvalues_up,
+                            occupations_up,
+                            density_up,
+                            input_potential_up,
+                            wavefunctions=wavefunctions_up,
+                        ),
+                        IterationChannelFields(
+                            eigenvalues_down,
+                            occupations_down,
+                            density_down,
+                            input_potential_down,
+                            wavefunctions=wavefunctions_down,
+                        ),
+                    ),
                 )
             )
         if (
             iteration > 5
-            and metrics.weighted < 100.0 * settings.convergence_criterion
+            and metrics.weighted < settings.approach_criterion
             and filter_degree > minimum_filter_degree
         ):
             filter_degree -= 1
@@ -854,6 +1060,11 @@ def run_scf_spin_polarized(
             converged = True
             break
 
+    dispersion = None
+    if dispersion_wanted(settings, converged):
+        dispersion, energies = dispersion_after_convergence(
+            system, density_up + density_down, energies
+        )
     return SpinPolarizedSinglePointResult(
         converged=converged,
         iterations=iteration,
@@ -873,6 +1084,8 @@ def run_scf_spin_polarized(
             "potential_up": output_potential_up,
             "potential_down": output_potential_down,
         },
+        hubbard=hubbard_state,
+        dispersion=dispersion,
     )
 
 

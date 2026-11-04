@@ -22,8 +22,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 
-from ..Relaxation.backend import IonicBackend, release_orbitals
-from ..models import Atom
+from ..Relaxation.backend import IonicBackend, moved_atoms, release_orbitals
 from .atomic_masses import atomic_masses
 from .md_files import (
     MD_NRG_HEADER,
@@ -103,12 +102,19 @@ def restart_structure(translation, input_directory: Path):
     restart = parse_md_restart(
         path.read_text(encoding="utf-8", errors="replace"), len(problem.atoms)
     )
-    atoms = tuple(
-        Atom(atom.symbol, position)
-        for atom, position in zip(problem.atoms, restart.current_positions)
+    # the atoms keep their other fields with Andrew Grieder's routines (parsec_python.Input.routines)
+    atoms = moved_atoms(
+        problem.atoms,
+        restart.current_positions,
+        not getattr(getattr(translation, "routines", None), "fortran", False),
     )
+    # A slab continues in the frame of the run that wrote the file (PARSEC
+    # would re-centre the current positions of mdinit.dat but not the
+    # previous ones, initial.f90:201-228): nothing is shifted or reported.
     translation = replace(
-        translation, problem=replace(problem, atoms=atoms, recenter_geometry=True)
+        translation,
+        problem=replace(problem, atoms=atoms, recenter_geometry=True),
+        slab_shift=0.0,
     )
     return translation, restart, [
         f" Molecular dynamics restarted from {MD_RESTART}, step {restart.frame}"
@@ -256,10 +262,8 @@ def run_recorded_molecular_dynamics(
         outcome.positions = np.asarray(step.positions, dtype=np.float64)
         if step.finished:
             break
-        atoms = tuple(
-            Atom(atom.symbol, position)
-            for atom, position in zip(system.atoms, step.positions)
-        )
+        # Andrew Grieder's loops keep the initial moment of a non-collinear calculation
+        atoms = moved_atoms(system.atoms, step.positions, getattr(backend, "keep_atom_fields", True))
         release_orbitals(result)
         moved = backend.update_geometry(system, atoms)
         carried = backend.warm_start(system, result, moved)

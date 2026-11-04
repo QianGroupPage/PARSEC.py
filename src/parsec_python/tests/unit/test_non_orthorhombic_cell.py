@@ -396,7 +396,10 @@ Kpoint_Method: mp
 begin Monkhorst_Pack_Grid
 2 2 2
 end Monkhorst_Pack_Grid
+Use_Fortran_Routines: .false.
 """
+# (Andrew Grieder's routines: without the parameter this cell runs on the Fortran-derived routines, whose space group
+# - the atom off the origin gives fractional translations - sets Fortran's grid, 12 points per vector against 14.)
 
 
 class ObliqueInputTests(unittest.TestCase):

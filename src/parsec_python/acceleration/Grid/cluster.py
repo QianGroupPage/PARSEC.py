@@ -69,6 +69,16 @@ def _active_points(settings: GridSettings, positions: list[np.ndarray]) -> np.nd
 
     n = positions[0].size
     active = np.empty((n, n, n), dtype=bool)
+    if settings.domain_shape in ("ellipsoid", "cylinder"):
+        # Not a product of three axis tests: the reference test decides the
+        # points of each slab, from the same coordinate values in the same
+        # (x, y, z) columns as on the cube of the reference builder.
+        y = np.repeat(positions[1], n)
+        z = np.tile(positions[2], n)
+        for slab in range(n):
+            points = np.column_stack([np.full(n * n, positions[0][slab]), y, z])
+            active[slab] = _inside_domain(settings, points).reshape(n, n)
+        return active
     if settings.domain_shape != "sphere":
         inside = _axis_decisions(settings, positions)
         np.logical_and(

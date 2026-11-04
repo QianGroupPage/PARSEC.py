@@ -11,9 +11,19 @@ PARSEC's ``src/eigval.F90``:
 * subsequent SCF solves call ``subspace`` exactly once; and
 * an incompatible eigenstate allocation restarts the selected first solver.
 
-Only Python/NumPy implementations are called.  There is intentionally no
-ARPACK fallback, Fortran subprocess, shared-library interface, or residual
+``Eigensolver: arpack`` (``arpk.f90z``) and ``diagla`` (``diagla.f90z``)
+follow the same rule when ``Chebyshev_Filtering`` is on (``solver%do_subsp``:
+the selected solver once, SUBSPACE afterwards); without it eigval.F90 runs
+the selected solver in every SCF iteration (lines 312-346): ARPACK from a
+new random start vector, DIAGLA from the orbitals of the previous iteration.
+
+Only Python/NumPy implementations are called (ARPACK through SciPy only
+when it is the selected solver).  There is intentionally no solver
+fallback, Fortran subprocess, shared-library interface, or residual
 criterion hidden in this dispatcher.
+
+``Dynamic_Diag_Tol`` (:func:`dynamic_diagonalization_tolerance`) sets the
+tolerance the SCF drivers hand to CHEBDAV, ARPACK and DIAGLA.
 """
 
 from __future__ import annotations
@@ -23,8 +33,11 @@ from typing import Any, Literal
 
 import numpy as np
 
+from .arpack import ArpackResult, ArpackSettings, run_arpack
 from .chebdav import ChebDavResult, ChebDavSettings, run_chebdav
 from .chebff import ChebFFResult, ChebFFSettings, run_chebff
+from .diagla import DiaglaResult, DiaglaSettings, run_diagla
+from .iterative import matvec_budget
 from .subspace import (
     SubspaceResult,
     SubspaceSettings,
@@ -33,8 +46,38 @@ from .subspace import (
 )
 
 
-InitialSolver = Literal["chebff", "chebdav"]
-SolverPath = Literal["chebff", "chebdav", "subspace"]
+InitialSolver = Literal["chebff", "chebdav", "arpack", "diagla"]
+SolverPath = Literal["chebff", "chebdav", "subspace", "arpack", "diagla"]
+# The solvers eigval.F90 may run in every SCF iteration.
+ITERATIVE_SOLVERS = frozenset({"arpack", "diagla"})
+# parsec.F90:1106-1111 (intended): the first SCF iteration of a loop with
+# Dynamic_Diag_Tol uses this eigensolver tolerance.
+DYNAMIC_TOLERANCE_START = 0.1
+
+
+def dynamic_diagonalization_tolerance(
+    tolerance: float,
+    weighted_residuals,
+    floor: float,
+) -> float:
+    """Eigensolver tolerance of the next SCF iteration (``Dynamic_Diag_Tol``).
+
+    parsec.F90:1304-1311 after ``getsre``::
+
+        toler = min(toler, minval(elec_st%sre)/10)
+        toler = max(toler, dyntoler)
+
+    with ``weighted_residuals`` the weighted SRE of each spin channel
+    (``elec_st%sre``) and ``floor`` the ``Diag_Tolerance`` of the input.
+    This is the rule the Fortran intends.  Its effective behaviour differs:
+    usrinputfile.F90:1497 already sets ``toler = 0.1`` when it reads
+    ``Dynamic_Diag_Tol``, so ``dyntoler = toler`` (parsec.F90:1109) stores
+    0.1 as the floor and the tolerance stays 0.1 throughout, the input
+    ``Diag_Tolerance`` being lost.
+    """
+
+    smallest = min(float(value) for value in weighted_residuals)
+    return max(min(float(tolerance), smallest / 10.0), float(floor))
 
 
 @dataclass(frozen=True)
@@ -53,12 +96,34 @@ class EigvalSettings:
     chebff: ChebFFSettings = field(default_factory=ChebFFSettings)
     chebdav: ChebDavSettings = field(default_factory=ChebDavSettings)
     subspace: SubspaceSettings = field(default_factory=SubspaceSettings)
+    arpack: ArpackSettings = field(default_factory=ArpackSettings)
+    diagla: DiaglaSettings = field(default_factory=DiaglaSettings)
+    # Chebyshev_Filtering for ARPACK and DIAGLA; None follows the rule of
+    # usrinputfile.F90 (on for CHEBFF/CHEBDAV, off otherwise).
+    chebyshev_filtering: bool | None = None
 
     def __post_init__(self) -> None:
         if self.safety_buffer < 0:
             raise ValueError("safety_buffer cannot be negative")
-        if self.initial_method not in {"chebff", "chebdav"}:
-            raise ValueError("initial_method must be 'chebff' or 'chebdav'")
+        if self.initial_method not in {"chebff", "chebdav", "arpack", "diagla"}:
+            raise ValueError(
+                "initial_method must be 'chebff', 'chebdav', 'arpack' or 'diagla'"
+            )
+        if (
+            self.initial_method not in ITERATIVE_SOLVERS
+            and self.chebyshev_filtering is False
+        ):
+            raise ValueError(
+                "PARSEC always follows CHEBFF and CHEBDAV by the SUBSPACE filter"
+            )
+
+    @property
+    def later_subspace_filter(self) -> bool:
+        """``solver%do_subsp``: later SCF iterations run SUBSPACE."""
+
+        if self.initial_method not in ITERATIVE_SOLVERS:
+            return True
+        return bool(self.chebyshev_filtering)
 
 
 @dataclass(frozen=True)
@@ -79,6 +144,11 @@ class EigvalState:
     initial_method: InitialSolver
     subspace: SubspaceState
     solves_completed: int
+    # ARPACK: the LAPACK seed of dgetv0, kept between solves.
+    start_seed: tuple[int, int, int, int] | None = None
+    # DIAGLA: evec columns beyond the working states (the window), the
+    # initial guesses of the next solve together with ``subspace.vectors``.
+    window_vectors: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +165,18 @@ class EigvalResult:
     chebff_result: ChebFFResult | None = None
     chebdav_result: ChebDavResult | None = None
     subspace_result: SubspaceResult | None = None
+    arpack_result: ArpackResult | None = None
+    diagla_result: DiaglaResult | None = None
+
+    @property
+    def iterative_counts(self) -> tuple[int, int] | None:
+        """``(nec, maxmvs)`` of an ARPACK or DIAGLA solve, as eigval.F90
+        reports them; ``None`` for the other solvers."""
+
+        solved = self.arpack_result or self.diagla_result
+        if solved is None:
+            return None
+        return (int(solved.converged_states), int(solved.matvecs))
 
     @property
     def working_eigenvalues(self) -> np.ndarray:
@@ -222,6 +304,10 @@ def solve_eigval(
       later-SCF SUBSPACE filter/Rayleigh--Ritz update; or
     * with an incompatible state, explicitly restart that selected solver.
 
+    With ARPACK or DIAGLA selected the solver runs instead of CHEBFF/CHEBDAV
+    (see :func:`_solve_iterative`), and in every call unless
+    ``settings.later_subspace_filter``.
+
     A restart is never converted into a different eigensolver.  Returned
     ``eigenvalues``/``vectors`` are truncated to ``requested_states``, while
     ``result.state`` always retains the complete working subspace.
@@ -244,6 +330,19 @@ def solve_eigval(
             requested_states=requested_states,
             working_states=working_states,
             initial_method=settings.initial_method,
+        )
+
+    if settings.initial_method in ITERATIVE_SOLVERS and (
+        state is None or reason is not None or not settings.later_subspace_filter
+    ):
+        return _solve_iterative(
+            operator,
+            requested_states,
+            dimension=dimension,
+            working_states=working_states,
+            settings=settings,
+            state=state,
+            reason=reason,
         )
 
     if state is None or reason is not None:
@@ -325,6 +424,100 @@ def solve_eigval(
         restarted=False,
         restart_reason=None,
         subspace_result=later,
+    )
+
+
+def _solve_iterative(
+    operator: Any,
+    requested_states: int,
+    *,
+    dimension: int,
+    working_states: int,
+    settings: EigvalSettings,
+    state: EigvalState | None,
+    reason: str | None,
+) -> EigvalResult:
+    """One ARPACK or DIAGLA solve of ``working_states`` eigenpairs.
+
+    eigval.F90 calls the solver with ``nn`` wanted pairs; the budget is
+    ``max(Maximum_matvec, n * n_states)`` (parsec.F90:687).  ARPACK
+    continues the LAPACK stream of its start vectors from ``state``; DIAGLA
+    starts from the saved vectors (``nn + winsize`` columns), or from zero
+    vectors -- PARSEC's freshly allocated ``evec`` -- on the first solve.
+    The pairs become the saved subspace exactly as after CHEBFF, so a run
+    with ``Chebyshev_Filtering`` continues with SUBSPACE.
+    """
+
+    reusable = state is not None and reason is None
+    method = settings.initial_method
+    if method == "arpack":
+        budget = matvec_budget(
+            settings.arpack.maximum_matvec, dimension, requested_states
+        )
+        solved = run_arpack(
+            operator,
+            working_states,
+            settings=settings.arpack,
+            matvec_budget=budget,
+            start_seed=None if state is None else state.start_seed,
+        )
+        residuals = None
+        start_seed = solved.start_seed
+        window_vectors = None
+        arpack_result: ArpackResult | None = solved
+        diagla_result: DiaglaResult | None = None
+    else:
+        budget = matvec_budget(
+            settings.diagla.maximum_matvec, dimension, requested_states
+        )
+        guesses = None
+        if reusable and state.window_vectors is not None:
+            guesses = np.hstack([state.subspace.vectors, state.window_vectors])
+        solved = run_diagla(
+            operator,
+            working_states,
+            settings=settings.diagla,
+            matvec_budget=budget,
+            initial_vectors=guesses,
+        )
+        residuals = np.asarray(solved.residual_norms[:requested_states])
+        start_seed = None
+        window_vectors = solved.all_vectors[:, working_states:]
+        arpack_result = None
+        diagla_result = solved
+    subspace = SubspaceState(
+        operator_dimension=dimension,
+        working_states=working_states,
+        eigenvalues=np.asarray(solved.eigenvalues),
+        vectors=np.asarray(solved.vectors),
+        # subspace.f90z recomputes this from max(saved Ritz) on firstfilt.
+        filter_lower_bound=None,
+        first_filter=True,
+        filters_completed=0,
+    )
+    next_state = EigvalState(
+        operator_dimension=dimension,
+        requested_states=requested_states,
+        working_states=working_states,
+        initial_method=method,
+        subspace=subspace,
+        solves_completed=state.solves_completed + 1 if reusable else 1,
+        start_seed=start_seed,
+        window_vectors=window_vectors,
+    )
+    eigenvalues, vectors = _requested_view(
+        solved.eigenvalues, solved.vectors, requested_states
+    )
+    return EigvalResult(
+        eigenvalues=eigenvalues,
+        vectors=vectors,
+        residual_norms=residuals,
+        state=next_state,
+        solver_path=method,
+        restarted=state is not None and reason is not None,
+        restart_reason=reason,
+        arpack_result=arpack_result,
+        diagla_result=diagla_result,
     )
 
 

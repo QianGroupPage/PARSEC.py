@@ -2597,7 +2597,7 @@ class CommandLineTests(unittest.TestCase):
         self.assertNotIn("the report failed", without)
 
         def masked(lines):
-            files = ("parsec.in", "parsec.out", "H_POTRE.DAT")
+            files = ("parsec.in", "parsec.out", "H_POTRE.DAT", "parsec.dat")
             return [
                 re.sub(
                     r"\d",

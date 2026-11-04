@@ -5,6 +5,7 @@ from .fermi_dirac import (
     OccupationResult,
     density_from_orbitals,
     fermi_occupations,
+    weighted_fermi_occupations,
 )
 from .fixed import (
     OccupationFile,
@@ -38,4 +39,5 @@ __all__ = [
     "spin_density_from_orbitals",
     "spin_fermi_occupations",
     "spin_fixed_occupations",
+    "weighted_fermi_occupations",
 ]

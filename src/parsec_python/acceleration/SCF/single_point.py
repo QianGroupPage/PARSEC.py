@@ -31,6 +31,9 @@ class AcceleratedPreparedSinglePointSystem:
     hartree_solver: Callable[..., object] | None = None
     orbital_density_builder: Callable[..., object] | None = None
     xc_evaluator: Callable[..., object] | None = None
+    # ``evaluate_spin_xc`` of the loop of two spin channels; ``None`` keeps
+    # the reference functional.
+    spin_xc_evaluator: Callable[..., object] | None = None
     mixer_factory: Callable[..., object] | None = None
     residual_metrics_evaluator: Callable[..., object] | None = None
     total_energy_evaluator: Callable[..., object] | None = None
@@ -49,6 +52,15 @@ class AcceleratedPreparedSinglePointSystem:
     # seconds from its entry and in the order of the starts.  Stages of
     # different threads overlap: a timeline, not a sum.
     preparation_stages: tuple = ()
+    # LDA+U on the devices (Hamiltonian.hubbard_device.DeviceHubbard): the
+    # term in the device Hamiltonians and the occupation matrices formed
+    # where the orbitals are.  ``None`` without LDA+U and on the CPU
+    # backends, which add the host term to the bound Hamiltonian.
+    hubbard_device: object | None = None
+    # ``dispersion_device(system, density)``: the TS correction with its
+    # grid sums on a device (Energy.dispersion_device); ``None`` takes the
+    # reference correction on the host.
+    dispersion_device: Callable[..., object] | None = None
 
     def __getattr__(self, name: str):
         return getattr(self.reference, name)
@@ -59,8 +71,41 @@ class AcceleratedPreparedSinglePointSystem:
             return self.boundary_tail_maximum
         return getattr(self.reference, "hartree_boundary_tail_maximum", None)
 
-    def hamiltonian(self, effective_potential) -> BoundHamiltonian:
-        return self.backend.bind(effective_potential)
+    @property
+    def density_symmetry(self):
+        """The point group of ``Symmetrize_Charge_Density``, for this SCF's fields.
+
+        The group of the reference system where the SCF loop keeps full-grid
+        densities; its average over the orbits of the symmetry sectors where
+        the loop keeps one value per orbit (:mod:`.density_symmetry`).
+        ``None`` without the option.
+        """
+
+        group = getattr(self.reference, "density_symmetry", None)
+        if group is None or self.scalar_field_adapter is None:
+            return group
+        from .density_symmetry import wedge_density_symmetry
+
+        return wedge_density_symmetry(group, self.scalar_field_adapter.reduction)
+
+    def hamiltonian(self, effective_potential, hubbard=None) -> BoundHamiltonian:
+        """Bind ``V_eff``; ``hubbard`` is the LDA+U term of the channel (``plusu.f90z``).
+
+        The reference loop passes it from the second iteration on, where
+        the system has LDA+U atoms.  The device Hamiltonians hold the term
+        (``hubbard_device`` writes its coefficients, zero for ``None``); the
+        CPU backends add it to the bound host Hamiltonian.
+        """
+
+        device = self.hubbard_device
+        if device is not None:
+            return device.hamiltonian(self.backend, effective_potential, hubbard)
+        bound = self.backend.bind(effective_potential)
+        if hubbard is None:
+            return bound
+        from ..Hamiltonian.hubbard_device import HostHubbardHamiltonian
+
+        return HostHubbardHamiltonian(bound, hubbard)
 
     def solve_hartree(self, *args, **kwargs):
         if self.hartree_solver is not None:
@@ -72,6 +117,11 @@ class AcceleratedPreparedSinglePointSystem:
             return self.xc_evaluator(*args, **kwargs)
         return self.reference.evaluate_xc(*args, **kwargs)
 
+    def evaluate_spin_xc(self, *args, **kwargs):
+        if self.spin_xc_evaluator is not None:
+            return self.spin_xc_evaluator(*args, **kwargs)
+        return self.reference.evaluate_spin_xc(*args, **kwargs)
+
 
 def run_scf(
     system: AcceleratedPreparedSinglePointSystem,
@@ -79,13 +129,18 @@ def run_scf(
     callback: Callable[[SCFIteration], None] | None = None,
     warm_start=None,
     convergence_criterion: float | None = None,
+    iteration_state_callback: Callable[..., None] | None = None,
 ) -> AcceleratedSinglePointResult:
     """Run the validated SCF algorithm through an accelerated H backend.
 
     ``warm_start`` continues from the SCF loop of the structure before an
     ionic move (:class:`parsec_python.SCF.SCFWarmStart`);
     ``convergence_criterion`` replaces the criterion of the input for this
-    loop.
+    loop.  ``iteration_state_callback`` receives the full-grid fields of
+    every iteration (``Save_Intermediate_Charge_Density``), as in the
+    reference loop; its orbitals are those of the eigensolver, on the
+    devices or in symmetry sectors (:mod:`.iteration_fields` brings them to
+    the host).
     """
     symmetry_eigensolver = getattr(
         system.backend, "symmetry_eigensolver", None
@@ -105,6 +160,11 @@ def run_scf(
             scalar_field_adapter=system.scalar_field_adapter,
             warm_start=warm_start,
             convergence_criterion=convergence_criterion,
+            **(
+                {}
+                if iteration_state_callback is None
+                else {"iteration_state_callback": iteration_state_callback}
+            ),
         )
         return _finalize_result(system, result, symmetry_eigensolver)
     finally:

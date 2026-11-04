@@ -36,6 +36,7 @@ from parsec_python.SCF.kpoints_soc import (
 )
 from parsec_python.SCF.noncollinear import run_self_consistent_noncollinear_kpoints
 from parsec_python.SCF.pbc import prepare_periodic_single_point
+from parsec_python.SCF.single_point import warm_start_for_moved_atoms
 
 _AU_POTRE = Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
 _BOX = 8.0
@@ -315,6 +316,35 @@ class IsolatedNonCollinearDeviceTests(unittest.TestCase):
         self.assertIn("WAVEFUNCTIONS ARE COMPLEX!", self.log)
         self.assertIn("Execution resources (k-point eigensolver)", self.log)
         self.assertIn("device-resident Ritz subspaces", self.log)
+
+
+class SpinOrbitWarmStartTests(unittest.TestCase):
+    """The eigensubspaces of the k-points leave the workers after a loop and go back into the next one."""
+
+    def _restart(self, environment: dict):
+        with mock.patch.dict(os.environ, environment):
+            system = _system(soc=True, self_consistent_spin_orbit=True, criterion=1.0e-5)
+            first = run_self_consistent_soc_kpoints(system, _K, _WEIGHTS)
+            again = run_self_consistent_soc_kpoints(
+                system, _K, _WEIGHTS, warm_start=warm_start_for_moved_atoms(system, first, system)
+            )
+        return first, again
+
+    def _check(self, first, again) -> None:
+        self.assertEqual(sorted(first.eigensolver_state), [0, 1, 2, 3])
+        for state in first.eigensolver_state.values():  # the subspaces come back to the host
+            vectors = state.vectors if hasattr(state, "vectors") else state.subspace.vectors
+            self.assertIsInstance(vectors, np.ndarray)
+        # the same structure again: the saved subspaces and potential are already the converged ones
+        self.assertLessEqual(again.iterations, 4)
+        self.assertLess(again.iterations, first.iterations)
+        self.assertAlmostEqual(again.energies.total, first.energies.total, places=5)
+
+    def test_pooled_host_solver(self) -> None:
+        self._check(*self._restart({"PARSEC_KPOINT_BACKEND": "cpu", "PARSEC_KPOINT_WORKERS": "2"}))
+
+    def test_device_subspaces(self) -> None:
+        self._check(*self._restart({"PARSEC_KPOINT_BACKEND": "numpy-device", "PARSEC_KPOINT_WORKERS": "1"}))
 
 
 class StageTimingAndResidualTests(unittest.TestCase):

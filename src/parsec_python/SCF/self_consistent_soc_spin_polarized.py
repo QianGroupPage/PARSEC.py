@@ -54,9 +54,16 @@ from ..Eigensolvers import (
 from ..Eigensolvers.perturbative_soc import AtomSpinOrbitProjectors
 from ..Energy import total_energy_no_degeneracy_spin_polarized
 from ..Hamiltonian.spinor_operator import SpinorKohnShamHamiltonian
-from ..Mixer import AndersonMixer, potential_residual_metrics
+from ..Mixer import make_mixer, potential_residual_metrics
 from ..Occupations import fermi_occupations
-from ..SCF.single_point import PreparedSinglePointSystem
+from ..SCF.single_point import (
+    PreparedSinglePointSystem,
+    first_diagonalization_tolerance,
+    iterative_solver_fields,
+    next_diagonalization_tolerance,
+    preconditioner_neighbors,
+    state_for_new_potential,
+)
 from ..SCF.spin_polarized import _weighted_initial_polarization
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
 
@@ -99,8 +106,33 @@ def _number_of_states(system: PreparedSinglePointSystem) -> int:
     return requested
 
 
-def _eigval_settings(system: PreparedSinglePointSystem, filter_degree: int) -> EigvalSettings:
+def _eigval_settings(
+    system: PreparedSinglePointSystem, filter_degree: int, tolerance: float | None = None
+) -> EigvalSettings:
+    # ``tolerance`` replaces Diag_Tolerance (Dynamic_Diag_Tol); CHEBFF and
+    # SUBSPACE use none, ARPACK and DIAGLA do.
     eigensolver_settings = system.input.eigensolver
+    if tolerance is None:
+        tolerance = eigensolver_settings.tolerance
+    if eigensolver_settings.method in ("arpack", "diagla"):
+        # The complex ARPACK (znaupd) and zdiagla_diag paths.
+        return EigvalSettings(
+            **iterative_solver_fields(
+                eigensolver_settings,
+                tolerance,
+                preconditioner_neighbors(system, eigensolver_settings),
+            ),
+            safety_buffer=eigensolver_settings.working_buffer,
+            initial_method=eigensolver_settings.method,
+            subspace=SubspaceSettings(
+                polynomial_degree=filter_degree,
+                degree_delta=eigensolver_settings.filter_degree_delta,
+                lanczos_steps=eigensolver_settings.lanczos_steps,
+                block_size=eigensolver_settings.matvec_block_size,
+                reset_recurrence_per_block=False,
+                random_seed=eigensolver_settings.random_seed,
+            ),
+        )
     if eigensolver_settings.method != "chebff":
         raise NotImplementedError(
             f"Eigensolver={eigensolver_settings.method!r} is not supported for "
@@ -108,7 +140,7 @@ def _eigval_settings(system: PreparedSinglePointSystem, filter_degree: int) -> E
             "basis and internal working arrays (CHEBDAV's are real-only)"
         )
     return EigvalSettings(
-        safety_buffer=eigensolver_settings.subspace_buffer,
+        safety_buffer=eigensolver_settings.working_buffer,
         initial_method="chebff",
         chebff=ChebFFSettings(
             polynomial_degree=eigensolver_settings.first_filter_degree,
@@ -135,14 +167,35 @@ def run_self_consistent_soc_spin_polarized(
     soc_projectors: tuple[AtomSpinOrbitProjectors, ...],
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
+    initial_potential: tuple[np.ndarray, np.ndarray] | None = None,
+    iteration_state_callback: Callable[[object], None] | None = None,
+    initial_eigensolver_state: object | None = None,
+    warm_start=None,
 ) -> SelfConsistentSOCResult:
     """Run self-consistent SOC combined with collinear spin polarization.
+
+    ``warm_start`` (:class:`~parsec_python.SCF.single_point.SCFWarmStart`, whose ``input_potential`` is the pair
+    ``(V_up, V_down)``) continues from the loop of the previous structure of a relaxation or dynamics run: its mixed
+    potentials, Hartree potential and eigensubspace.
 
     Requires ``system.input.scf.spin_polarized`` and
     ``system.input.scf.self_consistent_spin_orbit`` both set, and
     ``xc_functional`` either ``'ca'`` (LSDA) or ``'pbe'`` (collinear
     spin-polarized PBE with the spinor-projected spin densities).
+    ``initial_potential`` are the up and down potentials of the first
+    iteration (``Restart_Run`` from a spin-orbit ``parsec.dat``, or the warm
+    start of an ionic step), ``initial_eigensolver_state`` the subspace of a
+    loop before, as in
+    :func:`parsec_python.SCF.self_consistent_soc.run_self_consistent_soc`.
+    ``iteration_state_callback`` receives a
+    :class:`parsec_python.SCF.single_point.SpinorIterationFields` after every
+    iteration (``Save_Intermediate_*``, parsec.F90:1381-1402).
     """
+    from .single_point import refuse_hubbard_and_dispersion
+
+    refuse_hubbard_and_dispersion(
+        system, "run_self_consistent_soc_spin_polarized", dispersion=False
+    )
     settings = system.input.scf
     if not settings.spin_polarized:
         raise ValueError(
@@ -163,18 +216,37 @@ def run_self_consistent_soc_spin_polarized(
     density_up = 0.5 * (1.0 + polarization) * system.initial_density
     density_down = 0.5 * (1.0 - polarization) * system.initial_density
 
-    initial_hartree = system.solve_hartree(
-        density_up + density_down, initial_potential=-ionic_potential
-    )
-    hartree_potential = initial_hartree.potential
-    xc = system.evaluate_xc_spin_polarized(density_up, density_down)
-    input_potential_up = ionic_potential + hartree_potential + xc.potential_up
-    input_potential_down = ionic_potential + hartree_potential + xc.potential_down
+    if initial_potential is None and warm_start is None:
+        initial_hartree = system.solve_hartree(
+            density_up + density_down, initial_potential=-ionic_potential
+        )
+        hartree_potential = initial_hartree.potential
+        xc = system.evaluate_xc_spin_polarized(density_up, density_down)
+        input_potential_up = ionic_potential + hartree_potential + xc.potential_up
+        input_potential_down = ionic_potential + hartree_potential + xc.potential_down
+    elif warm_start is not None:
+        # Andrew Grieder's ionic loops: the structure before
+        hartree_potential = np.array(warm_start.hartree_potential, dtype=np.float64)
+        input_potential_up, input_potential_down = (
+            np.array(potential, dtype=np.float64) for potential in warm_start.input_potential
+        )
+    else:
+        # Restart_Run from a spin-orbit parsec.dat: vold(:,1:2) of the file.
+        hartree_potential = -np.asarray(ionic_potential, dtype=np.float64)
+        input_potential_up = np.array(initial_potential[0], dtype=np.float64)
+        input_potential_down = np.array(initial_potential[1], dtype=np.float64)
 
-    eigval_state: EigvalState | None = None
-    mixer = AndersonMixer(system.input.mixing)
+    eigval_state: EigvalState | None = (
+        state_for_new_potential(initial_eigensolver_state)
+        if warm_start is None
+        else warm_start.eigensolver_state
+    )
+    mixer = make_mixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
+    # Dynamic_Diag_Tol: 0.1 for the first iteration (parsec.F90:1106-1111).
+    dynamic_tolerance = system.input.eigensolver.dynamic_tolerance
+    diagonalization_tolerance = first_diagonalization_tolerance(system.input.eigensolver)
 
     eigenvalues = np.empty(0)
     occupations = np.empty(0)
@@ -186,9 +258,13 @@ def run_self_consistent_soc_spin_polarized(
     converged = False
 
     for iteration in range(1, settings.max_iterations + 1):
-        eigval_settings = _eigval_settings(system, filter_degree)
+        eigval_settings = _eigval_settings(
+            system,
+            filter_degree,
+            diagonalization_tolerance if dynamic_tolerance else None,
+        )
 
-        effective_potential_avg = 0.5 * (input_potential_up + input_potential_down)
+        effective_potential_avg = 0.5 * (input_potential_up + input_potential_down)  # what enters this eigenproblem
         xc_delta = 0.5 * (input_potential_up - input_potential_down)
 
         scalar_hamiltonian = system.hamiltonian(effective_potential_avg)
@@ -221,6 +297,15 @@ def run_self_consistent_soc_spin_polarized(
         density_up_out, density_down_out = spinor_spin_densities(
             spinors, occupations, system.grid.volume_element
         )
+        symmetrization = ()
+        if getattr(system, "density_symmetry", None) is not None:
+            # Symmetrize_Charge_Density: isp = 1 (reported), 2 and 3.
+            from .kpoints_soc import _symmetrized
+
+            symmetrized, symmetrization = _symmetrized(
+                system, {"up": density_up_out, "down": density_down_out}, True
+            )
+            density_up_out, density_down_out = symmetrized["up"], symmetrized["down"]
         density = density_up_out + density_down_out
 
         hartree = system.solve_hartree(density, initial_potential=hartree_potential)
@@ -258,12 +343,18 @@ def run_self_consistent_soc_spin_polarized(
         )
 
         mixed_combined = mixer.mix(input_combined, output_combined, iteration=iteration)
+        last_input_potential = 0.5 * (input_potential_up + input_potential_down)
         input_potential_up = mixed_combined[:n_grid]
         input_potential_down = mixed_combined[n_grid:]
 
         selected_residual = (
             metrics.plain if settings.use_plain_residual else metrics.weighted
         )
+        if dynamic_tolerance:
+            # parsec.F90:1302-1311 with this loop's SRE.
+            diagonalization_tolerance = next_diagonalization_tolerance(
+                system.input.eigensolver, diagonalization_tolerance, (metrics.weighted,)
+            )
         if callback is not None:
             callback(
                 SelfConsistentSOCIteration(
@@ -274,11 +365,36 @@ def run_self_consistent_soc_spin_polarized(
                     eigenvalues=tuple(float(value) for value in eigenvalues),
                     occupations=tuple(float(value) for value in occupations),
                     fermi_level=float(fermi_level),
+                    density_symmetrization=symmetrization,
+                    **(
+                        {"next_eigensolver_tolerance": diagonalization_tolerance}
+                        if dynamic_tolerance
+                        else {}
+                    ),
+                )
+            )
+        if iteration_state_callback is not None:
+            from .single_point import SpinorIterationFields
+
+            iteration_state_callback(
+                SpinorIterationFields(
+                    iteration=iteration,
+                    eigenvalues=eigenvalues,
+                    occupations=occupations,
+                    spinors=spinors,
+                    parsec_dat_fields={
+                        "kind": 2,
+                        "potentials": (
+                            np.array(input_potential_up, dtype=np.float64),
+                            np.array(input_potential_down, dtype=np.float64),
+                        ),
+                        "densities": (density_up_out, density_down_out),
+                    },
                 )
             )
         if (
             iteration > 5
-            and metrics.weighted < 100.0 * settings.convergence_criterion
+            and metrics.weighted < settings.approach_criterion
             and filter_degree > minimum_filter_degree
         ):
             filter_degree -= 1
@@ -286,6 +402,11 @@ def run_self_consistent_soc_spin_polarized(
             converged = True
             break
 
+    from .single_point import dispersion_after_convergence, dispersion_wanted
+    dispersion = None
+    if dispersion_wanted(settings, converged):
+        # efvdw.f90 after a converged loop: the TS correction of the density.
+        dispersion, energies = dispersion_after_convergence(system, density_up_out + density_down_out, energies)
     return SelfConsistentSOCResult(
         converged=converged,
         iterations=iteration,
@@ -300,6 +421,27 @@ def run_self_consistent_soc_spin_polarized(
         magnetic_moment=float(
             system.grid.volume_element * np.sum(density_up_out - density_down_out)
         ),
+        # The channel averages the forces read (forcloc.f90 with nspin = 2).
+        scf_input_potential=last_input_potential,
+        scf_output_potential=0.5 * (output_potential_up + output_potential_down),
+        xc_potential=0.5 * (xc.potential_up + xc.potential_down),
+        dispersion=dispersion,
+        parsec_dat_fields={
+            "kind": 2,
+            "potentials": (
+                np.array(input_potential_up, dtype=np.float64),
+                np.array(input_potential_down, dtype=np.float64),
+            ),
+            "densities": (density_up_out, density_down_out),
+        },
+        # pot%vnew(:,1:2) and the spinors: where the next structure of an
+        # ionic loop starts.
+        next_potential=(input_potential_up, input_potential_down),
+        input_effective_potential=effective_potential_avg,
+        output_effective_potential=0.5 * (output_potential_up + output_potential_down),
+        next_effective_potential=(input_potential_up, input_potential_down),
+        hartree_potential=hartree_potential,
+        eigensolver_state=eigval_state,
     )
 
 

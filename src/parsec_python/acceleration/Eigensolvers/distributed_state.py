@@ -1533,7 +1533,27 @@ def projection_slabs(
     )
 
 
-def shared_basis_fits(rows: int, columns: int, devices: int) -> bool:
+def resident_bytes_of(operator: Any) -> dict[int, int]:
+    """Bytes that other objects of the process keep on a device, by device, as the operator was told.
+
+    The device exchange-correlation evaluator of the accelerated driver
+    (``V_xc/device_xc.py``, ``planned_device_bytes``: its maps, the
+    multiplicities, the core density and the fields of one evaluation) on
+    the device that holds the Hartree objects, or on the current one.  The
+    driver tells the sector eigensolver
+    (:attr:`symmetry.CuPySymmetrySCFEigensolver.resident_device_bytes`),
+    which tells every sector operator.  Empty where nothing was told: CA,
+    whose evaluator runs on the host, and every functional on the host
+    (``PARSEC_CUPY_XC=off``).
+    """
+
+    resident = getattr(operator, "resident_device_bytes", None)
+    if not resident:
+        return {}
+    return {int(device): int(count) for device, count in dict(resident).items()}
+
+
+def shared_basis_fits(rows: int, columns: int, devices: int, reserved: int = 0) -> bool:
     """Whether the blocks of a shared ``rows x columns`` basis fit one device.
 
     The rule counts what :func:`tall_blocks_per_device` says a device holds.
@@ -1597,7 +1617,12 @@ def shared_basis_fits(rows: int, columns: int, devices: int) -> bool:
     ``PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION``, 0.85 by default.  The
     rest is for the operators, the filter buffers, the Gram matrices and the
     small solve: a basis with 50.9 GiB of blocks peaked at 55.3 GiB of the
-    79.25 GiB of its devices.
+    79.25 GiB of its devices.  ``reserved`` is what another object keeps on
+    the fullest device of the group beside the blocks
+    (:func:`resident_bytes_of`: the device XC evaluator of a GGA functional,
+    749.5 MiB at 39,368 electrons, which takes the count of a sector on four
+    devices from 0.6944 to 0.7037 of a device), counted with them; 0 where
+    nothing is kept, the count of every calculation before 2026-10-30.
 
     The rule keeps no room for the fallback after a failed stability audit
     (:meth:`SectorDeviceGroup.orthonormal_ritz`), which gathers the whole
@@ -1609,7 +1634,7 @@ def shared_basis_fits(rows: int, columns: int, devices: int) -> bool:
     tall block shares bases that no device could gather at all.
     """
 
-    return _blocks_fit(rows, columns, devices, False)
+    return _blocks_fit(rows, columns, devices, False, reserved)
 
 
 def _auto_fraction() -> float:
@@ -1667,17 +1692,17 @@ def shared_block_bytes(rows: int, columns: int, devices: int, wide: bool = False
     return needed
 
 
-def _blocks_fit(rows: int, columns: int, devices: int, wide: bool) -> bool:
+def _blocks_fit(rows: int, columns: int, devices: int, wide: bool, reserved: int = 0) -> bool:
     """:func:`shared_basis_fits` for the slab workspace of :func:`slab_workspace` with this ``wide``."""
 
     cp, _ = require_cupy()
     fraction = _auto_fraction()
-    needed = shared_block_bytes(rows, columns, devices, wide)
+    needed = shared_block_bytes(rows, columns, devices, wide) + int(reserved)
     _free, total = cp.cuda.runtime.memGetInfo()
     return needed <= fraction * total
 
 
-def wider_slabs_fit(rows: int, columns: int, devices: int) -> bool:
+def wider_slabs_fit(rows: int, columns: int, devices: int, reserved: int = 0) -> bool:
     """Whether the two-block Ritz step of this basis may cut slabs of up to 6 GiB.
 
     It may if the slabs are cut equal (:func:`equal_slabs_requested`), if
@@ -1705,6 +1730,8 @@ def wider_slabs_fit(rows: int, columns: int, devices: int) -> bool:
     have arrived, the fewer rounds the more of them, and it is chosen for
     its memory: its slabs take 4 GiB at most, and less with two devices
     and with four or more (:func:`slab_columns`).
+
+    ``reserved`` is that of :func:`shared_basis_fits`.
     """
 
     if tall_blocks_per_device() != 2 or not equal_slabs_requested():
@@ -1712,7 +1739,7 @@ def wider_slabs_fit(rows: int, columns: int, devices: int) -> bool:
     # Nothing to decide, and no device to ask, where the wider budget cuts no wider.
     if slab_columns(rows, columns, devices, True) <= slab_columns(rows, columns, devices):
         return False
-    return _blocks_fit(rows, columns, devices, True)
+    return _blocks_fit(rows, columns, devices, True, reserved)
 
 
 class DistributedBasis:
@@ -3079,15 +3106,30 @@ class SectorDeviceGroup:
         ``any`` is named: its estimate is new, and the rule had counted no
         room for it.  Like
         the rule it reads the size of the device and nothing of its state.
+        What another object keeps on ``helper`` (:func:`resident_bytes_of`,
+        the device XC evaluator on the device of the Hartree objects) is
+        counted with them.
         """
 
         cp, _ = require_cupy()
         count = len(self.devices)
+        reserved = self._resident_bytes().get(int(helper), 0)
         with cp.cuda.Device(helper):
-            wide = wider_slabs_fit(rows, states, count)
+            wide = wider_slabs_fit(rows, states, count, reserved)
             _free, total = cp.cuda.runtime.memGetInfo()
-        needed = shared_block_bytes(rows, states, count, wide) + condition_helper_bytes(states)
+        needed = shared_block_bytes(rows, states, count, wide) + condition_helper_bytes(states) + reserved
         return needed <= _auto_fraction() * total
+
+    def _resident_bytes(self) -> dict[int, int]:
+        """:func:`resident_bytes_of` the owner's operator."""
+
+        return resident_bytes_of(self._operator(self.owner))
+
+    def _reserved_bytes(self) -> int:
+        """The most that another object keeps on one device of this group (:func:`shared_basis_fits`)."""
+
+        resident = self._resident_bytes()
+        return max((resident.get(int(device), 0) for device in self.devices), default=0)
 
     def _condition_beside(self, helper: int):
         """The ``condition`` of :func:`rayleigh_ritz.solve_whitened_ritz_on_device` for an estimate on ``helper``.
@@ -3429,7 +3471,12 @@ class SectorDeviceGroup:
         edges = self.row_edges(rows)
         equal = equal_slabs_requested()
         if equal:
-            width = slab_columns(rows, states, len(self.devices), wider_slabs_fit(rows, states, len(self.devices)))
+            width = slab_columns(
+                rows,
+                states,
+                len(self.devices),
+                wider_slabs_fit(rows, states, len(self.devices), self._reserved_bytes()),
+            )
         else:
             width, work = self._slab_capacity(rows, states)
         rounds = projection_slabs(layout, width, equal, gram_multiple())
@@ -4231,7 +4278,8 @@ def shared_basis_devices(operator: Any, columns: int | None = None) -> tuple[int
     declines; a shared basis is always solved in its filtered form), or if
     its blocks do not fit the current (owner) device.  The owner-centred
     route is used then, which with ``PARSEC_CUPY_STREAMING_RITZ=auto`` keeps
-    a single array there.
+    a single array there.  The blocks are counted with what another object
+    keeps on a device of the group (:func:`resident_bytes_of`).
     """
 
     policy = distributed_state_policy()
@@ -4247,7 +4295,15 @@ def shared_basis_devices(operator: Any, columns: int | None = None) -> tuple[int
             columns is not None
             and not (
                 generalized_ritz_requested(int(operator.shape[0]), columns)
-                and shared_basis_fits(int(operator.shape[0]), columns, len(devices))
+                and shared_basis_fits(
+                    int(operator.shape[0]),
+                    columns,
+                    len(devices),
+                    reserved=max(
+                        (resident_bytes_of(operator).get(device, 0) for device in devices),
+                        default=0,
+                    ),
+                )
             )
         )
     ):
@@ -4556,6 +4612,7 @@ __all__ = [
     "slab_workspace",
     "block_rounds",
     "projection_slabs",
+    "resident_bytes_of",
     "shared_basis_devices",
     "shared_basis_fits",
     "shared_block_bytes",

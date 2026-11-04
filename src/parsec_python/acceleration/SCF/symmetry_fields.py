@@ -20,8 +20,9 @@ import os
 
 import numpy as np
 
+from parsec_python.Mixer import make_mixer
 from parsec_python.Mixer.anderson import safeguard_anderson_candidate
-from parsec_python.models import EnergyBreakdown, MixingSettings
+from parsec_python.models import CorrectedEnergyBreakdown, EnergyBreakdown, MixingSettings
 
 from ..Symmetry.axis_reflection import AxisReflectionReduction
 
@@ -231,8 +232,20 @@ class SymmetrySCFReducer:
             wedge_residual=residual_wedge,
         )
 
-    def mixer(self, settings: MixingSettings) -> "SymmetryAndersonMixer":
-        return SymmetryAndersonMixer(self, settings)
+    def mixer(
+        self, settings: MixingSettings
+    ) -> "SymmetryAndersonMixer | SymmetryWeightedMixer":
+        """The mixer of ``settings.method`` on one value per orbit.
+
+        Anderson keeps its buffered wedge implementation; the Broyden and
+        multisecant mixers of :func:`parsec_python.Mixer.make_mixer` run on
+        the wedge values with the orbit multiplicities as inner-product
+        weights, which reproduces their full-grid algebra.
+        """
+
+        if settings.method == "anderson":
+            return SymmetryAndersonMixer(self, settings)
+        return SymmetryWeightedMixer(self, make_mixer(settings, weights=self.weights))
 
     def total_energy(
         self,
@@ -248,6 +261,7 @@ class SymmetrySCFReducer:
         volume_element: float,
         alpha_z_energy: float = 0.0,
         band_energy_weight: float = 1.0,
+        hubbard_energy: float | None = None,
     ) -> EnergyBreakdown:
         """Evaluate the unchanged PARSEC energy using weighted wedge dots.
 
@@ -255,7 +269,9 @@ class SymmetrySCFReducer:
         ``total_energy``, which the SCF loop calls with the same arguments.
         It is zero for an isolated system.  ``band_energy_weight`` is the
         reference's per-k-point scale of the band energy; the wedge path is
-        Gamma-only, so it is 1.
+        Gamma-only, so it is 1.  ``hubbard_energy`` is the LDA+U term the
+        reference adds to the electronic energy (``None``: no LDA+U, the
+        plain breakdown as before).
         """
 
         eigenvalues = np.asarray(eigenvalues, dtype=np.float64)
@@ -298,6 +314,20 @@ class SymmetrySCFReducer:
             + 0.5 * hartree_integral
             + exchange_correlation_energy
         )
+        if hubbard_energy is not None:
+            # totnrg.f90: eele = eele + etot_plusu, as the reference's _breakdown.
+            electronic = float(electronic + float(hubbard_energy))
+            return CorrectedEnergyBreakdown(
+                eigenvalue=band_energy,
+                hartree=0.5 * hartree_integral,
+                integral_vxc_rho=vxc_integral,
+                exchange_correlation=float(exchange_correlation_energy),
+                electron_ion=electron_ion,
+                ion_ion=float(ion_ion_energy),
+                electronic=electronic,
+                total=electronic + float(ion_ion_energy),
+                hubbard=float(hubbard_energy),
+            )
         return EnergyBreakdown(
             eigenvalue=band_energy,
             hartree=0.5 * hartree_integral,
@@ -582,10 +612,48 @@ class SymmetryAndersonMixer:
         return self.reducer.expand_values(mixed)
 
 
+@dataclass
+class SymmetryWeightedMixer:
+    """A Broyden or multisecant mixer of :mod:`parsec_python.Mixer` on the wedge.
+
+    ``mixer`` was built with the orbit multiplicities as its inner-product
+    weights.  Its vectors are linear combinations of the input and output
+    fields with coefficients from inner products, and a weighted wedge
+    product of invariant fields is their full-grid product, so the mixed
+    wedge field is the orbit value of the full-grid result.  The vectors are
+    converted as :class:`SymmetryAndersonMixer` converts them: a
+    :class:`SymmetryScalarField` input gives one back, a full-grid input a
+    full-grid result.
+    """
+
+    reducer: SymmetrySCFReducer
+    mixer: object
+
+    def reset(self) -> None:
+        self.mixer.reset()
+
+    def mix(
+        self,
+        input_potential: np.ndarray,
+        output_potential: np.ndarray,
+        *,
+        iteration: int | None = None,
+    ) -> np.ndarray:
+        mixed = self.mixer.mix(
+            self.reducer.wedge_values(input_potential),
+            self.reducer.wedge_values(output_potential),
+            iteration=iteration,
+        )
+        if isinstance(input_potential, SymmetryScalarField):
+            return self.reducer.field(mixed)
+        return self.reducer.expand_values(mixed)
+
+
 __all__ = [
     "scf_buffers_requested",
     "SymmetryAndersonMixer",
     "SymmetryResidualMetrics",
     "SymmetrySCFReducer",
     "SymmetryScalarField",
+    "SymmetryWeightedMixer",
 ]

@@ -146,6 +146,7 @@ def local_forces(
             table=species.local_potential_derivative,
             use_spline=specification.use_spline,
             spline_padding_width=half_width,
+            direct=specification.old_interpolation,
         )
         ionic[index] = (potential_slope * density * inverse) @ relative
 

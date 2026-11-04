@@ -251,12 +251,14 @@ class PeriodicSpinPolarizedSOCSCFTests(unittest.TestCase):
         )
         self.assertGreater(result.magnetic_moment, 0.5)
 
-    def test_rejects_unequal_weights(self) -> None:
+    def test_rejects_weights_that_do_not_sum_to_one(self) -> None:
+        # Unequal weights are accepted (Fortran's irreducible wedge,
+        # test_space_group_kpoints); weights must still be normalized.
         with self.assertRaises(ValueError):
             run_self_consistent_soc_kpoints_spin_polarized(
                 self.system,
                 np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]]),
-                np.array([0.7, 0.3]),
+                np.array([0.7, 0.4]),
             )
 
     def test_requires_spin_polarized_settings(self) -> None:

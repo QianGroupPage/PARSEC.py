@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..models import EnergyBreakdown
+from ..models import CorrectedEnergyBreakdown, EnergyBreakdown
 
 
 def total_energy(
@@ -20,8 +20,13 @@ def total_energy(
     volume_element: float,
     alpha_z_energy: float = 0.0,
     band_energy_weight: float = 1.0,
+    hubbard_energy: float | None = None,
 ) -> EnergyBreakdown:
     """Evaluate the input-potential/new-density PARSEC energy expression.
+
+    ``hubbard_energy`` is the LDA+U term ``etot_plusu`` (Ry), which
+    ``totnrg.f90`` adds to the electronic energy; given, the result is a
+    :class:`~parsec_python.models.CorrectedEnergyBreakdown` holding it.
 
     ``band_energy_weight`` scales the ``2*dot(occ,eig)`` band-energy term
     only (everything else is a density-dotted integral and is already
@@ -61,7 +66,43 @@ def total_energy(
         + 0.5 * hartree_integral
         + exchange_correlation_energy
     )
-    return EnergyBreakdown(
+    return _breakdown(
+        band_energy,
+        hartree_integral,
+        vxc_integral,
+        exchange_correlation_energy,
+        electron_ion,
+        ion_ion_energy,
+        electronic,
+        hubbard_energy,
+    )
+
+
+def _breakdown(
+    band_energy: float,
+    hartree_integral: float,
+    vxc_integral: float,
+    exchange_correlation_energy: float,
+    electron_ion: float,
+    ion_ion_energy: float,
+    electronic: float,
+    hubbard_energy: float | None,
+) -> EnergyBreakdown:
+    """The breakdown, with ``eele = eele + etot_plusu`` where LDA+U is on."""
+
+    if hubbard_energy is None:
+        return EnergyBreakdown(
+            eigenvalue=band_energy,
+            hartree=0.5 * hartree_integral,
+            integral_vxc_rho=vxc_integral,
+            exchange_correlation=float(exchange_correlation_energy),
+            electron_ion=electron_ion,
+            ion_ion=float(ion_ion_energy),
+            electronic=electronic,
+            total=electronic + float(ion_ion_energy),
+        )
+    electronic = float(electronic + float(hubbard_energy))
+    return CorrectedEnergyBreakdown(
         eigenvalue=band_energy,
         hartree=0.5 * hartree_integral,
         integral_vxc_rho=vxc_integral,
@@ -70,6 +111,7 @@ def total_energy(
         ion_ion=float(ion_ion_energy),
         electronic=electronic,
         total=electronic + float(ion_ion_energy),
+        hubbard=float(hubbard_energy),
     )
 
 
@@ -158,8 +200,13 @@ def total_energy_spin_polarized(
     ion_ion_energy: float,
     volume_element: float,
     alpha_z_energy: float = 0.0,
+    hubbard_energy: float | None = None,
 ) -> EnergyBreakdown:
     """Spin-resolved analog of :func:`total_energy`.
+
+    ``hubbard_energy`` is the LDA+U term ``etot_plusu`` (Ry), added to the
+    electronic energy as in :func:`total_energy`; given, the result is a
+    :class:`~parsec_python.models.CorrectedEnergyBreakdown`.
 
     Each spin channel's orbitals hold at most one electron (no spin
     degeneracy), so unlike the unpolarized ``2*dot(occ, eig)`` band energy,
@@ -221,6 +268,17 @@ def total_energy_spin_polarized(
         + 0.5 * hartree_integral
         + exchange_correlation_energy
     )
+    if hubbard_energy is not None:
+        return _breakdown(
+            band_energy,
+            hartree_integral,
+            vxc_integral,
+            exchange_correlation_energy,
+            electron_ion,
+            ion_ion_energy,
+            electronic,
+            hubbard_energy,
+        )
     return EnergyBreakdown(
         eigenvalue=band_energy,
         hartree=0.5 * hartree_integral,
@@ -249,9 +307,14 @@ def total_energy_no_degeneracy_spin_polarized(
     volume_element: float,
     alpha_z_energy: float = 0.0,
     band_energy_weight: float = 1.0,
+    hubbard_energy: float | None = None,
 ) -> EnergyBreakdown:
     """:func:`total_energy_no_degeneracy` with :func:`total_energy_spin_polarized`'s
     spin-resolved Hxc bookkeeping.
+
+    ``hubbard_energy`` is the LDA+U term ``etot_plusu`` (Ry), added to the
+    electronic energy as in :func:`total_energy`; given, the result is a
+    :class:`~parsec_python.models.CorrectedEnergyBreakdown`.
 
     Used by self-consistent SOC combined with collinear spin polarization
     (``SCF.self_consistent_soc_spin_polarized``): the pooled spinor
@@ -307,6 +370,17 @@ def total_energy_no_degeneracy_spin_polarized(
         + 0.5 * hartree_integral
         + exchange_correlation_energy
     )
+    if hubbard_energy is not None:
+        return _breakdown(
+            band_energy,
+            hartree_integral,
+            vxc_integral,
+            exchange_correlation_energy,
+            electron_ion,
+            ion_ion_energy,
+            electronic,
+            hubbard_energy,
+        )
     return EnergyBreakdown(
         eigenvalue=band_energy,
         hartree=0.5 * hartree_integral,
@@ -416,14 +490,21 @@ def spin_total_energy(
     exchange_correlation_energy: float,
     ion_ion_energy: float,
     volume_element: float,
+    hubbard_energy: float | None = None,
+    alpha_z_energy: float | None = None,
 ) -> EnergyBreakdown:
     """Evaluate ``totnrg.f90`` for two spin channels, up first.
+
+    ``hubbard_energy`` is the LDA+U term, as in :func:`total_energy`.
+    ``alpha_z_energy`` is the alpha term of a periodic cell, added to the
+    band energy as :func:`total_energy` adds it (``None`` for a cluster).
 
     A state of a channel holds one electron, so the band energy is
     ``sum_s sum_i f_s,i e_s,i`` without the factor two of the unpolarized
     expression.  The Hartree and the electron-ion terms read the total
     density; the input-potential and the ``V_xc`` integrals are summed over
-    the channels, each with its own density and potential.
+    the channels, each with its own density and potential.  ``alpha_z_energy``
+    is the periodic cell's constant (zero for an isolated system).
     """
 
     ionic_potential = np.asarray(ionic_potential, dtype=float)
@@ -454,6 +535,8 @@ def spin_total_energy(
             * np.dot(density, np.asarray(input_potential) - ionic_potential)
         )
         vxc_integral += float(volume_element * np.dot(density, xc_potential))
+    if alpha_z_energy is not None:
+        band_energy += float(alpha_z_energy)
     total_density = np.asarray(densities[0], dtype=float) + np.asarray(
         densities[1], dtype=float
     )
@@ -465,15 +548,37 @@ def spin_total_energy(
         + 0.5 * hartree_integral
         + exchange_correlation_energy
     )
-    return EnergyBreakdown(
-        eigenvalue=band_energy,
-        hartree=0.5 * hartree_integral,
-        integral_vxc_rho=vxc_integral,
-        exchange_correlation=float(exchange_correlation_energy),
-        electron_ion=electron_ion,
-        ion_ion=float(ion_ion_energy),
-        electronic=electronic,
-        total=electronic + float(ion_ion_energy),
+    return _breakdown(
+        band_energy,
+        hartree_integral,
+        vxc_integral,
+        exchange_correlation_energy,
+        electron_ion,
+        ion_ion_energy,
+        electronic,
+        hubbard_energy,
+    )
+
+
+def with_dispersion(energies: EnergyBreakdown, dispersion_energy: float) -> CorrectedEnergyBreakdown:
+    """``energies`` with the TS dispersion energy added to the total.
+
+    This is the second ``totnrg.f90`` call of ``parsec.F90`` after
+    convergence (``vdw_flag``): ``etot = eele + enuc + evdw``; the electronic
+    energy and every other term are those of the converged iteration.
+    """
+
+    return CorrectedEnergyBreakdown(
+        eigenvalue=energies.eigenvalue,
+        hartree=energies.hartree,
+        integral_vxc_rho=energies.integral_vxc_rho,
+        exchange_correlation=energies.exchange_correlation,
+        electron_ion=energies.electron_ion,
+        ion_ion=energies.ion_ion,
+        electronic=energies.electronic,
+        total=float(energies.total + float(dispersion_energy)),
+        hubbard=float(getattr(energies, "hubbard", 0.0)),
+        dispersion=float(dispersion_energy),
     )
 
 
@@ -484,4 +589,5 @@ __all__ = [
     "total_energy_spin_polarized",
     "total_energy_no_degeneracy_spin_polarized",
     "total_energy_noncollinear",
+    "with_dispersion",
 ]

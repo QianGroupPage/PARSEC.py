@@ -103,6 +103,48 @@ class EwaldIonIonEnergyTests(unittest.TestCase):
         )
         self.assertAlmostEqual(energy, shifted_energy, places=8)
 
+    def test_atoms_across_a_cell_face_keep_every_pair_term(self) -> None:
+        # The terms decay with |r_a - r_b + T|, so pairs near opposite
+        # corners need translations longer than the cutoff.  Moving the
+        # crystal so that atoms cross the faces (and are translated back)
+        # changes nothing: the Si8 cube with the atom on the corner gave
+        # -67.20371845 Ry with |T| <= cutoff, Fortran's -67.20371829 with
+        # every term; moving the crystal by -0.1 bohr along the diagonal
+        # changed the former energy by 5e-8 Ry).
+        side = 10.26
+        fractions = np.array(
+            [
+                [0.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5], [0.5, 0.5, 0.0],
+                [0.25, 0.25, 0.25], [0.25, 0.75, 0.75], [0.75, 0.25, 0.75], [0.75, 0.75, 0.25],
+            ]
+        )
+        potentials = {"Si": SimpleNamespace(ionic_charge=4.0)}
+        cells = {
+            "cube": side * np.eye(3),
+            "monoclinic": np.array([[side, 0.0, 0.0], [1.3, side, 0.0], [0.0, 0.0, side]]),
+        }
+        for name, lattice_vectors in cells.items():
+            with self.subTest(cell=name):
+                positions = fractions @ lattice_vectors
+                atoms = [Atom("Si", position) for position in positions]
+                energy = ewald_ion_ion_energy(atoms, potentials, lattice_vectors)
+                for shift in ([0.31, 0.17, 0.05], [-0.1, -0.1, -0.1], [-1.0e-7, 2.0, 7.5]):
+                    moved = positions + np.asarray(shift)
+                    fractional = moved @ np.linalg.inv(lattice_vectors)
+                    wrapped = (fractional - np.floor(fractional)) @ lattice_vectors
+                    shifted = ewald_ion_ion_energy(
+                        [Atom("Si", position) for position in wrapped],
+                        potentials,
+                        lattice_vectors,
+                    )
+                    self.assertAlmostEqual(shifted, energy, delta=1.0e-11)
+        cube_energy = ewald_ion_ion_energy(
+            [Atom("Si", position) for position in fractions * side],
+            potentials,
+            cells["cube"],
+        )
+        self.assertAlmostEqual(cube_energy, -67.20371829, delta=5.0e-9)
+
 
 class EwaldLocalIonicPotentialTests(unittest.TestCase):
     _hydrogen_box = staticmethod(_hydrogen_box)
@@ -147,7 +189,10 @@ class EwaldLocalIonicPotentialTests(unittest.TestCase):
             periodic = ewald_local_ionic_potential(
                 grid, atoms, potentials, specifications, cell.lattice_vectors
             )
-            isolated = build_local_ionic_potential(grid, atoms, potentials, specifications)
+            # the periodic potential always uses the cubic spline of the table (a coarse one here), so the single
+            # copy it is compared with does too
+            spline_specifications = {"H": SpeciesPotential(_H_POTRE, 0, use_spline=True)}
+            isolated = build_local_ionic_potential(grid, atoms, potentials, spline_specifications)
             distance = np.linalg.norm(
                 grid.coordinates - np.asarray(atoms[0].position), axis=1
             )
@@ -156,6 +201,45 @@ class EwaldLocalIonicPotentialTests(unittest.TestCase):
             errors.append(float(np.max(np.abs(difference[near]))))
         self.assertLess(errors[-1], errors[0])
         self.assertLess(errors[-1], 0.05)
+
+    def test_atoms_across_a_cell_face_move_the_potential_with_them(self) -> None:
+        # Moving every atom by one grid step moves the potential by one grid
+        # step, also when atoms cross a face and are translated back into the
+        # cell: each atom keeps every image that reaches a grid point of the
+        # cell (|T| <= cutoff alone dropped some, up to 2e-6 Ry for Si8).
+        specifications = {"H": SpeciesPotential(_H_POTRE, 0)}
+        potentials = load_pseudopotentials(specifications, xc_functional="ca")
+        side = 6.0
+        cells = {
+            "cube": side * np.eye(3),
+            "fcc": 0.5 * 2.0 * side * np.array([[0.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 0.0]]) / np.sqrt(2.0),
+        }
+        fractions = np.array([[0.01, 0.02, 0.005], [0.985, 0.97, 0.99], [0.5, 0.97, 0.03]])
+        for name, lattice_vectors in cells.items():
+            with self.subTest(cell=name):
+                cell = PeriodicCell(lattice_vectors=lattice_vectors)
+                grid = build_periodic_grid(
+                    cell, PeriodicGridSettings(spacing=0.5, expansion_order=4, shift=(0.0, 0.0, 0.0))
+                )
+                n = tuple(int(value) for value in grid.points_per_axis)
+                step = lattice_vectors[0] / n[0]
+                positions = fractions @ lattice_vectors
+                moved = positions + step
+                fractional = moved @ np.linalg.inv(lattice_vectors)
+                wrapped = (fractional - np.floor(fractional)) @ lattice_vectors
+                values = [
+                    ewald_local_ionic_potential(
+                        grid,
+                        [Atom("H", position) for position in coordinates],
+                        potentials,
+                        specifications,
+                        lattice_vectors,
+                    ).reshape(n)
+                    for coordinates in (positions, wrapped)
+                ]
+                np.testing.assert_allclose(
+                    values[1], np.roll(values[0], 1, axis=0), rtol=0.0, atol=1.0e-11
+                )
 
 
 class EwaldAlphaZEnergyTests(unittest.TestCase):

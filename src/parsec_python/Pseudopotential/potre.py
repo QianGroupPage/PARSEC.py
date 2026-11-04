@@ -83,6 +83,30 @@ class ParsecPseudopotential:
     core_radius: float | None = None
     # ``Pseudopotential_Format`` the tables were read with.
     file_format: str = "martins_new"
+    # ``par_c`` of ``pseudo.f90``: the radial grid is
+    # ``r(i) = a*exp(b*(i-1)) - c``.  ``None`` is ``c = a``, the grid of every
+    # Martins file; an FHIPP file has ``c = 0`` (see :attr:`radial_offset`).
+    radial_parameter_c: float | None = None
+    # Tables replaced by the Fourier filter of ``fourier_f.f90``
+    # (:mod:`parsec_python.Pseudopotential.fourier_filter`): the normalized
+    # KB radial projector of each filtered channel and the atomic valence
+    # density.  Empty and ``None`` for an unfiltered potential.
+    filtered_projectors: dict[int, np.ndarray] = field(default_factory=dict)
+    filtered_valence_density: np.ndarray | None = None
+    # The local angular momentum a ``MARTINS_WANG`` file names (``loc``);
+    # ``None`` where the input chooses it (``Local_Component``).
+    local_channel: int | None = None
+
+    @property
+    def radial_offset(self) -> float:
+        """``c`` of the radial grid ``r(i) = a*exp(b*(i-1)) - c`` in bohr.
+
+        ``pseudo.f90`` differentiates radial tables with ``d/dr =
+        1/(b*(r + c)) d/di``.
+        """
+        if self.radial_parameter_c is None:
+            return self.radial_parameter_a
+        return self.radial_parameter_c
 
     @property
     def has_nonlinear_core_correction(self) -> bool:
@@ -129,12 +153,18 @@ class ParsecPseudopotential:
         *,
         use_spline: bool = False,
         spline_padding_width: int | None = None,
+        direct: bool = False,
     ) -> np.ndarray:
         """Evaluate the selected local potential with PARSEC's Coulomb tail.
 
         When ``use_spline`` is true, ``spline_padding_width`` must equal the
         real-space stencil half-width ``Expansion_Order/2``.  PARSEC uses it
         to extend the radial spline through the atomic origin.
+
+        Between the radial samples PARSEC interpolates ``r*V(r)`` linearly
+        and divides by ``r``.  ``direct`` interpolates ``V(r)`` itself, the
+        ``Old_Interpolation_Format`` branch of ``ionpot.f90:107-112``; the
+        spline takes precedence over both.
         """
         self.validate_local_channel(local_l)
         radius = np.asarray(distances, dtype=float)
@@ -156,6 +186,13 @@ class ParsecPseudopotential:
                     spline_padding_width,
                 )
                 result[inside] = spline(radius[inside])
+        elif direct:
+            # ``V_j + delr*(V_(j+1) - V_j)``; below the first sample the
+            # inserted origin carries the first value.
+            if np.any(inside):
+                result[inside] = np.interp(
+                    radius[inside], self.radii, values, left=values[0]
+                )
         else:
             near_zero = inside & (radius <= self.radii[0])
             result[near_zero] = values[0]
@@ -235,6 +272,13 @@ class ParsecPseudopotential:
         )
         if abs(denominator) < 1.0e-18:
             raise ValueError(f"nearly zero Kleinman-Bylander denominator for l={angular_momentum}")
+        if angular_momentum in self.filtered_projectors:
+            # ``fourier_f.f90`` replaces the normalized projector at every
+            # sample; the denominator and its sign stay those of the file.
+            return (
+                np.array(self.filtered_projectors[angular_momentum], dtype=float),
+                float(np.sign(denominator)),
+            )
         projector = delta_v * radial_wave / self.radii
         projector /= np.sqrt(abs(denominator))
         # PARSEC's 18th-order radial derivative setup (mor=9) replaces

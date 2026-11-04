@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import replace
 import os
 from pathlib import Path
 import sys
 import time
 from typing import Sequence
+
+import numpy as np
 
 from parsec_python.Eigensolvers.perturbative_soc import build_spin_orbit_projectors
 from parsec_python.Input import (
@@ -17,6 +20,7 @@ from parsec_python.Input import (
     summarize_translation,
 )
 from parsec_python.Output.parsec_output import domain_dry_run_lines
+from parsec_python.models import SinglePointInput
 from parsec_python.V_ion import load_pseudopotentials
 from parsec_python.MolecularDynamics.run import (
     restart_structure as dynamics_restart_structure,
@@ -30,14 +34,20 @@ from parsec_python.Relaxation.run import (
     symmetry_decision,
 )
 from parsec_python.cli import (
+    load_restart_start,
     main as reference_main,
+    output_file_conflict,
+    output_files_for,
     refinement_progress,
     relaxation_exit_code,
     save_result_archive,
     save_self_consistent_soc_result_archive,
+    start_output_files,
 )
+from parsec_python.Output.output_files import ReporterWithFiles, output_header_lines
 
 from .Output import AcceleratedTextReporter
+from .Output.post_scf import accelerated_band_structure, accelerated_dos, run_post_scf_outputs
 from .backends.selection import resolve_backend
 from .SCF.single_point import materialize_wavefunctions
 from .driver import (
@@ -400,7 +410,7 @@ def _resource_report(resources: Resources, system) -> list[str]:
 def _accelerated_self_consistent_soc_eligible(translation) -> bool:
     """Whether this input matches the one self-consistent-SOC shape the
     accelerated path implements: Gamma-point only, not combined with
-    collinear spin polarization.
+    collinear spin polarization, and without forces, relaxation or molecular dynamics.
 
     See :mod:`parsec_python.acceleration.SCF.self_consistent_soc`'s module
     docstring.  Combined with spin polarization or a periodic
@@ -410,11 +420,27 @@ def _accelerated_self_consistent_soc_eligible(translation) -> bool:
     """
 
     problem = translation.problem
+    # (the Fortran-derived routines, as before the merge: moving atoms are named by _reference_only_features instead)
+    fortran = getattr(getattr(translation, "routines", None), "fortran", False)
     return (
         problem.scf.self_consistent_spin_orbit
         and not problem.scf.spin_polarized
         and not problem.scf.noncollinear
         and problem.periodic_cell is None
+        and (fortran or not _asks_for_ionic_motion(translation))
+    )
+
+
+def _asks_for_ionic_motion(translation) -> bool:
+    """Whether the input asks for forces, a relaxation or molecular dynamics.
+
+    The CuPy spinor driver has no forces; the reference solver has them for every spin-orbit and non-collinear input.
+    """
+
+    return bool(
+        translation.relaxation is not None
+        or translation.molecular_dynamics is not None
+        or translation.compute_forces
     )
 
 
@@ -459,20 +485,32 @@ def _resolve_symmetry_mode(
 
 
 def _reference_only_features(
-    translation, *, accelerated_backend_selected: bool
+    translation,
+    *,
+    accelerated_backend_selected: bool,
+    device_eigensolver_selected: bool = False,
 ) -> list[str]:
     """Input features only the reference :mod:`parsec_python.cli` dispatches.
 
-    The accelerated driver runs a scalar Gamma-point SCF, spin-polarized
+    The accelerated driver runs a scalar Gamma-point SCF (forces, relaxation and molecular dynamics of isolated
+    systems only), spin-polarized
     where the system is isolated and carries no spin-orbit species, plus (when ``accelerated_backend_selected`` and the input is
     Gamma-point-only self-consistent SOC without spin polarization --
     :func:`_accelerated_self_consistent_soc_eligible`) the CuPy spinor
     Hamiltonian/eigensolver in
     :mod:`parsec_python.acceleration.SCF.self_consistent_soc`.  Without this
     check every other SOC/spin/k-point flag would be silently ignored.
+    ``device_eigensolver_selected``: the backend resolves to the CuPy
+    eigensolvers, which run ``Eigensolver: arpack`` on the device
+    (:mod:`parsec_python.acceleration.Eigensolvers.arpack`).
     """
 
     problem = translation.problem
+    # The routines of the run (parsec_python.Input.routines): the routes of
+    # the Fortran parity round for the Fortran-derived ones; Andrew Grieder's
+    # accelerated path also takes the Gamma point named as a one-point grid
+    # and his grids of every cell shape.
+    fortran = getattr(getattr(translation, "routines", None), "fortran", False)
     features = []
     if problem.scf.noncollinear:
         features.append("non-collinear magnetism (Non_Collinear_magnetism)")
@@ -488,7 +526,12 @@ def _reference_only_features(
                 "(SO_from_scratch with a periodic Boundary_Conditions)"
             )
         elif not accelerated_backend_selected:
-            features.append("self-consistent spin-orbit coupling (SO_from_scratch)")
+            # (the Fortran-derived routines name the moving atoms below, as before the merge)
+            features.append(
+                "forces, relaxation or molecular dynamics with self-consistent spin-orbit coupling (SO_from_scratch)"
+                if _asks_for_ionic_motion(translation) and not fortran
+                else "self-consistent spin-orbit coupling (SO_from_scratch)"
+            )
         # else: Gamma-point-only self-consistent SOC on a resolved CuPy
         # backend -- accelerated, not reference-only.
     elif problem.scf.spin_polarized and (
@@ -501,14 +544,296 @@ def _reference_only_features(
         features.append(
             "spin polarization of a periodic system or of spin-orbit species"
         )
-    if problem.has_kpoint_sampling and not (
-        (problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear)
-        and problem.periodic_cell is not None
+    if (
+        problem.has_kpoint_sampling
+        and (fortran or not _gamma_point_only(problem))
+        and not (
+            (problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear)
+            and problem.periodic_cell is not None
+        )
     ):
         features.append("k-point sampling (Monkhorst-Pack or explicit list)")
-    if problem.bands is not None:
+    if problem.bands is not None and not accelerated_band_structure(translation):
+        # After a Gamma-point SCF of a scalar cell the bands run after the
+        # accelerated SCF (acceleration/Output/post_scf.py).
         features.append("band structure along a k-path (bandstruc)")
+    if fortran and (problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear) and (
+        getattr(translation, "compute_forces", False)
+        or getattr(translation, "relaxation", None) is not None
+        or getattr(translation, "molecular_dynamics", None) is not None
+    ):
+        # The spin-orbit forces (Forces.spin_orbit_fortran) and the spinor ionic
+        # loop exist on the reference path only.  (Andrew Grieder's routines name
+        # them above and route them with _accelerated_self_consistent_soc_eligible.)
+        features.append(
+            "forces, relaxation or molecular dynamics with spin-orbit coupling "
+            "or non-collinear magnetism"
+        )
+    if (
+        problem.periodic_cell is not None
+        and (
+            getattr(translation, "compute_forces", False)
+            or getattr(translation, "relaxation", None) is not None
+            or getattr(translation, "molecular_dynamics", None) is not None
+        )
+        and getattr(translation, "energy_refinement", None) is not None
+    ):
+        # The accelerated Gamma-point path of a periodic cell has its forces
+        # and moved atoms (Forces/periodic_device.py); the energy refinement
+        # of the reference path follows the forces there (k-points, spin,
+        # wires and slabs, the general grid are listed above and below).
+        features.append(
+            "forces, relaxation or molecular dynamics of a periodic cell "
+            "together with Energy_Refinement"
+        )
+    from .SCF.periodic_routes import moving_cell_options_reference_only
+
+    features.extend(moving_cell_options_reference_only(translation))
+    # The seven field loops (acceleration.SCF.polarizability), the potential
+    # of point charges and the symmetrized density (acceleration.SCF.
+    # density_symmetry) run on the accelerated SCF of a cluster; the
+    # reference solver keeps those of a periodic cell (its space group).
+    if getattr(problem.scf, "symmetrize_density", False) and problem.periodic_cell is not None:
+        features.append(
+            "charge-density symmetrization of a periodic cell (Symmetrize_Charge_Density)"
+        )
+    if problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear:
+        # The accelerated spinor loop (SCF.self_consistent_soc) has none of them.
+        output_files = getattr(translation, "output_files", None)
+        for present, name in (
+            (getattr(translation, "polarizability_field", None) is not None, "Polarizability"),
+            (bool(getattr(problem, "point_charges", ())), "Add_Point_Charges"),
+            (getattr(problem.scf, "symmetrize_density", False), "Symmetrize_Charge_Density"),
+            (
+                output_files is not None
+                and output_files.output_data
+                and output_files.intermediate_density,
+                "Save_Intermediate_Charge_Density",
+            ),
+            (
+                getattr(problem.grid, "domain_shape", "sphere") in ("ellipsoid", "cylinder"),
+                "Cluster_Domain_Shape ellipsoid or cylinder",
+            ),
+        ):
+            if present:
+                features.append(f"{name} with spin-orbit coupling or non-collinear magnetism")
+    hubbard_species = [
+        specification
+        for specification in problem.pseudopotentials.values()
+        if getattr(specification, "has_hubbard", False)
+    ]
+    # The accelerated driver holds LDA+U (J = 0) in its device Hamiltonians
+    # and forms the TS sums on a device, for clusters, unpolarized and
+    # spin-polarized (acceleration.Hamiltonian.hubbard_device,
+    # acceleration.Energy.dispersion_device).  The rest stays here by name.
+    # A bulk cell at the Gamma point takes the accelerated driver too; its
+    # k-point, spin, wire/slab and force runs go to the reference solver by
+    # their own entries, whose k-point drivers apply the LDA+U term and form
+    # the TS sums on their device workers.
+    if any(float(item.hubbard_j) != 0.0 for item in hubbard_species):
+        # PARSEC's J term is not symmetric; the device eigensolvers apply
+        # symmetric separable terms only.
+        features.append("LDA+U with ldaplusu_j != 0")
+    if (
+        hubbard_species
+        and problem.periodic_cell is not None
+        and getattr(problem.grid, "periodicity", 3) in (1, 2)
+    ):
+        # Validated on the reference wire/slab loop only (the replicas along
+        # the periodic vectors of upot.F90), whatever route the wire or slab
+        # itself takes.
+        features.append("LDA+U of a wire or slab (ldaplusu_u)")
+    if getattr(problem.scf, "van_der_waals", False):
+        if problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear:
+            # The accelerated spinor loop has no TS correction.
+            features.append(
+                "the Tkatchenko-Scheffler correction with spin-orbit coupling or "
+                "non-collinear magnetism (Van_Der_Waals)"
+            )
+    # Eigensolvers of the reference solver only.  The accelerated SCF loop
+    # is the shared one, so Convergence_Criterion_Approach, Dynamic_Diag_Tol
+    # (the tolerance of each iteration reaches the device CHEBDAV first
+    # solves and ARPACK) and Fix_Number_Eigenvalues (no buffer; symmetry
+    # sectors keep their counts) run there; Eigensolver: none is the setup
+    # of the accelerated driver.  ARPACK runs on the device where the CuPy
+    # eigensolvers are selected, but not with spin-orbit coupling (the
+    # spinor eigensolver is CHEBFF).  DIAGLA is the reference solver's.
+    eigensolver = problem.eigensolver
+    if eigensolver.method == "arpack" and (
+        not device_eigensolver_selected
+        or problem.scf.self_consistent_spin_orbit
+        or problem.scf.noncollinear
+        # The device ARPACK is validated on clusters; a periodic cell keeps
+        # the reference ARPACK (on the device operator of the k-point workers).
+        or problem.periodic_cell is not None
+    ):
+        features.append("the ARPACK eigensolver (Eigensolver: arpack)")
+    elif eigensolver.method == "diagla":
+        features.append("the DIAGLA eigensolver (Eigensolver: diagla)")
+    # Pseudopotential set-up: the double grid (acceleration/V_ion/double_grid.py),
+    # Old_Interpolation_Format (the native and CuPy local builders and the
+    # device local forces) and, for a periodic cell, the Fourier filters and
+    # the double grid of the readable periodic preparation run accelerated.
+    from .V_ion.setup_options import reference_only_setup_features
+
+    features.extend(reference_only_setup_features(problem))
+    output_files = getattr(translation, "output_files", None)
+    if (
+        output_files is not None
+        and output_files.output_data
+        and output_files.intermediate_density
+        and problem.periodic_cell is not None
+    ):
+        # The accelerated SCF of a cluster hands its fields to parsec.dat
+        # (acceleration.Output.iteration_fields).
+        features.append(
+            "parsec.dat after every SCF iteration of a periodic cell "
+            "(Save_Intermediate_Charge_Density)"
+        )
+    if (
+        output_files is not None
+        and output_files.output_data
+        and output_files.intermediate_eigenvalues
+        and problem.has_kpoint_sampling
+    ):
+        # The k-point levels of every iteration come from the reference
+        # drivers' iteration fields.
+        features.append(
+            "the k-point levels of every SCF iteration in eigen.dat "
+            "(Save_Intermediate_Eigenvalues)"
+        )
+    if getattr(translation, "restart_run", False) and (
+        getattr(problem.scf, "self_consistent_spin_orbit", False)
+        or getattr(problem.scf, "noncollinear", False)
+    ):
+        # The spin-orbit loops take the stored potentials on the reference path.
+        features.append("Restart_Run of a spin-orbit calculation")
+    if getattr(translation, "restart_from_wfndat", False) and getattr(
+        translation, "restart_run", False
+    ):
+        # A cluster seeds the full-grid eigensolver with the stored states
+        # (acceleration.SCF.restart); sectors take no stored subspace.
+        from .driver import single_sector_setting
+
+        if problem.periodic_cell is not None:
+            features.append(
+                "a restart of a periodic cell from the legacy wfn.dat (Restart_From_Wfndat)"
+            )
+        elif single_sector_setting() == "on":
+            features.append(
+                "a restart from the legacy wfn.dat (Restart_From_Wfndat) with "
+                "PARSEC_CUPY_SINGLE_SECTOR=on, whose one sector takes no stored subspace"
+            )
+    # Post-processing of the reference CLI (parsec_python.SCF.nscf,
+    # parsec_python.Output.dos) and its reciprocal-space Hartree solve.
+    if getattr(translation, "nscf", None) is not None:
+        features.append("a non-self-consistent run (nscf_kpoints)")
+    if getattr(translation, "dos", None) is not None and not accelerated_dos(translation):
+        # The DOS of a cluster follows the accelerated SCF (Output/post_scf.py).
+        features.append("the density of states (Create_DOS)")
+    # Calc_Hartree_G, Periodic_Local_Potential: g_space and Zero_Average_Vxc of a
+    # Gamma-point 3-D cell run on the accelerated driver: the reference periodic
+    # preparation (G-space potential, alpha term), the Hartree solve of
+    # Hartree.pbc (on the device: acceleration/Hartree/periodic_device.py) and the
+    # shifted XC potential (V_xc/device_xc.py::ZeroAverageXC); with k-points,
+    # spin or forces the entries above route them, and with --mpi this:
+    from .SCF.periodic_routes import cell_options_reference_only
+
+    features.extend(cell_options_reference_only(translation))
+    if getattr(translation, "gw", None) is not None:
+        # parsec_python.Output.berkeleygw after the reference SCF or NSCF run.
+        features.append("the BerkeleyGW files WFN, RHO and VXC (Output_GW)")
+    if problem.periodic_cell is not None and getattr(problem.grid, "periodicity", 3) in (1, 2):
+        # Boundary_Conditions wire or slab (parsec_python.SCF.wire_slab): a
+        # Gamma-point single point runs on the accelerated driver (the reference
+        # preparation and Hartree plan, the device Hartree solve); k-points,
+        # spin and forces are routed above.
+        from .SCF.periodic_routes import wire_slab_reference_only
+
+        features.extend(wire_slab_reference_only(translation))
+    elif problem.periodic_cell is not None and fortran:
+        from parsec_python.Grid.pbc import uses_general_periodic_grid
+
+        if uses_general_periodic_grid(problem.periodic_cell, problem.grid):
+            features.append(
+                "a periodic cell on Fortran's general grid (non-orthogonal "
+                "lattice vectors, or sides without one common grid spacing)"
+            )
     return features
+
+
+def _mpi_unsupported_features(translation) -> list[str]:
+    """Features of the reference drivers that an MPI run (``--mpi``) cannot carry.
+
+    The MPI-distributed k-point solver (:mod:`.SCF.kpoint_mpi`) holds a block of
+    grid rows of every orbital on each rank and gathers no orbitals, and it runs
+    the device eigensolver (CHEBFF/CHEBDAV with SUBSPACE steps) only.  What needs
+    the whole orbitals or a host eigensolver is refused by name instead of being
+    computed from partial rows or an empty block.
+    """
+
+    problem = translation.problem
+    features = []
+    if any(
+        getattr(specification, "has_hubbard", False)
+        for specification in problem.pseudopotentials.values()
+    ):
+        features.append(
+            "LDA+U (its occupation matrices need the orbitals on every grid point)"
+        )
+    method = problem.eigensolver.method
+    if method in ("arpack", "diagla"):
+        features.append(
+            f"Eigensolver: {method} (a host eigensolver of the whole basis)"
+        )
+    uses_kpoint_solver = (
+        problem.periodic_cell is not None
+        or problem.has_kpoint_sampling
+        or problem.scf.noncollinear
+    )
+    if uses_kpoint_solver and (
+        getattr(translation, "compute_forces", False)
+        or getattr(translation, "relaxation", None) is not None
+        or getattr(translation, "molecular_dynamics", None) is not None
+    ):
+        features.append(
+            "forces, relaxation or molecular dynamics of a periodic or non-collinear "
+            "run (they read the orbitals, which the distributed solver does not gather)"
+        )
+    dos = getattr(translation, "dos", None)
+    if dos is not None and getattr(dos, "ylm_l", -1) >= 0:
+        features.append("the Ylm-projected density of states (YLM_DOS_L)")
+    if getattr(translation, "gw", None) is not None:
+        features.append("the BerkeleyGW files (Output_GW)")
+    return features
+
+
+def _device_eigensolver_selected(arguments: argparse.Namespace, translation) -> bool:
+    """Whether the backend of this run resolves to the CuPy eigensolvers.
+
+    Asked only for an input whose eigensolver the device runs only there
+    (``Eigensolver: arpack``); ``False`` for every other input.
+    """
+
+    if translation.problem.eigensolver.method != "arpack":
+        return False
+    try:
+        selection = resolve_backend(arguments.backend, translation.problem)
+    except (BackendUnavailableError, NotImplementedError, ValueError):
+        return False
+    return selection.selected == "cupy"
+
+
+def _gamma_point_only(problem: SinglePointInput) -> bool:
+    """Whether the k-point sampling of the input is the Gamma point alone (``mp 1 1 1``, or a list of one k = 0).
+
+    That is the Gamma-point calculation of the accelerated path, not a k-point sampling.
+    """
+
+    from parsec_python.Grid import kpoint_sampling
+
+    sampling = kpoint_sampling(problem)
+    return sampling is not None and len(sampling[0]) == 1 and not np.any(sampling[0])
 
 
 def _reference_argv(arguments: argparse.Namespace) -> list[str]:
@@ -590,9 +915,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     # The request reaches the solver through its variables, for this
     # calculation only: a process that runs several keeps none of them.
-    with resources.applied():
+    with resources.applied(), ExitStack() as scope:
         try:
-            status = _run(arguments, resources)
+            status = _run(arguments, resources, scope)
         except BaseException:
             _abort_mpi(1)
             raise
@@ -613,7 +938,9 @@ def _abort_mpi(status: int) -> None:
         context.comm.Abort(int(status))
 
 
-def _run(arguments: argparse.Namespace, resources: Resources) -> int:
+def _run(
+    arguments: argparse.Namespace, resources: Resources, scope: ExitStack | None = None
+) -> int:
     if arguments.profile_repeats < 1:
         print("Input error: --profile-repeats must be positive", file=sys.stderr)
         return 2
@@ -711,8 +1038,17 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
             selection_probe is not None and selection_probe.selected == "cupy"
         )
 
+    if scope is not None:
+        # Forces, relaxation and dynamics of a periodic cell: its ionic fields
+        # and their forces on the device (Forces/periodic_device.py), on the
+        # path below and on the reference solver alike.
+        from .Forces.periodic_device import periodic_ionic_scope
+
+        scope.enter_context(periodic_ionic_scope(translation))
     unsupported = _reference_only_features(
-        translation, accelerated_backend_selected=accelerated_self_consistent_soc
+        translation,
+        accelerated_backend_selected=accelerated_self_consistent_soc,
+        device_eigensolver_selected=_device_eigensolver_selected(arguments, translation),
     )
     if unsupported:
         features = ", ".join(unsupported)
@@ -744,23 +1080,49 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                 file=sys.stderr,
             )
             return 2
+        from .Parallel import mpi
+
+        blocked = _mpi_unsupported_features(translation) if mpi.requested() else []
+        if blocked:
+            print(
+                "Input error: "
+                + ", ".join(blocked)
+                + " is not implemented with the MPI-distributed k-point solver (--mpi); "
+                "run without --mpi",
+                file=sys.stderr,
+            )
+            return 2
         print(
             f"NOTE: {features} is not implemented on the accelerated path; "
-            "running the reference parsec_python.cli solver instead",
+            "running the reference parsec_python.cli solver instead"
+            + (
+                " (its k-point eigensolvers, and the force sums of a periodic cell, use the GPUs when CuPy and a device "
+                "are available; the output names the device)"
+                if reference_uses_gpu and resources.device != "cpu"
+                else ""
+            ),
             file=sys.stderr,
         )
         return reference_main(_reference_argv(arguments))
+    if translation.problem.periodic_cell is not None:
+        from .Parallel import mpi
 
-    if accelerated_self_consistent_soc and (
-        translation.relaxation is not None
-        or translation.molecular_dynamics is not None
-        or translation.compute_forces
-        or getattr(translation, "energy_refinement", None) is not None
-    ):
+        # The forces of a periodic cell read the orbitals of one process:
+        # refused under --mpi on this path as on the reference solver.
+        blocked = _mpi_unsupported_features(translation) if mpi.requested() else []
+        if blocked:
+            print(
+                "Input error: "
+                + ", ".join(blocked)
+                + " is not implemented with the MPI-distributed k-point solver (--mpi); "
+                "run without --mpi",
+                file=sys.stderr,
+            )
+            return 2
+
+    if accelerated_self_consistent_soc and getattr(translation, "energy_refinement", None) is not None:
         print(
-            "Input error: Minimization, Molecular_Dynamics, Skip_Force: false and "
-            "Energy_Refinement are not implemented together with self-consistent "
-            "spin-orbit coupling",
+            "Input error: Energy_Refinement is not implemented together with self-consistent spin-orbit coupling",
             file=sys.stderr,
         )
         return 2
@@ -775,6 +1137,30 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
             print(f"Input error: {error}", file=sys.stderr)
             return 2
     symmetrize_forces = symmetrize_forces and symmetry_mode != "off"
+    if (
+        getattr(translation, "polarizability_field", None) is not None
+        and getattr(translation, "energy_refinement", None) is not None
+    ):
+        print(
+            "Input error: Energy_Refinement is not implemented together with "
+            "Polarizability",
+            file=sys.stderr,
+        )
+        return 2
+    # The symmetry the solver is prepared with; the report keeps the mode above.
+    solver_symmetry_mode = symmetry_mode
+    if translation.restart_run and getattr(translation, "restart_from_wfndat", False):
+        # The orbitals of wfn.dat are full-grid states of one representation:
+        # they seed the eigensolver of the full grid (SCF.restart).  The
+        # forces keep the symmetrization of the input.
+        if arguments.symmetry == "on":
+            print(
+                "Input error: --symmetry on cannot be used with Restart_From_Wfndat: "
+                "the stored orbitals seed the eigensolver of the full grid",
+                file=sys.stderr,
+            )
+            return 2
+        solver_symmetry_mode = "off"
 
     summary = summarize_translation(translation)
     if arguments.dry_run:
@@ -836,8 +1222,9 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
 
     input_directory = translation.source.parent
     symmetry_cache_directory = _symmetry_cache_directory(arguments)
+    # Output_File_Name names the report as in PARSEC; --log overrules it.
     log_path = _resolve_output(
-        arguments.log, input_directory, "parsec.out"
+        arguments.log, input_directory, translation.output_files.output_file_name
     )
     archive_path = _npz_path(
         _resolve_output(
@@ -863,6 +1250,31 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
         if archive_path == log_path:
             print("Input error: --log and --output resolve to the same path", file=sys.stderr)
             return 2
+    # parsec.dat, eigen.dat and the cube files of Output_Grid_Data, beside
+    # the input as PARSEC writes them in its run directory.
+    files = output_files_for(translation, input_directory)
+    taken = {*protected_paths, log_path}
+    if not arguments.no_archive:
+        taken.add(archive_path)
+    conflict = output_file_conflict(files, taken)
+    if conflict is not None:
+        print(
+            f"Input error: refusing to overwrite {conflict}: it is an input, the log "
+            "or the archive of this run",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        translation.restart_run
+        and not getattr(translation, "restart_from_wfndat", False)
+        and not (input_directory / "parsec.dat").is_file()
+    ):
+        print(
+            f"Input error: Restart_Run: {input_directory / 'parsec.dat'} not found "
+            "(PARSEC error 371)",
+            file=sys.stderr,
+        )
+        return 2
 
     # The default rule of the sphere ran in the parser, before this clock:
     # its seconds belong to the calculation.  None for an input with a radius.
@@ -877,6 +1289,17 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                 symmetry_mode=symmetry_mode,
             )
             reporter.header()
+            # What usrinputfile.F90 prints about the output keywords the input gives.
+            for line in output_header_lines(translation.output_files):
+                log.write(line)
+            # usrinputfile.F90: the CAUTION line of Calc_Hartree_G (nscf_kpoints,
+            # Create_DOS and Output_GW are routed to the reference CLI).
+            from parsec_python.Output.post_processing_output import (
+                post_processing_header_lines,
+            )
+
+            for line in post_processing_header_lines(translation):
+                log.write(line)
             for warning in translation.warnings:
                 log.write(f"WARNING: {warning}")
             if symmetry_note is not None:
@@ -890,7 +1313,7 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
             system = prepare_single_point(
                 translation.problem,
                 backend=arguments.backend,
-                symmetry=symmetry_mode,
+                symmetry=solver_symmetry_mode,
                 symmetry_cache_directory=symmetry_cache_directory,
             )
             # Wavefunctions are much larger than all scalar observables and
@@ -910,9 +1333,43 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                 translation.relaxation is not None
                 or translation.molecular_dynamics is not None
             )
-            system.materialize_final_wavefunctions = wavefunctions_wanted and not moving
             reporter.setup(system)
             log.write("\n".join(_resource_report(resources, system)))
+            if translation.problem.eigensolver.method == "none":
+                # Eigensolver: none is PARSEC's TEST mode (parsec.F90:1085-1089):
+                # the setup of the accelerated driver is reported and the run
+                # ends without an SCF, as on the reference path.
+                reporter.reference.test_mode_complete()
+                log.write(
+                    " Total accelerated Python wall time [sec] : "
+                    f"{time.perf_counter() - started:11.2f}"
+                )
+                log.write(f"Text log: {log_path}")
+                return 0
+            restart = load_restart_start(translation, system, log, input_directory)
+            if restart is not None:
+                # wfn.dat: the stored orbitals go into the eigensolver of the run.
+                from .SCF.restart import accelerated_restart_start
+
+                restart = accelerated_restart_start(system, restart)
+            # The wavefunctions of parsec.dat are brought to the host like
+            # those of the archive.
+            start_output_files(files, translation, system, log)
+            wavefunctions_wanted = wavefunctions_wanted or files.selection_has_states
+            system.materialize_final_wavefunctions = wavefunctions_wanted and not moving
+            reporter = ReporterWithFiles(reporter, files)
+            # Save_Intermediate_Charge_Density: parsec.dat after every SCF
+            # iteration of every loop, with host fields.
+            from .Output.iteration_fields import iteration_files_callback
+
+            iteration_state_callback = iteration_files_callback(
+                files, system, translation.problem
+            )
+            scf_keywords = (
+                {}
+                if iteration_state_callback is None
+                else {"iteration_state_callback": iteration_state_callback}
+            )
             if arguments.profile_operator:
                 component_times = profile_hamiltonian_components(
                     system,
@@ -936,12 +1393,16 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                 result = run_self_consistent_soc(
                     system,
                     soc_projectors,
-                    callback=reporter.reference.iteration_self_consistent_soc,
+                    callback=lambda step: (
+                        reporter.reference.iteration_self_consistent_soc(step),
+                        files.iteration(step),
+                    ),
                 )
                 scf_completed = time.perf_counter()
                 reporter.reference.finish_self_consistent_soc(
                     result, scf_completed - scf_started
                 )
+                files.scf_finished(result)
                 reporting_completed = time.perf_counter()
                 log.write(
                     f" Pre-SCF setup/reporting wall time [sec] : "
@@ -965,19 +1426,63 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                         ),
                     )
                     log.write(f"Result archive: {saved}")
+                files.finish(result, system.grid, translation.problem)
                 log.write(f"Text log: {log_path}")
                 return 0 if result.converged else 3
 
 
+            def ionic_backend_of(extrapolation: str = "none"):
+                backend = ionic_backend(extrapolation)
+                if scf_keywords:
+                    from functools import partial
+
+                    backend = replace(
+                        backend, run_scf=partial(backend.run_scf, **scf_keywords)
+                    )
+                if translation.problem.periodic_cell is not None:
+                    from .Forces.periodic_device import with_periodic_operations
+
+                    backend = with_periodic_operations(backend)
+                if restart is not None:
+                    from parsec_python.SCF.restart import with_first_warm_start
+
+                    backend = with_first_warm_start(backend, restart)
+                return backend
+
             forces = None
             outcome = None
             dynamics = None
+            polarization = None
             check_seconds = 0.0
-            if translation.relaxation is not None:
+            if getattr(translation, "polarizability_field", None) is not None:
+                # The seven field loops of polar.f90 on the accelerated SCF,
+                # reported and written to polar.dat as the reference CLI does.
+                from parsec_python.cli import _run_polarizability
+
+                from .SCF.polarizability import (
+                    field_forces,
+                    field_runner,
+                    next_field_warm_start,
+                )
+
+                polarization, result, forces = _run_polarizability(
+                    system.reference,
+                    translation,
+                    reporter,
+                    log,
+                    input_directory,
+                    scf_runner=field_runner(
+                        system, iteration_state_callback=iteration_state_callback
+                    ),
+                    warm_start_builder=next_field_warm_start(system),
+                    compute_forces=field_forces(system),
+                )
+                scf_completed = time.perf_counter()
+            elif translation.relaxation is not None:
                 outcome = run_recorded_relaxation(
                     translation,
                     system,
-                    ionic_backend(translation.potential_extrapolation),
+                    ionic_backend_of(translation.potential_extrapolation),
                     reporter,
                     log.write,
                     directory=input_directory,
@@ -993,7 +1498,7 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                 dynamics = run_recorded_molecular_dynamics(
                     translation,
                     system,
-                    ionic_backend(translation.potential_extrapolation),
+                    ionic_backend_of(translation.potential_extrapolation),
                     reporter,
                     log.write,
                     directory=input_directory,
@@ -1005,11 +1510,16 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                 scf_completed = time.perf_counter()
             elif translation.compute_forces:
                 result, forces = run_single_point_with_forces(
-                    system, ionic_backend(), reporter, symmetrize=symmetrize_forces
+                    system, ionic_backend_of(), reporter, symmetrize=symmetrize_forces
                 )
                 scf_completed = time.perf_counter()
             else:
-                result = run_scf(system, callback=reporter.iteration)
+                result = run_scf(
+                    system,
+                    callback=reporter.iteration,
+                    **({} if restart is None else {"warm_start": restart}),
+                    **scf_keywords,
+                )
                 scf_completed = time.perf_counter()
                 # run_scf makes the optional check of the Hartree boundary
                 # before it returns: it is finalization, not SCF.
@@ -1072,11 +1582,15 @@ def _run(arguments: argparse.Namespace, resources: Resources) -> int:
                             ("relaxation", outcome),
                             ("dynamics", dynamics),
                             ("refinement", refinement),
+                            ("polarizability", polarization),
                         )
                         if value is not None
                     },
                 )
                 log.write(f"Result archive: {saved}")
+            files.finish(result, system.grid, translation.problem)
+            # bandstruc of a Gamma-point cell, Create_DOS of a cluster.
+            run_post_scf_outputs(system, translation, result, reporter, log.write, input_directory)
             log.write(f"Text log: {log_path}")
             if dynamics is not None:
                 return 3 if dynamics.scf_failed else 0

@@ -38,6 +38,8 @@ class _SCFEigvalResult:
     solver_path: str
     restarted: bool
     restart_reason: str | None
+    # ``(nec, maxmvs)`` of an ARPACK solve (eigval.F90's report), else None.
+    iterative_counts: tuple[int, int] | None = None
 
 
 class CuPySCFEigensolver:
@@ -116,6 +118,7 @@ class CuPySCFEigensolver:
             solver_path=result.solver_path,
             restarted=result.restarted,
             restart_reason=result.restart_reason,
+            iterative_counts=getattr(result, "iterative_counts", None),
         )
 
 

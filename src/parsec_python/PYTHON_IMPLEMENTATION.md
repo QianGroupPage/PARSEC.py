@@ -397,6 +397,16 @@ species must give `number_of_channels` (`Potential_Num`),
 `electrons_per_orbital` (the `Electron_Per_Orbital` block, whose sum is the
 ionic charge) and `core_cutoff_radius` (`Core_Cutoff_Radius`, the radius of
 its nonlocal projectors). Old and new files can be mixed in one input.
+`"martins_wang"` (`<Symbol>_POTRW.DAT`, `Pseudopotential/potrw.py`) needs
+only `core_cutoff_radius` and the local channel its file names; `"fhipp"`
+(`<Symbol>_FHIPP.DAT`, `Pseudopotential/fhipp.py`, radial grid with `c = 0`)
+needs the three values of an old file and reads its core density with
+`nonlinear_core_correction=True`. `old_interpolation`
+(`Old_Interpolation_Format`), `GridSettings.double_grid_order`
+(`Double_Grid_Order`, `V_ion/double_grid.py`) and the
+`fourier_filter_*` fields (`Alpha_Filter`, `Beta1_Filter`, `Core_Filter` of a
+periodic system, `Pseudopotential/fourier_filter.py`) are the other
+pseudopotential options of PARSEC; they run on the reference solver.
 
 `SCFSettings.fixed_occupations` holds one occupation per state in ascending
 order of energy; no Fermi level is then searched. The input translator fills
@@ -479,22 +489,22 @@ than substituted.
 
 ### Currently unsupported
 
-- periodic, slab, and wire boundary conditions
+- slab and wire boundary conditions on the accelerated path (the reference
+  solver runs them, `SCF/wire_slab.py`)
 - point-group reduction and MPI distribution
 - ellipsoid and cylinder masks in the Python builder
 - spin-orbit channels and non-collinear magnetism
-- spin polarization of periodic cells, and the Perdew-Wang LSDA (`pl`) that
-  PARSEC uses for a spin-polarized run without `Correlation_Type`
+- spin polarization of periodic cells
 - meta-GGA and self-consistent hybrid functionals
-- Ono-Hirose `Double_grid_order > 1`
 - forces, stress, geometry optimization, and molecular dynamics
 - DFT+U, external fields, k-points, and complex orbitals
-- Martins-Wang and FHI pseudopotential formats
 - PARSEC binary restart/checkpoint compatibility
 
 Sphere and box domains are implemented. POTRE files with spin-orbit channels
 or an XC label inconsistent with the selected CA/PZ-LDA or PBE family are
-rejected rather than silently misused.
+rejected rather than silently misused; with the other functionals of
+`V_xc/selection.py` a file of another functional is used with a warning, as
+in PARSEC's `pseudo.f90`.
 
 ## Spin-polarized calculations
 
@@ -502,7 +512,9 @@ rejected rather than silently misused.
 `SCFSettings(spin_polarized=True)`, runs the loop of
 `SCF/spin_polarized.py`: the algorithm of
 [`PARSEC_ALGORITHM.md`](PARSEC_ALGORITHM.md#spin-polarized-calculations) for
-isolated systems with `Correlation_Type: ca` or `pbe`, which must be given.
+isolated systems with any `Correlation_Type` that has a spin form (all but
+`xa`, `wi` and `hl`); without the line the functional is PARSEC's default,
+the Perdew-Wang LSDA (`pl`).
 
 ```text
 Spin_Polarization: true

@@ -32,9 +32,14 @@ def run_scf(
     system: PreparedSinglePointSystem,
     *,
     callback: Callable[[SCFIteration], None] | None = None,
+    **keywords,
 ) -> SinglePointResult:
-    """Run the SCF iteration for an already prepared system."""
-    return _run_scf(system, callback=callback)
+    """Run the SCF iteration for an already prepared system.
+
+    ``keywords`` (``warm_start``, ``iteration_state_callback``) go to
+    :func:`parsec_python.SCF.run_scf`.
+    """
+    return _run_scf(system, callback=callback, **keywords)
 
 
 def run_single_point(

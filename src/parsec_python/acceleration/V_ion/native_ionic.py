@@ -91,6 +91,61 @@ def _projector_box_rows(grid, position, radius):
     return np.sort(rows[rows >= 0])
 
 
+def _direct_interpolation(specification: SpeciesPotential) -> bool:
+    """``Old_Interpolation_Format`` acts on a species without cubic spline."""
+
+    return bool(getattr(specification, "old_interpolation", False)) and not specification.use_spline
+
+
+def _coordinate_bounds(coordinates) -> tuple[np.ndarray, np.ndarray]:
+    coordinates = np.asarray(coordinates, dtype=np.float64)
+    return coordinates.min(axis=0), coordinates.max(axis=0)
+
+
+def _farthest_distance(bounds, position) -> float:
+    """An upper bound of the distance from ``position`` to the points in ``bounds``."""
+
+    position = np.asarray(position, dtype=np.float64)
+    corner = np.maximum(np.abs(bounds[0] - position), np.abs(bounds[1] - position))
+    return float(np.sqrt(corner @ corner))
+
+
+def _direct_local_potential(evaluator, bounds, atom, potential, values) -> np.ndarray:
+    """``V_local`` of one atom with ``Old_Interpolation_Format`` (``ionpot.f90:107-112``).
+
+    Inside ``rs(ns-1)`` the table ``V`` is interpolated linearly (its first
+    value below the first sample), beyond it the Coulomb tail ``-2Z/r``, as
+    :meth:`parsec_python.Pseudopotential.ParsecPseudopotential.local_potential`
+    with ``direct=True``.  The native kernels give both parts: the density
+    kernel interpolates a table linearly inside ``rs(ns-1)`` and is zero
+    beyond, and the local-potential kernel of a zero table is zero inside
+    and the Coulomb tail beyond.  One of the two is zero at every point, so
+    their sum is exact; the tail is evaluated only where the grid reaches
+    ``rs(ns-1)``.
+    """
+
+    position = _values64(atom.position)
+    radii = _values64(potential.radii)
+    field = np.asarray(
+        evaluator.density(position, radii, values, _EMPTY, _EMPTY, _EMPTY),
+        dtype=np.float64,
+    )
+    if _farthest_distance(bounds, atom.position) >= potential.interpolation_cutoff:
+        field = field + np.asarray(
+            evaluator.local_potential(
+                position,
+                radii,
+                np.zeros_like(values),
+                float(potential.ionic_charge),
+                _EMPTY,
+                _EMPTY,
+                _EMPTY,
+            ),
+            dtype=np.float64,
+        )
+    return field
+
+
 class NativeIonicBuilders:
     """Cache grid coordinates and expose reference-compatible setup hooks."""
 
@@ -116,11 +171,17 @@ class NativeIonicBuilders:
         potentials: Mapping[str, ParsecPseudopotential],
         specifications: Mapping[str, SpeciesPotential],
     ) -> np.ndarray:
-        """Build ``sum_a V_local,a`` with PARSEC rV/spline interpolation."""
+        """Build ``sum_a V_local,a`` with PARSEC rV/spline interpolation.
+
+        A species with ``Old_Interpolation_Format`` (and no cubic spline,
+        which takes precedence) interpolates ``V`` itself
+        (:func:`_direct_local_potential`).
+        """
 
         evaluator = self._for_grid(grid)
         total = np.zeros(grid.size, dtype=np.float64)
         tables = {}
+        bounds = None
         for atom in atoms:
             potential = potentials[atom.symbol]
             specification = specifications[atom.symbol]
@@ -130,6 +191,11 @@ class NativeIonicBuilders:
                     potential, values, grid, specification.use_spline
                 ))
             values, spline = tables[atom.symbol]
+            if _direct_interpolation(specification):
+                if bounds is None:
+                    bounds = _coordinate_bounds(grid.coordinates)
+                total += _direct_local_potential(evaluator, bounds, atom, potential, values)
+                continue
             total += np.asarray(
                 evaluator.local_potential(
                     _values64(atom.position),
@@ -185,8 +251,16 @@ class NativeIonicBuilders:
         potentials: Mapping[str, ParsecPseudopotential],
         specifications: Mapping[str, SpeciesPotential],
     ) -> NonlocalProjectorOperator:
-        """Build PARSEC-order KB sparse columns with native radial kernels."""
+        """Build PARSEC-order KB sparse columns with native radial kernels.
 
+        With ``Double_Grid_Order > 1`` the columns are averaged over the
+        double grid (:mod:`.double_grid`, NumPy on the support boxes).
+        """
+
+        from .double_grid import build_double_grid_projectors, double_grid_order
+
+        if double_grid_order(grid) > 1:
+            return build_double_grid_projectors(grid, atoms, potentials, specifications)
         use_lookup = os.environ.get("PARSEC_NATIVE_PROJECTOR_LOOKUP", "1") == "1"
         evaluator = None if use_lookup else self._for_grid(grid)
         rows: list[np.ndarray] = []

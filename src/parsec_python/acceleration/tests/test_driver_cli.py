@@ -296,8 +296,17 @@ class PeriodicDriverTests(unittest.TestCase):
         )
         self.assertEqual(details["detected_symmetry_group_order"], "1")
         self.assertIn("periodic-wraparound", details["finite_difference_builder"])
+        # The readable periodic CG, on the host or (since 2026-10-30 by default) through the device
+        # hook where the k-point plan has a GPU; up to then this test asserted the host text alone.
+        from parsec_python.acceleration.Hartree.periodic_device import hartree_device_id
+
         self.assertTrue(
-            details["hartree_implementation"].startswith("periodic Ewald-consistent")
+            details["hartree_implementation"].startswith(
+                "periodic Ewald-consistent"
+                if hartree_device_id() is None
+                else "periodic conjugate-gradient solve, CuPy float64 on the device"
+            ),
+            details["hartree_implementation"],
         )
         self.assertEqual(details["hartree_backend"], "scipy")
         # No record of a boundary plan, and none that names a cluster route.
@@ -939,10 +948,12 @@ class AcceleratedCommandLineTests(unittest.TestCase):
                     self.assertEqual(details["symmetry_geometry_cache"], "disabled-built")
                     self.assertEqual(details["symmetry_geometry_cache_path"], "disabled")
                     self.assertIn(" symmetry_cache_directory = disabled", report)
-                    # Nothing beside the input, where the cache used to be.
+                    # Nothing beside the input, where the cache used to be,
+                    # but the report and the parsec.dat of Output_Data
+                    # (default true, as in PARSEC).
                     self.assertEqual(
                         sorted(item.name for item in directory.iterdir()),
-                        ["parsec.in", "parsec.out"],
+                        ["parsec.dat", "parsec.in", "parsec.out"],
                     )
 
             # A named directory is the former cache: a miss writes the entry

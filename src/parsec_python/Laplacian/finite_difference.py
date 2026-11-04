@@ -184,7 +184,15 @@ def build_negative_laplacian(grid: RealSpaceGrid) -> sp.csr_matrix:
     The returned CSR matrix has at most ``1 + 6*M`` nonzeros per row.  It is
     assembled once and reused as the kinetic operator and as the interior
     Poisson operator.
+
+    A :class:`~parsec_python.Grid.pbc.GeneralPeriodicGrid` (non-orthogonal
+    cell) gets the operator with auxiliary directions of
+    :func:`~.nonorthogonal.build_general_negative_laplacian` instead.
     """
+    if getattr(grid, "is_general_periodic", False):
+        from .nonorthogonal import build_general_negative_laplacian
+
+        return build_general_negative_laplacian(grid)
     if _is_oblique(grid):
         return _build_oblique_negative_laplacian(grid)
     coeff = second_derivative_coefficients(grid.settings.expansion_order)
@@ -249,9 +257,12 @@ def _build_oblique_negative_laplacian(grid) -> sp.csr_matrix:
         for shell in range(1, width + 1):
             for sign in (-1, 1):
                 rows = grid.rows_for_integer_coordinates(base + sign * shell * step)
-                row_parts.append(np.arange(n, dtype=np.int64))
-                col_parts.append(rows)
-                value_parts.append(np.full(n, -weight * coeff[width + shell], dtype=float))
+                valid = rows >= 0  # a neighbor outside a slab box is a zero wavefunction value
+                if not np.any(valid):
+                    continue
+                row_parts.append(np.flatnonzero(valid))
+                col_parts.append(rows[valid])
+                value_parts.append(np.full(int(np.count_nonzero(valid)), -weight * coeff[width + shell], dtype=float))
 
     matrix = sp.coo_matrix(
         (np.concatenate(value_parts), (np.concatenate(row_parts), np.concatenate(col_parts))),
@@ -330,7 +341,15 @@ def build_gradient(grid: RealSpaceGrid) -> tuple[sp.csr_matrix, sp.csr_matrix, s
     with the same coefficients), but a k-point kinetic term is only
     physically meaningful on a periodic grid, where every neighbor lookup
     wraps around and none are ever missing.
+
+    On a :class:`~parsec_python.Grid.pbc.GeneralPeriodicGrid` the three
+    matrices are still Cartesian, built from the derivatives along the
+    lattice directions (:func:`~.nonorthogonal.build_general_gradient`).
     """
+    if getattr(grid, "is_general_periodic", False):
+        from .nonorthogonal import build_general_gradient
+
+        return build_general_gradient(grid)
     coeff = first_derivative_coefficients(grid.settings.expansion_order)
     width = grid.settings.stencil_half_width
     oblique = _is_oblique(grid)

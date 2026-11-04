@@ -107,6 +107,17 @@ class PeriodicNonlocalProjectorTests(unittest.TestCase):
             operator.apply(probe), operator.as_sparse() @ probe, atol=1.0e-12
         )
 
+    def test_oblique_cell_sums_its_own_images(self) -> None:
+        # A general lattice is accepted (images bounded by the distances
+        # between lattice planes; test_nonorthogonal_pbc checks them against
+        # a brute-force sum).  In a 20 bohr cell only the atom itself reaches
+        # the grid, so the operator equals the isolated one.
+        grid, atoms, potentials, specifications, _cell = _setup(20.0)
+        oblique = np.array([[20.0, 0.0, 0.0], [1.0, 20.0, 0.0], [0.0, 0.0, 20.0]])
+        periodic = build_nonlocal_projectors(grid, atoms, potentials, specifications, oblique)
+        isolated = build_nonlocal_projectors(grid, atoms, potentials, specifications)
+        self.assertEqual((periodic.as_sparse() - isolated.as_sparse()).nnz, 0)
+
     def test_oblique_cell_matches_independent_brute_force_image_sum(self) -> None:
         # An oblique cell smaller than twice the support radius: the images follow the lattice vectors.
         specifications = {"H": SpeciesPotential(_H_POTRE, 0)}

@@ -8,10 +8,12 @@ translates both steps.
 
 The radial grid of a ``MARTINS_NEW`` file is logarithmic,
 
-``r_j = a*exp(b*(j-1)) - a``,  ``j = 2, ..., npoint``,
+``r_j = a*exp(b*(j-1)) - c``,  ``j = 2, ..., npoint``,
 
-so a derivative with respect to the index ``j`` becomes a radial derivative
-through ``dj/dr = 1/(b*(r_j + a))``.  PARSEC takes the index derivative with a
+with ``c = a`` for every Martins format and ``c = 0`` for an FHIPP file
+(:attr:`ParsecPseudopotential.radial_offset`), so a derivative with respect
+to the index ``j`` becomes a radial derivative through
+``dj/dr = 1/(b*(r_j + c))``.  PARSEC takes the index derivative with a
 central stencil of nine points on each side (``mor = 9`` in ``pseudo.f90``)
 whose weights ``fornberg.f90`` stores with ten digits; the same ten digits
 are used here.  Fortran indices ``j <= 1`` are padding that continues the
@@ -53,7 +55,7 @@ FIRST_DERIVATIVE_WEIGHTS = np.array(
 _LOCAL_DERIVATIVE_NOISE_RADIUS = 3.0e-4
 
 #: ``forcloc.f90`` switches to the analytic tail at ``rs(npoint-6)``, which is
-#: this index of the positive radial samples.
+#: this index of the positive radial samples (a table of at least seven).
 _TAIL_START_INDEX = -7
 
 
@@ -99,7 +101,7 @@ def log_grid_derivative(
         accumulated += weight * (padded[centre + offset] - padded[centre - offset])
     result[start:stop] = accumulated / (
         potential.radial_parameter_b
-        * (radii[start:stop] + potential.radial_parameter_a)
+        * (radii[start:stop] + potential.radial_offset)
     )
     return result
 
@@ -141,9 +143,13 @@ def valence_density_table(
     """Spherical atomic valence density ``rho_r`` in electrons/bohr**3.
 
     Without ``Read_Vcd`` PARSEC rebuilds it from the reduced radial functions
-    and their occupations, ``sum_l f_l*u_l(r)**2/(4*pi*r**2)``.
+    and their occupations, ``sum_l f_l*u_l(r)**2/(4*pi*r**2)``.  A Fourier
+    filtered potential carries the filtered density, which ``fourier_f.f90``
+    puts in place of either.
     """
 
+    if potential.filtered_valence_density is not None:
+        return np.asarray(potential.filtered_valence_density, dtype=float)
     if read_from_file:
         return np.asarray(potential.valence_density, dtype=float)
     radii = potential.radii
@@ -170,6 +176,14 @@ def radial_projector_with_derivative(
     take the derivative at ``2*mor``, and the last nine are zero.
     """
 
+    if angular_momentum in potential.filtered_projectors:
+        # ``fourier_f.f90`` sets ``dvw`` to the filtered projector itself
+        # (it calls ``fint`` where ``dfint`` was meant).  Forces of periodic
+        # systems, the only ones with filters, are not implemented.
+        raise ValueError(
+            "the radial derivative of a Fourier-filtered projector is not "
+            "implemented"
+        )
     projector, sign = potential.radial_projector(angular_momentum, local_l)
     delta_v = (
         potential.channel_potentials[angular_momentum]
@@ -188,9 +202,22 @@ def radial_projector_with_derivative(
 
 
 def tail_start_radius(potential: ParsecPseudopotential) -> float:
-    """Radius from which ``forcloc.f90`` uses the analytic Coulomb tail."""
+    """Radius from which ``forcloc.f90`` uses the analytic Coulomb tail.
 
-    return float(potential.radii[_TAIL_START_INDEX])
+    ``rlarge = rs(npoint-6)`` (forcloc.f90:153) with ``npoint`` the Fortran
+    index of the last sample (``count + 1``: the file samples are
+    ``rs(2:npoint)``, pseudo.f90:409-410).  For a table of seven samples or
+    more that is a file radius.  A shorter table points into the padding,
+    where pseudo.f90:843 sets ``rs(j) = j - 1`` for ``j <= 1``: the tail
+    radius is then zero or negative and every point from the first sample
+    outwards takes the Coulomb tail, as in PARSEC.
+    """
+
+    count = int(potential.radii.size)
+    if count >= -_TAIL_START_INDEX:
+        return float(potential.radii[_TAIL_START_INDEX])
+    # Fortran index npoint - 6 = count - 5 <= 1: the padding value j - 1.
+    return float(count - 6)
 
 
 def spline_derivative(spline: ParsecRadialSpline, points: np.ndarray) -> np.ndarray:
@@ -224,20 +251,25 @@ def evaluate_local_potential_derivative(
     table: np.ndarray | None = None,
     use_spline: bool = False,
     spline_padding_width: int | None = None,
+    direct: bool = False,
 ) -> np.ndarray:
     """dV_local/dr at ``distances`` with the rules of ``forcloc.f90``.
 
     Points closer than the first radial sample return zero: ``forcloc.f90``
     leaves them out of every force term.  From ``rs(npoint-6)`` outwards the
     value is the Coulomb derivative ``2*Z/r**2``.  In between the default is
-    PARSEC's linear interpolation of ``r**2 * dV/dr``; with ``use_spline`` it
-    is the derivative of the padded cubic spline of the potential.
+    PARSEC's linear interpolation of ``r**2 * dV/dr``; ``direct``
+    interpolates ``dV/dr`` itself (``Old_Interpolation_Format``,
+    ``forcloc.f90:201-203``); with ``use_spline`` it is the derivative of
+    the padded cubic spline of the potential, whichever of the two is set.
     """
 
     radius = np.asarray(distances, dtype=float)
     radii = potential.radii
     result = np.zeros_like(radius)
-    tail = radius >= tail_start_radius(potential)
+    # forcloc.f90:180-188: a point closer than rs(2) is skipped before the
+    # tail test (which matters only where the tail starts inside rs(2)).
+    tail = (radius >= tail_start_radius(potential)) & (radius >= radii[0])
     result[tail] = 2.0 * potential.ionic_charge / (radius[tail] * radius[tail])
     inner = (radius >= radii[0]) & ~tail
     if not np.any(inner):
@@ -253,6 +285,9 @@ def evaluate_local_potential_derivative(
         return result
     if table is None:
         table = local_potential_derivative_table(potential, local_l)
+    if direct:
+        result[inner] = np.interp(sample, radii, table)
+        return result
     result[inner] = np.interp(sample, radii, table * radii * radii) / (sample * sample)
     return result
 

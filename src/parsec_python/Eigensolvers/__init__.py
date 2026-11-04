@@ -23,11 +23,18 @@ Later SCF eigensolves:
 Only the first requested Ritz pairs return to occupations, while every
 requested-plus-buffer pair is saved for the next nonlinear iteration.
 
+Explicitly selected iterative solvers (``Eigensolver: arpack`` / ``diagla``):
+
+``eigval.solve_eigval`` -> ``arpack.run_arpack`` (SciPy's ARPACK) or
+``diagla.run_diagla`` (the block Davidson PLESa of ``diagla.f90z``), in
+every SCF iteration, or only for the first solve when
+``Chebyshev_Filtering`` hands later iterations to SUBSPACE.
+
 Nothing in this package invokes PARSEC Fortran or silently falls back to
-ARPACK.  ARPACK support, when added as a separate explicitly selected
-solver, belongs behind a different dispatch path.
+another eigensolver.
 """
 
+from .arpack import ArpackResult, ArpackSettings, run_arpack
 from .chebdav import (
     ChebDavIteration,
     ChebDavResult,
@@ -49,13 +56,22 @@ from .chebyshev import (
     subspace_filter,
     subspace_filter_blocks,
 )
+from .diagla import (
+    DiaglaResult,
+    DiaglaSettings,
+    fdo5scl_preconditioner,
+    run_diagla,
+)
 from .eigval import (
+    DYNAMIC_TOLERANCE_START,
     EigvalResult,
     EigvalSettings,
     EigvalState,
     StrictEigvalSolver,
+    dynamic_diagonalization_tolerance,
     solve_eigval,
 )
+from .iterative import IterativeDiagonalizationError, matvec_budget
 from .lapack_random import LapackRandom, PARSEC_RANDOM_ARRAY_SEED
 from .orthogonalize import OrthonormalizationResult, orthonormalize
 from .perturbative_soc import (
@@ -75,6 +91,17 @@ from .subspace import (
 )
 
 __all__ = [
+    "ArpackResult",
+    "ArpackSettings",
+    "DYNAMIC_TOLERANCE_START",
+    "DiaglaResult",
+    "DiaglaSettings",
+    "IterativeDiagonalizationError",
+    "dynamic_diagonalization_tolerance",
+    "fdo5scl_preconditioner",
+    "matvec_budget",
+    "run_arpack",
+    "run_diagla",
     "AtomSpinOrbitProjectors",
     "PerturbativeSpinOrbitResult",
     "build_spin_orbit_projectors",

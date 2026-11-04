@@ -68,15 +68,21 @@ class StrictSCFEigensolverTests(unittest.TestCase):
         self.assertEqual(result.iterations, 1)
         self.assertTrue(math.isnan(result.history[0].eigen_residual_max))
 
-    def test_unported_solver_is_not_silently_substituted(self) -> None:
-        system = prepare_single_point(
-            self._problem(method="arpack", iterations=1)
+    def test_selected_arpack_runs_and_is_not_substituted(self) -> None:
+        result = run_scf(
+            prepare_single_point(self._problem(method="arpack", iterations=2))
         )
 
-        with self.assertRaisesRegex(
-            NotImplementedError,
-            "not yet ported.*no alternate solver",
-        ):
+        # Only ARPACK and DIAGLA report (nec, maxmvs); without
+        # Chebyshev_Filtering ARPACK solves every iteration.
+        for step in result.history:
+            self.assertEqual(len(step.eigensolver_counts), 1)
+            self.assertEqual(step.eigensolver_counts[0][0], 2)
+
+    def test_test_mode_runs_no_scf(self) -> None:
+        system = prepare_single_point(self._problem(method="none", iterations=1))
+
+        with self.assertRaisesRegex(ValueError, "TEST mode"):
             run_scf(system)
 
 

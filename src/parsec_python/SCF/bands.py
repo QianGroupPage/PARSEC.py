@@ -40,7 +40,7 @@ from ..Eigensolvers import solve_eigval
 from ..Grid import band_path_kpoints, explicit_kpoints
 from ..Hamiltonian.kpoint_operator import KPointKohnShamHamiltonian
 from ..models import BandStructureResult, BandStructureSettings
-from .kpoint_solver import map_tasks
+from .kpoint_solver import device_solver_supports, map_tasks
 from .kpoints_soc import _eigval_settings, _k_point_operators, _spinor_hamiltonian
 
 MODES = ("scalar", "spin_polarized", "soc", "soc_spin_polarized", "noncollinear")
@@ -69,13 +69,22 @@ def band_mode(problem) -> str:
 
 
 def band_potentials(result, mode: str) -> dict[str, np.ndarray]:
-    """The converged local potentials a band calculation needs, from an SCF result."""
+    """The converged local potentials a band calculation needs, from an SCF result.
+
+    With LDA+U the result's potential matrices ``D`` (``result.hubbard``,
+    shape ``(channels, atoms, 5, 5)``) come along under ``"hubbard"``: the
+    bands are those of the converged Hamiltonian, LDA+U term included, with
+    the Bloch projectors of every band k-point (``calc_bands.f90`` keeps the
+    projectors of the SCF k-points instead, a Fortran defect).
+    """
+    hubbard = getattr(result, "hubbard", None)
+    extra = {} if hubbard is None else {"hubbard": np.asarray(hubbard.potentials)}
     if mode == "scalar":
-        return {"effective_potential": np.asarray(result.output_effective_potential)}
+        return {"effective_potential": np.asarray(result.output_effective_potential), **extra}
     potentials = getattr(result, "scf_potentials", None)
     if not potentials:
         raise ValueError(f"the SCF result carries no converged potentials for mode {mode!r}")
-    return {name: np.asarray(value) for name, value in potentials.items()}
+    return {**{name: np.asarray(value) for name, value in potentials.items()}, **extra}
 
 
 _REQUIRED = {
@@ -187,16 +196,93 @@ def run_band_structure(
     Each k-point is the same computation whatever the worker count, so the
     bands do not depend on it.
     """
+    if getattr(system, "hubbard", None) is not None and "hubbard" not in potentials:
+        raise NotImplementedError(
+            "a band structure with LDA+U needs the potential matrices of the SCF "
+            "(the 'hubbard' entry of band_potentials); an archive does not hold them"
+        )
+
+    cell = system.input.periodic_cell
+    segments, names = band_path_cartesian(settings, cell)
+    k_points = np.concatenate(segments)
+    counts = np.asarray([len(segment) for segment in segments])
+    bands = solve_kpoint_bands(
+        system,
+        k_points,
+        mode=mode,
+        potentials=potentials,
+        number_of_states=number_of_states,
+        callback=callback,
+        residual_tolerance=residual_tolerance,
+        max_attempts=max_attempts,
+        workers=workers,
+        backend=backend,
+    )
+    return BandStructureResult(
+        mode=mode,
+        channels=bands.channels,
+        segment_names=names,
+        segment_counts=counts,
+        k_points=k_points,
+        eigenvalues=bands.eigenvalues,
+        residual_norms=bands.residual_norms,
+        fermi_level=float(fermi_level),
+        spin_expectation=bands.spin_expectation,
+        attempts=bands.attempts,
+    )
+
+
+@dataclasses.dataclass
+class KPointBands:
+    """Eigenvalues of the fixed-potential Hamiltonian at a list of k-points.
+
+    ``eigenvalues`` (Ry) and ``residual_norms`` are indexed ``(channel, k)``
+    as in :class:`~parsec_python.models.BandStructureResult`;
+    ``attempts`` counts the diagonalizations of each ``(channel, k)``.
+    """
+
+    channels: tuple[str, ...]
+    eigenvalues: np.ndarray
+    residual_norms: np.ndarray
+    attempts: np.ndarray
+    spin_expectation: np.ndarray | None = None
+    # With ``keep_vectors``: ``vectors[channel][k]`` the ``(n_grid, n_states)``
+    # eigenvectors (Bloch factors ``u_nk``) of the reported levels; ``None``
+    # otherwise.
+    vectors: list | None = None
+
+
+def solve_kpoint_bands(
+    system,
+    k_points: np.ndarray,
+    *,
+    mode: str,
+    potentials: dict[str, np.ndarray],
+    number_of_states: int,
+    callback: Callable[[int, int, np.ndarray, float, int], None] | None = None,
+    residual_tolerance: float = 2.0e-2,
+    max_attempts: int = 5,
+    workers: int | str | None = None,
+    backend: str | None = None,
+    keep_vectors: bool = False,
+) -> KPointBands:
+    """Diagonalize the Hamiltonian of ``potentials`` at every row of ``k_points``.
+
+    The k-point loop of :func:`run_band_structure` (and of the
+    non-self-consistent run of :mod:`parsec_python.SCF.nscf`): every k-point
+    (Cartesian, 1/bohr) is solved from scratch by the SCF's first
+    eigensolver, with the CHEBDAV re-solve and the worker pool described
+    there.  ``callback`` is that of :func:`run_band_structure`.
+    ``keep_vectors`` keeps the eigenvectors of the reported levels
+    (``KPointBands.vectors``; host arrays).
+    """
 
     if mode not in MODES:
         raise ValueError(f"unknown band mode {mode!r}; choose from {MODES}")
     missing = [name for name in _REQUIRED[mode] if name not in potentials]
     if missing:
         raise ValueError(f"mode {mode!r} needs the potentials {missing}")
-    cell = system.input.periodic_cell
-    segments, names = band_path_cartesian(settings, cell)
-    k_points = np.concatenate(segments)
-    counts = np.asarray([len(segment) for segment in segments])
+    k_points = np.asarray(k_points, dtype=float)
 
     eigval_settings = _eigval_settings(system, system.input.eigensolver.filter_degree)
     spinor = mode in ("soc", "soc_spin_polarized", "noncollinear")
@@ -206,31 +292,74 @@ def run_band_structure(
     residuals = np.zeros((len(channels), n_k))
     attempts = np.ones((len(channels), n_k), dtype=int)
     sigma = np.zeros((1, n_k, number_of_states, 3)) if spinor else None
+    kept_vectors = [[None] * n_k for _ in channels] if keep_vectors else None
+
+    hubbard_matrices = potentials.get("hubbard")
+    if hubbard_matrices is not None:
+        if mode not in ("scalar", "spin_polarized"):
+            raise NotImplementedError(
+                "LDA+U bands are implemented for the scalar and collinear spin modes"
+            )
+        # Every backend applies the term: the device Bloch operators of the
+        # k-point workers add P_k D P_k^H of a BlochHubbardHamiltonian
+        # (acceleration/Hamiltonian/device_bloch.py).
+
+    def with_hubbard(hamiltonians_k, k_point):
+        """Add ``P_k D P_k^H`` of the SCF's ``D`` to every channel at ``k_point``."""
+        if hubbard_matrices is None:
+            return hamiltonians_k
+        from ..Hamiltonian.hubbard import (
+            HubbardOperator,
+            build_hubbard_projectors,
+            hubbard_replica_lattice,
+        )
+        from .kpoint_hubbard import BlochHubbardHamiltonian
+
+        projectors = build_hubbard_projectors(
+            system.grid,
+            system.atoms,
+            system.pseudopotentials,
+            system.input.pseudopotentials,
+            hubbard_replica_lattice(system),
+            k_point=k_point,
+        )
+        return [
+            BlochHubbardHamiltonian(
+                hamiltonian, HubbardOperator(projectors, hubbard_matrices[channel])
+            )
+            for channel, hamiltonian in enumerate(hamiltonians_k)
+        ]
 
     def hamiltonians(k_point):
         """One ``(operator, is_spinor)`` per channel at ``k_point``."""
         nonlocal_k, soc_k = _k_point_operators(system, k_point[None, :])[0]
         if mode == "scalar":
-            return [
-                KPointKohnShamHamiltonian(
-                    system.negative_laplacian,
-                    system.gradient,
-                    potentials["effective_potential"],
-                    nonlocal_k,
-                    k_point,
-                )
-            ]
+            return with_hubbard(
+                [
+                    KPointKohnShamHamiltonian(
+                        system.negative_laplacian,
+                        system.gradient,
+                        potentials["effective_potential"],
+                        nonlocal_k,
+                        k_point,
+                    )
+                ],
+                k_point,
+            )
         if mode == "spin_polarized":
-            return [
-                KPointKohnShamHamiltonian(
-                    system.negative_laplacian,
-                    system.gradient,
-                    potentials[name],
-                    nonlocal_k,
-                    k_point,
-                )
-                for name in ("potential_up", "potential_down")
-            ]
+            return with_hubbard(
+                [
+                    KPointKohnShamHamiltonian(
+                        system.negative_laplacian,
+                        system.gradient,
+                        potentials[name],
+                        nonlocal_k,
+                        k_point,
+                    )
+                    for name in ("potential_up", "potential_down")
+                ],
+                k_point,
+            )
         extra = {}
         if mode == "soc_spin_polarized":
             extra["xc_delta"] = potentials["xc_delta"]
@@ -274,10 +403,16 @@ def run_band_structure(
         point_residuals = np.zeros(len(channels))
         point_attempts = np.ones(len(channels), dtype=int)
         point_sigma = np.zeros((number_of_states, 3)) if spinor else None
+        point_vectors = [] if keep_vectors else None
         for channel, hamiltonian in enumerate(hamiltonians(k_point)):
             # A device converter that can solve on the device (duck-typed, so that this module does
-            # not import the acceleration package) keeps the whole first solve on the GPU.
-            device_solve = converter is not None and getattr(converter, "device_solver", False)
+            # not import the acceleration package) keeps the whole first solve on the GPU; ARPACK
+            # and DIAGLA stay host eigensolvers on the device operator.
+            device_solve = (
+                converter is not None
+                and getattr(converter, "device_solver", False)
+                and device_solver_supports(eigval_settings)
+            )
             if device_solve:
                 operator = None
             else:
@@ -314,9 +449,18 @@ def run_band_structure(
             point_values[channel] = values
             if spinor:
                 point_sigma = spin_expectation(vectors)
-        return point_values, point_residuals, point_attempts, point_sigma
+            if keep_vectors:
+                host = vectors.get() if hasattr(vectors, "get") else vectors
+                point_vectors.append(np.array(host, copy=True))
+        return point_values, point_residuals, point_attempts, point_sigma, point_vectors
 
-    for k_index, (values, point_residuals, point_attempts, point_sigma) in map_tasks(
+    for k_index, (
+        values,
+        point_residuals,
+        point_attempts,
+        point_sigma,
+        point_vectors,
+    ) in map_tasks(
         lambda k_index, converter: solve_point(k_points[k_index], converter),
         n_k,
         problem_size=system.grid.size,
@@ -324,6 +468,9 @@ def run_band_structure(
         backend=backend,
     ):
         eigenvalues[:, k_index] = values
+        if keep_vectors:
+            for channel, vectors_k in enumerate(point_vectors):
+                kept_vectors[channel][k_index] = vectors_k
         residuals[:, k_index] = point_residuals
         attempts[:, k_index] = point_attempts
         if spinor:
@@ -337,26 +484,24 @@ def run_band_structure(
                 int(point_attempts.max()),
             )
 
-    return BandStructureResult(
-        mode=mode,
+    return KPointBands(
         channels=channels,
-        segment_names=names,
-        segment_counts=counts,
-        k_points=k_points,
         eigenvalues=eigenvalues,
         residual_norms=residuals,
-        fermi_level=float(fermi_level),
-        spin_expectation=sigma,
         attempts=attempts,
+        spin_expectation=sigma,
+        vectors=kept_vectors,
     )
 
 
 __all__ = [
+    "KPointBands",
     "MODES",
     "band_mode",
     "band_path_cartesian",
     "band_potentials",
     "load_scf_for_bands",
     "run_band_structure",
+    "solve_kpoint_bands",
     "spin_expectation",
 ]

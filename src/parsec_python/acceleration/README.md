@@ -310,7 +310,10 @@ channel.
   are joined only on the host, where they are asked for.
 - The exchange-correlation potentials are evaluated by the NumPy functionals
   of the readable package on the host (`xc_implementation` says so); the C++
-  CA evaluator is unpolarized.
+  CA evaluator is unpolarized. The CuPy backend evaluates PW92, LB94,
+  Casida-Salahub, PBE and PW91 on the device instead (PBE since 2026-10-30;
+  `PARSEC_CUPY_XC=off` keeps the host; Exchange-correlation on the device,
+  below).
 - The MPI SCF (`mpi_context`, the multi-node runner without
   `--serial-control`) refuses a spin-polarized input: its ranks divide the
   symmetry sectors.
@@ -320,8 +323,115 @@ channel.
 
 Forces, relaxation, molecular dynamics and the B3LYP refinement take a
 spin-polarized result on every backend.
+
+### LDA+U and the TS correction
+
+An isolated system with `ldaplusu_u` (and `ldaplusu_j = 0`), unpolarized or
+spin-polarized, runs on the accelerated driver with the physics of
+`Hamiltonian/hubbard.py` (`upot.F90`, `plusu.f90z`, `calcden.f90z`):
+
+- The term `sum_a |phi_a,m> D_mm' <phi_a,m'|` is a separable operator like
+  the KB term, whose device kernels apply `B diag(s) B.T`. A symmetric 5x5
+  `D` is a combination of fifteen fixed rank-one terms, `e_i e_i^T` and
+  `(e_i + e_j)(e_i + e_j)^T`, so `Hamiltonian/hubbard_device.py` appends the
+  columns `phi_a,i` and `phi_a,i + phi_a,j` of every LDA+U atom to the KB
+  factor once per structure, with coefficient zero, and every SCF iteration
+  writes their fifteen coefficients per atom into the arrays of the signs of
+  every device operator (the full-grid operator, the sector operators, their
+  replicas on other devices, an opt-in FP32 shadow). No kernel changed; the
+  fused stencil scatter, the filter graphs and the sector reduction
+  `U_G^T B` take the term with the KB columns. `H_U` commutes with the
+  point group (the occupation matrices of the orbitals of all sectors follow
+  the d harmonics of the atoms), so the sector blocks are exact. A channel of
+  a spin-polarized run binds its `D` with its potential.
+- The occupation matrices `N` of every iteration and the LDA+U forces are
+  formed where the orbitals are: the full-grid basis on its device, the basis
+  of every sector on its device or spilled to the host, a basis that several
+  devices share, a basis that holds the Ritz hand-over; only `(atoms, 5, 5)`
+  arrays come back (the reduced projectors give the overlaps of the
+  full-grid orbitals). The KB force kernels read only their own columns.
+- The native and SciPy backends add the host term to their bound
+  Hamiltonian (`HostHubbardHamiltonian`).
+- A bulk cell at the Gamma point takes the same route, with the images of
+  the cell in its projectors, also for its forces, relaxations and dynamics:
+  `Forces/periodic_device.py` takes the LDA+U and TS terms from
+  `Forces/compute.py::correction_forces` (the LDA+U term from the orbitals on
+  the device with the projector gradients of the cell images, the TS forces
+  of the device sums).
+- Refused here (the command line hands them to the reference solver):
+  `ldaplusu_j != 0` (PARSEC's `D` is then not symmetric and has no such
+  form), the MPI SCF of several ranks.
+- The k-point (and periodic spin) drivers of the reference solver run LDA+U
+  on the k-point device workers: `Hamiltonian/device_bloch.py` applies
+  `P_k D P_k^H` beside the KB term of its Bloch operators (the Bloch
+  projectors cached per k-point, `D` uploaded with the potential), and
+  `SCF/kpoint_hubbard.py` forms `w_k N_k` from the device orbitals of each
+  k-point (the support rows of each atom).  Before, LDA+U kept these loops on
+  the CPU workers.  The band structures (`SCF/bands.py`) and the Gamma-point
+  spin runs of a wire or slab (the 1x1x1 k-point driver) take the same
+  workers.
+
+`Van_Der_Waals` forms the Hirshfeld volumes of the converged density and the
+pair sum of `efvdw.f90` on one device (`Energy/dispersion_device.py`): for a
+cluster, and for a bulk cell with its Hirshfeld cells and lattice shells (the
+accelerated Gamma path, and every periodic driver of the reference solver
+whose eigenproblems run on a CUDA device: `Energy.dispersion.set_device_dispersion`,
+installed with the k-point workers). The correction adds no potential, as in
+PARSEC. A cluster on the reference solver keeps the host sums.
+`benchmarks/check_corrections.py` compares an input on the two solvers,
+with the device memory a thread samples.
 `acceleration/tests/test_spin_polarized.py` compares complete calculations
 on the three backends with Fortran PARSEC.
+
+### Fields, point charges, symmetrized densities, domains and restarts of clusters
+
+These cluster inputs of PARSEC run on the accelerated SCF loop (also with
+collinear spin); the CLI hands them to the reference solver only where a
+periodic cell or spin-orbit coupling comes with them, by name:
+
+- `Polarizability`: the seven field loops of `polar.f90`
+  (`SCF/polarizability.py`) through the reference loop driver, which
+  replaces the ionic potential of the reference system by `V_ion + 2 F d.r`
+  for each field; the accelerated system keeps its Hamiltonian, eigensolver
+  and Hartree solver, and each loop after the first starts from the input
+  potential of the last iteration and the saved subspace on its devices,
+  as PARSEC does. `polar.dat`, the dipole lines and the forces of the last
+  loop are those of the reference CLI. No point group (PARSEC's rule): the
+  full grid on one GPU, or the one sector of `PARSEC_CUPY_SINGLE_SECTOR=on`
+  on several.
+- `Add_Point_Charges`: the potential and the ion-charge energy are in the
+  reference preparation that the accelerated one calls; the forces of the
+  charges on the nuclei are added to the accelerated forces
+  (`Forces/compute.py`). No point group either.
+- `Symmetrize_Charge_Density`: where the loop keeps one value per orbit of
+  the symmetry sectors, the average over the full point group of the atoms
+  is formed on those orbits (`SCF/density_symmetry.py`): the operations
+  of the group that the sectors lack (the threefold axes of a tetrahedral
+  cluster over its `D_2` sectors) map each representative row to an orbit,
+  and the average at that row is the reference's, term for term.
+- `Save_Intermediate_Charge_Density`: the fields of every iteration go to
+  `parsec.dat` on the host, the orbitals of the sectors or devices as one
+  full-grid matrix where the file holds wavefunctions
+  (`Output/iteration_fields.py`); in every SCF loop, relaxation, dynamics and
+  polarizability included.
+- `Cluster_Domain_Shape: ellipsoid` and `cylinder`: the slab-wise grid
+  builder decides the points of these shapes with the reference test
+  (`Grid/cluster.py`), and the direct Coulomb sum of the Hartree boundary
+  values runs on the GPU (`Hartree/cupy_direct_boundary.py`, one thread per
+  exterior point, compensated FP64 sums; `PARSEC_HARTREE_DIRECT_DEVICE`
+  `auto`, the default, for these two shapes; `off` takes the host sum of a
+  box instead). A box keeps its host sum by default, which now also takes
+  the orbit values of a run with symmetry sectors (such a run stopped in the
+  boundary before); `PARSEC_HARTREE_DIRECT_DEVICE=on` sums it on the GPU
+  too.
+- `Restart_From_Wfndat`: the stored subspace of `wfn.dat` is uploaded into
+  the persistent CuPy eigensolver of the full grid (`SCF/restart.py`); a run
+  restarted from it solves on the full grid, since the file holds states of
+  one representation. `PARSEC_CUPY_SINGLE_SECTOR=on` with it is handed to the
+  reference solver.
+
+The MPI runner refuses point charges, `Symmetrize_Charge_Density` and
+`Polarizability`.
 
 ### SciPy
 
@@ -370,6 +480,36 @@ remain visible in Python. A cached native CA/PZ-LDA evaluator handles the
 repeated exchange-correlation grid loop while preserving the reference
 float64 branch formulas. Under symmetry it evaluates one physical value per
 orbit and applies integer orbit multiplicities to the energy quadrature.
+
+Three pseudopotential set-up options of PARSEC run on the accelerated path
+(`V_ion/double_grid.py`, `V_ion/setup_options.py`):
+
+- `Double_Grid_Order > 1` (Ono-Hirose double grid, `nonloc.F90`): the
+  projector builder of the native and CuPy preparations averages each
+  projector over the `(2N-1)**3` fine points of a coarse point with NumPy,
+  on the support box of the atom (the grid lookup) and on up to four host
+  threads for 32 atoms or more. The matrix, and the projector gradients of
+  the forces, are those of the readable builders bit for bit; the device
+  Hamiltonians, symmetry sectors and force contractions take them as they
+  take the ordinary projectors. C795H300 (2.71 million points, 1095 atoms,
+  order 2) on an A100 node (CPUs shared with other jobs): 0.95 s for the
+  projectors and 1.1 s for the gradients, against 107 s and 105 s for the
+  readable builders (one thread: 2.5 s and 3.1 s).
+- `Old_Interpolation_Format` (`ionpot.f90:107-112`, `forcloc.f90:201-210`):
+  the local potential of a species without cubic spline interpolates `V`
+  itself. The native builder adds the native density kernel of the table
+  (linear inside `rs(ns-1)`, zero beyond) and the local-potential kernel of a
+  zero table (zero inside, `-2Z/r` beyond); the CuPy builder and the device
+  local forces compile a variant of their kernels with a per-species flag,
+  only for calculations that set the option.
+- A periodic cell at Gamma takes the readable periodic preparation, which
+  builds the double-grid projectors and applies the Fourier filters
+  (`Alpha_Filter`, `Beta1_Filter`, `Core_Filter`). A cluster's filters are
+  ignored by the parser, as in PARSEC.
+
+The double grid together with spin-orbit species (`SO_PSP`) runs on the
+reference solver. The prepared-system cache key hashes the interpolation
+and filter options only where a species sets them.
 
 ### CuPy
 
@@ -2379,6 +2519,21 @@ PARSEC MGS routine. Smaller symmetry sectors retain literal PARSEC MGS because
 GPU setup is not profitable there. Set `PARSEC_CUPY_CHEBDAV_BLOCK_ORTH=off`
 for a source-arithmetic comparison, `on` to force it, or change the automatic
 row crossover with `PARSEC_CUPY_CHEBDAV_BLOCK_ORTH_MIN_ROWS`.
+The literal fallback sweeps the whole Davidson workspace (`wanted + 12`
+columns), and the columns beyond the block that no step has used yet are
+zero and take one random replacement each. Only the replacements of the
+block count towards the limit of 100: before, an early fallback in a wide
+workspace stopped the solve ("orthogonalization exceeded the replacement
+limit"; the first solve of a 216-atom Si cell at Gamma, 476 working states,
+whose 108th block fell back with 325 unused columns). The sweep, its draws and
+the bases are those of before, so a solve that passed keeps its numbers.
+`PARSEC_CUPY_CHEBDAV_FALLBACK_TAIL=skip` sweeps the block alone: the unused
+columns stay zero and draw nothing from CHEBDAV's stream, which may change the
+later draws of a solve that falls back (the Si216 cell: the same energy and
+levels to the printed digits, 63 instead of 70 s).
+The Gram--Schmidt loops copy the growing prefix of a row-major basis into one
+reused buffer, where CuPy took one new copy per column and product; that cut
+the device peak of such a fallback from 24.5 to 7.2 GiB with the same bits.
 The projection against the growing prefix uses the complete contiguous
 C-order Davidson workspace for the coefficient GEMM. For the normal blocks
 of at most six vectors, a row-major CUDA kernel then applies only the active
@@ -2569,6 +2724,206 @@ batching can reduce launch count, but the measured GPU was bandwidth limited
 and ran faster with PARSEC's ordinary block traversal. It is therefore opt-in
 with `PARSEC_CUPY_BATCH_FILTERS=1`, not the default.
 
+#### ARPACK, Dynamic_Diag_Tol, Fix_Number_Eigenvalues and the TEST mode
+
+These PARSEC controls (the reports of the
+Fortran-parity round) run in the accelerated SCF loop, which is the shared
+one of `SCF/single_point.py` and `SCF/spin_polarized.py`; an input that
+gives none of them runs as before, bit for bit.
+
+- `Dynamic_Diag_Tol`: the loop hands the tolerance of each iteration (0.1 in
+  the first of every SCF loop, then `max(min(tol, SRE/10), Diag_Tolerance)`)
+  to the eigensolver settings of that iteration; the CuPy CHEBDAV first
+  solve of every sector, and of a sector that the spectral bracket grows,
+  uses it, CHEBFF and SUBSPACE use none (as in PARSEC). `Restart_Run`
+  switches it off in the parser.
+- `Fix_Number_Eigenvalues` (with `Restart_Run`): no `Subspace_Buffer_Size`
+  buffer. On the full grid the solver keeps `States_Num` vectors; symmetry
+  sectors are bracketed by the first solve of the run, then each keeps the
+  number of the lowest `States_Num` levels it holds (at least one) and no
+  later solve grows or trims it (`CuPySymmetrySCFEigensolver._fix_sector_states`).
+  PARSEC takes those counts per representation from the restart file; the
+  sectors of this code need not be the representations of that file.
+  `orbital_sector_final_state_counts` among the backend details shows them.
+- `Eigensolver: none`: PARSEC's TEST mode stops after the accelerated
+  preparation (`reporter.setup` and the execution resources) with
+  " TEST MODE COMPLETE" and no archive.
+- `Eigensolver: arpack` on the CuPy eigensolvers: `Eigensolvers/arpack.py`,
+  a device thick-restart Lanczos in ARPACK's role, one per sector (or on the
+  full grid), with the parameters of `arpk.f90z` (`ncv = 2 nev + 5`,
+  `which = 'SA'`, `180 nev` restarts, `Diag_Tolerance`), ARPACK's DGKS
+  reorthogonalization, convergence test and restart rule (`dsaitr`,
+  `dsconv`, `dsaup2`), the `dlarnv` start vector of every call from the
+  seed the previous call left, eigval.F90's five calls and its error 402.
+  Without `Chebyshev_Filtering` it solves every SCF iteration from a new
+  start vector, with it once before the device SUBSPACE passes. The
+  iteration report lists the converged pairs and products per
+  representation, as `eigval.F90` does. A sector is solved on its device;
+  several devices serve several sectors but never share an ARPACK basis.
+  ARPACK with spin-orbit coupling, and every input whose backend does not
+  resolve to CuPy, still runs on the reference solver.
+
+DIAGLA stays on the reference solver: PARSEC itself refuses it
+(`usrinputfile.F90` ierr 126, "to be removed"), it works with blocks of one
+vector and a host decision after every product, its preconditioner
+(`fdo5scl`) is defined on the full-grid neighbour map, and its cost per
+product is that of the device ARPACK above, which is already the slower
+solver on the device.
+
+Validation (A100, 1 and 4 GPUs, against `reference_main.py` on the same
+input): ARPACK on the four sectors of H2O, total energy within 1.3e-13 Ry and
+eigenvalues within 3.1e-11 Ry; with `Chebyshev_Filtering` and a criterion of
+1e-8 Ry 4.3e-14 Ry and 4.5e-9 Ry; spin-polarized H2O (full grid) 1.3e-13 Ry
+and 3.3e-11 Ry. CH4: the occupied levels within 1.5e-12 Ry; the reference
+ARPACK on the full grid misses the third copy of the empty t2 level, which
+the sectors split (0.1006 Ry against 0.1529 Ry). `Dynamic_Diag_Tol` with
+CHEBDAV on sectors, criterion 1e-8 Ry: 1.0e-13 Ry and 1.9e-9 Ry (18 against
+24 steps); spin 1.4e-14 Ry and 1.1e-11 Ry. `Fix_Number_Eigenvalues` after a
+restart: 1.4e-13 Ry, occupied levels within 5e-9 Ry (the empty top levels,
+which have no buffer, within 3e-4 Ry). On the full grid (`--symmetry off`)
+every one of these runs gives the SRE history of the reference to the
+printed digits.
+
+First calculations of C185H124 (309 atoms, 1,099,136 points, 605 states,
+four sectors of 274,784 rows) on A100 nodes shared with other requests (the
+seconds are indicative; peaks are those of the process, from nvidia-smi):
+
+| input | 1 GPU: program s, SCF steps, peak MiB | 4 GPUs: program s, peak MiB of the fullest |
+|---|---|---|
+| CHEBDAV (the input) | 12.2, 11, 4,440 | 11.7, 3,334 |
+| `Dynamic_Diag_Tol` | 22.2, 23, 26,380 | 20.7, 23,948 |
+| CHEBFF | 14.6, 20, 4,324 | 15.7, 1,958 |
+| ARPACK + `Chebyshev_Filtering` | 37.4, 11, 3,344 | 21.5, 2,302 |
+| ARPACK in every step | 299, 9, 6,104 | 148, 3,634 |
+| `Fix_Number_Eigenvalues` (restart from the converged file) | 11.9, 1, 6,798 | 10.2, 5,294 |
+| TEST mode | 2.4, 0, 574 | 3.1, 460 |
+
+With the launch profile of the measured series on four GPUs the same
+inputs took 7.7 s (CHEBDAV), 13.7 s (`Dynamic_Diag_Tol`), 17.6 s (ARPACK with
+`Chebyshev_Filtering`), 8.7 s (`Fix_Number_Eigenvalues`) and 1.5 s (TEST
+mode), with the same total energies to the printed digits and peaks within
+0.3 GiB of the plain runs (`Dynamic_Diag_Tol` 1.0 GiB more on its fullest
+GPU).
+ARPACK takes about 4,300 products per sector and SCF step (28 per pair),
+1.8 ms each with its reorthogonalization: 30 s a step on one GPU against
+0.16 to 4.7 s of CHEBDAV/SUBSPACE. The reference path is far slower:
+C35H36 (421,000 points, 130 states, full grid on the host) took 5,046 s of
+SCF with the reference ARPACK against 39 s on one A100 (the same 9 steps and
+total energy to the printed 1e-8 Ry), and 597 s with the reference CHEBDAV
+against 2.9 s. The dynamic tolerance makes the first CHEBDAV solves loose:
+their spectral bracket then grows sectors, in the first step (two sectors,
+157 to 236 states) and again in the fourth (two, 126 to 189), and the
+CHEBDAV restart of a sector after SUBSPACE passes raises the pool from 3.8
+to 24.5 GiB while its arrays take 0.4 GiB. The code before these features,
+driven through the same API, gives the same counts and the same peak: the
+growth path is the existing one, which the default inputs did not reach. A `Fix_Number_Eigenvalues` first solve starts without a
+buffer, so sectors that hold more than their share grow once before the
+counts are fixed (two of four on this cluster).
+
+### Exchange-correlation on the device
+
+`V_xc/device_xc.py` evaluates on a CUDA device the functionals that the
+readable package otherwise evaluates on the host: PW92 (`pl`), X-alpha,
+Wigner, Hedin-Lundqvist, LB94 and Casida-Salahub (`lb`, `cs`), PBE and PW91,
+and the spin forms of PW92, LB94, Casida-Salahub, PBE and PW91 that the loop
+of two spin channels evaluates (`evaluate_spin_xc`). CA-LDA keeps its own
+path, the native C++ evaluator.
+
+- The discretization is that of `parsec_python.V_xc`: the density gradient
+  of `pbe.py` (`density_gradient`: the centered stencil of `Expansion_Order`,
+  zero outside the cluster domain, wrapped around an orthorhombic cell),
+  summed in the order of `scipy.ndimage.correlate1d`, and the GGA potential
+  `df/dn + D.T (2 df/dsigma D n)`, the derivative of the discrete energy.
+  The pointwise formulas of `device_xc_kernels.cu` translate the NumPy ones
+  operation by operation and are compiled with `--fmad=false`; the results
+  differ from the host's only in the last bits of CUDA's elementary
+  functions (`cbrt`, `pow`, `log1p`, `expm1`, `exp`, `asinh`) and in the
+  order of the energy sum: fields to 1e-15 relative, energies of complete
+  calculations to 1e-13 Ry for small molecules.
+- With representation sectors the functional is evaluated once per orbit,
+  from the orbit values at the stencil neighbours of each representative.
+  The GGA flux `2 f_sigma D n` is a vector field: at another point of an
+  orbit it is that of the representative with the signs of the reflection
+  that carries one onto the other (a byte per point of the box). No
+  full-grid field is formed; the host path expands the density to the full
+  grid and averages the three result fields back.
+- The evaluator runs on the device of the Hartree objects
+  (`PARSEC_HARTREE_DEVICE`), the current device where there is none. It
+  keeps the value map of the box (int32), the reflection signs (uint8), the
+  representative positions and the orbit multiplicities there (35 MB for
+  the 677,542 orbits of C795H300) and takes about eleven fields of the
+  values during an evaluation. The SCF loop hands it the host density of
+  each step and receives the potential, energy density and energy.
+- The memory rules of the symmetry sectors count those bytes on that device
+  (since 2026-10-30): the driver names `planned_device_bytes` of the
+  evaluator (what it keeps, the core density and the most fields of one
+  evaluation: 4 to 11 fields unpolarized, 5 to 20 with spin; from the
+  shapes alone, within 1 % and 60 KB of what CuPy's pool holds after an
+  evaluation) to the sector eigensolver (`resident_device_bytes`), whose
+  rule of the state storage (0.974 of a device) and rule that shares a basis
+  (0.85, and the room of a condition helper) add them on the device that
+  holds them. Nothing is named for CA (its evaluator runs on the host) or
+  with `PARSEC_CUPY_XC=off`: those runs count as before. PBE of the
+  nanodiamond series (D2 orbits, A100 of 79.25 GiB): 90 MiB for 3,480
+  electrons, 255 MiB for 10,456, 502 MiB for 23,768, 750 MiB for 39,368;
+  the count of the fullest device of a sector shared by four devices of
+  39,368 electrons goes from 0.6944 to 0.7037 of a device, of 10,456
+  electrons on one device from 0.9763 to 0.9795 (spilled either way), of
+  29,576 on two from 0.7475 to 0.7543: no decision of the measured series
+  changes.
+- Each functional compiles only the kernels it launches (NVRTC, once; CuPy's
+  kernel cache keeps them).
+- Grids: cluster domains and orthorhombic periodic cells. The
+  non-orthogonal grid and wires and slabs keep the host functionals (a
+  Gamma-point wire or slab on the accelerated driver evaluates its functional
+  on the host: a few milliseconds per step, "Periodic features on the
+  device" below).
+
+| `PARSEC_CUPY_XC` | functionals on the device (CuPy backend) |
+| --- | --- |
+| `auto` (unset or empty) | the functionals added for Fortran parity: PW92, X-alpha, Wigner, Hedin-Lundqvist, PW91, LB94, Casida-Salahub, and PBE (since 2026-10-30; it stayed on the host before), unpolarized and spin-polarized, in the accelerated driver (clusters and the Gamma point of an orthorhombic cell); the spin PBE of the reference periodic drivers stays on the host (Periodic features on the device, below) |
+| `on` | the same in the accelerated driver; also the spin PBE of the reference periodic drivers |
+| `off` | none: every functional on the host, as before the device evaluators (PBE: as before 2026-10-30, bit for bit) |
+
+`xc_implementation` among the backend details names the path, for example
+`CuPy float64 discrete-variational PBE on the symmetry orbits` or
+`vectorized NumPy discrete-variational PBE`.
+
+PBE of C795H300 (k06 of `examples/0d_nanodiamonds/gpu_benchmark` with the
+PBE files of `NCPPs/PBE`, C local `d`; D2 sectors, 677,542 orbits; 11 SCF
+steps to 2e-4 Ry; code defaults otherwise; A100 of 80 GB, requests that
+shared the CPUs of a node with others):
+
+| | 1 GPU host | 1 GPU device | 4 GPUs host | 4 GPUs device |
+| --- | --- | --- | --- | --- |
+| one evaluation of the final density | 1.13 s | 3.9 ms | 1.12 s | 3.1 ms |
+| XC of the SCF (initial + 11 steps) | 14.7 s | 0.28 s | 14.2 s | 0.19 s |
+| SCF wall time (`parsec.out`) | 65.6 s | 50.5 s | 51.1 s | 37.9 s |
+| `run_scf` with the download of the final orbitals | 101.7 s | 88.1 s | 86.7 s | 73.2 s |
+| device memory peak (fullest device) | 22,562 MiB | 22,632 MiB | 8,718 MiB | 8,818 MiB |
+
+A second pair, without the evaluations of the first row: XC 15.3 and
+0.18 s, SCF wall time 65.8 and 49.7 s on one GPU, 14.2 and 0.16 s, 51.1 and
+39.0 s on four, the same peaks; on four GPUs the evaluator sat on the first
+device (that of the Hartree objects), the other three peaked alike.
+
+The two paths gave the same SCF history (11 steps, the same residuals to
+four digits), total energies 5.8e-10 Ry apart (-9421.2233762 Ry; the
+Hartree and electron-ion terms of 7e5 and 1.5e6 Ry moved by 3e-9 and
+1.6e-9 Ry), levels at most 1.8e-12 Ry and forces at most 6.5e-13 Ry/bohr
+apart. On these numbers the device became the default for PBE on
+2026-10-30 (it stayed on the host before, because existing calculations
+ran it there); `PARSEC_CUPY_XC=off` gives the former host path bit for bit.
+The change against the host path, laptop (RTX 5070), accelerated CLI, the
+same iterations in every case: water 2.8e-14 Ry (17 steps), spin-polarized
+water 0 Ry in the total and 5e-15 Ry in the levels, C5H12 at 0.30 A 6.3e-13
+Ry, C35H36 at 0.20 A (420,504 points, D2 sectors, 13 steps) 1.3e-11 Ry of
+-441.90 Ry, levels 8.6e-13 Ry. The XC of the C35H36 SCF took 0.021 instead
+of 2.8 s and the SCF 4.6 instead of 7.8 s (two runs each, one at a time);
+water spends 0.01 s instead of 0.04 s (on a first run of a node the PBE
+kernels compile once, about 1 s on the laptop, 0.5 s on an A100 node). The
+reference CLI, CA and the other functionals are unchanged bit for bit.
+
 ### Hartree acceleration
 
 All accelerated backends use an associated-Legendre recurrence for the same
@@ -2668,6 +3023,103 @@ The serial control of the runner keeps
 `0`, and `full` for `PARSEC_CUPY_DENSITY_COLLECTION` and `serial` for
 `PARSEC_CUPY_DENSITY_RELEASE` (`MULTI_GPU.md`).
 
+### Periodic features on the device
+
+Wires and slabs (`Boundary_Conditions: wire`/`slab`), the reciprocal-space
+Hartree potential (`Calc_Hartree_G`), Fortran's G-space local potential
+(`Periodic_Local_Potential: g_space`), the zero-average XC potential
+(`Zero_Average_Vxc`) and collinear spin of a periodic system take these
+device paths:
+
+- A Gamma-point single point of a wire, a slab, or a 3-D cell with
+  `Calc_Hartree_G`, `g_space` or `Zero_Average_Vxc` runs on the accelerated
+  driver (`SCF/periodic_routes.py`): the reference periodic preparation, the
+  CuPy eigensolver on the sparse operator, and the Hartree solve of the
+  prepared system. k-points, spin, forces, relaxation and molecular dynamics
+  of these inputs, and a restart of a wire or slab, stay with the reference
+  CLI (`_reference_only_features`), whose k-point eigenproblems run on the
+  device workers.
+- `Hartree/periodic_device.py` solves on the device, for every driver, the
+  wire and slab Hartree problem (the cylindrical moments of `hartset_wire`,
+  the plane moments of `hartset_slab` and the boundary series as products of
+  the readable tables, `8 pi n - A_IB V_B`, and the CG recurrence of
+  `Hartree.poisson`), the spectral solve of `Calc_Hartree_G` (CuPy FFT) and,
+  since 2026-10-30 by default, the finite-difference CG of an orthorhombic
+  3-D cell, through the hooks of `Hartree.confined` and `Hartree.pbc`; it
+  runs where the k-point plan puts eigenproblems on a CUDA device (and so
+  also in the accelerated driver's Gamma-point path of a cell, which solves
+  with the readable periodic CG).
+- `V_xc/device_xc.py::ZeroAverageXC` removes the average of a device XC
+  potential of a 3-D cell with `Zero_Average_Vxc`, as the readable
+  `evaluate_xc` does (`potshift`).
+- `V_xc/periodic_xc.py` evaluates the spin functionals of a periodic cell in
+  the reference spin drivers on the device, by `PARSEC_CUPY_XC`: the
+  functionals added for Fortran parity by default, PBE only with `on`
+  (`HOST_UNLESS_ASKED`: the accelerated driver takes PBE to the device by
+  default since 2026-10-30, these drivers do not follow it), CA on the
+  host.
+- A Gamma-only spin run of a wire or slab takes the 1x1x1 k-point driver on
+  the device, as a 3-D cell does (`cli.py::_gamma_spin_on_kpoint_driver`).
+
+| switch | values |
+| --- | --- |
+| `PARSEC_PERIODIC_HARTREE` | `auto` (default) and `device`: wire, slab and `Calc_Hartree_G` solves and the finite-difference CG of an orthorhombic 3-D cell on the device (the CG of a cell by default since 2026-10-30, `device` only before; it changes periodic results by the CG tolerance); `host`: every solve on the host (for a plain 3-D cell the former default, bit for bit) |
+| `PARSEC_CUPY_XC` | `on` also puts the spin PBE of a periodic cell on the device (not the default, also since PBE takes the device in the accelerated driver): the kernel of `pbe_spin`, which differs from the complex-step `pbe_spin_polarized` of the k-point and Gamma spin drivers by about 5e-10 Ry (bcc Fe) |
+| `PARSEC_PERIODIC_HARTREE_BATCH` | CG iterations per batch without a host synchronization (default 8) |
+| `PARSEC_WIRE_SLAB_GAMMA_SPIN` | `gamma` keeps the Gamma-only spin run of a wire or slab on the Gamma driver |
+
+The device CG (`FusedConjugateGradient`, `Hartree/periodic_device_cg.cu`)
+runs the recurrence of `Hartree.poisson` in five kernels per iteration (the
+CSR product in SciPy's row order fused with `p.Ap`, dot products reduced in a
+fixed order) and in batches of 8 iterations without a host synchronization;
+the host then applies the stopping test, the breakdown rule and the budget
+iteration by iteration and updates the solution with exactly the accepted
+iterations, so iteration counts and solutions are those of the sequential
+recurrence. The results equal the host solves to round-off where the CG is
+converged tightly (1e-13 Ry); at the default relative tolerance 1e-7 of
+`hpotcg` the two iterate paths stop at different points within it, up to
+8e-8 Ry in the total energy of a wire (polyacetylene) and 1e-8 for a slab.
+
+The CG of an orthorhombic 3-D cell runs there by default since 2026-10-30
+(`PARSEC_PERIODIC_HARTREE=host` gives the host CG bit for bit). Laptop
+(RTX 5070), against the host CG: the Si8 cube at h 0.35 (24,389 points) with
+the criterion at 1e-10 moves by -8e-12 Ry (accelerated Gamma path) and
+-1.2e-11 Ry (reference CLI), levels by at most 1.1e-10 Ry; at the input's own
+criterion (1e-7) the SCF stops at another step (38 against 25 steps, 1.2e-9
+Ry). The Hartree subtotal of its SCF fell from 2.12 to 0.19 s (0.056 to 0.008
+s per step) and the SCF from 3.5 to 1.2 s; `examples/3d_Si` (12,167 points)
+0.28 to 0.06 s of Hartree; the 8 k-points of the Si8 cube on the device
+workers 2.07 to 0.29 s of Hartree in 57 s of SCF. Wires and slabs are
+unchanged (their solves were on the device before).
+
+The preparation of an orthorhombic cell (`V_ion/periodic_setup.py`, installed
+with the package, both CLIs) sums the radial functions of the atom images out
+to where their terms stop being nonzero or above round-off
+(`PARSEC_PERIODIC_SETUP_REACH=physical`, the default since 2026-10-30);
+`table`, the default before, sums to the end of the radial tables (about 118
+bohr), bit for bit the readable definitions. Laptop: `examples/3d_Si` prepares
+in 0.20 instead of 5.2 s, the Si8 cube at h 0.35 in 0.30 instead of 10.3 s;
+total energies move by 1e-12 to 1.2e-11 Ry. Wires, slabs and oblique cells
+keep the readable sums.
+
+SCF seconds on one A100 (runs that shared the CPUs of a node; code
+defaults, warm CuPy cache), before -> after:
+
+| input | SCF before | SCF now |
+| --- | --- | --- |
+| graphene slab (2 C), Gamma, 20,736 points | 7.31 (host eigensolver and Hartree) | 0.93 |
+| H2 slab, Gamma, 36,864 points | 13.61 | 0.95 |
+| polyacetylene wire, Gamma, 23,744 points | 7.82 | 0.82 |
+| polyacetylene wire, 4 k-points | 7.35 (Hartree 3.49) | 3.64 (Hartree 0.17) |
+| Si2 wire, spin, Gamma | 4.94 (Gamma spin driver) | 1.81 (1x1x1 k-point driver) |
+| Si8 cube, Gamma, `Calc_Hartree_G` | 14.19 | 1.55 |
+| Si8 cube, Gamma, plain, `PARSEC_PERIODIC_HARTREE=device` (the default since 2026-10-30) | 3.03 (host CG) | 1.52 |
+
+A first run with an empty CuPy kernel cache compiles the kernels of the
+accelerated eigensolver, the device workers and these solves (20-45 s on a
+shared A100 node); the device Hartree's own share is 6 kernels (one module for
+the CG).
+
 ## Selection, fallback, and provenance
 
 An explicitly requested `scipy`, `native`, or `cupy` backend is a strict,
@@ -2743,11 +3195,11 @@ parsec_python/acceleration/
 ├── Laplacian/      Exact-key lazy full-grid finite-difference descriptor
 ├── Hamiltonian/    Backend-bound matrix-free Hamiltonian API
 ├── Eigensolvers/   CuPy full-grid and representation-sector eigensolvers
-├── Hartree/        Fast multipoles plus SciPy/native/CuPy Poisson solvers
+├── Hartree/        Fast multipoles plus SciPy/native/CuPy Poisson solvers, the device wire/slab/Calc_Hartree_G solves
 ├── Symmetry/       Reflection orbits, characters, sector stencils, projected operators
 ├── Occupations/    Fused device-resident orbital-density construction
 ├── V_ion/          Native radial local/density/KB setup wrappers
-├── V_xc/           Cached native CA/PZ-LDA evaluator
+├── V_xc/           Cached native CA/PZ-LDA evaluator, CuPy evaluators of the other functionals (also periodic spin)
 ├── SCF/            Reference SCF composition with backend substitution
 ├── Output/         Reference report plus backend provenance/statistics
 ├── native/         Optional CMake/pybind11 C++17/OpenMP extension

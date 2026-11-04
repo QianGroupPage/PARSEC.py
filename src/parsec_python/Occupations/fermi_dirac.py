@@ -35,6 +35,7 @@ def fermi_occupations(
     max_iterations: int = 100,
     degeneracy_tolerance: float = 1.0e-12,
     degeneracy: float = 2.0,
+    weights: np.ndarray | None = None,
 ) -> OccupationResult:
     """Occupy states with PARSEC's ``f_i in [0,1]`` convention.
 
@@ -44,7 +45,25 @@ def fermi_occupations(
     orbitals -- e.g. by pooling both channels' eigenvalues into one call for
     a spin-polarized calculation's single shared Fermi level (``flevel.f90``),
     then splitting the returned ``occupations`` back by channel.
+
+    ``weights`` (one per eigenvalue, in the same sorted order) are per-state
+    weights, the k-point weight of each pooled level as in ``flevel.f90``
+    (``weight(jj,isp) = kpwt(kplp)``): the electron count is
+    ``degeneracy * sum_i w_i f_i``.  ``None`` (the default) is the unweighted
+    count of every existing caller, computed exactly as before; see
+    :func:`weighted_fermi_occupations`.
     """
+    if weights is not None:
+        return weighted_fermi_occupations(
+            eigenvalues,
+            weights,
+            electron_count,
+            temperature_kelvin,
+            count_tolerance=count_tolerance,
+            max_iterations=max_iterations,
+            degeneracy_tolerance=degeneracy_tolerance,
+            degeneracy=degeneracy,
+        )
     eigenvalues = np.asarray(eigenvalues, dtype=float)
     if eigenvalues.ndim != 1 or eigenvalues.size == 0:
         raise ValueError("eigenvalues must be a nonempty one-dimensional array")
@@ -159,6 +178,139 @@ def fermi_occupations(
     )
 
 
+def weighted_fermi_occupations(
+    eigenvalues: np.ndarray,
+    weights: np.ndarray,
+    electron_count: float,
+    temperature_kelvin: float = 80.0,
+    *,
+    count_tolerance: float = 1.0e-12,
+    max_iterations: int = 100,
+    degeneracy_tolerance: float = 1.0e-12,
+    degeneracy: float = 2.0,
+) -> OccupationResult:
+    """:func:`fermi_occupations` with a weight per state (Fortran ``flevel.f90``).
+
+    Each level ``i`` of the sorted ``eigenvalues`` holds at most
+    ``degeneracy * w_i`` electrons; the Fermi level ``mu`` solves
+    ``sum_i w_i f((e_i - mu)/kT) = N / degeneracy`` (``flevel.f90:225-262``:
+    ``enum = sum f * weight``, tolerance ``1e-12``, ``|beta (e - mu)| > 35``
+    cut-offs, at most 100 bisection steps).  The bisection is the one of
+    :func:`fermi_occupations` (bracket ``[e_min - 36 kT, e_max + 36 kT]``,
+    midpoints), so equal weights ``w`` give the levels of
+    ``fermi_occupations(..., degeneracy=degeneracy*w)`` to round-off.  At zero
+    temperature the levels are filled in order, a group of degenerate levels
+    sharing one fractional occupation.  The returned occupations are the
+    ``f_i`` in ``[0, 1]``, without the weights.
+    """
+
+    eigenvalues = np.asarray(eigenvalues, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if eigenvalues.ndim != 1 or eigenvalues.size == 0:
+        raise ValueError("eigenvalues must be a nonempty one-dimensional array")
+    if weights.shape != eigenvalues.shape:
+        raise ValueError("weights must hold one value per eigenvalue")
+    if not np.all(np.isfinite(eigenvalues)):
+        raise ValueError("eigenvalues must be finite")
+    if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+        raise ValueError("state weights must be finite and non-negative")
+    if np.any(np.diff(eigenvalues) < 0):
+        raise ValueError("eigenvalues must be sorted")
+    if not np.isfinite(degeneracy) or degeneracy <= 0:
+        raise ValueError("degeneracy must be a positive finite number")
+    capacity = float(np.sum(weights))
+    if (
+        not np.isfinite(electron_count)
+        or electron_count < 0
+        or electron_count > degeneracy * capacity * (1.0 + 1.0e-12)
+    ):
+        raise ValueError("electron count exceeds the available degenerate states")
+    if not np.isfinite(count_tolerance) or count_tolerance <= 0:
+        raise ValueError("occupation tolerances must be finite and nonnegative")
+    if int(max_iterations) != max_iterations or max_iterations < 1:
+        raise ValueError("max_iterations must be a positive integer")
+    if not np.isfinite(temperature_kelvin):
+        raise ValueError("temperature must be finite")
+    target = float(electron_count) / degeneracy
+
+    if temperature_kelvin == 0:
+        occupations = np.zeros_like(eigenvalues)
+        remaining = target
+        index = 0
+        frontier_start = frontier_stop = 0
+        while index < eigenvalues.size and remaining > count_tolerance:
+            scale = max(1.0, abs(float(eigenvalues[index])))
+            stop = index + 1
+            while (
+                stop < eigenvalues.size
+                and abs(float(eigenvalues[stop] - eigenvalues[index]))
+                <= degeneracy_tolerance * scale
+            ):
+                stop += 1
+            group_weight = float(np.sum(weights[index:stop]))
+            group_occupation = 1.0 if group_weight <= 0.0 else min(1.0, remaining / group_weight)
+            occupations[index:stop] = group_occupation
+            remaining -= group_occupation * group_weight
+            frontier_start, frontier_stop = index, stop
+            index = stop
+        if target <= 0:
+            fermi_level = float(eigenvalues[0])
+        elif np.all(occupations >= 1.0 - count_tolerance):
+            fermi_level = float(eigenvalues[-1])
+        elif frontier_stop >= eigenvalues.size or np.any(
+            (occupations[frontier_start:frontier_stop] > count_tolerance)
+            & (occupations[frontier_start:frontier_stop] < 1.0 - count_tolerance)
+        ):
+            fermi_level = float(eigenvalues[frontier_start])
+        else:
+            fermi_level = float(
+                0.5 * (eigenvalues[frontier_stop - 1] + eigenvalues[frontier_stop])
+            )
+        return OccupationResult(
+            fermi_level=fermi_level,
+            occupations=occupations,
+            electron_count=float(degeneracy * np.dot(weights, occupations)),
+        )
+    if temperature_kelvin < 0:
+        raise ValueError("negative-temperature file occupations are not supported")
+    if target == 0:
+        return OccupationResult(float(eigenvalues[0]), np.zeros_like(eigenvalues), 0.0)
+    if target >= capacity:
+        raise ValueError(
+            "finite-temperature occupations require at least one buffered unoccupied state"
+        )
+
+    kbt = BOLTZMANN_RYDBERG_PER_KELVIN * temperature_kelvin
+    lower = float(eigenvalues[0] - 36.0 * kbt)
+    upper = float(eigenvalues[-1] + 36.0 * kbt)
+    occupations = _fermi_function(eigenvalues, 0.5 * (lower + upper), kbt)
+    previous_chemical_potential: float | None = None
+    count = float(np.dot(weights, occupations))
+    for _ in range(max_iterations):
+        chemical_potential = 0.5 * (lower + upper)
+        if chemical_potential == previous_chemical_potential:
+            # The bisection cannot narrow further (the count is as close as
+            # floating point allows); keep the last occupations.
+            break
+        previous_chemical_potential = chemical_potential
+        occupations = _fermi_function(eigenvalues, chemical_potential, kbt)
+        count = float(np.dot(weights, occupations))
+        if abs(count - target) <= count_tolerance:
+            break
+        if count < target:
+            lower = chemical_potential
+        else:
+            upper = chemical_potential
+    else:
+        raise RuntimeError("Fermi-level bisection did not reach the electron-count tolerance")
+
+    return OccupationResult(
+        fermi_level=float(0.5 * (lower + upper)),
+        occupations=occupations,
+        electron_count=float(degeneracy * np.dot(weights, occupations)),
+    )
+
+
 def density_from_orbitals(
     wavefunctions: np.ndarray,
     occupations: np.ndarray,
@@ -194,4 +346,5 @@ __all__ = [
     "OccupationResult",
     "density_from_orbitals",
     "fermi_occupations",
+    "weighted_fermi_occupations",
 ]

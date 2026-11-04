@@ -59,11 +59,15 @@ from .pbe import (
     _DENSITY_THRESHOLD,
     _GAMMA,
     _KF_COEFFICIENT,
-    _embed_active,
     _exchange_partials,
-    _gather_active,
+    _from_box,
+    _is_periodic,
+    _oblique_divergence_adjoint,
+    _oblique_gradient,
+    _oblique_mix,
     _pw92_g,
     _pw92_unpolarized,
+    _to_box,
     first_derivative_coefficients,
 )
 
@@ -272,16 +276,49 @@ def pbe_spin(
     )
     if up.shape != (grid.size,):
         raise ValueError("PBE densities do not match the active real-space grid")
+    return discrete_spin_gga(up, down, grid, pbe_spin_energy_partials)
+
+
+def discrete_spin_gga(
+    up: np.ndarray,
+    down: np.ndarray,
+    grid,
+    partials,
+) -> SpinXCResult:
+    """Spin GGA energy and exact discrete potentials of two spin densities.
+
+    ``partials(n_up, n_down, sigma_uu, sigma_dd, sigma)`` returns ``f`` and
+    its derivatives with respect to the five variables (Hartree), with
+    ``sigma_ss = |D n_s|**2`` and ``sigma = |D (n_up + n_down)|**2``, as
+    :func:`pbe_spin_energy_partials` does.  The potentials are the
+    derivatives of ``h**3 * sum_i f_i``,
+
+    ``v_s = df/dn_s + D.T @ (2 df/dsigma_ss D n_s + 2 df/dsigma D n)``,
+
+    returned in Rydberg with the energy.  ``up`` and ``down`` already
+    include half of any frozen core density.  An isolated cluster is
+    zero-padded outside its domain and a periodic grid wraps around, as in
+    :func:`parsec_python.V_xc.pbe.density_gradient`.  On a non-orthogonal
+    periodic grid the gradients are the lattice-direction derivatives made
+    Cartesian, as in :func:`parsec_python.V_xc.pbe.discrete_gga`.
+    """
+
+    if getattr(grid, "is_general_periodic", False):
+        return _spin_gga_general_periodic(up, down, grid, partials)
+    mix = _oblique_mix(grid)
+    if mix is not None:
+        return _spin_gga_oblique(up, down, grid, partials, mix)
 
     weights = first_derivative_coefficients(grid.settings.expansion_order)
     weights = weights / grid.spacing
+    boundary = "wrap" if _is_periodic(grid) else "constant"
 
     def gradient(values: np.ndarray) -> np.ndarray:
-        box = _embed_active(values, grid)
+        box = _to_box(values, grid)
         components = np.empty((3, grid.size), dtype=np.float64)
         for axis in range(3):
-            components[axis] = _gather_active(
-                correlate1d(box, weights, axis=axis, mode="constant", cval=0.0),
+            components[axis] = _from_box(
+                correlate1d(box, weights, axis=axis, mode=boundary, cval=0.0),
                 grid,
             )
         return components
@@ -296,7 +333,7 @@ def pbe_spin(
         f_sigma_up,
         f_sigma_down,
         f_sigma_total,
-    ) = pbe_spin_energy_partials(
+    ) = partials(
         up,
         down,
         np.einsum("ij,ij->j", gradient_up, gradient_up),
@@ -307,14 +344,14 @@ def pbe_spin(
     def potential(f_density, f_sigma, spin_gradient) -> np.ndarray:
         values = f_density.copy()
         for axis in range(3):
-            flux = _embed_active(
+            flux = _to_box(
                 2.0 * f_sigma * spin_gradient[axis]
                 + 2.0 * f_sigma_total * gradient_total[axis],
                 grid,
             )
             # D.T = -D for the antisymmetric centered stencil.
-            values += _gather_active(
-                correlate1d(flux, -weights, axis=axis, mode="constant", cval=0.0),
+            values += _from_box(
+                correlate1d(flux, -weights, axis=axis, mode=boundary, cval=0.0),
                 grid,
             )
         return values
@@ -329,4 +366,100 @@ def pbe_spin(
     )
 
 
-__all__ = ["pbe_spin", "pbe_spin_energy_partials", "pw92_spin_correlation"]
+def _spin_gga_oblique(up: np.ndarray, down: np.ndarray, grid, partials, mix: np.ndarray) -> SpinXCResult:
+    """:func:`discrete_spin_gga` on a periodic grid of the default routines with oblique (or unequal) steps.
+
+    The derivatives along the grid axes in index units mixed into Cartesian ones by ``C``
+    (:func:`parsec_python.V_xc.pbe._oblique_gradient`) and their exact transpose, as
+    :func:`parsec_python.V_xc.pbe.pbe_spin_polarized` does there.  (Without it the Cartesian stencil with the
+    shortest step was applied to the grid axes: 3e-3 Ry off for an fcc cell.)
+    """
+
+    weights = first_derivative_coefficients(grid.settings.expansion_order)
+    gradient_up = _oblique_gradient(up, grid, weights, mix)
+    gradient_down = _oblique_gradient(down, grid, weights, mix)
+    gradient_total = gradient_up + gradient_down
+    (
+        energy_hartree,
+        f_up,
+        f_down,
+        f_sigma_up,
+        f_sigma_down,
+        f_sigma_total,
+    ) = partials(
+        up,
+        down,
+        np.einsum("ij,ij->j", gradient_up, gradient_up),
+        np.einsum("ij,ij->j", gradient_down, gradient_down),
+        np.einsum("ij,ij->j", gradient_total, gradient_total),
+    )
+
+    def potential(f_density, f_sigma, spin_gradient) -> np.ndarray:
+        fluxes = 2.0 * f_sigma[None, :] * spin_gradient + 2.0 * f_sigma_total[None, :] * gradient_total
+        return f_density + _oblique_divergence_adjoint(fluxes, grid, weights, mix)
+
+    energy_density = 2.0 * energy_hartree
+    return SpinXCResult(
+        potential_up=2.0 * potential(f_up, f_sigma_up, gradient_up),
+        potential_down=2.0 * potential(f_down, f_sigma_down, gradient_down),
+        energy_density=energy_density,
+        total_energy=float(grid.volume_element * np.sum(energy_density)),
+    )
+
+
+def _spin_gga_general_periodic(
+    up: np.ndarray, down: np.ndarray, grid, partials
+) -> SpinXCResult:
+    """:func:`discrete_spin_gga` on a non-orthogonal periodic grid (``GeneralPeriodicGrid``).
+
+    The gradients are the wrapped lattice-direction derivatives made
+    Cartesian by ``inv(A_n)^T`` (Fortran ``gradmvs``), the potentials use their
+    exact transpose (:mod:`parsec_python.Laplacian.nonorthogonal`).
+    """
+
+    from ..Laplacian.nonorthogonal import (
+        cartesian_gradient,
+        cartesian_gradient_transpose,
+    )
+
+    weights = first_derivative_coefficients(grid.settings.expansion_order)
+    gradient_up = cartesian_gradient(up, grid, weights)
+    gradient_down = cartesian_gradient(down, grid, weights)
+    gradient_total = gradient_up + gradient_down
+    (
+        energy_hartree,
+        f_up,
+        f_down,
+        f_sigma_up,
+        f_sigma_down,
+        f_sigma_total,
+    ) = partials(
+        up,
+        down,
+        np.einsum("ij,ij->j", gradient_up, gradient_up),
+        np.einsum("ij,ij->j", gradient_down, gradient_down),
+        np.einsum("ij,ij->j", gradient_total, gradient_total),
+    )
+
+    def potential(f_density, f_sigma, spin_gradient) -> np.ndarray:
+        flux = (
+            2.0 * f_sigma[None, :] * spin_gradient
+            + 2.0 * f_sigma_total[None, :] * gradient_total
+        )
+        return f_density + cartesian_gradient_transpose(flux, grid, weights)
+
+    energy_density = 2.0 * energy_hartree
+    return SpinXCResult(
+        potential_up=2.0 * potential(f_up, f_sigma_up, gradient_up),
+        potential_down=2.0 * potential(f_down, f_sigma_down, gradient_down),
+        energy_density=energy_density,
+        total_energy=float(grid.volume_element * np.sum(energy_density)),
+    )
+
+
+__all__ = [
+    "discrete_spin_gga",
+    "pbe_spin",
+    "pbe_spin_energy_partials",
+    "pw92_spin_correlation",
+]

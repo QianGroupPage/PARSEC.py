@@ -80,10 +80,10 @@ python src\parsec_python\reference_main.py calculation\parsec.in --no-archive
 | `MLDensity/` | Load or predict optional ML initial densities (SCDP, ChargE3Net, custom bridges) on the exact DFT grid or a box; `ml_density.py` is its command line. |
 | `Grid/` | Build centered isolated sphere or box grids. |
 | `Laplacian/` | Generate high-order finite-difference coefficients and sparse `-nabla^2`. |
-| `Pseudopotential/` | Read Martins-new `POTRE.DAT` and old-format `POTR.DAT`, integrate radial data, and reproduce PARSEC splines. |
+| `Pseudopotential/` | Read Martins-new `POTRE.DAT`, old-format `POTR.DAT`, Martins-Wang `POTRW.DAT` and FHI98PP `FHIPP.DAT`, integrate radial data, reproduce PARSEC splines and Fourier filters. |
 | `V_ion/` | Assemble local ionic fields, KB nonlocal factors, initial atomic density, and ion-ion energy. |
 | `Hartree/` | Construct open-boundary data and solve the finite-difference Poisson equation. |
-| `V_xc/` | Evaluate CA/PZ LDA or PBE, without or with spin polarization, and their energy terms. |
+| `V_xc/` | Evaluate the functional of `Correlation_Type` (CA/PZ, PW92, X-alpha, Wigner, Hedin-Lundqvist, PBE, PW91, LB94, Casida-Salahub), without or with spin polarization, and their energy terms. |
 | `Hamiltonian/` | Apply the matrix-free Kohn--Sham operator. |
 | `Eigensolvers/` | Readable CHEBFF, CHEBDAV, subspace, filtering, orthogonalization, and Ritz primitives. |
 | `Occupations/` | Determine Fermi occupations and rebuild the density. |
@@ -149,9 +149,17 @@ Currently supported:
   Fermi distribution;
 - separable Kleinman--Bylander nonlocal projectors;
 - optional nonlinear core correction;
-- CA/PZ LDA and PBE;
+- every `Correlation_Type` of Fortran PARSEC: CA/PZ, PW92 (`pl`, the
+  default with spin polarization), Slater X-alpha (`xa`), Wigner (`wi`) and
+  Hedin-Lundqvist (`hl`) LDA, PBE and PW91 (`pw`) GGA, and the LB94 (`lb`)
+  and Casida-Salahub (`cs`, with `Ion_Energy_Diff`) potential corrections of
+  CA ([V_xc/selection.py](V_xc/selection.py));
 - collinear spin polarization of isolated systems (`Spin_Polarization: true`)
-  with both functionals, see [Spin polarization](#spin-polarization);
+  with every functional but `xa`, `wi` and `hl`, which have no spin form, see
+  [Spin polarization](#spin-polarization);
+- LDA+U of the d channel (`ldaplusu_u`, `ldaplusu_j` per species) and the
+  Tkatchenko--Scheffler dispersion correction (`Van_Der_Waals`), see
+  [LDA+U and the TS dispersion correction](#ldau-and-the-ts-dispersion-correction);
 - one post-SCF evaluation of the B3LYP energy on the converged orbitals of an
   isolated system (`Energy_Refinement: b3lyp`), see
   [Energy refinement by a hybrid functional](#energy-refinement-by-a-hybrid-functional);
@@ -164,17 +172,86 @@ Currently supported:
   `manual`) and molecular dynamics of isolated systems, on every execution
   path including several GPU nodes, with `relax_restart.dat` exchanged with
   PARSEC in both directions; see
-  [FORCES_AND_RELAXATION.md](FORCES_AND_RELAXATION.md).
+  [FORCES_AND_RELAXATION.md](FORCES_AND_RELAXATION.md);
+- the same for periodic cells without spin-orbit coupling, at the Gamma point or with k-points (spin-polarized ones at the
+  Gamma point): on the readable solver (`main.py` hands such an input to it), for a spin-unpolarized Gamma-point cell on the
+  accelerated path, and with k-points on the GPUs of the k-point solver, see "Periodic cells" and "On GPUs" in that document;
+- the same for self-consistent spin-orbit coupling (`SO_from_scratch`, alone or with `Spin_Polarization`) and non-collinear
+  magnetism, isolated or periodic (Gamma point or k-points), on the readable solver, see "Spin-orbit coupling and
+  non-collinear magnetism" in that document.
+- With `Use_Fortran_Routines: .true.` (and for the inputs that run on those routines by default - slabs, shifted bulk grids, forces of a bulk cell at the
+  Gamma point on a grid both sets share with Cubic_Spline species, bulk cells whose space group sets Fortran's grid -
+  or by themselves, see
+  `Input/routines.py`), the Fortran-derived routines:
+  - the total charge and dipole of an isolated system after every SCF loop
+    (`dipole.f90`), the static polarizability from PARSEC's seven finite-field
+    SCF loops (`Polarizability`, `Electric_Field`, file `polar.dat`), fixed
+    point charges (`Add_Point_Charges`, with their energy and forces) and the
+    point-group symmetrization of the density of a cluster
+    (`Symmetrize_Charge_Density`); these three run on the reference solver;
+  - wire and slab cells (`Boundary_Conditions: wire` / `slab`, PARSEC's 1-D
+    and 2-D periodic boundary conditions with `Boundary_Sphere_Radius` the
+    radius of the cylinder or half height of the slab, charged sheets of a slab
+    with `add_charged_sheets`): Fortran's grid, the Hartree boundary values of
+    `hartset_wire`/`hartset_slab`, the Gaussian-compensated local potential,
+    the wire ion-ion and slab Ewald energies, Gamma-point and k-point SCF
+    (collinear spin too), band structures, forces (also with collinear spin
+    and weighted or irreducible k-points), relaxation and molecular dynamics
+    (`Relaxation.wire_slab_backend`), Fortran's space group of a wire or slab
+    (`alatt` with `4 rmax` along the confined directions; a slab has none
+    unless bands, spin-orbit or NSCF turn it on) with `Monkhorst_Pack_Shift`
+    and `Symmetrize_Charge_Density`, `Polarizability`, parsec.dat with
+    `Restart_Run` and `nscf_kpoints`, `Super_Cell`/`Super_Cell_Vac`,
+    `Create_DOS` and LDA+U (at Gamma, with k-points, spin and bands; the
+    Bloch projectors replicate along the periodic directions), on the reference solver
+    (`SCF/wire_slab.py`).
+  - PARSEC's k-point machinery for periodic cells: with a `Monkhorst_Pack_Shift`
+    block the Monkhorst-Pack grid is Fortran's `((i-1)+s)/n`, reduced to the
+    irreducible wedge by the space group (found as `symmetries.f90` does) and
+    time reversal, with PARSEC's tables and `qpoints.dat`, and the density is
+    symmetrized over the space group (`Symmetrize_Charge_Density`, then true by
+    default); weighted `Kpoint_List` rows; reference solver only.  Without the
+    shift block the unreduced grid of earlier versions is kept.
+  - in every SCF driver (cluster, Gamma, k-points, periodic spin, spin-orbit,
+    non-collinear): `Dynamic_Diag_Tol` (off with `Restart_Run`, as PARSEC),
+    `Save_Intermediate_Charge_Density` / `Save_Intermediate_Eigenvalues`
+    (`parsec.dat` and `eigen.dat` after every iteration),
+    `Fix_Number_Eigenvalues` with `Restart_Run` (the eigensolver keeps the
+    stored `States_Num` states, no buffer); `nscf_kpoints` of a spin-orbit run
+    (from its spinor `parsec.dat`, `Spin_z` of every state); PARSEC's symmetry
+    report (`symchk`, Abelian subgroup and character table, the
+    multiplication tables at `Output_Level >= 2`) and ion-ion force table for
+    every run (`Grid/symmetry_analysis.py`; report only, the fields stay on the
+    full grid);
+  - forces, relaxation and molecular dynamics of periodic cells at Gamma and
+    with k-points (also collinear spin, an irreducible wedge completed over the
+    space group, `Double_Grid_Order > 1`) and of the spin-orbit
+    (`SO_from_scratch`) and non-collinear drivers, isolated or periodic, on
+    the reference solver; on a GPU the accelerated command line runs those of
+    an orthorhombic bulk cell at Gamma (no spin) on its own path and builds
+    the ionic fields of every orthorhombic bulk cell whose atoms move, and
+    their forces, on the device
+    ([FORCES_AND_RELAXATION.md](FORCES_AND_RELAXATION.md#periodic-cells)).
 
 Not currently supported as production physics:
 
 - periodic boundary conditions;
 - spin polarization of periodic cells, spin--orbit coupling and
   non-collinear magnetism;
-- forces, relaxation and molecular dynamics of periodic cells;
+- forces, relaxation and molecular dynamics of the perturbative spin-orbit correction (`SO_PSP` without `SO_from_scratch`), of
+  spin-polarized periodic cells with k-points, of spin-polarized periodic cells and spin-orbit or non-collinear inputs on
+  the accelerated path, and of periodic k-point cells on several nodes;
 - self-consistent hybrid functionals, meta-GGA functionals and DFT+U;
 - PARSEC restart files other than `relax_restart.dat` and `mdinit.dat`;
 - Ono--Hirose double-grid order greater than one.
+- With `Use_Fortran_Routines: .true.` (and for the inputs that run on those routines by default - slabs, shifted bulk grids, forces of a bulk cell at the
+  Gamma point on a grid both sets share with Cubic_Spline species, bulk cells whose space group sets Fortran's grid -
+  or by themselves, see
+  `Input/routines.py`), the Fortran-derived routines:
+  - forces with the perturbative spin-orbit correction (`SO_PSP` without
+    `SO_from_scratch`);
+  - self-consistent hybrid functionals and meta-GGA functionals;
+  - PARSEC restart files other than `relax_restart.dat` and `mdinit.dat`.
 
 Unsupported requested input is rejected rather than silently approximated.
 Sphere Hartree boundaries use a multipole expansion; box boundaries use the
@@ -451,6 +528,14 @@ These controls alter only the nonlinear convergence path.  They do not alter
 the Kohn--Sham equations, energy functional, or convergence criterion.  Leave
 `Mixing_Safeguard` absent or false for a line-by-line PARSEC mixer comparison.
 
+PARSEC's other mixers are available with its keywords and defaults:
+`Mixing_Method: broyden` (the generalized Broyden mixer of `genbro.f90`,
+with `Mixing_Param`, `Memory_Param` and `Restart_Mixing`) and
+`Mixing_Method: msecant1`, `msecant2` or `msecant3` (the Type-I, Type-II and
+hybrid multisecant mixers of `msecant1-3.f90`, with `Mixing_Group_Size`,
+`Mixing_EN_Like`, `Mixing_Restart_Factor`, `Mixing_Memory_Expand_Factor` and
+`Mixing_Preferred_Type`).  The safeguard belongs to the Anderson mixer only.
+
 ### Energy refinement by a hybrid functional
 
 ```text
@@ -507,9 +592,9 @@ and timings: [`examples/0_CH4_CF4/python_pbe_b3lyp`](../../examples/0_CH4_CF4/py
 `Spin_Polarization: true` solves an isolated system with two collinear spin
 channels, as PARSEC does: one potential and one eigenproblem per channel,
 one Fermi level, and the exchange-correlation functional of the two spin
-densities. `Correlation_Type` must be given, `ca` (local spin density,
-Perdew-Zunger) or `pbe`; without the line PARSEC uses the Perdew-Wang LSDA,
-which is not implemented.
+densities. Without a `Correlation_Type` line the functional is the
+Perdew-Wang LSDA (`pl`), as in PARSEC; `ca`, `pbe`, `pw`, `lb` and `cs` have
+spin forms too, `xa`, `wi` and `hl` are refused.
 
 ```text
 Spin_Polarization: true
@@ -541,8 +626,9 @@ multi-node runner refuses a spin-polarized input unless it runs in one
 process (`--serial-control`). Periodic cells are refused.
 
 With `ca`, energies, levels and forces agree with Fortran PARSEC to the
-digits it prints. With `pbe` they differ as they do without spin, because
-this package uses the potential of the discrete energy. A state with an
+digits it prints, and so do `pl`, `lb` and `cs`. With `pbe` and `pw` they
+differ as they do without spin, because this package uses the potential of
+the discrete energy. A state with an
 empty spin channel (a hydrogen atom, any one-electron system) is an ordinary
 calculation here; in Fortran PARSEC it does not converge with `ca` and loses
 its exchange energy with `pbe`. Two things are not unique in either program:
@@ -551,6 +637,73 @@ shell such as the oxygen atom at the default temperature, for which
 occupations fixed in `occup.in` give a reproducible state. Details:
 [`PYTHON_IMPLEMENTATION.md`](PYTHON_IMPLEMENTATION.md#spin-polarized-calculations)
 and [`PARSEC_ALGORITHM.md`](PARSEC_ALGORITHM.md#spin-polarized-calculations).
+
+## LDA+U and the TS dispersion correction
+
+`ldaplusu_u` and `ldaplusu_j` (per `Atom_Type`, an energy, default unit Ry)
+add PARSEC's on-site term of the d channel (`upot.F90`): five projectors per
+atom, the radial pseudo-wavefunction of the d channel of the file times the
+real d harmonics, cut at the radius that holds 95 % of its norm and not
+renormalized. From the second SCF iteration on, the occupation matrices of
+the orbitals of the iteration before give the potential matrix
+`D = -U N + 2J (P3:N + P4:N') + (U-J)/2` and the energy `LDA+U Energy` that
+is added to the electronic energy; `parsec.out` shows the two terms of
+`calcden.f90z` every iteration, as PARSEC does. A species whose file has no
+d channel keeps no term (a warning says so, PARSEC ignores it silently). The
+n-th `ldaplusu_u` line goes to the n-th `Atom_Type`, as ESDF hands it out;
+a line that would land on another species than the one it stands under is
+refused.
+
+```text
+Atom_Type: Zn
+Local_Component: s
+ldaplusu_u 5.0 eV
+```
+
+The term runs in the scalar loops (isolated, isolated spin-polarized,
+periodic Gamma-point and periodic spin-polarized cells), in the scalar and
+collinear-spin k-point loops with Bloch projectors (`SCF/kpoint_hubbard.py`;
+PARSEC's own k-point form is only right at k = 0), in the band structures of
+their converged Hamiltonians and with `Energy_Refinement`. `main.py` runs a
+cluster with `ldaplusu_j = 0`, unpolarized or spin-polarized, on the
+accelerated driver, with the term in its device Hamiltonians (also in the
+symmetry sectors and on several GPUs) and its occupation matrices and forces
+formed where the orbitals are (`acceleration/README.md`, "LDA+U and the TS
+correction"), and so it runs a bulk cell at the Gamma point, with its forces,
+relaxations and dynamics. Its k-point and periodic spin runs go to the
+reference solver, whose k-point workers apply the term in their device Bloch
+operators and form the occupation matrices from their device orbitals when a
+GPU is visible; so do its band structures and the Gamma-point spin runs of a
+wire or slab (the 1x1x1 k-point driver). A `J` term stays on the reference
+solver's CPU path, and the other wire and slab runs on the reference solver.
+A wire or slab has it in the
+same drivers, its Bloch projectors replicated along the periodic directions
+alone (`nreplica(1:per)` of `upot.F90`) and the occupations of an irreducible
+wedge averaged over its group of `alatt` (PARSEC's k-point LDA+U of a wire
+stops in `upot`). Spin-orbit coupling and non-collinear magnetism are
+refused with it (PARSEC's spinor path is not a spinor LDA+U). Forces,
+relaxation and molecular dynamics work with `ldaplusu_j = 0` and without
+k-points, with the derivative of the projectors (PARSEC's own LDA+U forces
+are zero, see `forcnloc_u`); with `ldaplusu_j` or k-points they are refused,
+because PARSEC's J term (its P3/P4 tensors applied to the real d harmonics)
+is not the derivative of its energy and the Bloch projector gradients are
+not written.
+
+`Van_Der_Waals: true` adds the Tkatchenko--Scheffler energy of the converged
+density (`efvdw.f90`) to the total energy of the report after convergence
+(`TS-vDW correction (included)`) and its forces to the forces, after every
+SCF driver (k-points, periodic spin, spin-orbit and non-collinear loops too;
+not for wires and slabs, where PARSEC needs a bulk cell). It needs
+`Correlation_Type: pbe` and `Ignore_Symmetry: true`, as in PARSEC; a periodic
+cell reads `Hf_One`, `Hf_Two` and `Hf_Three`, the Hirshfeld cells. The
+Hirshfeld volumes are those of the structure of each SCF loop (PARSEC keeps
+those of the input structure). On a GPU `main.py` forms the Hirshfeld sums
+and the pair sum on the device: of a cluster and of a bulk cell at the Gamma
+point on the accelerated driver (single points, forces, relaxations and
+dynamics), and of a bulk cell in every periodic driver
+of the reference solver whose eigenproblems run on the GPU (with its
+Hirshfeld cells and lattice shells); a cluster on the reference solver keeps
+the host sums.
 
 ## Pseudopotentials
 
@@ -566,7 +719,18 @@ functions only, so the input supplies the rest, as for Fortran PARSEC:
 (the radius of the projectors). The SiNa4 relaxation test of Fortran PARSEC
 (`tests/relaxation`) uses one.
 
-Pseudopotentials and the selected XC functional must be consistent. The
+`Pseudopotential_Format: martins_wang` reads `<Atom_Type>_POTRW.DAT`, which
+names its channels, occupations, ionic charge and local channel itself: the
+input gives only `Core_Cutoff_Radius` and no `Local_Component`.
+`Pseudopotential_Format: fhipp` reads an FHI98PP `<Atom_Type>_FHIPP.DAT`
+with `Potential_Num`, `Local_Component`, `Core_Cutoff_Radius`,
+`Electron_Per_Orbital` and, for its core density,
+`Nonlinear_Core_Correction: .true.`. As in Fortran PARSEC, the n-th
+occurrence of such a label goes to the n-th Atom_Type that reads it.
+
+Pseudopotentials and the selected XC functional must be consistent: a file
+generated for another functional is refused with `ca` and `pbe`, and used
+with a warning with the other functionals, as Fortran PARSEC warns. The
 solver can read converted norm-conserving UPF data, but conversion does not by
 itself validate transferability, ghost states, relativistic content, or
 core-hole suitability.

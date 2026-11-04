@@ -171,15 +171,56 @@ void local_force_chunks(
 """
 
 _COMPILED: dict[int, object] = {}
+_COMPILED_DIRECT: dict[int, object] = {}
 
 
-def _kernel(cp):
+def _direct_kernel_source() -> str:
+    """``local_force_chunks`` with a per-species flag ``parameters[8*kind+7]``.
+
+    A flagged species (``Old_Interpolation_Format`` without cubic spline)
+    takes the potential slope from the linear interpolation of ``dV/dr``
+    itself (``forcloc.f90:201-203``), the table it is given, instead of
+    ``r**2 * dV/dr`` divided by ``r**2``.  Every other rule is that of the
+    ordinary kernel.  Only calculations with the option compile it.
+    """
+
+    replacements = (
+        ("void local_force_chunks(", "void local_force_chunks_direct("),
+        (
+            "    const bool splined = parameters[7 * kind + 6] != 0.0;\n",
+            "    const bool splined = parameters[7 * kind + 6] != 0.0;\n"
+            "    const bool direct = parameters[7 * kind + 7] != 0.0;\n",
+        ),
+        (
+            "                potential_slope = (l_table[index]\n"
+            "                    + step * (l_table[index + 1] - l_table[index])) / (r * r);\n",
+            "                potential_slope = l_table[index]\n"
+            "                    + step * (l_table[index + 1] - l_table[index]);\n"
+            "                if (!direct) potential_slope /= (r * r);\n",
+        ),
+    )
+    source = _KERNEL
+    for old, new in replacements:
+        if source.count(old) != 1:
+            raise RuntimeError(f"the local force kernel source changed near {old!r}")
+        source = source.replace(old, new)
+    # Eight parameters per species.
+    return source.replace("parameters[7 * kind + ", "parameters[8 * kind + ")
+
+
+def _kernel(cp, direct: bool = False):
     device = int(cp.cuda.Device().id)
-    if device not in _COMPILED:
-        kernel = cp.RawKernel(_KERNEL, "local_force_chunks", options=("--std=c++11",))
+    compiled = _COMPILED_DIRECT if direct else _COMPILED
+    if device not in compiled:
+        if direct:
+            kernel = cp.RawKernel(
+                _direct_kernel_source(), "local_force_chunks_direct", options=("--std=c++11",)
+            )
+        else:
+            kernel = cp.RawKernel(_KERNEL, "local_force_chunks", options=("--std=c++11",))
         kernel.compile()
-        _COMPILED[device] = kernel
-    return _COMPILED[device]
+        compiled[device] = kernel
+    return compiled[device]
 
 
 def cupy_local_forces(
@@ -223,12 +264,15 @@ def cupy_local_forces(
     offsets, counts, parameters = [], [], []
     radii, valence_table = [], []
     local_table, local_second, core_table, core_second = [], [], [], []
+    # One flag per species: Old_Interpolation_Format without cubic spline.
+    direct: list[float] = []
     cursor = 0
     for symbol in symbols:
         potential = potentials[symbol]
         specification = specifications[symbol]
         tables = species_force_tables(potential, specification)
         samples = potential.radii
+        direct.append(0.0)
         offsets.append(cursor)
         counts.append(samples.size)
         cursor += samples.size
@@ -256,6 +300,13 @@ def cupy_local_forces(
             else:
                 core_table.append(zeros)
                 core_second.append(zeros)
+        elif getattr(specification, "old_interpolation", False):
+            # Old_Interpolation_Format: dV/dr itself is interpolated.
+            local_table.append(tables.local_potential_derivative)
+            local_second.append(zeros)
+            core_table.append(tables.core_density_derivative if has_core else zeros)
+            core_second.append(zeros)
+            direct[-1] = 1.0
         else:
             local_table.append(tables.local_potential_derivative * samples * samples)
             local_second.append(zeros)
@@ -272,6 +323,9 @@ def cupy_local_forces(
                 1.0 if specification.use_spline else 0.0,
             ]
         )
+    use_direct = any(direct)
+    if use_direct:
+        parameters = [row + [flag] for row, flag in zip(parameters, direct)]
 
     positions = np.array(
         [atoms[index].position for index in on_device], dtype=np.float64
@@ -307,7 +361,7 @@ def cupy_local_forces(
             sum_atoms(first, last)
 
     def sum_atoms(first, last):
-        kernel = _kernel(cp)
+        kernel = _kernel(cp, use_direct)
         device = {
             "coordinates": cp.asarray(coordinates),
             "density": cp.asarray(fields[0]),
@@ -367,7 +421,7 @@ def cupy_local_forces(
         # threads find their kernels instead of compiling side by side.
         for device_number in dict.fromkeys(device_ids):
             with cp.cuda.Device(device_number):
-                _kernel(cp)
+                _kernel(cp, use_direct)
         with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
             list(executor.map(part, enumerate(device_ids)))
     result *= grid.volume_element

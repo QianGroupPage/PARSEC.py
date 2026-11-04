@@ -16,8 +16,9 @@ from typing import Callable
 import numpy as np
 
 from ..Forces import atom_symmetry_operations, operations_preserving
-from ..V_ion import center_cluster_geometry
+from ..V_ion import center_cluster_geometry, center_slab_geometry
 from ..models import Atom
+from .backend import moved_atoms
 from .files import (
     RelaxRestart,
     parse_manual_structures,
@@ -45,8 +46,9 @@ def restart_structure(translation, directory: Path, source: Path | None = None):
     The coordinates of a ``relax_restart.dat`` are used as they are: they
     were recentred by the run that wrote them, and the state of its optimizer
     refers to them.  An XYZ file stands for the ``Atom_Coord`` blocks of the
-    input: its structure is recentred as theirs is (not in a ``manual`` run),
-    so that a file of any program can be given.
+    input: its structure is recentred as theirs is (not in a ``manual`` run;
+    a slab along z as ``initial.f90:201-228``, not in a restart), so that a
+    file of any program can be given.
     """
 
     settings = translation.relaxation
@@ -88,9 +90,18 @@ def restart_structure(translation, directory: Path, source: Path | None = None):
         restart = parse_relax_restart(text, atom_count)
         positions = restart.positions
         recenter = False
-    atoms = tuple(
-        Atom(atom.symbol, position) for atom, position in zip(problem.atoms, positions)
+    # the atoms keep their other fields with Andrew Grieder's routines (parsec_python.Input.routines)
+    atoms = moved_atoms(
+        problem.atoms, positions, not getattr(getattr(translation, "routines", None), "fortran", False)
     )
+    slab_shift = 0.0
+    if (
+        restart is None
+        and getattr(problem.grid, "periodicity", 3) == 2
+        and getattr(settings, "method", "") != "manual"
+        and not getattr(translation, "restart_run", False)
+    ):
+        atoms, slab_shift = center_slab_geometry(atoms)
     notes.append(
         "WARNING: atom coordinates in input were replaced by coordinates in "
         f"{source.name}"
@@ -101,7 +112,9 @@ def restart_structure(translation, directory: Path, source: Path | None = None):
         else:
             restart = replace(restart, lbfgsb=None)
     translation = replace(
-        translation, problem=replace(problem, atoms=atoms, recenter_geometry=recenter)
+        translation,
+        problem=replace(problem, atoms=atoms, recenter_geometry=recenter),
+        slab_shift=slab_shift,
     )
     return translation, restart, notes
 
@@ -187,6 +200,7 @@ def run_recorded_relaxation(
         movable=translation.movable,
         directory=directory,
         elements=elements,
+        warm_starts=getattr(backend, "warm_starts", True),
     )
     try:
         return run_relaxation(

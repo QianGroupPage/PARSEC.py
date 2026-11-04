@@ -22,7 +22,12 @@ from typing import Any
 
 import numpy as np
 
-from parsec_python.SCF.kpoint_solver import KPointJob, residual_max
+from parsec_python.SCF.kpoint_solver import (
+    KPointJob,
+    device_solver_supports,
+    job_eigval_settings,
+    residual_max,
+)
 
 from ..Eigensolvers.chebff_spinor import solve_spinor_eigval
 from ..Hamiltonian.device_bloch import NumpyArrayBackend
@@ -63,12 +68,25 @@ class MPIKPointSolver:
         key = f"worker_{name}_seconds"
         self._stats[key] = self._stats.get(key, 0.0) + time.perf_counter() - start
 
-    def solve(self, potentials: dict, filter_degree: int) -> list[np.ndarray]:
-        """One eigenvalue array per task; the same on every rank."""
+    def solve(
+        self, potentials: dict, filter_degree: int, tolerance: float | None = None
+    ) -> list[np.ndarray]:
+        """One eigenvalue array per task; the same on every rank.
+
+        ``tolerance`` replaces ``Diag_Tolerance`` for this call (``Dynamic_Diag_Tol``: the
+        residual test of a converged first solve).
+        """
+        settings = job_eigval_settings(self.job, filter_degree, tolerance)
+        if not device_solver_supports(settings):
+            # ARPACK and DIAGLA are host eigensolvers of the whole basis; the distributed basis
+            # has no host route.
+            raise NotImplementedError(
+                f"Eigensolver: {settings.initial_method} is not implemented with the MPI-distributed "
+                "k-point solver (chebff or chebdav), run without --mpi"
+            )
         # the drivers are replicated: stop with a message, not a deadlock, if they ever diverge
         checksum = float(sum(float(np.sum(np.asarray(v, dtype=float))) for v in potentials.values()))
         self.context.check_equal(checksum, "the effective potentials", 1.0e-9)
-        settings = self.job.eigval_settings(filter_degree)
         backend = self.backend
         backend.use()
         eigenvalues = []

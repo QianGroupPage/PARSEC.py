@@ -1,3 +1,7 @@
+
+# With both sets of routines: the periodic grids of this module are those of the Fortran-derived routines
+# (PeriodicGridSettings(fortran_routines=True), as Use_Fortran_Routines: .true. gives); the numbers checked
+# here are those of the Fortran parity round.
 from __future__ import annotations
 
 from pathlib import Path
@@ -27,7 +31,7 @@ def _hydrogen_box(side_length: float, spacing: float) -> SinglePointInput:
     return SinglePointInput(
         atoms=[Atom("H", [center, center, center])],
         pseudopotentials={"H": SpeciesPotential(_H_POTRE, 0)},
-        grid=PeriodicGridSettings(spacing=spacing, expansion_order=4),
+        grid=PeriodicGridSettings(fortran_routines=True, spacing=spacing, expansion_order=4),
         periodic_cell=cell,
         scf=SCFSettings(max_iterations=40, number_of_states=3, convergence_criterion=1.0e-5),
         hartree=HartreeSettings(
@@ -43,7 +47,7 @@ class SinglePointInputPeriodicValidationTests(unittest.TestCase):
             SinglePointInput(
                 atoms=[Atom("H", [0.0, 0.0, 0.0])],
                 pseudopotentials={"H": SpeciesPotential(_H_POTRE, 0)},
-                grid=PeriodicGridSettings(spacing=0.6),
+                grid=PeriodicGridSettings(fortran_routines=True, spacing=0.6),
             )
 
     def test_periodic_input_requires_periodic_grid_settings(self) -> None:
@@ -69,16 +73,18 @@ class PreparePeriodicSinglePointTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prepare_periodic_single_point(stripped)
 
-    def test_rejects_atom_outside_cell(self) -> None:
+    def test_translates_atom_outside_cell_into_it(self) -> None:
+        # Every periodic sum runs over images: an atom outside the cell is
+        # moved into it by a lattice vector instead of being refused.
         cell = PeriodicCell(lattice_vectors=6.0 * np.eye(3))
         problem = SinglePointInput(
             atoms=[Atom("H", [-0.5, 3.0, 3.0])],
             pseudopotentials={"H": SpeciesPotential(_H_POTRE, 0)},
-            grid=PeriodicGridSettings(spacing=0.6, expansion_order=4),
+            grid=PeriodicGridSettings(fortran_routines=True, spacing=0.6, expansion_order=4),
             periodic_cell=cell,
         )
-        with self.assertRaises(ValueError):
-            prepare_periodic_single_point(problem)
+        system = prepare_periodic_single_point(problem)
+        np.testing.assert_array_equal(system.atoms[0].position, [5.5, 3.0, 3.0])
 
 
 class RunPeriodicSinglePointTests(unittest.TestCase):

@@ -1,0 +1,55 @@
+{
+  "schema": "parsec_python.nanodiamond_optimization.v1",
+  "case": "k04_C185H124",
+  "xtb_version": "6.7.1pre 5071a88",
+  "threads": 28,
+  "charge": 0,
+  "unpaired_electrons": 0,
+  "stages": [
+    {
+      "name": "01_gfnff",
+      "method": "GFN-FF",
+      "optimization_level": "normal",
+      "command": [
+        "input.xyz",
+        "--gfnff",
+        "--chrg",
+        "0",
+        "--uhf",
+        "0",
+        "--opt",
+        "normal"
+      ],
+      "wall_seconds": 0.557380899990676,
+      "final_energy_hartree": -59.239828158528,
+      "final_gradient_norm_hartree_per_bohr": 0.000685775155,
+      "converged": true
+    },
+    {
+      "name": "02_gfn2",
+      "method": "GFN2-xTB",
+      "optimization_level": "tight",
+      "command": [
+        "input.xyz",
+        "--gfn",
+        "2",
+        "--chrg",
+        "0",
+        "--uhf",
+        "0",
+        "--opt",
+        "tight"
+      ],
+      "wall_seconds": 9.287964599992847,
+      "final_energy_hartree": -462.182317836196,
+      "final_gradient_norm_hartree_per_bohr": 0.000336478514,
+      "converged": true
+    }
+  ],
+  "final_structure": "structure_gfn2.xyz",
+  "original_files_modified": false,
+  "geometry_audit_passed": true,
+  "mass_weighted_rmsd_from_ideal_angstrom": 0.029203615243174157,
+  "maximum_displacement_from_ideal_angstrom": 0.06941826941901452,
+  "total_wall_seconds": 9.845345499983523
+}

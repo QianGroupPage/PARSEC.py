@@ -33,6 +33,11 @@ sectors. Geometries:
 - k08 to k14 are cut from the ideal diamond lattice, terminated with hydrogen
   and not relaxed.
 
+`structures/` shows how each geometry was made: the lattice cut, the GFN-FF
+and GFN2-xTB optimization and, for k05 to k07, a projection onto the exact
+point group, with the scripts, xyz files, xTB summaries and the commands that
+reproduce them ([`structures/README.md`](structures/README.md)).
+
 k06 appears in both folders with the same atoms. The two inputs differ in
 solver controls and in the Hartree boundary (see the notes below), so their
 total energies differ by 3.2e-2 Ry. The benchmark inputs use first-step filter

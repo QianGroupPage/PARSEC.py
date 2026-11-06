@@ -6,9 +6,10 @@ GPUs. They are the measurements behind the two GPU tables of `../README.md`.
 
 ## How they were measured
 
-- Code: `master` 0f47a3f of 23 October 2026, default settings, double
-  precision, first calculations (no symmetry cache), the inputs of
-  `gpu_benchmark/` (sphere 5 Angstrom beyond the outermost atom). Besides the
+- Code: the code of 5 November 2026, default settings (among them
+  `Chebyshev_Degree_Decrease_After` 4), double precision, first calculations
+  (no symmetry cache), the inputs of `gpu_benchmark/` (sphere 5 Angstrom beyond
+  the outermost atom, `FF_MaxIter: 3`). Besides the
   settings of the launch script, 30 of the 32 runs set
   `PARSEC_CUPY_SECTOR_STATE_STORAGE=device` and
   `PARSEC_CUPY_LARGE_PROBLEM_ALLOCATOR=pool` (the basis on the GPUs, the CuPy
@@ -18,17 +19,17 @@ GPUs. They are the measurements behind the two GPU tables of `../README.md`.
   7763; one MPI rank per node with 32 CPUs and 16 OpenMP threads, launched with
   `scripts/run_multi_gpu_scf.sh`. 1, 2 and 4 GPUs use one node; 8 and 16 GPUs
   use two and four nodes, the four nodes of the 16-GPU runs under one network
-  switch. Before the runs the Python environment, the sources and the CuPy
-  kernel cache were copied to the node-local `/tmp` of every node; inputs and
-  outputs stayed on the project file system. On Perlmutter, since its
-  maintenance of 21 October 2026, reading them from the project file system
-  (CFS) added 1 to 3 s to the first SCF step of runs on four nodes, at times.
-- One measured run per configuration after a warm-up run (k09 on 1 GPU and k10
-  on 2 GPUs, with the storage of the basis left to the code: the second of two
-  runs on a node; the first run on a freshly prepared node took 22 to 31 s
-  longer, in its first Hartree solve and its first eigensolve). Every run
-  converged in the same number of SCF steps as the outputs in
-  `gpu_benchmark/`, with total energies within 2e-7 Ry of them.
+  switch (two of them for the 8-GPU runs). Before the runs the Python
+  environment, the sources, the CuPy kernel cache and the inputs were copied to
+  the node-local `/tmp` of every node; the CUDA driver cache (`CUDA_CACHE_PATH`)
+  and the outputs were node-local too. On Perlmutter, since its maintenance of
+  21 October 2026, reading the software from the project file system (CFS)
+  added 1 to 3 s to the first SCF step of runs on four nodes, at times.
+- One measured run per configuration after a warm-up run of the same
+  configuration (k09 on 1 GPU and k10 on 2 GPUs, with the storage of the basis
+  left to the code: the second of two runs on a node). The runs on 16 GPUs are
+  the outputs in `gpu_benchmark/`; at every GPU count a case converged in the
+  same number of SCF steps, with total energies within 1e-10 Ry of them.
 - Program time runs from the end of input parsing to the final report. Peak
   GPU memory is the largest value `nvidia-smi` showed on the fullest GPU,
   sampled every 200 ms, including the CUDA context and the cache of the CuPy
@@ -53,15 +54,15 @@ Each figure is in `figures/` as PNG and PDF.
 
 ## What they show
 
-- **Time.** With the basis in GPU memory a complete calculation takes 5.7 s
-  (k06 on 16 GPUs) to 225 s (k14 on 16 GPUs). At a fixed number of GPUs the
-  program time grows as N^1.52 (16 GPUs) to N^1.77 (2 GPUs) in the number of
+- **Time.** With the basis in GPU memory a complete calculation takes 4.9 s
+  (k06 on 16 GPUs) to 209 s (k14 on 16 GPUs). At a fixed number of GPUs the
+  program time grows as N^1.55 (1 GPU) to N^1.79 (2 GPUs) in the number of
   electrons N, and as N^1.76 above 10,000 electrons on 16 GPUs.
-- **Where the time goes.** The Chebyshev filter (sparse) grows as N^1.80. The
-  dense products of the Rayleigh-Ritz step grow faster (Gram matrices N^2.38,
-  rotation N^2.66, on 16 GPUs), so their share of the program time rises from
-  5 % for k06 to 47 % for k14. Copies of the basis between the GPUs of a sector
-  take 11 to 15 % of the program time on 16 GPUs. Part of these copies runs
+- **Where the time goes.** The Chebyshev filter (sparse) grows as N^1.81. The
+  dense products of the Rayleigh-Ritz step grow faster (Gram matrices N^2.34,
+  rotation N^2.68, on 16 GPUs), so their share of the program time rises from
+  6 % for k06 to 47 % for k14. Copies of the basis between the GPUs of a sector
+  take 11 to 14 % of the program time on 16 GPUs. Part of these copies runs
   beside the Gram products; the stage seconds count both in full, so for the
   largest clusters the shares add up to about the whole program time.
 - **Memory.** The dense basis (grid points by states, per symmetry sector) must
@@ -73,11 +74,11 @@ Each figure is in `figures/` as PNG and PDF.
   of one node, so a
   system with four sectors stops at 16 GPUs: on 80 GB cards at about 43,400
   electrons, 10 % above k14. By extrapolation a cluster of 100,000 electrons
-  would take about 36 minutes on 16 GPUs, but needs 293 GiB of basis per GPU,
+  would take about 33 minutes on 16 GPUs, but needs 293 GiB of basis per GPU,
   3.7 times what an 80 GB card has.
 - **Basis in host memory.** k09 does not fit on one card with this input: the
   code keeps its basis in page-locked host memory and moves one sector at a
-  time to the GPU (348 s, against 91 s on two GPUs).
+  time to the GPU (359 s, against 87 s on two GPUs).
 
 ## Data
 

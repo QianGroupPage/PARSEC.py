@@ -23,14 +23,16 @@ input. Energy per atom in eV and largest force in Ry/bohr of every structure:
 | 0 | -155.04550, 0.22661 | -155.04550, 0.22661 |
 | 1 | -154.56606, 0.21984 | -154.56607, 0.21984 |
 | 2 | -155.26126, 0.08884 | -155.26126, 0.08884 |
-| 3 | -155.31577, 0.08506 | -155.31577, 0.08506 |
-| 4 | -155.42371, 0.10606 | -155.42368, 0.10614 |
-| 5 | -155.46132, 0.03881 | -155.46129, 0.03882 |
-| 6 | -155.47162, 0.01352 | -155.47162, 0.01352 |
+| 3 | -155.31577, 0.08506 | -155.31577, 0.08505 |
+| 4 | -155.42371, 0.10606 | -155.42422, 0.10540 |
+| 5 | -155.46132, 0.03881 | -155.46147, 0.03862 |
+| 6 | -155.47162, 0.01352 | -155.47161, 0.01389 |
 
 The input leaves the SCF criterion at PARSEC's default of 2e-4 Ry, so the two
 codes stop their SCF loops at slightly different points and the last digits
-differ. With `Convergence_Criterion: 1.0e-8` and `Max_Iter: 200` added, all
+differ (this package: code of 5 November 2026, where the Chebyshev degree of
+the later SCF steps may decrease after the fourth step instead of the fifth).
+With `Convergence_Criterion: 1.0e-8` and `Max_Iter: 200` added, all
 seven energies agree in every printed digit, the largest forces within 1e-5
 Ry/bohr and the coordinates within 1e-6 bohr.
 

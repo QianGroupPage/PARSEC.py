@@ -23,15 +23,17 @@ python src\parsec_python\main.py examples\h2_canonical_nodg\parsec.in --no-archi
 ```
 
 The calculation writes a PARSEC-style text report to `parsec.out` in
-this directory. With the native CHEBFF-first/SUBSPACE-later implementation,
-the completed calculation converged in 21 SCF iterations:
+this directory. The retained `parsec_python.out` is this command with
+`--log parsec_python.out`, run with the code of 5 November 2026 on a laptop
+GPU (RTX 5070). With the native CHEBFF-first/SUBSPACE-later implementation,
+the calculation converged in 20 SCF iterations:
 
 | Quantity | Python result |
 |---|---:|
 | Total energy | -2.13713415 Ry |
-| Occupied eigenvalue | -0.7196931667 Ry |
-| Plain SRE | 0.0131434491 |
-| Charge-weighted SRE | 0.0000846232 |
+| Occupied eigenvalue | -0.7195787674 Ry |
+| Plain SRE | 0.0082850657 |
+| Charge-weighted SRE | 0.0000675130 |
 
 The report follows PARSEC's organization and labels for the grid, atoms,
 pseudopotential, eigenstates, SCF iterations, energy decomposition, and SRE
@@ -46,12 +48,12 @@ strict reproduction test** because the double-grid orders differ:
 | Quantity | Python, DG=1 | Stock PARSEC, DG=3 | Python - PARSEC |
 |---|---:|---:|---:|
 | Total energy [Ry] | -2.13713415 | -2.13713410 | -0.00000005 |
-| Occupied eigenvalue [Ry] | -0.7196931667 | -0.7194900830 | -0.0002030837 |
-| Eigenvalue energy [Ry] | -1.43938633 | -1.43898017 | -0.00040616 |
-| Hartree energy [Ry] | 2.49249032 | 2.49240374 | 0.00008658 |
-| Integral of `Vxc*rho` [Ry] | -1.63985025 | -1.63979721 | -0.00005304 |
-| Exchange-correlation energy [Ry] | -1.25639533 | -1.25635504 | -0.00004029 |
-| Electron-ion energy [Ry] | -6.74628231 | -6.74608367 | -0.00019864 |
+| Occupied eigenvalue [Ry] | -0.7195787674 | -0.7194900830 | -0.0000886844 |
+| Eigenvalue energy [Ry] | -1.43915753 | -1.43898017 | -0.00017736 |
+| Hartree energy [Ry] | 2.49245281 | 2.49240374 | 0.00004907 |
+| Integral of `Vxc*rho` [Ry] | -1.63982846 | -1.63979721 | -0.00003125 |
+| Exchange-correlation energy [Ry] | -1.25637871 | -1.25635504 | -0.00002367 |
+| Electron-ion energy [Ry] | -6.74621360 | -6.74608367 | -0.00012993 |
 | Ion-ion energy [Ry] | 1.41113867 | 1.41113867 | 0.00000000 |
 
 PARSEC currently segfaults in its `nonloc` routine before SCF when this

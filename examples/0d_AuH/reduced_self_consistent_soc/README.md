@@ -22,8 +22,9 @@ Note: Fortran PARSEC's own input parser hard-rejects (`ierr=151`,
 `parsec_fortran.in` sets `Spin_Polarization: .true.` despite PARSEC.py's
 side not using it. AuH's ground state has zero net magnetic moment in both
 codes, so the comparison is still meaningful: the converged self-consistent
-SOC total energy matches to 8.4e-6 Ry (Fortran -68.34107156 Ry vs
-PARSEC.py -68.34106315 Ry), and Kramers double-degeneracy holds to high
-precision in both. Individual eigenvalues agree to ~1e-3 Ry; <S_z> within
-near-degenerate pairs diverges more, same basis-sensitivity caveat as the
-perturbative case.
+SOC total energy matches to 5.0e-6 Ry (Fortran -68.34107156 Ry vs
+PARSEC.py -68.34106654 Ry, PARSEC.py of 5 November 2026,
+`src/parsec_python/reference_main.py parsec.in`), and Kramers
+double-degeneracy holds to high precision in both. Individual eigenvalues
+agree to ~1e-3 Ry; <S_z> within near-degenerate pairs diverges more, same
+basis-sensitivity caveat as the perturbative case.

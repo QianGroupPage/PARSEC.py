@@ -69,6 +69,7 @@ from parsec_python.models import (
     GridSettings,
     HartreeSettings,
 )
+from parsec_python.tests.archives import read_archive
 
 
 DATA = Path(__file__).resolve().parents[1] / "data"
@@ -733,7 +734,7 @@ Correlation_Type: ca
             root = Path(scratch)
             plain = self.run_cli(root / "plain", "--no-archive")
             refined = self.run_cli(root / "refined", "--energy-refinement", "b3lyp")
-            archive = np.load(root / "refined" / "parsec_python_results.npz")
+            archive = read_archive(root / "refined" / "parsec_python_results.npz")
             archive = {name: archive[name] for name in archive.files}
 
         self.assertNotIn("refinement", plain.lower())

@@ -1,7 +1,7 @@
 """Worker pools for k-point and band-path parallelism."""
 
 from . import mpi
-from .blas import set_blas_threads
+from .blas import blas_threads, set_blas_threads
 from .pool import (
     WORKERS_ENV,
     WorkerError,
@@ -16,6 +16,7 @@ __all__ = [
     "WorkerError",
     "WorkerPool",
     "available_cpus",
+    "blas_threads",
     "make_pool",
     "resolve_workers",
     "set_blas_threads",

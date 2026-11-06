@@ -363,7 +363,9 @@ def periodic_geometry_lines(system, translation) -> list[str]:
         )
     problem = getattr(system, "input", None)
     cell = getattr(problem, "periodic_cell", None)
-    if cell is not None and any(
+    # (The Fortran-derived routines translate every atom about the cell centre at start, PARSEC 1.5's
+    # back_to_cell, and the preparation into [0, 1): the note is for atoms the input gave outside [0, 1).)
+    if cell is not None and getattr(translation, "atoms_outside_cell", None) is not False and any(
         not np.array_equal(np.asarray(given.position), np.asarray(placed.position))
         for given, placed in zip(problem.atoms, system.atoms)
     ):
@@ -1300,6 +1302,55 @@ def _mixer_lines(mixing) -> list[str]:
     ]
 
 
+def parsec15_solver_header_lines(eigensolver, scf) -> tuple[str, ...]:
+    """The lines of the PARSEC 1.5 solver options an input sets (none at the defaults).
+
+    The wording of ``usrinputfile.F90`` of 1.5 where 1.5 prints one (Vector
+    Seed, S.M.A.R.T, Scaled Chebyshev, the filter restart); the PARSEC.py
+    extensions say what they select.
+    """
+
+    lines = []
+    seed = getattr(eigensolver, "vector_seed", None)
+    if seed is not None:
+        lines += [" **Vector Seed Specified", f" Vector Seed: {seed:12d}"]
+    if getattr(eigensolver, "exact_state_count", False):
+        lines.append(" Working space of exactly States_Num vectors (Exact_State_Count, PARSEC 1.5)")
+    test = getattr(eigensolver, "first_filter_residual_test", "off")
+    if test != "off":
+        lines.append(
+            " First filter stops when the largest residual is below the diagonalization "
+            f"tolerance ({'stop' if test == 'stop' else 'continue'} after FF_MaxIter cycles)"
+        )
+    if getattr(eigensolver, "scaled_subspace_filter", False):
+        lines.append(" Performing (EXPERIMENTAL) Scaled Chebyshev subspace filtering")
+    rule = getattr(eigensolver, "subspace_lower_bound", "monotone")
+    if rule == "smart":
+        lines.append(" Using (EXPERIMENTAL) S.M.A.R.T adaptive lower filter bound")
+    elif rule == "adaptive":
+        lines.append(" Using the adaptive lower filter bound of PARSEC 1.5 (Smart_Subspace false)")
+    bounds = getattr(eigensolver, "lanczos_bounds", "parsec")
+    if bounds != "parsec":
+        lines.append(
+            f" Lanczos bounds of PARSEC 1.5 ({bounds}), max(degree/2, "
+            f"{getattr(eigensolver, 'lanczos_bound_steps', 10)}) steps"
+        )
+    threshold = getattr(eigensolver, "reorthogonalization_threshold", 0.1)
+    if threshold != 0.1:
+        lines.append(f" Gram-Schmidt reorthogonalization threshold {threshold:8.4f}")
+    after = getattr(scf, "degree_decrease_after", 4)
+    if after != 4:
+        lines.append(f" Chebyshev polynomial degree may decrease after iteration {after:4d}")
+    restart = getattr(eigensolver, "filter_restart", None)
+    if restart is not None:
+        lines += [
+            f" Will restart from scratch after {restart[0]:12d} ionic steps",
+            f" restart_cheb_remained_times {restart[1]:12d}",
+            f" remained_times_atomic_chrg_den {restart[2]:12d}",
+        ]
+    return tuple(lines)
+
+
 def iterative_eigensolver_header_lines(eigensolver) -> tuple[str, ...]:
     """Eigensolver lines of usrinputfile.F90 for ARPACK, DIAGLA and TEST mode."""
 
@@ -1387,10 +1438,19 @@ def fourier_filter_lines(problem) -> tuple[str, ...]:
         getattr(item, "has_fourier_filter", False) for item in species.values()
     ):
         return ()
-    from ..Grid.pbc import adjust_step, uses_general_periodic_grid
+    from ..Grid.pbc import adjust_step, fortran_grid_counts, fortran_orthorhombic_counts
 
-    if uses_general_periodic_grid(cell, problem.grid):
-        # grid%step(1) of Fortran's general grid (adjust_step).
+    if getattr(problem.grid, "fortran_routines", False):
+        counts = fortran_orthorhombic_counts(cell, problem.grid)
+        if counts is None:
+            # grid%step(1) of Fortran's general grid (adjust_step with the space group's translations).
+            spacing = float(fortran_grid_counts(cell, problem.grid)[1][0])
+        else:
+            # the one spacing L_0/n_0 of the orthorhombic grid (Fortran's counts)
+            side = float(np.diag(cell.lattice_vectors)[0])
+            spacing = side / float(counts[0])
+    elif _round_rule_general(cell, problem.grid):
+        # (Andrew Grieder's grid: the lines as they have been printed.)
         spacing = adjust_step(
             float(np.linalg.norm(cell.lattice_vectors[0])), problem.grid.spacing
         )[1]
@@ -1413,6 +1473,25 @@ def fourier_filter_lines(problem) -> tuple[str, ...]:
                 f"  acore = {core:10.4f}"
             )
     return tuple(lines)
+
+
+def _round_rule_general(cell, settings, tolerance: float = 1.0e-6) -> bool:
+    """The test of ``uses_general_periodic_grid`` before PARSEC 1.5's parity round (``round(L/h)`` points), which
+    the Fourier-filter lines of Andrew Grieder's grids keep."""
+
+    from ..Grid.cell import is_diagonal_lattice
+
+    vectors = cell.lattice_vectors
+    if not is_diagonal_lattice(vectors):
+        return True
+    sides = np.diag(vectors)
+    if np.any(sides <= 0.0):
+        return True
+    counts = np.round(sides / settings.spacing).astype(np.int64)
+    if np.any(counts <= 2 * settings.stencil_half_width):
+        return True
+    steps = sides / counts
+    return not np.allclose(steps, steps[0], rtol=tolerance)
 
 
 def _correlation_lines(scf) -> list[str]:
@@ -1789,6 +1868,8 @@ class ParsecTextReporter:
                 else ()
             ),
             f" Buffer size in subspace is {eigensolver.subspace_buffer:6d}",
+            # The PARSEC 1.5 solver options of the input (none by default).
+            *parsec15_solver_header_lines(eigensolver, scf),
             "",
             " Mixer data:",
             " -----------",
@@ -1925,7 +2006,8 @@ class ParsecTextReporter:
                         else "  pseudopotential format : new Martins"
                     ),
                     f"  pseudopotential file   : {potential.source}",
-                    # pseudo.f90 warns and goes on; CA and PBE refuse the file.
+                    # pseudo.f90 warns and goes on; CA and PBE refuse the file (but a CA file
+                    # in a PBE run, as PARSEC 1.5's Tier_xc inputs have).
                     *(
                         ()
                         if pseudopotential_matches_functional(
@@ -2115,6 +2197,10 @@ class ParsecTextReporter:
                 for second in range(periodicity):
                     if first != second and abs(metric[first, second]) > 0.0:
                         shift[first] = 0.0
+        requested = getattr(translation, "grid_shift", None)
+        if requested is not None:
+            # PARSEC 1.5's Grid_Shift block: the shift of the grid (the rule above without it)
+            shift = [float(value) for value in problem.grid.shift]
         relaxation = getattr(translation, "relaxation", None)
         mode = symmetry_search_mode(
             ignore_symmetry=ignore,

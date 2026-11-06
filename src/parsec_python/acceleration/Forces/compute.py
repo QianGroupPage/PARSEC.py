@@ -29,6 +29,7 @@ from parsec_python.Forces import (
     nonlocal_forces,
     point_charge_forces,
 )
+from parsec_python.Forces.total import embedding_force_fields
 
 
 def sector_columns(representations: np.ndarray) -> np.ndarray:
@@ -285,14 +286,16 @@ def compute_forces(
     residual = np.asarray(result.output_effective_potential) - np.asarray(
         result.input_effective_potential
     )
+    # FDET: rho_B + rho_A and V_xc + v_nad (Forces.total.embedding_force_fields).
+    density, xc_potential, embedded = embedding_force_fields(system, result)
     fields = (
         system.grid,
         atoms,
         system.pseudopotentials,
         specifications,
-        result.density,
+        density,
         residual,
-        result.xc_potential,
+        xc_potential,
     )
     if system.backend_info.selected == "cupy":
         from .local_device import (
@@ -339,6 +342,7 @@ def compute_forces(
         phase_seconds=clock,
         **corrections,
         **({} if charged is None else {"point_charge": charged}),
+        **({"keep_net_force": True} if embedded else {}),
     )
     clock["symmetrization"] = perf_counter() - mark
     return replace(forces, seconds=perf_counter() - started)

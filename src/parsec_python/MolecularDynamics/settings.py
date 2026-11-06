@@ -22,8 +22,16 @@ Friction_Coefficient  0          1/a.u.      Langevin friction; below 1e-6 the
                                              run is microcanonical
 Step_num              250        integer     number of time steps
 rng_seed              0          integer     seed, 0 means "from the clock"
+Mol_RNG_Seed          0          integer     PARSEC 1.5's name of ``rng_seed``
 test_rng              .false.    logical     use PARSEC's own simple generator
 ====================  =========  ==========  =====================================
+
+PARSEC 1.5 renamed ``rng_seed`` to ``Mol_RNG_Seed`` (``usrinputfile.F90:4741``)
+with the same meaning: a positive value is put as the seed of the compiler's
+generator before every refill of its buffer (``getrandom``), and it is the
+first state of PARSEC's own generator with ``test_rng``.  1.5 no longer reads
+``rng_seed`` (an input of the previous tree runs there from the clock); this
+port reads both names, and an input that gives both is refused.
 
 Unit rules (``esdf_physical``): a number may be followed by a unit of the
 same dimension as the unit the program asks for; the value is multiplied by
@@ -342,7 +350,14 @@ class MolecularDynamicsSettings:
         if raw is not None:
             values["step_num"] = _esdf_integer("step_num", raw)
         raw = given("rng_seed")
-        if raw is not None:
+        renamed = given("Mol_RNG_Seed")
+        if raw is not None and renamed is not None:
+            raise MolecularDynamicsInputError(
+                "rng_seed and Mol_RNG_Seed are one keyword (PARSEC 1.5 renamed it); give one of them"
+            )
+        if renamed is not None:
+            values["rng_seed"] = _esdf_integer("mol_rng_seed", renamed)
+        elif raw is not None:
             values["rng_seed"] = _esdf_integer("rng_seed", raw)
         raw = given("test_rng")
         if raw is not None:

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from parsec_python.Input import UnsupportedParsecOptionError, parse_parsec_input
+from parsec_python.tests.environment import pin_kpoints_on_the_cpu
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 AG = DATA / "Ag_POTRE.DAT"
@@ -163,7 +164,7 @@ Correlation_Type: CA
 class SpinOrbitCombinationTest(_Directory):
     def setUp(self) -> None:
         super().setUp()
-        os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+        pin_kpoints_on_the_cpu(self)
         for name in ("Au_POTRE.DAT", "H_POTRE.DAT"):
             shutil.copy(AUH / name, self.directory / name)
 
@@ -255,7 +256,7 @@ class IntermediateFilesWithWarmStartsTests(_Directory):
         from parsec_python.Output import output_files
         from parsec_python.cli import main
 
-        os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+        pin_kpoints_on_the_cpu(self)
         written: list[bool] = []
         original = output_files.RunOutputFiles._write_parsec_dat
 

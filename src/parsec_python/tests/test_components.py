@@ -102,10 +102,11 @@ class PhysicsKernelTests(unittest.TestCase):
     def test_occupations_and_density_conserve_electrons(self) -> None:
         eigenvalues = np.array([-1.0, -0.4, 0.2, 0.8])
         occupations = fermi_occupations(eigenvalues, 3.0, 80.0)
-        self.assertAlmostEqual(2.0 * occupations.occupations.sum(), 3.0, places=10)
+        # The pairs are counted to 1e-10 (PARSEC 1.5's flevel.f90:43), the electrons to twice that.
+        self.assertAlmostEqual(2.0 * occupations.occupations.sum(), 3.0, delta=2.0e-10)
         q, _ = np.linalg.qr(np.arange(32, dtype=float).reshape(8, 4) + np.eye(8, 4))
         density = density_from_orbitals(q, occupations.occupations, 0.125)
-        self.assertAlmostEqual(0.125 * density.sum(), 3.0, places=10)
+        self.assertAlmostEqual(0.125 * density.sum(), 3.0, delta=2.0e-10)
 
     def test_zero_temperature_shares_a_degenerate_frontier(self) -> None:
         result = fermi_occupations(

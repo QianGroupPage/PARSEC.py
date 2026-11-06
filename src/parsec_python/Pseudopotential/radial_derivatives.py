@@ -174,16 +174,23 @@ def radial_projector_with_derivative(
     ``dvw`` of ``pseudo.f90``: the stencil acts on the projector before its
     inner samples are replaced, the samples up to Fortran index ``2*mor``
     take the derivative at ``2*mor``, and the last nine are zero.
+
+    For a Fourier-filtered channel both tables are those ``fourier_f.f90``
+    puts in their place at every file radius: the filtered projector
+    (``fint``) and its radial derivative ``dfint`` (PARSEC 1.5
+    ``math/fourier_f.f90:265-268``; the previous tree stored ``fint`` as the
+    slope as well, a bug 1.5 fixed).
     """
 
     if angular_momentum in potential.filtered_projectors:
-        # ``fourier_f.f90`` sets ``dvw`` to the filtered projector itself
-        # (it calls ``fint`` where ``dfint`` was meant).  Forces of periodic
-        # systems, the only ones with filters, are not implemented.
-        raise ValueError(
-            "the radial derivative of a Fourier-filtered projector is not "
-            "implemented"
-        )
+        projector, sign = potential.radial_projector(angular_momentum, local_l)
+        slopes = potential.filtered_projector_slopes
+        if angular_momentum not in slopes:
+            raise ValueError(
+                "the Fourier-filtered projector of "
+                f"l={angular_momentum} carries no radial derivative (dfint)"
+            )
+        return projector, np.array(slopes[angular_momentum], dtype=float), sign
     projector, sign = potential.radial_projector(angular_momentum, local_l)
     delta_v = (
         potential.channel_potentials[angular_momentum]

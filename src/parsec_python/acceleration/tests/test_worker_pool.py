@@ -5,7 +5,14 @@ from __future__ import annotations
 import threading
 import unittest
 
-from parsec_python.acceleration.Parallel import WorkerError, make_pool, resolve_workers
+from parsec_python.acceleration.Parallel import (
+    WorkerError,
+    available_cpus,
+    blas_threads,
+    make_pool,
+    resolve_workers,
+    set_blas_threads,
+)
 
 
 class _Worker:
@@ -86,6 +93,42 @@ class WorkerPoolTests(unittest.TestCase):
         self.assertEqual(resolve_workers(1, 3), 1)
         self.assertEqual(resolve_workers("auto", 1), 1)
         self.assertEqual(resolve_workers("auto", 8, problem_size=100), 1)
+
+
+class _BlasProbe:
+    def __init__(self, tasks, index):
+        self.tasks = tasks
+
+    def threads(self):
+        yield None, blas_threads()
+
+
+class PoolBlasThreadTests(unittest.TestCase):
+    """The workers of a thread pool share a single-threaded BLAS, and closing gives the count back.
+
+    A multi-threaded OpenBLAS called from two workers at once gave wrong eigenpairs on Linux and an
+    access violation on Windows (test_kpoint_parallel.SpinOrbitWarmStartTests with
+    OPENBLAS_NUM_THREADS=4, up to 2026-11-05, when only /proc/self/maps was searched for the BLAS).
+    """
+
+    def test_workers_get_one_thread_and_the_previous_count_returns(self) -> None:
+        import numpy as np  # noqa: F401  (NumPy's BLAS is loaded)
+
+        before = blas_threads()
+        if not before:
+            self.skipTest("no loaded BLAS library tells its thread count")
+        try:
+            set_blas_threads(3)  # a count the pool must give back, not all the CPUs
+            with make_pool(range(4), _BlasProbe, workers=2) as pool:
+                for _, inside in pool.results("threads"):
+                    self.assertEqual(set(inside.values()), {1})
+            self.assertEqual(set(blas_threads().values()), {3})
+            with make_pool(range(4), _BlasProbe, workers=1) as pool:  # inline: the BLAS is not touched
+                for _, inside in pool.results("threads"):
+                    self.assertEqual(set(inside.values()), {3})
+        finally:
+            set_blas_threads(available_cpus(), previous=before)
+        self.assertEqual(blas_threads(), before)
 
 
 if __name__ == "__main__":

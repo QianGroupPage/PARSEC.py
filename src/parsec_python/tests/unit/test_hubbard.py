@@ -61,6 +61,20 @@ def _fortran_source(name: str) -> Path | None:
     return None
 
 
+def _fortran15_source(relative: str) -> Path | None:
+    """The PARSEC 1.5 source file ``relative`` (e.g. ``potential/upot.F90``), else ``None``."""
+
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        for directory in (
+            parent / "f15" / "src",
+            parent / ".tmp" / "parity15_20261104" / "f15" / "src",
+        ):
+            if (directory / relative).is_file():
+                return directory / relative
+    return None
+
+
 def _fortran_rc(potential) -> float:
     """The loop of ``upot.F90`` with Fortran indices (rs(1) = 0)."""
 
@@ -136,31 +150,51 @@ def _random_occupations(rng, atoms, spins):
 
 
 class HubbardTensorSourceTest(unittest.TestCase):
+    # The previous tree writes ``cmplx(re, im)``, PARSEC 1.5 ``cmplx(re d0, im d0, dpc)``.
+    PATTERN = re.compile(
+        r"u_pot%p([34])\((\d),(\d),(\d),(\d)\)\s*=\s*cmplx\(\s*([-\d.]+)(?:d0)?,"
+        r"\s*([-\d.]+)(?:d0)?\s*(,\s*dpc\s*)?\)"
+    )
+
+    def _rows(self, source: Path) -> tuple[dict[str, list], set[bool]]:
+        text = source.read_text()
+        body = text[text.index("subroutine initialize_p_matrices") :]
+        rows = {"3": [], "4": []}
+        kinds = set()
+        for match in self.PATTERN.finditer(body):
+            which, a, b, c, d, real, imaginary, kind = match.groups()
+            rows[which].append((int(a), int(b), int(c), int(d), real, imaginary))
+            kinds.add(kind is not None)
+        return rows, kinds
+
     def test_tensor_rows_are_those_of_upot(self):
         source = _fortran_source("upot.F90")
         if source is None:
             self.skipTest("PARSEC source upot.F90 not available")
-        text = source.read_text()
-        body = text[text.index("subroutine initialize_p_matrices") :]
-        pattern = re.compile(
-            r"u_pot%p([34])\((\d),(\d),(\d),(\d)\)\s*=\s*cmplx\(\s*([-\d.]+),\s*([-\d.]+)\)"
-        )
-        rows = {"3": [], "4": []}
-        for match in pattern.finditer(body):
-            which, a, b, c, d, real, imaginary = match.groups()
-            rows[which].append((int(a), int(b), int(c), int(d), real, imaginary))
+        rows, _ = self._rows(source)
         self.assertEqual(tuple(rows["3"]), P3_ENTRIES)
         self.assertEqual(tuple(rows["4"]), P4_ENTRIES)
 
-    def test_tensors_are_single_precision_literals(self):
+    def test_tensor_rows_are_the_double_literals_of_parsec15(self):
+        source = _fortran15_source("potential/upot.F90")
+        if source is None:
+            self.skipTest("PARSEC 1.5 source potential/upot.F90 not available")
+        rows, kinds = self._rows(source)
+        self.assertEqual(kinds, {True})
+        self.assertEqual(tuple(rows["3"]), P3_ENTRIES)
+        self.assertEqual(tuple(rows["4"]), P4_ENTRIES)
+
+    def test_tensors_are_double_precision_literals(self):
+        # PARSEC 1.5 (upot.F90:765-1522) stores the literals in double
+        # precision; the previous tree rounded them to float32.
         p3, p4 = coulomb_tensors()
         self.assertEqual(p3.shape, (5, 5, 5, 5))
         self.assertEqual(np.count_nonzero(p3) <= len(P3_ENTRIES), True)
         m, mp, k, l, real, imaginary = P3_ENTRIES[1]
         value = p3[m - 1, mp - 1, k - 1, l - 1]
-        self.assertEqual(value.real, float(np.float32(real)))
-        self.assertEqual(value.imag, float(np.float32(imaginary)))
-        self.assertNotEqual(value.real, float(real))
+        self.assertEqual(value.real, float(real))
+        self.assertEqual(value.imag, float(imaginary))
+        self.assertNotEqual(value.real, float(np.float32(real)))
         self.assertFalse(p4.flags.writeable)
 
 

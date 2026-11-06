@@ -263,7 +263,15 @@ class FusedConjugateGradient:
         matrix_vector_products = 1
         residual_squared = _device_scalar(cp.vdot(residual, residual))
         initial_norm = float(np.sqrt(residual_squared))
-        tolerance = settings.relative_tolerance * initial_norm + settings.absolute_tolerance
+        if getattr(settings, "cg_criterion", 1) == 2:
+            # Hartree_CG_Criterion 2 of PARSEC 1.5: the test against ||b|| (Hartree.poisson.cg_stopping_threshold)
+            from parsec_python.Hartree.poisson import cg_stopping_threshold
+
+            tolerance = cg_stopping_threshold(
+                settings, initial_norm, float(np.sqrt(_device_scalar(cp.vdot(rhs, rhs))))
+            )
+        else:
+            tolerance = settings.relative_tolerance * initial_norm + settings.absolute_tolerance
         if initial_norm <= tolerance:
             return solution, True, 0, matrix_vector_products, initial_norm, initial_norm
         direction = residual.copy()

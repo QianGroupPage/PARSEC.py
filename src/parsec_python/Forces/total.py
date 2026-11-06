@@ -72,6 +72,9 @@ class ForceResult:
     # The spin-orbit term of a spinor calculation (``forcso`` of
     # ``soforc.F90``), Ry/bohr; ``None`` without spin-orbit coupling.
     spin_orbit: np.ndarray | None = None
+    # FDET (PARSEC 1.5, forcnloc.F90:869-875): the net force is not removed,
+    # ``total`` is ``symmetrized``.
+    net_force_kept: bool = False
 
     @property
     def local_with_ion_ion(self) -> np.ndarray:
@@ -101,6 +104,7 @@ def assemble_forces(
     periodic: bool = False,
     spin_orbit: np.ndarray | None = None,
     keep_torque: bool = False,
+    keep_net_force: bool = False,
 ) -> ForceResult:
     """Combine the force terms as ``forcnloc.f90`` does at its end.
 
@@ -111,7 +115,8 @@ def assemble_forces(
     the nonlocal one.  The torque of a periodic cell has no meaning and is
     reported as zero (Andrew Grieder's routines); the Fortran-derived routines
     keep the value of the symmetrized forces (``keep_torque``), which their
-    report does not print.
+    report does not print.  ``keep_net_force`` (FDET) keeps the net force in
+    ``total``, as ``forcnloc.F90:869-875`` does with ``fex_is``.
     """
 
     unsymmetrized = ion_ion + local.total + nonlocal_pseudopotential
@@ -127,6 +132,8 @@ def assemble_forces(
         else symmetrize_forces(unsymmetrized, operations)
     )
     total, net = remove_net_force(symmetrized)
+    if keep_net_force:
+        total = symmetrized.copy()
     return ForceResult(
         positions=np.asarray(positions, dtype=np.float64),
         ion_ion=ion_ion,
@@ -147,6 +154,7 @@ def assemble_forces(
         dispersion=dispersion,
         periodic=periodic,
         spin_orbit=spin_orbit,
+        **({"net_force_kept": True} if keep_net_force else {}),
     )
 
 
@@ -219,15 +227,17 @@ def compute_forces(
         # forcept.f90 adds them to the ion-ion forces.
         charged = point_charge_forces(atoms, system.pseudopotentials, point_charges)
         repulsion = repulsion + charged
+    # FDET: rho_B + rho_A in the ionic term and V_xc + v_nad in the core term.
+    density, xc_potential, embedded = embedding_force_fields(system, result)
     local = local_forces(
         system.grid,
         atoms,
         system.pseudopotentials,
         specifications,
-        result.density,
+        density,
         np.asarray(result.output_effective_potential)
         - np.asarray(result.input_effective_potential),
-        result.xc_potential,
+        xc_potential,
     )
     gradients = build_nonlocal_projector_gradients(
         system.grid, atoms, system.pseudopotentials, specifications
@@ -256,6 +266,29 @@ def compute_forces(
         seconds=perf_counter() - started,
         point_charge=charged,
         **correction_forces(system, result),
+        **({"keep_net_force": True} if embedded else {}),
+    )
+
+
+def embedding_force_fields(system, result) -> tuple[np.ndarray, np.ndarray, bool]:
+    """The density and XC potential of the local forces, and whether FDET is on.
+
+    ``forcloc.f90`` with ``fex_is`` (PARSEC 1.5): the Hellmann-Feynman term
+    reads ``rho + rho0``, the tip density with the frozen sample density
+    (lines 324-327), and the core-correction term ``vxc + vnadd`` (line 175).
+    Without FDET: ``result.density``, ``result.xc_potential`` and ``False``.
+    """
+
+    field = getattr(system, "embedding", None)
+    if field is None:
+        return result.density, result.xc_potential, False
+    nonadditive = getattr(result, "embedding", None)
+    if nonadditive is None:
+        raise ValueError("an FDET result carries the non-additive kinetic potential of its last iteration")
+    return (
+        np.asarray(result.density, dtype=np.float64) + field.density,
+        np.asarray(result.xc_potential, dtype=np.float64) + nonadditive.potential,
+        True,
     )
 
 
@@ -430,4 +463,5 @@ __all__ = [
     "compute_periodic_forces",
     "compute_spinor_forces",
     "correction_forces",
+    "embedding_force_fields",
 ]

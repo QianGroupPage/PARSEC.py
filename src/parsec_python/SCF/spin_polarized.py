@@ -493,7 +493,7 @@ def run_spin_scf(
             metrics.plain if settings.use_plain_residual else metrics.weighted
         )
         if (
-            iteration > 5
+            iteration > settings.degree_decrease_after
             and metrics.weighted < settings.approach_criterion
             and filter_degree > minimum_filter_degree
         ):
@@ -1051,7 +1051,7 @@ def run_scf_spin_polarized(
                 )
             )
         if (
-            iteration > 5
+            iteration > settings.degree_decrease_after
             and metrics.weighted < settings.approach_criterion
             and filter_degree > minimum_filter_degree
         ):

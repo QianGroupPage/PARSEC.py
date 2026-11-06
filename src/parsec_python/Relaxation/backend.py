@@ -35,7 +35,11 @@ class IonicBackend:
     ``symmetry_operations(system)``, where given, returns the operations a
     relaxation keeps its structure on (a periodic cell, see
     :func:`fortran_periodic_backend`); without it they are the point-group
-    operations of the atoms of an isolated system.
+    operations of the atoms of an isolated system.  ``drop_subspace(carried)``,
+    where given, returns the warm start ``carried`` without its saved
+    eigensolver subspace (the restart of ``Filter_Restart_After``, PARSEC 1.5);
+    without it :func:`parsec_python.SCF.filter_restart.drop_eigensolver_subspace`
+    does it.
     """
 
     run_scf: Callable[..., object]
@@ -50,6 +54,7 @@ class IonicBackend:
     # calculation; Andrew Grieder's loops) or are new atoms of symbol and position (the Fortran-derived
     # routines of the parity round, ``fortran_spinor_backend``).
     keep_atom_fields: bool = True
+    drop_subspace: Callable[[object], object] | None = None
 
 
 def moved_atoms(atoms, positions, keep_fields: bool = True) -> tuple:
@@ -430,6 +435,7 @@ def fortran_spinor_backend(k_sampling=None, *, periodic: bool = False) -> IonicB
         restart_scf=lambda system, result: _MovedStructureStart(warm_start_for_moved_atoms(system, result, system)),
         symmetry_operations=operations if periodic else None,
         keep_atom_fields=False,
+        drop_subspace=_drop_moved_structure_subspace,
     )
 
 
@@ -598,6 +604,21 @@ class _MovedStructureStart:
     :class:`parsec_python.SCF.single_point.SCFWarmStart`, told apart from the start of a ``Restart_Run``)."""
 
     start: object
+
+
+def _drop_moved_structure_subspace(carried):
+    """``Filter_Restart_After`` of :func:`fortran_spinor_backend`: the wrapped start without its subspaces.
+
+    The spinor drivers then filter new vectors (a k-point driver imports no
+    ``{k-point: state}`` subspaces); the potentials, the exchange-correlation
+    field of a non-collinear run included, are kept.
+    """
+
+    from ..SCF.filter_restart import drop_eigensolver_subspace
+
+    if isinstance(carried, _MovedStructureStart):
+        return _MovedStructureStart(drop_eigensolver_subspace(carried.start))
+    return drop_eigensolver_subspace(carried)
 
 
 def release_orbitals(result) -> None:

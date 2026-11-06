@@ -279,6 +279,31 @@ class CuPyEigvalSolver:
         self.handover_record["ensure_rotations"] += 1
         return True
 
+    def translate_saved_rows(self, source_rows) -> CuPyEigvalDeviceState | None:
+        """Translate the saved subspace on the grid (FDET warm start, ``parsec.F90:2815-2899``).
+
+        Row ``i`` of every saved vector takes row ``source_rows[i]``, zero
+        where that is negative (``parsec_python.Embedding.warm_start``); the
+        Ritz values and filter bounds are kept.  A basis that several devices
+        share is refused.  Returns the state to hand to the next SCF loop.
+        """
+
+        state = self._state
+        if state is None:
+            return None
+        saved = state.subspace
+        vectors = saved.vectors
+        if hasattr(vectors, "group"):
+            raise NotImplementedError("a sector basis shared by several devices is not translated")
+        cp, _ = require_cupy()
+        xp = cp if isinstance(vectors, cp.ndarray) else np
+        rows = xp.asarray(np.asarray(source_rows, dtype=np.int64))
+        valid = rows >= 0
+        moved = xp.zeros_like(vectors)
+        moved[valid] = vectors[rows[valid]]
+        self._state = replace(state, subspace=replace(saved, vectors=moved, ritz_workspace=None))
+        return self._state
+
     def start_new_scf_loop(self) -> CuPyEigvalDeviceState | None:
         """Mark the saved subspace as the start of another SCF loop.
 

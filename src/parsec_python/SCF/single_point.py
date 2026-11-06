@@ -38,6 +38,7 @@ from ..Eigensolvers import (
     dynamic_diagonalization_tolerance,
     solve_eigval,
 )
+from ..Embedding.frozen_density import embedded_exchange_correlation, embedding_energies
 from ..Energy import total_energy
 from ..Energy.total_energy import with_dispersion
 from ..Grid import (
@@ -149,6 +150,12 @@ class PreparedSinglePointSystem:
     ``hubbard`` holds the LDA+U projectors of the atoms with ``ldaplusu_u``
     or ``ldaplusu_j`` (:mod:`parsec_python.Hamiltonian.hubbard`) and is
     ``None`` without LDA+U.
+
+    ``embedding`` is, for FDET (``Potential_Field``), the frozen sample
+    field on the grid (:class:`parsec_python.Embedding.frozen_density.FrozenSampleField`):
+    its potential is part of ``ionic_potential``, and the point charges then
+    enter the ion-ion energy only (``parsec.F90:1022-1028``); ``None``
+    without FDET.
     """
 
     input: SinglePointInput
@@ -171,6 +178,7 @@ class PreparedSinglePointSystem:
     point_charges: tuple = ()
     density_symmetry: GridPointGroup | None = None
     hubbard: HubbardProjectors | None = None
+    embedding: object | None = None
 
     @property
     def hartree_boundary_tail_maximum(self) -> float | None:
@@ -570,8 +578,15 @@ def warm_start_for_moved_atoms(
     density further along the trajectory that ``history`` follows.
     """
 
+    warm_start = _parsec_warm_start(previous_system, previous_result, system)
+    if getattr(system, "embedding", None) is not None:
+        # FDET of PARSEC 1.5: translation by whole grid steps, or the tip sphere
+        # (parsec_python.Embedding.warm_start); FDET takes no extrapolation.
+        from ..Embedding.warm_start import embedding_warm_start
+
+        return embedding_warm_start(previous_system, previous_result, system, warm_start)
     return extrapolated_warm_start(
-        _parsec_warm_start(previous_system, previous_result, system),
+        warm_start,
         previous_system,
         previous_result,
         system,
@@ -655,6 +670,60 @@ def _with_point_charge_potential(ionic_potential, grid, point_charges):
     if ionic_potential is None or not point_charges:
         return ionic_potential
     return ionic_potential + point_charge_potential(grid.coordinates, point_charges)
+
+
+def _embedding_field(problem: SinglePointInput, grid: RealSpaceGrid, atoms=(), pseudopotentials=None, tip=None):
+    """The frozen sample field of an FDET input on ``grid``, ``None`` without FDET.
+
+    ``tip`` is ``(S, spot-frame point charges)`` of the tip sphere
+    (:func:`_tip_sphere_frame`); ``atoms`` are then in the tip frame.
+    """
+
+    settings = getattr(problem, "embedding", None)
+    if settings is None:
+        return None
+    if tip is not None:
+        from ..Embedding.tip_sphere import tip_sphere_field
+
+        offset, spot_charges = tip
+        return tip_sphere_field(problem, grid, atoms, pseudopotentials, offset, spot_point_charges=spot_charges)
+    from ..Embedding.frozen_density import frozen_sample_field
+
+    return frozen_sample_field(settings, grid)
+
+
+def _tip_sphere_frame(problem: SinglePointInput, atoms, point_charges):
+    """Atoms and point charges of an FDET tip sphere in the tip frame (``tipsphere_recenter``).
+
+    Returns ``(atoms, point_charges, tip)`` with ``tip = (S, spot-frame
+    point charges)``; unchanged with ``tip = None`` without the tip sphere.
+    """
+
+    settings = getattr(problem, "embedding", None)
+    if settings is None or not settings.tip_sphere:
+        return atoms, point_charges, None
+    from ..Embedding.tip_sphere import place_tip
+
+    moved_atoms, moved_charges, offset, spot_charges = place_tip(atoms, point_charges, problem.grid.spacing)
+    return moved_atoms, moved_charges, (offset, spot_charges)
+
+
+def _with_external_fields(ionic_potential, grid, point_charges, embedding):
+    """The local ionic potential with the point charges or the FDET sample field.
+
+    Without FDET the potential of the point charges is added (``ionpot.f90``).
+    With FDET the sample ions act through the frozen field, which is added
+    instead (``parsec.F90:1022-1028, 1087-1089``); the point charges then
+    enter the ion-ion energy and forces only.
+    """
+
+    if embedding is None:
+        return _with_point_charge_potential(ionic_potential, grid, point_charges)
+    if ionic_potential is None:
+        return None
+    from ..Embedding.frozen_density import with_sample_potential
+
+    return with_sample_potential(ionic_potential, embedding)
 
 
 def _with_point_charge_energy(fields: dict, atoms, pseudopotentials, point_charges) -> dict:
@@ -869,6 +938,8 @@ def prepare_single_point(
         else tuple(problem.atoms)
     )
     point_charges = placed_point_charges(problem)
+    # FDET tip sphere: the tip at the centre of its own sphere (tipsphere_recenter).
+    atoms, point_charges, tip = _tip_sphere_frame(problem, atoms, point_charges)
     stage_start = time.perf_counter()
     pseudopotentials = load_pseudopotentials(
         problem.pseudopotentials,
@@ -918,6 +989,8 @@ def prepare_single_point(
     )
     grid_seconds = time.perf_counter() - stage_start
     _require_atoms_inside_domain(problem.grid, atoms)
+    # FDET: the frozen sample field on this grid (potfield.F90, tipsphere_field), None without.
+    embedding = _embedding_field(problem, grid, atoms, pseudopotentials, tip)
 
     stage_start = time.perf_counter()
     laplacian_builder = (
@@ -944,7 +1017,7 @@ def prepare_single_point(
             grid, atoms, pseudopotentials, problem.pseudopotentials
         )
     )
-    ionic_potential = _with_point_charge_potential(ionic_potential, grid, point_charges)
+    ionic_potential = _with_external_fields(ionic_potential, grid, point_charges, embedding)
     local_ionic_seconds = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
     build_nonlocal = (
@@ -993,6 +1066,7 @@ def prepare_single_point(
             hartree_boundary=boundary_plan,
             point_charges=point_charges,
             hubbard=hubbard,
+            embedding=embedding,
         )
 
     fields, stage_seconds = _density_and_energy_stages(
@@ -1033,6 +1107,7 @@ def prepare_single_point(
         point_charges=point_charges,
         density_symmetry=density_symmetry,
         hubbard=hubbard,
+        embedding=embedding,
     )
 
 
@@ -1217,8 +1292,8 @@ def complete_single_point(
     ionic_potential = build_local(
         system.grid, system.atoms, system.pseudopotentials, problem.pseudopotentials
     )
-    ionic_potential = _with_point_charge_potential(
-        ionic_potential, system.grid, system.point_charges
+    ionic_potential = _with_external_fields(
+        ionic_potential, system.grid, system.point_charges, getattr(system, "embedding", None)
     )
     local_ionic_seconds = time.perf_counter() - started
     fields, stage_seconds = _density_and_energy_stages(
@@ -1307,6 +1382,15 @@ def update_geometry(
         new.symbol != old.symbol for new, old in zip(atoms, system.atoms)
     ):
         raise ValueError("moved atoms must keep their number, order and species")
+    embedding = getattr(system, "embedding", None)
+    point_charges = system.point_charges
+    if embedding is not None and embedding.tip_sphere is not None:
+        # FDET tip sphere: ``atoms`` are in the spot frame (manual.dat); the
+        # tip goes back to the centre of its sphere and the field moves
+        # (parsec.F90:2614-2637, 2794-2800).
+        from ..Embedding.tip_sphere import moved_tip
+
+        atoms, point_charges, embedding = moved_tip(system, atoms)
     problem = replace(
         system.input,
         atoms=atoms,
@@ -1372,10 +1456,9 @@ def update_geometry(
         grid, atoms, pseudopotentials, problem.pseudopotentials
     )
     # The point charges stay where they are (parsec.F90 calls ionpot and
-    # forceion again after the move).
-    ionic_potential = _with_point_charge_potential(
-        ionic_potential, grid, system.point_charges
-    )
+    # forceion again after the move); so does a classical FDET field
+    # (parsec.F90:2780-2806 reads the same pot.dat again).
+    ionic_potential = _with_external_fields(ionic_potential, grid, point_charges, embedding)
     local_ionic_seconds = time.perf_counter() - stage_start
 
     boundary_plan = system.hartree_boundary
@@ -1392,7 +1475,7 @@ def update_geometry(
         boundary_plan,
         build_atomic_tail,
     )
-    _with_point_charge_energy(fields, atoms, pseudopotentials, system.point_charges)
+    _with_point_charge_energy(fields, atoms, pseudopotentials, point_charges)
     if pending is not None:
         nonlocal_operator, nonlocal_ionic_seconds = pending.result()
     density_symmetry = system.density_symmetry
@@ -1418,6 +1501,11 @@ def update_geometry(
         ),
         hartree_boundary=boundary_plan,
         hubbard=hubbard,
+        **(
+            {}
+            if embedding is None
+            else {"embedding": embedding, "point_charges": point_charges}
+        ),
     )
 
 
@@ -1543,6 +1631,56 @@ def iteration_eigensolver_fields(counts, next_tolerance: float | None) -> dict:
     return fields_
 
 
+def solver_option_fields(
+    eigensolver_settings, tolerance: float, filter_degree: int | None = None
+) -> tuple[dict, dict, dict]:
+    """The options of the PARSEC 1.5 round for one SCF step's eigensolvers.
+
+    Three dictionaries of fields, for :class:`ChebFFSettings`,
+    :class:`ChebDavSettings` and :class:`SubspaceSettings`, all empty at the
+    defaults (the settings are then those of every earlier version):
+    ``Vector_Rng_Seed`` (the LAPACK seed of the first-solve start vectors),
+    ``Reorthogonalization_Threshold`` (the first ratio of ``orth_normal``) and
+    PARSEC 1.5's residual-driven CHEBFF, whose tolerance is ``tolerance``,
+    the eigensolver tolerance of the step (``Diag_Tolerance``, or 0.1 in the
+    first step of ``Dynamic_Diag_Tol`` as 1.5 has it), and PARSEC 1.5's
+    SUBSPACE rules (``Smart_Subspace``, ``Chebyshev_Scaled``,
+    ``Bounds_Method``/``Bounds_Iter``: ``max(filter_degree/2, Bounds_Iter)``
+    Lanczos steps, ``filter_degree`` being the SUBSPACE degree of the step,
+    as ``solver%polym`` in ``chebff.f90z``/``subspace.f90z`` of 1.5).
+    """
+
+    chebff: dict = {}
+    chebdav: dict = {}
+    subspace: dict = {}
+    if getattr(eigensolver_settings, "vector_seed", None) is not None:
+        chebff["basis_seed"] = chebdav["basis_seed"] = eigensolver_settings.basis_seed
+    threshold = getattr(eigensolver_settings, "reorthogonalization_threshold", 0.1)
+    if threshold != 0.1:
+        for fields_ in (chebff, chebdav, subspace):
+            fields_["reorthogonalization_threshold"] = threshold
+    residual_test = getattr(eigensolver_settings, "first_filter_residual_test", "off")
+    if residual_test != "off":
+        chebff["residual_tolerance"] = float(tolerance)
+        chebff["residual_failure"] = residual_test
+    rule = getattr(eigensolver_settings, "lanczos_bounds", "parsec")
+    if rule != "parsec":
+        degree = eigensolver_settings.filter_degree if filter_degree is None else filter_degree
+        steps = max(int(degree) // 2, int(eigensolver_settings.lanczos_bound_steps))
+        chebff["bounds"] = rule
+        chebff["bound_steps"] = steps
+        # lancz_bound_full_orth serves the CHEBFF first solve only; 1.5's
+        # CHEBDAV keeps its five steps (chebdav.f90z:336 of 1.5).
+        subspace["bounds"] = chebdav["bounds"] = "lanczos"
+        subspace["bound_steps"] = steps
+    lower_rule = getattr(eigensolver_settings, "subspace_lower_bound", "monotone")
+    if lower_rule != "monotone":
+        subspace["lower_bound_rule"] = lower_rule
+    if getattr(eigensolver_settings, "scaled_subspace_filter", False):
+        subspace["scaled_filter"] = True
+    return chebff, chebdav, subspace
+
+
 def eigval_settings_for(
     eigensolver_settings,
     filter_degree: int,
@@ -1560,6 +1698,9 @@ def eigval_settings_for(
 
     if tolerance is None:
         tolerance = eigensolver_settings.tolerance
+    chebff_options, chebdav_options, subspace_options = solver_option_fields(
+        eigensolver_settings, tolerance, filter_degree
+    )
     return EigvalSettings(
         **iterative_solver_fields(eigensolver_settings, tolerance, neighbors),
         safety_buffer=eigensolver_settings.working_buffer,
@@ -1573,6 +1714,7 @@ def eigval_settings_for(
             block_size=eigensolver_settings.matvec_block_size,
             reset_recurrence_per_block=False,
             random_seed=eigensolver_settings.random_seed,
+            **chebff_options,
         ),
         chebdav=(
             ChebDavSettings(
@@ -1584,6 +1726,7 @@ def eigval_settings_for(
                 lanczos_steps=5,
                 max_outer_restarts=2,
                 random_seed=eigensolver_settings.random_seed,
+                **chebdav_options,
             )
             if eigensolver_settings.method == "chebdav"
             # A CHEBFF degree of 10 is valid.  Do not feed that unrelated
@@ -1598,6 +1741,7 @@ def eigval_settings_for(
             block_size=eigensolver_settings.matvec_block_size,
             reset_recurrence_per_block=False,
             random_seed=eigensolver_settings.random_seed,
+            **subspace_options,
         ),
     )
 
@@ -1740,7 +1884,20 @@ def run_scf(
 
     The mixer constructs ``V_in^(k+1)`` from these two local fields.  Kinetic
     and nonlocal terms are never mixed because they are density independent.
+
+    With FDET (``system.embedding``) ``V_ion,local`` holds the frozen sample
+    field, the XC terms read ``rho + rho_core + rho_A`` and both fields hold
+    the non-additive kinetic potential ``v_nad`` of the iteration
+    (:mod:`parsec_python.Embedding.frozen_density`); the energies are the
+    FDET energies of ``totnrg.f90``.
     """
+    embedding = getattr(system, "embedding", None)
+    if embedding is not None and (
+        getattr(system.input.scf, "spin_polarized", False) or scalar_field_adapter is not None
+    ):
+        raise NotImplementedError(
+            "FDET (Potential_Field) runs spin-unpolarized on the full grid only (no symmetry sectors)"
+        )
     if getattr(system.input.scf, "spin_polarized", False):
         from .spin_polarized import run_spin_scf
 
@@ -1861,7 +2018,10 @@ def run_scf(
         # XC sees rho_valence + frozen rho_core (CA-LDA or PBE, as selected).
         # The Hartree solve immediately above sees rho_valence only.
         stage_start = time.perf_counter()
-        xc = system.evaluate_xc(density)
+        if embedding is None:
+            xc = system.evaluate_xc(density)
+        else:
+            xc, nonadditive = embedded_exchange_correlation(system, density)
         initial_xc_seconds = time.perf_counter() - stage_start
         xc_potential = xc.potential
         # This array is the diagonal, local part of H.  V_NL is intentionally
@@ -1870,6 +2030,9 @@ def run_scf(
         input_potential = (
             ionic_potential + hartree_potential + xc_potential
         )
+        if embedding is not None:
+            # parsec.F90:1296: vold = vion + vxc + vhart + vnadd.
+            input_potential = input_potential + nonadditive.potential
     else:
         # The structure before the move supplies the first input potential,
         # the starting vector of the first Poisson solve and the subspace of
@@ -1895,12 +2058,18 @@ def run_scf(
             )
             initial_hartree_seconds = time.perf_counter() - stage_start
             stage_start = time.perf_counter()
-            moved_xc = system.evaluate_xc(guess)
+            if embedding is None:
+                moved_xc = system.evaluate_xc(guess)
+                moved_xc_potential = moved_xc.potential
+            else:
+                # The reference holds v_nad of the last output potential.
+                moved_xc, moved_nonadditive = embedded_exchange_correlation(system, guess)
+                moved_xc_potential = moved_xc.potential + moved_nonadditive.potential
             initial_xc_seconds = time.perf_counter() - stage_start
             hartree_potential = moved_hartree.potential
             input_potential = (
                 input_potential
-                + (hartree_potential + moved_xc.potential)
+                + (hartree_potential + moved_xc_potential)
                 - to_internal_scalar(
                     np.array(warm_start.hxc_reference, dtype=np.float64)
                 )
@@ -2079,7 +2248,11 @@ def run_scf(
         hartree_total += hartree_seconds
         hartree_potential = hartree.potential
         xc_start = time.perf_counter()
-        xc = system.evaluate_xc(density)
+        if embedding is None:
+            xc = system.evaluate_xc(density)
+        else:
+            # FDET: XC of rho + rho_core + rho_A and T_nad, v_nad (exc.f90:816-822).
+            xc, nonadditive = embedded_exchange_correlation(system, density)
         xc_seconds = time.perf_counter() - xc_start
         xc_total += xc_seconds
         xc_potential = xc.potential
@@ -2089,6 +2262,9 @@ def run_scf(
         output_potential = (
             ionic_potential + hartree_potential + xc_potential
         )
+        if embedding is not None:
+            # parsec.F90:1631-1633: vnew = vhart + vxc + vion + vnadd.
+            output_potential = output_potential + nonadditive.potential
 
         # 6. Evaluate convergence diagnostics and the total energy.  With
         # R_i=V_out,i-V_in,i, the default weighted SRE is
@@ -2131,6 +2307,11 @@ def run_scf(
                 }
             ),
         )
+        if embedding is not None:
+            # totnrg.f90:159-197: the FDET energy of tip and sample.
+            energies = embedding_energies(
+                energies, embedding, density, ionic_potential, nonadditive, system.grid.volume_element
+            )
         # 7. Mix the effective potential and apply PARSEC's SCF stop test.
         # Only V_eff is mixed.  T, V_NL, and the fixed local ionic component
         # remain unchanged; V_ion appears in both input and output and thus
@@ -2152,7 +2333,7 @@ def run_scf(
         # Convergence_Criterion_Approach, by default 100*vconv.
         approach_residual = metrics.weighted
         if (
-            iteration > 5
+            iteration > settings.degree_decrease_after
             and approach_residual < settings.approach_criterion
             and filter_degree > minimum_filter_degree
         ):
@@ -2279,6 +2460,8 @@ def run_scf(
         input_effective_potential=to_public_scalar(last_input_potential),
         output_effective_potential=to_public_scalar(
             ionic_potential + hartree_potential + xc_potential
+            if embedding is None
+            else output_potential
         ),
         next_effective_potential=to_public_scalar(mixed_potential),
         nonlocal_operator=system.nonlocal_operator,
@@ -2294,4 +2477,5 @@ def run_scf(
         eigensolver_state=eigval_state,
         hubbard=hubbard_state,
         dispersion=dispersion,
+        embedding=None if embedding is None else nonadditive,
     )

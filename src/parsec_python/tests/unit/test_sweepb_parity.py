@@ -24,6 +24,7 @@ import numpy as np
 from parsec_python.Input import parse_parsec_input
 from parsec_python.Input.parsec_input import UnsupportedParsecOptionError
 from parsec_python.models import Atom, EigensolverSettings
+from parsec_python.tests.environment import kpoints_on_the_cpu, pin_kpoints_on_the_cpu
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 AU_POTRE = Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -143,8 +144,7 @@ def _parse_kept(test: unittest.TestCase, template: str, **fields):
 def _run_cli(path: Path, *extra: str) -> tuple[int, str]:
     from parsec_python.cli import main
 
-    os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
-    with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as error:
+    with kpoints_on_the_cpu(), redirect_stdout(StringIO()), redirect_stderr(StringIO()) as error:
         code = main([str(path), "--quiet", *extra])
     return code, error.getvalue()
 
@@ -297,7 +297,7 @@ class DynamicToleranceTests(unittest.TestCase):
             system = prepare_periodic_single_point(translation.problem)
             k_points, weights = kpoint_sampling(translation.problem)
             records = []
-            os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+            pin_kpoints_on_the_cpu(self)
             result = run_scf_kpoints(system, k_points, weights, callback=records.append)
             self.assertTrue(result.converged)
             energies[flag] = result.energies.total
@@ -361,7 +361,7 @@ class DynamicToleranceTests(unittest.TestCase):
         )
         system = prepare_periodic_single_point(problem)
         records = []
-        os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+        pin_kpoints_on_the_cpu(self)
         run_self_consistent_soc_kpoints(
             system, np.zeros((1, 3)), np.ones(1), callback=records.append
         )
@@ -432,7 +432,7 @@ class IntermediateFilesTests(unittest.TestCase):
                 states.append(state.iteration)
                 files.iteration_fields(state, system.grid, translation.problem)
 
-            os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+            pin_kpoints_on_the_cpu(self)
             run_self_consistent_soc_kpoints(
                 system, np.zeros((1, 3)), np.ones(1), iteration_state_callback=callback
             )

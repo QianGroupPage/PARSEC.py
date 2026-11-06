@@ -662,16 +662,15 @@ def grid_fractional_points(grid) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """``(integer points, steps along each lattice direction, shift)`` of a grid.
 
     The fractional coordinate of point ``i`` along direction ``d`` is
-    ``(i_d + shift_d) / n_d``, the ``rw`` of ``symm_scalar``.  The
-    orthorhombic grid has shift zero; :class:`~parsec_python.Grid.pbc.GeneralPeriodicGrid`
-    has Fortran's shift.
+    ``(i_d + shift_d) / n_d``, the ``rw`` of ``symm_scalar``, with the grid's
+    own shift: Fortran's (0.5 unless ``Ignore_Symmetry``, or the ``Grid_Shift``
+    block) on every grid of the Fortran-derived routines, the orthorhombic one
+    included since PARSEC 1.5's parity round (it started at the origin before).
     """
 
     points = np.asarray(grid.integer_coordinates, dtype=np.int64)
     counts = np.asarray(grid.points_per_axis, dtype=np.int64)
     shift = np.asarray(getattr(grid, "shift", (0.0, 0.0, 0.0)), dtype=np.float64)
-    if not getattr(grid, "is_general_periodic", False):
-        shift = np.zeros(3)
     return points, counts, shift
 
 

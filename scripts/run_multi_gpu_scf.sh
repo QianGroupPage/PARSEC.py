@@ -66,7 +66,8 @@
 # basis (PARSEC_CUPY_DISTRIBUTED_STATE), and the mixed-precision filter
 # (PARSEC_CUPY_MIXED_FILTER, off by default).
 #
-# The measured inputs use Eigensolver chebff with FF_MaxIter 4,
+# The benchmark inputs use Eigensolver chebff with FF_MaxIter 3 (4 in the
+# published series of 2026-10-23; 3 since 2026-11-04, 7-13 % shorter SCF on A100),
 # Chebdav_Degree 30 and Chebyshev_Degree 15; these are input keywords, not
 # settings of this script.
 set -euo pipefail

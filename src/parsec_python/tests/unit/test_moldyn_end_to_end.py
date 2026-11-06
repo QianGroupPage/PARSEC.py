@@ -165,6 +165,43 @@ def _layout(lines) -> list:
     return [len(line) if _NUMBER.search(line) else line for line in lines]
 
 
+def _parsec15(lines, name: str) -> list:
+    """Lines of the previous Fortran tree in the integer formats of PARSEC 1.5.
+
+    md_nrg.dat: ``i6`` steps and four blanks after ``Step`` in the header;
+    md_mech.dat: ``'Step #',i6``; movie.xyz: ``i7`` atom counts
+    (``md/moldyn.f90:680,708,757``, ``scf/initial.f90:631,634``).
+    """
+
+    if name == "md_nrg.dat":
+        return [lines[0].replace("Step  Time", "Step    Time", 1)] + ["  " + line for line in lines[1:]]
+    if name == "md_mech.dat":
+        return ["Step #  " + line[6:] if line.startswith("Step #") else line for line in lines]
+    if name == "movie.xyz":
+        return [f"{int(line):7d}" if line.strip().isdigit() else line for line in lines]
+    return list(lines)
+
+
+def _kinetic_energies(mechanics: dict, species) -> dict:
+    """``{step: Ekin [eV per movable atom]}`` from the ``v(t)`` columns of md_mech.dat.
+
+    Block ``k`` holds the velocities of the call that wrote line ``k - 1`` of
+    md_nrg.dat (PARSEC 1.5 ``vxold_print``), the velocities its kinetic
+    energy is made of (``tke``, ``md/moldyn.f90``).
+    """
+
+    from parsec_python.MolecularDynamics import atomic_masses
+
+    masses = atomic_masses(species)
+    energies = {}
+    for step, block in mechanics.items():
+        velocities = block[:, 6:9]
+        movable = float(np.sum(block[:, 12]))
+        kinetic = float(np.sum(0.5 * masses[:, None] * velocities * velocities))
+        energies[step - 1] = kinetic * 2.0 / movable * 13.6058
+    return energies
+
+
 class _FortranComparison(unittest.TestCase):
     """Comparisons of one file of a run with the Fortran file, step by step."""
 
@@ -183,7 +220,11 @@ class _FortranComparison(unittest.TestCase):
                 msg=f"temperature of step {step}",
             )
 
-    def assert_md_mech(self, mine: dict, fortran: dict, steps) -> None:
+    def assert_md_mech(self, mine: dict, fortran: dict, steps, *, velocities: bool = True) -> None:
+        """``velocities=False``: the reference is the previous tree, whose velocity
+        columns are the next-step estimate where PARSEC 1.5 and this package
+        write ``v(t)`` (checked by :meth:`assert_velocities_give_the_kinetic_energy`)."""
+
         for step in steps:
             ours, theirs = mine[step], fortran[step]
             self.assertEqual(ours.shape, theirs.shape)
@@ -194,10 +235,20 @@ class _FortranComparison(unittest.TestCase):
                 ("accelerations", slice(9, 12), ACCELERATION_TOLERANCE),
                 ("movable flags", slice(12, 13), 0.0),
             ):
+                if name == "velocities" and not velocities:
+                    continue
                 np.testing.assert_allclose(
                     ours[:, columns], theirs[:, columns], rtol=0, atol=tolerance,
                     err_msg=f"{name} of step {step}",
                 )
+
+    def assert_velocities_give_the_kinetic_energy(self, files, species, steps) -> None:
+        """The ``v(t)`` columns of md_mech.dat give the kinetic energy of md_nrg.dat."""
+
+        kinetic = _kinetic_energies(_md_mech(files["md_mech.dat"]), species)
+        energies = _md_nrg(files["md_nrg.dat"])
+        for step in steps:
+            self.assertAlmostEqual(kinetic[step], energies[step][1], delta=ENERGY_TOLERANCE, msg=f"step {step}")
 
     def assert_coordinates(self, mine: dict, fortran: dict, keys, tolerance) -> None:
         self.assertEqual(list(mine), list(keys))
@@ -238,8 +289,11 @@ class LangevinRunTests(_FortranComparison):
         self.assertEqual(log.count(" Molecular dynamics step:"), 3)
 
     def test_files_have_the_layout_of_the_fortran_files(self) -> None:
+        # the previous tree's files in the integer widths of PARSEC 1.5
         for name in FILES:
-            self.assertEqual(_layout(self.files[name]), _layout(self.fortran[name]), msg=name)
+            self.assertEqual(
+                _layout(self.files[name]), _layout(_parsec15(self.fortran[name], name)), msg=name
+            )
 
     def test_energies_and_temperatures_match_fortran(self) -> None:
         mine = _md_nrg(self.files["md_nrg.dat"])
@@ -252,7 +306,8 @@ class LangevinRunTests(_FortranComparison):
     def test_positions_velocities_and_accelerations_match_fortran(self) -> None:
         mine = _md_mech(self.files["md_mech.dat"])
         self.assertEqual(list(mine), [1, 2, 3])
-        self.assert_md_mech(mine, _md_mech(self.fortran["md_mech.dat"]), (1, 2, 3))
+        self.assert_md_mech(mine, _md_mech(self.fortran["md_mech.dat"]), (1, 2, 3), velocities=False)
+        self.assert_velocities_give_the_kinetic_energy(self.files, ["O", "H", "H"], (0, 1, 2))
 
     def test_coordinates_match_fortran(self) -> None:
         self.assert_coordinates(
@@ -311,8 +366,12 @@ class RestartTests(_FortranComparison):
         self.assertEqual(lines[5], f" Step #{self.first:12d}")
         self.assertEqual(lines[6:9], self.case["mdinit"][1:])
         self.assert_md_mech(
-            mine, _md_mech(self.fortran["md_mech.dat"]), (self.first + 1, self.first + 2)
+            mine,
+            _md_mech(self.fortran["md_mech.dat"]),
+            (self.first + 1, self.first + 2),
+            velocities=False,
         )
+        self.assert_velocities_give_the_kinetic_energy(self.files, ["O", "H", "H"], (self.first, self.first + 1))
 
     def test_coordinates_match_the_unbroken_fortran_run(self) -> None:
         self.assert_coordinates(

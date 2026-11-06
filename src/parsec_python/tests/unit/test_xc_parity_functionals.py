@@ -609,12 +609,20 @@ class SelectionAndSettingsTests(unittest.TestCase):
             warnings.simplefilter("always")
             load_pseudopotentials(specification, xc_functional="ca")
             self.assertEqual(caught, [])
-            for functional in ("pw92", "pw91", "lb94", "xalpha"):
+            # a CA file in a PBE run: a warning too, as pseudo.f90 (PARSEC 1.5 io/pseudo.f90:482-492)
+            for functional in ("pw92", "pw91", "lb94", "xalpha", "pbe"):
                 load_pseudopotentials(specification, xc_functional=functional)
-        self.assertEqual(len(caught), 4)
+        self.assertEqual(len(caught), 5)
         self.assertTrue(all("does not match" in str(item.message) for item in caught))
-        with self.assertRaisesRegex(ValueError, "not the requested PBE functional"):
-            load_pseudopotentials(specification, xc_functional="pbe")
+        # a PBE file in a CA run stays refused
+        pbe_file = {
+            "H": SpeciesPotential(
+                path=pseudopotential_file("tests/data/spin_pbe_H_POTRE.DAT"),
+                local_angular_momentum=0,
+            )
+        }
+        with self.assertRaisesRegex(ValueError, "not the requested CA functional"):
+            load_pseudopotentials(pbe_file, xc_functional="ca")
 
 
 class ParserTests(unittest.TestCase):

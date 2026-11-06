@@ -331,9 +331,10 @@ class ImplicitTilePolicyTests(unittest.TestCase):
         # CHEBDAV filters until its residuals are met: one pass is counted.  ARPACK filters nothing first.
         self.assertEqual(counted_filter_applications(settings(method="chebdav", degree=15, later=10), 50), 15 + 80)
         self.assertEqual(counted_filter_applications(settings(method="arpack"), 50), 80)
-        # The settings of an input, with their defaults.
+        # The settings of an input, with their defaults (FF_MaxIter 3, PARSEC 1.5's, the default
+        # since 2026-11-04; 2 before).
         from parsec_python.models import EigensolverSettings, SCFSettings
-        self.assertEqual(counted_filter_applications(EigensolverSettings(), SCFSettings().max_iterations), 2*20 + 8*10)
+        self.assertEqual(counted_filter_applications(EigensolverSettings(), SCFSettings().max_iterations), 3*20 + 8*10)
 
     def test_share_of_regular_tiles_is_that_of_the_packer(self):
         def exact(metadata, tile):

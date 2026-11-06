@@ -145,6 +145,42 @@ class FilteredPotentialTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonnegative"):
             apply_fourier_filter(potential, 1, spacing=0.5, alpha=-1.0)
 
+    def test_projector_slope_is_dfint(self) -> None:
+        # PARSEC 1.5 math/fourier_f.f90:267: dvw = dfint, the radial
+        # derivative of the filtered projector (the previous tree stored fint).
+        from parsec_python.Pseudopotential.fourier_filter import filtered_derivative
+        from parsec_python.Pseudopotential.radial_derivatives import (
+            radial_projector_with_derivative,
+        )
+
+        potential = read_parsec_pseudopotential(DATA / "Si_POTRE.DAT")
+        spacing, alpha, beta1 = 0.5, 0.8, 5.0
+        filtered = apply_fourier_filter(potential, 1, spacing=spacing, alpha=alpha, beta1=beta1)
+        self.assertEqual(sorted(filtered.filtered_projector_slopes), [0, 2])
+        self.assertEqual(potential.filtered_projector_slopes, {})
+        radii = potential.radii
+        count = reciprocal_mesh_size(spacing, alpha, alpha)
+        for angular_momentum in (0, 2):
+            table, slope, sign = radial_projector_with_derivative(filtered, angular_momentum, 1)
+            np.testing.assert_array_equal(table, filtered.radial_projector(angular_momentum, 1)[0])
+            self.assertEqual(sign, filtered.radial_projector(angular_momentum, 1)[1])
+            np.testing.assert_array_equal(slope, filtered.filtered_projector_slopes[angular_momentum])
+            # Central differences of fint itself, on a fine uniform mesh.
+            original, _ = potential.radial_projector(angular_momentum, 1)
+            transform = fourier_transform(potential, original, angular_momentum, count)
+            mesh = np.linspace(0.3, 4.0, 38)
+            step = 1e-4
+            numerical = (
+                filtered_function(mesh + step, transform, angular_momentum, spacing, alpha, beta1)
+                - filtered_function(mesh - step, transform, angular_momentum, spacing, alpha, beta1)
+            ) / (2 * step)
+            analytic = filtered_derivative(mesh, transform, angular_momentum, spacing, alpha, beta1)
+            scale = np.max(np.abs(analytic))
+            self.assertGreater(scale, 0.1)
+            np.testing.assert_allclose(analytic, numerical, atol=1e-6 * scale)
+            # Not the projector itself (the previous tree's dvw = fint).
+            self.assertGreater(np.max(np.abs(slope - table)), 0.1 * scale)
+
     def test_species_parameters(self) -> None:
         species = SpeciesPotential(DATA / "Si_POTRE.DAT", 1)
         self.assertFalse(species.has_fourier_filter)

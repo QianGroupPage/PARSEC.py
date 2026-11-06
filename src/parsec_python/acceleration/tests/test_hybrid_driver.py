@@ -4619,9 +4619,14 @@ class RealHybridAccuracyTests(unittest.TestCase):
         self.assertEqual(slot_major["orbital_sector_tile_pack_workers"], "no tiles packed")
         self.assertEqual(len(handed), 8)
         plan = driver_module._filter_plan(SimpleNamespace(input=problem, electron_count=8.0))
+        # The sectors run on every device the process may use.  Up to 2026-11-05 this expected
+        # one: in the full suite an earlier module (test_default_domain) had left
+        # PARSEC_CUPY_DEVICES=0 behind, and alone on a node of four GPUs the test failed.
+        with patch.dict(driver_module.os.environ, kept, clear=True):
+            devices = len(symmetry.selected_device_ids(0))
         for work, tile in handed:
             self.assertEqual(
-                (work.applications, work.devices, tile), (plan.applications, 1, 0)
+                (work.applications, work.devices, tile), (plan.applications, devices, 0)
             )
             self.assertGreaterEqual(work.columns, 1)
             self.assertLessEqual(work.columns, plan.states // 8 + plan.buffer + 1)

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -100,6 +105,13 @@ class SpinFileTests(unittest.TestCase):
         np.testing.assert_allclose(lower[:, 4], [1, 1, 1, 1, 0, -1, -1, -1, -1], atol=1e-6)  # S_y of the lower branch
 
 
+# matplotlib is optional: requirements.txt has NumPy and SciPy, only the plots need it (and the
+# Python environment of the A100 test nodes has none, for instance).  Without it the plot test is
+# skipped and MissingMatplotlibTests checks the message the user then gets.
+_HAVE_MATPLOTLIB = importlib.util.find_spec("matplotlib") is not None
+
+
+@unittest.skipUnless(_HAVE_MATPLOTLIB, "matplotlib is not installed (optional: only the band plots need it)")
 class SpinPlotTests(unittest.TestCase):
     def test_plot_and_command_line(self) -> None:
         result = rashba_bands()
@@ -114,6 +126,31 @@ class SpinPlotTests(unittest.TestCase):
             self.assertTrue(output.exists())
             with self.assertRaises(ValueError):
                 plot_spin_texture(result, components="w")
+
+
+class MissingMatplotlibTests(unittest.TestCase):
+    """Without matplotlib the plots say what is missing and how to get it; the data files need none."""
+
+    def test_plot_and_command_line_name_the_missing_package(self) -> None:
+        result = rashba_bands()
+        hidden = {name: None for name in ("matplotlib", "matplotlib.pyplot", "matplotlib.collections")}
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(sys.modules, hidden):
+            for plot in (
+                lambda: plot_spin_texture(result, output=Path(directory) / "y.png"),
+                lambda: bands_module.plot_band_comparison([("run", result)]),
+            ):
+                with self.assertRaises(ModuleNotFoundError) as caught:
+                    plot()
+                self.assertEqual(caught.exception.name, "matplotlib")
+                self.assertIn("pip install matplotlib", str(caught.exception))
+            self.assertIsNotNone(write_spin_file(directory, result))  # the data file needs no matplotlib
+            archive = save_band_structure_archive(Path(directory) / "parsec_python_bands.npz", result)
+            stderr = io.StringIO()
+            with self.assertRaises(SystemExit) as caught, contextlib.redirect_stderr(stderr):
+                bands_module.main(["--spin", str(archive), "-o", str(Path(directory) / "texture.png")])
+            self.assertEqual(caught.exception.code, 1)
+            self.assertIn("pip install matplotlib", stderr.getvalue())
+            self.assertFalse((Path(directory) / "texture.png").exists())
 
 
 if __name__ == "__main__":

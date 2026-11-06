@@ -251,6 +251,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="additional pseudopotential directory searched before the input directory",
     )
     parser.add_argument(
+        "--esdf-lenient",
+        action="store_true",
+        help=(
+            "read the input as PARSEC's ESDF does: ignore labels this reader does not know and take the "
+            "first value of a label given twice, with a warning (default: refuse both)"
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -484,6 +492,30 @@ def _resolve_symmetry_mode(
     return mode
 
 
+def _reference_only_solver_options(problem) -> list[str]:
+    """Eigensolver options of the PARSEC 1.5 round that the device eigensolvers do not carry."""
+
+    eigensolver = problem.eigensolver
+    features = []
+    if getattr(eigensolver, "first_filter_residual_test", "off") != "off":
+        features.append("PARSEC 1.5's residual-driven CHEBFF (FF_Residual_Test)")
+    if (
+        getattr(eigensolver, "subspace_lower_bound", "monotone") != "monotone"
+        or getattr(eigensolver, "scaled_subspace_filter", False)
+        or getattr(eigensolver, "lanczos_bounds", "parsec") != "parsec"
+    ):
+        features.append(
+            "PARSEC 1.5's SUBSPACE rules (Smart_Subspace, Chebyshev_Scaled, "
+            "Bounds_Method, Bounds_Iter)"
+        )
+    if getattr(eigensolver, "reorthogonalization_threshold", 0.1) != 0.1:
+        features.append(
+            "another Gram-Schmidt reorthogonalization threshold "
+            "(Reorthogonalization_Threshold)"
+        )
+    return features
+
+
 def _reference_only_features(
     translation,
     *,
@@ -670,6 +702,11 @@ def _reference_only_features(
         features.append("the ARPACK eigensolver (Eigensolver: arpack)")
     elif eigensolver.method == "diagla":
         features.append("the DIAGLA eigensolver (Eigensolver: diagla)")
+    # Eigensolver options of the PARSEC 1.5 round that only the readable
+    # eigensolvers carry (a Vector_Rng_Seed start basis, Subspace_Buffer_Size
+    # 0 and the degree decrease of Chebyshev_Degree_Decrease_After run on the
+    # device too).
+    features.extend(_reference_only_solver_options(problem))
     # Pseudopotential set-up: the double grid (acceleration/V_ion/double_grid.py),
     # Old_Interpolation_Format (the native and CuPy local builders and the
     # device local forces) and, for a periodic cell, the Fourier filters and
@@ -759,6 +796,15 @@ def _reference_only_features(
                 "a periodic cell on Fortran's general grid (non-orthogonal "
                 "lattice vectors, or sides without one common grid spacing)"
             )
+    if problem.periodic_cell is None and getattr(problem.hartree, "cg_criterion", 1) == 2:
+        # PARSEC 1.5's Hartree_CG_Criterion 2 (the CG stops against ||b||): the readable CG
+        # (Hartree.poisson.cg_stopping_threshold) and the device CG of wires, slabs and cells
+        # (Hartree/periodic_device.py) have it; the CG backends of the accelerated cluster
+        # driver (CuPy, native, prepared, resident) test the initial residual only.
+        # Hartree_CG_Tolerance alone (criterion 1) runs there.
+        features.append(
+            "the Poisson CG test against the right-hand side (Hartree_CG_Criterion: 2) of a cluster"
+        )
     return features
 
 
@@ -805,6 +851,9 @@ def _mpi_unsupported_features(translation) -> list[str]:
         features.append("the Ylm-projected density of states (YLM_DOS_L)")
     if getattr(translation, "gw", None) is not None:
         features.append("the BerkeleyGW files (Output_GW)")
+    if getattr(problem, "embedding", None) is not None:
+        # FDET of PARSEC 1.5: one process holds the frozen sample field.
+        features.append("FDET (Potential_Field)")
     return features
 
 
@@ -859,6 +908,7 @@ def _reference_argv(arguments: argparse.Namespace) -> list[str]:
         ("--dry-run", arguments.dry_run),
         ("--quiet", arguments.quiet),
         ("--debug", arguments.debug),
+        ("--esdf-lenient", getattr(arguments, "esdf_lenient", False)),
     ):
         if enabled:
             argv.append(flag)
@@ -926,6 +976,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     return status
 
 
+def shared_vector_seed(translation, context=None):
+    """The translation with rank 0's start-vector seed on every MPI rank.
+
+    Every rank parses the input itself, and ``Vector_Rng_Seed: -1`` takes the seed from the clock during
+    the parse (``Input/solver_options.py``), so ranks whose parse falls into different seconds would draw
+    different seeds.  Each rank builds its own columns of the start basis from its seed
+    (``Eigensolvers/mpi_shared_basis.py``): the basis would mix streams, and the seed rank 0 prints and
+    writes to bak_complete_parsec.in would not repeat the run.
+    PARSEC 1.5 reads the input on one process.  An explicit seed is the same on every rank and stays.
+    ``context`` is the MPI context (:func:`.Parallel.mpi.context` when ``None``); every rank of a run with
+    more than one calls this function at the same place (one broadcast).
+    """
+    from .Parallel import mpi
+
+    if context is None:
+        context = mpi.context()
+    if context is None or context.size == 1:
+        return translation
+    eigensolver = translation.problem.eigensolver
+    own = (eigensolver.vector_seed, eigensolver.random_seed)
+    seeds = tuple(context.bcast(own, root=0))
+    if seeds == own:
+        return translation
+    return replace(
+        translation,
+        problem=replace(
+            translation.problem,
+            eigensolver=replace(eigensolver, vector_seed=seeds[0], random_seed=seeds[1]),
+        ),
+    )
+
+
 def _abort_mpi(status: int) -> None:
     """A rank that failed must not leave the others waiting in a collective (the interpreter's exit
     would wait for them in MPI_Finalize): end the whole MPI job."""
@@ -951,10 +1033,12 @@ def _run(
         translation = parse_parsec_input(
             arguments.input,
             pseudopotential_directory=arguments.pp_dir,
+            esdf_lenient=getattr(arguments, "esdf_lenient", False),
         )
     except (ParsecInputError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
+    translation = shared_vector_seed(translation)
     if arguments.mlff is not None:
         from parsec_python.MLFF import apply_mlff_option
 
@@ -1221,6 +1305,19 @@ def _run(
             return 2
 
     input_directory = translation.source.parent
+    # AFM_Scan: one folder per scan or part of a scan (rank 0 of an MPI run takes it).
+    scan_folder_note = None
+    if not arguments.dry_run and getattr(translation, "afm_scan", None) is not None:
+        from parsec_python.Output.afm_scan import claim_scan_folder
+        from .Parallel import mpi as _scan_mpi
+
+        _scan_context = _scan_mpi.context()
+        if _scan_context is None or _scan_context.is_root:
+            try:
+                scan_folder_note = claim_scan_folder(translation, input_directory)
+            except (OSError, ValueError) as error:
+                print(f"Input error: {error}", file=sys.stderr)
+                return 2
     symmetry_cache_directory = _symmetry_cache_directory(arguments)
     # Output_File_Name names the report as in PARSEC; --log overrules it.
     log_path = _resolve_output(
@@ -1300,12 +1397,27 @@ def _run(
 
             for line in post_processing_header_lines(translation):
                 log.write(line)
+            # PARSEC 1.5: FDET (Potential_Field) and pot.dat.
+            from parsec_python.Output.correction_output import embedding_header_lines
+
+            for line in embedding_header_lines(translation):
+                log.write(line)
+            if scan_folder_note is not None:
+                log.write(scan_folder_note)
             for warning in translation.warnings:
                 log.write(f"WARNING: {warning}")
             if symmetry_note is not None:
                 log.write(f"WARNING: {symmetry_note}")
             for note in restart_notes:
                 log.write(note)
+            # Generate_Complete_Parsec_In (PARSEC 1.5): bak_complete_parsec.in beside the input (rank 0 of an MPI run)
+            from parsec_python.Output.complete_input import write_complete_input
+            from .Parallel import mpi as _mpi
+
+            _context = _mpi.context()
+            if _context is None or _context.is_root:
+                for line in write_complete_input(translation):
+                    log.write(line)
             log.write()
             if translation.relaxation is not None:
                 log.write("\n".join(relaxation_header_lines(translation)))
@@ -1334,6 +1446,11 @@ def _run(
                 or translation.molecular_dynamics is not None
             )
             reporter.setup(system)
+            # FDET (PARSEC 1.5): the frozen field and the tip sphere.
+            from parsec_python.Output.correction_output import embedding_setup_lines
+
+            for line in embedding_setup_lines(system):
+                log.write(line)
             log.write("\n".join(_resource_report(resources, system)))
             if translation.problem.eigensolver.method == "none":
                 # Eigensolver: none is PARSEC's TEST mode (parsec.F90:1085-1089):
@@ -1589,6 +1706,16 @@ def _run(
                 )
                 log.write(f"Result archive: {saved}")
             files.finish(result, system.grid, translation.problem)
+            # Write_Potential_Field: pot.dat of PARSEC 1.5, of the last structure.
+            from parsec_python.Output.pot_dat import write_potential_field_after_run
+
+            write_potential_field_after_run(
+                translation, system, result, outcome, dynamics, log.write, input_directory
+            )
+            # AFM_Scan: the table of the scan (afm_scan.dat).
+            from parsec_python.Output.afm_scan import scan_lines_after_run
+
+            scan_lines_after_run(translation, outcome, log.write, input_directory)
             # bandstruc of a Gamma-point cell, Create_DOS of a cluster.
             run_post_scf_outputs(system, translation, result, reporter, log.write, input_directory)
             log.write(f"Text log: {log_path}")

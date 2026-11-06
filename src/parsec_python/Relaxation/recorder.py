@@ -34,6 +34,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 
+from ..Output.correction_output import embedding_move_lines
 from ..Output.force_output import movement_report_lines, relaxation_summary_lines
 from ..models import RelaxationSettings
 from .domove import MoveReport, MovementState
@@ -94,7 +95,9 @@ class RelaxationRecorder(IonicObserver):
     ``finish`` are called for every structure) and ``write`` its line sink.
     ``directory`` receives the files; ``None`` writes none.  ``elements``
     are the chemical symbols for the XYZ file where a species label is not
-    one.
+    one.  ``on_record`` (optional) is called with the records of all
+    structures so far after every structure (the AFM scan writes its table
+    with it, so that a later failure keeps the points before).
     """
 
     def __init__(
@@ -107,7 +110,10 @@ class RelaxationRecorder(IonicObserver):
         directory: Path | None,
         elements: Sequence[str] | None = None,
         warm_starts: bool = True,
+        on_record: Callable[[list[IonicStepRecord]], None] | None = None,
     ) -> None:
+        self.on_record = on_record
+        self._records: list[IonicStepRecord] = []
         self.warm_starts = warm_starts
         self.reporter = reporter
         self.write = write
@@ -226,6 +232,8 @@ class RelaxationRecorder(IonicObserver):
                         else (f" Structure of movement {step:4d}: the SCF loop starts afresh.",)
                     ),
                     "",
+                    # FDET tip sphere (PARSEC 1.5 tipsphere_field after domove); nothing otherwise.
+                    *embedding_move_lines(system),
                 ]
             )
         )
@@ -265,6 +273,9 @@ class RelaxationRecorder(IonicObserver):
         report: MoveReport | None,
         state: MovementState,
     ) -> None:
+        if self.on_record is not None:
+            self._records.append(record)
+            self.on_record(list(self._records))
         # The record is not changed after this step: the thread formats it.
         self._append(
             TRAJECTORY,
@@ -310,9 +321,11 @@ class RelaxationRecorder(IonicObserver):
                 upper=_copy(state.upper) if bfgs else None,
                 bound_step=state.bound_step if bfgs else None,
             )
-            self._start(
-                RELAX_RESTART, lambda: format_relax_restart(restart, block=self._block)
-            )
+            if getattr(self.settings, "write_restart", True):
+                # Write_Relax_Restart: .false. (PARSEC 1.5's default) writes none.
+                self._start(
+                    RELAX_RESTART, lambda: format_relax_restart(restart, block=self._block)
+                )
             if step < self.settings.max_movements:
                 text += format_atom_cor_structure(
                     step + 1, record.symbols, report.positions
@@ -325,6 +338,7 @@ class RelaxationRecorder(IonicObserver):
             minimum_force_found=outcome.minimum_force_found,
             manual=self.settings.method == "manual",
             scf_failed=outcome.scf_failed,
+            stopped_by_scf_failure=getattr(outcome, "stopped_by_scf_failure", False),
         )
         if outcome.records:
             last = outcome.records[-1]

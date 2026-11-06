@@ -414,7 +414,7 @@ def run_chebdav(
         else int(settings.max_iterations)
     )
 
-    basis_generator = LapackRandom()
+    basis_generator = LapackRandom(settings.basis_seed)
     if spectral_bound is None:
         bound_generator = np.random.default_rng(settings.random_seed)
         with device_stage(operator, "initial_bound_seconds"):

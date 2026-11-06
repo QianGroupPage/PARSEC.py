@@ -493,9 +493,16 @@ def run_scf_kpoints(
             last_input_potential = input_potential
             input_potential = mixed_potential
             if (
-                iteration > 5
+                iteration > settings.degree_decrease_after
                 and metrics.weighted
-                < (settings.approach_criterion if convergence_criterion is None else 100.0 * criterion)
+                < (
+                    # A loop criterion of the ionic loop (Relaxation_SCF_Upscale) gives
+                    # 100 times that criterion, unless the input writes
+                    # Convergence_Criterion_Approach, which holds as in every other loop.
+                    settings.approach_criterion
+                    if convergence_criterion is None or settings.convergence_criterion_approach is not None
+                    else 100.0 * criterion
+                )
                 and filter_degree > minimum_filter_degree
             ):
                 filter_degree -= 1
@@ -919,7 +926,7 @@ def run_scf_kpoints_spin_polarized(
             input_potential_up = mixed_combined[:n_grid]
             input_potential_down = mixed_combined[n_grid:]
             if (
-                iteration > 5
+                iteration > settings.degree_decrease_after
                 and metrics.weighted < settings.approach_criterion
                 and filter_degree > minimum_filter_degree
             ):

@@ -61,6 +61,10 @@ class AcceleratedPreparedSinglePointSystem:
     # grid sums on a device (Energy.dispersion_device); ``None`` takes the
     # reference correction on the host.
     dispersion_device: Callable[..., object] | None = None
+    # FDET of PARSEC 1.5: the grid operations of the non-additive kinetic
+    # terms on a device (acceleration.Embedding.device_kinetic); ``None``
+    # evaluates them on the host (and without FDET).
+    kinetic_operators: object | None = None
 
     def __getattr__(self, name: str):
         return getattr(self.reference, name)

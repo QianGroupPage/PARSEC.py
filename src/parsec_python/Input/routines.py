@@ -17,7 +17,10 @@ The input parameter ``Use_Fortran_Routines`` chooses:
 * ``.true.``: the Fortran-derived routines.
 
 An input that Andrew Grieder's routines do not compute (a keyword or a value they do not read, a geometry they
-refuse) runs on the Fortran-derived routines by itself, and the reason is printed with a warning.
+refuse) runs on the Fortran-derived routines by itself, and the reason is printed with a warning.  A keyword that
+both sets read the same way (the shared eigensolvers and SCF loops, :data:`NEUTRAL_KEYS`) chooses nothing, and so
+does a label written at a value that has no effect (:data:`NO_EFFECT`: label -> the predicate and its reason, such as
+``Add_Point_Charges: .false.`` or ``Mixing_Restart_Factor 0.3``, the lines PARSEC 1.5's bak_complete_parsec.in writes).
 :func:`decide_routines` makes the choice once per run, from the input's keywords; the parser adds the reasons it
 finds in the values and the features whose default is the Fortran-derived routines
 (``parsec_python.Input.parsec_input``) and records the result on the translation
@@ -29,6 +32,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Mapping, Sequence
+
+from .solver_options import SOLVER_KEYS
 
 #: The labels of the input that the default routines read (Andrew Grieder's parser: ``species_keys``,
 #: ``accepted_global`` and ``block_keys`` of ``Input/parsec_input.py`` on qian/pbc_forces and
@@ -60,6 +65,9 @@ DEFAULT_BLOCK_KEYS = frozenset(
         "kpoint_list",
         "bandstruc",
         "electron_per_orbital",
+        # PARSEC 1.5's grid shift: his grid reads any shift (the parser sets it; his slab, which has none, falls
+        # back by name)
+        "grid_shift",
     }
 )
 DEFAULT_GLOBAL_KEYS = frozenset(
@@ -74,6 +82,9 @@ DEFAULT_GLOBAL_KEYS = frozenset(
         "grid_spacing",
         "coordinate_unit",
         "ignore_symmetry",
+        # PARSEC 1.5's blocks of the domain: a cluster's domain (the same code under both choices) or, for a bulk
+        # cell, the grid of 1 with the symmetry switched off (the parser refuses what neither computes)
+        "foldblock_side_length",
         "expansion_order",
         "states_num",
         "net_charges",
@@ -173,6 +184,87 @@ DEFAULT_GLOBAL_KEYS = frozenset(
     }
 )
 
+#: Labels of PARSEC 1.5 that the merged parser reads and whose effect is the same under both sets of routines, so
+#: that they decide nothing (the parity round of 2026-11-04, input layer): keywords that only tune 1.5's MPI
+#: layout, ScaLAPACK, ELPA, HDF5, space-filling curves, spectrum slicing, threads or its internal tests (no effect
+#: here); ``Use_LibXC``/``Func_Id_*`` (refused when libxc is asked for, ignored otherwise, as 1.5 does);
+#: ``Pseudopot_File`` (the parser resolves the file for both); the Poisson CG controls (``HartreeSettings``, read by
+#: the solvers both sets share); the output switches ``Generate_Complete_Parsec_In``, ``Output_Ascii_Data`` and
+#: ``Print_Unconverged_Density``.  The renamed ``Mol_RNG_Seed`` is read as ``RNG_Seed`` before the choice.
+#: Since 2026-11-04 (evening) also the eigensolver and SCF
+#: controls of the earlier parity round that the shared eigensolvers and SCF loops read the same way under both
+#: sets (``Convergence_Criterion_Approach``, ``Chebyshev_Filtering``, ``Maximum_Matvec``,
+#: ``Fix_Number_Eigenvalues``) and the MPI tuning labels that act on nothing here (``MPI_Groups``, the earlier name
+#: of ``Npcol``, ``Exp_Comm``, ``Max_Lap_Buffers``).
+NEUTRAL_KEYS = frozenset(
+    {
+        "use_scalapack",
+        "scalapack_block_size",
+        "use_elpa",
+        "elpa_block_size",
+        "npcol",
+        "spectrum_slicing",
+        "use_krylov_subspace_method",
+        "use_lanczos_dos_estimation",
+        "spectrum_slicing_cycles_early_quit",
+        "spectrum_slicing_max_cycles",
+        "spectrum_slicing_max_cycles_first",
+        "num_of_iter_still_using_chebyshev",
+        "polym_first_ss_iter",
+        "polym_ss",
+        "num_of_copied_groups",
+        "num_of_slice1_filtering",
+        "nslices",
+        "spectrum_slicing_ratio",
+        "use_sfc",
+        "thread_random_init",
+        "rritz_logic",
+        "test_logic",
+        "max_taskgroups",
+        "vxc_matrix_elements",
+        "use_hdf5",
+        "use_libxc",
+        "func_id_x",
+        "func_id_c",
+        "pseudopot_file",
+        "hartree_cg_tolerance",
+        "hartree_cg_criterion",
+        "generate_complete_parsec_in",
+        "output_ascii_data",
+        "print_unconverged_density",
+        # Eigensolver and SCF controls of the Fortran parity round: shared code under both sets.
+        "convergence_criterion_approach",
+        "chebyshev_filtering",
+        "maximum_matvec",
+        "fix_number_eigenvalues",
+        # MPI tuning labels of the earlier PARSEC: read, warned about, no effect.
+        "mpi_groups",
+        "exp_comm",
+        "max_lap_buffers",
+        # FDET of PARSEC 1.5 and its PARSEC.py switches (FDET_KEYWORDS of parsec_input): FDET is
+        # for clusters only, and a periodic input that asks for it is refused by name (_fdet_settings); the
+        # values that ask for nothing (Potential_Field: .false., which 1.5's bak_complete_parsec.in writes in
+        # every run, Write_Potential_Field: .false., AFM_Scan: .false., or a functional without Potential_Field)
+        # are no-ops under both sets (since 2026-11-05).
+        "potential_field",
+        "potential_field_name",
+        "kinetic_energy_functional",
+        "pbe_m",
+        "pbe_k",
+        "boundary_sphere_around_tip",
+        "fdet_kinetic_form",
+        "write_potential_field",
+        "afm_scan",
+        "afm_scan_heights",
+        "afm_scan_height_step",
+        "afm_scan_line_range",
+    }
+    # The eigensolver, SCF-control and start-vector labels of PARSEC 1.5 and the
+    # extensions of its round (parsec_python.Input.solver_options): options of
+    # the eigensolvers and SCF loops that both sets of routines share.
+    | SOLVER_KEYS
+)
+
 #: The label of the choice (not read by Andrew Grieder's own parser: it is this merge's).
 KEYWORD = "use_fortran_routines"
 
@@ -183,6 +275,29 @@ SHIFTED_MESH_FEATURE = "shifted Monkhorst-Pack grids of bulk cells"
 GAMMA_FORCES_FEATURE = "forces, relaxation and molecular dynamics of bulk cells at the Gamma point"
 SYMMETRIC_GRID_FEATURE = "bulk cells whose space group sets the grid"
 FORTRAN_DEFAULT_FEATURES = (SLAB_FEATURE, SHIFTED_MESH_FEATURE, GAMMA_FORCES_FEATURE, SYMMETRIC_GRID_FEATURE)
+
+#: Labels of PARSEC 1.5 for the forces, ionic loops and band structure (the parity round of 2026-11-04)
+#: whose effect is the same under both sets of routines, so that they decide nothing: ``Calculate_Force``
+#: (read as ``Skip_Force``, which both read), ``Use_Old_Forces`` (no effect), ``Write_Relax_Restart`` (the file of
+#: the shared relaxation recorder) and ``Bands_FF_MaxIter`` (the shared band-structure solve).
+#: ``Recenter_Atoms_In_Aperiodic_Directions`` is one of them since 2026-11-05: both
+#: values act the same under both sets.  ``.true.`` is the default.  ``.false.`` keeps the coordinates of the input,
+#: which Andrew Grieder's routines do anyway for a bulk cell (the start-up ``back_to_cell`` of
+#: ``parsec_input`` runs for the Fortran-derived routines only); the re-centring of a slab along z (the parser
+#: and ``Relaxation/run.py``) and the frame of a molecular-dynamics restart (``MolecularDynamics/run.py``) are
+#: shared code that reads the value for both; wires are not re-centred.
+SMALL15_SHARED_KEYS = frozenset(
+    {
+        "calculate_force",
+        "use_old_forces",
+        "write_relax_restart",
+        "bands_ff_maxiter",
+        "recenter_atoms_in_aperiodic_directions",
+    }
+)
+
+#: Blocks that choose nothing for the same reason: the lateral points of an FDET AFM scan (``FDET_BLOCKS``).
+NEUTRAL_BLOCK_KEYS = frozenset({"afm_scan_lateral_points"})
 
 
 @dataclass(frozen=True)
@@ -289,6 +404,7 @@ def bulk_default_features(
     ignore_symmetry: bool,
     search_info: int,
     spline_species: bool = False,
+    requested_shift=None,
 ) -> tuple[str, ...]:
     """The features of a bulk cell whose default is the Fortran-derived routines (besides a shifted mesh).
 
@@ -297,14 +413,18 @@ def bulk_default_features(
     Gamma point alone; ``forces``: forces are computed (a relaxation, molecular dynamics or
     ``Skip_Force: .false.``); ``spinors``: self-consistent spin-orbit coupling or non-collinear magnetism;
     ``search_info``: the ``ierr`` of the Fortran-derived parser's space-group search
-    (``_bulk_symmetry_search_info``); ``spline_species``: every species uses ``Cubic_Spline``.
+    (``_bulk_symmetry_search_info``); ``spline_species``: every species uses ``Cubic_Spline``;
+    ``requested_shift``: the ``Grid_Shift`` block of PARSEC 1.5 (``None`` without it), which both grids take.
 
     * :data:`GAMMA_FORCES_FEATURE`: forces of scalar orbitals (spin-polarized or not) at the Gamma point without a
       k-point input, where the orthorhombic grid of the Fortran-derived routines has the points of Andrew
       Grieder's grid (:func:`_grids_coincide`) and every species uses ``Cubic_Spline`` (his local potential is
       always the cubic spline, theirs follows the species), so that a run with forces has the energy of the same
-      run without them: in practice ``Ignore_Symmetry`` inputs with spline species.  Widening it needs the
-      orthorhombic grid of the Fortran-derived routines to be Fortran's and the same local potential.  Their accelerated path is 2.5-5 times faster there (Si64 molecular dynamics on an A100: 7.6 against
+      run without them.  Since the parity round of PARSEC 1.5 their orthorhombic grid is Fortran's (``adjust_step``
+      with the space group's translations, half a step off the origin unless ``Ignore_Symmetry``), so the grids
+      coincide for symmetric cells too (a cube of a symmorphic group, or one whose translations
+      ``adjust_step`` meets with the even count anyway, as the 8-atom diamond cube at the Gamma point, whose
+      operations fail ``symchk``), not only for ``Ignore_Symmetry`` inputs.  Their accelerated path is 2.5-5 times faster there (Si64 molecular dynamics on an A100: 7.6 against
       41 s; device forces, device Hartree, geometry updates 4-15 times faster) and their forces are the
       derivative of their energy.
     * :data:`SYMMETRIC_GRID_FEATURE`: a cell on Fortran's general grid whose space group's fractional
@@ -324,51 +444,104 @@ def bulk_default_features(
     * the forces and ionic loops of spinor orbitals: his are 30-150 times faster per force evaluation.
     """
 
+    from dataclasses import replace
+
     from ..Grid.pbc import uses_general_periodic_grid
 
-    general = uses_general_periodic_grid(periodic_cell, grid)
     features: list[str] = []
+    gamma_forces = forces and not spinors and not kpoints and spline_species
+    reference_in_both = spin_polarized or spinors or (kpoints and not gamma_only)
+    symmetric_grid = not forces and not ignore_symmetry and search_info != 2 and reference_in_both
+    if not (gamma_forces or symmetric_grid):
+        return ()
+    # The grid settings of the Fortran-derived routines: the space group's fractional translations (as their
+    # parser finds them; a search only where a feature may follow), and their shift.
+    ours = replace(
+        grid,
+        fractional_translations=_fortran_translations(atoms, periodic_cell, ignore_symmetry, search_info),
+        shift=_fortran_shift(periodic_cell, ignore_symmetry, requested_shift),
+        points_rule="round",
+        fortran_routines=True,
+    )
+    general = uses_general_periodic_grid(periodic_cell, ours)
     if (
-        forces
-        and not spinors
-        and not kpoints
+        gamma_forces
         and not general
-        and spline_species
-        and _grids_coincide(periodic_cell, grid, ignore_symmetry)
+        and _grids_coincide(periodic_cell, ours, ignore_symmetry, requested_shift)
     ):
         features.append(GAMMA_FORCES_FEATURE)
-    reference_in_both = spin_polarized or spinors or (kpoints and not gamma_only)
     if (
-        general
-        and not forces
-        and not ignore_symmetry
-        and search_info != 2
-        and reference_in_both
+        symmetric_grid
+        and general
         and _space_group_sets_grid(atoms, periodic_cell, grid.spacing, search_info)
     ):
         features.append(SYMMETRIC_GRID_FEATURE)
     return tuple(features)
 
 
-def _grids_coincide(periodic_cell, grid, ignore_symmetry: bool) -> bool:
+def _fortran_translations(atoms, periodic_cell, ignore_symmetry: bool, search_info: int):
+    """The fractional translations the Fortran-derived parser hands to ``adjust_step`` (``_periodic_symmetry``):
+    none with ``Ignore_Symmetry`` or without a search (``search_info`` 2), none where ``symchk`` fails (``search_info``
+    0), else those of the space group of the atoms."""
+
+    import numpy as np
+
+    from ..Grid.space_group import find_space_group
+    from ..Grid.symmetry_analysis import symmetry_check
+
+    if ignore_symmetry or search_info == 2:
+        return ()
+    try:
+        group = find_space_group(np.asarray(periodic_cell.lattice_vectors, dtype=float), atoms)
+    except ValueError:
+        return ()  # the Fortran-derived parser says why, if it runs
+    if group.order <= 1 or (search_info == 0 and symmetry_check(group).error):
+        return ()
+    return group.commensurate_translations()
+
+
+def _fortran_shift(periodic_cell, ignore_symmetry: bool, requested_shift):
+    from ..Grid.pbc import periodic_grid_shift
+
+    return periodic_grid_shift(
+        periodic_cell.lattice_vectors, ignore_symmetry=ignore_symmetry, requested=requested_shift
+    )
+
+
+def _andrew_shift(periodic_cell, ignore_symmetry: bool, requested_shift):
+    """The shift of Andrew Grieder's grid as the parser sets it (``fortran_grid_shift``, or the ``Grid_Shift``
+    block)."""
+
+    from ..Grid.pbc import fortran_grid_shift
+
+    if requested_shift is None:
+        return fortran_grid_shift(periodic_cell.lattice_vectors, ignore_symmetry)
+    return _fortran_shift(periodic_cell, ignore_symmetry, requested_shift)
+
+
+def _grids_coincide(periodic_cell, grid, ignore_symmetry: bool, requested_shift=None) -> bool:
     """Whether the orthorhombic grid of the Fortran-derived routines has the points of Andrew Grieder's grid.
 
-    Theirs (``build_fortran_periodic_grid``): ``round(L_i/h)`` points per side, the step ``L_0/n_0`` along every
-    axis, from the origin.  His: the largest even number of points whose step is not below ``h``
-    (``fortran_points_per_axis``), the step ``L_i/n_i`` along each axis, half a step off the origin unless
-    ``Ignore_Symmetry`` is set (``fortran_grid_shift``).  The same counts, the same steps to the last bit and no
-    shift give the same points.
+    Theirs (``build_fortran_periodic_grid``, ``grid`` their settings): ``adjust_step``'s counts with the space
+    group's translations (:func:`parsec_python.Grid.pbc.fortran_orthorhombic_counts`), the step ``L_0/n_0`` along
+    every axis, the shift ``grid.shift``.  His: the largest even number of points whose step is not below ``h``
+    (``fortran_points_per_axis``, without the translations and without PARSEC 1.5's slack ``1e-15``), the step
+    ``L_i/n_i`` along each axis, half a step off the origin unless ``Ignore_Symmetry`` is set
+    (``fortran_grid_shift``) or the ``Grid_Shift`` block.  The same counts, the same steps to the last bit and the
+    same shift give the same points.
     """
 
     import numpy as np
 
-    from ..Grid.pbc import fortran_grid_shift, fortran_points_per_axis
+    from ..Grid.pbc import fortran_orthorhombic_counts, fortran_points_per_axis
 
     lattice_vectors = np.asarray(periodic_cell.lattice_vectors, dtype=float)
-    if any(fortran_grid_shift(lattice_vectors, ignore_symmetry)):
+    if tuple(grid.shift) != tuple(_andrew_shift(periodic_cell, ignore_symmetry, requested_shift)):
+        return False
+    ours = fortran_orthorhombic_counts(periodic_cell, grid)
+    if ours is None:
         return False
     sides = np.diag(lattice_vectors)
-    ours = np.round(sides / grid.spacing).astype(np.int64)
     try:
         his = fortran_points_per_axis(sides, grid.spacing)
     except ValueError:
@@ -388,7 +561,7 @@ def _space_group_sets_grid(atoms, periodic_cell, spacing: float, search_info: in
 
     import numpy as np
 
-    from ..Grid.pbc import adjust_step, fortran_points_per_axis
+    from ..Grid.pbc import adjusted_steps, fortran_points_per_axis
     from ..Grid.space_group import find_space_group
     from ..Grid.symmetry_analysis import symmetry_check
 
@@ -402,10 +575,7 @@ def _space_group_sets_grid(atoms, periodic_cell, spacing: float, search_info: in
     lengths = np.linalg.norm(lattice_vectors, axis=1)
     try:
         his = [int(value) for value in fortran_points_per_axis(lengths, spacing)]
-        ours = [
-            adjust_step(float(length), spacing, translations=taus)[0]
-            for length, taus in zip(lengths, group.commensurate_translations())
-        ]
+        ours = adjusted_steps(lengths, spacing, group.commensurate_translations())[0]
     except ValueError:
         return False
     return ours != his
@@ -420,6 +590,206 @@ class UseFortranRoutines(Exception):
     def __init__(self, choice: RoutineChoice) -> None:
         super().__init__("; ".join(choice.reasons))
         self.choice = choice
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Labels that Andrew Grieder's routines do not read, at values that do nothing (since 2026-11-05: each such value
+# gives the identical translation).  PARSEC 1.5's bak_complete_parsec.in writes most of them in every run, at
+# their defaults; written so they must not move a periodic input to the Fortran-derived routines.  A value that
+# acts keeps choosing them (and the parser's refusals and fall-backs keep applying).
+# ---------------------------------------------------------------------------------------------------------------
+
+_LOGICAL_TRUE = {"yes", "true", "t", "1", "on"}
+_LOGICAL_FALSE = {"no", "false", "f", "0", "off"}
+
+
+def _texts(scalar: Mapping[str, Sequence[object]], key: str) -> list[str]:
+    """The written values of ``key`` (one per occurrence: species labels have one per species)."""
+
+    return [str(getattr(item, "value", "")) for item in scalar.get(key, ())]
+
+
+def _logical(text: str) -> bool | None:
+    """An ESDF logical as the parser reads it (``_boolean``), ``None`` for anything else."""
+
+    normalized = "".join(char for char in text.lower() if char not in "._- \t")
+    if normalized in _LOGICAL_TRUE:
+        return True
+    if normalized in _LOGICAL_FALSE:
+        return False
+    return None
+
+
+def _number(text: str) -> float | None:
+    """The first number of a value (a unit may follow; Fortran's ``d`` exponent read), ``None`` otherwise."""
+
+    words = text.split()
+    if not words:
+        return None
+    try:
+        return float(words[0].lower().replace("d", "e"))
+    except ValueError:
+        return None
+
+
+def _is_true(key: str, scalar) -> bool:
+    """``key`` is written and every occurrence is a true logical."""
+
+    texts = _texts(scalar, key)
+    return bool(texts) and all(_logical(text) is True for text in texts)
+
+
+def _false(key: str):
+    return lambda scalar, blocks: all(_logical(text) is False for text in _texts(scalar, key))
+
+
+def _equals(key: str, value: float):
+    return lambda scalar, blocks: all(_number(text) == value for text in _texts(scalar, key))
+
+
+def _word(key: str, *words: str):
+    return lambda scalar, blocks: all(text.strip().strip("'\"").lower() in words for text in _texts(scalar, key))
+
+
+def _either(*tests):
+    return lambda scalar, blocks: any(test(scalar, blocks) for test in tests)
+
+
+def _unless_true(other: str):
+    """No effect unless the logical ``other`` is true (the label is read only then)."""
+
+    return lambda scalar, blocks: not _is_true(other, scalar)
+
+
+def _always(scalar, blocks) -> bool:
+    return True
+
+
+def _no_nscf_run(scalar, blocks) -> bool:
+    """No non-self-consistent run (``nscf_kpoints``/``nscf_kgrid`` block) and no BerkeleyGW output."""
+
+    return not any(key in blocks for key in ("nscf_kpoints", "nscf_kgrid", "nscf_kgrid_shift")) and not _is_true(
+        "output_gw", scalar
+    )
+
+
+def _with_kpoints(scalar, blocks) -> bool:
+    """A k-point run (``Kpoint_Method`` mp or manual with its grid or list): eigen.dat is written whatever
+    ``Output_Eigenvalues`` says (the parser's ``eigenvalues = Output_Eigenvalues or has_kpoints``)."""
+
+    methods = [text.strip().lower() for text in _texts(scalar, "kpoint_method")]
+    if methods == ["mp"]:
+        return "monkhorst_pack_grid" in blocks
+    if methods == ["manual"]:
+        return "kpoint_list" in blocks or bool(_texts(scalar, "kpoint_file"))
+    return False
+
+
+def _no_core_filter(scalar, blocks) -> bool:
+    """``Core_Filter 0`` with every ``Alpha_Filter`` and ``Beta1_Filter`` 0: no Fourier filter at all (the parser
+    then sets none; ``SpeciesPotential.has_fourier_filter``)."""
+
+    return all(
+        all(_number(text) == 0.0 for text in _texts(scalar, key))
+        for key in ("core_filter", "alpha_filter", "beta1_filter")
+    )
+
+
+@dataclass(frozen=True)
+class NoEffect:
+    """When a label, as written, does nothing: ``test(scalar, blocks)`` and why (``reason``)."""
+
+    test: object
+    reason: str
+
+
+#: Label -> the predicate "has no effect" and its reason.  Every entry is checked by
+#: ``tests/unit/test_routines.py`` (``ValueAwareRoutineTests``): the no-op values give the translation of the input
+#: without the line, on the default routines; the acting values still choose the Fortran-derived ones.
+NO_EFFECT: dict[str, NoEffect] = {
+    "add_point_charges": NoEffect(_false("add_point_charges"), "false: no point charges (the default)"),
+    "point_typ_num": NoEffect(
+        _either(_equals("point_typ_num", 0), _unless_true("add_point_charges")),
+        "0, or without Add_Point_Charges: no point charges",
+    ),
+    "add_charged_sheets": NoEffect(_false("add_charged_sheets"), "false: no charged sheets (the default)"),
+    "num_charged_sheets": NoEffect(
+        _either(_equals("num_charged_sheets", 0), _unless_true("add_charged_sheets")),
+        "0, or without Add_Charged_Sheets: no charged sheets",
+    ),
+    "alpha_filter": NoEffect(_equals("alpha_filter", 0.0), "0 (the default): no Fourier filter"),
+    "beta1_filter": NoEffect(_equals("beta1_filter", 0.0), "0 (the default): no Fourier filter"),
+    "core_filter": NoEffect(_no_core_filter, "0 with Alpha_Filter and Beta1_Filter 0: no Fourier filter"),
+    "calc_hartree_g": NoEffect(_false("calc_hartree_g"), "false (the default): the real-space Hartree solver"),
+    "create_dos": NoEffect(_false("create_dos"), "false (the default): no DOS"),
+    "dos_pnum": NoEffect(
+        _either(_equals("dos_pnum", 1000), _unless_true("create_dos")),
+        "1000 (the default), or without Create_DOS (read for the DOS only)",
+    ),
+    "ylm_dos_l": NoEffect(
+        _either(_equals("ylm_dos_l", -1), _unless_true("create_dos")),
+        "-1 (the default), or without Create_DOS (read for the DOS only)",
+    ),
+    "external_mag_field": NoEffect(
+        _equals("external_mag_field", 0.0), "0 (the default): no field and real wavefunctions"
+    ),
+    "hf_one": NoEffect(
+        _either(_equals("hf_one", 0), _unless_true("van_der_waals")), "0, or without Van_Der_Waals (ignored)"
+    ),
+    "hf_two": NoEffect(
+        _either(_equals("hf_two", 0), _unless_true("van_der_waals")), "0, or without Van_Der_Waals (ignored)"
+    ),
+    "hf_three": NoEffect(
+        _either(_equals("hf_three", 0), _unless_true("van_der_waals")), "0, or without Van_Der_Waals (ignored)"
+    ),
+    "van_der_waals": NoEffect(_false("van_der_waals"), "false (the default): no TS correction"),
+    "ldaplusu_u": NoEffect(_equals("ldaplusu_u", 0.0), "0 for every species: no LDA+U term"),
+    "ldaplusu_j": NoEffect(_equals("ldaplusu_j", 0.0), "0 for every species: no LDA+U term"),
+    "mixing_en_like": NoEffect(_equals("mixing_en_like", 0), "0, the default of the mixer"),
+    "mixing_group_size": NoEffect(_equals("mixing_group_size", 1), "1, the default of the mixer"),
+    "mixing_memory_expand_factor": NoEffect(
+        _equals("mixing_memory_expand_factor", 2.0), "2, the default of the mixer"
+    ),
+    "mixing_preferred_type": NoEffect(_equals("mixing_preferred_type", 1), "1, the default of the mixer"),
+    "mixing_restart_factor": NoEffect(_equals("mixing_restart_factor", 0.3), "0.3, the default of the mixer"),
+    "nscf_fermi_level": NoEffect(_no_nscf_run, "without a non-self-consistent run or Output_GW (not read)"),
+    "nscf_kpoint_unit": NoEffect(_no_nscf_run, "without a non-self-consistent run or Output_GW (not read)"),
+    "nscf_states_num": NoEffect(_no_nscf_run, "without a non-self-consistent run or Output_GW (not read)"),
+    "orb_mag": NoEffect(_always, "any value: accepted as in PARSEC, where it changes nothing (a warning)"),
+    "output_gw": NoEffect(_false("output_gw"), "false (the default): no BerkeleyGW files"),
+    "polarizability": NoEffect(_false("polarizability"), "false (the default): no polarizability run"),
+    "restart_from_wfndat": NoEffect(
+        _either(_false("restart_from_wfndat"), _unless_true("restart_run")),
+        "false, or without Restart_Run (read and unused, parsec.F90 l.917-933)",
+    ),
+    "symmetrize_charge_density": NoEffect(
+        _false("symmetrize_charge_density"), "false (the default): the density is not symmetrized"
+    ),
+    # Output switches at their defaults: the same files and the same parsec.out.
+    "output_data": NoEffect(lambda scalar, blocks: all(_logical(t) is True for t in _texts(scalar, "output_data")),
+                            "true (the default): parsec.dat is written"),
+    "output_eigenvalues": NoEffect(
+        _either(_false("output_eigenvalues"), _with_kpoints),
+        "false (the default; the notice 'No eigenvalue output File!' PARSEC prints for the written label comes "
+        "from the output both sets share), or any value with k-points, which write eigen.dat anyway",
+    ),
+    "save_intermediate_eigenvalues": NoEffect(_false("save_intermediate_eigenvalues"), "false (the default)"),
+    "save_intermediate_charge_density": NoEffect(_false("save_intermediate_charge_density"), "false (the default)"),
+    "output_file_name": NoEffect(_word("output_file_name", "parsec.out"), "parsec.out (the default)"),
+    "output_grid_data": NoEffect(_word("output_grid_data", "none", ""), "none (the default): no grid files"),
+}
+
+
+def has_no_effect(key: str, scalar: Mapping[str, Sequence[object]], blocks: Mapping[str, Sequence[object]]) -> bool:
+    """Whether ``key`` is written at a value that does nothing (:data:`NO_EFFECT`); ``False`` for other labels."""
+
+    entry = NO_EFFECT.get(key)
+    if entry is None or not _texts(scalar, key):
+        return False
+    try:
+        return bool(entry.test(scalar, blocks))
+    except (TypeError, ValueError):
+        return False
 
 
 def decide_routines(
@@ -440,11 +810,24 @@ def decide_routines(
         return RoutineChoice(fortran=True, requested=True)
     start = RoutineChoice(requested=requested)
     unknown = sorted(
-        key for key in scalar if key != KEYWORD and key not in DEFAULT_SPECIES_KEYS | DEFAULT_GLOBAL_KEYS
+        key
+        for key in scalar
+        if key != KEYWORD
+        and key not in DEFAULT_SPECIES_KEYS | DEFAULT_GLOBAL_KEYS | NEUTRAL_KEYS | SMALL15_SHARED_KEYS
+        # a label written at a value that has no effect chooses nothing (NO_EFFECT)
+        and not has_no_effect(key, scalar, blocks)
     )
-    unknown += [f"begin {key}" for key in sorted(blocks) if key not in DEFAULT_BLOCK_KEYS]
+    # the values of the labels of NO_EFFECT that act, so that the warning names them
+    unknown = [
+        f"{key} = {' / '.join(_texts(scalar, key))}" if key in NO_EFFECT else key for key in unknown
+    ]
+    unknown += [
+        f"begin {key}" for key in sorted(blocks) if key not in DEFAULT_BLOCK_KEYS | NEUTRAL_BLOCK_KEYS
+    ]
     if unknown:
-        return start.with_reason("input option(s) " + ", ".join(unknown))
+        return start.with_reason(
+            "input option(s) " + ", ".join(unknown) + " (read by the Fortran-derived routines only)"
+        )
     return start
 
 
@@ -454,6 +837,7 @@ __all__ = [
     "GAMMA_FORCES_FEATURE",
     "SHIFTED_MESH_FEATURE",
     "SLAB_FEATURE",
+    "SMALL15_SHARED_KEYS",
     "SYMMETRIC_GRID_FEATURE",
     "bulk_default_features",
     "routines_report_line",
@@ -461,6 +845,11 @@ __all__ = [
     "DEFAULT_GLOBAL_KEYS",
     "DEFAULT_SPECIES_KEYS",
     "KEYWORD",
+    "NEUTRAL_BLOCK_KEYS",
+    "NEUTRAL_KEYS",
+    "NO_EFFECT",
+    "NoEffect",
+    "has_no_effect",
     "RoutineChoice",
     "UseFortranRoutines",
     "decide_routines",

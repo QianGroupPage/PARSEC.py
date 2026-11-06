@@ -96,6 +96,11 @@ class ParsecPseudopotential:
     # The local angular momentum a ``MARTINS_WANG`` file names (``loc``);
     # ``None`` where the input chooses it (``Local_Component``).
     local_channel: int | None = None
+    # ``dvw`` of a filtered channel: the radial derivative of its filtered
+    # projector, ``dfint`` of PARSEC 1.5 (``math/fourier_f.f90:267``; the
+    # previous tree stored the projector itself there).  Same keys as
+    # ``filtered_projectors``; empty for an unfiltered potential.
+    filtered_projector_slopes: dict[int, np.ndarray] = field(default_factory=dict)
 
     @property
     def radial_offset(self) -> float:

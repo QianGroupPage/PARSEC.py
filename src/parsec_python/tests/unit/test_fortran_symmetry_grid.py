@@ -4,10 +4,10 @@
 (:func:`parsec_python.Input.parsec_input._periodic_symmetry`, :func:`parsec_python.Grid.pbc.adjust_step`):
 
 * a translation no grid is commensurate with (fcc Si2, the second atom at 0.27 on the three-fold
-  axis: C3v, symmetry on, h 0.6): Fortran keeps its 12 operations and the grid of 2 nint(L/2h)
-  points, with the step left at the input spacing (12 x 0.600 bohr in a 7.2549 bohr cell);
-  this port takes 12 points with the step L/12 = 0.605 bohr, the grid of Fortran's own run of the
-  input with Ignore_Symmetry;
+  axis: C3v, symmetry on, h 0.6): Fortran keeps its 12 operations; the previous Fortran tree
+  kept the step at the input spacing (12 x 0.600 bohr in a 7.2549 bohr cell), PARSEC 1.5 and
+  this port take nint(L/h) = 12 points with the step L/12 = 0.605 bohr, the grid of Fortran's own
+  run of the input with Ignore_Symmetry;
 * operations that do not form a group modulo the lattice (``symchk``, run at the Gamma point on a
   grid shifted by 0.5): Fortran keeps the identity alone (the diamond cube stretched to 15.39 bohr
   along z: 20 x 20 x 30 points, not the 28 planes of the (1/4, 1/4, 1/4) translation);
@@ -122,7 +122,7 @@ class _InputCase(unittest.TestCase):
 class AdjustStepWithoutCommensurateStepTests(unittest.TestCase):
     def test_parsecs_count_with_the_step_that_spans_the_cell(self) -> None:
         length = 10.26 / np.sqrt(2.0)
-        # 0.27 divides no even count near L/h: 2 nint(L/2h) points, step L/n.
+        # 0.27 divides no even count near L/h: PARSEC 1.5's nint(L/h) points, step L/n.
         self.assertEqual(adjust_step(length, 0.6, translations=(0.27, 0.27)), (12, length / 12))
         # Fortran's nint, not the largest even count below L/h: L/h = 13.5 gives 14.
         self.assertEqual(adjust_step(8.1, 0.6, translations=(0.27,)), (14, 8.1 / 14))
@@ -147,7 +147,7 @@ class IncommensurateTranslationTests(_InputCase):
         # The six operations with the 0.27 translation stay in Fortran's group (12 operations).
         self.assertEqual(len(problem.grid.fractional_translations[0]), 6)
         self.assertTrue(
-            any("0.27000 0.27000 0.27000" in note and "2 nint(L/2h)" in note for note in translation.warnings)
+            any("0.27000 0.27000 0.27000" in note and "nint(L/h) points" in note for note in translation.warnings)
         )
         # The density cannot be averaged over operations that do not map the grid onto itself.
         with self.assertRaisesRegex(UnsupportedParsecOptionError, "no grid spacing is commensurate"):
@@ -189,7 +189,9 @@ class SymmetryCheckTests(_InputCase):
         self.assertFalse(any(problem.grid.fractional_translations))
         grid = build_periodic_grid(problem.periodic_cell, problem.grid)
         self.assertEqual(grid.points_per_axis.tolist(), [20, 20, 30])  # Fortran; 28 planes before
-        np.testing.assert_allclose(grid.spacings, 0.513, rtol=0, atol=1e-12)
+        # one step along the three sides: the orthorhombic grid of Fortran's counts (PARSEC 1.5's parity round;
+        # Fortran's general grid before, the same points)
+        np.testing.assert_allclose(grid.spacing, 0.513, rtol=0, atol=1e-12)
         np.testing.assert_allclose(grid.shift, 0.5)
         # Symmetrize_Charge_Density averages over the identity alone, as in Fortran.
         symmetrized = self.parse(_STRETCHED_DIAMOND.format(extra="Symmetrize_Charge_Density: .true."))

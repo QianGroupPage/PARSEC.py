@@ -8,6 +8,10 @@ import numpy as np
 
 from ..models import MixingSettings
 
+#: ``twomach_eps`` of PARSEC 1.5 (``math/const.F90:32``): the electrons below
+#: which ``getsre.f90`` takes a spin channel for empty.
+EMPTY_CHANNEL_ELECTRONS = 4.440892098500626161694526672363e-16
+
 
 def _weighted_norm(vector: np.ndarray, weights: np.ndarray | None = None) -> float:
     """Return the norm used by the corresponding Anderson least-squares metric."""
@@ -118,8 +122,11 @@ def spin_potential_residual_metrics(
     With ``R_s = V_out,s - V_in,s`` the plain norm of a channel is
     ``sqrt(h^3 sum R_s^2)`` and the weighted one
     ``sqrt(h^3 sum rho_s R_s^2 / N_s)``, with the density and the electrons
-    ``N_s`` of that channel.  A channel without electrons has a weighted
-    norm of zero.
+    ``N_s`` of that channel.  A channel without electrons
+    (``N_s < 2 eps``) has both norms zero, as in PARSEC 1.5
+    (``scf/getsre.f90:87-97``; the previous tree zeroed only the weighted
+    norm, and only for ``N_s == 0``), so that an empty channel does not hold
+    up ``Use_Plain_SRE``.
     """
 
     if volume_element <= 0:
@@ -138,11 +145,14 @@ def spin_potential_residual_metrics(
         ):
             raise ValueError("potential and density arrays must have identical shapes")
         residual = output_potential - input_potential
+        if count < EMPTY_CHANNEL_ELECTRONS:
+            # getsre.f90 of PARSEC 1.5: "recognized empty spin channel".
+            plain.append(0.0)
+            weighted.append(0.0)
+            continue
         plain.append(float(np.sqrt(volume_element * np.dot(residual, residual))))
         weighted.append(
-            0.0
-            if count == 0.0
-            else float(
+            float(
                 np.sqrt(
                     volume_element * np.dot(density, residual * residual) / count
                 )

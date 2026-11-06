@@ -237,3 +237,190 @@ def lanczos_upper_bound(
         requested_steps=requested_steps,
         breakdown=breakdown,
     )
+
+
+def _parsec15_beta_scale(beta: float) -> float:
+    """PARSEC 1.5's enlargement of the last ``beta`` (``lancz_bound.f90z:481-494`` of 1.5).
+
+    ``10 beta`` below 1e-2, ``5 beta`` below 0.1, ``2 beta`` below 1,
+    ``1.5 beta`` below 100, ``1.01 beta`` below 1000 (the source writes
+    ``10d1`` and ``10d2``), ``beta`` otherwise.
+    """
+
+    for limit, factor in ((1.0e-2, 10.0), (1.0e-1, 5.0), (1.0, 2.0), (100.0, 1.5), (1000.0, 1.01)):
+        if beta < limit:
+            return beta * factor
+    return beta
+
+
+def _start_vector(size: int, initial_vector, rng) -> np.ndarray:
+    if initial_vector is None:
+        vector = _random_start(size, np.random.default_rng() if rng is None else rng)
+    else:
+        vector = np.array(initial_vector, copy=True)
+        if vector.shape != (size,):
+            raise ValueError("initial_vector must have shape (operator.shape[0],)")
+    norm = float(np.linalg.norm(vector))
+    if norm == 0.0 or not np.isfinite(norm):
+        raise ValueError("initial_vector must be finite and nonzero")
+    return vector / norm
+
+
+def lanczos_bound_parsec15(
+    operator: Any,
+    initial_vector: np.ndarray | None = None,
+    steps: int = 10,
+    *,
+    rng: np.random.Generator | None = None,
+) -> LanczosBoundResult:
+    """PARSEC 1.5's short-Lanczos bound (``lancz_bound.f90z:282-510`` of 1.5).
+
+    The same unreorthogonalized recurrence as :func:`lanczos_upper_bound`,
+    with the changes of 1.5: ``steps`` is taken as given (no ``[4, 8]``
+    clamp; the callers ask for ``max(degree/2, Bounds_Iter)``), the radius
+    ``max(theta_max, abs(theta_min))`` is gone (``OLDLANCZBOUND`` undefined:
+    ``theta_max`` alone), ``middle = (theta_max + theta_min)/2`` and the
+    margin is :func:`_parsec15_beta_scale` of the ``beta`` that started the
+    last step.  The start vector is NumPy's uniform ``[0, 1)`` vector as in
+    :func:`lanczos_upper_bound`; 1.5 draws it with ``random_Nvector`` (the
+    gfortran generator, re-seeded at every call), which is not reproduced.
+    A breakdown keeps the steps that were built (1.5 steps back twice).
+    """
+
+    size = _square_operator_size(operator)
+    requested_steps = int(steps)
+    if requested_steps != steps or requested_steps < 1:
+        raise ValueError("steps must be a positive integer")
+    target_steps = min(requested_steps, size)
+    vector = _start_vector(size, initial_vector, rng)
+    projected = np.zeros((target_steps, target_steps), dtype=float)
+    residual = _apply(operator, vector, size)
+    alpha = float(np.real(np.vdot(vector, residual)))
+    residual = residual - alpha * vector
+    projected[0, 0] = alpha
+    actual_steps = 1
+    raw_beta = float(np.linalg.norm(residual))
+    breakdown = False
+    for column in range(1, target_steps):
+        raw_beta = float(np.linalg.norm(residual))
+        if raw_beta <= _BREAKDOWN_TOLERANCE:
+            breakdown = True
+            break
+        previous = vector
+        vector = residual / raw_beta
+        residual = _apply(operator, vector, size) - raw_beta * previous
+        alpha = float(np.real(np.vdot(vector, residual)))
+        residual = residual - alpha * vector
+        projected[column, column - 1] = raw_beta
+        projected[column - 1, column] = raw_beta
+        projected[column, column] = alpha
+        actual_steps = column + 1
+    ritz_values = np.linalg.eigvalsh(projected[:actual_steps, :actual_steps])
+    lower_bound = float(ritz_values[0])
+    largest = float(ritz_values[-1])
+    residual_scale = _parsec15_beta_scale(raw_beta)
+    return LanczosBoundResult(
+        upper_bound=float(largest + residual_scale),
+        lower_bound=lower_bound,
+        middle=float(0.5 * (largest + lower_bound)),
+        ritz_values=ritz_values,
+        raw_beta=raw_beta,
+        residual_scale=float(residual_scale),
+        steps=actual_steps,
+        requested_steps=requested_steps,
+        breakdown=breakdown,
+    )
+
+
+def lanczos_bound_full_orthogonalization(
+    operator: Any,
+    initial_vector: np.ndarray | None = None,
+    steps: int = 10,
+    *,
+    rng: np.random.Generator | None = None,
+) -> LanczosBoundResult:
+    """PARSEC 1.5's ``lancz_bound_full_orth`` (``lancz_bound.f90z:17-180`` of 1.5).
+
+    ``Bounds_Method: lanczos_full`` of the CHEBFF first solve: Lanczos with a
+    full reorthogonalization of every new vector against all earlier ones,
+    a lucky break when ``(j+1) beta_j^2 < orthtol * w`` (``w`` the running
+    sum of ``alpha^2 + 2 beta^2``, ``orthtol = 2.5e-16``, const.F90:106), and
+    the bounds of Zhou and Li (Linear Algebra Appl. 435, 480 (2011)): with
+    Ritz pairs ``(theta_j, z_j)`` of the tridiagonal and ``b`` its last
+    off-diagonal ``beta``, ``lower = min_j (theta_j - |b z_kj|)`` and
+    ``upper = max_j (theta_j + |b z_kj|)``.  As in 1.5, ``b`` is the ``beta``
+    before the last step (``finalbeta = bet(fsteps-1)``).  ``middle`` is the
+    centre of the two bounds (1.5 returns none).
+    """
+
+    size = _square_operator_size(operator)
+    requested_steps = int(steps)
+    if requested_steps != steps or requested_steps < 2:
+        raise ValueError("steps must be an integer of at least two")
+    target_steps = min(requested_steps, size)
+    start = _start_vector(size, initial_vector, rng)
+    basis = np.zeros((size, target_steps + 1), dtype=np.result_type(start.dtype, float))
+    basis[:, 0] = start
+    alphas = np.zeros(target_steps)
+    betas = np.zeros(target_steps)
+    running = 0.0
+    final_steps = target_steps
+    for j in range(target_steps):
+        candidate = _apply(operator, basis[:, j], size)
+        if j > 0:
+            candidate = candidate - betas[j - 1] * basis[:, j - 1]
+        alphas[j] = float(np.real(np.vdot(basis[:, j], candidate)))
+        running += alphas[j] * alphas[j]
+        candidate = candidate - alphas[j] * basis[:, j]
+        # The full reorthogonalization: one classical Gram-Schmidt pass.
+        candidate = candidate - basis[:, : j + 1] @ (basis[:, : j + 1].conj().T @ candidate)
+        squared = float(np.real(np.vdot(candidate, candidate)))
+        if squared * (j + 2) < _BREAKDOWN_TOLERANCE * running:
+            final_steps = j + 1
+            break
+        running += 2.0 * squared
+        betas[j] = np.sqrt(squared)
+        basis[:, j + 1] = candidate / betas[j]
+    if final_steps < 2:
+        raise RuntimeError("the full-reorthogonalization Lanczos bound broke down in its first step")
+    tridiagonal = (
+        np.diag(alphas[:final_steps])
+        + np.diag(betas[: final_steps - 1], 1)
+        + np.diag(betas[: final_steps - 1], -1)
+    )
+    ritz_values, vectors = np.linalg.eigh(tridiagonal)
+    final_beta = float(betas[final_steps - 2])
+    spread = np.abs(final_beta * vectors[final_steps - 1, :])
+    lower_bound = float(np.min(ritz_values - spread))
+    upper_bound = float(np.max(ritz_values + spread))
+    return LanczosBoundResult(
+        upper_bound=upper_bound,
+        lower_bound=lower_bound,
+        middle=0.5 * (upper_bound + lower_bound),
+        ritz_values=ritz_values,
+        raw_beta=final_beta,
+        residual_scale=float(upper_bound - ritz_values[-1]),
+        steps=final_steps,
+        requested_steps=requested_steps,
+        breakdown=final_steps < target_steps,
+    )
+
+
+def spectral_bound(
+    operator: Any,
+    rule: str = "parsec",
+    steps: int = 5,
+    *,
+    rng: np.random.Generator | None = None,
+) -> LanczosBoundResult:
+    """The Lanczos bound of ``rule``: ``parsec`` (:func:`lanczos_upper_bound`, the earlier
+    PARSEC), ``lanczos`` (:func:`lanczos_bound_parsec15`) or ``lanczos_full``
+    (:func:`lanczos_bound_full_orthogonalization`), PARSEC 1.5's ``Bounds_Method``."""
+
+    if rule == "parsec":
+        return lanczos_upper_bound(operator, steps=steps, rng=rng)
+    if rule == "lanczos":
+        return lanczos_bound_parsec15(operator, steps=steps, rng=rng)
+    if rule == "lanczos_full":
+        return lanczos_bound_full_orthogonalization(operator, steps=steps, rng=rng)
+    raise ValueError("the bound rule must be parsec, lanczos or lanczos_full")

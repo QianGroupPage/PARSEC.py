@@ -11,7 +11,8 @@ class EigensolverSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.method, "chebff")
         self.assertEqual(settings.first_filter_degree, 20)
-        self.assertEqual(settings.first_filter_cycles, 2)
+        # FF_MaxIter of CHEBFF defaults to 3 (PARSEC 1.5) since 2026-11-04 (2 before).
+        self.assertEqual(settings.first_filter_cycles, 3)
         self.assertEqual(settings.matvec_block_size, 6)
         self.assertEqual(settings.subspace_buffer, 6)
         self.assertEqual(settings.filter_degree, 15)
@@ -40,7 +41,9 @@ class EigensolverSettingsTests(unittest.TestCase):
         invalid_values = (
             ({"first_filter_degree": 9}, "first_filter_degree"),
             ({"first_filter_cycles": 0}, "first_filter_cycles"),
-            ({"first_filter_cycles": 10}, "first_filter_cycles"),
+            # PARSEC 1.5 accepts FF_MaxIter up to 50 (usrinputfile.F90:2303 of
+            # 1.5; the earlier PARSEC 1..9), so 10 is valid since the 1.5 round.
+            ({"first_filter_cycles": 51}, "first_filter_cycles"),
             ({"matvec_block_size": 0}, "matvec_block_size"),
             ({"subspace_buffer": 5}, "subspace buffer"),
         )

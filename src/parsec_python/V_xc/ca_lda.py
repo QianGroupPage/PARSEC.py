@@ -217,7 +217,15 @@ def ca_lda_spin_polarized(
     potential_down = np.zeros_like(rho_down)
     energy_density = np.zeros_like(rho_up)
 
-    positive = (rho_up > 0.0) & (rho_down > 0.0)
+    # Wherever the total density is positive (a decision of this port, 2026-11-05).  exc_spn.f90 evaluates
+    # only where both channels are positive (``minval(rh) > zero``): an empty channel, which the Fermi
+    # occupations give exactly (``flevel.f90``: zero beyond 36.7 kT), then has no exchange-correlation at all,
+    # in either channel.  Here such a point is the fully polarized limit: zeta = +-1 exactly, no exchange of
+    # the empty channel (``(2 * 0)**(1/3) = 0``) and its finite potential, the limit of a vanishing minority
+    # density.  A channel below zero is taken as empty.  Points with both channels positive keep their bits.
+    rho_up = np.maximum(rho_up, 0.0)
+    rho_down = np.maximum(rho_down, 0.0)
+    positive = (rho_up + rho_down) > 0.0
     if np.any(positive):
         rh1 = rho_up[positive]
         rh2 = rho_down[positive]

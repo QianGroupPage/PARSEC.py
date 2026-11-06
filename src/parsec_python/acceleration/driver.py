@@ -2446,6 +2446,19 @@ def _prepare_single_point(
                 "the calculation uses no point group"
             )
         symmetry = "off"
+    if getattr(problem, "embedding", None) is not None:
+        # FDET of PARSEC 1.5 (Potential_Field): the frozen sample field has no
+        # point group of the tip atoms, and only this process holds it.
+        if mpi_context is not None:
+            raise NotImplementedError(
+                "FDET (Potential_Field) does not run as an MPI SCF; run the input in one process (main.py)"
+            )
+        if _normalize_symmetry_mode(symmetry) == "on":
+            raise ValueError(
+                "symmetry='on' cannot be used with FDET (Potential_Field): the frozen sample field "
+                "breaks the point group of the tip"
+            )
+        symmetry = "off"
     # A periodic cell has no Hartree boundary values.  The switches are read
     # for it too, so that a value they do not know is refused in every run,
     # and leave its input as it is.
@@ -4251,13 +4264,13 @@ def _prepare_single_point(
 
         nonlocal reference, hartree_boundary_tail, native_xc_evaluator
         from parsec_python.SCF import update_geometry as update_reference_geometry
-        from parsec_python.models import Atom
 
         positions = np.asarray(positions, dtype=np.float64)
         if positions.shape != (len(reference.atoms), 3):
             raise ValueError("one position per atom of the prepared system is required")
+        # every other field of an atom is kept (the initial moment of a non-collinear run)
         atoms = tuple(
-            Atom(atom.symbol, position)
+            replace(atom, position=position)
             for atom, position in zip(reference.atoms, positions)
         )
         if is_periodic and not uses_fortran_routines(reference.grid):
@@ -4398,7 +4411,19 @@ def _prepare_single_point(
         scalar_field_adapter=scf_reducer,
         hubbard_device=hubbard_device,
         dispersion_device=dispersion_device,
+        **_fdet_kinetic_operators(reference, selection.selected, hartree_device),
     )
+
+
+def _fdet_kinetic_operators(reference, backend: str, device_id) -> dict:
+    """``kinetic_operators`` of an FDET system on CuPy (the device kinetic terms), else nothing."""
+
+    if getattr(reference, "embedding", None) is None:
+        return {}
+    from .Embedding.device_kinetic import device_kinetic_operators
+
+    operators = device_kinetic_operators(reference, backend, device_id)
+    return {} if operators is None else {"kinetic_operators": operators}
 
 
 def _refuse_corrections(problem, *, is_periodic: bool, mpi_context) -> None:
@@ -4560,8 +4585,21 @@ def warm_start_for_moved_atoms(
 
     from parsec_python.SCF.single_point import extrapolated_warm_start
 
+    warm_start = _parsec_warm_start(previous_system, previous_result, system)
+    if getattr(system, "embedding", None) is not None:
+        # FDET of PARSEC 1.5 (parsec_python.Embedding.warm_start): a translation
+        # moves the subspace the device eigensolver keeps.
+        from parsec_python.Embedding.warm_start import embedding_warm_start
+
+        return embedding_warm_start(
+            previous_system,
+            previous_result,
+            system,
+            warm_start,
+            translate_state=getattr(system.eigenproblem_solver, "translate_saved_rows", None),
+        )
     return extrapolated_warm_start(
-        _parsec_warm_start(previous_system, previous_result, system),
+        warm_start,
         previous_system,
         previous_result,
         system,

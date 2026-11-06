@@ -284,6 +284,29 @@ class HartreeResult:
     boundary_tail: "AtomicTail | None" = None
 
 
+def cg_stopping_threshold(
+    settings: HartreeSettings,
+    initial_norm: float,
+    rhs_norm: float | None = None,
+) -> float:
+    """The residual norm at which a conjugate-gradient Poisson solve stops.
+
+    ``settings.cg_criterion`` 1 (the default): ``relative_tolerance *
+    ||r_0|| + absolute_tolerance``; 2 (PARSEC 1.5's
+    ``Hartree_CG_Criterion: 2``, SPARSKIT ``cg`` with ``ipar(3) = 2``,
+    ``potential/hartree.F90:2096-2108``): ``relative_tolerance * ||b|| +
+    absolute_tolerance`` with ``b`` the right-hand side, whose norm
+    ``rhs_norm`` the caller then gives.  The two agree for a zero start
+    (``r_0 = b``).
+    """
+
+    if getattr(settings, "cg_criterion", 1) == 2:
+        if rhs_norm is None:
+            raise ValueError("Hartree_CG_Criterion 2 needs the norm of the right-hand side")
+        return settings.relative_tolerance * float(rhs_norm) + settings.absolute_tolerance
+    return settings.relative_tolerance * float(initial_norm) + settings.absolute_tolerance
+
+
 def _conjugate_gradient(
     operator: sp.spmatrix,
     rhs: np.ndarray,
@@ -296,7 +319,10 @@ def _conjugate_gradient(
     conditions is symmetric positive definite, so CG is applicable.  With
     residual ``r_k = b-A*x_k``, convergence is declared when
 
-    ``||r_k||_2 <= relative_tolerance*||r_0||_2 + absolute_tolerance``.
+    ``||r_k||_2 <= relative_tolerance*||r_0||_2 + absolute_tolerance``
+
+    (``||b||_2`` in place of ``||r_0||_2`` with ``settings.cg_criterion`` 2,
+    :func:`cg_stopping_threshold`).
 
     The return tuple is ``(solution, converged, iterations, matvecs,
     final_residual_norm, initial_residual_norm)``.
@@ -308,8 +334,10 @@ def _conjugate_gradient(
     residual = rhs - operator @ solution
     matrix_vector_products = 1
     initial_norm = float(np.linalg.norm(residual))
-    tolerance = (
-        settings.relative_tolerance * initial_norm + settings.absolute_tolerance
+    tolerance = cg_stopping_threshold(
+        settings,
+        initial_norm,
+        float(np.linalg.norm(rhs)) if getattr(settings, "cg_criterion", 1) == 2 else None,
     )
     if initial_norm <= tolerance:
         return solution, True, 0, matrix_vector_products, initial_norm, initial_norm

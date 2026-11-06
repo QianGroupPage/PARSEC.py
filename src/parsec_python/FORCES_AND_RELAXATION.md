@@ -74,9 +74,12 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 | `Min_Step` | 1e-4 bohr | `simple`: displacement of a coordinate whose force equals `Force_Min`. |
 | `BFGS_number_corr` | 7 | Corrections the limited-memory matrix keeps. |
 | `Relax_Restart` | `false` | Read `relax_restart.dat` beside the input: its coordinates replace those of the input and its BFGS block continues the optimizer. |
+| `Write_Relax_Restart` | `true` here | PARSEC 1.5: write `relax_restart.dat` after every movement. 1.5 writes it only with `true` (its default is `false`); this package writes it unless the input says `false`. |
+| `Calculate_Force` | not given | PARSEC 1.5: `true` gives the forces of a single point (as `Skip_Force: false`), `false` none. Without either keyword a single point computes no forces here (PARSEC computes them in every run). `false` with a relaxation or molecular dynamics is refused. `Use_Old_Forces` (1.5's serial force routines, the same forces) is accepted and changes nothing. |
+| `Recenter_Atoms_In_Aperiodic_Directions` | `true` | PARSEC 1.5: `false` keeps the coordinates of the input (no re-centring of a cluster or, along z, of a slab; also in a molecular dynamics restart). Since 1.5 a slab is re-centred in a `Restart_Run` too. |
 | `Move_Flag` (per `Atom_Type`) | 0 | 0 moves every atom of the type, `n > 0` its first `n` atoms, a negative value reads a fourth column of `Atom_Coord` (1 moves, 0 fixes). |
 | `Molecular_Dynamics` | `false` | Switches molecular dynamics on; it excludes `Minimization`. |
-| `Cooling_Method`, `Tinit`, `T_Final`, `T_Step`, `Time_Step`, `Friction_Coefficient`, `Step_num`, `Restart_mode`, `rng_seed`, `test_rng` | PARSEC's | Controls of `moldyn.f90`; see "Molecular dynamics" below. |
+| `Cooling_Method`, `Tinit`, `T_Final`, `T_Step`, `Time_Step`, `Friction_Coefficient`, `Step_num`, `Restart_mode`, `rng_seed` (PARSEC 1.5: `Mol_RNG_Seed`), `test_rng` | PARSEC's | Controls of `moldyn.f90`; see "Molecular dynamics" below. |
 | `Initial_Structure` | `input` | Not a PARSEC keyword. `mlff` relaxes the input structure with a machine-learned force field (UMA, MACE, `MLFF_Model`) before the first SCF loop; see [MLFF/README.md](MLFF/README.md). |
 | `Potential_Extrapolation` | `none` | Not a PARSEC keyword. How the SCF loop of a moved structure starts: `none` as PARSEC, `atomic` with the superposed atomic densities moved along with the atoms, `second_order` with the density change also extrapolated along the trajectory; see "Start of the next SCF loop" below. |
 | `Relaxation_SCF_Upscale` | 1 | Not a PARSEC keyword. `bfgs` and `simple` only: the SCF loop of a structure may stop at up to this many times `Convergence_Criterion` while the forces are large; 1 keeps the criterion fixed as PARSEC does. See "SCF criterion of a relaxation". |
@@ -104,7 +107,11 @@ scripts/run_multi_gpu_scf.sh calculation/parsec.in output_directory
 
 The exit status is 0 for a finished run, 3 when an SCF loop did not converge
 and 4 when the structure is not relaxed (movements used up, or the optimizer
-stopped above `Force_Min`).
+stopped above `Force_Min`).  As in PARSEC 1.5, an SCF loop that does not
+converge ends a relaxation or molecular dynamics run: the forces of that
+structure are computed and reported, the atoms are not moved from it, and the
+log says " WARNING !!! atom movement is terminated" (the previous Fortran tree,
+and this package before, moved on).
 
 Two inputs of Fortran PARSEC are kept as runnable examples with their Fortran
 trajectories: `examples/0d_water_geoopt` (BFGS) and
@@ -126,7 +133,10 @@ directory):
 | `parsec_python_results.npz` | Unless `--no-archive`: the result of the last structure and, under `relaxation_*`, positions, energies and forces of all of them. |
 
 Molecular dynamics writes PARSEC's `md_nrg.dat`, `md_mech.dat`, `mdinit.dat`,
-`atom.cor` and `movie.xyz`.
+`atom.cor` and `movie.xyz`, in the formats of PARSEC 1.5: integer fields `i6`
+for the steps and `i7` for the atom count, and the velocities of
+`md_mech.dat` (and so of an `mdinit.dat` cut from it) are `v(t)` of the step,
+where the previous Fortran tree wrote its estimate of the next step's velocity.
 
 ### From Python
 
@@ -466,7 +476,12 @@ trajectory can be compared with Fortran PARSEC only where both draw the same
 ones:
 
 - `test_rng: true` selects PARSEC's own deterministic generator, started from
-  `rng_seed`; the numbers are those of the Fortran program.
+  `rng_seed`; the numbers are those of the Fortran program.  A restart draws
+  `2 (iframe - 1)` numbers first, as PARSEC 1.5 does, so that the generator
+  continues about where the earlier run left it.
+- `Mol_RNG_Seed` is PARSEC 1.5's name of `rng_seed` (1.5 no longer reads the
+  old name); both are read here with the same meaning, an input with both is
+  refused.
 - `rng_seed: n` with `n > 0` alone makes PARSEC seed the generator of its
   compiler. This package then draws what a PARSEC built by gfortran 8 or
   later draws, so the two give the same trajectory;
@@ -869,7 +884,15 @@ and largest force of `atom.cor` equal in all printed digits.
 Molecular dynamics, both SCF loops converged to 1e-8 Ry: `md_nrg.dat` is the
 same text as the Fortran file in every case below, and positions, velocities
 and accelerations of `md_mech.dat` agree within one unit of their last
-printed digit.
+printed digit (the previous Fortran tree; since the formats of PARSEC 1.5 the
+integer fields are wider and the velocities are `v(t)`).  Against PARSEC 1.5
+itself (H2, Langevin with `test_rng` and `Mol_RNG_Seed`, 3 steps and a restart
+of 2, both codes with their own SCF): `md_nrg.dat` and `movie.xyz` are the same
+text (but for the last digit of one temperature), `md_mech.dat` agrees to its
+eighth digit (the forces of the two codes differ at 1e-7), and a restart
+reproduces 1.5 only with its fast-forward of the generator
+(`tests/unit/test_moldyn.py::Parsec15ExecutableTests` replays 1.5's printed
+forces).
 
 | Case | Steps |
 |---|---:|

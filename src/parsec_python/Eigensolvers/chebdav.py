@@ -35,9 +35,9 @@ from typing import Any
 import numpy as np
 
 from .chebyshev import chebff_filter, chebyshev_filter
-from .lapack_random import LapackRandom
+from .lapack_random import LapackRandom, PARSEC_RANDOM_ARRAY_SEED
 from .orthogonalize import orthonormalize
-from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
+from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound, spectral_bound
 
 
 @dataclass(frozen=True)
@@ -57,7 +57,13 @@ class ChebDavSettings:
     ``max_iterations`` and ``random_seed`` are explicit Python diagnostic
     controls.  If ``max_iterations`` is omitted, the source formula is used.
     The seed controls the compiler-RNG-like Lanczos starting vector; trial
-    basis columns use PARSEC's independent canonical LAPACK random stream.
+    basis columns use PARSEC's independent LAPACK random stream from
+    ``basis_seed`` (the canonical seed unless ``Vector_Rng_Seed`` selects
+    another).  ``reorthogonalization_threshold`` is the first ratio test of
+    ``orth_normal`` (0.1; PARSEC 1.5 uses 0.68).  ``bounds`` ``"lanczos"``
+    takes PARSEC 1.5's Lanczos bound formula
+    (:func:`spectral_bounds.lanczos_bound_parsec15`, 1.5 ``chebdav.f90z:336``
+    keeps five steps); ``"parsec"`` is the earlier one.
     """
 
     polynomial_degree: int = 20
@@ -68,8 +74,18 @@ class ChebDavSettings:
     max_outer_restarts: int = 2
     max_iterations: int | None = None
     random_seed: int = 7
+    basis_seed: tuple[int, int, int, int] = PARSEC_RANDOM_ARRAY_SEED
+    reorthogonalization_threshold: float = 0.1
+    bounds: str = "parsec"
 
     def __post_init__(self) -> None:
+        if self.bounds not in ("parsec", "lanczos"):
+            raise ValueError("CHEBDAV bounds must be parsec or lanczos")
+        object.__setattr__(
+            self, "basis_seed", LapackRandom(tuple(self.basis_seed)).seed
+        )
+        if not 0.0 < self.reorthogonalization_threshold < 1.0:
+            raise ValueError("reorthogonalization_threshold must be in (0, 1)")
         if int(self.polynomial_degree) != self.polynomial_degree:
             raise ValueError("polynomial_degree must be an integer")
         if self.polynomial_degree < 15:
@@ -265,6 +281,7 @@ def _orthonormalize_appended(
     existing_columns: int,
     appended_columns: int,
     generator: LapackRandom,
+    reorthogonalization_threshold: float = 0.1,
 ) -> None:
     """Run PARSEC ``orth_normal`` only on a newly appended basis block."""
 
@@ -276,6 +293,7 @@ def _orthonormalize_appended(
         existing_are_orthonormal=True,
         rng=generator,
         copy=False,
+        reorthogonalization_threshold=reorthogonalization_threshold,
     )
 
 
@@ -322,6 +340,7 @@ def _final_approximate_subspace(
     lower_bound: float,
     upper_bound: float,
     generator: LapackRandom,
+    reorthogonalization_threshold: float = 0.1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Apply CHEBDAV's restart-limited filtered-subspace cleanup."""
 
@@ -378,6 +397,7 @@ def _final_approximate_subspace(
         locked_count,
         active_count,
         generator,
+        reorthogonalization_threshold,
     )
     active_values, active_vectors, active_residuals = _rayleigh_ritz_upper(
         operator,
@@ -451,13 +471,18 @@ def run_chebdav(
         else int(settings.max_iterations)
     )
 
-    basis_generator = LapackRandom()
+    basis_generator = LapackRandom(settings.basis_seed)
     bound_generator = np.random.default_rng(settings.random_seed)
-    bound = lanczos_upper_bound(
-        operator,
-        steps=settings.lanczos_steps,
-        rng=bound_generator,
-    )
+    if settings.bounds == "parsec":
+        bound = lanczos_upper_bound(
+            operator,
+            steps=settings.lanczos_steps,
+            rng=bound_generator,
+        )
+    else:
+        bound = spectral_bound(
+            operator, settings.bounds, settings.lanczos_steps, rng=bound_generator
+        )
     upper_bound = float(bound.upper_bound)
     lower_bound = _initial_lower_bound(bound.lower_bound, upper_bound)
     if not lower_bound < upper_bound:
@@ -482,7 +507,9 @@ def run_chebdav(
         upper_bound=upper_bound,
         reference_eigenvalue=lower_bound,
     )
-    _orthonormalize_appended(basis, 0, block_size, basis_generator)
+    _orthonormalize_appended(
+        basis, 0, block_size, basis_generator, settings.reorthogonalization_threshold
+    )
 
     matrix_vector_products = bound.steps + settings.polynomial_degree * block_size
     locked_count = 0
@@ -722,6 +749,7 @@ def run_chebdav(
             append_start,
             block_size,
             basis_generator,
+            settings.reorthogonalization_threshold,
         )
 
         records.append(
@@ -774,6 +802,7 @@ def run_chebdav(
             lower_bound,
             upper_bound,
             basis_generator,
+            settings.reorthogonalization_threshold,
         )
         matrix_vector_products += cleanup_mv
 

@@ -53,6 +53,8 @@ from .Output import ParsecTextReporter
 from .Output.bands import save_band_structure_archive, write_bands_files, write_spin_file
 from .Output.output_files import ReporterWithFiles, RunOutputFiles, output_header_lines
 from .Output.post_processing_output import post_processing_header_lines
+from .Output.correction_output import embedding_header_lines
+from .Output.pot_dat import write_potential_field_after_run
 from .SCF.bands import (
     band_mode,
     band_potentials,
@@ -1819,6 +1821,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="additional pseudopotential directory (searched before the input directory)",
     )
     parser.add_argument(
+        "--esdf-lenient",
+        action="store_true",
+        help=(
+            "read the input as PARSEC's ESDF does: ignore labels this reader does not know and take the "
+            "first value of a label given twice, with a warning (default: refuse both)"
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -1926,6 +1936,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         translation = parse_parsec_input(
             arguments.input,
             pseudopotential_directory=arguments.pp_dir,
+            esdf_lenient=arguments.esdf_lenient,
         )
     except (ParsecInputError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
@@ -2001,6 +2012,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         restart_notes = [*restart_notes, *mlff_notes]
         use_symmetry, symmetry_note = symmetry_decision(translation)
+        # AFM_Scan: one folder per scan or part of a scan.
+        scan_folder_note = None
+        if getattr(translation, "afm_scan", None) is not None:
+            from .Output.afm_scan import claim_scan_folder
+
+            scan_folder_note = claim_scan_folder(translation, input_directory)
     except MLFFError as error:
         print(f"MLFF error: {error}", file=sys.stderr)
         return 2
@@ -2302,6 +2319,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             # usrinputfile.F90: Calc_Hartree_G, nscf_kpoints and Create_DOS.
             for line in post_processing_header_lines(translation):
                 log.write(line)
+            # PARSEC 1.5: FDET (Potential_Field) and pot.dat.
+            for line in embedding_header_lines(translation):
+                log.write(line)
+            if scan_folder_note is not None:
+                log.write(scan_folder_note)
             # A periodic cell has no Hartree boundary values for a switch of
             # the accelerated driver to change.
             switch_warnings = () if is_periodic else ignored_boundary_switch_warnings()
@@ -2311,6 +2333,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.write(f"WARNING: {symmetry_note}")
             for note in restart_notes:
                 log.write(note)
+            # Generate_Complete_Parsec_In (PARSEC 1.5): bak_complete_parsec.in beside the input
+            from .Output.complete_input import write_complete_input
+
+            for line in write_complete_input(translation):
+                log.write(line)
             log.write()
             if (
                 noncollinear
@@ -2331,6 +2358,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 system = prepare_single_point(translation.problem)
             reporter.setup(system)
+            # FDET (PARSEC 1.5): the frozen field and the tip sphere.
+            from .Output.correction_output import embedding_setup_lines
+
+            for line in embedding_setup_lines(system):
+                log.write(line)
             if arguments.bands_from is None:
                 write_qpoints_file(translation.problem, input_directory, log.write)
 
@@ -2546,6 +2578,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 log.write(f"Result archive: {saved}")
             files.finish(result, system.grid, translation.problem)
+            # Write_Potential_Field: pot.dat of PARSEC 1.5, of the last structure.
+            write_potential_field_after_run(translation, system, result, outcome, dynamics, log.write, input_directory)
+            # AFM_Scan: the table of the scan (afm_scan.dat).
+            from .Output.afm_scan import scan_lines_after_run
+
+            scan_lines_after_run(translation, outcome, log.write, input_directory)
             # The SCF archive is written first so a long band calculation cannot lose it.
             _run_band_structure(system, translation, result, reporter, input_directory)
             # Create_DOS (parsec.F90 l.2181-2189), of the last structure.

@@ -30,6 +30,7 @@ from ..Forces import (
 from .backend import IonicBackend, moved_atoms, reference_backend, release_orbitals
 from .domove import MoveReport, MovementState, RelaxationSettings, domove
 from .files import RYDBERG_TO_EV, RelaxRestart
+from ..SCF.filter_restart import FilterRestart
 
 
 def adaptive_scf_criterion(
@@ -134,6 +135,9 @@ class IonicOutcome:
     done: bool = False
     movements_exhausted: bool = False
     scf_failed: bool = False
+    # The SCF loop of the last structure did not converge, and the atoms were
+    # not moved from it (PARSEC 1.5, parsec.F90:2124-2137).
+    stopped_by_scf_failure: bool = False
     error: int = 0
     state: MovementState | None = None
     timings: list[dict[str, float]] = field(default_factory=list)
@@ -212,7 +216,10 @@ def _relaxation_loop(
     With ``Movement_Num`` equal to ``M`` at most ``M + 1`` structures are
     computed.  The mover is called after each of them; the run ends when the
     largest force on a movable atom is below ``Force_Min``, when the
-    optimizer stops, or when ``M`` movements have been used.
+    optimizer stops, when ``M`` movements have been used, or, as in PARSEC
+    1.5, when the SCF loop of a structure did not converge (its forces are
+    computed and reported, the atoms are not moved from it:
+    ``IonicOutcome.stopped_by_scf_failure``).
     """
 
     watch = IonicObserver() if observer is None else observer
@@ -255,6 +262,9 @@ def _relaxation_loop(
         moving = np.asarray(forces.total)[mask]
         return float(np.max(np.linalg.norm(moving, axis=1), initial=0.0))
 
+    filter_restart = FilterRestart.from_eigensolver(
+        getattr(getattr(system, "input", None), "eigensolver", None)
+    )
     while True:
         step = state.number
         started = time.perf_counter()
@@ -350,6 +360,14 @@ def _relaxation_loop(
         if settings.max_movements == 0:
             watch.movement(step, record, None, state)
             break
+        if not result.converged:
+            # PARSEC 1.5 (parsec.F90:2124-2137): "if scf failed there is no
+            # point in performing relaxation or molecular dynamics", so the
+            # movement stops after the forces of this structure (the previous
+            # tree moved the atoms on).
+            outcome.stopped_by_scf_failure = True
+            watch.movement(step, record, None, state)
+            break
         move_started = time.perf_counter()
         report = domove(
             state,
@@ -392,6 +410,11 @@ def _relaxation_loop(
         carried = (
             backend.warm_start(system, result, moved_system) if warm_start else None
         )
+        if filter_restart is not None:
+            # Filter_Restart_After (PARSEC 1.5, parsec.F90:2944-3026).
+            carried, _reset = filter_restart.warm_start_after_move(
+                carried, state.number, getattr(backend, "drop_subspace", None)
+            )
         system = moved_system
         clock["update"] = time.perf_counter() - update_started
 

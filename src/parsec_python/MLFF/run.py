@@ -36,7 +36,6 @@ from typing import Callable
 
 import numpy as np
 
-from ..models import Atom
 from .settings import MLFFSettings, interpreter
 
 #: PARSEC's bohr in angstrom, as in the files of a relaxation.
@@ -330,7 +329,11 @@ def _require_sensible(translation, result: dict, relaxed: np.ndarray, settings: 
             f"{energies[0]:.6f} to {energies[-1]:.6f} eV during the relaxation" + advice
         )
     problem = translation.problem
-    atoms = tuple(Atom(atom.symbol, position) for atom, position in zip(problem.atoms, relaxed))
+    # every other field of an atom is kept (the initial moment of a non-collinear run)
+    atoms = tuple(
+        replace(atom, position=np.asarray(position, dtype=np.float64))
+        for atom, position in zip(problem.atoms, relaxed)
+    )
     if problem.recenter_geometry:
         atoms = center_cluster_geometry(atoms)
     try:
@@ -344,7 +347,7 @@ def _require_sensible(translation, result: dict, relaxed: np.ndarray, settings: 
 def _replaced(translation, positions_bohr: np.ndarray):
     problem = translation.problem
     atoms = tuple(
-        Atom(atom.symbol, np.asarray(position, dtype=np.float64))
+        replace(atom, position=np.asarray(position, dtype=np.float64))
         for atom, position in zip(problem.atoms, positions_bohr)
     )
     return replace(translation, problem=replace(problem, atoms=atoms))

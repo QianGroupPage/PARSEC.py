@@ -132,6 +132,7 @@ import the SCF driver. Physics components must remain independently callable.
 | `Forces` | ion-ion, local, nonlocal forces, their symmetrization and net-force removal | moving atoms |
 | `Relaxation` | L-BFGS-B, steepest-descent and manual ionic steps, the ionic loop, relaxation files | electronic structure of a structure |
 | `MolecularDynamics` | the integrator of `moldyn.f90`, its input, random numbers and files | energies or forces |
+| `Embedding` | PARSEC 1.5's frozen-density embedding (FDET) of a tip in a frozen sample: the sample field on the tip grid, non-additive kinetic functionals, FDET energy terms, the tip sphere, the warm starts of scans, the AFM scan points and `k_ts` | the SCF loop (it calls these), file formats (`Output/pot_dat.py`) |
 | `Output` | PARSEC-shaped reporting and optional serialization | numerical decisions |
 | `acceleration` | backend selection, symmetry sectors, GPU eigensolvers, native kernels, and timing provenance | independent physical formulas or silent accuracy changes |
 

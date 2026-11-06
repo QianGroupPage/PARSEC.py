@@ -29,6 +29,7 @@ from parsec_python.acceleration.cli import (
     _resolve_symmetry_mode,
     main as accelerated_main,
 )
+from parsec_python.tests.archives import read_archive
 
 GPU_AVAILABLE = cupy_available()
 
@@ -228,7 +229,7 @@ class AcceleratedCliDelegationTests(unittest.TestCase):
     def test_backend_auto_delegates_and_converges(self) -> None:
         exit_code = accelerated_main([str(self.input_path), "--quiet"])
         self.assertEqual(exit_code, 0)
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertTrue(bool(archive["converged"]))
 
     @unittest.skipIf(GPU_AVAILABLE, "this check targets the no-GPU fallback")
@@ -238,7 +239,7 @@ class AcceleratedCliDelegationTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         log = (self.directory / "parsec.out").read_text(encoding="utf-8")
         self.assertIn("Reporting non-local force components", log)
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertEqual(archive["forces_total"].shape, (1, 3))
         # asked for explicitly, the accelerated backends cannot run it
         self.assertEqual(accelerated_main([str(self.input_path), "--backend", "cupy", "--dry-run"]), 2)

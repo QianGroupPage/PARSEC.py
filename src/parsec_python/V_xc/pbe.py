@@ -628,6 +628,28 @@ def pbe_spin_polarized_partials(n_up, n_down, s_uu, s_ud, s_dd):
         outputs[index + 1][active] = (
             _pbe_spin_energy_density(*perturbed).imag / _COMPLEX_STEP
         )
+    # An empty channel (a decision of this port, 2026-11-05): with the floor, zeta lies 2e-16/n from +-1, where
+    # d phi/d zeta ~ (1 -+ zeta)**(-1/3) of the exact phi diverges, and the empty channel got potentials of
+    # 1e7 Ry.  Those points take the fully polarized limit of the PBE form with PBE's regularized phi
+    # (V_xc.pbe_spin, as the PBE reference code), its sigma derivatives written for s_ab:
+    # sigma_total = s_uu + 2 s_ud + s_dd.  Points with both channels positive keep their bits.
+    empty = active & ((arrays[0] <= 0.0) | (arrays[1] <= 0.0))
+    if np.any(empty):
+        from .pbe_spin import pbe_spin_energy_partials
+
+        suu, sud, sdd = np.maximum(arrays[2][empty], 0.0), arrays[3][empty], np.maximum(arrays[4][empty], 0.0)
+        f, d_up, d_down, d_sigma_up, d_sigma_down, d_sigma_total = pbe_spin_energy_partials(
+            np.maximum(arrays[0][empty], 0.0),
+            np.maximum(arrays[1][empty], 0.0),
+            suu,
+            sdd,
+            np.maximum(suu + 2.0 * sud + sdd, 0.0),
+        )
+        for output, value in zip(
+            outputs,
+            (f, d_up, d_down, d_sigma_up + d_sigma_total, 2.0 * d_sigma_total, d_sigma_down + d_sigma_total),
+        ):
+            output[empty] = value
     return tuple(outputs)
 
 

@@ -23,6 +23,7 @@ RUNTIME_PACKAGE_DIRECTORIES = (
     "Forces",
     "Relaxation",
     "MolecularDynamics",
+    "Embedding",
     "Output",
     "provenance",
 )

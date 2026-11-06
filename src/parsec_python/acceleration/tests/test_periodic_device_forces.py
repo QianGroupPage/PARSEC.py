@@ -131,6 +131,35 @@ class DeviceFieldTests(unittest.TestCase):
                 )
                 np.testing.assert_allclose(device, readable, rtol=0.0, atol=1.0e-14)
 
+    def test_a_shifted_grid_gives_the_readable_fields(self) -> None:
+        # PARSEC 1.5's parity round: the orthorhombic grid of the Fortran-derived routines reads its shift
+        lattice = _CUBE.lattice_vectors
+        for shift in ((0.5, 0.5, 0.5), (0.25, 0.0, 0.5)):
+            grid = build_periodic_grid(
+                _CUBE, PeriodicGridSettings(fortran_routines=True, spacing=0.7, expansion_order=4, shift=shift)
+            )
+            with self.subTest(shift=shift):
+                device = device_fields.device_local_ionic_potential(
+                    grid, _ATOMS, self.si_potentials, self.si, lattice, None, 1.0e-14
+                )
+                readable = periodic_setup.fft_local_ionic_potential(
+                    grid, _ATOMS, self.si_potentials, self.si, lattice, None, 1.0e-14
+                )
+                np.testing.assert_allclose(device, readable, rtol=0.0, atol=1.0e-12)
+                # the points relative to the atoms of the grid without shift and the atoms moved back
+                moved = tuple(Atom(atom.symbol, atom.position - np.asarray(shift) * 0.7) for atom in _ATOMS)
+                back = device_fields.device_local_ionic_potential(
+                    self.grid, moved, self.si_potentials, self.si, lattice, None, 1.0e-14
+                )
+                np.testing.assert_allclose(device, back, rtol=0.0, atol=1.0e-11)
+                density = device_fields.device_atomic_density(grid, _ATOMS, self.si_potentials, self.si, lattice)
+                np.testing.assert_allclose(
+                    density,
+                    superpose_atomic_density(grid, _ATOMS, self.si_potentials, self.si, lattice),
+                    rtol=0.0,
+                    atol=1.0e-14,
+                )
+
     def test_what_the_device_builders_decline(self) -> None:
         general = build_periodic_grid(_FCC, PeriodicGridSettings(fortran_routines=True, spacing=0.9, expansion_order=4))
         self.assertIsNone(
@@ -231,6 +260,30 @@ class DeviceLocalForceTests(unittest.TestCase):
                         getattr(device, name), getattr(readable, name), rtol=0.0, atol=1e-11, err_msg=name
                     )
                 self.assertTrue(np.any(device.self_consistency != 0.0))
+
+    def test_a_shifted_grid_gives_the_readable_terms(self) -> None:
+        # the long-range term takes the phase of the shifted points (PARSEC 1.5's parity round)
+        hydrogen = tuple(Atom("H", atom.position) for atom in _ATOMS)
+        for shift in ((0.5, 0.5, 0.5), (0.25, 0.0, 0.5)):
+            grid = build_periodic_grid(
+                _CUBE, PeriodicGridSettings(fortran_routines=True, spacing=0.7, expansion_order=4, shift=shift)
+            )
+            density, residual, xc = _fields(grid, self.lattice)
+            for potentials, specifications, atoms in (
+                (self.si_potentials, self.si, _ATOMS),
+                (self.core_potentials, self.core, hydrogen),
+            ):
+                with self.subTest(shift=shift, species=list(specifications)):
+                    device = device_forces.device_periodic_local_forces(
+                        grid, atoms, potentials, specifications, self.lattice, density, residual, xc
+                    )
+                    readable = periodic_local_forces(
+                        grid, atoms, potentials, specifications, self.lattice, density, residual, xc
+                    )
+                    for name in ("ionic", "self_consistency", "core_correction"):
+                        np.testing.assert_allclose(
+                            getattr(device, name), getattr(readable, name), rtol=0.0, atol=1e-11, err_msg=name
+                        )
 
     def test_ionic_term_is_the_derivative_of_the_device_potential(self) -> None:
         density, _, _ = _fields(self.grid, self.lattice)

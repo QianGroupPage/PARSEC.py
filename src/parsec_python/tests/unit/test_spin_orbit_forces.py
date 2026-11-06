@@ -132,7 +132,9 @@ def _periodic_problem(noncollinear=False):
     return SinglePointInput(
         atoms=list(ATOMS),
         pseudopotentials=SPECIES,
-        grid=PeriodicGridSettings(fortran_routines=True, spacing=0.55, expansion_order=4),
+        # 12 points of 6.5/12 bohr per side, the grid of round(6.5/0.55) before PARSEC 1.5's parity round
+        # (Fortran's count at 0.55 is 10)
+        grid=PeriodicGridSettings(fortran_routines=True, spacing=0.54, expansion_order=4),
         periodic_cell=PeriodicCell(lattice_vectors=6.5 * np.eye(3)),
         scf=SCFSettings(
             max_iterations=100,

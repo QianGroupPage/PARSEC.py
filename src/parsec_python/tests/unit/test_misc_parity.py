@@ -30,6 +30,8 @@ from parsec_python.Hamiltonian.hubbard import (
 from parsec_python.Pseudopotential import read_parsec_pseudopotential
 from parsec_python.V_ion import real_spherical_harmonics
 from parsec_python.models import Atom, SpeciesPotential
+from parsec_python.tests.environment import pin_kpoints_on_the_cpu
+from parsec_python.tests.archives import read_archive
 
 
 DATA = Path(__file__).resolve().parents[1] / "data"
@@ -260,7 +262,7 @@ class KPointHubbardDriverTest(unittest.TestCase):
         from parsec_python.SCF.kpoints import run_scf_kpoints
         from parsec_python.Grid.kpoints import kpoint_sampling
 
-        os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+        pin_kpoints_on_the_cpu(self)
         translation = _parse(iterations=3)
         system = prepare_periodic_single_point(translation.problem)
         k_points, weights = kpoint_sampling(translation.problem)
@@ -311,7 +313,7 @@ class SpinorSymmetrizationAndPolarizabilityTest(unittest.TestCase):
 
         from parsec_python.cli import main as cli_main
 
-        os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+        pin_kpoints_on_the_cpu(self)
         directory = Path(tempfile.mkdtemp())
         (directory / "Au_POTRE.DAT").write_bytes(_AU_POTRE.read_bytes())
         path = directory / "parsec.in"
@@ -459,17 +461,16 @@ class WfnDatRestartTest(unittest.TestCase):
         from parsec_python.SCF import prepare_single_point, run_scf
         from parsec_python.SCF.restart import RestartError, load_wfndat_restart
 
-        os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+        pin_kpoints_on_the_cpu(self)
         first = self._directory()
         system = prepare_single_point(parse_parsec_input(first / "parsec.in").problem)
         result = run_scf(system)
         restart = self._directory("Restart_Run: .true.\nRestart_From_Wfndat: .true.")
         write_wfn_dat(restart / "wfn.dat", wfn_dat_from_result(result, system.grid))
         self.assertEqual(cli_main([str(restart / "parsec.in"), "--quiet"]), 0)
-        archive = np.load(restart / "parsec_python_results.npz")
+        archive = read_archive(restart / "parsec_python_results.npz")
         self.assertLessEqual(int(archive["iterations"]), 2)
         self.assertAlmostEqual(float(archive["energy_total_ry"]), result.energies.total, places=6)
-        archive.close()
         log = (restart / "parsec.out").read_text(encoding="utf-8")
         self.assertIn("wfn.dat file created on", log)
         self.assertIn("You should think seriously about upgrading source code!", log)
@@ -647,7 +648,7 @@ class SpinorParsecDatTest(unittest.TestCase):
 
         from parsec_python.cli import main as cli_main
 
-        os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+        pin_kpoints_on_the_cpu(self)
         directory = Path(tempfile.mkdtemp())
         (directory / "Au_POTRE.DAT").write_bytes(_AU_POTRE.read_bytes())
         text = _SOC_INPUT.format(mode=mode, extra=extra, so=".true." if "SO_" in mode else ".false.")
@@ -669,9 +670,8 @@ class SpinorParsecDatTest(unittest.TestCase):
         self.assertEqual(block.vectors.shape[0], 2 * data.nwedge)
         norms = np.sum(np.abs(block.vectors) ** 2, axis=0)
         np.testing.assert_allclose(norms, 1.0, atol=1e-10)
-        first = np.load(directory / "parsec_python_results.npz")
+        first = read_archive(directory / "parsec_python_results.npz")
         energy = float(first["energy_total_ry"])
-        first.close()
         path = directory / "parsec.in"
         path.write_text(
             path.read_text().replace("SO_from_scratch: .true.", "SO_from_scratch: .true.\nRestart_Run: .true."),
@@ -680,10 +680,9 @@ class SpinorParsecDatTest(unittest.TestCase):
         from parsec_python.cli import main as cli_main
 
         self.assertEqual(cli_main([str(path), "--quiet"]), 0)
-        archive = np.load(directory / "parsec_python_results.npz")
+        archive = read_archive(directory / "parsec_python_results.npz")
         self.assertAlmostEqual(float(archive["energy_total_ry"]), energy, places=6)
         self.assertLessEqual(int(archive["iterations"]), 6)
-        archive.close()
 
     def test_noncollinear_file_is_written_and_refused_for_a_restart(self):
         from parsec_python.Output.parsec_dat import read_parsec_dat
@@ -736,7 +735,7 @@ class PeriodicSpinOrbitRestartTest(unittest.TestCase):
         from parsec_python.cli import main as cli_main
         from parsec_python.Output.parsec_dat import read_parsec_dat
 
-        os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+        pin_kpoints_on_the_cpu(self)
         directory = Path(tempfile.mkdtemp())
         (directory / "Au_POTRE.DAT").write_bytes(_AU_POTRE.read_bytes())
         path = directory / "parsec.in"
@@ -745,12 +744,10 @@ class PeriodicSpinOrbitRestartTest(unittest.TestCase):
         data = read_parsec_dat(directory / "parsec.dat", wavefunctions=False)
         self.assertEqual(data.wavefunction_kind, 2)
         self.assertEqual(data.boundary_code, 1)
-        first = np.load(directory / "parsec_python_results.npz")
+        first = read_archive(directory / "parsec_python_results.npz")
         energy = float(first["energy_total_ry"])
-        first.close()
         path.write_text(_PERIODIC_SOC_INPUT.format(extra="Restart_Run: .true."), encoding="utf-8")
         self.assertEqual(cli_main([str(path), "--quiet"]), 0)
-        archive = np.load(directory / "parsec_python_results.npz")
+        archive = read_archive(directory / "parsec_python_results.npz")
         self.assertAlmostEqual(float(archive["energy_total_ry"]), energy, places=6)
         self.assertLessEqual(int(archive["iterations"]), 4)
-        archive.close()

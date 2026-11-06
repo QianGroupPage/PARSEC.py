@@ -63,6 +63,30 @@ def _integer_to_seed(state: int) -> tuple[int, int, int, int]:
     return tuple(digits)  # type: ignore[return-value]
 
 
+def lapack_seed_from_integer(seed: int) -> tuple[int, int, int, int]:
+    """The four-digit LAPACK seed that ``Vector_Rng_Seed`` selects.
+
+    PARSEC 1.5 seeds gfortran's ``random_number`` with ``Vector_Rng_Seed``
+    plus the MPI rank (``init_vector.f90z:38-114``); its numbers depend on the
+    compiler, the rank count and the grid layout, so they cannot be
+    reproduced here.  This port keeps its LAPACK ``DLARNV`` stream and maps
+    the integer to that stream's 48-bit state: one SplitMix64 round
+    (Steele, Lea and Flood, OOPSLA 2014) spreads neighbouring integers over
+    the state, the low 48 bits are kept and made odd (``DLARUV`` needs an
+    odd last digit).  Any integer is accepted (taken modulo ``2**64``).  An
+    input without ``Vector_Rng_Seed`` does not come here: it keeps the
+    canonical :data:`PARSEC_RANDOM_ARRAY_SEED`, so its vectors are those of
+    every earlier version.
+    """
+
+    mask = (1 << 64) - 1
+    value = (int(seed) + 0x9E3779B97F4A7C15) & mask
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+    value ^= value >> 31
+    return _integer_to_seed((value % _MODULUS) | 1)
+
+
 @dataclass
 class LapackRandom:
     """Stateful translation of the ``DLARUV``/``DLARNV`` uniform path.
@@ -140,4 +164,4 @@ class LapackRandom:
         return values.reshape(shape)
 
 
-__all__ = ["LapackRandom", "PARSEC_RANDOM_ARRAY_SEED"]
+__all__ = ["LapackRandom", "PARSEC_RANDOM_ARRAY_SEED", "lapack_seed_from_integer"]

@@ -318,6 +318,11 @@ class ControlTests(unittest.TestCase):
             dynamic_diagonalization_tolerance(0.04, (0.3, 0.02), 1e-4), 0.002
         )
         self.assertEqual(dynamic_diagonalization_tolerance(0.002, (1e-7,), 1e-4), 1e-4)
+        # PARSEC 1.5 parsec.F90:1665-1675: an empty spin channel (SRE 0) is
+        # bypassed, the other channel sets the tolerance.
+        self.assertAlmostEqual(dynamic_diagonalization_tolerance(0.1, (0.3, 0.0), 1e-4), 0.03)
+        self.assertAlmostEqual(dynamic_diagonalization_tolerance(0.1, (0.0, 0.5), 1e-4), 0.05)
+        self.assertEqual(dynamic_diagonalization_tolerance(0.1, (0.0, 0.0), 1e-4), 1e-4)
 
     def test_new_settings_fields_are_hidden_from_repr_at_defaults(self) -> None:
         defaults = EigensolverSettings()
@@ -603,13 +608,14 @@ class SCFTests(unittest.TestCase):
             degrees.append(settings.subspace.polynomial_degree)
             return solve_eigval(operator, states, settings=settings, state=state)
 
-        def run(approach):
+        def run(approach, **scf):
             degrees.clear()
             system = prepare_single_point(
                 self._problem(
                     EigensolverSettings(method="chebff"),
                     max_iterations=12,
                     convergence_criterion_approach=approach,
+                    **scf,
                 )
             )
             result = run_scf(system, eigenproblem_solver=recording_solver)
@@ -617,20 +623,27 @@ class SCFTests(unittest.TestCase):
 
         default_degrees, default_result = run(None)
         loose_degrees, loose_result = run(10.0)
-        # A loose approach criterion lowers the degree from the seventh
-        # iteration on (iter > 5 after the sixth).
+        # A loose approach criterion lowers the degree from the sixth
+        # iteration on (iter > 4 after the fifth: PARSEC 1.5's rule, the
+        # default since 2026-11-04).
         self.assertGreater(len(loose_degrees), 7)
         self.assertEqual(
             loose_degrees,
-            [max(10, 15 - max(0, k - 6)) for k in range(1, len(loose_degrees) + 1)],
+            [max(10, 15 - max(0, k - 5)) for k in range(1, len(loose_degrees) + 1)],
         )
-        # The default 100 * vconv is the former hard-coded rule.
+        # Chebyshev_Degree_Decrease_After 5, the earlier rule: from the seventh on.
+        earlier_degrees, _ = run(10.0, degree_decrease_after=5)
+        self.assertEqual(
+            earlier_degrees,
+            [max(10, 15 - max(0, k - 6)) for k in range(1, len(earlier_degrees) + 1)],
+        )
+        # The default 100 * vconv is the former hard-coded criterion.
         weighted = [step.weighted_residual for step in default_result.history]
         degree = 15
         expected = []
         for iteration, residual in enumerate(weighted, start=1):
             expected.append(degree)
-            if iteration > 5 and residual < 100 * 1e-6 and degree > 10:
+            if iteration > 4 and residual < 100 * 1e-6 and degree > 10:
                 degree -= 1
         self.assertEqual(default_degrees, expected)
 

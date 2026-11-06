@@ -24,6 +24,12 @@ is numerically dependent, is replaced by a LAPACK-stream random vector, and
 the same tests restart.  This is the audited ``orth_normal`` policy; it should
 not be confused with PARSEC's separate DGKS routine, whose ratio decisions
 differ.
+
+PARSEC 1.5 raised the first ratio to 0.68 (``orth_normal.f90z:85`` of 1.5,
+``reorth1 = reorth2 = 0.68``: a second projection whenever the first one keeps
+less than 68 % of the norm, "twice is enough").  ``orthonormalize`` takes the
+first ratio as ``reorthogonalization_threshold`` (default 0.1, the earlier
+PARSEC; ``Reorthogonalization_Threshold`` of the input).
 """
 
 from __future__ import annotations
@@ -80,6 +86,7 @@ def orthonormalize(
     rng: UniformRandom | None = None,
     max_replacements: int = 100,
     copy: bool = True,
+    reorthogonalization_threshold: float = _FIRST_REORTHOGONALIZATION_RATIO,
 ) -> OrthonormalizationResult:
     """Orthonormalize columns with PARSEC's ``orth_normal`` decisions.
 
@@ -90,6 +97,8 @@ def orthonormalize(
     ``orth_normal`` with zero existing columns, so every filtered vector is
     processed against the columns accepted before it.  Random replacement
     prevents a collapsed filtered subspace from silently losing dimension.
+    ``reorthogonalization_threshold`` is the first ratio test (0.1 here and in
+    the earlier PARSEC, 0.68 in PARSEC 1.5).
     """
 
     input_array = np.asarray(vectors)
@@ -124,6 +133,9 @@ def orthonormalize(
     if max_replacements < 0:
         raise ValueError("max_replacements cannot be negative")
     generator = np.random.default_rng() if rng is None else rng
+    first_ratio = float(reorthogonalization_threshold)
+    if not 0.0 < first_ratio < 1.0:
+        raise ValueError("reorthogonalization_threshold must be in (0, 1)")
 
     first_column = existing_columns if existing_are_orthonormal else 0
     random_replacements = 0
@@ -153,7 +165,7 @@ def orthonormalize(
                 vector = vector - previous @ (previous.conj().T @ vector)
             projected_norm = float(np.linalg.norm(vector))
 
-            if projected_norm > _FIRST_REORTHOGONALIZATION_RATIO * input_norm:
+            if projected_norm > first_ratio * input_norm:
                 if abs(projected_norm - 1.0) >= _EPS:
                     vector = vector / projected_norm
                 basis[:, column] = vector

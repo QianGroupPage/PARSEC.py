@@ -72,9 +72,10 @@ def load_pseudopotentials(
       the matching p/d spin-orbit channels (without ``SO_PSP`` only the scalar
       components of a relativistic file are used); and
     * the pseudopotential was generated for the selected XC family.  A file
-      of another functional is refused for CA and PBE; for the other
-      functionals it is used with a ``UserWarning``, as ``pseudo.f90``
-      (lines 383-394) only warns.
+      of another functional is refused for CA and PBE, but for a CA file in a
+      PBE run; for that one and for the other functionals it is used with a
+      ``UserWarning``, as ``pseudo.f90`` (lines 383-394; PARSEC 1.5
+      ``io/pseudo.f90:482-492``) only warns.
 
     A file's spin-orbit channels (if present) are always parsed into
     :attr:`~parsec_python.Pseudopotential.ParsecPseudopotential.spin_orbit_channel_potentials`
@@ -166,7 +167,9 @@ def load_pseudopotentials(
                 f"{potential.relativity!r})"
             )
         if not pseudopotential_matches_functional(potential, requested):
-            if requested in _REQUIRED_PSEUDOPOTENTIAL_LABELS:
+            if requested in _REQUIRED_PSEUDOPOTENTIAL_LABELS and not (
+                requested == "pbe" and potential.correlation.strip().lower() in _CA_LABELS
+            ):
                 raise ValueError(
                     f"{specification.path} was generated for {potential.correlation!r}, "
                     f"not the requested {requested.upper()} functional"
@@ -200,11 +203,15 @@ def cluster_centering_shift(
 
 
 # The correlation labels a pseudopotential file must carry for the CA and
-# PBE functionals: any other label is refused.
+# PBE functionals: any other label is refused, but for a CA file in a PBE
+# run, which pseudo.f90 (PARSEC 1.5, io/pseudo.f90:482-492) only warns about,
+# as for every other pair: the twelve GGA inputs of 1.5's Tier_xc tests are
+# such runs.
 _REQUIRED_PSEUDOPOTENTIAL_LABELS = {
     "ca": frozenset({"ca", "pz", "lda"}),
     "pbe": frozenset({"pb", "pbe"}),
 }
+_CA_LABELS = _REQUIRED_PSEUDOPOTENTIAL_LABELS["ca"]
 # For the other functionals pseudo.f90 (lines 383-394) only warns when the
 # label of the file differs from the two-letter code of the functional.
 _EXPECTED_PSEUDOPOTENTIAL_LABELS = {
@@ -253,12 +260,19 @@ def center_cluster_geometry(atoms: Sequence[Atom], threshold: float = 0.1) -> tu
     The operation is separate from grid construction so callers can retain
     absolute coordinates when desired.  It performs only the translation;
     the caller decides whether recentering is enabled for a calculation.
+    Every other field of an atom is kept: the initial moment of a
+    non-collinear run (``Initial_NCL_Moment``) was lost here before
+    2026-11-05, so that an off-centre cluster started without its moments
+    (Au2+ 0.19 bohr off the origin, two SCF steps with FF_MaxIter 4: then
+    |m| = 0, with the moments kept |m| = 2.35).
     """
     positions = np.asarray([atom.position for atom in atoms], dtype=float)
     shift = 0.5 * (positions.min(axis=0) + positions.max(axis=0))
     if np.linalg.norm(shift) <= threshold:
         return tuple(atoms)
-    return tuple(Atom(atom.symbol, atom.position - shift) for atom in atoms)
+    return tuple(
+        replace(atom, position=np.asarray(atom.position, dtype=float) - shift) for atom in atoms
+    )
 
 
 def center_slab_geometry(

@@ -339,15 +339,20 @@ class FermiLevelTests(unittest.TestCase):
             w * N.fixed_fermi_occupations(values, fermi, 2000.0).sum()
             for values, w in zip(levels[0], weights)
         )
-        self.assertAlmostEqual(count, 1.5, places=11)  # pairs: xele/2
+        # pairs: xele/2, within small = 1e-10 of PARSEC 1.5's flevel.f90
+        self.assertAlmostEqual(count, 1.5, delta=1.0e-10)
         spin = N.fermi_level_from_levels([levels[0], levels[0]], weights, 3.0, 2000.0)
         self.assertAlmostEqual(spin, fermi, places=9)
 
     def test_fixed_occupations(self) -> None:
         beta = 1.0 / N.KELVIN_TO_RYDBERG / 300.0
-        values = np.array([-1.0, 0.0, 1.0, 35.5 / beta, -35.5 / beta])
+        values = np.array([-1.0, 0.0, 1.0, 37.0 / beta, -37.0 / beta])
         occupations = N.fixed_fermi_occupations(values, 0.0, 300.0)
         np.testing.assert_array_equal(occupations, [1.0, 0.5, 0.0, 0.0, 1.0])
+        # PARSEC 1.5 cuts at difmax = 36.7 (35 before): 35.5 is a Fermi-Dirac value.
+        tail = N.fixed_fermi_occupations(np.array([35.5 / beta, -35.5 / beta]), 0.0, 300.0)
+        np.testing.assert_allclose(tail, [1.0 / (np.exp(35.5) + 1.0), 1.0], rtol=1e-12)
+        self.assertGreater(tail[0], 0.0)
 
 
 # ----------------------------------------------------------------------------

@@ -22,6 +22,7 @@ from parsec_python import (
 from parsec_python.Eigensolvers.perturbative_soc import build_spin_orbit_projectors
 from parsec_python.SCF.self_consistent_soc import run_self_consistent_soc
 from parsec_python.SCF.single_point import prepare_single_point
+from parsec_python.tests.kramers import assert_level_moments_cancel
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -77,8 +78,10 @@ class SelfConsistentSOCKramersDegeneracyTests(unittest.TestCase):
 
     def test_kramers_partners_have_opposite_moment(self) -> None:
         moments = self.result.magnetic_moment_per_state
-        for i in range(0, len(moments) - 3, 2):
-            self.assertAlmostEqual(moments[i] + moments[i + 1], 0.0, delta=0.05)
+        # the spin cancels per degenerate level, not per pair inside a quartet (tests/kramers.py)
+        assert_level_moments_cancel(
+            self, self.result.eigenvalues, moments, checked=len(moments) - 2
+        )
 
     def test_moments_are_physically_bounded(self) -> None:
         moments = self.result.magnetic_moment_per_state

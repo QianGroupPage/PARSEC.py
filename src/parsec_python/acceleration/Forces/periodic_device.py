@@ -236,8 +236,22 @@ def _long_range_forces(cp, grid, positions, charges, eta, tolerance, density) ->
 
     spectrum = cp.fft.fftn(cp.asarray(np.asarray(density, dtype=np.float64).reshape(tuple(int(v) for v in n))))
     index = [cp.asarray(np.mod(frequencies[axis], n[axis])) for axis in range(3)]
-    # Q(G) = sum_r rho(r) exp(i G.r) = conj(fftn(rho)) at the frequencies of G.
+    # Q(G) = sum_r rho(r) exp(i G.r) = conj(fftn(rho)) at the frequencies of G, times exp(i G.s h) for the points
+    # (j + s) h of a shifted grid (no factor for s = 0).
     q = cp.conj(spectrum[cp.ix_(index[0], index[1], index[2])])
+    shifts = _setup._plain_shift(grid)
+    if np.any(shifts != 0.0):
+        q = q * cp.asarray(
+            np.exp(
+                2.0j
+                * np.pi
+                * (
+                    frequencies[0][:, None, None] * (shifts[0] / n[0])
+                    + frequencies[1][None, :, None] * (shifts[1] / n[1])
+                    + frequencies[2][None, None, :] * (shifts[2] / n[2])
+                )
+            )
+        )
     amplitude = cp.asarray(weight) * q
     gx, gy, gz = (cp.asarray(axis) for axis in g_axes)
     forces = np.zeros((len(positions), 3), dtype=np.float64)

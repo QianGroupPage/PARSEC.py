@@ -30,6 +30,7 @@ from parsec_python.Laplacian import build_gradient, build_negative_laplacian
 from parsec_python.SCF.kpoints_soc import run_self_consistent_soc_kpoints
 from parsec_python.SCF.pbc import prepare_periodic_single_point
 from parsec_python.V_ion import build_nonlocal_projectors, load_pseudopotentials
+from parsec_python.tests.kramers import assert_level_moments_cancel
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -207,8 +208,16 @@ class PeriodicSelfConsistentSOCSCFTests(unittest.TestCase):
             pseudopotentials={"Au": SpeciesPotential(_AU_POTRE, 0, spin_orbit=True)},
             grid=PeriodicGridSettings(spacing=0.6, expansion_order=6),
             periodic_cell=cell,
+            # 1000 K, not the default 80 K: at 80 K the half-filled Kramers pair at the Fermi level
+            # makes the SCF residual wander between 0.01 and 0.4 for tens of steps, and when it drops
+            # below the criterion is chance (A100, 2026-11-05, steps to convergence for mixing
+            # 0.3 / 0.2 / 0.1: CPU 46 / 75 / 55, GPU 70 / 32 / 53, the device solver on the host
+            # >80 / 40 / 63; up to then this test passed on the CPU's 46 of 60 and failed on a GPU).
+            # At 1000 K the three routes converge in 17 steps, to energies within 4e-6 Ry; the Kramers
+            # pairs at Gamma do not depend on the temperature.
             scf=SCFSettings(
-                max_iterations=60, number_of_states=20, convergence_criterion=5.0e-3
+                max_iterations=60, number_of_states=20, convergence_criterion=5.0e-3,
+                fermi_temperature_kelvin=1000.0,
             ),
             hartree=HartreeSettings(multipole_order=4),
             eigensolver=EigensolverSettings(method="chebff", tolerance=1.0e-6),
@@ -225,7 +234,8 @@ class PeriodicSelfConsistentSOCSCFTests(unittest.TestCase):
         moments = self.result.magnetic_moment_per_state
         for i in range(0, len(eigenvalues) - 3, 2):
             self.assertAlmostEqual(eigenvalues[i], eigenvalues[i + 1], delta=1.0e-4)
-            self.assertAlmostEqual(moments[i] + moments[i + 1], 0.0, delta=0.05)
+        # the spin cancels per degenerate level, not per pair inside a quartet (tests/kramers.py)
+        assert_level_moments_cancel(self, eigenvalues, moments, checked=len(eigenvalues) - 2)
 
     def test_rejects_weights_that_do_not_sum_to_one(self) -> None:
         # Unequal weights are accepted (Fortran's irreducible wedge,

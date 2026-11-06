@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from parsec_python.cli import main as cli_main
+from parsec_python.tests.archives import read_archive
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -76,7 +77,7 @@ class KPointSamplingCliTests(unittest.TestCase):
         log_text = (self.directory / "parsec.out").read_text(encoding="utf-8")
         self.assertIn("Self-consistency convergence achieved.", log_text)
 
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertTrue(bool(archive["converged"]))
         # 8 k-points (2x2x2) x 10 states each = 80 pooled eigenvalues.
         self.assertEqual(archive["eigenvalues_ry"].shape, (80,))
@@ -98,7 +99,8 @@ class KPointSamplingCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
 
     def test_monkhorst_pack_shift_gives_the_fortran_mesh(self) -> None:
-        # Fortran (irrbz.f90): k = (i + shift)/n in reciprocal-lattice coordinates, i = 0 ... n-1
+        # Fortran (irrbz.f90): k = (i + shift)/n in reciprocal-lattice coordinates, i = 0 ... n-1, folded into
+        # (-1/2, 1/2] (this port's decision; 1/2 stays 1/2)
         from parsec_python.Input.parsec_input import parse_parsec_input
 
         input_path = self._write_input(
@@ -112,8 +114,8 @@ class KPointSamplingCliTests(unittest.TestCase):
         np.testing.assert_allclose(problem.kpoint_weights, 1.0 / np.prod(dims))
         reciprocal = 2.0 * np.pi * np.linalg.inv(problem.periodic_cell.lattice_vectors).T
         fractions = problem.kpoints @ np.linalg.inv(reciprocal)
-        np.testing.assert_allclose(np.unique(np.round(fractions[:, 0], 12)), (np.arange(dims[0]) + 0.5) / dims[0])
-        np.testing.assert_allclose(np.unique(np.round(fractions[:, 1], 12)), np.arange(dims[1]) / dims[1])
+        np.testing.assert_allclose(np.unique(np.round(fractions[:, 0], 12)), [-0.25, 0.25])
+        np.testing.assert_allclose(np.unique(np.round(fractions[:, 1], 12)), [0.0, 0.5])
 
     def test_monkhorst_pack_shift_takes_fortrans_reduced_grid(self) -> None:
         """With the shift block the grid is PARSEC's, reduced to the

@@ -126,9 +126,11 @@ default device solve does not read. The storage of the sector states and
 their allocator are `auto` when unset, which keeps a basis that does not fit
 its device on the host instead of stopping (below); four runs of the series
 left both unnamed. The inputs of the series set
-`Eigensolver: chebff`, `FF_MaxIter: 4`, `Chebdav_Degree: 30` and
-`Chebyshev_Degree: 15`; `tests/data/C795H300_parsec.in` of the reference
-package is the smallest of them.
+`Eigensolver: chebff`, `FF_MaxIter: 3`, `Chebdav_Degree: 30` and
+`Chebyshev_Degree: 15` (the series of 5 November 2026; the earlier series used
+`FF_MaxIter: 4`, which made the program 2-18 % slower in 31 of 32 cells);
+`tests/data/C795H300_parsec.in` of the reference package is the smallest of
+them, with `FF_MaxIter: 4`.
 
 ### Relaxations and forces on several nodes
 

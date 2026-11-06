@@ -127,7 +127,7 @@ def run_chebff(
     if not 1 <= wanted_states <= dimension:
         raise ValueError("wanted_states is outside the operator dimension")
 
-    basis_generator = LapackRandom()
+    basis_generator = LapackRandom(settings.basis_seed)
     if os.environ.get("PARSEC_CUPY_DEVICE_RANDOM", "0").lower() in {"1", "true", "on"}:
         vectors = basis_generator.device_uniform_minus_1_1(
             (dimension, wanted_states), column_major=True

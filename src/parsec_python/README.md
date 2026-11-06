@@ -208,7 +208,11 @@ Currently supported:
   - PARSEC's k-point machinery for periodic cells: with a `Monkhorst_Pack_Shift`
     block the Monkhorst-Pack grid is Fortran's `((i-1)+s)/n`, reduced to the
     irreducible wedge by the space group (found as `symmetries.f90` does) and
-    time reversal, with PARSEC's tables and `qpoints.dat`, and the density is
+    time reversal, with PARSEC's tables and `qpoints.dat`; the k-points are then
+    folded into `(-1/2, 1/2]` of the reciprocal lattice (PARSEC 1.5 keeps them in
+    `[0, 1)`; the finite-difference Bloch operator is not invariant under
+    `k -> k + G`, so the folded set makes a run without symmetry agree with the
+    symmetric one; Andrew Grieder's routines fold their shifted grid alike), and the density is
     symmetrized over the space group (`Symmetrize_Charge_Density`, then true by
     default); weighted `Kpoint_List` rows; reference solver only.  Without the
     shift block the unreduced grid of earlier versions is kept.
@@ -631,7 +635,14 @@ differ as they do without spin, because this package uses the potential of
 the discrete energy. A state with an
 empty spin channel (a hydrogen atom, any one-electron system) is an ordinary
 calculation here; in Fortran PARSEC it does not converge with `ca` and loses
-its exchange energy with `pbe`. Two things are not unique in either program:
+its exchange energy with `pbe`. Since 5 November 2026 this holds in every driver:
+the spin forms of periodic cells, spin-orbit and non-collinear runs
+(`ca_lda_spin_polarized`, `pbe_spin_polarized`) had kept PARSEC's rule of
+evaluating only where both channels are positive (CA: no exchange-correlation
+at all when a channel empties) or a 1e-16 floor (PBE: potentials of 1e7 Ry in
+the empty channel); they now take the fully polarized limit wherever the
+total density is positive, and points with both channels positive keep their
+values. Two things are not unique in either program:
 the sign of the moment, and the orientation of a partly filled degenerate
 shell such as the oxygen atom at the default temperature, for which
 occupations fixed in `occup.in` give a reproducible state. Details:
@@ -705,6 +716,63 @@ of the reference solver whose eigenproblems run on the GPU (with its
 Hirshfeld cells and lattice shells); a cluster on the reference solver keeps
 the host sums.
 
+## Frozen-density embedding (FDET) and AFM scans
+
+PARSEC 1.5's FDET embeds an AFM tip (solved by Kohn-Sham) in a frozen sample
+that an earlier run wrote to `pot.dat` (`Embedding/`, `Output/pot_dat.py`).
+The sample run gives `Write_Potential_Field: true` (a PARSEC.py switch; PARSEC
+1.5 writes `pot.dat` after every run, this port only on request), the tip run
+`Potential_Field: true` with `Potential_Field_Name` (default `pot.dat`), the
+sample ions as point charges (`Add_Point_Charges`, `Pt_Chg` = valence charge,
+sample-frame coordinates), the `Boundary_Sphere_Radius` and `Grid_Spacing` of
+the sample run (classical mode: the tip on the sample grid) or
+`Boundary_Sphere_Around_Tip: true` with a small sphere of its own (needs
+`Ignore_Symmetry: true`). `Kinetic_Energy_Functional` is `tf` (default), `tw`,
+`pw` (PW91k), `pb` (PBE-like, `pbe_m`/`pbe_k`) or `no`. Two defects of the 1.5
+potentials are corrected by default and kept for comparisons with
+`FDET_Kinetic_Form: parsec1.5`: the `pw`/`pb` potentials of 1.5 use twice the
+`u` of their energy derivative, and 1.5's `tw` is TF + vW/18 instead of the
+gradient expansion TF + vW/9. The total energy is 1.5's FDET energy (with the
+tip sphere shifted by a constant of the sample: only differences count);
+forces keep the net force, as in 1.5. A tip run is never recentred.
+`Molecular_Dynamics` (classical mode) integrates the motion of the centre of
+mass that this net force drives; PARSEC 1.5 removes the centre-of-mass
+velocity in every step also here, which throws away the work of the net force
+(the energy is then not conserved).
+
+```text
+Potential_Field            true
+Potential_Field_Name       sample_pot.dat
+Kinetic_Energy_Functional  pw
+Boundary_Sphere_Around_Tip true
+AFM_Scan                   true
+AFM_Scan_Heights           3
+AFM_Scan_Height_Step       0.4 bohr
+begin AFM_Scan_Lateral_Points
+ 0.0 0.0
+ 0.8 0.0
+end AFM_Scan_Lateral_Points
+```
+
+`AFM_Scan` (PARSEC.py; 1.5 leaves scans to the closed PARSEC-Edge app) moves
+the tip rigidly over the lateral points and heights (the input height in the
+middle) as one manual sequence with warm starts and writes `afm_scan.dat`
+with `E(x, y, z)` and `k_ts = d2E/dz2` by three-point differences (Ry/bohr^2
+and N/m; no tilt correction). The table is rewritten after every tip position,
+so a run that stops keeps the points before; a `k_ts` whose three SCF loops
+did not all converge is left out (`unconv`). Every tip position is checked
+against the domain when the input is read. `AFM_Scan_Line_Range: first last`
+runs a part of the lines, so that several processes or GPUs share a scan
+(table `afm_scan_lines_<first>-<last>.dat`). Each part needs a folder of its
+own: the parts write the same `parsec.out`, archive, `atom.cor` and restart
+files. The first scan in a folder writes `afm_scan_part.lock` with its line
+range, and a part with another range is refused there. `Minimization:
+manual` scans of `manual.dat` work as in 1.5, with 1.5's warm starts (the
+tip-sphere field moved under the kept orbitals; in the classical mode density
+and orbitals translated when the tip moves by whole grid steps). Spin,
+periodic tip runs (1.5's slab samples), symmetry and MPI are refused with
+FDET. Both `main.py` (accelerated driver) and `reference_main.py` run it.
+
 ## Pseudopotentials
 
 The pseudopotential filename is normally `<Atom_Type>_POTRE.DAT`. A
@@ -726,14 +794,88 @@ input gives only `Core_Cutoff_Radius` and no `Local_Component`.
 with `Potential_Num`, `Local_Component`, `Core_Cutoff_Radius`,
 `Electron_Per_Orbital` and, for its core density,
 `Nonlinear_Core_Correction: .true.`. As in Fortran PARSEC, the n-th
-occurrence of such a label goes to the n-th Atom_Type that reads it.
+occurrence of such a label goes to the n-th Atom_Type that reads it;
+`Potential_Num` is read for `martins_old` and `fhipp` species only, as PARSEC
+1.5 reads it (the PARSEC before 1.5 read one for every species: such an input
+is refused with a message).
+
+`Pseudopot_File` (PARSEC 1.5, one per Atom_Type, the n-th to the n-th) names
+the file of a species instead of `<Atom_Type>_<suffix>.DAT`: a relative path
+is looked for beside the input, then in `--pp-dir` and the current directory.
 
 Pseudopotentials and the selected XC functional must be consistent: a file
 generated for another functional is refused with `ca` and `pbe`, and used
-with a warning with the other functionals, as Fortran PARSEC warns. The
+with a warning with the other functionals, as Fortran PARSEC warns; a CA
+file in a PBE run is used with that warning too (PARSEC 1.5's `Tier_xc`
+GGA tests are such runs). The
 solver can read converted norm-conserving UPF data, but conversion does not by
 itself validate transferability, ghost states, relativistic content, or
 core-hole suitability.
+
+## PARSEC 1.5 input keywords
+
+The reader takes the keywords that PARSEC 1.5 (`usrinputfile.F90` of the 1.5 package) added to the input and I/O
+layer, with 1.5's validation (`Input/parsec_input.py`, block `_INPUT15_*`):
+
+- `Mol_RNG_Seed` is 1.5's name of `RNG_Seed` and `Npcol` that of `MPI_Groups`; both names are read, an input with
+  both is refused.
+- Keywords that only tune 1.5's MPI layout and libraries are read with their type and change nothing (one warning
+  names them): `Use_ScaLAPACK`, `ScaLAPACK_Block_Size`, `Use_ELPA`, `ELPA_Block_Size`, `Npcol` (1.5 also rounds
+  `States_Num` up to a multiple of `Npcol*ScaLAPACK_Block_Size`; this run keeps the input's, the warning gives 1.5's
+  number), `Nslices` and the spectrum-slicing keywords (`Spectrum_Slicing: .true.` runs the input's eigensolver, which
+  converges to the same states), `Use_Sfc`, `Thread_Random_Init`, `Rritz_Logic`, `Test_Logic` (`none` only),
+  `Max_Taskgroups`, `Vxc_Matrix_Elements`.  `Use_HDF5: .true.` writes no HDF5 file: `parsec.dat` is written as with
+  `.false.` (a 1.5 binary without HDF5 writes neither).
+- `Use_LibXC: .true.` is refused (no libxc here yet); with `.false.` (1.5's default) `Func_Id_X`/`Func_Id_C` are
+  ignored, as 1.5 ignores them there.
+- `Correlation_Type: wb` (1.5's PBE with the White-Bird variational potential) runs this port's PBE, whose potential
+  is the exact derivative of the discrete energy, as 1.5's `wb` of an unpolarized cluster without symmetry (H2O:
+  -34.56585964 Ry here, -34.56585973 Ry with 1.5 `wb`); 1.5's spin `wb` is not the derivative of its energy.
+- `Hartree_CG_Tolerance` / `Hartree_CG_Criterion`: without them the Poisson CG stops at 1e-7 of the initial residual
+  within 1600 products (this port's default, kept on 2026-11-04); with either of them it is 1.5's CG: the
+  given relative tolerance (1.5's default 1e-13), the test against the initial residual (1) or the right-hand side
+  (2), 2400 products.  Criterion 2 of a cluster runs on the reference solver.
+- `Generate_Complete_Parsec_In: .true.` writes `bak_complete_parsec.in` beside the input: the effective input of the
+  run in atomic units, the cell and atoms after `Super_Cell`, which read again gives the same problem
+  (`Input/complete_input.py` makes the text, `Output/complete_input.py` writes the file).
+- `Output_Ascii_Data` and `Print_Unconverged_Density` (`.true.`) are refused with the reason (debug dumps of 1.5's
+  per-rank layout; cube files and `Save_Intermediate_Charge_Density` hold the same fields).
+- `Periodic_System` is never read by PARSEC: without the line it follows `Boundary_Conditions`.
+- Warnings where 1.5 would stop or warn: `States_Num` below `N_val/2 + 2` (1.5's ierr 213), a CA pseudopotential in a
+  PBE run.  `Fermi_Temp` takes ESDF's energy units (`0.05 eV` is 580.226 K, as in 1.5).
+
+Eigensolver and SCF controls (`Input/solver_options.py`, measured in the 1.5 round):
+
+- `FF_MaxIter` (CHEBFF first-filter cycles) defaults to 3, PARSEC 1.5's default, since 4 November 2026 (2 before;
+  spinor runs, non-collinear or with spin-orbit coupling, take 3 too but keep the degree decrease after the fifth
+  iteration: with the decrease after the fourth the warm-started field loops of a spin-orbit polarizability run need
+  as many steps as the first;
+  the default chosen after an A100 batch on the nanodiamonds k06-k14: SCF 7-13 % shorter than with 4, equal
+  iterations, energies within 1.1e-4 Ry). 1.5's range 0..50 is accepted and a value outside resets to 3. With 0,
+  1.5 runs no first-filter cycle: it keeps the wavefunctions of an HDF5 restart (`restart.h5`, its
+  `restart_run_just_check_force` tests), random vectors otherwise; this port reads no `restart.h5`, so 0 runs the
+  default 3 cycles, with a warning. `Bands_FF_MaxIter` defaults to `FF_MaxIter`, as in 1.5.
+- The later-SCF Chebyshev degree may be lowered by one at the end of every iteration after the fourth (PARSEC 1.5's
+  `iter > 4`; before 4 November 2026 after the fifth). `Chebyshev_Degree_Decrease_After: 5` (an extension of this port) gives the earlier rule bit
+  for bit; `Convergence_Criterion_Approach` (default 100 x `Convergence_Criterion`; 1.5's is 2 x) sets the SRE below
+  which it happens.
+- The default eigensolver stays CHEBDAV (1.5's is CHEBFF): CHEBFF is faster on the large clusters, whose inputs
+  write it, and slower or less accurate at the same criterion on Si28H36 and on periodic cells.
+- Opt-in labels of 1.5: `Vector_Rng_Seed` (start vectors of the first solve; -1 a seed from the clock, named in a
+  warning), `Smart_Subspace`, `Chebyshev_Scaled`, `Bounds_Method`, `Bounds_Iter` (1.5's SUBSPACE lower bound, scaled
+  filter and Lanczos bounds, on the reference eigensolvers), `Filter_Restart_After` with its two companions
+  (relaxation and molecular dynamics). Under MPI every rank takes rank 0's clock seed, so that the seed printed
+  repeats the run.
+  Extensions: `FF_Residual_Test: stop` (1.5's residual-driven CHEBFF at `Diag_Tolerance`, which stops the run as 1.5
+  does when `FF_MaxIter` cycles do not reach it; `continue` keeps only the early exit; off by default, so an explicit
+  `Diag_Tolerance` keeps its earlier meaning), `Exact_State_Count: .true.` (1.5's working space of exactly
+  `States_Num` vectors, which has no buffer) and `Reorthogonalization_Threshold` (0.1; 1.5 uses 0.68).
+  `Subspace_Buffer_Size`, which 1.5 no longer reads, keeps its earlier meaning: 0 to 5 reset to 6 with a warning.
+
+`--esdf-lenient` (both command lines) reads an input as ESDF does: labels this reader does not know are ignored and a
+label given twice takes its first value, each with a warning.  The inputs of 1.5's test suite need it for lines such as
+`boundary_mask false`, `scfso true` or `nscf_kpoints (block)`, which ESDF ignores without a word; by default such
+lines are refused.
 
 ## Examples and validation
 

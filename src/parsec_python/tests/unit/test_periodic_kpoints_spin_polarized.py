@@ -24,6 +24,7 @@ from parsec_python.SCF.kpoints import run_scf_kpoints, run_scf_kpoints_spin_pola
 from parsec_python.SCF.pbc import prepare_periodic_single_point
 from parsec_python.SCF.spin_polarized import run_scf_spin_polarized
 from parsec_python.cli import main as cli_main
+from parsec_python.tests.archives import read_archive
 
 _EXAMPLES = Path(__file__).resolve().parents[4] / "examples" / "0d_AuH"
 _AU_POTRE = _EXAMPLES / "Au_POTRE.DAT"
@@ -239,7 +240,7 @@ class KPointSpinPolarizedCliTests(unittest.TestCase):
             exit_code = cli_main([str(directory / "parsec.in"), "--quiet"])
             self.assertEqual(exit_code, 0)
             log = (directory / "parsec.out").read_text(encoding="utf-8")
-            archive = np.load(directory / "parsec_python_results.npz")
+            archive = read_archive(directory / "parsec_python_results.npz")
             moment = float(archive["magnetic_moment"])
             self.assertTrue(bool(archive["converged"]))
         self.assertIn("Converged magnetic moment N_up - N_down", log)

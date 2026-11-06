@@ -446,6 +446,11 @@ class GridSettings:
     ``domain_parameters = (r_x, r_y, r_z)`` and ``cylinder`` with
     ``domain_parameters = (radius, length, axis)`` (axis 1, 2 or 3 for x, y,
     z; ``|coordinate| <= length/2`` along it), all in bohr.
+
+    ``foldblock_side_length`` is PARSEC 1.5's ``Foldblock_Side_Length``
+    (``grid_partition.f90:525-607``): with 2 the domain is filled up to whole
+    blocks of 2 x 2 x 2 points starting at even indices (a block enters when
+    any of its points lies inside the shape); 1 is the shape alone.
     """
 
     spacing: float
@@ -456,13 +461,15 @@ class GridSettings:
     box_lengths: tuple[float, float, float] | None = None
     double_grid_order: int = 1
     domain_parameters: tuple[float, float, float] | None = None
+    foldblock_side_length: int = 1
 
     def __repr__(self) -> str:
-        # The double grid and the parameters of an ellipsoid or a cylinder
-        # print nothing at their defaults, so the text of every calculation
-        # without them stays what it was (cache keys hash it).
+        # The double grid, the parameters of an ellipsoid or a cylinder and
+        # the fold blocks print nothing at their defaults, so the text of every
+        # calculation without them stays what it was (cache keys hash it).
         return _repr_without_defaults(
-            self, {"double_grid_order": 1, "domain_parameters": None}
+            self,
+            {"double_grid_order": 1, "domain_parameters": None, "foldblock_side_length": 1},
         )
 
     def __post_init__(self) -> None:
@@ -519,6 +526,10 @@ class GridSettings:
             )
         object.__setattr__(self, "expansion_order", order)
         object.__setattr__(self, "shift", tuple(float(x) for x in self.shift))
+        side = int(self.foldblock_side_length)
+        if side != self.foldblock_side_length or side not in (1, 2):
+            raise ValueError("foldblock_side_length must be 1 or 2")
+        object.__setattr__(self, "foldblock_side_length", side)
 
     @property
     def stencil_half_width(self) -> int:
@@ -601,11 +612,11 @@ class PeriodicGridSettings:
     periodicity: int = 3
     # ``Boundary_Sphere_Radius`` of a wire or slab (bohr), None for bulk.
     confinement_radius: float | None = None
-    # Fortran ``adjust_step`` (inipbc.f90:327-429) on the general grid: per
-    # lattice direction, the fractional translations |M t| of the space
-    # group that the step must be commensurate with.  Empty: none (a
-    # symmorphic group, Ignore_Symmetry, or the orthorhombic grid, which
-    # keeps its own rule).
+    # Fortran ``adjust_step`` (inipbc.f90:327-429) on the grids of the
+    # Fortran-derived routines: per lattice direction, the fractional
+    # translations |M t| of the space group that the step must be
+    # commensurate with.  Empty: none (a symmorphic group, Ignore_Symmetry,
+    # or no search: molecular dynamics, manual movements).
     fractional_translations: tuple[tuple[float, ...], ...] = ()
     # The local pseudopotential of a 3-D cell: ``"real_space"``, this port's
     # Ewald split (:func:`parsec_python.V_ion.ewald_local_ionic_potential`),
@@ -705,10 +716,11 @@ class PeriodicGridSettings:
                 "points_rule belongs to the default routines; the Fortran-derived routines "
                 "(fortran_routines=True) choose their own points"
             )
-        if not self.fortran_routines:
-            if len(self.shift) != 3 or not np.all(np.isfinite(self.shift)):
-                raise ValueError("grid shift must have three finite entries")
-            object.__setattr__(self, "shift", tuple(float(value) for value in self.shift))
+        # Both sets of routines read the shift (the Fortran-derived orthorhombic grid since the parity round of
+        # PARSEC 1.5; before it started at the origin whatever the shift said).
+        if len(self.shift) != 3 or not np.all(np.isfinite(self.shift)):
+            raise ValueError("grid shift must have three finite entries")
+        object.__setattr__(self, "shift", tuple(float(value) for value in self.shift))
         order = int(self.expansion_order)
         if order != self.expansion_order:
             raise ValueError("PARSEC expansion_order must be an integer")
@@ -755,6 +767,14 @@ class HartreeSettings:
     (:mod:`parsec_python.Hartree.gspace`) instead of the finite-difference
     Poisson solve.  It is not printed by ``repr`` at its default (the
     accelerated driver hashes the settings text).
+
+    ``cg_criterion`` is the stopping test of the conjugate-gradient Poisson
+    solve, PARSEC 1.5's ``Hartree_CG_Criterion`` (``ipar(3)`` of SPARSKIT's
+    ``cg`` in ``potential/hartree.F90:2096-2108``): 1 (the default) stops at
+    ``||r_k|| <= relative_tolerance*||r_0|| + absolute_tolerance``, 2 at
+    ``||r_k|| <= relative_tolerance*||b|| + absolute_tolerance`` with ``b``
+    the right-hand side (:func:`parsec_python.Hartree.poisson.cg_stopping_threshold`).  It is not printed by
+    ``repr`` at its default.
     """
 
     multipole_order: int = 9
@@ -767,9 +787,10 @@ class HartreeSettings:
     atomic_tail: HartreeAtomicTail = "auto"
     minimum_multipole_order: int | None = None
     periodic_g_space: bool = False
+    cg_criterion: int = 1
 
     def __repr__(self) -> str:
-        return _repr_without_defaults(self, {"periodic_g_space": False})
+        return _repr_without_defaults(self, {"periodic_g_space": False, "cg_criterion": 1})
 
     def __post_init__(self) -> None:
         order = int(self.multipole_order)
@@ -806,6 +827,8 @@ class HartreeSettings:
             raise ValueError("invalid Hartree solver tolerance")
         if max_iterations != self.max_iterations or max_iterations < 1:
             raise ValueError("Hartree max_iterations must be positive")
+        if self.cg_criterion not in (1, 2):
+            raise ValueError("Hartree cg_criterion must be 1 (initial residual) or 2 (right-hand side)")
         if self.boundary_method not in {"auto", "multipole", "direct"}:
             raise ValueError("Hartree boundary_method must be auto, multipole, or direct")
         if (
@@ -825,7 +848,8 @@ class EigensolverSettings:
     """PARSEC eigensolver controls retained by the pure-Python port.
 
     ``first_filter_degree`` is PARSEC's ``Chebdav_Degree`` for CHEBFF and
-    CHEBDAV.  ``first_filter_cycles`` is ``FF_MaxIter`` and affects CHEBFF
+    CHEBDAV.  ``first_filter_cycles`` is ``FF_MaxIter`` (default 3, PARSEC
+    1.5's, since 2026-11-04; 2 before) and affects CHEBFF
     only; CHEBDAV instead uses ``tolerance`` for residual locking.
     ``filter_degree`` and ``filter_degree_delta`` control the later subspace
     filter.  The input translator resolves PARSEC's ``Matvec_Blocksize``
@@ -855,12 +879,45 @@ class EigensolverSettings:
     print nothing at their defaults, so the text of the settings of every
     earlier calculation is unchanged (it enters cache keys of the
     accelerated driver).
+
+    Options of the PARSEC 1.5 round (all off by default, printed only when
+    set): ``vector_seed`` is ``Vector_Rng_Seed``: the start vectors of the
+    first solve (CHEBFF/CHEBDAV) come from the LAPACK seed it selects
+    (:func:`parsec_python.Eigensolvers.lapack_random.lapack_seed_from_integer`)
+    and ``random_seed`` is set to it by the input reader, so the Lanczos
+    starts follow too; ``None`` keeps PARSEC's canonical seed.
+    ``reorthogonalization_threshold`` is the first ratio of the selective
+    Gram--Schmidt (0.1, the earlier PARSEC; 1.5 uses 0.68).
+    ``first_filter_residual_test`` is PARSEC 1.5's residual-driven CHEBFF
+    (``FF_Residual_Test``): ``"off"`` (fixed cycles, the default), ``"stop"``
+    (1.5: the first-solve cycles stop once the largest residual of the
+    ``States_Num`` states is below the eigensolver tolerance of the
+    iteration, and the run stops, 1.5 ierr 401, when ``first_filter_cycles``
+    cycles do not reach it) or ``"continue"`` (the same early exit; the SCF
+    goes on after ``first_filter_cycles`` cycles otherwise).
+    ``exact_state_count`` is PARSEC 1.5's working space of exactly
+    ``States_Num`` vectors (``Exact_State_Count: .true.``; 1.5 has no buffer at
+    all, ``eigen_solver_module.F90:53``).  The PARSEC 1.5 SUBSPACE rules
+    (readable eigensolvers only): ``subspace_lower_bound`` ``"monotone"``
+    (the earlier PARSEC: the largest Ritz value, never lowered), ``"smart"``
+    or ``"adaptive"`` (``Smart_Subspace`` true or false,
+    ``subspace.f90z:237-327`` of 1.5); ``scaled_subspace_filter``
+    (``Chebyshev_Scaled``: the filter normalized at the lowest Ritz value);
+    ``lanczos_bounds`` ``"parsec"`` (5 SUBSPACE and 8 CHEBFF steps, the
+    earlier bound), ``"lanczos"`` or ``"lanczos_full"`` (``Bounds_Method`` of
+    1.5: ``max(degree/2, lanczos_bound_steps)`` steps and 1.5's bound,
+    ``lancz_bound.f90z`` of 1.5; ``lanczos_full`` with full
+    reorthogonalization), ``lanczos_bound_steps`` being ``Bounds_Iter``.
+    ``filter_restart`` is ``(Filter_Restart_After, Restart_Cheb_Remained_Times,
+    Remained_Times_Atomic_Chrg_Den)`` of PARSEC 1.5 for relaxation and
+    molecular dynamics (:mod:`parsec_python.SCF.filter_restart`), ``None``
+    without it.
     """
 
     method: EigensolverName = "chebff"
     tolerance: float = 1.0e-4
     first_filter_degree: int = 20
-    first_filter_cycles: int = 2
+    first_filter_cycles: int = 3
     matvec_block_size: int = 6
     subspace_buffer: int = 6
     filter_degree: int = 15
@@ -871,6 +928,15 @@ class EigensolverSettings:
     dynamic_tolerance: bool = False
     maximum_matvec: int = DEFAULT_MAXIMUM_MATVEC
     fixed_state_count: bool = False
+    vector_seed: int | None = None
+    reorthogonalization_threshold: float = 0.1
+    first_filter_residual_test: str = "off"
+    exact_state_count: bool = False
+    subspace_lower_bound: str = "monotone"
+    scaled_subspace_filter: bool = False
+    lanczos_bounds: str = "parsec"
+    lanczos_bound_steps: int = 10
+    filter_restart: tuple[int, int, int] | None = None
 
     def __repr__(self) -> str:
         # Hidden at their defaults: the text of these settings is hashed by
@@ -880,6 +946,15 @@ class EigensolverSettings:
             "dynamic_tolerance": not self.dynamic_tolerance,
             "maximum_matvec": self.maximum_matvec == DEFAULT_MAXIMUM_MATVEC,
             "fixed_state_count": not self.fixed_state_count,
+            "vector_seed": self.vector_seed is None,
+            "reorthogonalization_threshold": self.reorthogonalization_threshold == 0.1,
+            "first_filter_residual_test": self.first_filter_residual_test == "off",
+            "exact_state_count": not self.exact_state_count,
+            "subspace_lower_bound": self.subspace_lower_bound == "monotone",
+            "scaled_subspace_filter": not self.scaled_subspace_filter,
+            "lanczos_bounds": self.lanczos_bounds == "parsec",
+            "lanczos_bound_steps": self.lanczos_bound_steps == 10,
+            "filter_restart": self.filter_restart is None,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -909,7 +984,20 @@ class EigensolverSettings:
         eigenpairs, ``States_Num``, in every solve).
         """
 
-        return 0 if self.fixed_state_count else self.subspace_buffer
+        return 0 if self.fixed_state_count or self.exact_state_count else self.subspace_buffer
+
+    @property
+    def basis_seed(self) -> tuple[int, int, int, int]:
+        """The LAPACK seed of the first-solve start vectors (``Vector_Rng_Seed``)."""
+
+        from .Eigensolvers.lapack_random import (
+            PARSEC_RANDOM_ARRAY_SEED,
+            lapack_seed_from_integer,
+        )
+
+        if self.vector_seed is None:
+            return PARSEC_RANDOM_ARRAY_SEED
+        return lapack_seed_from_integer(self.vector_seed)
 
     def __post_init__(self) -> None:
         if self.method not in {"chebff", "chebdav", "arpack", "diagla", "none"}:
@@ -931,6 +1019,37 @@ class EigensolverSettings:
                 )
         object.__setattr__(self, "dynamic_tolerance", bool(self.dynamic_tolerance))
         object.__setattr__(self, "fixed_state_count", bool(self.fixed_state_count))
+        object.__setattr__(self, "exact_state_count", bool(self.exact_state_count))
+        object.__setattr__(
+            self, "scaled_subspace_filter", bool(self.scaled_subspace_filter)
+        )
+        if self.first_filter_residual_test not in ("off", "stop", "continue"):
+            raise ValueError("first_filter_residual_test must be off, stop or continue")
+        if self.subspace_lower_bound not in ("monotone", "smart", "adaptive"):
+            raise ValueError("subspace_lower_bound must be monotone, smart or adaptive")
+        if self.lanczos_bounds not in ("parsec", "lanczos", "lanczos_full"):
+            raise ValueError("lanczos_bounds must be parsec, lanczos or lanczos_full")
+        steps = int(self.lanczos_bound_steps)
+        if steps != self.lanczos_bound_steps or steps < 1:
+            raise ValueError("lanczos_bound_steps must be a positive integer")
+        object.__setattr__(self, "lanczos_bound_steps", steps)
+        if self.filter_restart is not None:
+            restart = tuple(int(item) for item in self.filter_restart)
+            if len(restart) != 3 or restart[0] < 1:
+                raise ValueError(
+                    "filter_restart is (Filter_Restart_After >= 1, restarts, density resets)"
+                )
+            object.__setattr__(self, "filter_restart", restart)
+        if self.vector_seed is not None:
+            if int(self.vector_seed) != self.vector_seed:
+                raise ValueError("vector_seed must be an integer")
+            object.__setattr__(self, "vector_seed", int(self.vector_seed))
+        threshold = float(self.reorthogonalization_threshold)
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("reorthogonalization_threshold must be in (0, 1)")
+        object.__setattr__(self, "reorthogonalization_threshold", threshold)
+        if self.first_filter_residual_test != "off" and self.method != "chebff":
+            raise ValueError("first_filter_residual_test is a CHEBFF option")
         maximum_matvec = int(self.maximum_matvec)
         if maximum_matvec != self.maximum_matvec or maximum_matvec < 1:
             raise ValueError("maximum_matvec must be a positive integer")
@@ -963,13 +1082,19 @@ class EigensolverSettings:
                 f"first_filter_degree must be at least {minimum_first_degree} "
                 f"for {self.method}"
             )
-        if not 1 <= self.first_filter_cycles <= 9:
-            raise ValueError("first_filter_cycles must be between 1 and 9")
+        # 1..9 in the earlier PARSEC, up to 50 in PARSEC 1.5
+        # (usrinputfile.F90:2303 of 1.5).
+        if not 1 <= self.first_filter_cycles <= 50:
+            raise ValueError("first_filter_cycles must be between 1 and 50")
         if self.matvec_block_size < 1:
             raise ValueError("matvec_block_size must be positive")
         if self.subspace_buffer < 0:
             raise ValueError("subspace_buffer cannot be negative")
-        if self.filters_later_iterations and self.subspace_buffer < 6:
+        if (
+            self.filters_later_iterations
+            and self.subspace_buffer < 6
+            and not self.exact_state_count
+        ):
             raise ValueError(
                 "PARSEC filtering requires a subspace buffer of at least 6"
             )
@@ -1204,6 +1329,12 @@ class SCFSettings:
     # a zero average every time it is evaluated (the Hartree potential has a
     # zero average anyway).  Applied by the periodic prepared system.
     zero_average_xc_potential: bool = False
+    # The later-SCF Chebyshev degree is lowered from the iteration after this
+    # one on: 4, PARSEC 1.5's ``iter > 4`` (parsec.F90:1942-1952 of 1.5), the
+    # default since 2026-11-04 (5, the earlier PARSEC's
+    # ``iter > 5`` of parsec.F90:1453, gives the runs before it bit for bit);
+    # see :attr:`approach_criterion`.
+    degree_decrease_after: int = 4
 
     def __repr__(self) -> str:
         # The text of these settings is hashed by the cache keys of the
@@ -1225,6 +1356,7 @@ class SCFSettings:
             ),
             "ionization_energy_difference": self.ionization_energy_difference == 0.0,
             "zero_average_xc_potential": not self.zero_average_xc_potential,
+            "degree_decrease_after": self.degree_decrease_after == 4,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -1238,10 +1370,13 @@ class SCFSettings:
         """The SRE below which later SCF iterations lower the filter degree.
 
         ``vconv_approach`` of parsec.F90:1452-1454: once the iteration is
-        beyond the fifth and the weighted SRE (the larger of the spin
-        channels) falls below it, the later-SCF Chebyshev degree drops by one
-        per iteration, down to 10.  The default ``100 * vconv`` follows the
-        criterion of this loop (``Relaxation_SCF_Upscale`` replaces it).
+        beyond the fourth (:attr:`degree_decrease_after`) and the weighted SRE
+        (the larger of the spin channels) falls below it, the later-SCF
+        Chebyshev degree drops by one per iteration, down to 10.  The default
+        ``100 * vconv`` follows the criterion of this loop
+        (``Relaxation_SCF_Upscale`` replaces it); PARSEC 1.5's default is
+        ``2 * vconv`` (usrinputfile.F90:2596-2601 of 1.5), which an explicit
+        ``Convergence_Criterion_Approach`` gives.
         """
 
         if self.convergence_criterion_approach is None:
@@ -1266,6 +1401,10 @@ class SCFSettings:
             )
         if not np.isfinite(self.net_charge):
             raise ValueError("net_charge must be finite")
+        decrease_after = int(self.degree_decrease_after)
+        if decrease_after != self.degree_decrease_after or decrease_after < 0:
+            raise ValueError("degree_decrease_after must be a nonnegative integer")
+        object.__setattr__(self, "degree_decrease_after", decrease_after)
         if self.convergence_criterion_approach is not None:
             approach = float(self.convergence_criterion_approach)
             if not np.isfinite(approach):
@@ -1468,6 +1607,11 @@ class RelaxationSettings:
     loop of a structure may be while the forces are large (1, the default,
     keeps the criterion fixed as PARSEC does; see
     :func:`parsec_python.Relaxation.ionic_loop.adaptive_scf_criterion`).
+    ``write_restart`` is PARSEC 1.5's ``Write_Relax_Restart``: whether
+    ``relax_restart.dat`` is written after every move.  1.5 writes it only
+    on request (``relaxation/domove.f90:390``, "I think this is broken");
+    here it is written unless the input says ``.false.`` (the writer works
+    and is atomic).
     """
 
     method: RelaxationMethod
@@ -1478,6 +1622,11 @@ class RelaxationSettings:
     bfgs_corrections: int = 7
     restart: bool = False
     scf_upscale: float = 1.0
+    write_restart: bool = True
+
+    def __repr__(self) -> str:
+        # Write_Relax_Restart is new; the repr of a run without it is unchanged.
+        return _repr_without_defaults(self, {"write_restart": True})
 
     def __post_init__(self) -> None:
         if self.method not in {"simple", "bfgs", "manual"}:
@@ -1555,13 +1704,28 @@ class BandStructureSettings:
 
     The shortest segment gets ``points`` k-points and the others
     proportionally more (see :func:`~parsec_python.Grid.kpoints.band_path_kpoints`).
-    Each k-point is solved from scratch with the SCF's first eigensolver
-    (CHEBFF: ``FF_MaxIter`` filter cycles of degree ``Chebdav_Degree``) in the
-    converged self-consistent potential, exactly as Fortran ``calc_bands``.
+    ``rounding`` is how a segment's share is made an integer: ``"truncate"``
+    (this port's rule, that of the previous Fortran tree) or ``"nint"``
+    (PARSEC 1.5, ``utilities/calc_bands.f90:152-158``).  This port keeps its
+    default, 20 points with truncation, where the input gives no
+    ``Bandstruc_Points`` (PARSEC 1.5's default is 100); a written
+    ``Bandstruc_Points`` takes 1.5's rounding (since 2026-11-04 the rule for
+    defaults that 1.5 changed).  Each k-point is solved from scratch
+    with the SCF's first eigensolver (CHEBFF: ``FF_MaxIter`` filter cycles of
+    degree ``Chebdav_Degree``) in the converged self-consistent potential,
+    exactly as Fortran ``calc_bands``.  ``ff_maxiter`` is 1.5's
+    ``Bands_FF_MaxIter``: the CHEBFF filter cycles of the band k-points
+    (``calc_bands.f90:336-338``); ``None`` keeps ``FF_MaxIter``.
     """
 
     segments: tuple[BandSegment, ...]
     points: int = 20
+    ff_maxiter: int | None = None
+    rounding: str = "truncate"
+
+    def __repr__(self) -> str:
+        # Bands_FF_MaxIter and the rounding are new; the repr of a run without them is unchanged.
+        return _repr_without_defaults(self, {"ff_maxiter": None, "rounding": "truncate"})
 
     def __post_init__(self) -> None:
         segments = tuple(
@@ -1574,6 +1738,12 @@ class BandStructureSettings:
         if int(self.points) < 1:
             raise ValueError("bandstruc_points must be at least 1")
         object.__setattr__(self, "points", int(self.points))
+        if self.ff_maxiter is not None:
+            if int(self.ff_maxiter) != self.ff_maxiter or int(self.ff_maxiter) < 1:
+                raise ValueError("bands_ff_maxiter must be a positive integer")
+            object.__setattr__(self, "ff_maxiter", int(self.ff_maxiter))
+        if self.rounding not in ("truncate", "nint"):
+            raise ValueError("the rounding of band-path points is truncate or nint")
 
 
 #: Values of ``Output_Grid_Data`` (``usrinputfile.F90`` l.2598-2638), in the
@@ -1760,6 +1930,42 @@ class GWSettings:
             object.__setattr__(self, "fermi_level", float(self.fermi_level))
 
 
+# --- FDET (PARSEC 1.5 frozen-density embedding) --------------------------------
+
+
+@dataclass(frozen=True)
+class EmbeddingSettings:
+    """``Potential_Field``: frozen-density embedding of PARSEC 1.5 (FDET/AFM).
+
+    The run is the active tip ``B`` in the frozen field of a sample ``A``
+    that an earlier run wrote to ``field_path`` (``Potential_Field_Name``,
+    a ``pot.dat`` of :mod:`parsec_python.Output.pot_dat`).
+    ``kinetic_functional`` is ``Kinetic_Energy_Functional`` (``tf``, ``tw``,
+    ``pw``, ``pb``, ``none``), ``pbe_mu``/``pbe_kappa`` are ``pbe_m``/``pbe_k``
+    of ``pb``, ``kinetic_form`` is ``FDET_Kinetic_Form`` (``corrected``, the
+    default, or ``parsec1.5``, :mod:`parsec_python.Embedding.kinetic`), and
+    ``tip_sphere`` is ``Boundary_Sphere_Around_Tip`` (the tip in a sphere of
+    its own, :mod:`parsec_python.Embedding.tip_sphere`).
+    """
+
+    field_path: Path
+    kinetic_functional: str = "tf"
+    pbe_mu: float = 0.2319
+    pbe_kappa: float = 0.8438
+    kinetic_form: str = "corrected"
+    tip_sphere: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "field_path", Path(self.field_path))
+        if self.kinetic_functional not in ("tf", "tw", "pw", "pb", "none"):
+            raise ValueError("kinetic_functional must be tf, tw, pw, pb or none")
+        if self.kinetic_form not in ("corrected", "parsec1.5"):
+            raise ValueError("kinetic_form must be corrected or parsec1.5")
+        object.__setattr__(self, "pbe_mu", float(self.pbe_mu))
+        object.__setattr__(self, "pbe_kappa", float(self.pbe_kappa))
+        object.__setattr__(self, "tip_sphere", bool(self.tip_sphere))
+
+
 @dataclass(frozen=True)
 class SinglePointInput:
     """
@@ -1815,6 +2021,9 @@ class SinglePointInput:
     calculation uses it: the irreducible wedge of a ``monkhorst_pack_shift``
     grid and ``SCFSettings.symmetrize_density``.  ``None`` stands for the
     identity alone."""
+    embedding: EmbeddingSettings | None = None
+    """PARSEC 1.5's frozen-density embedding (``Potential_Field``) of an
+    isolated, spin-unpolarized tip run; ``None`` without it."""
 
     def __repr__(self) -> str:
         # Point charges and charged sheets that are not there, and the
@@ -1826,6 +2035,7 @@ class SinglePointInput:
             "charged_sheets": not self.charged_sheets,
             "monkhorst_pack_shift": self.monkhorst_pack_shift is None,
             "space_group": self.space_group is None,
+            "embedding": self.embedding is None,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -1992,6 +2202,37 @@ class CorrectedEnergyBreakdown(EnergyBreakdown):
 
     hubbard: float = 0.0
     dispersion: float = 0.0
+
+
+@dataclass(frozen=True)
+class EmbeddingEnergyBreakdown(EnergyBreakdown):
+    """:class:`EnergyBreakdown` of an FDET tip run (``totnrg.f90:159-197``), in Ry.
+
+    ``electron_ion`` reads the ionic potential with the sample field
+    (Fortran's ``eion``), ``exchange_correlation`` is
+    ``E_xc[rho_B + rho_core + rho_A]`` and ``integral_vxc_rho`` its potential
+    times ``rho_B``.  The other terms: ``nonadditive_kinetic`` ``T_nad``,
+    ``integral_vnad_rho`` ``Integral v_nad rho_B`` (it cancels in the total),
+    ``tip_ion_sample_electron`` ``Integral rho_A v_tip,ion``, ``sample_hartree``
+    ``E_H[rho_A] = Integral rho_A v_H^A / 2``, ``sample_electron_ion``
+    ``Integral rho_A v_A,ion``, ``sample_kinetic`` the ``newk`` of the sample
+    file, and with the tip sphere ``sample_xc_on_tip_grid`` (``E_xc[rho_A]``
+    on the tip grid) and ``tip_ion_sample_electron_outside`` (the
+    attraction of the sample electrons outside the tip sphere).  With the tip
+    sphere the total leaves out the sample Hartree, electron-ion, kinetic and
+    exchange-correlation energies, a constant of the sample.  ``electronic``
+    holds every term but ``ion_ion``.
+    """
+
+    nonadditive_kinetic: float = 0.0
+    integral_vnad_rho: float = 0.0
+    tip_ion_sample_electron: float = 0.0
+    sample_hartree: float = 0.0
+    sample_electron_ion: float = 0.0
+    sample_kinetic: float = 0.0
+    tip_sphere: bool = False
+    sample_xc_on_tip_grid: float = 0.0
+    tip_ion_sample_electron_outside: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -2239,6 +2480,10 @@ class SinglePointResult:
     """``(atoms, 3)`` nonlocal (Kleinman-Bylander) forces in Ry/bohr, summed over the k-points from the converged
     eigenvectors of the last SCF step.  A k-point run does not keep its eigenvectors, so it accumulates this term
     while they exist (``run_scf_kpoints(..., compute_forces=True)``); ``None`` when not requested."""
+    embedding: object | None = None
+    """FDET (``Potential_Field``): the :class:`parsec_python.Embedding.kinetic.NonadditiveKinetic`
+    of the last iteration (``T_nad`` and ``v_nad``, which ``input_effective_potential`` and
+    ``output_effective_potential`` hold and ``xc_potential`` does not); ``None`` without FDET."""
 
     @property
     def all_electron_total(self) -> float:

@@ -99,7 +99,9 @@ def restart_structure(translation, directory: Path, source: Path | None = None):
         restart is None
         and getattr(problem.grid, "periodicity", 3) == 2
         and getattr(settings, "method", "") != "manual"
-        and not getattr(translation, "restart_run", False)
+        # PARSEC 1.5 re-centres a slab with Restart_Run too (initial.f90:287-289),
+        # and not at all with Recenter_Atoms_In_Aperiodic_Directions: .false.
+        and getattr(translation, "recenter_aperiodic", True)
     ):
         atoms, slab_shift = center_slab_geometry(atoms)
     notes.append(
@@ -155,6 +157,10 @@ def manual_structures(translation, directory: Path):
     settings = translation.relaxation
     if settings is None or settings.method != "manual" or settings.max_movements == 0:
         return None
+    scan = getattr(translation, "afm_scan", None)
+    if scan is not None:
+        # AFM_Scan (parsec_python.Embedding.afm): the scan points after the first.
+        return scan.structures(scan.tip_positions)[1:]
     path = Path(directory) / MANUAL_FILE
     if not path.is_file():
         raise FileNotFoundError(
@@ -184,11 +190,18 @@ def run_recorded_relaxation(
 
     ``directory`` receives ``atom.cor``, ``relax_restart.dat`` and the XYZ
     trajectory.  ``manual.dat`` is read from ``input_directory``, by default
-    the same one.
+    the same one, where an AFM scan also writes its table after every point.
     """
 
     settings = translation.relaxation
     source = directory if input_directory is None else input_directory
+    on_record = None
+    scan = getattr(translation, "afm_scan", None)
+    if scan is not None and source is not None:
+        # AFM_Scan: afm_scan.dat after every tip position, so that a failure keeps the points before.
+        from ..Output.afm_scan import write_scan_progress
+
+        on_record = lambda records: write_scan_progress(source, scan, records)  # noqa: E731
     elements = [
         translation.problem.pseudopotentials[atom.symbol].element_symbol or atom.symbol
         for atom in system.atoms
@@ -201,6 +214,7 @@ def run_recorded_relaxation(
         directory=directory,
         elements=elements,
         warm_starts=getattr(backend, "warm_starts", True),
+        **({} if on_record is None else {"on_record": on_record}),
     )
     try:
         return run_relaxation(

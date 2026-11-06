@@ -203,7 +203,9 @@ class KPointLoopTest(unittest.TestCase):
 
         for extra in ("", "Spin_Polarization: .true."):
             with self.subTest(spin=bool(extra)):
-                translation = _ag(kpoints=_TWO_K, extra=extra)
+                # With FF_MaxIter 3, the default of CHEBFF since 2026-11-04, the spin-polarized
+                # run needs 32 steps on the host (18 with FF_MaxIter 2), the other one 16 (21).
+                translation = _ag(kpoints=_TWO_K, extra=extra, iterations=40)
                 system = prepare_periodic_single_point(translation.problem)
                 host = _kpoint_run(system, translation, "cpu")
                 device = _kpoint_run(system, translation, "cupy")

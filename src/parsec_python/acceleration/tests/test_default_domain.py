@@ -150,6 +150,12 @@ class RankAgreementTests(unittest.TestCase):
         # and the boundary record what a comparison of two runs reads.
         from parsec_python.acceleration.tests import test_mpi_scf
 
+        # The runner names the devices of its run for the process (PARSEC_CUPY_DEVICES=0), as a
+        # launch should; up to 2026-11-05 that stayed set for the rest of the suite, whose later
+        # tests then saw one GPU of a node of four (the k-point tests: 1 worker, not 4).
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
         harness = test_mpi_scf.FullSCFRunnerContextTests(
             "test_switch_is_on_unless_named_off"
         )

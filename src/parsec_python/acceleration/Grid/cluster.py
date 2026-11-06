@@ -121,8 +121,15 @@ def build_cluster_grid_by_slabs(settings: GridSettings) -> RealSpaceGrid:
 
     Rows are numbered as there: x, then y, then z, each from its largest
     index to its smallest, which is the C order of the Boolean cube.
+
+    A domain of fold blocks (``settings.foldblock_side_length`` 2, PARSEC
+    1.5) is the reference builder's.
     """
 
+    if int(getattr(settings, "foldblock_side_length", 1)) != 1:
+        from parsec_python.Grid.cluster import build_cluster_grid
+
+        return build_cluster_grid(settings)
     n = int(np.floor(2.0 * settings.enclosing_radius / settings.spacing)) + 2
     index_min = np.full(3, -(n // 2), dtype=int)
     index_max = np.full(3, n + index_min[0] - 1, dtype=int)

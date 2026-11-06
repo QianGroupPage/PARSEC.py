@@ -327,6 +327,7 @@ def subspace_filter(
     *,
     block_size: int = 7,
     reset_recurrence_per_block: bool = False,
+    reference_eigenvalue: float | None = None,
 ) -> np.ndarray:
     """Apply PARSEC's later-SCF filter with its exact degree split.
 
@@ -335,6 +336,9 @@ def subspace_filter(
     ideal mapped reference is ``x0=-1`` and ``sigma1=-1``.  The filter is not
     an eigensolver by itself: its output still has to be orthonormalized and
     Rayleigh--Ritz rotated by :func:`subspace.run_subspace_filter`.
+    ``reference_eigenvalue`` moves the normalization point (PARSEC 1.5's
+    ``Chebyshev_Scaled``: the lowest Ritz value); ``None`` keeps the lower
+    bound.
     """
 
     matrix, was_vector = _as_column_matrix(vectors)
@@ -359,7 +363,7 @@ def subspace_filter(
             upper_bound,
             # In non-BETA subspace.f90z, lowb is both the unwanted
             # interval boundary and the recurrence normalization point.
-            lower_bound,
+            lower_bound if reference_eigenvalue is None else reference_eigenvalue,
             initial_sigma=(
                 None if reset_recurrence_per_block else carried_sigma
             ),

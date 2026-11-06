@@ -28,6 +28,7 @@ from parsec_python import (
 from parsec_python.cli import main as cli_main
 from parsec_python.SCF.pbc import prepare_periodic_single_point
 from parsec_python.SCF.spin_polarized import run_scf_spin_polarized
+from parsec_python.tests.archives import read_archive
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -137,7 +138,7 @@ class PeriodicSpinPolarizedCliTests(unittest.TestCase):
         # No SO_PSP species in this input, so no SOC section should appear.
         self.assertNotIn("Perturbative spin-orbit correction", log_text)
 
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertTrue(bool(archive["converged"]))
         self.assertAlmostEqual(float(archive["magnetic_moment"]), 1.0, places=1)
 

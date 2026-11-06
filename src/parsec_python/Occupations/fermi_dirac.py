@@ -8,6 +8,15 @@ import numpy as np
 
 BOLTZMANN_RYDBERG_PER_KELVIN = 6.33327186e-6
 
+#: The limits of the Fermi-level search of PARSEC 1.5 (``utilities/flevel.f90:43-51``):
+#: ``difmax``, beyond which ``|(e - mu)/kT|`` gives an occupation of exactly one or zero
+#: (36.7: ``exp(-36.7) = 1.2e-16``, below half the double-precision epsilon; the previous
+#: tree had 35), ``small``, the tolerance of the electron count (1e-10, before 1e-12), and
+#: ``iterlim``, the most bisection steps (1000, before 100).
+FERMI_EXPONENT_CUTOFF = 36.7
+FERMI_COUNT_TOLERANCE = 1.0e-10
+FERMI_MAX_BISECTIONS = 1000
+
 
 @dataclass(frozen=True)
 class OccupationResult:
@@ -19,9 +28,9 @@ class OccupationResult:
 def _fermi_function(eigenvalues: np.ndarray, chemical_potential: float, kbt: float) -> np.ndarray:
     exponent = (eigenvalues - chemical_potential) / kbt
     result = np.empty_like(exponent)
-    result[exponent >= 35.0] = 0.0
-    result[exponent <= -35.0] = 1.0
-    middle = np.abs(exponent) < 35.0
+    result[exponent >= FERMI_EXPONENT_CUTOFF] = 0.0
+    result[exponent <= -FERMI_EXPONENT_CUTOFF] = 1.0
+    middle = np.abs(exponent) < FERMI_EXPONENT_CUTOFF
     result[middle] = 1.0 / (np.exp(exponent[middle]) + 1.0)
     return result
 
@@ -31,8 +40,8 @@ def fermi_occupations(
     electron_count: float,
     temperature_kelvin: float = 80.0,
     *,
-    count_tolerance: float = 1.0e-12,
-    max_iterations: int = 100,
+    count_tolerance: float = FERMI_COUNT_TOLERANCE,
+    max_iterations: int = FERMI_MAX_BISECTIONS,
     degeneracy_tolerance: float = 1.0e-12,
     degeneracy: float = 2.0,
     weights: np.ndarray | None = None,
@@ -184,8 +193,8 @@ def weighted_fermi_occupations(
     electron_count: float,
     temperature_kelvin: float = 80.0,
     *,
-    count_tolerance: float = 1.0e-12,
-    max_iterations: int = 100,
+    count_tolerance: float = FERMI_COUNT_TOLERANCE,
+    max_iterations: int = FERMI_MAX_BISECTIONS,
     degeneracy_tolerance: float = 1.0e-12,
     degeneracy: float = 2.0,
 ) -> OccupationResult:
@@ -194,8 +203,9 @@ def weighted_fermi_occupations(
     Each level ``i`` of the sorted ``eigenvalues`` holds at most
     ``degeneracy * w_i`` electrons; the Fermi level ``mu`` solves
     ``sum_i w_i f((e_i - mu)/kT) = N / degeneracy`` (``flevel.f90:225-262``:
-    ``enum = sum f * weight``, tolerance ``1e-12``, ``|beta (e - mu)| > 35``
-    cut-offs, at most 100 bisection steps).  The bisection is the one of
+    ``enum = sum f * weight``; the limits of PARSEC 1.5, tolerance ``1e-10``,
+    ``|beta (e - mu)| > 36.7`` cut-offs, at most 1000 bisection steps,
+    :data:`FERMI_COUNT_TOLERANCE`).  The bisection is the one of
     :func:`fermi_occupations` (bracket ``[e_min - 36 kT, e_max + 36 kT]``,
     midpoints), so equal weights ``w`` give the levels of
     ``fermi_occupations(..., degeneracy=degeneracy*w)`` to round-off.  At zero

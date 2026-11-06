@@ -118,14 +118,23 @@ DEFAULT_REACH_RULE = "physical"
 def _axis_spacing(grid: PeriodicRealSpaceGrid) -> tuple[np.ndarray, np.ndarray, float]:
     n = np.asarray(grid.points_per_axis, dtype=np.int64)
     sides = np.diag(np.asarray(grid.cell.lattice_vectors, dtype=float))
-    # ``build_periodic_grid`` places point ``i`` at ``i * (side / n)`` of the first axis
+    # ``build_periodic_grid`` places point ``i`` at ``(i + shift) * (side / n)`` of the first axis
     return n, sides, float(sides[0] / n[0])
 
 
-def _index_range(centre: float, radius: float, spacing: float, count: int):
-    """Inclusive grid index range around ``centre`` (one index of margin for round-off), or ``None``."""
-    low = max(math.ceil((centre - radius) / spacing) - 1, 0)
-    high = min(math.floor((centre + radius) / spacing) + 1, count - 1)
+def _plain_shift(grid) -> np.ndarray:
+    """The shift of the orthorhombic grid of these routines (``grid.shift``; zero on Andrew Grieder's grids, whose
+    index boxes here have always taken the margin of one index for it)."""
+    if uses_fortran_routines(grid):
+        return np.asarray(grid.shift, dtype=float)
+    return np.zeros(3)
+
+
+def _index_range(centre: float, radius: float, spacing: float, count: int, shift: float = 0.0):
+    """Inclusive grid index range around ``centre`` (one index of margin for round-off), or ``None``; the point
+    ``i`` lies at ``(i + shift) * spacing`` (``x - 0.0`` is ``x``: the ranges of a zero shift are the earlier ones)."""
+    low = max(math.ceil((centre - radius) / spacing - shift) - 1, 0)
+    high = min(math.floor((centre + radius) / spacing - shift) + 1, count - 1)
     return (low, high) if low <= high else None
 
 
@@ -156,17 +165,18 @@ def _default_bulk_grid(grid) -> bool:
 
 
 def _plain_orthorhombic(grid) -> bool:
-    """The grid of :func:`parsec_python.Grid.pbc.build_periodic_grid`: one spacing, no shift.
+    """The orthorhombic grid of :func:`parsec_python.Grid.pbc.build_fortran_periodic_grid`: one spacing ``h``, the
+    points ``(i + shift) h`` (the shift of PARSEC 1.5's parity round; zero before).
 
     Fortran's general grid (:class:`parsec_python.Grid.pbc.GeneralPeriodicGrid`: oblique lattice
-    vectors, a step per lattice direction, a shift) and the wire/slab grid
+    vectors, a step per lattice direction) and the wire/slab grid
     (:class:`parsec_python.Grid.confined.ConfinedPeriodicGrid`) are subclasses with other point
     positions, which the index boxes below do not describe: they keep the readable definitions.
     """
     return (
         isinstance(grid, PeriodicRealSpaceGrid)
         and not getattr(grid, "is_general_periodic", False)
-        # the orthorhombic grid of the default routines may carry a shift: not this one
+        # the orthorhombic grid of the default routines is Andrew Grieder's (periodic_setup.py)
         and uses_fortran_routines(grid)
     )
 
@@ -190,9 +200,10 @@ def grid_ball(grid, centre: np.ndarray, radius: float):
     if not _plain_orthorhombic(grid):
         return _ionic.dense_support(grid, centre, radius)
     n, _, spacing = _axis_spacing(grid)
+    shift = _plain_shift(grid)
     ranges = []
     for axis in range(3):
-        found = _index_range(float(centre[axis]), radius, spacing, int(n[axis]))
+        found = _index_range(float(centre[axis]), radius, spacing, int(n[axis]), float(shift[axis]))
         if found is None:
             empty = np.empty(0, dtype=np.int64)
             return empty, np.empty((0, 3)), np.empty(0)
@@ -211,13 +222,14 @@ def _atom_balls(grid, position: np.ndarray, radius: float):
     never held in memory at once; rows repeat across images and the caller sums over them.
     """
     n, sides, spacing = _axis_spacing(grid)
+    shift = _plain_shift(grid)
     axis_images = []
     for axis in range(3):
         reach = int(math.ceil(radius / sides[axis])) + 1
         found = []
         for image in range(-reach, reach + 1):
             centre = float(position[axis]) + image * sides[axis]
-            index_range = _index_range(centre, radius, spacing, int(n[axis]))
+            index_range = _index_range(centre, radius, spacing, int(n[axis]), float(shift[axis]))
             if index_range is not None:
                 found.append((centre, index_range))
         axis_images.append(found)
@@ -332,16 +344,16 @@ class _AxisImages:
 
 
 def _axis_images(
-    line: np.ndarray, position: float, side, radius: float, spacing: float, count: int
+    line: np.ndarray, position: float, side, radius: float, spacing: float, count: int, shift: float = 0.0
 ) -> _AxisImages:
     """The images of :func:`_atom_balls` (and of the translations of ``superpose_atomic_density``,
     ``position + m * side``) along one axis: ``m`` up to ``ceil(radius / side) + 1``, the index ranges
-    of ``_index_range``."""
+    of ``_index_range`` (``shift``: that of the grid's points)."""
     reach = int(math.ceil(radius / side)) + 1
     low, high, squares = [], [], []
     for image in range(-reach, reach + 1):
         centre = position + image * side
-        index_range = _index_range(float(centre), radius, spacing, count)
+        index_range = _index_range(float(centre), radius, spacing, count, shift)
         if index_range is None:
             continue
         displacement = line[index_range[0] : index_range[1] + 1] - centre
@@ -660,6 +672,7 @@ def _short_range_by_blocks(
     """
     n_array, sides, spacing = _axis_spacing(grid)
     n = tuple(int(value) for value in n_array)
+    shift = _plain_shift(grid)
     padding = grid.settings.stencil_half_width
     species = {
         symbol: _short_range_species(
@@ -676,6 +689,7 @@ def _short_range_by_blocks(
                 species[atom.symbol].reach,
                 spacing,
                 n[axis],
+                float(shift[axis]),
             )
             for axis in range(3)
         ]
@@ -790,6 +804,18 @@ def _structure_factor_series(
         structure += ((charges[start:stop, None] * phases[0]).T @ yz).reshape(shape)
 
     coefficients = (-8.0 * np.pi / volume) * weight * structure
+    # the points are at (j + s) h: exp(i G.(j + s) h) = exp(2 pi i m j/n) exp(2 pi i m s/n) (no factor for s = 0)
+    shifts = _plain_shift(grid)
+    if np.any(shifts != 0.0):
+        coefficients = coefficients * np.exp(
+            2.0j
+            * np.pi
+            * (
+                frequencies[0][:, None, None] * (shifts[0] / n[0])
+                + frequencies[1][None, :, None] * (shifts[1] / n[1])
+                + frequencies[2][None, None, :] * (shifts[2] / n[2])
+            )
+        )
     spectrum = np.zeros(tuple(int(v) for v in n), dtype=np.complex128)
     index = [np.mod(frequencies[axis], n[axis]) for axis in range(3)]
     spectrum[np.ix_(index[0], index[1], index[2])] = coefficients
@@ -871,8 +897,8 @@ def periodic_atomic_density(
 ):
     """The density of :func:`~parsec_python.V_ion.ionic_potential.superpose_atomic_density`, or ``None``.
 
-    For a cell on the grid of :func:`parsec_python.Grid.pbc.build_periodic_grid` with diagonal
-    lattice vectors: every translation ``m * side`` with ``|m| <= ceil(cutoff / side) + 1``, the points
+    For a cell on the orthorhombic grid of :func:`parsec_python.Grid.pbc.build_fortran_periodic_grid` (with its
+    shift): every translation ``m * side`` with ``|m| <= ceil(cutoff / side) + 1``, the points
     of its ball (``grid_ball``, distance ``<= rs(ns-1)``) inside the table (``< rs(ns-1)``), the table
     interpolated linearly with its first value continued inwards, added in translation order.  A
     ``Cubic_Spline`` core density, another grid or lattice return ``None`` (the readable sum runs).
@@ -921,6 +947,8 @@ def periodic_atomic_density(
         reach = _density_reach(potential, table, rule) if reaches is None else float(reaches[atom.symbol])
         tables[atom.symbol] = (table, reach)
 
+    # the shift of this module's grid (Andrew Grieder's keeps the margin of one index for his)
+    shift = _plain_shift(grid)
     atom_images = []
     for atom in contributing:
         potential = potentials[atom.symbol]
@@ -928,7 +956,9 @@ def periodic_atomic_density(
         radius = tables[atom.symbol][1]
         atom_images.append(
             [
-                _axis_images(axes[axis], position[axis], side_lengths[axis], radius, steps[axis], n[axis])
+                _axis_images(
+                    axes[axis], position[axis], side_lengths[axis], radius, steps[axis], n[axis], float(shift[axis])
+                )
                 for axis in range(3)
             ]
         )

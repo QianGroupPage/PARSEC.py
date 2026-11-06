@@ -21,7 +21,9 @@ leave reported bands unconverged, at a block size that is not predictable.  When
 reported band's residual exceeds ``residual_tolerance`` the k-point is re-solved
 with a larger block and a new random start (up to ``max_attempts`` in total) and
 the attempt with the smallest residual is kept; the number of attempts per k-point
-is recorded in ``BandStructureResult.attempts``.
+is recorded in ``BandStructureResult.attempts``.  A device worker that runs the
+device-resident first solve (the default on a GPU, see :func:`run_band_structure`)
+re-solves the same way from a new random start; it has no Davidson block.
 
 The Hamiltonian follows the SCF mode, so the same ``bandstruc`` block gives
 scalar, collinear spin-polarized (up/down), spin-orbit, spin-orbit +
@@ -106,7 +108,9 @@ def band_path_cartesian(
         starts, unit="reciprocal_lattice_vectors", cell=cell
     )
     end_cartesian, _ = explicit_kpoints(ends, unit="reciprocal_lattice_vectors", cell=cell)
-    segments = band_path_kpoints(start_cartesian, end_cartesian, settings.points)
+    segments = band_path_kpoints(
+        start_cartesian, end_cartesian, settings.points, rounding=getattr(settings, "rounding", "truncate")
+    )
     return segments, tuple(segment.name for segment in settings.segments)
 
 
@@ -117,36 +121,38 @@ def load_scf_for_bands(archive_path, problem, system, mode: str):
     repeating the SCF.  The archive must come from the same input: the grid size and
     atom positions are checked.
     """
-    archive = np.load(archive_path)
-    files = set(archive.files)
-    if "atom_coordinates_bohr" in files:
-        stored = np.asarray(archive["atom_coordinates_bohr"], dtype=float)
-        current = np.asarray([atom.position for atom in system.atoms], dtype=float)
-        if stored.shape != current.shape or not np.allclose(stored, current, atol=1e-6):
-            raise ValueError(f"{archive_path} was written for different atom positions")
-    if mode == "scalar":
-        keys = {"effective_potential": "output_effective_potential_ry"}
-    else:
-        keys = {
-            name: f"scf_potential_{name}" for name in _REQUIRED[mode]
-        }
-    missing = [key for key in keys.values() if key not in files]
-    if missing:
-        raise ValueError(
-            f"{archive_path} lacks {missing}; rerun the SCF with this version "
-            f"to store the converged potentials needed for mode {mode!r}"
-        )
-    potentials = {name: np.asarray(archive[key]) for name, key in keys.items()}
-    for name, value in potentials.items():
-        if value.shape[-1] != system.grid.size:
+    # Closed when done (an error raised below keeps this frame, and an open archive would keep its
+    # file, alive: Windows then cannot remove the folder of the archive).
+    with np.load(archive_path) as archive:
+        files = set(archive.files)
+        if "atom_coordinates_bohr" in files:
+            stored = np.asarray(archive["atom_coordinates_bohr"], dtype=float)
+            current = np.asarray([atom.position for atom in system.atoms], dtype=float)
+            if stored.shape != current.shape or not np.allclose(stored, current, atol=1e-6):
+                raise ValueError(f"{archive_path} was written for different atom positions")
+        if mode == "scalar":
+            keys = {"effective_potential": "output_effective_potential_ry"}
+        else:
+            keys = {
+                name: f"scf_potential_{name}" for name in _REQUIRED[mode]
+            }
+        missing = [key for key in keys.values() if key not in files]
+        if missing:
             raise ValueError(
-                f"{archive_path}: potential {name!r} has {value.shape[-1]} grid points, "
-                f"the input's grid has {system.grid.size}"
+                f"{archive_path} lacks {missing}; rerun the SCF with this version "
+                f"to store the converged potentials needed for mode {mode!r}"
             )
-    eigenvalue_key = "eigenvalues_up_ry" if mode == "spin_polarized" else "eigenvalues_ry"
-    k_count = int(archive["n_kpoints"]) if "n_kpoints" in files else 1
-    number_of_states = int(np.asarray(archive[eigenvalue_key]).size // k_count)
-    return potentials, float(archive["fermi_level_ry"]), number_of_states
+        potentials = {name: np.asarray(archive[key]) for name, key in keys.items()}
+        for name, value in potentials.items():
+            if value.shape[-1] != system.grid.size:
+                raise ValueError(
+                    f"{archive_path}: potential {name!r} has {value.shape[-1]} grid points, "
+                    f"the input's grid has {system.grid.size}"
+                )
+        eigenvalue_key = "eigenvalues_up_ry" if mode == "spin_polarized" else "eigenvalues_ry"
+        k_count = int(archive["n_kpoints"]) if "n_kpoints" in files else 1
+        number_of_states = int(np.asarray(archive[eigenvalue_key]).size // k_count)
+        return potentials, float(archive["fermi_level_ry"]), number_of_states
 
 
 def spin_expectation(spinors: np.ndarray) -> np.ndarray:
@@ -187,14 +193,25 @@ def run_band_structure(
     control the CHEBDAV re-solve described in the module docstring (a CHEBFF
     first solver is never retried).
 
-    The k-points of the path are independent, so they are spread over
-    ``workers`` worker threads (``None``: ``PARSEC_KPOINT_WORKERS``, default
-    automatic; see :mod:`parsec_python.acceleration.Parallel`; serial without the acceleration package).  ``backend`` (or ``PARSEC_KPOINT_BACKEND``) selects ``cpu`` (default),
-    ``cupy`` (one worker thread per CUDA device; the Hamiltonian and the
-    Chebyshev filter run on the GPU), ``auto`` or ``numpy-device`` (the device
-    code on the host).
-    Each k-point is the same computation whatever the worker count, so the
-    bands do not depend on it.
+    The k-points of the path are independent, so they are spread over workers
+    (serial without the acceleration package).  ``backend`` (or
+    ``PARSEC_KPOINT_BACKEND``) selects ``cpu`` (``workers`` worker threads;
+    ``None``: ``PARSEC_KPOINT_WORKERS``, default automatic; see
+    :mod:`parsec_python.acceleration.Parallel`), ``cupy`` (one worker thread
+    per CUDA device of ``PARSEC_CUPY_DEVICES``, whatever ``workers`` says),
+    ``auto`` (``cupy`` when CuPy sees a device, else ``cpu``) or
+    ``numpy-device`` (the device code on the host, ``PARSEC_KPOINT_WORKERS``
+    threads).  Without either, the device of
+    ``PARSEC_DEVICE`` (``--device``, default ``auto``) decides: a GPU when CuPy
+    sees one, the CPU otherwise.  A device worker runs the Hamiltonian on the
+    device and, unless ``PARSEC_KPOINT_SOLVER=host`` (the host eigensolver with
+    only the Chebyshev filter on the device), the device-resident first solve
+    (CHEBFF, with more CHEBFF cycles to CHEBDAV's residual test for
+    ``Eigensolver: chebdav``).
+    Each k-point is the same computation whatever the worker count or device,
+    so the bands do not depend on them (to round-off); the host and the
+    device-resident eigensolvers are different algorithms and agree to the
+    eigensolver tolerance.
     """
     if getattr(system, "hubbard", None) is not None and "hubbard" not in potentials:
         raise NotImplementedError(
@@ -217,6 +234,7 @@ def run_band_structure(
         max_attempts=max_attempts,
         workers=workers,
         backend=backend,
+        filter_cycles=settings.ff_maxiter,
     )
     return BandStructureResult(
         mode=mode,
@@ -265,6 +283,7 @@ def solve_kpoint_bands(
     workers: int | str | None = None,
     backend: str | None = None,
     keep_vectors: bool = False,
+    filter_cycles: int | None = None,
 ) -> KPointBands:
     """Diagonalize the Hamiltonian of ``potentials`` at every row of ``k_points``.
 
@@ -274,7 +293,9 @@ def solve_kpoint_bands(
     eigensolver, with the CHEBDAV re-solve and the worker pool described
     there.  ``callback`` is that of :func:`run_band_structure`.
     ``keep_vectors`` keeps the eigenvectors of the reported levels
-    (``KPointBands.vectors``; host arrays).
+    (``KPointBands.vectors``; host arrays).  ``filter_cycles`` replaces
+    ``FF_MaxIter`` in these solves (PARSEC 1.5's ``Bands_FF_MaxIter``,
+    ``calc_bands.f90:336-338``; CHEBFF first solver only); ``None`` keeps it.
     """
 
     if mode not in MODES:
@@ -285,6 +306,11 @@ def solve_kpoint_bands(
     k_points = np.asarray(k_points, dtype=float)
 
     eigval_settings = _eigval_settings(system, system.input.eigensolver.filter_degree)
+    if filter_cycles is not None:
+        eigval_settings = dataclasses.replace(
+            eigval_settings,
+            chebff=dataclasses.replace(eigval_settings.chebff, filter_cycles=int(filter_cycles)),
+        )
     spinor = mode in ("soc", "soc_spin_polarized", "noncollinear")
     channels = ("up", "down") if mode == "spin_polarized" else ("all",)
     n_k = k_points.shape[0]

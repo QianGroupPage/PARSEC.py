@@ -60,15 +60,22 @@ class SpinPolarizedBehaviorTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(result.potential_down)))
         self.assertTrue(np.all(result.potential_up < result.potential_down))
 
-    def test_zero_minority_density_point_contributes_nothing(self) -> None:
-        """Matches exc_spn.f90's ``if (minval(rh) > zero)`` guard: a point
-        with one spin density exactly zero gets zero XC potential/energy."""
+    def test_zero_minority_density_point_is_fully_polarized(self) -> None:
+        """exc_spn.f90's ``if (minval(rh) > zero)`` guard gave a point with one
+        spin density exactly zero no XC potential or energy; since 2026-11-05
+        (a decision of this port) it is the fully polarized limit, zeta = 1,
+        as a vanishing minority density gives it (tests/unit/test_spin_xc_empty_channel.py)."""
         result = ca_lda_spin_polarized(
             np.array([1.0]), np.array([0.0]), volume_element=0.5
         )
-        self.assertEqual(result.potential_up[0], 0.0)
-        self.assertEqual(result.potential_down[0], 0.0)
-        self.assertEqual(result.energy_density[0], 0.0)
+        tiny = ca_lda_spin_polarized(
+            np.array([1.0]), np.array([1.0e-300]), volume_element=0.5
+        )
+        self.assertLess(result.energy_density[0], 0.0)
+        self.assertEqual(result.energy_density[0], tiny.energy_density[0])
+        self.assertEqual(result.potential_up[0], tiny.potential_up[0])
+        self.assertAlmostEqual(result.potential_down[0], tiny.potential_down[0], delta=1e-90)
+        self.assertTrue(np.isfinite(result.potential_down[0]))
 
     def test_rejects_mismatched_shapes(self) -> None:
         with self.assertRaises(ValueError):

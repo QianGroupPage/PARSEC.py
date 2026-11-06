@@ -10,6 +10,8 @@ from pathlib import Path
 import numpy as np
 
 from parsec_python.cli import main as cli_main
+from parsec_python.tests.archives import read_archive
+from parsec_python.tests.kramers import assert_level_moments_cancel
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -68,7 +70,7 @@ class SelfConsistentSOCCliTests(unittest.TestCase):
         self.assertIn("Self-consistency convergence achieved.", log_text)
         self.assertIn("<S_z>", log_text)
 
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertTrue(bool(archive["converged"]))
         self.assertEqual(archive["eigenvalues_ry"].shape, (20,))
         self.assertEqual(archive["magnetic_moment_per_state"].shape, (20,))
@@ -77,7 +79,8 @@ class SelfConsistentSOCCliTests(unittest.TestCase):
         moments = archive["magnetic_moment_per_state"]
         for i in range(0, len(eigenvalues) - 3, 2):
             self.assertAlmostEqual(eigenvalues[i], eigenvalues[i + 1], delta=1.0e-4)
-            self.assertAlmostEqual(moments[i] + moments[i + 1], 0.0, delta=0.05)
+        # the spin cancels per degenerate level, not per pair inside a quartet (tests/kramers.py)
+        assert_level_moments_cancel(self, eigenvalues, moments, checked=len(eigenvalues) - 2)
 
     def test_self_consistent_soc_with_spin_polarization_is_accepted(self) -> None:
         """Cluster self-consistent SOC combined with spin polarization is

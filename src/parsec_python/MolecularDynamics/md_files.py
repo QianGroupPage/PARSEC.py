@@ -7,10 +7,12 @@ of ``moldyn`` (``moldyn.f90``); a restart reads a fifth one:
     one line per time step: step, time, kinetic, potential and total energy
     per atom in eV, target and actual temperature.
 ``md_mech.dat`` (unit 79)
-    for every time step a line ``Step #nnnn`` and one line per atom with
+    for every time step a line ``Step #nnnnnn`` and one line per atom with
     thirteen numbers in ``1x,e15.8``: the next position, the current
-    position, the current velocity estimate, the current acceleration and
-    the movable flag.  Atomic units throughout.
+    position, the current velocity ``v(t)``, the current acceleration and
+    the movable flag.  Atomic units throughout.  PARSEC 1.5 writes ``v(t)``
+    (``vxold_print``, ``md/moldyn.f90:332,528,604,675``) where the previous
+    tree wrote the estimate of the next step's velocity.
 ``mdinit.dat`` (unit 76)
     the restart file: the last step of ``md_mech.dat``, copied by the user.
 ``atom.cor`` (unit 66)
@@ -24,12 +26,15 @@ paths and appends.  :func:`initial_records` and :func:`step_records` give, per
 file, what ``initial.f90`` writes when a run starts and what one call of
 ``moldyn`` writes.
 
-The fixed formats follow the Fortran ``format`` statements.  The
-list-directed records (``write(unit,*)``) are compiler dependent; they are
-written as gfortran writes them.  Two things are kept although they look
-like slips: the second header line of ``md_mech.dat`` reads
-``current positioncurrent velocity``, and the atom count of ``movie.xyz``
-is written with ``i3``, so that a cluster of a thousand atoms gets ``***``.
+The fixed formats follow the Fortran ``format`` statements of PARSEC 1.5,
+whose integer fields are wider than before: the step of ``md_nrg.dat`` and of
+the ``md_mech.dat`` headers ``i6`` (``i4`` before; ``md/moldyn.f90:680,708``),
+the atom count of ``movie.xyz`` ``i7`` (``i3``; ``moldyn.f90:757``,
+``scf/initial.f90:634``), and the header of ``md_nrg.dat`` has four blanks
+after ``Step`` (``initial.f90:631``).  The list-directed records
+(``write(unit,*)``) are compiler dependent; they are written as gfortran
+writes them.  One thing is kept although it looks like a slip: the second
+header line of ``md_mech.dat`` reads ``current positioncurrent velocity``.
 """
 
 from __future__ import annotations
@@ -56,7 +61,7 @@ from .moldyn import (
 from .settings import RESCALE_FRICTION, MolecularDynamicsSettings
 
 MD_NRG_HEADER = (
-    "Step  Time[ps]  Ekin[eV/at]  Epot[eV/at]  Etot[eV/at]     T[K]  Tcalc[K]\n"
+    "Step    Time[ps]  Ekin[eV/at]  Epot[eV/at]  Etot[eV/at]     T[K]  Tcalc[K]\n"
 )
 MD_MECH_HEADER = (
     "Each line contains: six coordinates, three velocities, and three accelerations\n"
@@ -98,13 +103,14 @@ def _positions(positions: np.ndarray | Sequence, count: int | None = None) -> np
 def format_md_nrg_line(step: MoldynStep) -> str:
     """One line of ``md_nrg.dat``.
 
-    ``format(i4,3x,f7.3,2x,f11.5,2(2x,f11.5),2x,f7.2,3x,f7.2)``: step, time
+    ``format(i6,3x,f7.3,2x,f11.5,2(2x,f11.5),2x,f7.2,3x,f7.2)`` (PARSEC 1.5,
+    ``md/moldyn.f90:708``; ``i4`` before): step, time
     in ps, kinetic energy per movable atom, potential energy per atom and
     their sum in eV, target temperature and actual temperature in K.  A
     number that does not fit its field appears as asterisks, as in Fortran.
     """
     return (
-        fortran_i(step.frame, 4)
+        fortran_i(step.frame, 6)
         + "   "
         + fortran_f(step.time_ps, 7, 3)
         + "  "
@@ -124,13 +130,13 @@ def format_md_nrg_line(step: MoldynStep) -> str:
 # ----------------------------------------------------------------------
 # md_mech.dat and mdinit.dat
 # ----------------------------------------------------------------------
-def _mechanics_lines(state: MolecularDynamicsState) -> str:
-    """``format(13(1x,e15.8))`` for every atom."""
+def _mechanics_lines(state: MolecularDynamicsState, velocities: np.ndarray | None = None) -> str:
+    """``format(13(1x,e15.8))`` for every atom; ``velocities`` replace ``state.velocities``."""
     table = np.hstack(
         [
             state.current_positions,
             state.previous_positions,
-            state.velocities,
+            state.velocities if velocities is None else np.asarray(velocities, dtype=float),
             state.accelerations,
             state.movable.astype(float)[:, None],
         ]
@@ -141,20 +147,26 @@ def _mechanics_lines(state: MolecularDynamicsState) -> str:
     )
 
 
-def format_md_mech_step(state: MolecularDynamicsState) -> str:
+def format_md_mech_step(
+    state: MolecularDynamicsState, velocities: np.ndarray | None = None
+) -> str:
     """The block ``moldyn`` appends to ``md_mech.dat`` after a step.
 
-    ``state`` is the state *after* the step.  The header is
-    ``format('Step #',i4)`` with ``state.frame``; from step 10000 on the
-    number is written as ``****`` and the block cannot be used for a restart.
-    This block is also the content of ``mdinit.dat``.
+    ``state`` is the state *after* the step and ``velocities`` the
+    ``v(t)`` of the step (:attr:`MoldynStep.current_velocities`), which
+    PARSEC 1.5 writes; ``None`` writes ``state.velocities``.  The header is
+    ``format('Step #',i6)`` with ``state.frame`` (``i4`` before 1.5); from
+    step 1000000 on the number is written as ``******`` and the block cannot
+    be used for a restart.  This block is also the content of ``mdinit.dat``.
     """
-    return "Step #" + fortran_i(state.frame, 4) + "\n" + _mechanics_lines(state)
+    return "Step #" + fortran_i(state.frame, 6) + "\n" + _mechanics_lines(state, velocities)
 
 
-def format_md_restart(state: MolecularDynamicsState) -> str:
-    """Text of a restart file ``mdinit.dat`` for ``state``."""
-    return format_md_mech_step(state)
+def format_md_restart(
+    state: MolecularDynamicsState, velocities: np.ndarray | None = None
+) -> str:
+    """Text of a restart file ``mdinit.dat`` for ``state`` (see :func:`format_md_mech_step`)."""
+    return format_md_mech_step(state, velocities)
 
 
 def format_md_mech_restart_step(state: MolecularDynamicsState) -> str:
@@ -204,13 +216,14 @@ def parse_md_restart(text: str, atom_count: int | None = None) -> MolecularDynam
     fields and missing decimal points.  ``atom_count`` lines are read; if it
     is ``None`` all lines up to the end or to the next ``Step #`` line are.
 
-    PARSEC reads the header with ``format('Step #',i4)``.  A character
-    constant in an input format is not standard Fortran: gfortran stops with
-    "Constant string in input format", so a PARSEC built with gfortran
-    cannot restart molecular dynamics at all, while compilers that accept
-    it skip the six characters.  This function reads the number after
-    ``Step #`` and also accepts the list-directed header that
-    ``initial.f90`` itself writes.
+    PARSEC 1.5 reads the header with ``format(a6,i6)`` (``scf/initial.f90:195``);
+    the previous tree's ``format('Step #',i4)`` put a character constant in
+    an input format, which gfortran refuses ("Constant string in input
+    format").  This function reads the number after ``Step #``, from the
+    ``i4`` and ``i6`` headers alike, and also accepts the list-directed
+    header that ``initial.f90`` itself writes.  The velocities are those of
+    the file: ``v(t)`` from PARSEC 1.5 and this port, the next-step
+    estimate from the previous tree.
     """
     lines = text.splitlines()
     while lines and not lines[0].strip():
@@ -352,14 +365,14 @@ def format_atom_cor_next_run(positions: np.ndarray) -> str:
 def format_movie_xyz_frame(species: Sequence[str], positions: np.ndarray, frame: int) -> str:
     """One frame of ``movie.xyz``.
 
-    The number of atoms (``i3``), a list-directed title `` Step # `` with the
+    The number of atoms (``i7``, PARSEC 1.5; ``i3`` before), a list-directed title `` Step # `` with the
     step number, and for every atom ``format(a2, 3(3x, f10.6))`` with the
     coordinates in angstrom (1 bohr = 0.529177 angstrom, PARSEC's value).
     ``positions`` are in bohr.
     """
     positions = _positions(positions, len(species))
     lines = [
-        fortran_i(len(species), 3) + "\n",
+        fortran_i(len(species), 7) + "\n",
         " Step # " + list_directed_integer(frame) + "\n",
     ]
     for name, row in zip(species, positions):
@@ -522,7 +535,7 @@ def step_records(
         movie_xyz = format_movie_xyz_frame(species, step.positions, step.state.frame)
     return MoldynRecords(
         md_nrg=format_md_nrg_line(step),
-        md_mech=format_md_mech_step(step.state),
+        md_mech=format_md_mech_step(step.state, step.current_velocities),
         atom_cor=atom_cor,
         movie_xyz=movie_xyz,
     )

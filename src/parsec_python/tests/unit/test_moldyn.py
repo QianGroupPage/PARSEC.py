@@ -88,6 +88,69 @@ LANGEVIN = [name for name in RUNNING if name not in NEWTONIAN]
 # deviate.
 TRAJECTORY_RTOL = 1.0e-12
 
+#: Park and Miller's multiplier and modulus (``get_rand_test``).
+_PM_MULTIPLIER = 16807
+_PM_MODULUS = 2147483647
+
+
+def _rewound_seed(seed: int, draws: int) -> int:
+    """The state of ``get_rand_test`` ``draws`` numbers before ``seed``.
+
+    PARSEC 1.5 fast-forwards the test generator by ``2 (iframe - 1)`` numbers
+    at the first call of a restart (``md/moldyn.f90:445-455``); the reference
+    runs of the previous tree did not.  Starting a restarted run from the
+    rewound state therefore reproduces the reference, and only if exactly
+    that many numbers are drawn first.
+    """
+
+    state = 123459876 if seed == 0 else seed % _PM_MODULUS
+    return state * pow(_PM_MULTIPLIER, -draws, _PM_MODULUS) % _PM_MODULUS
+
+
+def _md15(text: str, name: str) -> str:
+    """A file of the previous tree's moldyn in the integer formats of PARSEC 1.5.
+
+    md_nrg.dat: ``i6`` steps (``i4`` before) and four blanks after ``Step``;
+    md_mech.dat: ``'Step #',i6`` headers; movie.xyz: ``i7`` atom counts
+    (``md/moldyn.f90:680,708,757``, ``scf/initial.f90:631,634``).  The
+    velocity columns of md_mech.dat, which 1.5 writes as ``v(t)``, are masked
+    by :func:`_mech`; atom.cor is unchanged.
+    """
+
+    lines = text.split("\n")
+    if name == "md_nrg.dat":
+        lines = [
+            line.replace("Step  Time", "Step    Time", 1) if line.startswith("Step")
+            else ("  " + line if line else line)
+            for line in lines
+        ]
+    elif name == "md_mech.dat":
+        lines = ["Step #  " + line[6:] if line.startswith("Step #") else line for line in lines]
+    elif name == "movie.xyz":
+        lines = [
+            f"{int(line):7d}" if line.strip().isdigit() and line == line.rstrip() else line
+            for line in lines
+        ]
+    return "\n".join(lines)
+
+
+def _mech(text: str) -> str:
+    """md_mech.dat with the three velocity fields of every atom line masked."""
+
+    return "\n".join(
+        line[:96] + "v" * 48 + line[144:] if len(line) >= 13 * 16 else line
+        for line in text.split("\n")
+    )
+
+
+def _files15(files: dict) -> dict:
+    """:func:`_md15` of every file of a reference run, md_mech.dat masked."""
+
+    converted = {name: _md15(text, name) for name, text in files.items()}
+    if "md_mech.dat" in converted:
+        converted["md_mech.dat"] = _mech(converted["md_mech.dat"])
+    return converted
+
 
 def _number(value) -> float:
     """Numbers of the reference; infinity and NaN are stored as strings."""
@@ -143,8 +206,21 @@ class _Case:
 
     def seed_before(self, index: int) -> int:
         if index == 0:
-            return self.settings.rng_seed
+            return self.first_seed()
         return self.steps[index - 1]["after"]["rng_seed"]
+
+    def first_seed(self) -> int:
+        """``rng_seed`` of the input, rewound over the 1.5 fast-forward of a restart."""
+        if self.settings.restart and self.settings.use_test_rng:
+            frame = self.initial_state().frame
+            return _rewound_seed(self.settings.rng_seed, max(0, 2 * (frame - 1)))
+        return self.settings.rng_seed
+
+    def random_source(self):
+        """``settings.random_source()``, started at :meth:`first_seed`."""
+        if self.settings.use_test_rng:
+            return ParsecTestRandom(self.first_seed())
+        return self.settings.random_source()
 
     def draws_random_numbers(self, index: int) -> bool:
         first = index == 0 and not self.settings.restart
@@ -744,7 +820,7 @@ class TrajectoryTests(unittest.TestCase):
             case = _Case(name)
             with self.subTest(case=name):
                 state = case.initial_state()
-                random = case.settings.random_source()
+                random = case.random_source()
                 for index, reference in enumerate(case.steps):
                     step = moldyn_step(
                         case.settings, state, reference["forces"], reference["etot"],
@@ -798,9 +874,9 @@ class TrajectoryTests(unittest.TestCase):
             state = step.state
         # 5 atoms, 3 velocities each, at least two uniform numbers per deviate
         self.assertGreater(random.position, 30)
-        files = case.data["files"]
+        files = _files15(case.data["files"])
         self.assertEqual(records.md_nrg, files["md_nrg.dat"])
-        self.assertEqual(records.md_mech, files["md_mech.dat"])
+        self.assertEqual(_mech(records.md_mech), files["md_mech.dat"])
         self.assertEqual(records.atom_cor, files["atom.cor"])
         self.assertEqual(records.movie_xyz, files["movie.xyz"])
         with self.assertRaises(ValueError):
@@ -818,6 +894,7 @@ class TrajectoryTests(unittest.TestCase):
                     case.settings,
                     case.initial_state(),
                     lambda positions: _morse(positions, case.species),
+                    random=case.random_source(),
                     first_positions=case.first_positions,
                 )
                 self.assertEqual(run.evaluations, case.data["scf_count"])
@@ -840,11 +917,77 @@ class TrajectoryTests(unittest.TestCase):
                     )
         self.assertLess(worst, 1.0e-11)
 
+    def test_md_mech_velocities_are_those_of_the_kinetic_energy(self) -> None:
+        """PARSEC 1.5 writes v(t) to md_mech.dat (``vxold_print``, md/moldyn.f90:332,528,604).
+
+        ``v(t)`` is the velocity the kinetic energy of the step is computed
+        from, in all three branches (first step, microcanonical, Langevin), so
+        the written columns are checked against the Fortran ``tke``.
+        """
+        compared = 0
+        for name in REPEATABLE:
+            case = _Case(name)
+            state = case.initial_state()
+            random = case.random_source()
+            mobile = float(case.movable.sum())
+            for index, reference in enumerate(case.steps):
+                with self.subTest(case=name, step=index):
+                    previous = state
+                    step = moldyn_step(
+                        case.settings, state, reference["forces"], reference["etot"],
+                        random=random,
+                    )
+                    state = step.state
+                    v = step.current_velocities
+                    tke = float(
+                        np.cumsum(
+                            0.5 * previous.masses * (v[:, 0] * v[:, 0] + v[:, 1] * v[:, 1] + v[:, 2] * v[:, 2])
+                        )[-1]
+                    )
+                    # (the first call rescales tke itself: equal to round-off;
+                    # a single movable atom has no velocity left after the
+                    # centre of mass is held)
+                    if step.kinetic_energy == 0.0:
+                        self.assertEqual(tke, 0.0)
+                    else:
+                        self.assertAlmostEqual(2.0 * tke / step.kinetic_energy, 1.0, delta=1.0e-14)
+                    fortran = _number(reference["energy"]["tke"])
+                    if math.isfinite(fortran) and fortran != 0.0:
+                        self.assertAlmostEqual(2.0 * tke / mobile / fortran, 1.0, delta=TRAJECTORY_RTOL)
+                    written = parse_md_restart(
+                        format_md_mech_step(step.state, v), len(case.species)
+                    )
+                    np.testing.assert_allclose(written.velocities, v, rtol=1.0e-7, atol=1.0e-12)
+                    # the next step goes on from the estimate, not from v(t)
+                    self.assertFalse(np.array_equal(step.state.velocities, v))
+                    compared += 1
+        self.assertGreaterEqual(compared, 60)
+
+    def test_restart_fast_forwards_the_test_generator(self) -> None:
+        """md/moldyn.f90:445-455 of PARSEC 1.5: 2 (iframe - 1) numbers at a restart's first call."""
+        case = _Case("restart_nve")
+        self.assertTrue(case.settings.use_test_rng and case.settings.is_microcanonical)
+        state = case.initial_state()
+        self.assertGreater(state.frame, 1)
+        reference = case.steps[0]
+        random = ParsecTestRandom(case.settings.rng_seed)
+        moldyn_step(case.settings, state, reference["forces"], reference["etot"], random=random)
+        expected = ParsecTestRandom(case.settings.rng_seed)
+        for _ in range(2 * (state.frame - 1)):
+            expected.uniform()
+        self.assertEqual(random.seed, expected.seed)
+        self.assertEqual(_rewound_seed(expected.seed, 2 * (state.frame - 1)), case.settings.rng_seed)
+        # a fresh run and the later calls of a restart draw nothing extra here
+        later = ParsecTestRandom(5)
+        step = moldyn_step(case.settings, state, reference["forces"], reference["etot"], random=random)
+        moldyn_step(case.settings, step.state, case.steps[1]["forces"], case.steps[1]["etot"], random=later)
+        self.assertEqual(later.seed, 5)
+
     def test_number_of_calls_and_the_last_step(self) -> None:
         # the final temperature is reached: the last call is the "last step"
         case = _Case("nve_stair")
         state = case.initial_state()
-        random = case.settings.random_source()
+        random = case.random_source()
         flags = []
         for reference in case.steps:
             step = moldyn_step(
@@ -856,7 +999,7 @@ class TrajectoryTests(unittest.TestCase):
         # the stair did not get to T_Final: there is no "last step"
         case = _Case("nve_stair_unfinished")
         state = case.initial_state()
-        random = case.settings.random_source()
+        random = case.random_source()
         flags = []
         for reference in case.steps:
             step = moldyn_step(
@@ -883,9 +1026,9 @@ class TrajectoryTests(unittest.TestCase):
         self.assertIs(run.state, state)
         with self.assertRaises(ValueError):
             moldyn_step(case.settings, state, np.zeros((5, 3)), 0.0)
-        files = case.data["files"]
+        files = _files15(case.data["files"])
         self.assertEqual(run.records.md_nrg, files["md_nrg.dat"])
-        self.assertEqual(run.records.md_mech, files["md_mech.dat"])
+        self.assertEqual(_mech(run.records.md_mech), files["md_mech.dat"])
         self.assertEqual(run.records.atom_cor, files["atom.cor"])
         self.assertEqual(run.records.movie_xyz, files["movie.xyz"])
 
@@ -914,7 +1057,7 @@ class TrajectoryTests(unittest.TestCase):
         fixed = np.flatnonzero(case.movable == 0)
         self.assertEqual(list(fixed), [2])
         state = case.initial_state()
-        random = case.settings.random_source()
+        random = case.random_source()
         for reference in case.steps:
             step = moldyn_step(
                 case.settings, state, reference["forces"], reference["etot"], random=random
@@ -958,7 +1101,7 @@ class TrajectoryTests(unittest.TestCase):
                 case.initial_state(),
                 case.steps[0]["forces"],
                 case.steps[0]["etot"],
-                random=case.settings.random_source(),
+                random=case.random_source(),
             )
             mobile = int(case.movable.sum())
             self.assertEqual(step.time_ps, 0.0)
@@ -991,7 +1134,7 @@ class TrajectoryTests(unittest.TestCase):
             case.initial_state(),
             case.steps[0]["forces"],
             case.steps[0]["etot"],
-            random=case.settings.random_source(),
+            random=case.random_source(),
         )
         self.assertEqual(step.temperature, math.inf)
         self.assertEqual(_number(case.steps[0]["energy"]["tcalc"]), math.inf)
@@ -1102,7 +1245,7 @@ class TrajectoryTests(unittest.TestCase):
                 state,
                 np.zeros((2, 3)),
                 0.0,
-                random=case.settings.random_source(),
+                random=case.random_source(),
             )
         before = state.current_positions.copy()
         step = moldyn_step(
@@ -1110,7 +1253,7 @@ class TrajectoryTests(unittest.TestCase):
             state,
             reference["forces"],
             reference["etot"],
-            random=case.settings.random_source(),
+            random=case.random_source(),
         )
         self.assertTrue(np.array_equal(state.current_positions, before))
         self.assertEqual(state.frame, 0)
@@ -1138,7 +1281,7 @@ class FileTests(unittest.TestCase):
             case = _Case(name)
             with self.subTest(case=name):
                 state = case.initial_state()
-                random = case.settings.random_source()
+                random = case.random_source()
                 records = initial_records(state, case.species, case.first_positions)
                 for reference in case.steps:
                     step = moldyn_step(
@@ -1147,9 +1290,13 @@ class FileTests(unittest.TestCase):
                     )
                     records = records + step_records(state, step, case.species)
                     state = step.state
-                files = case.data["files"]
+                # The files of the previous tree in PARSEC 1.5's integer
+                # formats, the velocity columns (v(t) in 1.5) masked: they
+                # are checked against the kinetic energy in
+                # test_md_mech_velocities_are_those_of_the_kinetic_energy.
+                files = _files15(case.data["files"])
                 self.assertEqual(records.md_nrg, files["md_nrg.dat"])
-                self.assertEqual(records.md_mech, files["md_mech.dat"])
+                self.assertEqual(_mech(records.md_mech), files["md_mech.dat"])
                 self.assertEqual(records.atom_cor, files["atom.cor"])
                 self.assertEqual(records.movie_xyz, files["movie.xyz"])
                 compared += 4
@@ -1177,7 +1324,7 @@ class FileTests(unittest.TestCase):
         )
 
     def test_headers(self) -> None:
-        files = CASES["nve_stair"]["files"]
+        files = _files15(CASES["nve_stair"]["files"])
         self.assertTrue(files["md_nrg.dat"].startswith(MD_NRG_HEADER))
         self.assertTrue(files["md_mech.dat"].startswith(MD_MECH_HEADER))
         self.assertEqual(MD_NRG_HEADER.count("\n"), 1)
@@ -1191,7 +1338,7 @@ class FileTests(unittest.TestCase):
             lambda positions: _morse(positions, case.species),
             species=case.species,
         )
-        files = case.data["files"]
+        files = _files15(case.data["files"])
         # eight or nine printed digits: last-bit differences of exp() in the
         # forces do not show
         self.assertEqual(run.records.md_nrg, files["md_nrg.dat"])
@@ -1211,7 +1358,7 @@ class FileTests(unittest.TestCase):
         Python values.
         """
         silver = REFERENCE["silver_cluster_md_nrg"]
-        lines = silver["md_nrg_dat"].splitlines()
+        lines = _md15(silver["md_nrg_dat"], "md_nrg.dat").splitlines()
         self.assertEqual(lines[0] + "\n", MD_NRG_HEADER)
         settings = MolecularDynamicsSettings.from_keywords(silver["keywords"])
         self.assertEqual(settings.cooling_method, "log")
@@ -1231,19 +1378,19 @@ class FileTests(unittest.TestCase):
         self.assertEqual(len(run.steps), len(lines) - 1)
         self.assertEqual(len(run.steps), settings.step_num + 1)
         for index, (step, line) in enumerate(zip(run.steps, lines[1:])):
-            kinetic = float(line[16:27])
-            potential = float(line[29:40])
-            total = float(line[42:53])
+            kinetic = float(line[18:29])
+            potential = float(line[31:42])
+            total = float(line[44:55])
             if index == 0:
                 kinetic = step.kinetic_energy_ev
                 temperature = step.temperature
                 self.assertAlmostEqual(temperature, 2000.0, places=9)
-            elif "*" in line[65:72]:
+            elif "*" in line[67:74]:
                 # 2/3 Ekin/k of the microcanonical branch does not fit f7.2
                 temperature = 2.0 / 3.0 * (kinetic / 13.6058) / 6.33327186e-06
                 self.assertGreater(temperature, 9999.995)
             else:
-                temperature = float(line[65:72])
+                temperature = float(line[67:74])
             rebuilt = replace(
                 step,
                 kinetic_energy_ev=kinetic,
@@ -1252,7 +1399,7 @@ class FileTests(unittest.TestCase):
                 temperature=temperature,
             )
             self.assertEqual(format_md_nrg_line(rebuilt), line + "\n")
-            self.assertEqual(len(line), 72)
+            self.assertEqual(len(line), 74)
 
     def test_single_blocks(self) -> None:
         state = MolecularDynamicsState(
@@ -1267,7 +1414,7 @@ class FileTests(unittest.TestCase):
             move_count=12,
         )
         block = format_md_mech_step(state).splitlines()
-        self.assertEqual(block[0], "Step #  12")
+        self.assertEqual(block[0], "Step #    12")  # 'Step #',i6 of PARSEC 1.5
         self.assertEqual(len(block), 3)
         self.assertEqual(len(block[1]), 13 * 16)
         self.assertEqual(
@@ -1276,10 +1423,18 @@ class FileTests(unittest.TestCase):
         self.assertTrue(block[1].endswith(" -0.10000000E-06  0.10000000E+01"))
         self.assertTrue(block[2].endswith("  0.00000000E+00"))
         self.assertEqual(format_md_restart(state), format_md_mech_step(state))
-        # from step 10000 on the header overflows its i4 field
+        # from step 1000000 on the header overflows its i6 field (i4 before 1.5)
         self.assertTrue(
-            format_md_mech_step(replace(state, frame=10000)).startswith("Step #****\n")
+            format_md_mech_step(replace(state, frame=10000)).startswith("Step # 10000\n")
         )
+        self.assertTrue(
+            format_md_mech_step(replace(state, frame=1000000)).startswith("Step #******\n")
+        )
+        # the velocity columns are those given (v(t) of a step), the state's otherwise
+        given = format_md_mech_step(state, np.full((2, 3), 2.5e-3)).splitlines()
+        self.assertEqual(given[1][96:112], "  0.25000000E-02")
+        self.assertEqual(given[1][:96], block[1][:96])
+        self.assertEqual(given[1][144:], block[1][144:])
         cor = format_atom_cor_step(["Si", "H"], state.current_positions, 3)
         self.assertEqual(
             cor.splitlines(),
@@ -1295,7 +1450,7 @@ class FileTests(unittest.TestCase):
         self.assertEqual(
             xyz.splitlines(),
             [
-                "  2",
+                "      2",  # i7 of PARSEC 1.5 (i3 before)
                 " Step #            3",
                 "Si     0.529177    -1.058354     0.396883",
                 "H      0.000000     0.000000     0.000000",
@@ -1304,9 +1459,9 @@ class FileTests(unittest.TestCase):
         # two atom types with the same name next to each other form one group
         grouped = format_atom_cor_step(["H", "H"], state.current_positions, 0)
         self.assertEqual(grouped.count(" H \n"), 1)
-        # i3 for the number of atoms
+        # i7 for the number of atoms (PARSEC 1.5; i3 before, *** for 1000 atoms)
         many = format_movie_xyz_frame(["H"] * 1000, np.zeros((1000, 3)), 0)
-        self.assertTrue(many.startswith("***\n"))
+        self.assertTrue(many.startswith("   1000\n"))
         with self.assertRaises(ValueError):
             format_atom_cor_step(["Si"], state.current_positions, 3)
 
@@ -1345,11 +1500,18 @@ class RestartTests(unittest.TestCase):
                         parent.settings, state, reference["forces"], reference["etot"],
                         random=random,
                     )
-                    md_mech += format_md_mech_step(step.state)
+                    md_mech += format_md_mech_step(step.state, step.current_velocities)
                     state = step.state
                 self.assertEqual(state.frame, origin["frame"])
-                self.assertEqual(format_md_restart(state), CASES[name]["mdinit_dat"])
-                self.assertEqual(last_md_mech_step(md_mech), CASES[name]["mdinit_dat"])
+                # PARSEC 1.5's header and v(t) columns; the other columns are those
+                # of the previous tree's file
+                fortran = _mech(_md15(CASES[name]["mdinit_dat"], "md_mech.dat"))
+                restart_text = format_md_restart(state, step.current_velocities)
+                self.assertEqual(_mech(restart_text), fortran)
+                self.assertEqual(_mech(last_md_mech_step(md_mech)), fortran)
+                self.assertEqual(last_md_mech_step(md_mech), restart_text)
+                # the previous tree wrote the next-step estimate there
+                self.assertEqual(_mech(format_md_restart(state)), fortran)
 
     def test_restart_continues_the_run_to_the_digits_of_the_file(self) -> None:
         """The restart file has eight digits: the continuation is that close."""
@@ -1405,7 +1567,7 @@ class RestartTests(unittest.TestCase):
                 reference = case.steps[0]
                 step = moldyn_step(
                     case.settings, state, reference["forces"], reference["etot"],
-                    random=case.settings.random_source(),
+                    random=case.random_source(),
                 )
                 np.testing.assert_allclose(
                     step.positions, reference["after"]["xcur"], rtol=TRAJECTORY_RTOL
@@ -1528,7 +1690,8 @@ class ParsecExecutableTests(unittest.TestCase):
             state = step.state
             self.assertEqual(step.finished, index == len(blocks) - 1)
             self.assertEqual(step.last_step, index == len(blocks) - 1)
-        files = data["files"]
+        # the previous executable's files in PARSEC 1.5's integer formats
+        files = _files15(data["files"])
         self.assertEqual(records.md_nrg, files["md_nrg.dat"])
         self.assertEqual(records.movie_xyz, files["movie.xyz"])
         self.assertIn("Coordinates for next Run", files["atom.cor"])
@@ -1546,6 +1709,123 @@ class ParsecExecutableTests(unittest.TestCase):
             [line for line in records.atom_cor.splitlines() if line.count(".") != 3],
             [line for line in files["atom.cor"].splitlines() if line.count(".") != 3],
         )
+
+
+def _numbers_and_layout(text: str) -> tuple[list[float], str]:
+    """The numbers of a file and its text with every number replaced by ``#``."""
+
+    pattern = r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[EeDd][-+]?\d+)?"
+    import re
+
+    values = [float(token.replace("D", "E")) for token in re.findall(pattern, text)]
+    return values, re.sub(pattern, "#", text)
+
+
+class Parsec15ExecutableTests(unittest.TestCase):
+    """PARSEC 1.5 itself: H2 with Langevin dynamics, ``test_rng``, ``Mol_RNG_Seed`` and a restart.
+
+    ``tests/data/moldyn_parsec15_h2_langevin_reference.json`` holds the files of
+    the 1.5 executable and the forces and energies it printed for every
+    structure.  Python integrates the same forces from the same input and must
+    write the same files: the integer widths of 1.5 (``i6``/``i7``), the
+    velocities ``v(t)`` in md_mech.dat, and in the restart the fast-forward of
+    the test generator (``md/moldyn.f90:445-455``) and the velocities read
+    back from mdinit.dat.  The forces carry six decimals, so the numbers agree
+    to that precision; the layout and every integer agree exactly.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        path = DATA.with_name("moldyn_parsec15_h2_langevin_reference.json")
+        cls.data = json.loads(path.read_text(encoding="utf-8"))
+        cls.masses = atomic_masses(cls.data["species"])
+
+    def _run(self, run, state, random):
+        species = self.data["species"]
+        settings = MolecularDynamicsSettings.from_keywords(run["keywords"])
+        records = initial_records(state, species)
+        for forces, energy in zip(run["forces"], run["total_energies"]):
+            step = moldyn_step(settings, state, forces, energy, random=random)
+            records = records + step_records(state, step, species)
+            state = step.state
+        return records
+
+    def _compare(self, records, files) -> None:
+        for name, mine in (
+            ("md_nrg.dat", records.md_nrg),
+            ("md_mech.dat", records.md_mech),
+            ("movie.xyz", records.movie_xyz),
+            ("atom.cor", records.atom_cor),
+        ):
+            with self.subTest(file=name):
+                values, layout = _numbers_and_layout(mine)
+                theirs, their_layout = _numbers_and_layout(files[name])
+                self.assertEqual(layout, their_layout)
+                if name == "md_nrg.dat":
+                    self._same_md_nrg(mine, files[name])
+                else:
+                    np.testing.assert_allclose(values, theirs, rtol=2.0e-5, atol=2.0e-6)
+
+    def _same_md_nrg(self, mine: str, theirs: str) -> None:
+        """md_nrg.dat of PARSEC 1.5 within one unit of the last printed decimal.
+
+        The forces carry six decimals; a kinetic energy of 1e-5 eV or a
+        temperature of 1e-2 K is what shows it.  Steps, times and the layout
+        agree exactly.
+        """
+
+        import re
+
+        mine_lines, their_lines = mine.splitlines(), theirs.splitlines()
+        self.assertEqual(len(mine_lines), len(their_lines))
+        self.assertEqual(mine_lines[0], their_lines[0])
+        for line, other in zip(mine_lines[1:], their_lines[1:]):
+            self.assertEqual(_numbers_and_layout(line)[1], _numbers_and_layout(other)[1])
+            self.assertEqual(line.split()[:2], other.split()[:2])
+            for value, reference in zip(line.split()[2:], other.split()[2:]):
+                decimals = len(reference.split(".")[1]) if "." in reference else 0
+                self.assertLessEqual(abs(float(value) - float(reference)), 1.01 * 10.0 ** -decimals, (line, other))
+
+    def test_first_run_and_restart_follow_parsec15(self) -> None:
+        first = self.data["runs"]["first"]
+        settings = MolecularDynamicsSettings.from_keywords(first["keywords"])
+        self.assertTrue(settings.use_test_rng)
+        self.assertEqual(settings.rng_seed, 12345)  # Mol_RNG_Seed
+        self.assertFalse(settings.is_microcanonical)
+        state = start_molecular_dynamics(settings, first["positions"], self.masses)
+        records = self._run(first, state, settings.random_source())
+        self._compare(records, first["files"])
+        self._same_md_nrg(records.md_nrg, first["files"]["md_nrg.dat"])
+
+        restart = self.data["runs"]["restart"]
+        settings = MolecularDynamicsSettings.from_keywords(restart["keywords"])
+        self.assertTrue(settings.restart)
+        loaded = parse_md_restart(restart["mdinit_dat"], 2)
+        self.assertEqual(loaded.frame, 4)
+        state = restart_molecular_dynamics(settings, loaded, self.masses)
+        records = self._run(restart, state, settings.random_source())
+        self._compare(records, restart["files"])
+        self._same_md_nrg(records.md_nrg, restart["files"]["md_nrg.dat"])
+
+        # With Mol_RNG_Seed 12345 the first three pairs of uniform numbers are
+        # all rejected by gdev, so the fast-forward of 6 numbers changes nothing
+        # there; with 777 it does, and only the fast-forwarded generator gives
+        # PARSEC 1.5's restart.
+        restart = self.data["runs"]["restart777"]
+        settings = MolecularDynamicsSettings.from_keywords(restart["keywords"])
+        self.assertEqual(settings.rng_seed, 777)
+        records = self._run(
+            restart, restart_molecular_dynamics(settings, loaded, self.masses), settings.random_source()
+        )
+        self._compare(records, restart["files"])
+        self._same_md_nrg(records.md_nrg, restart["files"]["md_nrg.dat"])
+        # without the fast-forward (the previous tree's restart) the run is another one
+        unforwarded = ParsecTestRandom(_rewound_seed(settings.rng_seed, 2 * (loaded.frame - 1)))
+        other = self._run(restart, restart_molecular_dynamics(settings, loaded, self.masses), unforwarded)
+        values, _ = _numbers_and_layout(other.md_mech)
+        theirs, _ = _numbers_and_layout(restart["files"]["md_mech.dat"])
+        self.assertGreater(float(np.max(np.abs(np.array(values) - np.array(theirs)))), 1.0e-5)
+
 
 
 if __name__ == "__main__":

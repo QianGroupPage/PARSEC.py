@@ -4367,7 +4367,7 @@ def run_distributed_chebff(
     if not 1 <= wanted_states <= dimension:
         raise ValueError("wanted_states is outside the operator dimension")
     blocks = uniform_filter_blocks(wanted_states, settings.block_size, settings.polynomial_degree)
-    basis_generator = LapackRandom()
+    basis_generator = LapackRandom(settings.basis_seed)
     basis = group.random_basis(basis_generator, dimension, group.column_layout(blocks))
     stats = getattr(operator, "timing_stats", None)
     if stats is not None and os.environ.get("PARSEC_CUPY_DEVICE_RANDOM", "0").lower() in {"1", "true", "on"}:

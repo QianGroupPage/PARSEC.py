@@ -521,6 +521,7 @@ def _reference_only_features(
     *,
     accelerated_backend_selected: bool,
     device_eigensolver_selected: bool = False,
+    hybrid_on_device: bool = False,
 ) -> list[str]:
     """Input features only the reference :mod:`parsec_python.cli` dispatches.
 
@@ -535,6 +536,10 @@ def _reference_only_features(
     ``device_eigensolver_selected``: the backend resolves to the CuPy
     eigensolvers, which run ``Eigensolver: arpack`` on the device
     (:mod:`parsec_python.acceleration.Eigensolvers.arpack`).
+    ``hybrid_on_device``: the input has a self-consistent hybrid functional
+    and the backend resolves to CuPy in one process, where the device Fock
+    loop runs it (:mod:`parsec_python.acceleration.SCF.hybrid`); otherwise
+    the reference solver runs it.
     """
 
     problem = translation.problem
@@ -544,6 +549,14 @@ def _reference_only_features(
     # and his grids of every cell shape.
     fortran = getattr(getattr(translation, "routines", None), "fortran", False)
     features = []
+    if getattr(problem.scf, "is_hybrid", False) and not hybrid_on_device:
+        # The device Fock loop (acceleration.SCF.hybrid) needs the CuPy
+        # backend in one process; on the CPU backends and under --mpi the
+        # reference solver runs the Fock loop of parsec_python.SCF.hybrid,
+        # with its single point, forces and relaxation.
+        features.append(
+            f"the self-consistent hybrid functional (Correlation_Type: {problem.scf.xc_functional})"
+        )
     if problem.scf.noncollinear:
         features.append("non-collinear magnetism (Non_Collinear_magnetism)")
     elif problem.scf.self_consistent_spin_orbit:
@@ -854,7 +867,39 @@ def _mpi_unsupported_features(translation) -> list[str]:
     if getattr(problem, "embedding", None) is not None:
         # FDET of PARSEC 1.5: one process holds the frozen sample field.
         features.append("FDET (Potential_Field)")
+    if getattr(problem.scf, "is_hybrid", False):
+        # The exchange operator needs every orbital on every grid point.
+        features.append(
+            f"the self-consistent hybrid functional (Correlation_Type: {problem.scf.xc_functional})"
+        )
     return features
+
+
+def _hybrid_on_device(arguments: argparse.Namespace, translation) -> bool:
+    """Whether the device Fock loop runs this input's hybrid functional.
+
+    The input has one, its pairs are solved by the Kronecker solver (the
+    default ``Exx_Pair_Solver``), the backend resolves to CuPy and the run is
+    one process (no ``--mpi``): the GPUs of one node.  ``False`` for every
+    other input, which the reference solver then runs.
+    """
+
+    from .Parallel import mpi
+
+    if not getattr(translation.problem.scf, "is_hybrid", False):
+        return False
+    if getattr(arguments, "mpi", False) or mpi.requested():
+        return False
+    # The device solves the pair densities with the Kronecker solver only;
+    # Exx_Pair_Solver: cg runs on the reference solver.
+    settings = getattr(translation.problem.scf, "exact_exchange", None)
+    if getattr(settings, "pair_solver", "kronecker") != "kronecker":
+        return False
+    try:
+        selection = resolve_backend(arguments.backend, translation.problem)
+    except (BackendUnavailableError, NotImplementedError, ValueError):
+        return False
+    return selection.selected == "cupy"
 
 
 def _device_eigensolver_selected(arguments: argparse.Namespace, translation) -> bool:
@@ -1133,6 +1178,7 @@ def _run(
         translation,
         accelerated_backend_selected=accelerated_self_consistent_soc,
         device_eigensolver_selected=_device_eigensolver_selected(arguments, translation),
+        hybrid_on_device=_hybrid_on_device(arguments, translation),
     )
     if unsupported:
         features = ", ".join(unsupported)

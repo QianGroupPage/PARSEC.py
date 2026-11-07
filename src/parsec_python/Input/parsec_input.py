@@ -38,6 +38,8 @@ from ..models import (
     PeriodicGridSettings,
     PointCharge,
     UNPOLARIZED_ONLY_XC_FUNCTIONALS,
+    ExactExchangeSettings,
+    HYBRID_XC_FUNCTIONALS,
 )
 from ..models import EmbeddingSettings  # FDET of PARSEC 1.5
 from ..Grid.cell import primitive_lattice, replicate_positions, supercell_lattice
@@ -100,6 +102,18 @@ _CORRELATION_LABELS = {
     "lb": "lb94",
     "cs": "casida_salahub",
 }
+# Self-consistent hybrid functionals (PARSEC.py; no Fortran PARSEC label), the
+# Fock loop of parsec_python.SCF.hybrid: the labels and aliases of
+# parsec_python.V_xc.hybrid (canonical_hybrid_label), read before the table above.
+# The Fock-loop keywords of a hybrid Correlation_Type (PARSEC.py).
+_HYBRID_KEYS = (
+    "exact_exchange_fraction",
+    "screening_parameter",
+    "exx_max_iter",
+    "exx_tolerance",
+    "exx_batch_size",
+    "exx_pair_solver",
+)
 
 
 class ParsecInputError(ValueError):
@@ -405,6 +419,148 @@ _INPUT15_ACCEPTED_GLOBAL = frozenset(
 
 #: Per-species keywords of PARSEC 1.5 (read once per Atom_Type, ESDF cursor).
 _INPUT15_SPECIES_KEYS = frozenset({"pseudopot_file"})
+
+
+def _hybrid_label(text: str) -> str | None:
+    """The registry label of a hybrid ``Correlation_Type``, ``None`` for another one."""
+
+    from ..V_xc.hybrid import canonical_hybrid_label
+
+    raw = str(text).strip().lower()
+    for candidate in (raw, raw.replace("-", "_"), raw.replace("_", "-")):
+        try:
+            label = canonical_hybrid_label(candidate)
+        except ValueError:
+            continue
+        return label if label in HYBRID_XC_FUNCTIONALS else None
+    return None
+
+
+def _exact_exchange_settings(scalar, one, xc_functional: str) -> ExactExchangeSettings | None:
+    """``Exact_Exchange_Fraction``, ``Screening_Parameter`` and the ``Exx_*`` keys.
+
+    ``None`` for a functional without exact exchange, where the keys are
+    refused; for a hybrid every key that is not given keeps its default
+    (:class:`parsec_python.models.ExactExchangeSettings`).
+    """
+
+    given = [key for key in _HYBRID_KEYS if key in scalar]
+    if xc_functional not in HYBRID_XC_FUNCTIONALS:
+        if given:
+            raise ParsecInputError(
+                ", ".join(given)
+                + " belong to a hybrid Correlation_Type ("
+                + ", ".join(sorted(HYBRID_XC_FUNCTIONALS))
+                + f"), not to {xc_functional!r}"
+            )
+        return None
+    keywords: dict = {}
+    try:
+        if "exact_exchange_fraction" in scalar:
+            keywords["fraction"] = _plain_float(one("exact_exchange_fraction"), "Exact_Exchange_Fraction")
+        if "screening_parameter" in scalar:
+            keywords["screening"] = _inverse_length_bohr(one("screening_parameter"))
+        if "exx_max_iter" in scalar:
+            value = _plain_float(one("exx_max_iter"), "Exx_Max_Iter")
+            if value != int(value):
+                raise ValueError("Exx_Max_Iter must be an integer")
+            keywords["max_iterations"] = int(value)
+        if "exx_tolerance" in scalar:
+            keywords["tolerance"] = _energy_rydberg(one("exx_tolerance"), label="Exx_Tolerance")
+        if "exx_batch_size" in scalar:
+            value = _plain_float(one("exx_batch_size"), "Exx_Batch_Size")
+            if value != int(value):
+                raise ValueError("Exx_Batch_Size must be an integer")
+            keywords["batch_size"] = int(value)
+        if "exx_pair_solver" in scalar:
+            keywords["pair_solver"] = _normalize_label(one("exx_pair_solver"))
+        settings = ExactExchangeSettings(**keywords)
+    except ValueError as error:
+        raise ParsecInputError(str(error)) from error
+    from ..SCF.hybrid import hybrid_definition, require_pair_solver
+
+    probe = SCFSettings(xc_functional=xc_functional, exact_exchange=settings)
+    try:
+        require_pair_solver(hybrid_definition(probe))
+    except NotImplementedError as error:
+        raise UnsupportedParsecOptionError(str(error)) from error
+    except ValueError as error:
+        raise ParsecInputError(str(error)) from error
+    return settings
+
+
+def _plain_float(text: str, label: str) -> float:
+    match = _FLOAT_PATTERN.match(str(text).strip())
+    if match is None or str(text).strip()[match.end():].strip():
+        raise ValueError(f"{label} must be a number, got {text!r}")
+    return float(match.group(0).replace("d", "e").replace("D", "e"))
+
+
+def _inverse_length_bohr(text: str) -> float:
+    """``Screening_Parameter`` in bohr^-1: a number, optionally ``bohr^-1`` or ``ang^-1``."""
+
+    value = str(text).strip()
+    match = _FLOAT_PATTERN.match(value)
+    if match is None:
+        raise ValueError(f"Screening_Parameter must be a number, got {text!r}")
+    number = float(match.group(0).replace("d", "e").replace("D", "e"))
+    unit = re.sub(r"\s+", "", value[match.end():].lower())
+    if unit in ("", "bohr^-1", "1/bohr", "bohr-1"):
+        return number
+    if unit in ("ang^-1", "1/ang", "ang-1", "angstrom^-1", "1/angstrom"):
+        return number / ANGSTROM_TO_BOHR
+    raise ValueError(f"Screening_Parameter: unknown unit {unit!r} (bohr^-1 or ang^-1)")
+
+
+def _check_hybrid_request(
+    scf,
+    *,
+    is_periodic: bool,
+    specifications,
+    energy_refinement,
+    embedding: bool,
+    polarizability: bool,
+    nscf: bool,
+    output_gw: bool,
+    bands: bool,
+) -> None:
+    """Refuse by name what the hybrid functionals do not cover yet.
+
+    The Fock loop is that of an isolated system with real orbitals on the
+    full grid (spin-unpolarized or collinear spin).
+    """
+
+    hubbard = any(
+        specification.hubbard_u != 0.0 or specification.hubbard_j != 0.0
+        for specification in specifications.values()
+    )
+    refused = [
+        label
+        for condition, label in (
+            (is_periodic, "a periodic Boundary_Conditions (bulk, wire or slab)"),
+            (
+                scf.self_consistent_spin_orbit
+                or any(specification.spin_orbit for specification in specifications.values()),
+                "spin-orbit coupling (SO_PSP, SO_from_scratch)",
+            ),
+            (scf.noncollinear, "non-collinear magnetism"),
+            (embedding, "FDET (Potential_Field)"),
+            (hubbard, "LDA+U (ldaplusu_u, ldaplusu_j)"),
+            (energy_refinement is not None, "Energy_Refinement (the hybrid is already self-consistent)"),
+            (scf.van_der_waals, "Van_Der_Waals"),
+            (polarizability, "Polarizability"),
+            (nscf, "a non-self-consistent calculation (nscf)"),
+            (output_gw, "Output_GW"),
+            (bands, "a band structure (bandstruc)"),
+        )
+        if condition
+    ]
+    if refused:
+        raise UnsupportedParsecOptionError(
+            f"Correlation_Type: {scf.xc_functional} (a self-consistent hybrid functional) is "
+            "implemented for isolated systems, spin-unpolarized or collinear spin; not "
+            "together with " + ", ".join(refused)
+        )
 
 
 def _normalize_label(value: str) -> str:
@@ -1805,15 +1961,42 @@ def _input15_pseudopotential_notes(
     import warnings as python_warnings
 
     from ..V_ion import load_pseudopotentials, pseudopotential_matches_functional
+    from ..V_ion.ionic_potential import (
+        _CA_LABELS,
+        hybrid_pseudopotential_family,
+        hybrid_pseudopotential_labels,
+        hybrid_pseudopotential_refusal,
+    )
 
+    hybrid_labels = hybrid_pseudopotential_labels(xc_functional)
     if potentials is None:
         try:
             with python_warnings.catch_warnings():
                 python_warnings.simplefilter("ignore")
-                potentials = load_pseudopotentials(specifications, xc_functional=xc_functional)
+                # A hybrid's files are checked below, by name, before the run.
+                potentials = load_pseudopotentials(
+                    specifications,
+                    xc_functional=xc_functional,
+                    check_correlation=hybrid_labels is None,
+                )
         except (OSError, ValueError, KeyError):
             return []
     notes = []
+    if hybrid_labels is not None:
+        # A hybrid reads the files of its semilocal family (PBE; B3PW91 also PW91).
+        for symbol, potential in potentials.items():
+            if pseudopotential_matches_functional(potential, xc_functional):
+                continue
+            label = potential.correlation.strip().lower()
+            if label not in _CA_LABELS:
+                raise UnsupportedParsecOptionError(
+                    hybrid_pseudopotential_refusal(symbol, potential.source, label, xc_functional)
+                )
+            notes.append(
+                f"Atom_Type {symbol}: {potential.source} was generated for {potential.correlation!r}, "
+                f"not for {hybrid_pseudopotential_family(xc_functional)}, the pseudopotentials of the "
+                f"hybrid {xc_functional}; it is used, as a PBE run uses a CA file"
+            )
     if xc_functional == "pbe":
         for symbol, potential in potentials.items():
             if not pseudopotential_matches_functional(potential, "pbe"):
@@ -2074,6 +2257,8 @@ def _parse_parsec_input(
         # on the converged orbitals (ARES ``Lrefine``).  It changes nothing
         # of the SCF.
         "energy_refinement",
+        # PARSEC.py extension: the Fock loop of a hybrid Correlation_Type.
+        *_HYBRID_KEYS,
         # Tkatchenko-Scheffler dispersion correction (usrinputfile.F90).
         "van_der_waals",
         "hf_one",
@@ -2307,14 +2492,15 @@ def _parse_parsec_input(
 
     # usrinputfile.F90:2308-2361: without the line a spin-polarized run takes
     # the Perdew-Wang LSDA ("pl"), an unpolarized one CA.
-    correlation = _normalize_label(
-        one("correlation_type", "pl" if spin_polarized else "ca")
-    )
-    xc_functional = _CORRELATION_LABELS.get(correlation)
+    correlation_text = one("correlation_type", "pl" if spin_polarized else "ca")
+    correlation = _normalize_label(correlation_text)
+    xc_functional = _CORRELATION_LABELS.get(correlation) or _hybrid_label(correlation_text)
     if xc_functional is None:
         raise ParsecInputError(
             f"Correlation_Type={correlation!r} is unknown; PARSEC accepts "
             + ", ".join(sorted(_CORRELATION_LABELS))
+            + "; the hybrid functionals are "
+            + ", ".join(sorted(HYBRID_XC_FUNCTIONALS))
         )
     if xc_functional in UNPOLARIZED_ONLY_XC_FUNCTIONALS and (
         spin_polarized or noncollinear
@@ -2326,6 +2512,7 @@ def _parse_parsec_input(
             "(PARSEC's exc_spn.f90 does not implement it); it cannot be "
             "combined with Spin_Polarization or Non_Collinear_magnetism"
         )
+    exact_exchange = _exact_exchange_settings(scalar, one, xc_functional)
     # Notes of the PARSEC 1.5 keywords (input layer), added to the warnings below.
     input15_notes = list(input15.warnings)
     if correlation == "wb":
@@ -4006,6 +4193,7 @@ def _parse_parsec_input(
         ),
         xc_functional=xc_functional,
         ionization_energy_difference=ionization_energy_difference,
+        **({} if exact_exchange is None else {"exact_exchange": exact_exchange}),
         self_consistent_spin_orbit=self_consistent_spin_orbit
         or (
             noncollinear
@@ -4962,6 +5150,18 @@ def _parse_parsec_input(
         extrapolation=potential_extrapolation,
         grid_shift=tuple(float(value) for value in getattr(grid, "shift", (0.0, 0.0, 0.0))),
     )
+    if scf.is_hybrid:
+        _check_hybrid_request(
+            scf,
+            is_periodic=is_periodic,
+            specifications=specifications,
+            energy_refinement=energy_refinement,
+            embedding=fdet.embedding is not None,
+            polarizability=polarizability,
+            nscf=post_processing.nscf is not None,
+            output_gw=output_gw,
+            bands=band_settings is not None,
+        )
     afm_scan = _afm_scan_settings(
         scalar,
         blocks,

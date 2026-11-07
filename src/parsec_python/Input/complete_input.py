@@ -92,6 +92,13 @@ _RECONSTRUCTED = frozenset(
         "spin_polarization",
         "correlation_type",
         "ion_energy_diff",
+        # the Fock loop of a hybrid Correlation_Type (parsec_input._HYBRID_KEYS)
+        "exact_exchange_fraction",
+        "screening_parameter",
+        "exx_max_iter",
+        "exx_tolerance",
+        "exx_batch_size",
+        "exx_pair_solver",
         "atom_types_num",
         "total_atom_num",
         "add_point_charges",
@@ -421,10 +428,23 @@ def complete_input_text(
         f"Net_Charges  {_number(scf.net_charge)}",
         f"Fermi_Temp  {_number(scf.fermi_temperature_kelvin)}",
         f"Spin_Polarization  {_logical(bool(scf.spin_polarized))}",
-        f"Correlation_Type  {FORTRAN_CORRELATION_CODES[scf.xc_functional]}",
+        f"Correlation_Type  {FORTRAN_CORRELATION_CODES.get(scf.xc_functional, scf.xc_functional)}",
     ]
     if scf.xc_functional == "casida_salahub":
         lines.append(f"Ion_Energy_Diff  {_number(scf.ionization_energy_difference)} Ry")
+    exact_exchange = getattr(scf, "exact_exchange", None)
+    if exact_exchange is not None:
+        # The Fock loop of a hybrid functional (PARSEC.py).
+        if exact_exchange.fraction is not None:
+            lines.append(f"Exact_Exchange_Fraction  {_number(exact_exchange.fraction)}")
+        if exact_exchange.screening is not None:
+            lines.append(f"Screening_Parameter  {_number(exact_exchange.screening)}")
+        lines += [
+            f"Exx_Max_Iter  {int(exact_exchange.max_iterations)}",
+            f"Exx_Tolerance  {_number(exact_exchange.tolerance)} Ry",
+            f"Exx_Batch_Size  {int(exact_exchange.batch_size)}",
+            f"Exx_Pair_Solver  {exact_exchange.pair_solver}",
+        ]
     if problem.point_charges:
         counts = tuple(getattr(translation, "point_charge_type_counts", ())) or (len(problem.point_charges),)
         lines += ["Add_Point_Charges  .true.", f"Point_Typ_Num  {len(counts)}"]

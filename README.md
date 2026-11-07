@@ -490,7 +490,10 @@ Atomic_Energy_Correction: -572.190341 Ry
 
 `Local_Component` is the channel that passed the ghost-state test; do not
 replace it by another one without testing. Use `Correlation_Type: pbe` with
-the potentials of `PBE/` and `Correlation_Type: ca` with those of `CA/`.
+the potentials of `PBE/` and `Correlation_Type: ca` with those of `CA/`; the
+self-consistent hybrid functionals (`pbe0`, `hse06`, `b3lyp`, `hf`, ...; see
+[the package guide](src/parsec_python/README.md#self-consistent-hybrid-functionals))
+read those of `PBE/`.
 
 ### Generating further potentials
 
@@ -1122,7 +1125,7 @@ src/
 │   ├── Pseudopotential/           PARSEC POTRE reader and radial splines
 │   ├── V_ion/                     local potential and nonlocal projectors
 │   ├── Hartree/                   Poisson solve and open-boundary data
-│   ├── V_xc/                      CA/PZ LDA and PBE, also spin-polarized
+│   ├── V_xc/                      LDA, GGA, the hybrids' semilocal parts and exact exchange (ACE)
 │   ├── Hamiltonian/               matrix-free Kohn--Sham operator
 │   ├── Eigensolvers/              PARSEC-style ChebFF/CHEBDAV/subspace code
 │   ├── Occupations/               Fermi level, occupations, and density

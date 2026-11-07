@@ -65,6 +65,10 @@ class AcceleratedPreparedSinglePointSystem:
     # terms on a device (acceleration.Embedding.device_kinetic); ``None``
     # evaluates them on the host (and without FDET).
     kinetic_operators: object | None = None
+    # A hybrid functional: its exact exchange in the device Hamiltonians and
+    # the device pieces of the Fock loop (.hybrid.DeviceExchange); ``None``
+    # without a hybrid.
+    exchange_device: object | None = None
 
     def __getattr__(self, name: str):
         return getattr(self.reference, name)
@@ -92,15 +96,24 @@ class AcceleratedPreparedSinglePointSystem:
 
         return wedge_density_symmetry(group, self.scalar_field_adapter.reduction)
 
-    def hamiltonian(self, effective_potential, hubbard=None) -> BoundHamiltonian:
+    def hamiltonian(self, effective_potential, hubbard=None, exchange=None) -> BoundHamiltonian:
         """Bind ``V_eff``; ``hubbard`` is the LDA+U term of the channel (``plusu.f90z``).
 
         The reference loop passes it from the second iteration on, where
         the system has LDA+U atoms.  The device Hamiltonians hold the term
         (``hubbard_device`` writes its coefficients, zero for ``None``); the
-        CPU backends add it to the bound host Hamiltonian.
+        CPU backends add it to the bound host Hamiltonian.  ``exchange`` is
+        ``a_x V_ACE`` of the channel of a hybrid's inner loop, which
+        ``exchange_device`` writes into the device Hamiltonians (``None``
+        removes it: the semilocal loops of the same devices).
         """
 
+        if self.exchange_device is not None:
+            self.exchange_device.bind(exchange)
+        elif exchange is not None:
+            raise NotImplementedError(
+                "this accelerated system holds no exact-exchange operator in its Hamiltonians"
+            )
         device = self.hubbard_device
         if device is not None:
             return device.hamiltonian(self.backend, effective_potential, hubbard)

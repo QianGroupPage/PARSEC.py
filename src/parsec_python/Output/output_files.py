@@ -30,7 +30,7 @@ from typing import Callable
 
 import numpy as np
 
-from ..models import OutputFileSettings, WavefunctionSelection
+from ..models import ExchangeLoopIteration, OutputFileSettings, WavefunctionSelection
 from .cube import CUBE_FILE_STEMS, grid_data_fields, write_parsec_cube
 from .eigen_dat import (
     EigenDatFile,
@@ -244,6 +244,11 @@ class RunOutputFiles:
         )
 
     def iteration(self, step) -> None:
+        if isinstance(step, ExchangeLoopIteration):
+            # An outer iteration of a hybrid's Fock loop: no levels of its own.
+            # (A spin-polarized record has eigenvalues_up/_down and no
+            # eigenvalues: it is not one.)
+            return
         # A k-point run writes its levels from iteration_fields (all k-points).
         if (
             self._eigen is not None

@@ -311,6 +311,10 @@ class CuPyHamiltonian:
         projection_block_columns: int | None = None,
     ) -> None:
         self.timing_stats = timing_stats or CuPyTimingStats()
+        # The adaptively compressed exchange of a hybrid functional,
+        # ``factor * xi xi^T`` (Hamiltonian.exchange_device); ``None`` without.
+        self.exchange_projectors = None
+        self.exchange_factor = 0.0
 
         def initialize() -> None:
             cp, cpsparse = require_cupy()
@@ -697,6 +701,64 @@ class CuPyHamiltonian:
     def projector_count(self) -> int:
         return self._projector_count
 
+    def bind_exchange(self, projectors: Any | None, factor: float = 0.0) -> None:
+        """Hold ``factor * xi xi^T`` in every application of this operator.
+
+        ``projectors`` is ``xi`` (rows of this operator x rank, float64, on
+        this operator's device), the adaptively compressed exchange of a
+        hybrid functional (``V_ACE = -xi xi^T``, Lin, J. Chem. Theory Comput.
+        12, 2242 (2016)), and ``factor`` is ``-a_x``: the term is
+        ``a_x V_ACE``.  ``None`` removes the term.  :meth:`apply`,
+        :meth:`apply_into` and :meth:`chebyshev_recurrence` add it with two
+        GEMMs; the FP32 recurrence and the fused filter graphs, which the
+        hybrid run does not select, refuse it.
+        """
+
+        if projectors is None:
+            self.exchange_projectors = None
+            self.exchange_factor = 0.0
+            return
+        cp, _ = require_cupy()
+        if (
+            not isinstance(projectors, cp.ndarray)
+            or projectors.ndim != 2
+            or projectors.shape[0] != self.shape[0]
+            or projectors.dtype != cp.dtype(cp.float64)
+        ):
+            raise ValueError(
+                "exchange projectors must be a float64 device array with one row per operator row"
+            )
+        device = getattr(self.effective_potential, "device", None)
+        if device is not None and int(projectors.device.id) != int(device.id):
+            raise ValueError("exchange projectors must be on the device of the operator")
+        self.exchange_projectors = projectors
+        self.exchange_factor = float(factor)
+
+    def _exchange_coefficients(self, block: Any):
+        """``xi^T X`` of a block, or ``None`` without an exchange term."""
+
+        projectors = self.exchange_projectors
+        if projectors is None:
+            return None
+        cp, _ = require_cupy()
+        columns = block[:, None] if block.ndim == 1 else block
+        return cp.matmul(projectors.T, columns)
+
+    def _add_exchange(self, result: Any, coefficients: Any, scale: float = 1.0):
+        """``result += scale * factor * xi C`` (in place where cuBLAS can write it)."""
+
+        if coefficients is None:
+            return result
+        from cupy import cublas
+
+        target = result[:, None] if result.ndim == 1 else result
+        alpha = float(scale) * self.exchange_factor
+        if target.flags.f_contiguous or target.flags.c_contiguous:
+            cublas.gemm("N", "N", self.exchange_projectors, coefficients, target, alpha, 1.0)
+        else:
+            target += alpha * (self.exchange_projectors @ coefficients)
+        return result
+
     def update_local_potential(self, effective_potential: Any) -> None:
         """Upload one new SCF local field while retaining ``A``, ``B``, and state."""
 
@@ -803,6 +865,14 @@ class CuPyHamiltonian:
         self.timing_stats.orbital_vectors_applied += (
             1 if block.ndim == 1 else int(block.shape[1])
         )
+        if self.exchange_projectors is not None:
+            exchange = self._exchange_coefficients(block)
+            return self._add_exchange(self._apply_without_exchange(block), exchange)
+        return self._apply_without_exchange(block)
+
+    def _apply_without_exchange(self, block: Any):
+        """The kinetic, local and KB terms of :meth:`apply`."""
+
         if self.compact_finite_difference is not None and self.fused_projector_scatter:
             coefficients = self._signed_nonlocal_coefficients_or_none(block)
             return self.compact_finite_difference.apply(
@@ -861,6 +931,9 @@ class CuPyHamiltonian:
         self.timing_stats.orbital_vectors_applied += (
             1 if was_vector else int(block.shape[1])
         )
+        # A hybrid's exchange term reads the input, which may share no
+        # memory with the output: its coefficients come first.
+        exchange = self._exchange_coefficients(kernel_block)
         if (
             self.compact_finite_difference is not None
             and self.fused_projector_scatter
@@ -875,6 +948,7 @@ class CuPyHamiltonian:
                 projector_coefficients=coefficients,
                 output=kernel_target,
             )
+            self._add_exchange(kernel_target, exchange)
             return target
 
         # Exact compatibility fallback for optional compact/generic paths
@@ -895,6 +969,7 @@ class CuPyHamiltonian:
         if nonlocal_values is not None:
             result += nonlocal_values
         kernel_target[...] = result
+        self._add_exchange(kernel_target, exchange)
         return target
 
     def chebyshev_recurrence(
@@ -936,12 +1011,56 @@ class CuPyHamiltonian:
         else:
             previous_block = None
 
+        if self.exchange_projectors is not None:
+            # The exchange term of a hybrid: H X - c X with the term, then
+            # ``sigma_next * (scale * (...) - sigma * previous)``.
+            exchange = self._exchange_coefficients(block)
+            result = self.chebyshev_recurrence_without_exchange(
+                block,
+                center=center,
+                scale=scale,
+                sigma_next=sigma_next,
+                previous=previous_block,
+                sigma=sigma,
+            )
+            return self._add_exchange(
+                result, exchange, float(sigma_next) * float(scale)
+            )
+        return self.chebyshev_recurrence_without_exchange(
+            block,
+            center=center,
+            scale=scale,
+            sigma_next=sigma_next,
+            previous=previous_block,
+            sigma=sigma,
+        )
+
+    def chebyshev_recurrence_without_exchange(
+        self,
+        block: Any,
+        *,
+        center: float,
+        scale: float,
+        sigma_next: float = 1.0,
+        previous: Any | None = None,
+        sigma: float = 0.0,
+    ):
+        """:meth:`chebyshev_recurrence` of the kinetic, local and KB terms."""
+
+        previous_block = previous
         selected = self.compact_finite_difference
         fused = getattr(selected, "chebyshev_recurrence", None)
         if fused is None or (
             self.projector_count and not self.fused_projector_scatter
         ):
-            applied = self.apply(block)
+            if self.exchange_projectors is None:
+                applied = self.apply(block)
+            else:
+                self.timing_stats.hamiltonian_applications += 1
+                self.timing_stats.orbital_vectors_applied += (
+                    1 if block.ndim == 1 else int(block.shape[1])
+                )
+                applied = self._apply_without_exchange(block)
             result = (applied - float(center) * block) * float(scale)
             if previous_block is not None:
                 result -= float(sigma) * previous_block
@@ -985,6 +1104,10 @@ class CuPyHamiltonian:
         recurrence = self.mixed_precision_recurrence
         if recurrence is None:
             raise RuntimeError("mixed-precision filtering is unavailable")
+        if self.exchange_projectors is not None:
+            raise RuntimeError(
+                "the FP32 filter does not hold the exchange operator of a hybrid functional"
+            )
         cp, _ = require_cupy()
         block = cp.asarray(current, dtype=cp.float32)
         self.timing_stats.hamiltonian_applications += 1

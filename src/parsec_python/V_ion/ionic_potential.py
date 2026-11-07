@@ -60,6 +60,7 @@ def load_pseudopotentials(
     specifications: Mapping[str, SpeciesPotential],
     *,
     xc_functional: str = "ca",
+    check_correlation: bool = True,
 ) -> dict[str, ParsecPseudopotential]:
     """Read and validate one PARSEC pseudopotential per chemical species.
 
@@ -90,9 +91,15 @@ def load_pseudopotentials(
     valence/core densities, and the ionic valence charge ``Z_ion``.
     Checking the correlation label validates how the file was generated; this
     function does not itself evaluate an exchange-correlation functional.
+    A hybrid functional reads the files of its semilocal family
+    (:func:`hybrid_pseudopotential_labels`: PBE, for B3PW91 also PW91): a CA
+    file is used with a warning, as in a PBE run, any other is refused.
+    ``check_correlation=False`` reads the files without that check (the input
+    reader makes it itself, to refuse by name before the run).
     """
     result: dict[str, ParsecPseudopotential] = {}
-    requested = xc_functional.strip().lower()
+    hybrid_labels = hybrid_pseudopotential_labels(xc_functional.strip().lower())
+    requested = pseudopotential_functional(xc_functional.strip().lower())
     if requested not in _REQUIRED_PSEUDOPOTENTIAL_LABELS and (
         requested not in _EXPECTED_PSEUDOPOTENTIAL_LABELS
     ):
@@ -166,7 +173,23 @@ def load_pseudopotentials(
                 f"does not contain spin-orbit potentials (relativity="
                 f"{potential.relativity!r})"
             )
-        if not pseudopotential_matches_functional(potential, requested):
+        if not check_correlation:
+            pass
+        elif hybrid_labels is not None:
+            if not pseudopotential_matches_functional(potential, xc_functional.strip().lower()):
+                label = potential.correlation.strip().lower()
+                if label not in _CA_LABELS:
+                    raise ValueError(hybrid_pseudopotential_refusal(
+                        symbol, specification.path, label, xc_functional.strip().lower()
+                    ))
+                warnings.warn(
+                    f"{specification.path} was generated for {potential.correlation!r}, not for "
+                    f"{hybrid_pseudopotential_family(xc_functional.strip().lower())}, the "
+                    f"pseudopotentials of the hybrid {xc_functional}; it is used, as a PBE run uses it",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        elif not pseudopotential_matches_functional(potential, requested):
             if requested in _REQUIRED_PSEUDOPOTENTIAL_LABELS and not (
                 requested == "pbe" and potential.correlation.strip().lower() in _CA_LABELS
             ):
@@ -225,6 +248,58 @@ _EXPECTED_PSEUDOPOTENTIAL_LABELS = {
 }
 
 
+def pseudopotential_functional(xc_functional: str) -> str:
+    """The functional whose pseudopotentials a calculation reads.
+
+    A hybrid functional (``parsec_python.SCF.hybrid``) reads PBE
+    pseudopotentials, as Quantum ESPRESSO's hybrid runs usually do: there are
+    no hybrid norm-conserving pseudopotentials in the libraries of this code
+    (B3PW91 also takes PW91 files, :func:`hybrid_pseudopotential_labels`).
+    Every other functional reads its own.
+    """
+
+    from ..models import HYBRID_XC_FUNCTIONALS
+
+    return "pbe" if xc_functional in HYBRID_XC_FUNCTIONALS else xc_functional
+
+
+#: The correlation labels of the files each hybrid reads beyond PBE's: its semilocal family.
+_HYBRID_EXTRA_LABELS = {"b3pw91": frozenset({"pw", "pw91", "pwgga"})}
+
+
+def hybrid_pseudopotential_labels(xc_functional: str) -> frozenset | None:
+    """The correlation labels of the pseudopotentials a hybrid reads, ``None`` for another functional.
+
+    PBE files (``pb``, ``pbe``) for every hybrid; B3PW91 also PW91 files
+    (``pw``, ``pw91``, ``pwgga``), the semilocal parent of its correlation.
+    A CA file is used with a warning (as in a PBE run); any other label is
+    refused, by the input reader before the run.
+    """
+
+    from ..models import HYBRID_XC_FUNCTIONALS
+
+    if xc_functional not in HYBRID_XC_FUNCTIONALS:
+        return None
+    return _REQUIRED_PSEUDOPOTENTIAL_LABELS["pbe"] | _HYBRID_EXTRA_LABELS.get(xc_functional, frozenset())
+
+
+def hybrid_pseudopotential_family(xc_functional: str) -> str:
+    """Name of the pseudopotentials a hybrid reads (``"PBE"`` or ``"PBE or PW91"``)."""
+
+    return "PBE or PW91" if xc_functional in _HYBRID_EXTRA_LABELS else "PBE"
+
+
+def hybrid_pseudopotential_refusal(symbol: str, path, label: str, xc_functional: str) -> str:
+    """The message that refuses a file of another functional under a hybrid."""
+
+    labels = ", ".join(sorted(hybrid_pseudopotential_labels(xc_functional) or ()))
+    return (
+        f"Atom_Type {symbol}: {path} was generated for {label!r}; a {xc_functional} run reads "
+        f"{hybrid_pseudopotential_family(xc_functional)} pseudopotentials (labels {labels}; a CA "
+        "file is used with a warning)"
+    )
+
+
 def pseudopotential_matches_functional(
     potential: ParsecPseudopotential, xc_functional: str
 ) -> bool:
@@ -233,9 +308,12 @@ def pseudopotential_matches_functional(
     An old Martins file names no functional and matches every one.
     """
 
-    labels = _REQUIRED_PSEUDOPOTENTIAL_LABELS.get(
-        xc_functional, _EXPECTED_PSEUDOPOTENTIAL_LABELS.get(xc_functional)
-    )
+    labels = hybrid_pseudopotential_labels(xc_functional)
+    if labels is None:
+        xc_functional = pseudopotential_functional(xc_functional)
+        labels = _REQUIRED_PSEUDOPOTENTIAL_LABELS.get(
+            xc_functional, _EXPECTED_PSEUDOPOTENTIAL_LABELS.get(xc_functional)
+        )
     if labels is None:
         raise ValueError(f"unsupported XC functional {xc_functional!r}")
     correlation = getattr(potential, "correlation", None)

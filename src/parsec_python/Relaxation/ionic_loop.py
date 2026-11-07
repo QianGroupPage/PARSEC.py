@@ -405,11 +405,16 @@ def _relaxation_loop(
         # views of it held by the result of this structure would only pin
         # device memory.  The result of the last structure keeps its own.
         update_started = time.perf_counter()
-        release_orbitals(result)
+        # A hybrid functional's warm start reads them: they go after it.
+        hybrid = getattr(result, "exact_exchange", None) is not None
+        if not hybrid:
+            release_orbitals(result)
         moved_system = backend.update_geometry(system, atoms)
         carried = (
             backend.warm_start(system, result, moved_system) if warm_start else None
         )
+        if hybrid:
+            release_orbitals(result)
         if filter_restart is not None:
             # Filter_Restart_After (PARSEC 1.5, parsec.F90:2944-3026).
             carried, _reset = filter_restart.warm_start_after_move(

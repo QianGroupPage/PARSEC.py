@@ -2383,6 +2383,8 @@ def prepare_single_point(
     every thread began and ended.
     """
 
+    if getattr(getattr(problem, "scf", None), "is_hybrid", False):
+        _refuse_hybrid_routes(problem, backend=backend, mpi_context=mpi_context)
     preparation = _Preparation()
     try:
         return _prepare_single_point(
@@ -2397,6 +2399,173 @@ def prepare_single_point(
         # A preparation that returns has joined its threads where it read
         # their results; one that raises may have left some running.
         preparation.close()
+
+
+
+def _refuse_hybrid_routes(problem, *, backend, mpi_context) -> None:
+    """Refuse the routes of a hybrid functional that the device exchange does not cover.
+
+    The device Fock loop (SCF/hybrid.py) runs isolated systems in one
+    process on the GPUs of one node, unpolarized and spin-polarized, on the
+    full grid or in the symmetry sectors with one device per sector basis.
+    """
+
+    label = problem.scf.xc_functional
+    if mpi_context is not None:
+        raise NotImplementedError(
+            f"the self-consistent hybrid functional {label!r} is not implemented for the "
+            "MPI SCF of several ranks or nodes; run it in one process on one node "
+            "(--serial-control), which uses all GPUs of that node"
+        )
+    if str(backend).lower() not in ("auto", "cupy"):
+        raise NotImplementedError(
+            f"the self-consistent hybrid functional {label!r} runs on the CuPy backend of the "
+            "accelerated path; use --backend auto or cupy, or the reference solver "
+            "(reference_main.py)"
+        )
+    settings = getattr(problem.scf, "exact_exchange", None)
+    if getattr(settings, "pair_solver", "kronecker") != "kronecker":
+        raise NotImplementedError(
+            "the device exchange operator solves the pair densities with the Kronecker "
+            "solver only (Exx_Pair_Solver: kronecker); Exx_Pair_Solver: cg runs on the "
+            "reference solver (reference_main.py)"
+        )
+    for name, refused, reason in (
+        (
+            "PARSEC_CUPY_DISTRIBUTED_FILTER",
+            {"1"},
+            "a filter spread over several devices does not hold the exchange operator",
+        ),
+        (
+            "PARSEC_CUPY_RITZ_HANDOVER",
+            {"triangular"},
+            "the exchange operator is built from Ritz vectors",
+        ),
+        (
+            "PARSEC_CUPY_MIXED_FILTER",
+            {"on"},
+            "the FP32 filter does not hold the exchange operator",
+        ),
+    ):
+        if os.environ.get(name, "").strip().lower() in refused:
+            raise NotImplementedError(
+                f"{name}={os.environ[name]} is not implemented with the self-consistent hybrid "
+                f"functional {label!r}: {reason}"
+            )
+
+
+def _hybrid_xc_evaluators(reference, *, backend, reducer, device_id, core_density):
+    """``(unpolarized, spin, (start unpolarized, start spin))`` evaluators of a hybrid.
+
+    The semilocal part of the hybrid on the device where
+    :func:`.V_xc.device_hybrid_xc.device_hybrid_supported` allows it, and
+    the start functional of the Fock loop where ``PARSEC_CUPY_XC`` puts it on
+    the device (:func:`.V_xc.accelerated_xc_evaluators`); ``None`` entries
+    keep the host functionals of the reference system.
+    """
+
+    from types import SimpleNamespace
+
+    from parsec_python.SCF.hybrid import hybrid_definition, hybrid_functional_of
+
+    from .V_xc import accelerated_xc_evaluators, device_xc_mode
+
+    scf = reference.input.scf
+    spin = bool(getattr(scf, "spin_polarized", False))
+    unpolarized = spin_evaluator = None
+    if backend == "cupy" and device_xc_mode() != "off":
+        from .V_xc.device_hybrid_xc import (
+            DeviceHybridXCEvaluator,
+            DeviceSpinHybridXCEvaluator,
+            device_hybrid_supported,
+        )
+
+        functional = hybrid_functional_of(scf)
+        if device_hybrid_supported(functional, reference.grid):
+            if spin:
+                spin_evaluator = DeviceSpinHybridXCEvaluator(
+                    functional, reference.grid, core_density=core_density, device_id=device_id
+                )
+            else:
+                unpolarized = DeviceHybridXCEvaluator(
+                    functional,
+                    reference.grid,
+                    core_density=core_density,
+                    reducer=reducer,
+                    device_id=device_id,
+                )
+    start_scf = replace(
+        scf, xc_functional=hybrid_definition(scf).start_functional, exact_exchange=None
+    )
+    start_reference = SimpleNamespace(
+        input=replace(reference.input, scf=start_scf),
+        grid=reference.grid,
+        core_density=reference.core_density,
+    )
+    start = accelerated_xc_evaluators(
+        start_reference,
+        backend=backend,
+        reducer=reducer,
+        device_id=device_id,
+        core_density=core_density,
+    )
+    return unpolarized, spin_evaluator, start
+
+
+def _count_hybrid_device_bytes(sectors, exchange_device, reference, xc_evaluator, start_xc) -> None:
+    """Hand the device bytes of a hybrid to the memory rules of the sectors (``resident_device_bytes``)."""
+
+    from parsec_python.SCF.hybrid import hybrid_definition
+    from parsec_python.SCF.single_point import _number_of_states
+
+    counts = dict(sectors.resident_device_bytes)
+    for evaluator in (xc_evaluator, *start_xc):
+        planned = getattr(evaluator, "planned_device_bytes", None)
+        device = getattr(evaluator, "device_id", None)
+        if planned is not None and device is not None:
+            counts[int(device)] = counts.get(int(device), 0) + int(planned)
+    planned = exchange_device.planned_device_bytes(
+        reference, hybrid_definition(reference.input.scf), _number_of_states(reference)
+    )
+    for device, count in planned.items():
+        counts[int(device)] = counts.get(int(device), 0) + int(count)
+    exchange_device.planned_bytes = planned
+    sectors.resident_device_bytes = counts
+
+
+def _start_xc_with_reducer(start_xc, reference_of, reducer):
+    """The start evaluators of a hybrid's Fock loop, the host ones on the wedge too.
+
+    A missing unpolarized device evaluator of a symmetry-reduced loop is the
+    reference start functional on the full grid with the wedge fields of the
+    loop, as the driver gives every host functional; ``None`` elsewhere (the
+    reference system's own functional).  ``reference_of()`` returns the
+    reference system of the present structure: an ionic move replaces it,
+    and with it the frozen core density the start functional reads.
+    """
+
+    unpolarized, spin = start_xc
+    if unpolarized is not None or reducer is None:
+        return (unpolarized, spin)
+    from parsec_python.SCF.hybrid import hybrid_definition
+    from parsec_python.V_xc import XCResult
+
+    def start_xc_evaluator(density):
+        reference = reference_of()
+        scf = reference.input.scf
+        start_scf = replace(
+            scf, xc_functional=hybrid_definition(scf).start_functional, exact_exchange=None
+        )
+        start_reference = replace(reference, input=replace(reference.input, scf=start_scf))
+        evaluated = start_reference.evaluate_xc(reducer.to_full(density))
+        return XCResult(
+            potential=reducer.from_full(evaluated.potential),
+            energy_per_electron=reducer.from_full(evaluated.energy_per_electron),
+            energy_density=reducer.from_full(evaluated.energy_density),
+            total_energy=evaluated.total_energy,
+        )
+
+    return (start_xc_evaluator, spin)
 
 
 def _prepare_single_point(
@@ -2997,7 +3166,20 @@ def _prepare_single_point(
             )
 
     spin_xc_evaluator = None
-    if native_xc_evaluator is None:
+    # A hybrid functional: the semilocal part of the hybrid and the start
+    # functional of its Fock loop (V_xc/device_hybrid_xc.py, device_xc.py).
+    hybrid_start_xc = (None, None)
+    if native_xc_evaluator is None and getattr(
+        getattr(getattr(reference, "input", None), "scf", None), "is_hybrid", False
+    ):
+        native_xc_evaluator, spin_xc_evaluator, hybrid_start_xc = _hybrid_xc_evaluators(
+            reference,
+            backend=selection.selected,
+            reducer=scf_reducer,
+            device_id=hartree_device,
+            core_density=lambda: reference.core_density,
+        )
+    elif native_xc_evaluator is None:
         # The other functionals on the device where PARSEC_CUPY_XC puts them
         # there (V_xc/device_xc.py); None leaves them to the host below.
         from .V_xc import accelerated_xc_evaluators
@@ -4377,6 +4559,25 @@ def _prepare_single_point(
         from .Energy import device_dispersion_correction
 
         dispersion_device = device_dispersion_correction
+    # A hybrid functional: its exact exchange in the device Hamiltonians.
+    from .SCF.hybrid import device_exchange_for
+
+    exchange_device = device_exchange_for(
+        reference,
+        implementation,
+        symmetry_eigensolver,
+        selected_backend=selection.selected,
+        # The structure of the present atoms (move_atoms rebinds it).
+        start_xc=_start_xc_with_reducer(hybrid_start_xc, lambda: reference, scf_reducer),
+    )
+    if exchange_device is not None and symmetry_eigensolver is not None:
+        # The memory rules of the sectors count what the hybrid keeps on the
+        # devices: its device XC evaluators and the exchange (xi, the
+        # expansions, the Kronecker plans and the tile work), so that the
+        # sector states are spilled where they and the exchange do not fit.
+        _count_hybrid_device_bytes(
+            symmetry_eigensolver, exchange_device, reference, native_xc_evaluator, hybrid_start_xc
+        )
 
     return AcceleratedPreparedSinglePointSystem(
         reference=reference,
@@ -4411,6 +4612,7 @@ def _prepare_single_point(
         scalar_field_adapter=scf_reducer,
         hubbard_device=hubbard_device,
         dispersion_device=dispersion_device,
+        exchange_device=exchange_device,
         **_fdet_kinetic_operators(reference, selection.selected, hartree_device),
     )
 
@@ -4586,6 +4788,13 @@ def warm_start_for_moved_atoms(
     from parsec_python.SCF.single_point import extrapolated_warm_start
 
     warm_start = _parsec_warm_start(previous_system, previous_result, system)
+    exchange_device = getattr(system, "exchange_device", None)
+    if exchange_device is not None and getattr(previous_result, "exact_exchange", None) is not None:
+        # A hybrid functional: the orbitals before the move, where the
+        # eigensolvers keep them, build the first exchange operator.
+        warm_start = replace(
+            warm_start, exchange_orbitals=exchange_device.orbital_sets(previous_result)
+        )
     if getattr(system, "embedding", None) is not None:
         # FDET of PARSEC 1.5 (parsec_python.Embedding.warm_start): a translation
         # moves the subspace the device eigensolver keeps.

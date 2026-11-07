@@ -50,12 +50,18 @@ class KohnShamHamiltonian:
     (:class:`parsec_python.Hamiltonian.hubbard.HubbardOperator`,
     ``plusu.f90z``), ``None`` without LDA+U or while its potential matrix is
     still zero; it is a fourth low-rank term of :meth:`apply`.
+
+    ``exchange`` is the exact-exchange term ``a_x V_ACE`` of a hybrid
+    functional (:class:`parsec_python.V_xc.exchange_operator.CompressedExchange`
+    of the channel being solved, built from the orbitals of the outer Fock
+    iteration before), ``None`` otherwise; a fifth low-rank term.
     """
 
     negative_laplacian: sp.csr_matrix
     effective_potential: np.ndarray
     nonlocal_operator: NonlocalProjectorOperator
     hubbard: object | None = None
+    exchange: object | None = None
 
     def __post_init__(self) -> None:
         # This class intentionally represents PARSEC's real scalar path.  The
@@ -71,6 +77,8 @@ class KohnShamHamiltonian:
             raise ValueError("nonlocal operator does not match the kinetic operator")
         if self.hubbard is not None and tuple(self.hubbard.shape) != (size, size):
             raise ValueError("LDA+U term does not match the kinetic operator")
+        if self.exchange is not None and tuple(self.exchange.shape) != (size, size):
+            raise ValueError("exact-exchange term does not match the kinetic operator")
         object.__setattr__(self, "effective_potential", potential)
 
     @property
@@ -105,6 +113,8 @@ class KohnShamHamiltonian:
         )
         if self.hubbard is not None:
             result = result + self.hubbard.apply(vectors)
+        if self.exchange is not None:
+            result = result + self.exchange.apply(vectors)
         return result
 
     def as_linear_operator(self) -> "LinearOperator":
@@ -138,4 +148,6 @@ class KohnShamHamiltonian:
         )
         if self.hubbard is not None:
             matrix = matrix + self.hubbard.as_sparse()
+        if self.exchange is not None:
+            matrix = matrix + self.exchange.as_sparse()
         return matrix.tocsr()

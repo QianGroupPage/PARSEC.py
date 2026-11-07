@@ -188,7 +188,10 @@ class PreparedSinglePointSystem:
         return None if tail is None else tail.maximum
 
     def hamiltonian(
-        self, effective_potential: np.ndarray, hubbard: object | None = None
+        self,
+        effective_potential: np.ndarray,
+        hubbard: object | None = None,
+        exchange: object | None = None,
     ) -> KohnShamHamiltonian:
         """Compose the current SCF Hamiltonian without forming a dense matrix.
 
@@ -201,8 +204,18 @@ class PreparedSinglePointSystem:
 
         ``H = -nabla_FD^2 + diag(V_eff) + V_NL``,
 
-        plus the LDA+U term ``hubbard`` of the channel where it is given.
+        plus the LDA+U term ``hubbard`` of the channel where it is given and
+        the exact-exchange term ``a_x V_ACE`` of a hybrid functional
+        (``exchange``, :mod:`parsec_python.SCF.hybrid`).
         """
+        if exchange is not None:
+            return KohnShamHamiltonian(
+                self.negative_laplacian,
+                effective_potential,
+                self.nonlocal_operator,
+                hubbard,
+                exchange,
+            )
         if hubbard is None:
             return KohnShamHamiltonian(
                 self.negative_laplacian,
@@ -250,8 +263,17 @@ class PreparedSinglePointSystem:
         )
 
     def evaluate_xc(self, density: np.ndarray) -> XCResult:
-        """Evaluate the selected XC functional including frozen NLCC."""
+        """Evaluate the selected XC functional including frozen NLCC.
 
+        For a hybrid functional this is its semilocal part (the reduced
+        semilocal exchange and the correlation); the exact exchange is the
+        operator of :mod:`parsec_python.SCF.hybrid`.
+        """
+
+        if getattr(self.input.scf, "is_hybrid", False):
+            from .hybrid import scf_semilocal_xc
+
+            return scf_semilocal_xc(self.input.scf, density, self.grid, self.core_density)
         if self.input.scf.xc_functional == "ca":
             return ca_lda(density, self.grid.volume_element, self.core_density)
         if self.input.scf.xc_functional == "pbe":
@@ -269,6 +291,10 @@ class PreparedSinglePointSystem:
     ) -> SpinPolarizedXCResult:
         """Collinear spin-polarized XC (LSDA or PBE) including frozen NLCC."""
 
+        if getattr(self.input.scf, "is_hybrid", False):
+            return as_spin_polarized_result(
+                self.evaluate_spin_xc(density_up, density_down)
+            )
         functional = self.input.scf.xc_functional
         if functional == "ca":
             return ca_lda_spin_polarized(
@@ -304,9 +330,16 @@ class PreparedSinglePointSystem:
         """Evaluate the selected spin-polarized XC functional.
 
         Each channel sees its valence density plus half of the frozen NLCC
-        density (``rho_hart.F90``).
+        density (``rho_hart.F90``).  For a hybrid functional, its semilocal
+        part.
         """
 
+        if getattr(self.input.scf, "is_hybrid", False):
+            from .hybrid import scf_semilocal_spin_xc
+
+            return scf_semilocal_spin_xc(
+                self.input.scf, density_up, density_down, self.grid, self.core_density
+            )
         if self.input.scf.xc_functional == "ca":
             return ca_lda_spin(
                 density_up, density_down, self.grid.volume_element, self.core_density
@@ -357,6 +390,11 @@ class SCFWarmStart:
     close to the one of the moved atoms while the saved orbitals still belong
     to the old structure; one stronger filter lets them catch up before the
     mixer sees their density.
+
+    ``exchange_orbitals`` are, for a hybrid functional, the orbitals of the
+    structure before (one :class:`parsec_python.SCF.hybrid.OrbitalSet` per
+    spin channel set): the first exchange operator of the Fock loop is built
+    from them instead of a semilocal start.  ``None`` otherwise.
     """
 
     input_potential: np.ndarray
@@ -365,6 +403,7 @@ class SCFWarmStart:
     density_guess: np.ndarray | None = None
     hxc_reference: np.ndarray | None = None
     first_iteration_degree: int | None = None
+    exchange_orbitals: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -579,6 +618,13 @@ def warm_start_for_moved_atoms(
     """
 
     warm_start = _parsec_warm_start(previous_system, previous_result, system)
+    if getattr(previous_result, "exact_exchange", None) is not None:
+        # A hybrid functional: the orbitals before the move start the Fock loop.
+        from .hybrid import exchange_start_orbitals
+
+        warm_start = replace(
+            warm_start, exchange_orbitals=exchange_start_orbitals(previous_result)
+        )
     if getattr(system, "embedding", None) is not None:
         # FDET of PARSEC 1.5: translation by whole grid steps, or the tip sphere
         # (parsec_python.Embedding.warm_start); FDET takes no extrapolation.
@@ -1746,6 +1792,25 @@ def eigval_settings_for(
     )
 
 
+def refuse_exchange_hooks(**hooks) -> None:
+    """Stop an SCF loop that would leave out the exchange operator of a hybrid.
+
+    The operator joins the Hamiltonian of :meth:`PreparedSinglePointSystem.hamiltonian`
+    and reads the full-grid host orbitals of every iteration; an execution
+    backend that applies a Hamiltonian of its own (or keeps fields on a
+    symmetry wedge) would drop it, unless the system holds the operator in
+    its device Hamiltonians (``exchange_device`` of the accelerated systems,
+    :mod:`parsec_python.acceleration.SCF.hybrid`).
+    """
+
+    given = sorted(name for name, hook in hooks.items() if hook is not None)
+    if given:
+        raise NotImplementedError(
+            "self-consistent hybrid functionals run on the reference SCF path only; "
+            f"the execution hooks {', '.join(given)} would drop the exact-exchange operator"
+        )
+
+
 def refuse_hubbard_and_dispersion(system, driver: str, *, dispersion: bool = True) -> None:
     """Stop a driver that has neither the LDA+U term nor the TS correction.
 
@@ -1857,6 +1922,7 @@ def run_scf(
     warm_start: SCFWarmStart | None = None,
     convergence_criterion: float | None = None,
     iteration_state_callback: Callable[[SCFIterationFields], None] | None = None,
+    exchange_term: object | None = None,
 ) -> SinglePointResult:
     """Run PARSEC-style potential mixing on a prepared system.
 
@@ -1890,7 +1956,41 @@ def run_scf(
     the non-additive kinetic potential ``v_nad`` of the iteration
     (:mod:`parsec_python.Embedding.frozen_density`); the energies are the
     FDET energies of ``totnrg.f90``.
+
+    A hybrid ``Correlation_Type`` (``system.input.scf.is_hybrid``) runs the
+    Fock loop of :func:`parsec_python.SCF.hybrid.run_hybrid_scf`, whose inner
+    loops come back here with ``exchange_term``: the fixed exact-exchange
+    operator of the loop (:class:`parsec_python.SCF.hybrid.FockOperator`).
+    It joins every Hamiltonian of the loop, ``H = H[V_in] + a_x V_ACE``, and
+    the energies of every iteration (:meth:`FockOperator.iteration_energies`).
     """
+    if exchange_term is None and getattr(system.input.scf, "is_hybrid", False):
+        from .hybrid import run_hybrid_scf
+
+        return run_hybrid_scf(
+            system,
+            callback=callback,
+            eigenproblem_solver=eigenproblem_solver,
+            orbital_density_builder=orbital_density_builder,
+            mixer_factory=mixer_factory,
+            residual_metrics_evaluator=residual_metrics_evaluator,
+            total_energy_evaluator=total_energy_evaluator,
+            scalar_field_adapter=scalar_field_adapter,
+            warm_start=warm_start,
+            convergence_criterion=convergence_criterion,
+            iteration_state_callback=iteration_state_callback,
+        )
+    if exchange_term is not None and getattr(system, "exchange_device", None) is None:
+        # An accelerated system whose device Hamiltonians hold the operator
+        # (acceleration.SCF.hybrid) takes its hooks along.
+        refuse_exchange_hooks(
+            eigenproblem_solver=eigenproblem_solver,
+            orbital_density_builder=orbital_density_builder,
+            mixer_factory=mixer_factory,
+            residual_metrics_evaluator=residual_metrics_evaluator,
+            total_energy_evaluator=total_energy_evaluator,
+            scalar_field_adapter=scalar_field_adapter,
+        )
     embedding = getattr(system, "embedding", None)
     if embedding is not None and (
         getattr(system.input.scf, "spin_polarized", False) or scalar_field_adapter is not None
@@ -1917,6 +2017,7 @@ def run_scf(
                 if iteration_state_callback is None
                 else {"iteration_state_callback": iteration_state_callback}
             ),
+            **({} if exchange_term is None else {"exchange_term": exchange_term}),
         )
     scf_start = time.perf_counter()
     # The validated reference path always selects ``solve_eigval`` here.  The
@@ -2128,8 +2229,13 @@ def run_scf(
         # KB terms; LinearOperator routes all Lanczos and Chebyshev H@Q calls
         # through that same three-term action.
         binding_start = time.perf_counter()
-        if hubbard_projectors is None:
+        if hubbard_projectors is None and exchange_term is None:
             hamiltonian = system.hamiltonian(input_potential)
+        elif hubbard_projectors is None:
+            # A hybrid functional: the fixed exchange operator of the loop.
+            hamiltonian = system.hamiltonian(
+                input_potential, None, exchange_term.operator(0)
+            )
         else:
             if iteration > 1:
                 # calcden.f90z: N and D from the orbitals and occupations of
@@ -2311,6 +2417,12 @@ def run_scf(
             # totnrg.f90:159-197: the FDET energy of tip and sample.
             energies = embedding_energies(
                 energies, embedding, density, ionic_potential, nonadditive, system.grid.volume_element
+            )
+        if exchange_term is not None:
+            # The exchange operator's part of the band energy is removed and
+            # the exact exchange of the functional this loop minimizes added.
+            energies = exchange_term.iteration_energies(
+                energies, (wavefunctions,), (occupations,)
             )
         # 7. Mix the effective potential and apply PARSEC's SCF stop test.
         # Only V_eff is mixed.  T, V_NL, and the fixed local ionic component

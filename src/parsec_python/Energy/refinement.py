@@ -82,11 +82,22 @@ def check_refinement_request(
     *,
     periodic: bool,
     molecular_dynamics: bool,
+    hybrid: bool = False,
 ) -> None:
-    """Refuse a refinement the calculation cannot give; ``None`` is always fine."""
+    """Refuse a refinement the calculation cannot give; ``None`` is always fine.
+
+    ``hybrid``: the SCF functional is a self-consistent hybrid
+    (:mod:`parsec_python.SCF.hybrid`), refused as the input reader refuses
+    ``Energy_Refinement`` with it.
+    """
 
     if functional is None:
         return
+    if hybrid:
+        raise ValueError(
+            "Energy_Refinement is not implemented together with a self-consistent hybrid "
+            "Correlation_Type (the hybrid is already self-consistent)"
+        )
     if periodic:
         raise ValueError(
             "Energy_Refinement is implemented for isolated systems "
@@ -117,6 +128,7 @@ def apply_refinement_option(translation, option: str | None):
         functional,
         periodic=translation.problem.periodic_cell is not None,
         molecular_dynamics=translation.molecular_dynamics is not None,
+        hybrid=bool(getattr(translation.problem.scf, "is_hybrid", False)),
     )
     return replace(translation, energy_refinement=functional)
 

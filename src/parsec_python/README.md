@@ -160,6 +160,11 @@ Currently supported:
 - LDA+U of the d channel (`ldaplusu_u`, `ldaplusu_j` per species) and the
   Tkatchenko--Scheffler dispersion correction (`Van_Der_Waals`), see
   [LDA+U and the TS dispersion correction](#ldau-and-the-ts-dispersion-correction);
+- self-consistent hybrid functionals of isolated systems (HF, PBE0, PBEh,
+  HSE06, HSE03, B3LYP, B3LYP5, B3PW91, LC-wPBE, CAM-B3LYP), unpolarized and
+  spin-polarized, with forces, relaxation and molecular dynamics, on the CPU
+  and on the GPUs of one node, see
+  [Self-consistent hybrid functionals](#self-consistent-hybrid-functionals);
 - one post-SCF evaluation of the B3LYP energy on the converged orbitals of an
   isolated system (`Energy_Refinement: b3lyp`), see
   [Energy refinement by a hybrid functional](#energy-refinement-by-a-hybrid-functional);
@@ -239,13 +244,13 @@ Currently supported:
 
 Not currently supported as production physics:
 
-- periodic boundary conditions;
-- spin polarization of periodic cells, spin--orbit coupling and
-  non-collinear magnetism;
 - forces, relaxation and molecular dynamics of the perturbative spin-orbit correction (`SO_PSP` without `SO_from_scratch`), of
   spin-polarized periodic cells with k-points, of spin-polarized periodic cells and spin-orbit or non-collinear inputs on
-  the accelerated path, and of periodic k-point cells on several nodes;
-- self-consistent hybrid functionals, meta-GGA functionals and DFT+U;
+  the accelerated path (`main.py` hands them to the readable solver), and of periodic cells and non-collinear inputs on
+  several nodes (`--mpi`);
+- hybrid functionals of periodic cells and on several nodes (`--mpi`),
+  meta-GGA functionals, and DFT+U beyond PARSEC's LDA+U of the d channel
+  (other channels or forms);
 - PARSEC restart files other than `relax_restart.dat` and `mdinit.dat`;
 - Ono--Hirose double-grid order greater than one.
 - With `Use_Fortran_Routines: .true.` (and for the inputs that run on those routines by default - slabs, shifted bulk grids, forces of a bulk cell at the
@@ -254,7 +259,7 @@ Not currently supported as production physics:
   `Input/routines.py`), the Fortran-derived routines:
   - forces with the perturbative spin-orbit correction (`SO_PSP` without
     `SO_from_scratch`);
-  - self-consistent hybrid functionals and meta-GGA functionals;
+  - hybrid functionals of periodic cells and meta-GGA functionals;
   - PARSEC restart files other than `relax_restart.dat` and `mdinit.dat`.
 
 Unsupported requested input is rejected rather than silently approximated.
@@ -590,6 +595,220 @@ density and the exact exchange the valence orbitals, a combination that no
 reference has checked. The refined energy is not variational and follows
 the error of the density to first order. Example, validation against ARES
 and timings: [`examples/0_CH4_CF4/python_pbe_b3lyp`](../../examples/0_CH4_CF4/python_pbe_b3lyp/README.md).
+With a hybrid `Correlation_Type` the refinement is refused (the functional is
+then self-consistent, see the next section).
+
+## Self-consistent hybrid functionals
+
+```text
+Correlation_Type: pbe0
+```
+
+runs a generalized Kohn-Sham SCF with a nonlocal exact-exchange operator for
+an isolated system (`Boundary_Conditions: cluster`, sphere or box domain),
+spin-unpolarized or with collinear spin (`Spin_Polarization: true`, also with
+the occupations of `occup.in`), with forces, structural relaxation and
+molecular dynamics. The functional is
+
+```text
+E_xc = a_x E_x^HF[K] + E_xc^semilocal[n],
+```
+
+the exact (Hartree-Fock) exchange of the occupied valence orbitals with the
+kernel `K` of the functional (`1/r`, the short-range `erfc(omega r)/r` or the
+long-range `erf(omega r)/r`) and a semilocal part with the reduced semilocal
+exchange of the functional. Every orbital sees the Hamiltonian
+`-nabla^2 + V_ion + V_H + V_xc^semilocal + V_NL + a_x V_x`, where `V_x` is the
+exchange operator of the occupied orbitals of the same spin
+([V_xc/exchange_operator.py](V_xc/exchange_operator.py),
+[SCF/hybrid.py](SCF/hybrid.py), [V_xc/hybrid.py](V_xc/hybrid.py)).
+
+### Functionals
+
+| label | functional | exact exchange | semilocal part |
+|---|---|---|---|
+| `hf` | Hartree-Fock | `1/r`, 1 | none |
+| `pbe0` | PBE0 | `1/r`, 0.25 | 0.75 PBE exchange + PBE correlation |
+| `pbeh` | PBEh(a) | `1/r`, a (`Exact_Exchange_Fraction`, default 0.25) | (1 - a) PBE exchange + PBE correlation |
+| `hse06` | HSE06 | `erfc(omega r)/r`, 0.25, omega = 0.11 bohr^-1 | PBE exchange - 0.25 wPBE short-range exchange (omega = 0.11) + PBE correlation |
+| `hse03` | HSE03 | `erfc(omega r)/r`, 0.25, omega = 0.15/sqrt(2) = 0.1061 bohr^-1 | PBE exchange - 0.25 wPBE short-range exchange (omega = 0.15 * 2^(1/3) = 0.1890) + PBE correlation |
+| `b3lyp` | B3LYP (VWN-RPA, as Gaussian and libxc) | `1/r`, 0.20 | 0.08 Slater + 0.72 B88 + 0.19 VWN-RPA + 0.81 LYP |
+| `b3lyp5` | B3LYP with VWN5 (Quantum ESPRESSO's `b3lyp`) | `1/r`, 0.20 | 0.08 Slater + 0.72 B88 + 0.19 VWN5 + 0.81 LYP |
+| `b3pw91` | B3PW91 | `1/r`, 0.20 | 0.08 Slater + 0.72 B88 + 0.19 PW92 + 0.81 PW91 correlation |
+| `lc-wpbe` | LC-wPBE | `erf(omega r)/r`, 1, omega = 0.4 bohr^-1 | wPBE short-range exchange (omega = 0.4) + PBE correlation |
+| `cam-b3lyp` | CAM-B3LYP | `1/r`, 0.19, + `erf(omega r)/r`, 0.46, omega = 0.33 bohr^-1 | 0.35 B88 + 0.46 short-range B88 (omega = 0.33) + 0.19 VWN5 + 0.81 LYP |
+
+B88 includes its Slater part. The short-range wPBE exchange is Heyd's
+exchange-hole form, the one of Quantum ESPRESSO and VASP; HSE06 uses one
+omega for both parts. Case, `-` and `_` do not matter in a label, and the
+spellings `hartree-fock`, `pbe1pbe`, `hse`, `hseh1pbe`, `hse2pbe`, `lcwpbe`
+and `camb3lyp` are accepted. Each functional of the registry states its
+references, its libxc counterpart and how libxc, Gaussian and Quantum
+ESPRESSO differ (`HybridFunctional.variants`).
+
+### Keywords
+
+| keyword | default | meaning |
+|---|---|---|
+| `Exact_Exchange_Fraction` | that of the functional | `a` of `pbeh`, and the short-range fraction of `hse06` and `hse03` (HSE(a)); in (0, 1]; refused for every other functional, which is defined by its fraction (`pbe0` asks for `pbeh`) |
+| `Screening_Parameter` | that of the functional | omega in bohr^-1 (a number, or with `bohr^-1` / `ang^-1`) of `hse06`, `lc-wpbe` and `cam-b3lyp`, in the exact and the semilocal part together; refused for `hse03` (defined by two omegas) and for the global hybrids |
+| `Exx_Max_Iter` | 100 | outer (Fock) iterations, a positive integer; Quantum ESPRESSO's outer loop has the same cap |
+| `Exx_Tolerance` | `1e-6 Ry` | the estimated exchange error below which the Fock loop stops (an energy, in the units of the other energy keywords) |
+| `Exx_Batch_Size` | 32 | pair densities per batched Poisson solve, a positive integer |
+| `Exx_Pair_Solver` | `kronecker` | `kronecker` (every kernel) or `cg` (the conjugate gradients of the Hartree solver, `1/r` only) |
+
+The six keywords without a hybrid `Correlation_Type` are refused.
+`Convergence_Criterion`, `Max_Iter`, the mixer and the eigensolver settings
+apply to every SCF loop of the Fock loop. `Generate_Complete_Parsec_In`
+writes the Fock-loop keywords with their values (the fraction and omega where
+the input sets them).
+
+### Method
+
+1. **Start.** An SCF with PBE (for every hybrid), or, after an ionic move,
+   the orbitals of the structure before. The potential is then rebuilt from
+   the converged density with the semilocal part of the hybrid, and the
+   eigensolver keeps its subspace.
+2. **Operator.** `W = V_x Psi` for the `States_Num` orbitals of each spin
+   channel (the occupied ones and the empty states the input asks for, so
+   the LUMO is in the span), each pair of occupied orbitals solved once, and
+   its adaptively compressed form (ACE, Lin 2016; the batched pair solves
+   follow the principles of SPARC, Jing, Sharma, Pask and Suryanarayana,
+   arXiv:2501.16572 and arXiv:2406.16998):
+   `M = -Psi^T W = L L^T`, `xi = W L^-T`, `V_ACE = -xi xi^T`, equal to `V_x` on
+   the span of `Psi` and applied as two matrix products.
+3. **Inner SCF.** The SCF loop of the code with `a_x V_ACE` fixed in every
+   Hamiltonian: the Chebyshev filters, the Lanczos bounds, the Rayleigh-Ritz
+   step and the residuals. Its iterations report the energy of the
+   functional with the exchange linearized about the orbitals of the
+   operator (`(linearized: fixed operator)` in `parsec.out`).
+4. **Stop test.** `E_x` of the new orbitals `P` and Quantum ESPRESSO's
+   estimated exchange error
+   `dexx = a_x [2 E_x(P, P0) - E_x(P0) - E_x(P)] >= 0`, `P0` the orbitals of
+   the operator. The loop stops when `dexx < Exx_Tolerance` and the inner
+   loop converged; otherwise the operator of `P` is built and the next inner
+   loop starts from the last one. The last outer iteration evaluates only
+   the occupied pairs.
+
+The total energy after each inner loop is that of the hybrid functional,
+`E_formula - 2 a_x E_x(P, P0) + a_x E_x(P)`: the band energy holds
+`2 a_x E_x(P, P0)` of exchange, which is removed (double counting), and the
+exact exchange of the new orbitals is added. With fractional occupations the
+exchange is that of the ensemble density matrix of each spin channel.
+`parsec.out` reports every outer iteration (`E_x`, the change, dexx, the
+total energy, the pair solves) and a final block with the energy terms of
+the generalized Kohn-Sham functional. The result archive holds
+`energy_semilocal_exchange_correlation_ry`, `energy_exact_exchange_ry` and
+`energy_exact_exchange_band_ry`, the `exx_*` members (fraction, `E_x`,
+dexx, the history of the outer iterations with `exx_history_columns`) and
+`scf_history_loop`, the loop of every row of `scf_history` (0 for the PBE
+start, `n` for the inner loop of outer iteration `n`).
+
+**Pair solver.** `Exx_Pair_Solver: kronecker` solves the finite-difference
+Poisson problem of the run's Laplacian directly on the bounding box of the
+domain ([Hartree/kronecker.py](Hartree/kronecker.py)): the three 1-D
+Dirichlet matrices are diagonalized once, and a batch of pair densities
+costs three batched matrix products, a Hadamard product and three products
+back (`12 n^4` flops for `n` points per axis). The boundary values beyond
+the box are the multipole expansion of each pair density at the order the
+Hartree boundary of the run uses, folded into the right-hand side. The
+expansion converges only beyond the farthest point that carries density,
+so the solver pads a box, ellipsoid or cylinder domain automatically until
+the exterior point nearest to the origin lies beyond the farthest active
+point (a sphere needs no padding). The screened kernels are the Coulomb
+solution smoothed by a Gaussian (`erf`) plus the smoothed exterior tails,
+and `erfc = 1/r - erf`; a two-kernel functional (CAM-B3LYP) is one solve of
+the weighted kernel. `Exx_Pair_Solver: cg` uses the conjugate gradients of
+the Hartree solver on the domain itself, with the multipole (sphere) or
+direct (box) boundary of each pair density and the boundary harmonics
+formed once.
+
+### Command lines and GPUs
+
+- `reference_main.py` runs the Fock loop on the host, with the host
+  Kronecker solver: single points, forces, relaxations and molecular
+  dynamics.
+- `main.py` with the CuPy backend runs the same loop on the GPUs of one
+  node: `a_x V_ACE` lives in the device Hamiltonians, of the full grid or of
+  every symmetry sector (`-xi_G xi_G^T` per sector), and the pair densities
+  of all sectors are solved by the device Kronecker solver on every GPU of
+  the process, in tiles of `Exx_Batch_Size` columns, each pair once. Its
+  records, energies and stop test are those of the reference loop.
+- The device bytes of the exchange (`xi` of every channel and sector, the
+  sector expansions, the Kronecker plans and the tile work) are counted by
+  the memory rules of the sectors, which spill sector states to the host
+  where the states and the exchange do not fit together. A build whose
+  `W = V_x Psi` cannot be held where its sectors are is refused with the
+  numbers (use more GPUs, fewer `States_Num` or a smaller `Exx_Batch_Size`).
+- `main.py` hands any other hybrid input to the reference solver with a
+  NOTE: a CPU backend, or `Exx_Pair_Solver: cg`. `--backend cupy` or
+  `native` and `--device gpu` refuse such an input. Hybrids on several nodes
+  (`--mpi`) are refused: the exchange operator needs every orbital in one
+  process.
+
+### What is refused
+
+Each of these is refused by name when the input is read:
+
+- periodic cells (bulk, wire and slab): exact exchange of a periodic system
+  needs a treatment of the Coulomb singularity at `G = 0` that is not
+  implemented;
+- spin-orbit coupling (`SO_PSP`, `SO_from_scratch`) and non-collinear
+  magnetism: the operator acts on real scalar orbitals;
+- FDET (`Potential_Field`, and so AFM scans) and LDA+U (`ldaplusu_u`,
+  `ldaplusu_j`): their terms are not combined with the exchange operator;
+- `Energy_Refinement`, in the input or as `--energy-refinement`: the hybrid
+  is already self-consistent;
+- `Van_Der_Waals`: PARSEC's Tkatchenko-Scheffler correction is defined for
+  PBE;
+- `Polarizability`, `nscf_kpoints`, `Output_GW` and band structures: not
+  implemented together with the Fock loop.
+
+### Pseudopotentials
+
+There are no hybrid norm-conserving pseudopotentials in the libraries of this
+repository; every hybrid reads PBE files (correlation label `pb` or `pbe`),
+as Quantum ESPRESSO's hybrid runs usually do, and B3PW91 also PW91 files
+(`pw`, `pw91`, `pwgga`). A CA (LDA) file is used with a WARNING that names it,
+as in a PBE run; a file of any other functional is refused when the input
+is read. FHIPP and old-format Martins files carry no label.
+
+### Diagnostics of the Fock loop
+
+After the loop `parsec.out` may add:
+
+- a NOTE when dexx rose more than tenfold above its smallest earlier value:
+  the state the loop approached was unstable under exact exchange, and the
+  loop went on to a lower one;
+- a WARNING when the loop stopped unconverged while its energy steps shrink
+  geometrically: the ratio per outer iteration and the energy still to be
+  gained; raise `Exx_Max_Iter`;
+- a WARNING for fractional final occupations.
+
+Exact exchange penalizes fractional occupations. A symmetric ensemble with
+a half-filled degenerate level, which the PBE start can give at finite
+`Fermi_Temp`, can therefore be a stationary point but a saddle of the hybrid
+functional, with a symmetry-broken state of lower energy. A ring of 12
+hydrogen atoms (bond 1.40 bohr, PBE0, 80 K) shows all three cases: dexx
+first falls to about `3e-7 Ry`, then rises to `3e-2 Ry` as the symmetry
+breaks, and the bond-alternating state that follows lies about 65 mRy lower;
+its soft rotation then shrinks dexx by only 0.90 per outer iteration, so the
+loop needs about 50 outer iterations, as Quantum ESPRESSO, which needs 66.
+With the default `Exx_Tolerance` such a loop can stop at the symmetric
+saddle; the fractional-occupation warning says so. The symmetry sectors of
+`main.py` (`--symmetry auto`) keep the reflection symmetry of the atoms in
+every orbital, so they cannot reach a state that breaks it; `--symmetry off`
+can.
+
+### Comparison with Quantum ESPRESSO
+
+For H2, H2O, CH4, CO, N2, O2 (triplet) and benzene with PBE0, HSE06, HSE03,
+B3LYP, B3LYP5, B3PW91 and HF, against Quantum ESPRESSO 7.5 with the same
+FHI98PP pseudopotentials and geometries, `E_hyb - E_PBE` agrees within
+`5e-5 Ry` in all 49 cases, the Fock energies `a_x E_x` within `6.5e-5 Ry`
+and the HOMOs within 1.9 meV (HSE03 against a reference derived from QE's
+HSE and libxc's HSE03, since QE has no HSE03 of this form). Inputs,
+references and tables: [`examples/0d_hybrid_functionals`](../../examples/0d_hybrid_functionals/).
 
 ## Spin polarization
 
@@ -627,7 +846,8 @@ Every execution path runs it: `reference_main.py`, and `main.py` with the
 SciPy, native and CuPy backends. The two channels are solved on the full
 grid: a GPU run does not use the symmetry representations, and the
 multi-node runner refuses a spin-polarized input unless it runs in one
-process (`--serial-control`). Periodic cells are refused.
+process (`--serial-control`). A spin-polarized periodic cell runs the
+periodic spin drivers of the readable solver (see "Physical scope").
 
 With `ca`, energies, levels and forces agree with Fortran PARSEC to the
 digits it prints, and so do `pl`, `lb` and `cs`. With `pbe` and `pw` they

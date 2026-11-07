@@ -41,7 +41,23 @@ XCFunctional = Literal[
     "pw91",
     "lb94",
     "casida_salahub",
+    "hf",
+    "pbe0",
+    "pbeh",
+    "hse06",
+    "hse03",
+    "b3lyp",
+    "b3lyp5",
+    "b3pw91",
+    "lc-wpbe",
+    "cam-b3lyp",
 ]
+# Self-consistent hybrid functionals (generalized Kohn-Sham with a nonlocal
+# exchange operator, parsec_python.SCF.hybrid): the labels of the registry
+# parsec_python.V_xc.hybrid.HYBRID_FUNCTIONALS; no Fortran PARSEC label.
+HYBRID_XC_FUNCTIONALS = frozenset(
+    ("hf", "pbe0", "pbeh", "hse06", "hse03", "b3lyp", "b3lyp5", "b3pw91", "lc-wpbe", "cam-b3lyp")
+)
 XC_FUNCTIONAL_NAMES = frozenset(
     (
         "ca",
@@ -54,7 +70,7 @@ XC_FUNCTIONAL_NAMES = frozenset(
         "lb94",
         "casida_salahub",
     )
-)
+) | HYBRID_XC_FUNCTIONALS
 # Functionals without a spin-polarized form (none in Fortran's exc_spn.f90).
 UNPOLARIZED_ONLY_XC_FUNCTIONALS = frozenset(("xalpha", "wigner", "hedin_lundqvist"))
 # ``sad``, ``file``, or a density model of ``MLDensity.registry`` (built in:
@@ -1241,6 +1257,84 @@ class MixingSettings:
             object.__setattr__(self, name, value)
 
 
+#: ``Exx_Max_Iter``: outer (Fock) iterations of a hybrid SCF.  100 is the cap of
+#: Quantum ESPRESSO's outer loop (``electron_maxstep``): a state with a soft mode
+#: converges linearly and slowly (a ring of 12 hydrogen atoms, bond 1.40 bohr,
+#: PBE0: dexx shrinks by 0.90 per outer iteration here and in QE 7.5, which needs 66).
+DEFAULT_EXX_MAX_ITERATIONS = 100
+#: ``Exx_Tolerance`` (Ry): the estimated exchange error of the Fock loop
+#: (Quantum ESPRESSO's ``dexx``) below which it stops.
+DEFAULT_EXX_TOLERANCE = 1.0e-6
+#: ``Exx_Batch_Size``: pair densities per batched Poisson solve.
+DEFAULT_EXX_BATCH_SIZE = 32
+
+
+@dataclass(frozen=True)
+class ExactExchangeSettings:
+    """Controls of a self-consistent hybrid functional (``SCFSettings.exact_exchange``).
+
+    ``fraction`` is ``Exact_Exchange_Fraction`` and ``screening`` is
+    ``Screening_Parameter`` (bohr^-1); ``None`` takes the value of the
+    functional (:mod:`parsec_python.SCF.hybrid`).  ``max_iterations``
+    (``Exx_Max_Iter``) bounds the outer Fock iterations, ``tolerance``
+    (``Exx_Tolerance``, Ry) is the estimated exchange error at which they
+    stop, and ``batch_size`` (``Exx_Batch_Size``) is the number of pair
+    densities each Poisson call solves.  ``pair_solver`` (``Exx_Pair_Solver``)
+    is ``"kronecker"`` (the direct solver on the bounding box, every kernel)
+    or ``"cg"`` (the conjugate gradients of the Hartree solver, 1/r only).
+    The text of the settings names only what differs from the defaults.
+    """
+
+    fraction: float | None = None
+    screening: float | None = None
+    max_iterations: int = DEFAULT_EXX_MAX_ITERATIONS
+    tolerance: float = DEFAULT_EXX_TOLERANCE
+    batch_size: int = DEFAULT_EXX_BATCH_SIZE
+    pair_solver: str = "kronecker"
+
+    def __post_init__(self) -> None:
+        if self.pair_solver not in ("kronecker", "cg"):
+            raise ValueError("the pair solver must be 'kronecker' or 'cg'")
+        if self.fraction is not None:
+            fraction = float(self.fraction)
+            if not np.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+                raise ValueError("the exact-exchange fraction must lie in (0, 1]")
+            object.__setattr__(self, "fraction", fraction)
+        if self.screening is not None:
+            screening = float(self.screening)
+            if not np.isfinite(screening) or screening <= 0.0:
+                raise ValueError("the screening parameter must be positive (bohr^-1)")
+            object.__setattr__(self, "screening", screening)
+        iterations = int(self.max_iterations)
+        if iterations != self.max_iterations or iterations < 1:
+            raise ValueError("the Fock-loop iteration limit must be a positive integer")
+        object.__setattr__(self, "max_iterations", iterations)
+        tolerance = float(self.tolerance)
+        if not np.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError("the Fock-loop tolerance must be positive (Ry)")
+        object.__setattr__(self, "tolerance", tolerance)
+        batch = int(self.batch_size)
+        if batch != self.batch_size or batch < 1:
+            raise ValueError("the pair-density batch size must be a positive integer")
+        object.__setattr__(self, "batch_size", batch)
+
+    def __repr__(self) -> str:
+        defaults = {
+            "fraction": None,
+            "screening": None,
+            "max_iterations": DEFAULT_EXX_MAX_ITERATIONS,
+            "tolerance": DEFAULT_EXX_TOLERANCE,
+            "batch_size": DEFAULT_EXX_BATCH_SIZE,
+            "pair_solver": "kronecker",
+        }
+        shown = [
+            f"{item.name}={getattr(self, item.name)!r}"
+            for item in fields(self)
+            if getattr(self, item.name) != defaults[item.name]
+        ]
+        return f"{type(self).__qualname__}({', '.join(shown)})"
+
+
 @dataclass(frozen=True)
 class SCFSettings:
     """Isolated single-point SCF controls.
@@ -1335,6 +1429,15 @@ class SCFSettings:
     # ``iter > 5`` of parsec.F90:1453, gives the runs before it bit for bit);
     # see :attr:`approach_criterion`.
     degree_decrease_after: int = 4
+    # The Fock-loop controls of a hybrid ``xc_functional``
+    # (:class:`ExactExchangeSettings`); ``None`` for every other functional.
+    exact_exchange: ExactExchangeSettings | None = None
+
+    @property
+    def is_hybrid(self) -> bool:
+        """Whether ``xc_functional`` has a nonlocal exact-exchange term."""
+
+        return self.xc_functional in HYBRID_XC_FUNCTIONALS
 
     def __repr__(self) -> str:
         # The text of these settings is hashed by the cache keys of the
@@ -1357,6 +1460,7 @@ class SCFSettings:
             "ionization_energy_difference": self.ionization_energy_difference == 0.0,
             "zero_average_xc_potential": not self.zero_average_xc_potential,
             "degree_decrease_after": self.degree_decrease_after == 4,
+            "exact_exchange": self.exact_exchange is None,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -1422,6 +1526,16 @@ class SCFSettings:
                 f"xc_functional={self.xc_functional!r} has no spin-polarized "
                 "form; it cannot be used with spin polarization or "
                 "non-collinear magnetism"
+            )
+        if self.xc_functional in HYBRID_XC_FUNCTIONALS:
+            if self.exact_exchange is None:
+                object.__setattr__(self, "exact_exchange", ExactExchangeSettings())
+            elif not isinstance(self.exact_exchange, ExactExchangeSettings):
+                raise TypeError("exact_exchange must be an ExactExchangeSettings")
+        elif self.exact_exchange is not None:
+            raise ValueError(
+                "exact_exchange settings belong to a hybrid xc_functional, not "
+                f"to {self.xc_functional!r}"
             )
         energy_difference = float(self.ionization_energy_difference)
         if not np.isfinite(energy_difference):
@@ -2205,6 +2319,73 @@ class CorrectedEnergyBreakdown(EnergyBreakdown):
 
 
 @dataclass(frozen=True)
+class HybridEnergyBreakdown(EnergyBreakdown):
+    """:class:`EnergyBreakdown` of a hybrid functional (generalized Kohn-Sham), in Ry.
+
+    ``eigenvalue`` is the band energy of the Hamiltonian with the exchange
+    operator ``a_x V_x``; ``exact_exchange_band`` is the part of it that
+    operator gives, ``w sum_i f_i <q_i|a_x V_x|q_i>``, which ``electronic``
+    removes (double counting).  ``exact_exchange`` is the scaled exact
+    exchange energy ``a_x E_x`` the total holds and
+    ``semilocal_exchange_correlation`` the semilocal part of the functional
+    (with its reduced semilocal exchange); ``exchange_correlation`` is their
+    sum.  ``integral_vxc_rho`` is that of the semilocal potential.
+
+    Within an inner SCF loop the operator is fixed (built from the orbitals
+    ``P0`` of the outer iteration before) and ``linearized`` is true:
+    ``exact_exchange = a_x (2 E_x(P, P0) - E_x(P0))``, the exchange energy of
+    the functional that loop minimizes.  After the loop ``exact_exchange``
+    is ``a_x E_x(P)`` of the new orbitals and ``linearized`` false.
+    """
+
+    semilocal_exchange_correlation: float = 0.0
+    exact_exchange: float = 0.0
+    exact_exchange_band: float = 0.0
+    exact_exchange_fraction: float = 0.0
+    linearized: bool = False
+
+
+@dataclass(frozen=True)
+class ExchangeLoopIteration:
+    """One outer iteration of the Fock loop of a hybrid SCF (energies in Ry).
+
+    ``iteration`` 0 is the operator built from the orbitals of the start
+    (the semilocal SCF ``start_functional``, or the structure before a move);
+    iteration ``n >= 1`` reports the inner SCF loop run with the operator of
+    iteration ``n - 1``.  ``exchange_energy`` is ``E_x`` of the orbitals of
+    this iteration (no fraction), ``cross_exchange_energy`` the exchange
+    energy of those orbitals with the operator they were solved with,
+    ``E_x(P_n, P_n-1)``, ``estimated_error`` Quantum ESPRESSO's ``dexx``,
+    ``a_x (2 E_x(P_n, P_n-1) - E_x(P_n-1) - E_x(P_n))`` (nonnegative), and
+    ``total_energy`` the total energy of the hybrid functional of the
+    orbitals of this iteration.  ``pair_solves`` and the times are those of
+    this iteration's exchange evaluation; ``operator_ranks`` the number of
+    orbitals of the operator built after it, per spin channel (empty when no
+    operator was built).
+    """
+
+    iteration: int
+    functional: str
+    fraction: float
+    exchange_energy: float
+    total_energy: float | None = None
+    previous_exchange_energy: float | None = None
+    cross_exchange_energy: float | None = None
+    estimated_error: float | None = None
+    tolerance: float = 0.0
+    inner_iterations: int = 0
+    inner_converged: bool = True
+    converged: bool = False
+    pair_solves: int = 0
+    poisson_seconds: float = 0.0
+    exchange_seconds: float = 0.0
+    operator_ranks: tuple[int, ...] = ()
+    start_functional: str | None = None
+    pair_solver: str = ""
+    operator_asymmetry: float = 0.0
+
+
+@dataclass(frozen=True)
 class EmbeddingEnergyBreakdown(EnergyBreakdown):
     """:class:`EnergyBreakdown` of an FDET tip run (``totnrg.f90:159-197``), in Ry.
 
@@ -2484,6 +2665,10 @@ class SinglePointResult:
     """FDET (``Potential_Field``): the :class:`parsec_python.Embedding.kinetic.NonadditiveKinetic`
     of the last iteration (``T_nad`` and ``v_nad``, which ``input_effective_potential`` and
     ``output_effective_potential`` hold and ``xc_potential`` does not); ``None`` without FDET."""
+    exact_exchange: object | None = None
+    """A hybrid functional: the :class:`parsec_python.SCF.hybrid.FockLoopSummary` of the Fock
+    loop (its outer iterations and what an ionic step needs to start the next structure);
+    ``None`` otherwise.  ``xc_potential`` is then the semilocal part only."""
 
     @property
     def all_electron_total(self) -> float:

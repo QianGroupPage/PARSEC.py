@@ -291,9 +291,14 @@ def run_recorded_molecular_dynamics(
             break
         # Andrew Grieder's loops keep the initial moment of a non-collinear calculation
         atoms = moved_atoms(system.atoms, step.positions, getattr(backend, "keep_atom_fields", True))
-        release_orbitals(result)
+        # A hybrid functional's warm start reads the orbitals: they go after it.
+        hybrid = getattr(result, "exact_exchange", None) is not None
+        if not hybrid:
+            release_orbitals(result)
         moved = backend.update_geometry(system, atoms)
         carried = backend.warm_start(system, result, moved)
+        if hybrid:
+            release_orbitals(result)
         if filter_restart is not None:
             # Filter_Restart_After (PARSEC 1.5, parsec.F90:2944-3026): the
             # movements made so far are the steps done.

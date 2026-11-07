@@ -654,7 +654,10 @@ class ParserTests(unittest.TestCase):
             )
             self.assertEqual(translation.problem.scf.xc_functional, functional, label)
         with self.assertRaisesRegex(ParsecInputError, "unknown"):
-            self.parse("h2o_ca", "Correlation_Type: b3lyp", drop=("Correlation_Type",))
+            self.parse("h2o_ca", "Correlation_Type: m06l", drop=("Correlation_Type",))
+        # The self-consistent hybrids of PARSEC.py (parsec_python.SCF.hybrid).
+        translation = self.parse("h2o_ca", "Correlation_Type: b3lyp", drop=("Correlation_Type",))
+        self.assertEqual(translation.problem.scf.xc_functional, "b3lyp")
 
     def test_spin_polarization(self) -> None:
         self.assertEqual(self.parse("ch3_default").problem.scf.xc_functional, "pw92")

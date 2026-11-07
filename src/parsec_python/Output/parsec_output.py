@@ -45,6 +45,7 @@ from .correction_output import (
     hubbard_setup_lines,
 )
 from .force_output import force_report_lines
+from .hybrid_output import hybrid_energy_lines, hybrid_finish_lines
 from .kpoint_output import (
     kpoint_generation_lines,
     monkhorst_pack_input_lines,
@@ -1505,6 +1506,10 @@ def _correlation_lines(scf) -> list[str]:
     """
 
     functional = scf.xc_functional
+    if getattr(scf, "is_hybrid", False):
+        from .hybrid_output import hybrid_correlation_lines
+
+        return hybrid_correlation_lines(scf)
     if functional == "ca":
         return [
             " Exchange-Correlation functional is ca",
@@ -2417,10 +2422,16 @@ class ParsecTextReporter:
             self.iteration_spin_polarized(step)
             return
         # (The spinor records also carry diagonalization_seconds now: test the type.)
-        from ..models import SelfConsistentSOCIteration
+        from ..models import ExchangeLoopIteration, SelfConsistentSOCIteration
 
         if isinstance(step, SelfConsistentSOCIteration):
             self.iteration_self_consistent_soc(step)
+            return
+        if isinstance(step, ExchangeLoopIteration):
+            # An outer (Fock) iteration of a hybrid functional.
+            from .hybrid_output import exchange_loop_lines
+
+            self.write("\n".join(exchange_loop_lines(step)))
             return
         self._diagonalization_total += step.diagonalization_seconds
         self._hartree_total += step.hartree_seconds
@@ -2528,6 +2539,8 @@ class ParsecTextReporter:
                 ),
                 # LDA+U Energy where it is not zero (totnrg.f90).
                 *energy_correction_lines(energies),
+                # A hybrid functional: its exact exchange.
+                *hybrid_energy_lines(energies),
             ]
         )
         if self._previous_total is not None:
@@ -2682,6 +2695,8 @@ class ParsecTextReporter:
         lines = [
             # The TS report of parsec.F90 after convergence (Van_Der_Waals).
             *dispersion_report_lines(result),
+            # A hybrid functional: the energies of the Fock loop.
+            *hybrid_finish_lines(result),
             status,
             "",
             (
@@ -2736,7 +2751,9 @@ class ParsecTextReporter:
         timings = getattr(result, "timings", None)
         if timings is not None:
             preparation = timings.preparation
-            xc_timing_name = XC_DISPLAY_NAMES[self.problem.scf.xc_functional]
+            xc_timing_name = XC_DISPLAY_NAMES.get(
+                self.problem.scf.xc_functional, self.problem.scf.xc_functional.upper()
+            )
             initial_hamiltonian_total = (
                 preparation.finite_difference_seconds
                 + preparation.local_ionic_seconds
@@ -3089,6 +3106,8 @@ class ParsecTextReporter:
         lines = [
             # The TS report of parsec.F90 after convergence (Van_Der_Waals).
             *dispersion_report_lines(result),
+            # A hybrid functional: the energies of the Fock loop.
+            *hybrid_finish_lines(result),
             status,
             "",
             f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
@@ -3322,6 +3341,8 @@ class ParsecTextReporter:
         lines = [
             # The TS report of parsec.F90 after convergence (Van_Der_Waals).
             *dispersion_report_lines(result),
+            # A hybrid functional: the energies of the Fock loop.
+            *hybrid_finish_lines(result),
             status,
             "",
             f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",

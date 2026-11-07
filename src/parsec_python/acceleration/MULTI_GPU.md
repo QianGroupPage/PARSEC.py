@@ -1150,6 +1150,16 @@ so that four sectors use 8 or 16 GPUs on two or four nodes of four. No sector
 is spread over ranks, and through
 `main.py` an asymmetric system uses one GPU.
 
+A self-consistent hybrid functional (`../README.md`, "Self-consistent hybrid
+functionals") runs on the GPUs of one process: the compressed exchange
+operator of each symmetry sector stays on the device of the sector, and the
+pair densities of all sectors are solved as tiles on every GPU of the
+process, so an asymmetric system uses all of them for its exchange while
+its eigensolver stays on one. The exchange's device bytes enter the memory
+rules of the sectors above (states are spilled to the host where they and
+the exchange do not fit), and a build that cannot hold `W = V_x Psi` is
+refused with the numbers. The MPI runner and `--mpi` refuse hybrids.
+
 Record the GPU model, active GPU count, allocated and active CPU counts,
 precision, input hashes, code revision, iterations, and peak memory. Separate
 SCF wall time from startup, preparation, archive writing, and optional forces.

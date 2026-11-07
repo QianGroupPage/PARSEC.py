@@ -442,6 +442,9 @@ def save_result_archive(
         ),
     }
     for name, value in energy.items():
+        if name in _NON_ENERGY_FIELDS:
+            # A hybrid's fraction and flag are no energies (exx_* members).
+            continue
         payload[f"energy_{name}_ry"] = np.asarray(value)
     # A spin-polarized result adds its two channels, up first.  The members
     # above then describe both together (SinglePointResult): the total
@@ -585,6 +588,7 @@ def save_result_archive(
             payload[f"refinement_{name}_ry"] = np.asarray(getattr(refinement, name))
         payload["refinement_pair_solves"] = np.asarray(refinement.exchange.pair_solves)
         payload["refinement_seconds"] = np.asarray(refinement.seconds)
+    payload.update(_fock_loop_payload(result))
     payload.update(_dipole_payload(_isolated_dipole(result), polarizability))
     payload.update(_k_point_payload(result))
     payload.update(_scf_potential_payload(result))
@@ -593,6 +597,71 @@ def save_result_archive(
     # members are written as they are.
     np.savez(output, **payload)
     return output
+
+
+#: Fields of an energy breakdown that are no energies: kept out of the ``energy_*_ry`` members.
+_NON_ENERGY_FIELDS = frozenset({"exact_exchange_fraction", "linearized"})
+
+
+def _fock_loop_payload(result) -> dict[str, np.ndarray]:
+    """The Fock loop of a hybrid functional (``exx_*`` members), nothing otherwise.
+
+    ``scf_history_loop`` gives the SCF loop of each row of ``scf_history``:
+    0 for the semilocal start (PBE energies), ``n`` for the inner loop of
+    outer iteration ``n`` (linearized hybrid energies); the iteration numbers
+    of ``scf_history`` start again in every loop.  ``exx_energies_linearized``
+    says whether the final ``energy_*`` members are linearized (they are not
+    after a Fock loop) and ``exx_fraction`` is the fraction of exact exchange.
+    """
+
+    summary = getattr(result, "exact_exchange", None)
+    if summary is None:
+        return {}
+    records = summary.iterations
+    loops = np.concatenate(
+        [np.full(int(record.inner_iterations), int(record.iteration), dtype=np.int64) for record in records]
+        or [np.empty(0, dtype=np.int64)]
+    )
+    extra = {}
+    if loops.size == len(getattr(result, "history", ())):
+        extra["scf_history_loop"] = loops
+    return {
+        **extra,
+        "exx_energies_linearized": np.asarray(bool(getattr(result.energies, "linearized", False))),
+        "exx_functional": np.asarray(summary.functional),
+        "exx_fraction": np.asarray(summary.fraction),
+        "exx_exchange_energy_ry": np.asarray(summary.exchange_energy),
+        "exx_estimated_error_ry": np.asarray(summary.estimated_error),
+        "exx_converged": np.asarray(summary.converged),
+        "exx_pair_solves": np.asarray(summary.pair_solves),
+        "exx_seconds": np.asarray(summary.seconds),
+        "exx_history": np.asarray(
+            [
+                [
+                    record.iteration,
+                    record.exchange_energy,
+                    np.nan if record.total_energy is None else record.total_energy,
+                    np.nan if record.estimated_error is None else record.estimated_error,
+                    record.inner_iterations,
+                    record.pair_solves,
+                    record.exchange_seconds,
+                ]
+                for record in records
+            ],
+            dtype=float,
+        ),
+        "exx_history_columns": np.asarray(
+            [
+                "iteration",
+                "exchange_energy_ry",
+                "total_energy_ry",
+                "estimated_error_ry",
+                "inner_iterations",
+                "pair_solves",
+                "exchange_seconds",
+            ]
+        ),
+    }
 
 
 def relaxation_exit_code(result, outcome, *, manual: bool = False) -> int:

@@ -80,6 +80,7 @@ from .single_point import (
     hubbard_terms_of_iteration,
     iteration_eigensolver_fields,
     preconditioner_neighbors,
+    refuse_exchange_hooks,
     require_reference_hooks,
 )
 
@@ -182,6 +183,7 @@ def run_spin_scf(
     warm_start: SCFWarmStart | None = None,
     convergence_criterion: float | None = None,
     iteration_state_callback: Callable[[object], None] | None = None,
+    exchange_term: object | None = None,
 ) -> SinglePointResult:
     """Run PARSEC-style potential mixing with two spin channels.
 
@@ -219,6 +221,14 @@ def run_spin_scf(
         eigenproblem_solver=eigenproblem_solver,
         orbital_density_builder=orbital_density_builder,
     )
+    if exchange_term is not None and getattr(system, "exchange_device", None) is None:
+        # A hybrid functional: the exchange operator of each channel joins
+        # its Hamiltonian (parsec_python.SCF.hybrid); the reference path, or
+        # an accelerated system whose device Hamiltonians hold it.
+        refuse_exchange_hooks(
+            eigenproblem_solver=eigenproblem_solver,
+            orbital_density_builder=orbital_density_builder,
+        )
     # LDA+U potential matrices of both channels, zero in the first iteration.
     hubbard_state = None
 
@@ -327,8 +337,12 @@ def run_spin_scf(
         solver_counts: list[tuple[int, int] | None] = []
         for spin in range(2):
             binding_start = time.perf_counter()
-            if hubbard_projectors is None:
+            if hubbard_projectors is None and exchange_term is None:
                 hamiltonian = system.hamiltonian(input_potentials[spin])
+            elif hubbard_projectors is None:
+                hamiltonian = system.hamiltonian(
+                    input_potentials[spin], None, exchange_term.operator(spin)
+                )
             else:
                 hamiltonian = system.hamiltonian(
                     input_potentials[spin],
@@ -480,6 +494,10 @@ def run_spin_scf(
                 else {}
             ),
         )
+        if exchange_term is not None:
+            energies = exchange_term.iteration_energies(
+                energies, tuple(wavefunctions), tuple(occupations)
+            )
 
         # 6. Mix the two potentials as one vector, up first, and test the
         # larger residual of the two channels.

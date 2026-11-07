@@ -13,6 +13,10 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 - Isolated systems (`Boundary_Conditions: cluster`), sphere or box domain,
   CA/PZ LDA or PBE, without or with spin polarization, with or without
   nonlinear core correction, projectors through `l = 3`.
+- Self-consistent hybrid functionals of isolated systems (PBE0, HSE06,
+  B3LYP, HF, ...), without or with spin polarization: forces, relaxation and
+  molecular dynamics on both command lines (`main.py` on the GPUs of one
+  node); see [Hybrid functionals](#hybrid-functionals) below.
 - Periodic cells (`Boundary_Conditions: bulk`), without spin-orbit coupling, at the Gamma point or with a Monkhorst-Pack
   k-point sampling (collinear spin polarization at the Gamma point only): forces, `Minimization: bfgs | simple | manual`
   and molecular dynamics. See "Periodic cells" below; the spin-unpolarized Gamma-point cell also runs on the accelerated
@@ -194,6 +198,22 @@ out, as in PARSEC.
 `parsec.out` prints the tables PARSEC prints: the ion-ion, local, SCF
 correction, core correction and nonlocal forces, the total before and after
 symmetrization, the net force that was removed and the torque.
+
+### Hybrid functionals
+
+With a hybrid `Correlation_Type` ([README.md](README.md#self-consistent-hybrid-functionals))
+the forces keep the form above, with the orbitals and the density of the
+converged generalized Kohn-Sham state: with norm-conserving
+pseudopotentials the exchange operator has no explicit dependence on the
+ions, and the only term that sees the core density is the semilocal part,
+whose potential (with the reduced semilocal exchange) the core-correction
+force reads. Finite differences of the total energy (H2, H2O and LiH, whose
+Li has a core correction, `h = 0.4` bohr, displacements of 0.01 bohr) give
+the same analytic-minus-numeric difference for PBE0 as for PBE, 1.2e-3 to
+3.4e-3 Ry/bohr (the grid error of that spacing), equal within 1e-4 Ry/bohr.
+In a relaxation or in molecular dynamics the Fock loop of a moved structure
+builds its first exchange operator from the orbitals of the structure
+before, so only the first structure runs the PBE start.
 
 ## Periodic cells
 

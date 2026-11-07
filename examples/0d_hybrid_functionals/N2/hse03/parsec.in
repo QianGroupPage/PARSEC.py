@@ -1,0 +1,28 @@
+# N2 (1.0977 A): HSE03: as HSE06 with w_HF = 0.15/sqrt(2) and w_PBE = 0.15*2**(1/3) 1/bohr
+# Quantum ESPRESSO reference: no input in this form; libxc 427 and a correction, see README
+
+Boundary_Sphere_Radius: 11.04
+Grid_Spacing: 0.160
+Coordinate_Unit: Cartesian_Bohr
+Expansion_Order: 12
+Correlation_Type: hse03
+Exx_Tolerance: 1e-8 Ry   # Fock-loop stop (default 1e-6 Ry), tight for the comparison
+States_Num: 9
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+Atom_Types_Num: 1
+
+Atom_Type: N
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 1.6
+begin Electron_Per_Orbital
+2 3 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.   # spline of the radial table, see README
+begin Atom_Coord
+     0.0000000000    0.0000000000    1.0371761835
+     0.0000000000    0.0000000000   -1.0371761835
+end Atom_Coord

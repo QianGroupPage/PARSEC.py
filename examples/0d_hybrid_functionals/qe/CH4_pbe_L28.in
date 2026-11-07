@@ -1,0 +1,34 @@
+ &control
+    calculation = 'scf'
+    prefix = 'CH4_pbe_L28_e150'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 28.000000
+    nat = 5
+    ntyp = 2
+    ecutwfc = 150.0
+    assume_isolated = 'mt'
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'pbe'
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ H 1.008 h_pbe_tm.UPF
+ C 12.011 c_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ C 14.0000000000 14.0000000000 14.0000000000
+ H 15.1859538349 15.1859538349 15.1859538349
+ H 12.8140461651 12.8140461651 15.1859538349
+ H 12.8140461651 15.1859538349 12.8140461651
+ H 15.1859538349 12.8140461651 12.8140461651
+K_POINTS gamma

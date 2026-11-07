@@ -62,6 +62,7 @@ python src\parsec_python\main.py examples\0d_Si28H36\parsec.in --dry-run
 | `0d_Si28H36` | Larger hydrogen-passivated silicon cluster; use this after validating the environment on a smaller case. | `python src\parsec_python\main.py examples\0d_Si28H36\parsec.in --no-archive` |
 | `0d_nanodiamonds` | Hydrogen-terminated nanodiamonds from C1H4 to C9449H1572 (up to 39,368 valence electrons): Fortran PARSEC comparisons up to C795H300 and the multi-GPU benchmark series with A100 reference times and memory. | See [`0d_nanodiamonds/README.md`](0d_nanodiamonds/README.md). |
 | `0_CH4_CF4` | ARES comparison, FHI98PP-generated ordinary/core-hole potentials, and four spin-unpolarized PBE delta-SCF inputs. | See the core-hole commands below. |
+| `0d_hybrid_functionals` | Self-consistent hybrids (PBE0, HSE06, HSE03, B3LYP, B3LYP5, B3PW91, HF) of H2, H2O, CH4, CO, N2, benzene and triplet O2 on the GPU, compared with Quantum ESPRESSO using the same FHI98PP potentials. | `python src\parsec_python\main.py examples\0d_hybrid_functionals\H2O\pbe0\parsec.in --pp-dir examples\0d_hybrid_functionals --no-archive`; see [`0d_hybrid_functionals/README.md`](0d_hybrid_functionals/README.md). |
 | `ml_initial_density` | Fourteen-molecule SAD/SCDP/ChargE3Net suite with portable predicted densities and CHEBFF/CHEBDAV reference outputs. | See [`ml_initial_density/README.md`](ml_initial_density/README.md). |
 | `3d_Si` | Periodic boundary conditions for bulk silicon with an 8 atom conventional unit cell | `python src\parsec_python\main.py examples\3d_Si\parsec.in --no-archive` |
 

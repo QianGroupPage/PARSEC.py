@@ -70,6 +70,26 @@ def device_free_bytes(device_id: int | None = None) -> int | None:
         return None
 
 
+def allocation_failure(error: BaseException) -> bool:
+    """Whether ``error`` says that a device allocation failed, and nothing else.
+
+    ``MemoryError`` (CuPy's ``OutOfMemoryError``), a CUDA runtime error
+    ``cudaErrorMemoryAllocation`` or a driver error ``CUDA_ERROR_OUT_OF_MEMORY``
+    (both status 2).  Other CUDA errors (an illegal address, a failed launch)
+    are not, and a fallback must not hide them.
+    """
+
+    if isinstance(error, MemoryError):
+        return True
+    try:
+        import cupy
+    except Exception:  # noqa: BLE001 - CuPy absent: no CUDA errors to name
+        return False
+    if isinstance(error, (cupy.cuda.runtime.CUDARuntimeError, cupy.cuda.driver.CUDADriverError)):
+        return int(getattr(error, "status", -1)) == 2
+    return False
+
+
 def cuda_allocation_errors() -> tuple[type[BaseException], ...]:
     """The errors of a GPU allocation that a choice of ``auto`` gives way to.
 

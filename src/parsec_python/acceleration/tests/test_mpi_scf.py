@@ -754,6 +754,8 @@ class MPISCFTests(unittest.TestCase):
             self.assertFalse(ritz._column_copy_requested())
             self.assertFalse(ritz.streaming_ritz_requested(SimpleNamespace(low_memory_ritz=True)))
             self.assertIsNone(driver._hartree_device_request())
+            # The host interface of the Hartree solve, without the resident chain.
+            self.assertEqual(driver._resident_hartree_request(), '0')
             # The slabs of its projection as wide as they were: an eighth of the columns, and the columns of
             # the budget where its launcher asks for one array.  That budget is an eighth of the basis within
             # 1 and 4 GiB, as it was: the control names the limit that a run has at 2 GiB, and not the budget

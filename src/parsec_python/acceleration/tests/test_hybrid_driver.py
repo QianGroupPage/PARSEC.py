@@ -1309,11 +1309,21 @@ class MPIRolePreparationTests(unittest.TestCase):
                     details["hartree_boundary_setup"],
                     "overlapped with GPU orbital setup",
                 )
+                # The root of an MPI run reports the choice of the resident
+                # chain like a run of one process (here the switch is 0).
+                self.assertEqual(
+                    details["hartree_resident_chain"],
+                    "off (PARSEC_CUPY_RESIDENT_HARTREE=0)",
+                )
 
     def test_sector_worker_prepares_only_what_its_commands_use(self) -> None:
         root = self.prepare(SimpleNamespace(rank=0, root=0, size=2))
         context = SimpleNamespace(rank=1, root=0, size=2)
         worker = self.prepare(context)
+        self.assertEqual(
+            dict(worker.system.backend_info.details)["hartree_resident_chain"],
+            "not used (no Hartree solver on this rank)",
+        )
 
         worker.prepare_reference.assert_called_once_with(
             worker.problem,
@@ -4263,10 +4273,14 @@ class RealHybridAccuracyTests(unittest.TestCase):
         device = int(details["hartree_cg_device"])
         resident = solver.resident_device_bytes
         host_resident = host.backend.symmetry_eigensolver.resident_device_bytes
+        # Since 2026-11-07 the boundary of the wedge and the resident chain
+        # are on that device too, and counted.
+        self.assertTrue(details["hartree_resident_chain"].startswith("on (auto"))
         self.assertEqual(
             resident.get(device, 0) - host_resident.get(device, 0),
             int(details["hartree_cg_device_bytes"])
-            + int(details["hartree_boundary_device_bytes"]),
+            + int(details["hartree_boundary_device_bytes"])
+            + int(details["hartree_resident_device_bytes"]),
         )
         for operator in solver._operators:
             if operator is not None:

@@ -1340,7 +1340,9 @@ class SectorStateStorageTests(unittest.TestCase):
                          ("fresh", "release"))
         # And the host CG of the Hartree potential, the default before the GPU CG.
         self.assertEqual(control["PARSEC_HARTREE_LINEAR_BACKEND"], "native")
-        self.assertEqual(len(control), 28 + len(preparation))
+        # And its host interface, the default before the resident chain.
+        self.assertEqual(control["PARSEC_CUPY_RESIDENT_HARTREE"], "0")
+        self.assertEqual(len(control), 29 + len(preparation))
 
     def test_the_former_values_of_the_switches_of_the_round_after_select_every_former_route_together(self):
         import importlib

@@ -67,6 +67,11 @@ _GPU_BOUNDARY_BUILDERS = frozenset(
         "CuPyPointMultipoleBoundaryBuilder",
     }
 )
+# The boundary of the resident chain on an axis-reflection wedge takes the
+# wedge kernels whatever the plan (A100, 2026-11-07: O2 PBE in sectors, Hartree
+# 1.12 s with the orbit table, 1.01 s with the full-grid kernels and 0.78 s
+# with the wedge kernels, peaks 1074, 1230 and 1102 MiB).
+_RESIDENT_WEDGE_KERNELS = True
 _REFERENCE_CACHE: OrderedDict[str, object] = OrderedDict()
 _REFERENCE_CACHE_LOCK = Lock()
 
@@ -1478,6 +1483,76 @@ def _hartree_device_request() -> int | str | None:
     return value
 
 
+def _resident_hartree_request() -> str:
+    """Parse ``PARSEC_CUPY_RESIDENT_HARTREE``: ``auto`` (the default), ``1`` or ``0``.
+
+    ``auto`` (the default since 2026-11-07) runs the device-resident Hartree
+    chain (``Hartree/cupy_resident.py``) where the conjugate gradients run on
+    a GPU on the symmetry wedge of the SCF fields, with the boundary values
+    built on that device; ``1`` asks for the chain by name and stops where it
+    does not apply or cannot be built; ``0`` keeps the host interface, which
+    was the default before.
+    """
+
+    raw = os.environ.get("PARSEC_CUPY_RESIDENT_HARTREE", "auto").strip().lower()
+    if raw in {"", "auto"}:
+        return "auto"
+    if raw not in {"0", "1"}:
+        raise ValueError("PARSEC_CUPY_RESIDENT_HARTREE must be auto, 1 or 0")
+    return raw
+
+
+def _resident_hartree_plan(
+    request: str,
+    *,
+    linear_backend: str,
+    hartree_reduction,
+    orbital_decomposition,
+    orbital_reduction,
+    boundary_builder_planned: bool,
+) -> tuple[bool, str]:
+    """Whether the preparation builds the resident Hartree chain, and why.
+
+    Decided before the boundary thread starts, because the chain takes its
+    boundary from a GPU builder on the wedge where the host builder would
+    otherwise use its orbit table.  The chain applies where the conjugate
+    gradients run on a GPU (``linear_backend``), on the wedge
+    ``hartree_reduction`` that the SCF fields use too (a symmetry-sector
+    eigensolver, whose reduction is ``orbital_reduction``), with a multipole
+    boundary builder (``boundary_builder_planned``), on a grid of ``int32``
+    indices, and where neither ``PARSEC_HARTREE_BOUNDARY_BACKEND=native`` nor
+    ``PARSEC_HARTREE_BOUNDARY_KERNEL=full`` keeps the boundary on the host by
+    name.  Returns ``(applies, reason)``; ``reason`` completes the
+    ``hartree_resident_chain`` line.
+    """
+
+    if request == "0":
+        return False, "PARSEC_CUPY_RESIDENT_HARTREE=0"
+    prefix = "auto" if request == "auto" else "PARSEC_CUPY_RESIDENT_HARTREE=1"
+    if linear_backend != "cupy":
+        return False, f"{prefix}: the conjugate gradients run on the host"
+    if hartree_reduction is None:
+        return False, f"{prefix}: the Hartree problem is solved on the full grid"
+    if orbital_decomposition is None:
+        return False, (
+            f"{prefix}: the orbitals are solved on the full grid, whose SCF "
+            "fields have no symmetry wedge"
+        )
+    if orbital_reduction is not hartree_reduction:
+        return False, f"{prefix}: the SCF fields use another wedge than the Hartree solve"
+    if not boundary_builder_planned:
+        return False, f"{prefix}: no multipole boundary builder (domain or boundary method)"
+    if int(hartree_reduction.full_size) > np.iinfo(np.int32).max:
+        return False, f"{prefix}: the grid exceeds int32 indices"
+    if os.environ.get("PARSEC_HARTREE_BOUNDARY_BACKEND", "").strip().lower() == "native":
+        return False, f"{prefix}: PARSEC_HARTREE_BOUNDARY_BACKEND=native keeps the boundary on the host"
+    if _hartree_boundary_kernel() == "full" and os.environ.get(
+        "PARSEC_HARTREE_BOUNDARY_BACKEND", ""
+    ).strip().lower() != "cupy":
+        return False, f"{prefix}: PARSEC_HARTREE_BOUNDARY_KERNEL=full keeps the boundary on the host"
+    return True, f"{prefix}: the GPU conjugate gradients on the symmetry wedge of the SCF fields"
+
+
 class _GPUHartreeUnavailable(Exception):
     """The GPU CG chosen by ``auto`` could not be built on the symmetry wedge."""
 
@@ -1570,6 +1645,84 @@ def _gpu_hartree_device_bytes(poisson_solver, boundary_builder, resident_hartree
     if stored and device is not None:
         counts[int(device)] = counts.get(int(device), 0) + int(stored)
     return counts
+
+
+class _ResidentHartreeSolve:
+    """The Hartree solver of a prepared system with the resident chain in front.
+
+    Every solve runs ``chain`` (:class:`.Hartree.cupy_resident.CuPyResidentHartree`)
+    and adds its seconds to ``statistics``; the result carries the atomic
+    tail in rows that ``tail()`` returns, as the host interface's does.
+    Where a device allocation of a solve fails (CuPy's ``OutOfMemoryError``,
+    or a CUDA runtime or driver error of status 2; :func:`allocation_failure`)
+    and the chain was not asked for by name, the chain ends for the rest of
+    the calculation and the route before it takes over: the arrays of the
+    chain are dropped, ``leave()`` replaces its GPU boundary builder by the
+    host builder of that wedge (the orbit table) and returns the report lines
+    of what was built, the predictor history goes to the host solver
+    ``poisson_solver`` (the GPU CG stays), and ``host_solve``, the host
+    interface, repeats the solve and takes every later one.  ``fallback``
+    then says why and from which solve on, and ``fallback_details`` holds
+    those report lines.  Any other error stops the run.
+    """
+
+    def __init__(
+        self, chain, host_solve, statistics, *, tail, poisson_solver, named: bool, leave
+    ):
+        self.chain = chain
+        self.host_solve = host_solve
+        self.statistics = statistics
+        self.tail = tail
+        self.poisson_solver = poisson_solver
+        self.named = named
+        self.leave = leave
+        self.solves = 0
+        self.fallback: str | None = None
+        self.fallback_details: tuple[tuple[str, str], ...] = ()
+
+    def __call__(self, density, initial_potential=None, **kwargs):
+        self.solves += 1
+        if self.chain is not None:
+            from .Hartree.gpu_memory import allocation_failure
+
+            started = perf_counter()
+            try:
+                result = self.chain.solve(density, initial_potential, **kwargs)
+            except Exception as error:
+                if self.named or not allocation_failure(error):
+                    raise
+                self._leave_chain(error)
+            else:
+                self.statistics.hartree_solve_calls += 1
+                self.statistics.hartree_rhs_seconds += self.chain.rhs_seconds
+                self.statistics.hartree_linear_solve_seconds += self.chain.solve_seconds
+                self.statistics.hartree_total_seconds += perf_counter() - started
+                tail = self.tail()
+                return result if tail is None else replace(result, boundary_tail=tail)
+        return self.host_solve(density, initial_potential, **kwargs)
+
+    def _leave_chain(self, error) -> None:
+        chain, self.chain = self.chain, None
+        history = chain.host_history()
+        device = chain.device_id
+        chain.release()
+        del chain
+        self.fallback_details = tuple(self.leave())
+        adopt = getattr(getattr(self.poisson_solver, "solver", None), "adopt_history", None)
+        if callable(adopt):
+            adopt(history)
+        try:
+            from .backends.cupy import require_cupy
+
+            cp, _ = require_cupy()
+            with cp.cuda.Device(device):
+                cp.get_default_memory_pool().free_all_blocks()
+        except Exception:  # noqa: BLE001 - the release of cached blocks is a courtesy
+            pass
+        self.fallback = (
+            f"off from Hartree solve {self.solves} (auto: {type(error).__name__}: "
+            f"{error}); the boundary on the host and the host interface from then on"
+        )
 
 
 def _planned_sector_device_groups(
@@ -1870,15 +2023,22 @@ def _hartree_boundary_kernel() -> str:
     Where the boundary plan is engaged and the boundary is built on a GPU,
     ``auto`` takes the wedge kernels if an axis-reflection group reduces
     the Hartree problem and the same kernels under the identity alone, one
-    value per unique exterior point of the full grid, if none does.
-    Elsewhere, and with ``full``, the full-grid kernels of PARSEC's boundary
-    run.
+    value per unique exterior point of the full grid, if none does; the
+    boundary of the resident chain takes the wedge kernels of such a group
+    whether the plan is engaged or not.  Elsewhere, and with ``full``, the
+    full-grid kernels of PARSEC's boundary run.
     """
 
     kernel = os.environ.get("PARSEC_HARTREE_BOUNDARY_KERNEL", "auto").strip().lower()
     if kernel not in {"auto", "full", "wedge"}:
         raise ValueError("PARSEC_HARTREE_BOUNDARY_KERNEL must be auto, full, or wedge")
     return kernel
+
+
+def _host_boundary_kernel(symmetric: bool) -> str:
+    """The ``hartree_boundary_kernel`` line of a native boundary builder."""
+
+    return "native wedge (C++ orbit table)" if symmetric else "native full grid (C++)"
 
 
 def _hartree_tail_on_host() -> bool:
@@ -2082,6 +2242,8 @@ def _build_native_boundary_builder(
     boundary_tail=None,
     gpu_kernels: bool = False,
     gpu_linear: bool | None = None,
+    resident_wedge: bool = False,
+    notes: dict | None = None,
 ):
     """Construct the reusable isolated-boundary geometry.
 
@@ -2115,6 +2277,15 @@ def _build_native_boundary_builder(
     ``PARSEC_HARTREE_BOUNDARY_BACKEND=auto`` requires too; ``None`` reads
     it from ``PARSEC_HARTREE_LINEAR_BACKEND=cupy`` (a caller outside the
     preparation, which has no resolved choice).
+
+    ``resident_wedge`` says that the device-resident chain will solve on
+    ``hartree_reduction`` (:func:`_resident_hartree_plan`).  The boundary of
+    that wedge is then built on the GPU in place of the orbit table (since
+    2026-11-07): the wedge kernels where an axis-reflection group reduces
+    the problem, whether the plan is engaged or not, and otherwise the
+    kernels of the plan.  A GPU builder that cannot be made leaves the
+    orbit table, and ``notes["resident_boundary"]`` says why (``"gpu"``
+    where the GPU builder was made for the chain).
     """
 
     from .Hartree.native_boundary import (
@@ -2156,14 +2327,32 @@ def _build_native_boundary_builder(
         boundary_backend = "cupy" if (
             gpu_linear and auto_gpu_boundary_requested(wedge_rows, order)
         ) else "native"
-    if kernel == "wedge" and boundary_backend != "cupy":
+    # The resident chain takes the boundary of the wedge from the GPU, where
+    # the native builder would keep its orbit table on the host; only
+    # ``PARSEC_HARTREE_BOUNDARY_BACKEND=native`` or ``..._KERNEL=full`` by
+    # name keep it there.
+    resident_gpu = (
+        resident_wedge
+        and boundary_backend != "cupy"
+        and gpu_kernels
+        and gpu_linear
+        and hartree_reduction is not None
+        and requested != "native"
+        and kernel in {"auto", "wedge"}
+    )
+    if kernel == "wedge" and boundary_backend != "cupy" and not resident_gpu:
         raise ValueError(
             "PARSEC_HARTREE_BOUNDARY_KERNEL=wedge needs the GPU boundary "
             "(PARSEC_HARTREE_BOUNDARY_BACKEND=cupy)"
         )
 
-    def gpu_builder():
-        """Return a GPU builder and whether it works on the symmetry wedge."""
+    def gpu_builder(wedge_kernels: bool = False):
+        """Return a GPU builder and whether it works on the symmetry wedge.
+
+        ``wedge_kernels`` takes the kernels of the wedge wherever an
+        axis-reflection group reduces the problem, also for a plan that is
+        not engaged (the resident chain).
+        """
 
         from .Hartree.cupy_boundary import (
             CuPyMultipoleBoundaryBuilder,
@@ -2178,7 +2367,10 @@ def _build_native_boundary_builder(
                 "PARSEC_HARTREE_BOUNDARY_KERNEL=wedge needs an axis-reflection "
                 "reduction of the Hartree problem"
             )
-        if not (kernel == "wedge" or (kernel == "auto" and engaged)):
+        if not (
+            kernel == "wedge"
+            or (kernel == "auto" and (engaged or (wedge_kernels and wedge)))
+        ):
             builder = CuPyMultipoleBoundaryBuilder(
                 reference.grid, order, device_id=device_id
             )
@@ -2216,6 +2408,21 @@ def _build_native_boundary_builder(
     if boundary_backend == "cupy":
         builder, symmetry_boundary = gpu_builder()
         return builder, symmetry_boundary, None, perf_counter() - started
+    if resident_gpu:
+        try:
+            builder, symmetry_boundary = gpu_builder(wedge_kernels=_RESIDENT_WEDGE_KERNELS)
+        except (RuntimeError, MemoryError) as error:
+            # As below: the route of a default must not fail where the
+            # native one runs.  The orbit table then serves the host
+            # interface, and the chain is not built.
+            if notes is not None:
+                notes["resident_boundary"] = (
+                    f"the GPU boundary could not be built ({type(error).__name__}: {error})"
+                )
+        else:
+            if notes is not None:
+                notes["resident_boundary"] = "gpu"
+            return builder, symmetry_boundary, None, perf_counter() - started
     builder = None
     symmetry_boundary = False
     cache_info = None
@@ -3203,6 +3410,33 @@ def _prepare_single_point(
                 f"{free_hartree_bytes / 2**20:.0f} MiB free on their device beside "
                 "a full-grid eigensolver, which does not plan around them"
             )
+    # PARSEC_CUPY_RESIDENT_HARTREE: where the GPU CG solves the wedge of the
+    # SCF fields, the boundary of that wedge is built on its device too and
+    # every solve stays there (decided here, before the boundary thread).
+    resident_request = _resident_hartree_request()
+    resident_wedge, resident_reason = _resident_hartree_plan(
+        resident_request,
+        linear_backend=hartree_linear_backend,
+        hartree_reduction=hartree_reduction,
+        orbital_decomposition=orbital_decomposition,
+        orbital_reduction=orbital_reduction,
+        boundary_builder_planned=boundary_setup_eligible and selection.selected == "cupy",
+    )
+    resident_wedge = resident_wedge and not sector_worker
+    planned_resident_reason = resident_reason
+    resident_prefix = "auto" if resident_request == "auto" else "PARSEC_CUPY_RESIDENT_HARTREE=1"
+    boundary_setup_notes: dict = {}
+    # The boundary builder of the chain lies on the device of the GPU CG: the
+    # Hartree device, or without one (a single device, or
+    # PARSEC_HARTREE_DEVICE=off) the first device of the sectors, which the
+    # CG takes; the default device of the boundary thread may be another.
+    boundary_device = hartree_device
+    if resident_wedge and boundary_device is None:
+        from .Eigensolvers.symmetry import selected_device_ids
+        from .backends.cupy import require_cupy
+
+        cp, _ = require_cupy()
+        boundary_device = selected_device_ids(int(cp.cuda.Device().id))[0]
     if (
         boundary_setup_eligible
         and boundary_overlap_enabled
@@ -3230,10 +3464,12 @@ def _prepare_single_point(
             hartree_reduction,
             symmetry_cache_directory=symmetry_cache_directory,
             symmetry_geometry_cache_info=symmetry_geometry_cache_info,
-            device_id=hartree_device,
+            device_id=boundary_device,
             tail_on_device=True,
             gpu_kernels=True,
             gpu_linear=hartree_linear_backend == "cupy",
+            resident_wedge=resident_wedge,
+            notes=boundary_setup_notes,
         )
         boundary_setup_status = "overlapped with GPU orbital setup"
 
@@ -3682,16 +3918,73 @@ def _prepare_single_point(
                     hartree_reduction,
                     symmetry_cache_directory=symmetry_cache_directory,
                     symmetry_geometry_cache_info=symmetry_geometry_cache_info,
-                    device_id=hartree_device,
+                    device_id=boundary_device,
                     tail_on_device=selection.selected == "cupy",
                     gpu_kernels=selection.selected == "cupy",
                     gpu_linear=hartree_linear_backend == "cupy",
+                    resident_wedge=resident_wedge,
+                    notes=boundary_setup_notes,
                 )
                 boundary_setup_status = (
                     "inline (overlap disabled)"
                     if selection.selected == "cupy"
                     else "inline (no independent GPU setup)"
                 )
+
+        def host_boundary(
+            status: str, *, gpu_kernels: bool, gpu_linear: bool, tail_on_device: bool = True
+        ) -> None:
+            """Put the boundary builder of the route before the chain in its place.
+
+            ``gpu_kernels`` and ``gpu_linear`` are those that route asked
+            the builder with: the orbit table where it fits, and otherwise
+            the GPU kernels or the host recurrences as they decide.  A tail
+            in rows comes from the device kernel if ``tail_on_device``.
+            """
+
+            nonlocal native_boundary_builder, native_symmetry_boundary, hartree_boundary_tail
+            nonlocal native_boundary_cache_info, boundary_setup_seconds, boundary_setup_status
+            discarded = native_boundary_builder
+            native_boundary_builder = None
+            (
+                native_boundary_builder,
+                native_symmetry_boundary,
+                native_boundary_cache_info,
+                rebuild_seconds,
+            ) = stages.timed("hartree_boundary_setup", _build_native_boundary_builder)(
+                reference,
+                hartree_reduction,
+                symmetry_cache_directory=symmetry_cache_directory,
+                symmetry_geometry_cache_info=symmetry_geometry_cache_info,
+                device_id=hartree_device,
+                boundary_tail=_attached_boundary_tail(discarded),
+                tail_on_device=tail_on_device and selection.selected == "cupy",
+                gpu_kernels=gpu_kernels,
+                gpu_linear=gpu_linear,
+            )
+            del discarded
+            implementation.native_boundary_builder = native_boundary_builder
+            hartree_boundary_tail = _attached_boundary_tail(native_boundary_builder)
+            boundary_setup_notes.pop("resident_boundary", None)
+            boundary_setup_seconds += rebuild_seconds
+            boundary_setup_status = status
+
+        if (
+            boundary_setup_notes.get("resident_boundary") == "gpu"
+            and hartree_reduction is not None
+            and hartree_linear_backend != "cupy"
+        ):
+            # The GPU CG gave way to the host CG: the boundary of the wedge as
+            # that route asked for it before (the orbit table, or the GPU
+            # kernels where it has none), with the host CG beside it.
+            resident_reason = f"{resident_prefix}: the conjugate gradients run on the host"
+            host_boundary(
+                "rebuilt after the host-CG fallback",
+                gpu_kernels=selection.selected == "cupy",
+                gpu_linear=True,
+            )
+        elif boundary_setup_notes.get("resident_boundary", "gpu") != "gpu":
+            resident_reason = f"{resident_prefix}: {boundary_setup_notes['resident_boundary']}"
         # CuPy's statistics bridge expects ``poisson_solver`` to expose CuPy
         # event timings.  Keep the native solver under a distinct, inspectable
         # name and accumulate its host timings directly below.
@@ -3823,30 +4116,120 @@ def _prepare_single_point(
                 result = replace(result, boundary_tail=hartree_boundary_tail)
             return result
 
-        resident_policy = os.environ.get("PARSEC_CUPY_RESIDENT_HARTREE", "0").strip().lower()
-        if resident_policy not in {"0", "1", "auto"}:
-            raise ValueError("PARSEC_CUPY_RESIDENT_HARTREE must be 0, 1, or auto")
+        # The resident chain: the GPU boundary builder and the GPU CG on the
+        # wedge of the SCF fields (PARSEC_CUPY_RESIDENT_HARTREE, auto by
+        # default).  The host interface above stays behind it.
         resident_eligible = (
             type(native_boundary_builder).__name__ in _GPU_BOUNDARY_BUILDERS
             and hartree_linear_backend == "cupy"
-            and hartree_reduction is not None and scf_reducer is not None
+            and hartree_reduction is not None
+            and scf_reducer is not None
             and scf_reducer.reduction is hartree_reduction
+            and (
+                resident_request == "1"
+                or int(hartree_reduction.full_size) <= np.iinfo(np.int32).max
+            )
         )
-        if resident_policy == "1" and not resident_eligible:
-            raise ValueError("resident Hartree requires GPU boundary/CG and matching scalar/Poisson wedge")
-        if resident_policy in {"1", "auto"} and resident_eligible:
+        if resident_request == "1" and not resident_eligible:
+            raise ValueError(
+                "PARSEC_CUPY_RESIDENT_HARTREE=1 requires the GPU boundary and CG on the "
+                f"symmetry wedge of the SCF fields ({resident_reason})"
+            )
+        resident_built_here = boundary_setup_notes.get("resident_boundary") == "gpu"
+        if (
+            resident_request != "0"
+            and resident_eligible
+            and int(native_boundary_builder.device_id)
+            != int(poisson_solver.solver.backend.device_id)
+        ):
+            # Builder and CG on two devices would copy every solve across
+            # them (and stop without peer access): the route before instead.
+            message = (
+                f"the boundary builder is on device {native_boundary_builder.device_id}, "
+                f"the CG on device {poisson_solver.solver.backend.device_id}"
+            )
+            if resident_request == "1":
+                raise ValueError(f"PARSEC_CUPY_RESIDENT_HARTREE=1: {message}")
+            resident_eligible = False
+            resident_reason = f"auto: {message}"
+            if resident_built_here:
+                host_boundary(
+                    "rebuilt: builder and CG on two devices",
+                    gpu_kernels=selection.selected == "cupy",
+                    gpu_linear=True,
+                )
+        if resident_request != "0" and resident_eligible:
             from .Hartree.cupy_resident import CuPyResidentHartree
-            resident_hartree = stages.timed("resident_hartree", CuPyResidentHartree)(
-                native_boundary_builder,hartree_reduction,
-                poisson_solver.solver.backend,reference.input.hartree)
-            def accelerated_hartree(density,initial_potential=None,**kwargs):
-                started=perf_counter()
-                result=resident_hartree.solve(density,initial_potential,**kwargs)
-                implementation.statistics.hartree_solve_calls+=1
-                implementation.statistics.hartree_rhs_seconds+=resident_hartree.rhs_seconds
-                implementation.statistics.hartree_linear_solve_seconds+=resident_hartree.solve_seconds
-                implementation.statistics.hartree_total_seconds+=perf_counter()-started
-                return result
+
+            try:
+                resident_hartree = stages.timed("resident_hartree", CuPyResidentHartree)(
+                    native_boundary_builder,
+                    hartree_reduction,
+                    poisson_solver.solver.backend,
+                    reference.input.hartree,
+                )
+            except cuda_allocation_errors() as error:
+                if resident_request == "1":
+                    raise
+                resident_hartree = None
+                resident_reason = (
+                    f"auto: the chain could not be built ({type(error).__name__}: {error})"
+                )
+                if resident_built_here:
+                    host_boundary(
+                        "rebuilt: the resident chain could not be built",
+                        gpu_kernels=selection.selected == "cupy",
+                        gpu_linear=True,
+                    )
+            else:
+                if not resident_built_here:
+                    # A GPU boundary named by PARSEC_HARTREE_BOUNDARY_BACKEND.
+                    resident_reason = (
+                        f"{resident_prefix}: the GPU boundary and CG on the symmetry wedge "
+                        "of the SCF fields"
+                    )
+
+                def leave_chain():
+                    """The boundary of the route before, on the host, after an allocation failure."""
+
+                    host_boundary(
+                        "rebuilt on the host after an allocation failure of the resident chain",
+                        gpu_kernels=False,
+                        gpu_linear=False,
+                        tail_on_device=False,
+                    )
+                    return (
+                        ("hartree_backend", "native-boundary/cupy-linear"),
+                        ("hartree_boundary_kernel", _host_boundary_kernel(native_symmetry_boundary)),
+                        ("hartree_boundary_device_bytes", "0"),
+                        ("hartree_boundary_device", "host"),
+                        ("hartree_boundary_setup", boundary_setup_status),
+                    )
+
+                accelerated_hartree = _ResidentHartreeSolve(
+                    resident_hartree,
+                    accelerated_hartree,
+                    implementation.statistics,
+                    # move_atoms rebinds the tail in rows.
+                    tail=lambda: hartree_boundary_tail,
+                    poisson_solver=poisson_solver,
+                    named=resident_request == "1",
+                    leave=leave_chain,
+                )
+        if resident_hartree is None and resident_reason == planned_resident_reason and resident_wedge:
+            # Planned, but the Hartree solve changed at the join (a reduced
+            # solver that could not be built leaves the full grid): the plan
+            # again, with what was built.
+            _, resident_reason = _resident_hartree_plan(
+                resident_request,
+                linear_backend=hartree_linear_backend,
+                hartree_reduction=hartree_reduction,
+                orbital_decomposition=orbital_decomposition,
+                orbital_reduction=orbital_reduction,
+                boundary_builder_planned=native_boundary_builder is not None,
+            )
+            if resident_reason == planned_resident_reason:
+                resident_reason = f"{resident_prefix}: the boundary is built on the host"
 
         if symmetry_eigensolver is not None:
             # The memory rules of the sectors (state storage, shared bases)
@@ -4044,8 +4427,34 @@ def _prepare_single_point(
         ("hartree_linear_backend", _hartree_linear_report(
             selection, periodic=is_periodic, backend=hartree_linear_backend,
             reason=hartree_linear_reason)),
-        ("hartree_full_grid_transfer_policy", "device-resident" if resident_hartree is not None else "host-interface"),
-        ("hartree_resident_predictor", resident_hartree.predictor if resident_hartree is not None else "disabled"),
+        (
+            "hartree_full_grid_transfer_policy",
+            "device-resident" if resident_hartree is not None else "host-interface",
+        ),
+        (
+            "hartree_resident_predictor",
+            resident_hartree.predictor if resident_hartree is not None else "disabled",
+        ),
+        # PARSEC_CUPY_RESIDENT_HARTREE: whether the chain runs and why.
+        (
+            "hartree_resident_chain",
+            "not used (no Hartree solver on this rank)"
+            if sector_worker
+            else "not used (periodic cell)"
+            if is_periodic
+            else f"not used (the {selection.hartree_backend} Hartree solver of the selected backend)"
+            if selection.hartree_backend != "native"
+            else "off (the C++/OpenMP CG of a CPU run)"
+            if selection.selected != "cupy"
+            else f"on ({resident_reason})"
+            if resident_hartree is not None
+            else f"off ({resident_reason})",
+        ),
+        *(
+            (("hartree_resident_device_bytes", str(resident_hartree.device_bytes)),)
+            if resident_hartree is not None
+            else ()
+        ),
         *_hartree_boundary_details(
             reference, hartree_boundary_tail, native_boundary_builder
         ),
@@ -4641,11 +5050,16 @@ def _prepare_single_point(
     # ------------------------------------------------------------------
 
     def tail_maximum():
+        # The builder of the present structure: a resident chain that gave
+        # way rebuilds it on the host.
         return (
             hartree_boundary_tail.maximum
             if hartree_boundary_tail is not None
-            else native_boundary_builder.atomic_tail_maximum
-            if boundary_on_wedge_gpu or boundary_on_point_gpu
+            else getattr(native_boundary_builder, "atomic_tail_maximum", None)
+            if type(native_boundary_builder).__name__ in {
+                "CuPySymmetryMultipoleBoundaryBuilder",
+                "CuPyPointMultipoleBoundaryBuilder",
+            }
             else None
         )
 
@@ -5255,6 +5669,24 @@ def run_scf(
     if boundary_check:
         result.backend = replace(
             result.backend, details=result.backend.details + boundary_check
+        )
+    solver = getattr(system, "hartree_solver", None)
+    fallback = getattr(solver, "fallback", None)
+    if isinstance(fallback, str):
+        # The resident chain gave way to the route before during a solve.
+        changed = dict(getattr(solver, "fallback_details", ()))
+        changed.update(
+            hartree_resident_chain=fallback,
+            hartree_full_grid_transfer_policy="host-interface",
+            hartree_resident_predictor="disabled",
+        )
+        result.backend = replace(
+            result.backend,
+            details=tuple(
+                (name, changed.get(name, value))
+                for name, value in result.backend.details
+                if name != "hartree_resident_device_bytes"
+            ),
         )
     return result
 

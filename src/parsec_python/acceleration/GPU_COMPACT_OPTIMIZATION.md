@@ -40,8 +40,10 @@ keep 16 physical CPU cores fixed while varying GPU count.
 | `PARSEC_CUPY_RESIDENT_PREDICTOR` | `host` | Keep `host` for validated arithmetic |
 | `PARSEC_CUPY_RITZ_CONDITION` | `symmetric` | `svd` |
 
-`auto` residency is eligible
-only with the GPU boundary, GPU CG and the same scalar/Poisson symmetry wedge.
+`auto` residency (the default of the code since 2026-11-07, which then builds
+the boundary of the wedge on the GPU itself; `Hartree/GPU_HARTREE.md`) is
+eligible only with the GPU boundary, GPU CG and the same scalar/Poisson
+symmetry wedge.
 It leaves the original interface in place for native boundaries, asymmetric
 cases and other ineligible layouts. Forced `1` rejects an ineligible layout
 rather than mixing representations. The backend details record the selected

@@ -924,7 +924,8 @@ class BoundaryCheckSwitchTests(unittest.TestCase):
 class BoundaryKernelChoiceTests(unittest.TestCase):
     def choose(
         self, reduction, environment, *, gpu_kernels=False, orbit_table=True,
-        gpu_failure=None, tail_on_device=False, gpu_linear=None, **hartree
+        gpu_failure=None, tail_on_device=False, gpu_linear=None, resident_wedge=False,
+        **hartree
     ):
         """Build the boundary of a hydrogen reference under doubles of the builders.
 
@@ -933,7 +934,7 @@ class BoundaryKernelChoiceTests(unittest.TestCase):
         builder fail as it does where its table exceeds the storage limit,
         and ``gpu_failure`` is raised by the GPU builders.  ``tail_options``
         of the doubles holds the options of every tail in rows that was
-        asked for.
+        asked for, ``notes`` what the builder noted for the resident chain.
         """
 
         from types import SimpleNamespace
@@ -974,12 +975,14 @@ class BoundaryKernelChoiceTests(unittest.TestCase):
             patch.object(
                 driver_module, "_hartree_boundary_tail", side_effect=tail_in_rows),
         ):
+            doubles.notes = {}
             builder, symmetric, _cache, _seconds = (
                 driver_module._build_native_boundary_builder(
                     reference, reduction, symmetry_cache_directory=None,
                     symmetry_geometry_cache_info=None, device_id=3,
                     gpu_kernels=gpu_kernels, tail_on_device=tail_on_device,
-                    gpu_linear=gpu_linear))
+                    gpu_linear=gpu_linear, resident_wedge=resident_wedge,
+                    notes=doubles.notes))
         return builder, symmetric, doubles
 
     def unsupported_reduction(self, reduction):
@@ -1258,6 +1261,209 @@ class BoundaryKernelChoiceTests(unittest.TestCase):
         self.assertIs(builder, doubles.native_wedge.return_value)
         self.assertTrue(symmetric)
         doubles.full.assert_not_called()
+
+    def test_the_resident_chain_takes_the_wedge_kernels_in_place_of_the_orbit_table(
+        self,
+    ) -> None:
+        """Since 2026-11-07 the boundary of the chain's wedge is built on its GPU."""
+
+        reduction = AxisReflectionReduction.detect(
+            sphere_grid(), (Atom("H", (0.0, 0.0, 0.0)),))
+        default = {"PARSEC_HARTREE_BOUNDARY_BACKEND": ""}
+        legacy = {"boundary_tolerance": None}
+        for plan in ({}, legacy):
+            with self.subTest(engaged=not plan):
+                # The wedge kernels for PARSEC's boundary as for an engaged one.
+                builder, symmetric, doubles = self.choose(
+                    reduction, default, gpu_kernels=True, gpu_linear=True,
+                    resident_wedge=True, **plan)
+                self.assertIs(builder, doubles.wedge.return_value)
+                self.assertTrue(symmetric)
+                self.assertEqual(doubles.notes, {"resident_boundary": "gpu"})
+                doubles.native_wedge.assert_not_called()
+                doubles.full.assert_not_called()
+                # A named kernel of the wedge needs no named GPU boundary here.
+                builder, _, doubles = self.choose(
+                    reduction, {**default, "PARSEC_HARTREE_BOUNDARY_KERNEL": "wedge"},
+                    gpu_kernels=True, gpu_linear=True, resident_wedge=True, **plan)
+                self.assertIs(builder, doubles.wedge.return_value)
+        # Without axis reflections: the kernels of the plan (full grid for PARSEC's).
+        builder, symmetric, doubles = self.choose(
+            self.unsupported_reduction(reduction), default, gpu_kernels=True,
+            gpu_linear=True, resident_wedge=True, **legacy)
+        self.assertIs(builder, doubles.full.return_value)
+        self.assertFalse(symmetric)
+        # The host by name, the host CG, or a GPU builder that fails: the orbit table.
+        for environment, linear, failure in (
+            ({"PARSEC_HARTREE_BOUNDARY_BACKEND": "native"}, True, None),
+            ({**default, "PARSEC_HARTREE_BOUNDARY_KERNEL": "full"}, True, None),
+            (default, False, None),
+            (default, True, MemoryError("out of memory")),
+        ):
+            with self.subTest(environment=environment, linear=linear, failure=failure):
+                builder, symmetric, doubles = self.choose(
+                    reduction, environment, gpu_kernels=True, gpu_linear=linear,
+                    gpu_failure=failure, resident_wedge=True, **legacy)
+                self.assertIs(builder, doubles.native_wedge.return_value)
+                self.assertTrue(symmetric)
+                if failure is None:
+                    self.assertEqual(doubles.notes, {})
+                else:
+                    self.assertIn("MemoryError", doubles.notes["resident_boundary"])
+        # Without the chain the wedge keeps its orbit table, as before.
+        builder, _, doubles = self.choose(
+            reduction, default, gpu_kernels=True, gpu_linear=True, **legacy)
+        self.assertIs(builder, doubles.native_wedge.return_value)
+
+
+class ResidentChainRuleTests(unittest.TestCase):
+    """``PARSEC_CUPY_RESIDENT_HARTREE`` (auto by default since 2026-11-07)."""
+
+    def test_request_is_auto_by_default(self) -> None:
+        for raw, expected in ((None, "auto"), ("", "auto"), ("AUTO", "auto"), ("1", "1"), ("0", "0")):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, clean_environment(), clear=True):
+                    if raw is not None:
+                        os.environ["PARSEC_CUPY_RESIDENT_HARTREE"] = raw
+                    self.assertEqual(driver_module._resident_hartree_request(), expected)
+        with patch.dict(os.environ, {"PARSEC_CUPY_RESIDENT_HARTREE": "yes"}):
+            with self.assertRaisesRegex(ValueError, "PARSEC_CUPY_RESIDENT_HARTREE"):
+                driver_module._resident_hartree_request()
+
+    def test_plan_applies_to_the_gpu_cg_on_the_wedge_of_the_scf_fields(self) -> None:
+        from types import SimpleNamespace
+
+        reduction = SimpleNamespace(full_size=1000)
+        sectors = object()
+
+        def plan(request="auto", environment=None, **changes):
+            arguments = dict(
+                linear_backend="cupy", hartree_reduction=reduction,
+                orbital_decomposition=sectors, orbital_reduction=reduction,
+                boundary_builder_planned=True)
+            arguments.update(changes)
+            with patch.dict(os.environ, {**clean_environment(), **(environment or {})}, clear=True):
+                return driver_module._resident_hartree_plan(request, **arguments)
+
+        applies, reason = plan()
+        self.assertTrue(applies)
+        self.assertTrue(reason.startswith("auto: "))
+        self.assertTrue(plan("1")[0])
+        self.assertTrue(plan(environment={"PARSEC_HARTREE_BOUNDARY_BACKEND": "cupy"})[0])
+        self.assertTrue(plan(environment={
+            "PARSEC_HARTREE_BOUNDARY_BACKEND": "cupy",
+            "PARSEC_HARTREE_BOUNDARY_KERNEL": "full"})[0])
+        for request, environment, changes, words in (
+            ("0", None, {}, "PARSEC_CUPY_RESIDENT_HARTREE=0"),
+            ("auto", None, {"linear_backend": "native"}, "on the host"),
+            ("auto", None, {"hartree_reduction": None}, "full grid"),
+            ("auto", None, {"orbital_decomposition": None}, "orbitals"),
+            ("auto", None, {"orbital_reduction": SimpleNamespace(full_size=1000)}, "another wedge"),
+            ("auto", None, {"boundary_builder_planned": False}, "boundary builder"),
+            ("auto", {"PARSEC_HARTREE_BOUNDARY_BACKEND": "native"}, {}, "BOUNDARY_BACKEND=native"),
+            ("auto", {"PARSEC_HARTREE_BOUNDARY_KERNEL": "full"}, {}, "KERNEL=full"),
+        ):
+            with self.subTest(request=request, environment=environment, changes=changes):
+                applies, reason = plan(request, environment, **changes)
+                self.assertFalse(applies)
+                self.assertIn(words, reason)
+        large = SimpleNamespace(full_size=2**31)
+        applies, reason = plan(hartree_reduction=large, orbital_reduction=large)
+        self.assertFalse(applies)
+        self.assertIn("int32", reason)
+
+    def test_an_exhausted_device_hands_the_solves_to_the_host_interface(self) -> None:
+        from types import SimpleNamespace
+
+        history = [(np.arange(3.0), np.ones(3)), (np.arange(3.0) + 1, 2 * np.ones(3))]
+
+        class Chain:
+            rhs_seconds = solve_seconds = 0.5
+            released = False
+            device_id = 0
+
+            def __init__(self, failure=None):
+                self.failure = failure
+
+            def solve(self, density, initial_potential=None, **kwargs):
+                if self.failure is not None:
+                    raise self.failure
+                return SimpleNamespace(boundary_tail=None, label="chain")
+
+            def host_history(self):
+                return history
+
+            def release(self):
+                self.released = True
+
+        adopted = []
+        poisson = SimpleNamespace(solver=SimpleNamespace(adopt_history=adopted.append))
+        statistics = SimpleNamespace(
+            hartree_solve_calls=0, hartree_rhs_seconds=0.0,
+            hartree_linear_solve_seconds=0.0, hartree_total_seconds=0.0)
+        host_calls = []
+
+        def host_solve(density, initial_potential=None, **kwargs):
+            host_calls.append((density, initial_potential, kwargs))
+            return "host"
+
+        left = []
+
+        def leave():
+            left.append(None)
+            return (("hartree_boundary_kernel", "native wedge (C++ orbit table)"),)
+
+        def solver(chain, named=False):
+            return driver_module._ResidentHartreeSolve(
+                chain, host_solve, statistics, tail=lambda: None,
+                poisson_solver=poisson, named=named, leave=leave)
+
+        working = solver(Chain())
+        self.assertEqual(working("rho").label, "chain")
+        self.assertEqual(statistics.hartree_solve_calls, 1)
+        self.assertEqual(statistics.hartree_rhs_seconds, 0.5)
+        self.assertIsNone(working.fallback)
+        failing_chain = Chain(MemoryError("out of memory allocating 64 bytes"))
+        failing = solver(failing_chain)
+        self.assertEqual(failing("rho", "v0", max_iterations=7), "host")
+        self.assertEqual(host_calls, [("rho", "v0", {"max_iterations": 7})])
+        self.assertTrue(failing_chain.released)
+        self.assertIsNone(failing.chain)
+        self.assertEqual(adopted, [history])
+        self.assertIn("off from Hartree solve 1", failing.fallback)
+        self.assertIn("MemoryError", failing.fallback)
+        self.assertEqual(left, [None])
+        self.assertEqual(
+            failing.fallback_details,
+            (("hartree_boundary_kernel", "native wedge (C++ orbit table)"),))
+        # Every later solve takes the host interface.
+        self.assertEqual(failing("rho"), "host")
+        self.assertEqual(len(host_calls), 2)
+        # Asked for by name, the error stops the run; other errors always do.
+        with self.assertRaises(MemoryError):
+            solver(Chain(MemoryError("out of memory")), named=True)("rho")
+        with self.assertRaises(ValueError):
+            solver(Chain(ValueError("another wedge")))("rho")
+        try:
+            import cupy
+        except ImportError:
+            return
+        # A CUDA error of a failed allocation falls back; another one stops.
+        runtime = cupy.cuda.runtime.CUDARuntimeError
+        self.assertEqual(solver(Chain(runtime(2)))("rho"), "host")
+        with self.assertRaises(runtime):
+            solver(Chain(runtime(700)))("rho")
+
+    def test_a_host_solver_continues_the_predictor_of_the_chain(self) -> None:
+        from parsec_python.acceleration.Hartree.native_poisson import NativePoissonSolver
+
+        solver = NativePoissonSolver.__new__(NativePoissonSolver)
+        solver.adopt_history([(np.zeros(2), np.ones(2)), (np.ones(2), 2 * np.ones(2))])
+        np.testing.assert_array_equal(solver._previous_previous_rhs, np.zeros(2))
+        np.testing.assert_array_equal(solver._previous_solution, 2 * np.ones(2))
+        solver.adopt_history([(np.ones(2), np.ones(2))])
+        self.assertIsNone(solver._previous_previous_rhs)
+        np.testing.assert_array_equal(solver._previous_rhs, np.ones(2))
 
 
 @unittest.skipUnless(
@@ -1565,14 +1771,15 @@ class CuPyWedgeBoundaryTests(unittest.TestCase):
                         self.assertGreater(float(cp.abs(newer - older).max()), 0.0)
                         if builder is wedge_builder:
                             self.assertNotEqual(newer.data.ptr, builder.rhs.data.ptr)
-                    # A full-grid density takes the lazily uploaded maps.
+                    # A full-grid density: reduced on the host for a wedge
+                    # builder, which keeps no full-grid map on the device.
                     full_density = resident.solve(1.01 * density, None)
                     wedge_density = resident.solve(SymmetryScalarField(
                         reduction, 1.01 * density[reduction.representative_rows]), None)
                     np.testing.assert_allclose(
                         full_density.right_hand_side.values,
                         wedge_density.right_hand_side.values, rtol=0, atol=3e-12)
-                    self.assertIsNotNone(resident.members)
+                    self.assertEqual(resident.members is None, builder is wedge_builder)
 
 
     def test_driver_runs_the_engaged_boundary_on_every_builder(self) -> None:
@@ -1658,6 +1865,148 @@ class CuPyWedgeBoundaryTests(unittest.TestCase):
                     hosted.energies.total, wedge.energies.total, places=9)
                 np.testing.assert_allclose(
                     hosted.hartree_potential, wedge.hartree_potential, rtol=0, atol=1e-8)
+
+    def test_default_runs_the_resident_chain_and_falls_back_to_the_former_route(self) -> None:
+        # Since 2026-11-07: the GPU CG on the sector wedge takes the GPU
+        # boundary of that wedge and the resident chain by default; =0 and
+        # the native boundary by name give the route before, and a chain
+        # that cannot be built or runs out of memory gives way to it.
+        from parsec_python.acceleration.Hartree import cupy_resident
+
+        problem = hydrogen_problem(multipole_order=2)
+        problem = replace(
+            problem,
+            atoms=[Atom("H", 1.3 * position) for position in ARRANGEMENTS["D2"]],
+            scf=replace(problem.scf, max_iterations=4),
+        )
+
+        def run(**environment):
+            with patch.dict(
+                os.environ, {**clean_environment(), **environment}, clear=True
+            ):
+                system = driver_module.prepare_single_point(problem, backend="auto")
+                details = dict(system.backend_info.details)
+                return driver_module.run_scf(system), details
+
+        defaults = {}
+        for plan in ({}, {"PARSEC_HARTREE_BOUNDARY": "legacy"}):
+            with self.subTest(plan=plan):
+                default, details = run(**plan)
+                self.assertTrue(details["hartree_resident_chain"].startswith("on (auto"))
+                self.assertEqual(details["hartree_full_grid_transfer_policy"], "device-resident")
+                self.assertTrue(details["hartree_boundary_kernel"].startswith("wedge"))
+                self.assertEqual(details["hartree_backend"], "cupy-boundary/cupy-linear")
+                self.assertGreater(int(details["hartree_resident_device_bytes"]), 0)
+                former, former_details = run(PARSEC_CUPY_RESIDENT_HARTREE="0", **plan)
+                self.assertEqual(
+                    former_details["hartree_resident_chain"],
+                    "off (PARSEC_CUPY_RESIDENT_HARTREE=0)")
+                self.assertEqual(
+                    former_details["hartree_full_grid_transfer_policy"], "host-interface")
+                self.assertTrue(former_details["hartree_boundary_kernel"].startswith("native wedge"))
+                named, named_details = run(PARSEC_HARTREE_BOUNDARY_BACKEND="native", **plan)
+                self.assertIn("BOUNDARY_BACKEND=native", named_details["hartree_resident_chain"])
+                self.assertTrue(named_details["hartree_boundary_kernel"].startswith("native wedge"))
+                # The route before, bit for bit, either way.
+                np.testing.assert_array_equal(named.hartree_potential, former.hartree_potential)
+                self.assertEqual(named.energies, former.energies)
+                self.assertAlmostEqual(default.energies.total, former.energies.total, places=9)
+                np.testing.assert_allclose(
+                    default.hartree_potential, former.hartree_potential, rtol=0, atol=1e-8)
+                self.assertEqual(len(default.history), len(former.history))
+                defaults[bool(plan)] = default
+
+        # A chain that cannot be built: the orbit table again, as with =0.
+        with patch.object(
+            cupy_resident, "CuPyResidentHartree", side_effect=MemoryError("out of memory")
+        ):
+            rebuilt, rebuilt_details = run()
+        self.assertIn("could not be built (MemoryError", rebuilt_details["hartree_resident_chain"])
+        self.assertTrue(rebuilt_details["hartree_boundary_kernel"].startswith("native wedge"))
+        self.assertEqual(
+            rebuilt_details["hartree_boundary_setup"],
+            "rebuilt: the resident chain could not be built")
+        former, _ = run(PARSEC_CUPY_RESIDENT_HARTREE="0")
+        np.testing.assert_array_equal(rebuilt.hartree_potential, former.hartree_potential)
+        self.assertEqual(rebuilt.energies, former.energies)
+        # ... and by name it stops the run.
+        with patch.object(
+            cupy_resident, "CuPyResidentHartree", side_effect=MemoryError("out of memory")
+        ), self.assertRaises(MemoryError):
+            run(PARSEC_CUPY_RESIDENT_HARTREE="1")
+
+        # A solve that runs out of memory: the host interface from there on.
+        original = cupy_resident.CuPyResidentHartree.solve
+        calls = []
+
+        def exhausted(chain, *args, **kwargs):
+            calls.append(None)
+            if len(calls) == 2:
+                raise MemoryError("out of memory allocating 8 bytes")
+            return original(chain, *args, **kwargs)
+
+        with patch.object(cupy_resident.CuPyResidentHartree, "solve", exhausted):
+            switched, _ = run()
+        self.assertEqual(len(calls), 2)
+        switched_details = dict(switched.backend.details)
+        self.assertTrue(switched_details["hartree_resident_chain"].startswith(
+            "off from Hartree solve 2 (auto: MemoryError"))
+        # From there on the route before: the orbit table on the host.
+        self.assertEqual(switched_details["hartree_full_grid_transfer_policy"], "host-interface")
+        self.assertEqual(switched_details["hartree_resident_predictor"], "disabled")
+        self.assertNotIn("hartree_resident_device_bytes", switched_details)
+        self.assertTrue(switched_details["hartree_boundary_kernel"].startswith("native wedge"))
+        self.assertEqual(switched_details["hartree_boundary_device"], "host")
+        self.assertAlmostEqual(switched.energies.total, defaults[False].energies.total, places=9)
+        # An error that is no failed allocation stops the run.
+        import cupy
+
+        def broken(chain, *args, **kwargs):
+            raise cupy.cuda.runtime.CUDARuntimeError(700)  # an illegal address
+
+        with patch.object(cupy_resident.CuPyResidentHartree, "solve", broken):
+            with self.assertRaises(cupy.cuda.runtime.CUDARuntimeError):
+                run()
+
+    def test_a_single_device_other_than_the_first_holds_the_whole_chain(self) -> None:
+        # One GPU of the process that is not device 0 (--gpu-ids N): the
+        # boundary of the chain goes to the device of the CG, not to the
+        # default device of the boundary thread.
+        cp, _ = require_cupy()
+        device_count = cp.cuda.runtime.getDeviceCount()
+        if device_count < 2:
+            self.skipTest("requires at least two allocated GPUs")
+        problem = hydrogen_problem(multipole_order=2)
+        problem = replace(
+            problem,
+            atoms=[Atom("H", 1.3 * position) for position in ARRANGEMENTS["D2"]],
+            scf=replace(problem.scf, max_iterations=3),
+        )
+        last = str(device_count - 1)
+
+        def run(devices, **environment):
+            with patch.dict(
+                os.environ,
+                {**clean_environment(), "PARSEC_CUPY_DEVICES": devices, **environment},
+                clear=True,
+            ):
+                system = driver_module.prepare_single_point(problem, backend="auto")
+                details = dict(system.backend_info.details)
+                chain = system.hartree_solver.chain
+                self.assertEqual(chain.device_id, int(details["hartree_cg_device"]))
+                self.assertEqual(chain.builder.device_id, chain.backend.device_id)
+                return driver_module.run_scf(system), details
+
+        for environment in ({}, {"PARSEC_HARTREE_DEVICE": "off"}):
+            with self.subTest(environment=environment):
+                expected, _first = run("0", **environment)
+                actual, details = run(last, **environment)
+                self.assertEqual(
+                    (details["hartree_cg_device"], details["hartree_boundary_device"]),
+                    (last, last))
+                self.assertTrue(details["hartree_resident_chain"].startswith("on (auto"))
+                np.testing.assert_array_equal(actual.hartree_potential, expected.hartree_potential)
+                self.assertEqual(actual.energies, expected.energies)
 
     def test_wedge_builder_tail_and_chain_on_another_device_return_the_same_bits(
         self,

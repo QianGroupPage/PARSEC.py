@@ -119,13 +119,17 @@ and 39,368 on 16.
 These are the settings of the measured runs, not the defaults of the code.
 Unset, the ionic backend is `native`, the Hartree linear backend `auto`
 (the GPU CG of the series wherever the orbitals run on a GPU, since
-2026-11-07; `native` for the host CG of the code before) and the Hartree
-boundary the native builders on their orbit table of a symmetry wedge (the
-GPU kernels of the series where they have none, since the same day), the
+2026-11-07; `native` for the host CG of the code before), the resident
+Hartree chain `auto` (since the same day: on the wedge of the sectors the
+boundary on the GPU, with the wedge kernels whether the plan is engaged or
+not, where the series took the full-grid kernels for PARSEC's boundary; `0`
+for the orbit table on the host and the host interface of the code before)
+and the Hartree boundary elsewhere the native builders (the GPU kernels of
+the series where they have no orbit table, since the same day), the
 rotation is `allocate`, and the device random
 numbers, the filter graphs, the column-major filter, the native sector
 assembly, the generalized first Ritz step, the distributed filter, the
-recycled state, the resident Hartree chain and the stage timing are off: a
+recycled state and the stage timing are off: a
 run without them takes other routes than the measured ones.
 `PARSEC_NATIVE_PROJECTOR_LOOKUP=1` and `PARSEC_CUPY_RESIDENT_PREDICTOR=host`
 are the defaults, the Ritz condition follows the place of the small solve

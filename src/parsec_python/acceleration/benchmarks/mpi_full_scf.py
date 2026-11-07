@@ -184,6 +184,10 @@ _SERIAL_CONTROL_SETTINGS = {
     # before 2026-11-07 (a launcher that names cupy keeps it; with the device
     # entry above off, a GPU CG would lie on the first device of the sectors).
     'PARSEC_HARTREE_LINEAR_BACKEND': 'native',
+    # The host interface of the Hartree solve, the default before 2026-11-07
+    # (the device-resident chain needs the GPU CG; a launcher that names auto
+    # or 1 with it keeps the chain).
+    'PARSEC_CUPY_RESIDENT_HARTREE': '0',
     'PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS': '1',
     # The former recurrence kernel of the filter: the pipelined one gives the
     # same bits, and a defect of it would otherwise be in both sides.

@@ -894,10 +894,11 @@ can.
 For H2, H2O, CH4, CO, N2, O2 (triplet) and benzene with PBE0, HSE06, HSE03,
 B3LYP, B3LYP5, B3PW91 and HF, against Quantum ESPRESSO 7.5 with the same
 FHI98PP pseudopotentials and geometries, `E_hyb - E_PBE` agrees within
-`5e-5 Ry` in all 49 cases, the Fock energies `a_x E_x` within `6.5e-5 Ry`
-and the HOMOs within 1.9 meV (HSE03 against a reference derived from QE's
-HSE and libxc's HSE03, since QE has no HSE03 of this form). Inputs,
-references and tables: [`examples/0d_hybrid_functionals`](../../examples/0d_hybrid_functionals/).
+`9.4e-5 Ry` in all 49 cases (the largest, B3LYP and B3LYP5 of O2, are QE's
+cutoff error for LYP: `1.1e-5 Ry` against QE at 250 Ry), the Fock energies
+`a_x E_x` within `5.9e-5 Ry` and the HOMOs within 1.94 meV (HSE03 against
+a reference derived from QE's HSE and libxc's HSE03, since QE has no HSE03
+of this form). Inputs, references and tables: [`examples/0d_hybrid_functionals`](../../examples/0d_hybrid_functionals/).
 
 ## Spin polarization
 

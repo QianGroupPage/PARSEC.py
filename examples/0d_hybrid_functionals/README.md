@@ -19,7 +19,9 @@ python src\parsec_python\main.py examples\0d_hybrid_functionals\H2O\pbe0\parsec.
 
 The hybrid runs on the GPU with CuPy (`--device gpu`, the default when one is found); without CuPy the accelerated CLI routes the input to the reference solver, which is much slower at this grid. `parsec.out` is written beside the input; compare it with `parsec_python.out`.
 
-Settings of every input: grid spacing 0.16 bohr, sphere = largest atom distance from the centre + 10 bohr, finite-difference order 12, `Convergence_Criterion 1e-6 Ry`, `Cubic_Spline: .true.` for every species, `Exx_Tolerance 1e-8 Ry` (default 1e-6 Ry; tight for the comparison: the default changes the energies by < 1e-6 Ry). Everything else is the default: PBE start of the Fock loop, ACE of the `States_Num` orbitals, Kronecker-product pair solver, HSE06 with w = 0.11 1/bohr.
+Settings of every input: grid spacing 0.16 bohr, sphere = largest atom distance from the centre + 10 bohr, finite-difference order 12, `Convergence_Criterion 1e-6 Ry`, `Cubic_Spline: .true.` for every species, `Exx_Tolerance 1e-8 Ry` (default 1e-6 Ry; tight for the comparison: the default changes the energies by < 1e-6 Ry). Everything else is the default: PBE start of the Fock loop, ACE of the `States_Num` orbitals, Kronecker-product pair solver (the pair densities of the symmetry-sector orbitals in reflection-parity classes), `Exx_Inner_Criterion adaptive`, `Exx_Outer_Mixing diis`, HSE06 with w = 0.11 1/bohr; O2 keeps both spin channels in the symmetry sectors (`Spin_Symmetry_Sectors auto`).
+
+With the adaptive inner criterion the PBE start of a spin-unpolarized hybrid stops at a residual of 1e-4 Ry. The energy its log prints for the start (the last `Total Energy` before `Fock loop`, with the note that it is the energy of a start) is therefore not a converged PBE energy: here it lies 4.0e-08 to 1.4e-05 Ry above the energy of the `pbe` input (benzene the most). E_PBE in the tables below is always the energy of the `pbe` input. The O2 start (spin-polarized) runs to `Convergence_Criterion`: its printed energy equals E_PBE to the printed digits.
 
 ## PBE level
 
@@ -37,59 +39,61 @@ QE: 150 Ry, benzene 120 Ry (QE's H2O total at 150 Ry is 6e-5 Ry above its 250 Ry
 
 ## Hybrids against QE
 
-dE = E_hyb - E_PBE (Ry), each code at its own discretization; ddE = this code - QE; Fock = a_x E_x^HF of the final orbitals (Ry); HOMO in eV (O2: up / down channel). QE rows: internal `pbe0`, internal `hse` with `screening_parameter = 0.11`, libxc 402 / 475 / 401 for B3LYP / B3LYP5 / B3PW91, `hf`; HSE03 see below.
+dE = E_hyb - E_PBE (Ry), each code at its own discretization (this code: the `pbe` input); ddE = this code - QE; Fock = a_x E_x^HF of the final orbitals (Ry); HOMO in eV (O2: up / down channel). QE rows: internal `pbe0`, internal `hse` with `screening_parameter = 0.11`, libxc 402 / 475 / 401 for B3LYP / B3LYP5 / B3PW91, `hf`; HSE03 see below.
 
 | functional | molecule | dE this code | dE QE | ddE | Fock this code | Fock QE | HOMO this code | HOMO QE |
 |---|---|---|---|---|---|---|---|---|
-| pbe0 | H2 | -0.00613246 | -0.00613599 | +3.5e-06 | -0.32884144 | -0.32884726 | -12.0030 | -12.0031 |
-| pbe0 | H2O | +0.00543159 | +0.00540135 | +3.0e-05 | -1.96907648 | -1.96908409 | -9.0470 | -9.0473 |
-| pbe0 | CH4 | -0.01578129 | -0.01579183 | +1.1e-05 | -1.47996426 | -1.47996664 | -11.0057 | -11.0058 |
-| pbe0 | CO | +0.02213437 | +0.02213003 | +4.3e-06 | -2.33983048 | -2.33983251 | -10.7431 | -10.7436 |
-| pbe0 | N2 | +0.02828811 | +0.02828276 | +5.4e-06 | -2.24329567 | -2.24328729 | -12.1977 | -12.1982 |
-| pbe0 | C6H6 | +0.00192255 | +0.00190234 | +2.0e-05 | -5.73059037 | -5.73059923 | -7.2995 | -7.2996 |
-| pbe0 | O2 (triplet) | +0.04026927 | +0.04022361 | +4.6e-05 | -3.16306171 | -3.16306389 | -9.0153 / -12.9353 | -9.0165 / -12.9364 |
-| hse06 | H2 | -0.00510568 | -0.00510630 | +6.2e-07 | -0.26808890 | -0.26809615 | -11.5836 | -11.5836 |
-| hse06 | H2O | +0.00762621 | +0.00760713 | +1.9e-05 | -1.72403274 | -1.72404677 | -8.6321 | -8.6324 |
-| hse06 | CH4 | -0.01247447 | -0.01247594 | +1.5e-06 | -1.23633043 | -1.23633660 | -10.5917 | -10.5918 |
-| hse06 | CO | +0.02493897 | +0.02494017 | -1.2e-06 | -2.03395409 | -2.03395215 | -10.3273 | -10.3276 |
-| hse06 | N2 | +0.03110814 | +0.03111482 | -6.7e-06 | -1.93748234 | -1.93747648 | -11.7842 | -11.7846 |
-| hse06 | C6H6 | +0.01176413 | +0.01174862 | +1.6e-05 | -4.81796657 | -4.81797872 | -6.9028 | -6.9027 |
+| pbe0 | H2 | -0.00613246 | -0.00613599 | +3.5e-06 | -0.32884160 | -0.32884726 | -12.0030 | -12.0031 |
+| pbe0 | H2O | +0.00543159 | +0.00540135 | +3.0e-05 | -1.96907693 | -1.96908409 | -9.0470 | -9.0473 |
+| pbe0 | CH4 | -0.01578129 | -0.01579183 | +1.1e-05 | -1.47996468 | -1.47996664 | -11.0057 | -11.0058 |
+| pbe0 | CO | +0.02213437 | +0.02213003 | +4.3e-06 | -2.33983044 | -2.33983251 | -10.7431 | -10.7436 |
+| pbe0 | N2 | +0.02828811 | +0.02828276 | +5.4e-06 | -2.24329569 | -2.24328729 | -12.1977 | -12.1982 |
+| pbe0 | C6H6 | +0.00192255 | +0.00190234 | +2.0e-05 | -5.73059354 | -5.73059923 | -7.2995 | -7.2996 |
+| pbe0 | O2 (triplet) | +0.04026927 | +0.04022361 | +4.6e-05 | -3.16306350 | -3.16306389 | -9.0153 / -12.9353 | -9.0165 / -12.9364 |
+| hse06 | H2 | -0.00510568 | -0.00510630 | +6.2e-07 | -0.26808897 | -0.26809615 | -11.5836 | -11.5836 |
+| hse06 | H2O | +0.00762621 | +0.00760713 | +1.9e-05 | -1.72403282 | -1.72404677 | -8.6321 | -8.6324 |
+| hse06 | CH4 | -0.01247447 | -0.01247594 | +1.5e-06 | -1.23633052 | -1.23633660 | -10.5917 | -10.5918 |
+| hse06 | CO | +0.02493897 | +0.02494017 | -1.2e-06 | -2.03395456 | -2.03395215 | -10.3272 | -10.3276 |
+| hse06 | N2 | +0.03110814 | +0.03111482 | -6.7e-06 | -1.93748241 | -1.93747648 | -11.7842 | -11.7846 |
+| hse06 | C6H6 | +0.01176413 | +0.01174862 | +1.6e-05 | -4.81796759 | -4.81797872 | -6.9028 | -6.9027 |
 | hse06 | O2 (triplet) | +0.04313384 | +0.04310624 | +2.8e-05 | -2.79498170 | -2.79497840 | -8.6003 / -12.5192 | -8.6017 / -12.5203 |
-| hse03 | H2 | -0.04563330 | -0.04563432 | +1.0e-06 | -0.27069008 | -0.27069810 | -11.8640 | -11.8640 |
-| hse03 | H2O | -0.16327978 | -0.16329488 | +1.5e-05 | -1.73367886 | -1.73369653 | -8.9093 | -8.9096 |
-| hse03 | CH4 | -0.17677952 | -0.17679047 | +1.1e-05 | -1.24598170 | -1.24599087 | -10.8675 | -10.8676 |
-| hse03 | CO | -0.18688697 | -0.18688571 | -1.3e-06 | -2.04587396 | -2.04587594 | -10.6061 | -10.6065 |
-| hse03 | N2 | -0.18042801 | -0.18042079 | -7.2e-06 | -1.94922534 | -1.94922256 | -12.0678 | -12.0681 |
-| hse03 | C6H6 | -0.60499049 | -0.60503878 | +4.8e-05 | -4.85273757 | -4.85275277 | -7.1613 | -7.1611 |
-| hse03 | O2 (triplet) | -0.21600442 | -0.21604556 | +4.1e-05 | -2.80905320 | -2.80905330 | -8.8913 / -12.8013 | -8.8927 / -12.8024 |
-| b3lyp | H2 | -0.02680872 | -0.02681196 | +3.2e-06 | -0.26262181 | -0.26263902 | -11.8164 | -11.8156 |
-| b3lyp | H2O | -0.05079245 | -0.05074475 | -4.8e-05 | -1.57305814 | -1.57308427 | -8.8198 | -8.8190 |
-| b3lyp | CH4 | -0.04323489 | -0.04323551 | +6.2e-07 | -1.18350674 | -1.18352905 | -10.7773 | -10.7768 |
-| b3lyp | CO | -0.03600991 | -0.03598029 | -3.0e-05 | -1.87085529 | -1.87086635 | -10.5661 | -10.5657 |
-| b3lyp | N2 | -0.01997046 | -0.01992990 | -4.1e-05 | -1.79307212 | -1.79307506 | -12.0168 | -12.0165 |
-| b3lyp | C6H6 | -0.00961238 | -0.00963286 | +2.0e-05 | -4.58670744 | -4.58674653 | -7.0360 | -7.0354 |
-| b3lyp | O2 (triplet) | -0.04263789 | -0.04254443 | -9.3e-05 | -2.52868117 | -2.52872814 | -8.7539 / -12.7440 | -8.7531 / -12.7432 |
-| b3lyp5 | H2 | -0.01329455 | -0.01329778 | +3.2e-06 | -0.26253375 | -0.26255086 | -11.7248 | -11.7240 |
-| b3lyp5 | H2O | +0.00680291 | +0.00685061 | -4.8e-05 | -1.57282073 | -1.57284672 | -8.7279 | -8.7270 |
-| b3lyp5 | CH4 | +0.01252589 | +0.01252528 | +6.1e-07 | -1.18329640 | -1.18331869 | -10.6854 | -10.6848 |
-| b3lyp5 | CO | +0.03569400 | +0.03572351 | -3.0e-05 | -1.87060466 | -1.87061573 | -10.4739 | -10.4735 |
-| b3lyp5 | N2 | +0.05162333 | +0.05166384 | -4.1e-05 | -1.79284412 | -1.79284712 | -11.9236 | -11.9233 |
-| b3lyp5 | C6H6 | +0.20188216 | +0.20186172 | +2.0e-05 | -4.58619319 | -4.58623198 | -6.9456 | -6.9449 |
-| b3lyp5 | O2 (triplet) | +0.04403612 | +0.04412960 | -9.3e-05 | -2.52847657 | -2.52852392 | -8.6678 / -12.6415 | -8.6670 / -12.6407 |
-| b3pw91 | H2 | -0.02627809 | -0.02628176 | +3.7e-06 | -0.26358855 | -0.26360699 | -11.7624 | -11.7617 |
-| b3pw91 | H2O | -0.06939934 | -0.06941150 | +1.2e-05 | -1.57582005 | -1.57585112 | -8.7469 | -8.7463 |
-| b3pw91 | CH4 | -0.07562034 | -0.07563168 | +1.1e-05 | -1.18510404 | -1.18512474 | -10.7570 | -10.7565 |
-| b3pw91 | CO | -0.06880684 | -0.06879803 | -8.8e-06 | -1.87284661 | -1.87286506 | -10.4832 | -10.4829 |
-| b3pw91 | N2 | -0.06052324 | -0.06051616 | -7.1e-06 | -1.79576745 | -1.79577674 | -11.9068 | -11.9065 |
-| b3pw91 | C6H6 | -0.19687547 | -0.19690742 | +3.2e-05 | -4.58794954 | -4.58798564 | -7.1158 | -7.1152 |
-| b3pw91 | O2 (triplet) | -0.07640795 | -0.07640513 | -2.8e-06 | -2.53131004 | -2.53135931 | -8.6537 / -12.7328 | -8.6531 / -12.7323 |
-| hf | H2 | +0.06327050 | +0.06326826 | +2.2e-06 | -1.31607104 | -1.31610309 | -16.1763 | -16.1764 |
-| hf | H2O | +0.58000823 | +0.58000211 | +6.1e-06 | -7.90789804 | -7.90796261 | -13.7680 | -13.7692 |
-| hf | CH4 | +0.44473686 | +0.44472939 | +7.5e-06 | -5.93860900 | -5.93865321 | -14.8431 | -14.8434 |
-| hf | CO | +0.78937998 | +0.78940883 | -2.9e-05 | -9.39270547 | -9.39273655 | -15.0710 | -15.0715 |
-| hf | N2 | +0.82309906 | +0.82314955 | -5.0e-05 | -8.96341942 | -8.96339912 | -16.6711 | -16.6722 |
-| hf | C6H6 | +2.17024243 | +2.17025095 | -8.5e-06 | -22.95271541 | -22.95275275 | -9.1339 | -9.1340 |
-| hf | O2 (triplet) | +1.02027913 | +1.02026324 | +1.6e-05 | -12.70091348 | -12.70095410 | -15.0114 / -15.6669 | -15.0133 / -15.6676 |
+| hse03 | H2 | -0.04563330 | -0.04563432 | +1.0e-06 | -0.27069015 | -0.27069810 | -11.8640 | -11.8640 |
+| hse03 | H2O | -0.16327978 | -0.16329488 | +1.5e-05 | -1.73367950 | -1.73369653 | -8.9094 | -8.9096 |
+| hse03 | CH4 | -0.17677952 | -0.17679047 | +1.1e-05 | -1.24598219 | -1.24599087 | -10.8675 | -10.8676 |
+| hse03 | CO | -0.18688697 | -0.18688571 | -1.3e-06 | -2.04587370 | -2.04587594 | -10.6061 | -10.6065 |
+| hse03 | N2 | -0.18042801 | -0.18042079 | -7.2e-06 | -1.94922537 | -1.94922256 | -12.0678 | -12.0681 |
+| hse03 | C6H6 | -0.60499049 | -0.60503878 | +4.8e-05 | -4.85273892 | -4.85275277 | -7.1612 | -7.1611 |
+| hse03 | O2 (triplet) | -0.21600442 | -0.21604556 | +4.1e-05 | -2.80905336 | -2.80905330 | -8.8913 / -12.8013 | -8.8927 / -12.8024 |
+| b3lyp | H2 | -0.02680872 | -0.02681196 | +3.2e-06 | -0.26262190 | -0.26263902 | -11.8164 | -11.8156 |
+| b3lyp | H2O | -0.05079245 | -0.05074475 | -4.8e-05 | -1.57305840 | -1.57308427 | -8.8198 | -8.8190 |
+| b3lyp | CH4 | -0.04323489 | -0.04323551 | +6.2e-07 | -1.18350686 | -1.18352905 | -10.7773 | -10.7768 |
+| b3lyp | CO | -0.03600991 | -0.03598029 | -3.0e-05 | -1.87085538 | -1.87086635 | -10.5661 | -10.5657 |
+| b3lyp | N2 | -0.01997046 | -0.01992990 | -4.1e-05 | -1.79307215 | -1.79307506 | -12.0168 | -12.0165 |
+| b3lyp | C6H6 | -0.00961238 | -0.00963286 | +2.0e-05 | -4.58670899 | -4.58674653 | -7.0360 | -7.0354 |
+| b3lyp | O2 (triplet) | -0.04263789 | -0.04254443 | -9.3e-05 | -2.52868134 | -2.52872814 | -8.7539 / -12.7440 | -8.7531 / -12.7432 |
+| b3lyp5 | H2 | -0.01329455 | -0.01329778 | +3.2e-06 | -0.26253393 | -0.26255086 | -11.7248 | -11.7240 |
+| b3lyp5 | H2O | +0.00680291 | +0.00685061 | -4.8e-05 | -1.57282084 | -1.57284672 | -8.7279 | -8.7270 |
+| b3lyp5 | CH4 | +0.01252589 | +0.01252528 | +6.1e-07 | -1.18329651 | -1.18331869 | -10.6854 | -10.6848 |
+| b3lyp5 | CO | +0.03569400 | +0.03572351 | -3.0e-05 | -1.87060470 | -1.87061573 | -10.4739 | -10.4735 |
+| b3lyp5 | N2 | +0.05162333 | +0.05166384 | -4.1e-05 | -1.79284423 | -1.79284712 | -11.9236 | -11.9233 |
+| b3lyp5 | C6H6 | +0.20188216 | +0.20186172 | +2.0e-05 | -4.58619463 | -4.58623198 | -6.9456 | -6.9449 |
+| b3lyp5 | O2 (triplet) | +0.04403612 | +0.04412960 | -9.3e-05 | -2.52847706 | -2.52852392 | -8.6678 / -12.6415 | -8.6670 / -12.6407 |
+| b3pw91 | H2 | -0.02627809 | -0.02628176 | +3.7e-06 | -0.26358859 | -0.26360699 | -11.7624 | -11.7617 |
+| b3pw91 | H2O | -0.06939934 | -0.06941150 | +1.2e-05 | -1.57582525 | -1.57585112 | -8.7469 | -8.7463 |
+| b3pw91 | CH4 | -0.07562034 | -0.07563168 | +1.1e-05 | -1.18510379 | -1.18512474 | -10.7570 | -10.7565 |
+| b3pw91 | CO | -0.06880684 | -0.06879803 | -8.8e-06 | -1.87284668 | -1.87286506 | -10.4831 | -10.4829 |
+| b3pw91 | N2 | -0.06052324 | -0.06051616 | -7.1e-06 | -1.79576741 | -1.79577674 | -11.9068 | -11.9065 |
+| b3pw91 | C6H6 | -0.19687547 | -0.19690742 | +3.2e-05 | -4.58794965 | -4.58798564 | -7.1158 | -7.1152 |
+| b3pw91 | O2 (triplet) | -0.07640795 | -0.07640513 | -2.8e-06 | -2.53131037 | -2.53135931 | -8.6537 / -12.7328 | -8.6531 / -12.7323 |
+| hf | H2 | +0.06327050 | +0.06326826 | +2.2e-06 | -1.31608532 | -1.31610309 | -16.1763 | -16.1764 |
+| hf | H2O | +0.58000823 | +0.58000211 | +6.1e-06 | -7.90790413 | -7.90796261 | -13.7680 | -13.7692 |
+| hf | CH4 | +0.44473686 | +0.44472939 | +7.5e-06 | -5.93861804 | -5.93865321 | -14.8430 | -14.8434 |
+| hf | CO | +0.78937998 | +0.78940883 | -2.9e-05 | -9.39272897 | -9.39273655 | -15.0712 | -15.0715 |
+| hf | N2 | +0.82309906 | +0.82314955 | -5.0e-05 | -8.96341022 | -8.96339912 | -16.6711 | -16.6722 |
+| hf | C6H6 | +2.17024244 | +2.17025095 | -8.5e-06 | -22.95270204 | -22.95275275 | -9.1338 | -9.1340 |
+| hf | O2 (triplet) | +1.02027913 | +1.02026324 | +1.6e-05 | -12.70092375 | -12.70095410 | -15.0114 / -15.6670 | -15.0133 / -15.6676 |
+
+Over the table: |ddE| <= 9.4e-05 Ry, |Fock this code - Fock QE| <= 5.9e-05 Ry, |HOMO this code - HOMO QE| <= 1.94 meV. The totals are variational and reproduce to 1e-8 Ry between runs converged to `Exx_Tolerance 1e-8 Ry`; the Fock energies and the levels are first order in the orbitals and reproduce to about 3e-5 Ry and 3e-4 eV (the last digit of a HOMO can change from one such run to the next).
 
 Bound LUMOs (CO, N2, benzene, O2 down channel) agree within 2 meV for benzene and O2. Those of CO and N2 in the hybrids (-0.6 to -1.4 eV) are bound weakly enough to feel the sphere: +1 to +9 meV at 10 bohr of vacuum, +0.2 / +0.8 meV (PBE0) with 4 bohr more. The LUMOs of H2, H2O, CH4 are diffuse domain states in both codes and those of HF are box states: not compared.
 
@@ -132,12 +136,22 @@ Wall time of `main.py` (program wall, PBE start included) on one A100 of a share
 
 | molecule | grid points | PBE (s) | hybrids (s) | HF (s) | QE, hybrids and HF (s) |
 |---|---|---|---|---|---|
-| H2 | 1,252,368 | 19 | 23-32 | 30 | 53-158 |
-| H2O | 1,568,208 | 37 | 70-105 | 136 | 86-294 |
-| CH4 | 1,788,656 | 29 | 79-90 | 124 | 95-283 |
-| CO | 1,387,496 | 23 | 72-78 | 87 | 114-299 |
-| N2 | 1,376,312 | 14 | 30-47 | 54 | 99-258 |
-| C6H6 | 3,241,288 | 31 | 81-138 | 185 | 404-744 |
-| O2 (triplet) | 1,413,968 | 285 | 541-764 | 401 | 257-654 |
+| H2 | 1,252,368 | 6 | 9-17 | 11 | 53-158 |
+| H2O | 1,568,208 | 12 | 14-23 | 22 | 86-294 |
+| CH4 | 1,788,656 | 11 | 15-27 | 24 | 95-283 |
+| CO | 1,387,496 | 10 | 15-22 | 18 | 114-299 |
+| N2 | 1,376,312 | 8 | 12-21 | 14 | 99-258 |
+| C6H6 | 3,241,288 | 13 | 33-52 | 38 | 404-744 |
+| O2 (triplet) | 1,413,968 | 14 | 25-31 | 29 | 257-654 |
 
-Outer Fock iterations to an estimated exchange error below 1e-8 Ry: 3-4 for PBE0, HSE and B3*, the same as QE for PBE0 and HSE06 (QE starts the libxc hybrids from the functional without its exact exchange and HF from Slater exchange, and needs one or two more there); 6-12 for HF. O2 is slow because the two spin channels run on the full grid (no symmetry sectors); the exact exchange itself is a few seconds of each run.
+Outer Fock iterations to an estimated exchange error below 1e-8 Ry: 3-4 for PBE0, HSE and B3*, 6-7 for HF (QE, whose loop runs to 1e-10 Ry and starts the libxc hybrids from the functional without its exact exchange and HF from Slater exchange: 4-6 and 10-16). The table gives outer iterations / inner SCF iterations of the Fock loop (summed over its outer iterations); the PBE start takes 13-29 SCF iterations before them, the `pbe` input 20-44. The exact exchange itself (pair solves and ACE builds) is 0.3-21.8 s of a run.
+
+| molecule | pbe0 | hse06 | hse03 | b3lyp | b3lyp5 | b3pw91 | hf |
+|---|---|---|---|---|---|---|---|
+| H2 | 3 / 39 | 3 / 40 | 3 / 27 | 3 / 26 | 3 / 21 | 3 / 27 | 6 / 38 |
+| H2O | 4 / 35 | 3 / 25 | 3 / 29 | 3 / 23 | 3 / 37 | 4 / 30 | 7 / 62 |
+| CH4 | 4 / 29 | 4 / 47 | 4 / 42 | 4 / 36 | 4 / 37 | 4 / 32 | 7 / 75 |
+| CO | 4 / 39 | 4 / 44 | 4 / 44 | 4 / 32 | 4 / 31 | 4 / 31 | 7 / 44 |
+| N2 | 4 / 28 | 4 / 44 | 4 / 33 | 4 / 38 | 4 / 35 | 4 / 30 | 7 / 45 |
+| C6H6 | 4 / 41 | 4 / 51 | 4 / 41 | 4 / 48 | 4 / 46 | 4 / 44 | 7 / 57 |
+| O2 (triplet) | 4 / 43 | 4 / 52 | 4 / 44 | 4 / 43 | 4 / 47 | 4 / 39 | 7 / 52 |

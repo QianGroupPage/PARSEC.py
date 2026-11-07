@@ -924,7 +924,7 @@ class BoundaryCheckSwitchTests(unittest.TestCase):
 class BoundaryKernelChoiceTests(unittest.TestCase):
     def choose(
         self, reduction, environment, *, gpu_kernels=False, orbit_table=True,
-        gpu_failure=None, tail_on_device=False, **hartree
+        gpu_failure=None, tail_on_device=False, gpu_linear=None, **hartree
     ):
         """Build the boundary of a hydrogen reference under doubles of the builders.
 
@@ -978,7 +978,8 @@ class BoundaryKernelChoiceTests(unittest.TestCase):
                 driver_module._build_native_boundary_builder(
                     reference, reduction, symmetry_cache_directory=None,
                     symmetry_geometry_cache_info=None, device_id=3,
-                    gpu_kernels=gpu_kernels, tail_on_device=tail_on_device))
+                    gpu_kernels=gpu_kernels, tail_on_device=tail_on_device,
+                    gpu_linear=gpu_linear))
         return builder, symmetric, doubles
 
     def unsupported_reduction(self, reduction):
@@ -1223,6 +1224,40 @@ class BoundaryKernelChoiceTests(unittest.TestCase):
                     native_full(doubles, builder, symmetric, tailed=not hartree)
                     self.assertEqual(
                         doubles.native_full.call_args.args[1], 2 if hartree else 8)
+
+    def test_a_gpu_cg_takes_the_boundary_the_native_table_cannot(self) -> None:
+        """With the CG on the GPU no host recurrence over the full grid remains."""
+
+        reduction = AxisReflectionReduction.detect(
+            sphere_grid(), (Atom("H", (0.0, 0.0, 0.0)),))
+        default = {"PARSEC_HARTREE_BOUNDARY_BACKEND": ""}
+        legacy = {"boundary_tolerance": None}
+        for symmetry in (reduction, None):
+            with self.subTest(symmetry=symmetry is None):
+                # PARSEC's boundary, not engaged: the full-grid GPU kernels.
+                builder, symmetric, doubles = self.choose(
+                    symmetry, default, gpu_kernels=True, orbit_table=False,
+                    gpu_linear=True, **legacy)
+                self.assertIs(builder, doubles.full.return_value)
+                self.assertFalse(symmetric)
+                doubles.native_full.assert_not_called()
+                # The host CG, or the native boundary by name: the host builder.
+                for environment, linear in (
+                    (default, False),
+                    ({"PARSEC_HARTREE_BOUNDARY_BACKEND": "native"}, True),
+                    ({**default, "PARSEC_HARTREE_BOUNDARY_KERNEL": "full"}, True),
+                ):
+                    builder, symmetric, doubles = self.choose(
+                        symmetry, environment, gpu_kernels=True, orbit_table=False,
+                        gpu_linear=linear, **legacy)
+                    self.assertIs(builder, doubles.native_full.return_value)
+                    doubles.full.assert_not_called()
+        # An orbit table stays on the host, the GPU CG beside it.
+        builder, symmetric, doubles = self.choose(
+            reduction, default, gpu_kernels=True, gpu_linear=True, **legacy)
+        self.assertIs(builder, doubles.native_wedge.return_value)
+        self.assertTrue(symmetric)
+        doubles.full.assert_not_called()
 
 
 @unittest.skipUnless(
@@ -1924,10 +1959,19 @@ class CuPyWedgeBoundaryTests(unittest.TestCase):
         unnamed, unnamed_details = run(PARSEC_HARTREE_BOUNDARY_BACKEND="")
         self.assertTrue(unnamed_details["hartree_boundary_kernel"].startswith("points"))
         np.testing.assert_array_equal(unnamed.hartree_potential, point.hartree_potential)
+        # PARSEC's boundary, no plan engaged: with the CG on the GPU the
+        # full-grid kernels of the GPU take it in place of the host
+        # recurrences over the full grid (since 2026-11-07), with the host
+        # CG the native builder as before.
         legacy, legacy_details = run(
             PARSEC_HARTREE_BOUNDARY_BACKEND="", PARSEC_HARTREE_BOUNDARY="legacy")
-        self.assertTrue(legacy_details["hartree_boundary_kernel"].startswith("native full"))
+        self.assertTrue(legacy_details["hartree_boundary_kernel"].startswith("full"))
         self.assertGreater(abs(legacy.energies.total - point.energies.total), 1e-5)
+        host, host_details = run(
+            PARSEC_HARTREE_BOUNDARY_BACKEND="", PARSEC_HARTREE_BOUNDARY="legacy",
+            PARSEC_HARTREE_LINEAR_BACKEND="native")
+        self.assertTrue(host_details["hartree_boundary_kernel"].startswith("native full"))
+        self.assertAlmostEqual(host.energies.total, legacy.energies.total, places=9)
 
 
 @unittest.skipUnless(

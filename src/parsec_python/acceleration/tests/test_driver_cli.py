@@ -418,7 +418,7 @@ class PeriodicDriverTests(unittest.TestCase):
             ("PARSEC_HARTREE_BOUNDARY", "sometimes", "must be auto or legacy"),
             ("PARSEC_HARTREE_LPOLE", "many", "must be an integer"),
             ("PARSEC_HARTREE_BOUNDARY_KERNEL", "fast", "must be auto, full, or wedge"),
-            ("PARSEC_HARTREE_LINEAR_BACKEND", "fast", "must be native or cupy"),
+            ("PARSEC_HARTREE_LINEAR_BACKEND", "fast", "must be auto, native or cupy"),
         ):
             with (
                 self.subTest(switch=name),

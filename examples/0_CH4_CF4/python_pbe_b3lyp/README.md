@@ -44,8 +44,8 @@ in `../python_pbe`, and `analyze.py` reads it where the first is absent:
 
 | log of a run | kept copy | run |
 |---|---|---|
-| `parsec_gpu_hartree.out` | `parsec_gpu_hartree_python.out` | the command below with `PARSEC_HARTREE_LINEAR_BACKEND=cupy` (Poisson solves on the GPU); all four cases |
-| `parsec.out` | `parsec_python.out` | the command below with default settings (Poisson solves on the CPU); CH4 IS, CH4 FS_1s and CF4 IS |
+| `parsec_gpu_hartree.out` | `parsec_gpu_hartree_python.out` | the command below with `PARSEC_HARTREE_LINEAR_BACKEND=cupy` (Poisson solves on the GPU, the default since 2026-11-07); all four cases |
+| `parsec.out` | `parsec_python.out` | the command below with the default settings of then (Poisson solves on the CPU, now `PARSEC_HARTREE_LINEAR_BACKEND=native`); CH4 IS, CH4 FS_1s and CF4 IS |
 
 The default-settings run of CF4 FS_1s was stopped during its refinement,
 when other jobs on the machine had slowed its CPU Poisson solves to more
@@ -67,9 +67,11 @@ From one of the four case directories:
   --backend auto --symmetry auto --log parsec.out --no-archive
 ```
 
-Set `$env:PARSEC_HARTREE_LINEAR_BACKEND = "cupy"` before it to run the
-Poisson solves of the SCF and of the refinement on the GPU, which is six
-times faster per pair for CF4 (`--log parsec_gpu_hartree.out` for that log).
+On a GPU the Poisson solves of the SCF and of the refinement run there, the
+default since 2026-11-07, which is six times faster per pair for CF4 than
+the CPU (`--log parsec_gpu_hartree.out` for that log); set
+`$env:PARSEC_HARTREE_LINEAR_BACKEND = "native"` before the command to solve
+them on the CPU, as for `parsec_python.out`.
 After the four jobs:
 
 ```powershell
@@ -191,7 +193,7 @@ memory" the high-water mark of the process at the end of the run.
 
 With `PARSEC_HARTREE_LINEAR_BACKEND=cupy` (conjugate gradients in double
 precision on the GPU, for the Hartree potential of the SCF and for the pair
-densities):
+densities; the default since 2026-11-07):
 
 | case | grid points | SCF steps | SCF [s] | occupied orbitals | pair solves | refinement [s] | s per pair | whole run [s] | host memory [GiB] |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -200,8 +202,8 @@ densities):
 | CF4 IS | 3,103,688 | 40 | 456.6 | 16 | 136 | 210.3 | 1.526 | 680.2 | 11.22 |
 | CF4 FS_1s | 3,103,688 | 37 | 397.5 | 16 | 136 | 212.7 | 1.543 | 618.7 | 12.36 |
 
-Default settings (the same conjugate gradients in C++/OpenMP on 28
-threads):
+The default settings of then, now `PARSEC_HARTREE_LINEAR_BACKEND=native`
+(the same conjugate gradients in C++/OpenMP on 28 threads):
 
 | case | grid points | SCF steps | SCF [s] | occupied orbitals | pair solves | refinement [s] | s per pair | whole run [s] | host memory [GiB] |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|

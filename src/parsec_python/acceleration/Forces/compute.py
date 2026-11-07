@@ -112,6 +112,21 @@ def _spin_nonlocal_forces(system, channels, operator, atom_count: int) -> np.nda
     its device or in the result.
     """
 
+    sectors = getattr(system.backend, "symmetry_eigensolver", None)
+    if sectors is not None:
+        # Both channels in the symmetry sectors (Spin_Symmetry_Sectors): each
+        # channel's sector subspaces, half its occupations.
+        selections = []
+        for channel in channels:
+            representations = np.asarray(channel.representations, dtype=np.int32) - 1
+            selections.append(
+                (
+                    representations,
+                    sector_columns(representations),
+                    0.5 * np.asarray(channel.occupations, dtype=np.float64),
+                )
+            )
+        return _atom_sums(sectors.spin_projector_force_terms(selections), operator.labels, atom_count)
     gradients = system.projector_gradients()
     for_channel = getattr(system.eigenproblem_solver, "for_spin_channel", None)
     device_operator = getattr(system.backend, "device_operator", None)

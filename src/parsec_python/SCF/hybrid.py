@@ -97,6 +97,8 @@ from ..models import (
     SinglePointResult,
 )
 from ..V_xc.exact_exchange import OCCUPATION_THRESHOLD
+from .fock_controls import InnerCriterion, fock_loop_mixer, fractional_start, recording_hooks
+from .fock_diis import OccupiedBlock, OuterDIIS, OutputSet, orthonormal_complement
 from ..V_xc.exchange_operator import (
     CompressedExchange,
     apply_exchange_to_orbitals,
@@ -782,6 +784,129 @@ class HostExchange:
     def drop_orbitals(self, sets, result=None) -> None:
         """Nothing to drop: host orbitals pin no eigensolver memory."""
 
+    def occupied_blocks(self, sets) -> list:
+        """Copies of the occupied orbitals of each set (``Exx_Outer_Mixing: diis``), one block per set."""
+
+        blocks = []
+        for orbital_set in sets:
+            occupied = np.flatnonzero(orbital_set.occupations > OCCUPATION_THRESHOLD)
+            blocks.append(
+                {}
+                if not occupied.size
+                else {
+                    None: OccupiedBlock(
+                        np.array(orbital_set.orbitals[:, occupied]),
+                        np.array(orbital_set.occupations[occupied], dtype=np.float64),
+                    )
+                }
+            )
+        return blocks
+
+    def natural_sets(self, sets, natural):
+        """The orbital sets of natural orbitals ``natural`` and the empty states of ``sets``."""
+
+        return natural_orbital_sets(sets, natural)
+
+
+def natural_orbital_sets(sets, natural) -> tuple[OrbitalSet, ...]:
+    """Host :class:`OrbitalSet` of natural orbitals with their occupations, and the
+    empty states of ``sets`` orthonormalized against them (the ACE of an
+    extrapolated density matrix, :mod:`parsec_python.SCF.fock_diis`)."""
+
+    result = []
+    for orbital_set, blocks in zip(sets, natural):
+        empty = orbital_set.orbitals[:, orbital_set.occupations <= OCCUPATION_THRESHOLD]
+        phi, values = blocks.get(None, (None, np.zeros(0)))
+        if phi is None:
+            columns, occupations = empty, np.zeros(empty.shape[1])
+        else:
+            rest = orthonormal_complement(phi, empty) if empty.shape[1] else empty
+            columns = np.hstack([phi, rest])
+            occupations = np.concatenate([values, np.zeros(rest.shape[1])])
+        result.append(OrbitalSet(np.asarray(columns, dtype=np.float64), occupations, orbital_set.spin_weight))
+    return tuple(result)
+
+
+def _diis_sets(engine, diis, proposal, sets):
+    """The orbital sets of the extrapolated density matrix, or ``None`` (plain step)."""
+
+    try:
+        natural = diis.natural_orbitals(proposal)
+        if natural is None:
+            return None
+        natural_sets = engine.natural_sets(sets, natural)
+    except MemoryError:  # cupy.cuda.memory.OutOfMemoryError is one
+        _stop_diis(diis, "the extrapolated orbitals do not fit the device memory: plain steps from here")
+        return None
+    if natural_sets is None:
+        diis.last_note = "the extrapolated orbitals do not fit the sectors: plain step"
+    return natural_sets
+
+
+def _diis_operator(engine, diis, natural_sets, fraction):
+    """``(operator, applications)`` of the extrapolated density matrix from its orbital sets.
+
+    ``None`` when the build does not fit the devices: the window is freed and
+    the loop goes on with plain steps (a note in ``parsec.out``).
+    """
+
+    try:
+        applications = engine.exchange(natural_sets, columns="all")
+        operator = engine.fock_operator(natural_sets, applications, fraction)
+    except MemoryError:  # cupy.cuda.memory.OutOfMemoryError is one
+        engine.drop_orbitals(natural_sets)
+        _stop_diis(diis, "the extrapolated operator does not fit the device memory: plain steps from here")
+        return None
+    engine.drop_orbitals(natural_sets)
+    return operator, applications
+
+
+def _stop_diis(diis, note: str) -> None:
+    """Switch the outer DIIS off for the rest of the loop and free its window."""
+
+    diis.enabled = False
+    diis.last_note = note
+    diis.rollback = None
+    diis.clear()
+
+
+@dataclass(frozen=True)
+class _Spent:
+    """What an exchange evaluation took, without its arrays (pair solves, solver seconds)."""
+
+    pair_solves: int
+    poisson_seconds: float
+
+
+def _spent(applications) -> _Spent:
+    return _Spent(
+        int(sum(application.pair_solves for application in applications)),
+        float(sum(application.poisson_seconds for application in applications)),
+    )
+
+
+def _observe(
+    diis, engine, step: int, sets, source, error=None, energy=None, extrapolated=False, criteria=None, final_next=False
+) -> None:
+    """Hand the output of a loop to the outer DIIS: its orbitals are copied only
+    where the gate of an extrapolation is open (:meth:`OuterDIIS.judge`); a copy
+    that does not fit the devices stops DIIS."""
+
+    output = OutputSet(step, None, source, error, energy, extrapolated=extrapolated)
+    occupations = [np.asarray(orbital_set.occupations) for orbital_set in sets]
+    if not diis.judge(output, occupations, criteria, final_next):
+        return
+    # The oldest output goes before the copy of the new one: WINDOW copies at most.
+    diis.make_room()
+    try:
+        blocks = engine.occupied_blocks(sets)
+    except MemoryError:  # cupy.cuda.memory.OutOfMemoryError is one
+        blocks = None
+    if blocks is None:
+        _stop_diis(diis, "the DIIS window does not fit the device memory: plain steps from here")
+        return
+    diis.append(replace(output, channels=blocks))
+
 
 def run_hybrid_scf(
     system,
@@ -833,6 +958,18 @@ def run_hybrid_scf(
         keywords["convergence_criterion"] = convergence_criterion
     if iteration_state_callback is not None:
         keywords["iteration_state_callback"] = iteration_state_callback
+    # How the loop gets to its fixed point (parsec_python.SCF.fock_controls).
+    criteria = InnerCriterion(
+        adaptive=settings.inner_criterion == "adaptive",
+        final=float(scf.convergence_criterion if convergence_criterion is None else convergence_criterion),
+        tolerance=float(settings.tolerance),
+        use_plain=bool(getattr(scf, "use_plain_residual", False)),
+    )
+    mixer = fock_loop_mixer(system, settings, keywords)
+    recorded: list = []
+    diis = OuterDIIS(enabled=settings.outer_mixing == "diis", tolerance=float(settings.tolerance))
+    # The plain loop (fixed criterion, no DIIS) returns its eigenpairs as PARSEC does.
+    refine_levels = settings.inner_criterion == "adaptive" or settings.outer_mixing == "diis"
 
     def report(record: ExchangeLoopIteration) -> None:
         records.append(record)
@@ -850,28 +987,72 @@ def run_hybrid_scf(
     exchange_seconds = 0.0
 
     # 0. The orbitals the first operator is built from.
+    start_note = ""
     if carried is None:
         start_system = engine.start_system(system, definition)
-        start = run_scf(start_system, callback=callback, warm_start=warm_start, **keywords)
+        # Exx_Inner_Criterion: adaptive -- a spin-unpolarized start stops at
+        # START_CRITERION; one with a partly filled level then goes on to the
+        # criterion of the loop (parsec_python.SCF.fock_controls).
+        start_criterion = criteria.start_criterion(bool(scf.spin_polarized))
+        start = run_scf(
+            start_system,
+            callback=callback,
+            warm_start=warm_start,
+            **recording_hooks(
+                mixer,
+                system,
+                keywords if start_criterion is None else {**keywords, "convergence_criterion": start_criterion},
+                recorded,
+            ),
+        )
         history.extend(start.history)
         loops.append(_Timed(start.timings))
+        start_iterations = int(start.iterations)
+        if start_criterion is not None and start.converged and fractional_start(start):
+            start_note = (
+                f"partly filled levels after {start_iterations} iterations: the start goes on to "
+                f"a residual of {criteria.final:.2E} Ry"
+            )
+            start_criterion = None
+            start = run_scf(
+                start_system,
+                callback=callback,
+                warm_start=engine.next_warm_start(start_system, start),
+                **recording_hooks(mixer, system, keywords, recorded),
+            )
+            history.extend(start.history)
+            loops.append(_Timed(start.timings))
+            start_iterations += int(start.iterations)
+        if recorded:
+            mixer.seed(recorded[-1].pairs)
         sets = engine.orbital_sets(start)
         inner_start = engine.transition_warm_start(system, start)
-        start_iterations = int(start.iterations)
         start_functional = definition.start_functional
     else:
         sets = tuple(carried)
         inner_start = replace(warm_start, exchange_orbitals=None)
         start = None
+        start_criterion = None
         start_iterations = 0
         start_functional = None
     if len(sets) != (2 if scf.spin_polarized else 1):
         raise ValueError("the start orbitals do not match the spin channels of the system")
+    # A start stopped at START_CRITERION has left the path of the plain loop.
+    off_plain_path = start_criterion is not None
 
     # 1. The operator of the start orbitals.
     step_started = perf_counter()
+    # The operator is the ACE of the orbitals before (not of an extrapolated
+    # density matrix, Exx_Outer_Mixing): only such a loop can end the Fock loop.
+    plain = True
+    # Its density matrix is an extrapolation (a rejected one is taken back).
+    operator_extrapolated = False
     applications = engine.exchange(sets, columns="all")
     operator = engine.fock_operator(sets, applications, fraction)
+    if diis.enabled and start is not None:
+        # Y_0 of the outer DIIS (Exx_Outer_Mixing): the start (its numbers; no copy before the gate).
+        _observe(diis, engine, 0, sets, {})
+    source = {0: 1.0}
     # The orbitals of the start (or of the structure before a move) are not
     # read again: an engine whose orbitals are views of an eigensolver's
     # subspace lets them go before that subspace moves on.
@@ -909,6 +1090,8 @@ def run_hybrid_scf(
                 (channel.asymmetry for channel in operator.channels if channel is not None),
                 default=0.0,
             ),
+            inner_criterion=start_criterion,
+            outer_note=start_note,
         )
     )
 
@@ -917,14 +1100,27 @@ def run_hybrid_scf(
     inner = None
     exchange_energy = previous_energy
     for outer in range(1, settings.max_iterations + 1):
-        # 2. The inner SCF with the operator fixed.
+        # 2. The inner SCF with the operator fixed: at Convergence_Criterion, or
+        # (Exx_Inner_Criterion: adaptive) at a share of its first residual
+        # while the loop is far from converged; the last allowed one is exact.
+        share = None if outer == settings.max_iterations else criteria.share()
+        # An exact loop of the faster controls ends with its levels converged
+        # at its last Hamiltonian (to Exx_Tolerance) once the loop has left the
+        # path of the plain loop (a loose start or inner loop, a DIIS step):
+        # fewer SCF iterations filter the empty states less than those of the
+        # plain loop, and its orbitals may build the final operator or be the
+        # result.  On the plain path nothing is added.
+        levels = float(settings.tolerance) if share is None and refine_levels and off_plain_path else None
         inner = run_scf(
             system,
             callback=callback,
-            warm_start=inner_start,
+            warm_start=replace(inner_start, mixer=mixer, relative_criterion=share, level_tolerance=levels),
             exchange_term=operator,
             **keywords,
         )
+        level_detail = getattr(inner.timings, "detail", None) or {}
+        level_passes = int(level_detail.get("level_passes", 0))
+        level_change = float(level_detail.get("level_change", 0.0))
         history.extend(inner.history)
         loops.append(_Timed(inner.timings))
         sets = engine.orbital_sets(inner)
@@ -933,21 +1129,97 @@ def run_hybrid_scf(
         # columns only) and dexx.
         step_started = perf_counter()
         cross = engine.cross_energy(operator, sets)
+        operator_energy = float(operator.reference_energy)
         engine.release(operator)
         occupied_applications = engine.exchange(sets)
         exchange_energy = float(sum(application.energy for application in occupied_applications))
-        estimated_error = fraction * (2.0 * cross - previous_energy - exchange_energy)
+        # E_x(P0) of the operator's own density matrix: the orbitals of the loop
+        # before, or the natural orbitals of an extrapolated one (Exx_Outer_Mixing).
+        estimated_error = fraction * (2.0 * cross - operator_energy - exchange_energy)
         energies = energies_with_exchange(inner.energies, exchange_energy)
         inner = replace(inner, energies=energies)
-        converged = bool(estimated_error < settings.tolerance and inner.converged)
+        # An inexact inner loop never ends the Fock loop: below the tolerance
+        # after one, the next runs at Convergence_Criterion.  Nor one solved
+        # with the operator of another density matrix than its own loop
+        # before (an extrapolated one, Exx_Outer_Mixing, or the one a
+        # rejected extrapolation went back to): the stop test is dexx of a
+        # plain ACE of the orbitals before.
+        converged = bool(
+            estimated_error < settings.tolerance
+            and inner.converged
+            and criteria.tight(inner)
+            and plain
+        )
+        inner_criterion = criteria.threshold(inner, share) if criteria.adaptive and share is not None else None
+        if inner_criterion is not None and inner_criterion > criteria.final:
+            off_plain_path = True
+        criteria.observe(inner, estimated_error)
         last = converged or outer == settings.max_iterations
         ranks: tuple[int, ...] = ()
         asymmetry = 0.0
+        extrapolated = False
+        note = ""
         if not last:
-            # 1'. The operator of the new orbitals: the empty columns too.
-            applications = engine.exchange(sets, known=occupied_applications, columns="all")
-            operator = engine.fock_operator(sets, applications, fraction)
-            engine.drop_orbitals(sets, inner)
+            built = None
+            if diis.enabled:
+                # Exx_Outer_Mixing: diis -- an extrapolated density matrix where
+                # the guard of parsec_python.SCF.fock_diis lets it.
+                # The next loop is the last one Exx_Max_Iter allows: its operator
+                # must be the plain one, or it could not end the Fock loop.
+                final_next = outer + 1 >= settings.max_iterations
+                _observe(
+                    diis,
+                    engine,
+                    outer,
+                    sets,
+                    source,
+                    float(estimated_error),
+                    float(energies.total),
+                    extrapolated=operator_extrapolated,
+                    criteria=criteria,
+                    final_next=final_next,
+                )
+                back = diis.rollback
+                diis.rollback = None
+                if final_next:
+                    proposal = None
+                    if diis.enabled and (back is not None or len(diis.window) >= 3):
+                        diis.last_note = "the next loop is the last allowed: plain step"
+                elif back is not None:
+                    # A rejected extrapolation: the operator of the output it started from.
+                    proposal = {back: 1.0}
+                else:
+                    proposal = diis.proposal(criteria) if diis.enabled else None
+                natural_sets = None if proposal is None else _diis_sets(engine, diis, proposal, sets)
+                if natural_sets is not None:
+                    # W of the occupied columns (dexx) goes before the build.
+                    spent = _spent(occupied_applications)
+                    occupied_applications = None
+                    built = _diis_operator(engine, diis, natural_sets, fraction)
+                    natural_sets = None
+                    if built is None:
+                        # The build did not fit the devices: plain steps from here.
+                        occupied_applications = engine.exchange(sets)
+                note = diis.last_note
+            if built is not None:
+                operator, applications = built
+                applications = [*applications, spent]
+                engine.drop_orbitals(sets, inner)
+                source = dict(proposal)
+                operator_extrapolated = back is None
+                extrapolated = operator_extrapolated
+                off_plain_path = True
+                if operator_extrapolated:
+                    diis.steps_taken += 1
+                plain = False
+            else:
+                # 1'. The operator of the new orbitals: the empty columns too.
+                applications = engine.exchange(sets, known=occupied_applications, columns="all")
+                operator = engine.fock_operator(sets, applications, fraction)
+                engine.drop_orbitals(sets, inner)
+                source = {outer: 1.0}
+                operator_extrapolated = False
+                plain = True
             ranks = tuple(0 if channel is None else channel.rank for channel in operator.channels)
             asymmetry = max(
                 (channel.asymmetry for channel in operator.channels if channel is not None),
@@ -981,6 +1253,12 @@ def run_hybrid_scf(
                 operator_ranks=ranks,
                 pair_solver=solver_name,
                 operator_asymmetry=asymmetry,
+                inner_criterion=inner_criterion,
+                mixer_seeds=0 if mixer is None else mixer.seed_count,
+                extrapolated=extrapolated,
+                outer_note=note,
+                level_passes=level_passes,
+                level_change=level_change,
             )
         )
         if last:

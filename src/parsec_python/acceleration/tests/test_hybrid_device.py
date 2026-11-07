@@ -362,17 +362,23 @@ class DeviceFockLoopTests(_Inputs, unittest.TestCase):
             self.assertIsNone(operator.exchange_projectors)
 
     def test_spin_polarized_atom(self) -> None:
-        problem = self.problem(
-            "pbe0",
-            states=2,
-            atoms="  0.0 0.0 0.0\n",
-            species="Initial_Spin_Polarization: 1.0\n",
-            extra="Spin_Polarization: .true.\n" + TIGHT,
-        )
-        reference, _, accelerated, _ = self.both(problem)
-        self.check(reference, accelerated, energy=1e-12, levels=1e-12)
-        up, down = accelerated.spin
-        self.assertAlmostEqual(float(np.sum(up.occupations)), 1.0, places=8)
+        # Both channels on the full grid take the reference path's arithmetic
+        # to round-off; in the symmetry sectors (the default of a hybrid,
+        # Spin_Symmetry_Sectors: auto) the loop takes another SCF path, and
+        # E_x and the levels agree to first order in the SCF residual.
+        for sectors, tolerances in (("off", dict(energy=1e-12, levels=1e-12)), ("auto", {})):
+            problem = self.problem(
+                "pbe0",
+                states=2,
+                atoms="  0.0 0.0 0.0\n",
+                species="Initial_Spin_Polarization: 1.0\n",
+                extra="Spin_Polarization: .true.\n" + TIGHT + f"Spin_Symmetry_Sectors: {sectors}\n",
+            )
+            reference, system, accelerated, _ = self.both(problem)
+            self.assertEqual(getattr(system.backend, "symmetry_eigensolver", None) is not None, sectors == "auto")
+            self.check(reference, accelerated, **tolerances)
+            up, down = accelerated.spin
+            self.assertAlmostEqual(float(np.sum(up.occupations)), 1.0, places=8)
 
     def test_screened_and_two_kernel_hybrids(self) -> None:
         for functional in ("hse06", "cam-b3lyp"):

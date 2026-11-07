@@ -182,8 +182,6 @@ class _HybridEvaluatorBase(_DeviceEvaluatorBase):
 
         if not device_grid_supported(grid):
             raise ValueError("the device XC evaluators need a cluster or orthorhombic grid")
-        if self.spin_polarized and reducer is not None:
-            raise ValueError("the spin channels are evaluated on the full grid")
         weights, omegas = component_parameters(functional.semilocal)
         cp, _ = require_cupy()
         self._cp = cp
@@ -273,10 +271,12 @@ class DeviceHybridXCEvaluator(_HybridEvaluatorBase):
 
 
 class DeviceSpinHybridXCEvaluator(_HybridEvaluatorBase):
-    """``evaluator(valence_up, valence_down) -> SpinXCResult`` on a device (full grid, Rydberg).
+    """``evaluator(valence_up, valence_down) -> SpinXCResult`` on a device (Rydberg).
 
     The counterpart of :func:`parsec_python.V_xc.hybrid.hybrid_semilocal_xc_spin`
-    (each channel sees half of the frozen core density).
+    (each channel sees half of the frozen core density): full-grid channels,
+    or with ``reducer`` the orbit fields of a spin loop in the symmetry
+    sectors, as :class:`.device_xc.DeviceSpinXCEvaluator` takes them.
     """
 
     spin_polarized = True
@@ -325,9 +325,9 @@ class DeviceSpinHybridXCEvaluator(_HybridEvaluatorBase):
             potential_down = self.geometry.adjoint(cp, kernels, flux_down, f_down, 2.0)
             total_energy = self._integral(energy_density)
             return SpinXCResult(
-                potential_up=cp.asnumpy(potential_up),
-                potential_down=cp.asnumpy(potential_down),
-                energy_density=cp.asnumpy(energy_density),
+                potential_up=self._field(potential_up),
+                potential_down=self._field(potential_down),
+                energy_density=self._field(energy_density),
                 total_energy=total_energy,
             )
 

@@ -47,7 +47,12 @@ The example holds native CPU work at 14 threads for comparable 1/2/4-GPU
 tests. Additional CPUs allocated by Slurm are not automatically additional
 workers. More OpenMP or BLAS threads can be slower; benchmark the chosen system.
 `--backend auto` enables native Hartree with GPU orbitals when both backends
-are installed. Check the reported backend and fallback reasons.
+are installed; since 2026-11-07 the conjugate gradients of that Hartree solve
+run on one GPU of the process (`hartree_backend =
+native-boundary/cupy-linear`, `PARSEC_HARTREE_LINEAR_BACKEND`,
+`Hartree/GPU_HARTREE.md`), and so do the boundary values where the host has
+no orbit table for them (full grid); a symmetry wedge keeps them on the
+host. Check the reported backend and fallback reasons.
 
 ### Several nodes
 
@@ -112,8 +117,12 @@ electrons on 1, 4 and 16 GPUs, 14,680 on 4, 23,768 on 8 and 16, 29,576 on 8
 and 39,368 on 16.
 
 These are the settings of the measured runs, not the defaults of the code.
-Unset, the ionic backend, the Hartree linear backend and the Hartree boundary
-backend are `native`, the rotation is `allocate`, and the device random
+Unset, the ionic backend is `native`, the Hartree linear backend `auto`
+(the GPU CG of the series wherever the orbitals run on a GPU, since
+2026-11-07; `native` for the host CG of the code before) and the Hartree
+boundary the native builders on their orbit table of a symmetry wedge (the
+GPU kernels of the series where they have none, since the same day), the
+rotation is `allocate`, and the device random
 numbers, the filter graphs, the column-major filter, the native sector
 assembly, the generalized first Ritz step, the distributed filter, the
 recycled state, the resident Hartree chain and the stage timing are off: a
@@ -1159,6 +1168,37 @@ its eigensolver stays on one. The exchange's device bytes enter the memory
 rules of the sectors above (states are spilled to the host where they and
 the exchange do not fit), and a build that cannot hold `W = V_x Psi` is
 refused with the numbers. The MPI runner and `--mpi` refuse hybrids.
+
+A spin-polarized run in the sectors (`Spin_Symmetry_Sectors: auto`, the
+default; `../README.md`, "Spin channels in the symmetry sectors")
+places the sectors on the devices as an unpolarized run does; both channels
+use the same sector operators and devices, one after the other, each with
+its own subspace there. The memory rules count the subspaces of both
+channels, and sector states spilled to the host take the former staging
+(no persistent host buffers, which are one per sector). Without the sectors
+(`off`, or a run the symmetry guard sends to the full grid) both channels
+stay on one device.
+
+The pair densities of sector orbitals are solved in reflection-parity
+classes on the octant of the Kronecker box (`../README.md`): a tile gathers
+its two blocks from their sectors into the coset form (the values at the
+images `h r` of the octant points `r` under one sign operation `h` per coset
+of the group, `N/g` rows per column instead of `N`), forms the class
+densities and both blocks' `W` there with two CUDA kernels, and folds `W`
+into the sectors by one gather; no device holds a full-grid block or the
+full-box Kronecker plan. `PARSEC_CUPY_EXCHANGE_PARITY=off` (default `auto`)
+unfolds the blocks to the full grid as before. The class densities are
+written by their kernel straight onto the octant box, which is then the
+right-hand side of the class solve in place (no scatter);
+`PARSEC_CUPY_EXCHANGE_PARITY_BOX=0` (default 1) forms them on the octant
+points and lets the solve scatter them (comparisons; about 8 % slower).
+Measured on A100 (PBE0 of the nanodiamond inputs of `examples/0d_nanodiamonds`,
+D2, four sectors; full-grid path -> parity classes): an ACE build of k04 76.0
+-> 12.0 s on one GPU and 19.5 -> 3.7 s on four, k05 183 -> 34 s on four; the
+whole k04 run 386 -> 100 s (one GPU) and 111 -> 38 s (four), k05 1174 -> 277 s
+(four); peak device memory lower in every case. Energies agree with the
+full-grid path within the round-off of the Kronecker solver (1e-11 to 8e-10
+Ry, `acceleration/benchmarks/exchange_parity.py` for the builds alone).
 
 Record the GPU model, active GPU count, allocated and active CPU counts,
 precision, input hashes, code revision, iterations, and peak memory. Separate

@@ -79,13 +79,39 @@ from .single_point import (
     hubbard_iteration_record,
     hubbard_terms_of_iteration,
     iteration_eigensolver_fields,
+    loop_criterion,
     preconditioner_neighbors,
+    refine_levels,
     refuse_exchange_hooks,
     require_reference_hooks,
+    warm_start_mixer,
 )
 
 
 SPIN_NAMES = ("up", "down")
+#: Levels up to this far (Ry) above the Fermi level enter the convergence of a
+#: start spectrum that a reduced adapter asks to solve again (test 1 of
+#: acceleration/SCF/spin_sectors.py: the spread bound of its multiplets).
+START_LEVEL_WINDOW = 3.0e-2
+
+
+def _spin_occupations(eigenvalues, system, settings):
+    """One Fermi level for both channels (or the occupations of ``occup.in``)."""
+
+    if settings.fixed_occupations is None:
+        return spin_fermi_occupations(
+            eigenvalues[0],
+            eigenvalues[1],
+            system.electron_count,
+            settings.fermi_temperature_kelvin,
+        )
+    return spin_fixed_occupations(
+        eigenvalues[0],
+        eigenvalues[1],
+        system.electron_count,
+        settings.fixed_occupations,
+        settings.fixed_occupations_down,
+    )
 
 
 def _channel_solvers(eigenproblem_solver) -> tuple[Callable[..., object], ...]:
@@ -133,13 +159,24 @@ class SpinOrbitalBlocks:
         return 2
 
     def to_full_host(self) -> np.ndarray:
-        """Download both blocks into one host array, up first."""
+        """Download both blocks into one host array, up first.
+
+        A block that exports itself (``to_full_host``: the orbitals of the
+        symmetry sectors of an accelerated loop) is asked to.
+        """
 
         host = np.empty(self.shape, dtype=np.float64)
         column = 0
         for block in self.blocks:
+            export = getattr(block, "to_full_host", None)
             download = getattr(block, "get", None)
-            values = download() if callable(download) else np.asarray(block)
+            values = (
+                export()
+                if callable(export)
+                else download()
+                if callable(download)
+                else np.asarray(block)
+            )
             host[:, column : column + values.shape[1]] = values
             column += values.shape[1]
         return host
@@ -148,6 +185,9 @@ class SpinOrbitalBlocks:
         """Join the two blocks with the array library they belong to."""
 
         up, down = self.blocks
+        if callable(getattr(up, "to_full_device", None)):
+            # The orbitals of the symmetry sectors: each channel expands itself.
+            up, down = up.to_full_device(), down.to_full_device()
         library = sys.modules.get(type(up).__module__.split(".")[0])
         stack = getattr(library, "hstack", None)
         if stack is None:
@@ -191,11 +231,20 @@ def run_spin_scf(
     dispatches here.  ``eigenproblem_solver`` and ``orbital_density_builder``
     are the execution hooks of the accelerated package.  The hooks of a
     symmetry-reduced backend, which keep scalar fields on one value per
-    orbit, have no spin-polarized counterpart and are refused.
+    orbit, are accepted from an adapter made for two channels
+    (``scalar_field_adapter.spin_hooks()``, the symmetry sectors of the
+    accelerated driver with ``Spin_Symmetry_Sectors``): its mixer takes the
+    two channels' orbit values joined, up first, and its residual norms and
+    energy take the per-channel arguments of
+    :func:`parsec_python.Mixer.spin_potential_residual_metrics` and
+    :func:`parsec_python.Energy.spin_total_energy`.  Other reduced hooks are
+    refused.  Such an adapter may also check the occupations of the result
+    of a loop without an exchange operator (``check_spin_result``).
 
     The returned result holds the two channels in ``spin`` and describes
     them together in its other fields, as
-    :class:`parsec_python.models.SinglePointResult` documents.
+    :class:`parsec_python.models.SinglePointResult` documents; its fields are
+    full-grid arrays also where the loop kept them on the orbits.
     """
 
     reduced_hooks = {
@@ -206,11 +255,23 @@ def run_spin_scf(
     }
     given = [name for name, hook in reduced_hooks.items() if hook is not None]
     if given:
-        raise NotImplementedError(
-            "a spin-polarized calculation keeps its scalar fields on the full "
-            "grid; the symmetry-reduced SCF hooks are not available for it "
-            f"({', '.join(given)})"
-        )
+        spin_hooks = getattr(scalar_field_adapter, "spin_hooks", None)
+        expected = spin_hooks() if callable(spin_hooks) else None
+        if expected is None or any(reduced_hooks[name] != hook for name, hook in expected.items()):
+            raise NotImplementedError(
+                "a spin-polarized calculation keeps its scalar fields on the full "
+                "grid; the symmetry-reduced SCF hooks are not available for it "
+                "unless an adapter of two channels gives them "
+                f"({', '.join(given)})"
+            )
+    reduced = scalar_field_adapter is not None
+    to_internal = (lambda values: values) if not reduced else scalar_field_adapter.from_full
+    to_public = (lambda values: values) if not reduced else scalar_field_adapter.to_full
+    evaluate_residual_metrics = (
+        spin_potential_residual_metrics if residual_metrics_evaluator is None else residual_metrics_evaluator
+    )
+    evaluate_total_energy = spin_total_energy if total_energy_evaluator is None else total_energy_evaluator
+    build_mixer = make_mixer if mixer_factory is None else mixer_factory
     if system.initial_spin_densities is None and warm_start is None:
         raise ValueError(
             "the system was not prepared for a spin-polarized calculation: "
@@ -233,8 +294,9 @@ def run_spin_scf(
     hubbard_state = None
 
     scf_start = time.perf_counter()
+    level_detail = None
     solvers = _channel_solvers(eigenproblem_solver)
-    ionic_potential = system.ionic_potential
+    ionic_potential = to_internal(system.ionic_potential)
     volume_element = system.grid.volume_element
     number_of_states = _number_of_states(system)
     settings = system.input.scf
@@ -256,12 +318,14 @@ def run_spin_scf(
     if warm_start is None:
         stage_start = time.perf_counter()
         initial_hartree = system.solve_hartree(
-            system.initial_density.copy(), initial_potential=-ionic_potential
+            to_internal(system.initial_density.copy()), initial_potential=-ionic_potential
         )
         initial_hartree_seconds = time.perf_counter() - stage_start
         hartree_potential = initial_hartree.potential
         stage_start = time.perf_counter()
-        xc = system.evaluate_spin_xc(*system.initial_spin_densities)
+        xc = system.evaluate_spin_xc(
+            *(to_internal(density) for density in system.initial_spin_densities)
+        )
         initial_xc_seconds = time.perf_counter() - stage_start
         input_potentials = [
             ionic_potential + hartree_potential + xc_potential
@@ -273,19 +337,32 @@ def run_spin_scf(
         # start of the first Poisson solve, and the saved subspaces.
         initial_hartree_seconds = 0.0
         initial_xc_seconds = 0.0
-        hartree_potential = np.array(warm_start.hartree_potential, dtype=np.float64)
+        hartree_potential = to_internal(
+            np.array(warm_start.hartree_potential, dtype=np.float64)
+        )
         if len(warm_start.input_potential) != 2:
             raise ValueError(
                 "a spin-polarized warm start needs the potentials of both channels"
             )
         input_potentials = [
-            np.array(potential, dtype=np.float64)
+            to_internal(np.array(potential, dtype=np.float64))
             for potential in warm_start.input_potential
         ]
         states = warm_start.eigensolver_state
         eigval_states = [None, None] if states is None else list(states)
 
-    mixer = make_mixer(system.input.mixing)
+    # The mixer a warm start carries (the Fock loop's Exx_Mixer_History), else a new one.
+    mixer = warm_start_mixer(warm_start, lambda: build_mixer(system.input.mixing))
+    if reduced:
+        # The orbit values of both channels, up first, and back.
+        join_channels = scalar_field_adapter.join_channels
+        split_channels = scalar_field_adapter.split_channels
+    else:
+        join_channels = np.concatenate
+
+        def split_channels(mixed):
+            return [mixed[:grid_size].copy(), mixed[grid_size:].copy()]
+
     history: list[SCFIteration] = []
     filter_degree = eigensolver_settings.filter_degree
     minimum_filter_degree = max(10, eigensolver_settings.filter_degree_delta + 1)
@@ -312,7 +389,20 @@ def run_spin_scf(
     xc_total = 0.0
     mixing_energy_total = 0.0
 
-    for iteration in range(1, settings.max_iterations + 1):
+    # SCFWarmStart.level_tolerance (run_scf): one more iteration on the same V_in.
+    level_tolerance = None if warm_start is None else getattr(warm_start, "level_tolerance", None)
+    refining = False
+    # Test 2 of a reduced loop (acceleration/SCF/spin_sectors.py): the
+    # criterion is tightened while the asymmetry of a converged state looks
+    # like SCF noise; the loop counts as converged once the given criterion
+    # was met.
+    criterion_scale = 1.0
+    symmetry_tightenings = 0
+    last_asymmetry = None
+    met_criterion = False
+    for iteration in range(1, settings.max_iterations + 1 + int(level_tolerance is not None)):
+        if iteration > settings.max_iterations and not refining:
+            break
         iteration_start = time.perf_counter()
         last_input_potentials = [potential.copy() for potential in input_potentials]
         eigval_settings = eigval_settings_for(
@@ -356,12 +446,37 @@ def run_spin_scf(
             hamiltonian_operator = operator_factory()
             hamiltonian_binding_seconds += time.perf_counter() - binding_start
             diagonalization_start = time.perf_counter()
-            eigensolution = solvers[spin](
-                hamiltonian_operator,
-                number_of_states,
-                settings=eigval_settings,
-                state=eigval_states[spin],
-            )
+            if reduced:
+                # The sector views of the channel's last orbitals are no state
+                # once its next solve begins (as in run_scf).
+                release = getattr(wavefunctions[spin], "release_intermediate_storage", None)
+                if callable(release):
+                    release()
+            if refining:
+                # The loop converged at the iteration before (run_scf).
+                eigensolution, passes, seconds, change = refine_levels(
+                    solvers[spin],
+                    hamiltonian_operator,
+                    number_of_states,
+                    eigval_settings,
+                    eigval_states[spin],
+                    eigenvalues[spin],
+                    None,
+                    float(level_tolerance),
+                    release=reduced,
+                )
+                level_detail = {
+                    "level_passes": float(passes) + (level_detail or {}).get("level_passes", 0.0),
+                    "level_seconds": float(seconds) + (level_detail or {}).get("level_seconds", 0.0),
+                    "level_change": max(float(change), (level_detail or {}).get("level_change", 0.0)),
+                }
+            else:
+                eigensolution = solvers[spin](
+                    hamiltonian_operator,
+                    number_of_states,
+                    settings=eigval_settings,
+                    state=eigval_states[spin],
+                )
             eigval_states[spin] = eigensolution.state
             solver_counts.append(getattr(eigensolution, "iterative_counts", None))
             diagonalization_seconds += time.perf_counter() - diagonalization_start
@@ -385,25 +500,71 @@ def run_spin_scf(
 
         # 3. One Fermi level for both channels, then the density of each.
         occupations_density_start = time.perf_counter()
-        occupation_result = (
-            spin_fermi_occupations(
-                eigenvalues[0],
-                eigenvalues[1],
-                system.electron_count,
-                settings.fermi_temperature_kelvin,
-            )
-            if settings.fixed_occupations is None
-            else spin_fixed_occupations(
-                eigenvalues[0],
-                eigenvalues[1],
-                system.electron_count,
-                settings.fixed_occupations,
-                settings.fixed_occupations_down,
-            )
-        )
+        occupation_result = _spin_occupations(eigenvalues, system, settings)
         occupations = list(occupation_result.occupations)
         electrons = occupation_result.electrons
         fermi_level = occupation_result.fermi_level
+        start_report = getattr(scalar_field_adapter, "start_spectrum_report", None)
+        if reduced and warm_start is None and iteration == 1 and callable(start_report):
+            # The levels of the start Hamiltonian, which has the point group
+            # of the atoms: a reduced adapter refuses a partly filled
+            # multiplet here (acceleration/SCF/spin_sectors.py), once the
+            # levels are converged; until then the start Hamiltonian is
+            # solved again from its subspaces.
+            passes = 0
+            change = np.inf
+            while True:
+                report = start_report(eigenvalues, occupations, representations)
+                if report is None:
+                    break
+                if passes and change <= scalar_field_adapter.start_level_change:
+                    scalar_field_adapter.abandon_start(report, passes)
+                if passes >= scalar_field_adapter.start_spectrum_passes or hubbard_projectors is not None:
+                    # Still moving: tests 2 and 3 decide at the end.
+                    break
+                previous = [values.copy() for values in eigenvalues]
+                window = fermi_level + START_LEVEL_WINDOW
+                diagonalization_start = time.perf_counter()
+                for spin in range(2):
+                    if exchange_term is None:
+                        hamiltonian = system.hamiltonian(input_potentials[spin])
+                    else:
+                        hamiltonian = system.hamiltonian(
+                            input_potentials[spin], None, exchange_term.operator(spin)
+                        )
+                    operator_factory = getattr(
+                        hamiltonian, "as_eigensolver_operator", hamiltonian.as_linear_operator
+                    )
+                    release = getattr(wavefunctions[spin], "release_intermediate_storage", None)
+                    if callable(release):
+                        release()
+                    eigensolution = solvers[spin](
+                        operator_factory(),
+                        number_of_states,
+                        settings=eigval_settings,
+                        state=eigval_states[spin],
+                    )
+                    eigval_states[spin] = eigensolution.state
+                    eigenvalues[spin] = np.asarray(eigensolution.eigenvalues, dtype=np.float64)
+                    wavefunctions[spin] = eigensolution.vectors
+                    sector_labels = getattr(eigensolution, "representations", None)
+                    representations[spin] = (
+                        np.ones(eigenvalues[spin].size, dtype=np.int32)
+                        if sector_labels is None
+                        else np.asarray(sector_labels, dtype=np.int32) + 1
+                    )
+                diagonalization_total += time.perf_counter() - diagonalization_start
+                passes += 1
+                change = max(
+                    float(np.max(np.abs(new - old)[(old <= window) | (new <= window)], initial=0.0))
+                    if new.shape == old.shape
+                    else np.inf
+                    for new, old in zip(eigenvalues, previous)
+                )
+                occupation_result = _spin_occupations(eigenvalues, system, settings)
+                occupations = list(occupation_result.occupations)
+                electrons = occupation_result.electrons
+                fermi_level = occupation_result.fermi_level
         for spin in range(2):
             if orbital_density_builder is None:
                 densities[spin] = spin_density_from_orbitals(
@@ -413,14 +574,17 @@ def run_spin_scf(
                 # A backend builder forms 2/dV sum f |psi|^2, the density of
                 # doubly occupied orbitals.  Half the occupation gives the
                 # one electron per state of a spin channel, bit for bit.
-                densities[spin] = np.asarray(
-                    orbital_density_builder(
-                        wavefunctions[spin], 0.5 * occupations[spin], volume_element
-                    ),
-                    dtype=np.float64,
+                built = orbital_density_builder(
+                    wavefunctions[spin], 0.5 * occupations[spin], volume_element
                 )
+                # (A reduced builder returns the field of the orbits.)
+                densities[spin] = built if reduced else np.asarray(built, dtype=np.float64)
         symmetrization = ()
         density_symmetry = getattr(system, "density_symmetry", None)
+        if density_symmetry is not None and reduced:
+            raise NotImplementedError(
+                "Symmetrize_Charge_Density is not implemented for spin channels in the symmetry sectors"
+            )
         if density_symmetry is not None:
             # Symmetrize_Charge_Density: symm_scalar of newrho.F90 for the
             # total density and for each channel (isp = 1, 2, 3).
@@ -459,14 +623,14 @@ def run_spin_scf(
         # potentials and the Hartree and XC terms to the new densities, as
         # in the unpolarized loop.
         mixing_energy_start = time.perf_counter()
-        metrics = spin_potential_residual_metrics(
+        metrics = evaluate_residual_metrics(
             input_potentials,
             output_potentials,
             densities,
             volume_element,
             electrons,
         )
-        energies = spin_total_energy(
+        energies = evaluate_total_energy(
             eigenvalues,
             occupations,
             densities,
@@ -502,11 +666,11 @@ def run_spin_scf(
         # 6. Mix the two potentials as one vector, up first, and test the
         # larger residual of the two channels.
         mixed = mixer.mix(
-            np.concatenate(input_potentials),
-            np.concatenate(output_potentials),
+            join_channels(input_potentials),
+            join_channels(output_potentials),
             iteration=iteration,
         )
-        mixed_potentials = [mixed[:grid_size].copy(), mixed[grid_size:].copy()]
+        mixed_potentials = split_channels(mixed)
         selected_residual = (
             metrics.plain if settings.use_plain_residual else metrics.weighted
         )
@@ -516,7 +680,11 @@ def run_spin_scf(
             and filter_degree > minimum_filter_degree
         ):
             filter_degree -= 1
-        iteration_converged = selected_residual < settings.convergence_criterion
+        if iteration == 1:
+            first_residual = selected_residual
+        iteration_converged = selected_residual < criterion_scale * loop_criterion(
+            warm_start, settings.convergence_criterion, first_residual
+        )
         if eigensolver_settings.dynamic_tolerance:
             # The smaller weighted SRE of the two channels (minval(sre)).
             diagonalization_tolerance = dynamic_diagonalization_tolerance(
@@ -544,8 +712,12 @@ def run_spin_scf(
                 int(value) for values in representations for value in values
             ),
             fermi_level=float(fermi_level),
-            density_minimum=float(np.min(density)),
-            density_maximum=float(np.max(density)),
+            density_minimum=(
+                scalar_field_adapter.minimum(density) if reduced else float(np.min(density))
+            ),
+            density_maximum=(
+                scalar_field_adapter.maximum(density) if reduced else float(np.max(density))
+            ),
             diagonalization_seconds=diagonalization_seconds,
             hartree_seconds=hartree_seconds,
             hamiltonian_binding_seconds=hamiltonian_binding_seconds,
@@ -553,11 +725,18 @@ def run_spin_scf(
             xc_seconds=xc_seconds,
             mixing_energy_seconds=mixing_energy_seconds,
             total_seconds=time.perf_counter() - iteration_start,
+            **({"level_refinement": True} if refining else {}),
             spin_plain_residuals=metrics.plain_by_spin,
             spin_weighted_residuals=metrics.weighted_by_spin,
             spin_electrons=(float(electrons[0]), float(electrons[1])),
-            spin_density_minimum=tuple(float(np.min(values)) for values in densities),
-            spin_density_maximum=tuple(float(np.max(values)) for values in densities),
+            spin_density_minimum=tuple(
+                scalar_field_adapter.minimum(values) if reduced else float(np.min(values))
+                for values in densities
+            ),
+            spin_density_maximum=tuple(
+                scalar_field_adapter.maximum(values) if reduced else float(np.max(values))
+                for values in densities
+            ),
             density_symmetrization=symmetrization,
             **hubbard_iteration_record(hubbard_state),
             **iteration_eigensolver_fields(
@@ -579,11 +758,11 @@ def run_spin_scf(
                     occupations=occupations[spin],
                     wavefunctions=wavefunctions[spin],
                     representations=representations[spin],
-                    density=densities[spin],
-                    xc_potential=xc_potentials[spin],
-                    input_effective_potential=last_input_potentials[spin],
-                    output_effective_potential=output_potentials[spin],
-                    next_effective_potential=mixed_potentials[spin],
+                    density=to_public(densities[spin]),
+                    xc_potential=to_public(xc_potentials[spin]),
+                    input_effective_potential=to_public(last_input_potentials[spin]),
+                    output_effective_potential=to_public(output_potentials[spin]),
+                    next_effective_potential=to_public(mixed_potentials[spin]),
                     electron_count=float(electrons[spin]),
                 )
                 for spin in range(2)
@@ -595,19 +774,64 @@ def run_spin_scf(
                     occupations=np.concatenate(occupations),
                     representations=np.concatenate(representations),
                     wavefunctions=None,
-                    density=density,
-                    next_effective_potential=0.5 * (mixed_potentials[0] + mixed_potentials[1]),
+                    density=to_public(density),
+                    next_effective_potential=0.5
+                    * (
+                        to_public(mixed_potentials[0]) + to_public(mixed_potentials[1])
+                    ),
                     spin=iteration_channels,
                 )
             )
 
-        if iteration_converged:
+        measure_asymmetry = getattr(scalar_field_adapter, "density_symmetry_measure", None)
+        if iteration_converged and not refining and reduced and exchange_term is None and callable(measure_asymmetry):
+            met_criterion = True
+            asymmetry = measure_asymmetry([to_public(values) for values in densities])
+            log = getattr(scalar_field_adapter, "symmetry_measures", None)
+            if isinstance(log, list):
+                log.append((iteration, asymmetry, criterion_scale * settings.convergence_criterion))
+            if (
+                asymmetry is not None
+                and scalar_field_adapter.density_symmetry_tolerance
+                <= asymmetry
+                < scalar_field_adapter.density_symmetry_noise_bound
+                and symmetry_tightenings < scalar_field_adapter.density_symmetry_tightenings
+                and (last_asymmetry is None or asymmetry <= 0.5 * last_asymmetry)
+                and iteration < settings.max_iterations
+            ):
+                # Noise shrinks with the residual, a broken state keeps its
+                # asymmetry: go on to a criterion ten times tighter.
+                symmetry_tightenings += 1
+                last_asymmetry = asymmetry
+                criterion_scale *= 0.1
+                input_potentials = mixed_potentials
+                continue
+        if iteration_converged or refining:
+            if level_tolerance is not None and not refining:
+                # V_in stays: the next iteration solves the same Hamiltonians.
+                refining = True
+                continue
             converged = True
             break
         input_potentials = mixed_potentials
 
     if energies is None:
         raise RuntimeError("SCF loop did not execute")
+    # A loop that met its criterion and then ran out of iterations while
+    # tightening it (test 2 of a reduced loop) has converged.
+    converged = converged or met_criterion
+    output_potentials = [
+        ionic_potential + hartree_potential + xc_potential
+        for xc_potential in xc_potentials
+    ]
+    if reduced:
+        # The result holds full-grid fields, as that of the full-grid loop.
+        densities = [to_public(values) for values in densities]
+        xc_potentials = [to_public(values) for values in xc_potentials]
+        last_input_potentials = [to_public(values) for values in last_input_potentials]
+        output_potentials = [to_public(values) for values in output_potentials]
+        mixed_potentials = [to_public(values) for values in mixed_potentials]
+        hartree_potential = to_public(hartree_potential)
     dispersion = None
     if dispersion_wanted(settings, converged):
         dispersion, energies = dispersion_after_convergence(
@@ -625,11 +849,8 @@ def run_spin_scf(
         xc_seconds=xc_total,
         mixing_energy_seconds=mixing_energy_total,
         total_seconds=time.perf_counter() - scf_start,
+        **({} if level_detail is None else {"detail": level_detail}),
     )
-    output_potentials = [
-        ionic_potential + hartree_potential + xc_potential
-        for xc_potential in xc_potentials
-    ]
     # The orbitals are stored once: host channels are views of the joined
     # array, device channels the blocks the backend returned.
     stacked, channel_orbitals = _join_orbitals(wavefunctions[0], wavefunctions[1])
@@ -649,7 +870,7 @@ def run_spin_scf(
         )
         for spin in range(2)
     )
-    return SinglePointResult(
+    result = SinglePointResult(
         converged=converged,
         iterations=len(history),
         atoms=system.atoms,
@@ -681,6 +902,13 @@ def run_spin_scf(
         hubbard=hubbard_state,
         dispersion=dispersion,
     )
+    check = getattr(scalar_field_adapter, "check_spin_result", None)
+    if exchange_term is None and callable(check):
+        # The symmetry guard of a reduced loop (the symmetry sectors of the
+        # accelerated driver): a result that breaks the symmetry of the atoms
+        # or has fractional occupations is not kept.
+        check(result)
+    return result
 
 
 # ----------------------------------------------------------------------------

@@ -179,13 +179,16 @@ class DeviceExchange:
         for the sectors of this system (or its full grid) and ``states``
         orbitals per channel.  The driver hands it to the memory rules of the
         sectors, which then spill the sector states to the host where the
-        states and the exchange do not fit together.
+        states and the exchange do not fit together.  The window of the outer
+        DIIS (``Exx_Outer_Mixing: diis``) is not in it: it takes what the
+        devices have free while the loop runs (:func:`~.fock_device.window_fits`).
         """
 
         from ..Hamiltonian.exchange_device import estimated_box_points, planned_exchange_bytes
 
         grid = reference.grid
         kernels = [kernel for kernel, _fraction, _omega in definition.terms]
+        parity = self._planned_parity(grid, kernels)
         if self.sectors is not None:
             owned = [
                 representation
@@ -205,7 +208,7 @@ class DeviceExchange:
             rows = {None: int(grid.size)}
             places = {None: int(operator.effective_potential.device.id)}
         spin = bool(getattr(reference.input.scf, "spin_polarized", False))
-        return planned_exchange_bytes(
+        counts = planned_exchange_bytes(
             full_size=int(grid.size),
             box_points=estimated_box_points(grid, kernels, self.multipole_order),
             kernels=kernels,
@@ -215,7 +218,19 @@ class DeviceExchange:
             states=int(states),
             channels=2 if spin else 1,
             batch_size=self.batch_size,
+            parity=parity,
         )
+        return counts
+
+    def _planned_parity(self, grid, kernels):
+        """The parity classes the sector orbitals will use (:func:`~..exchange_device.planned_parity`), or ``None``."""
+
+        from ..Hamiltonian.exchange_device import planned_parity
+
+        decomposition = getattr(self.sectors, "decomposition", None)
+        if decomposition is None:
+            return None
+        return planned_parity(grid, kernels, self.multipole_order, decomposition.reduction)
 
     def pair_solvers(self, system, definition: HybridDefinition) -> DevicePairSolvers:
         terms = tuple(definition.terms)
@@ -225,9 +240,17 @@ class DeviceExchange:
         key = (terms, self.batch_size)
         solvers = self._solvers.get(key)
         if solvers is None:
-            # The host plans are built beside the semilocal start of the loop.
+            # The host plans are built beside the semilocal start of the loop;
+            # the plans of the parity classes only where the sector orbitals
+            # will take that path.
+            kernels = [kernel for kernel, _weight, _omega in terms]
             solvers = DevicePairSolvers(
-                system.grid, terms, self.multipole_order, self.batch_size, background=True
+                system.grid,
+                terms,
+                self.multipole_order,
+                self.batch_size,
+                background=True,
+                parity=self._planned_parity(system.grid, kernels) is not None,
             )
             self._solvers[key] = solvers
         return solvers
@@ -320,13 +343,14 @@ class DeviceFockEngine:
                 hartree_potential=hartree,
                 eigensolver_state=_new_loop_state(solver, start.eigensolver_state),
             )
+        # (Orbit fields where the channels are in the symmetry sectors.)
         xc = system.evaluate_spin_xc(
-            np.asarray(channels[0].density, dtype=np.float64),
-            np.asarray(channels[1].density, dtype=np.float64),
+            self._internal(system, channels[0].density),
+            self._internal(system, channels[1].density),
         )
         return SCFWarmStart(
             input_potential=tuple(
-                ionic + hartree + np.asarray(potential, dtype=np.float64) for potential in xc.potentials
+                ionic + hartree + self._public(system, potential) for potential in xc.potentials
             ),
             hartree_potential=hartree,
             eigensolver_state=tuple(
@@ -346,8 +370,8 @@ class DeviceFockEngine:
             semilocal = system.evaluate_xc(self._internal(system, start.density)).total_energy
         else:
             semilocal = system.evaluate_spin_xc(
-                np.asarray(channels[0].density, dtype=np.float64),
-                np.asarray(channels[1].density, dtype=np.float64),
+                self._internal(system, channels[0].density),
+                self._internal(system, channels[1].density),
             ).total_energy
         energies = start.energies
         return float(
@@ -409,6 +433,24 @@ class DeviceFockEngine:
                 if callable(release):
                     release()
 
+    def occupied_blocks(self, sets) -> list:
+        """Copies of the occupied orbitals of each channel, by sector (``Exx_Outer_Mixing: diis``)."""
+
+        from .fock_device import occupied_blocks
+
+        return occupied_blocks(sets)
+
+    def natural_sets(self, sets, natural):
+        """The channels of natural orbitals ``natural`` and the empty states of ``sets``."""
+
+        from .fock_device import build_fits, natural_channels
+
+        if not build_fits(sets):
+            raise MemoryError("the channel of the extrapolated density matrix does not fit the devices")
+
+        return natural_channels(sets, natural)
+
+
     def release(self, operator: DeviceFockOperator) -> None:
         """Remove the operator from the device Hamiltonians and free its ``xi``."""
 
@@ -452,6 +494,11 @@ def device_exchange_for(
         else selected_device_ids(int(cp.cuda.Device().id))
     )
     hybrid_functional_of(scf)  # the input's overrides are valid
+    from ..Hamiltonian.exchange_device import exchange_parity_box_setting, exchange_parity_setting
+
+    # The switches of the parity classes are refused here when wrong.
+    exchange_parity_setting()
+    exchange_parity_box_setting()
     return DeviceExchange(
         backend=backend,
         sectors=sectors,

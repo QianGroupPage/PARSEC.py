@@ -1291,6 +1291,26 @@ def _run(
             )
             return 2
         solver_symmetry_mode = "off"
+    scf_settings = translation.problem.scf
+    if (
+        translation.restart_run
+        and scf_settings.spin_polarized
+        and scf_settings.spin_symmetry_sector_mode == "auto"
+    ):
+        # parsec.dat holds full-grid fields of a run that may have broken the
+        # point group of the atoms, which the sectors would average: the two
+        # channels of a restart are solved on the full grid.
+        translation = replace(
+            translation,
+            problem=replace(
+                translation.problem, scf=replace(scf_settings, spin_symmetry_sectors="off")
+            ),
+        )
+        restart_notes = [
+            *restart_notes,
+            "NOTE: Restart_Run of a spin-polarized calculation: both channels on the full grid "
+            "(Spin_Symmetry_Sectors: off for the restart)",
+        ]
 
     summary = summarize_translation(translation)
     if arguments.dry_run:

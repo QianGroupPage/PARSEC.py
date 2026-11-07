@@ -133,7 +133,9 @@ def _prepared_conjugate_gradient(system, reference):
     The backend of the SCF Hartree solver is reused where that solver works
     on the full grid.  Where it works on a symmetry wedge a full-grid backend
     of the same kind (C++/OpenMP, or CUDA where the SCF solve ran there) is
-    prepared from the finite-difference Laplacian.
+    prepared from the finite-difference Laplacian; a CUDA one only where it
+    takes at most half of the free device memory and can be made, the
+    C++/OpenMP one otherwise (the description says why).
     """
 
     from ..Laplacian import materialize_negative_laplacian
@@ -162,19 +164,49 @@ def _prepared_conjugate_gradient(system, reference):
         return backend, describe(backend, "the solver of the SCF Hartree potential")
     try:
         operator = materialize_negative_laplacian(reference.negative_laplacian)
+        origin = "prepared for the full grid"
         if on_device:
-            from .cupy_prepared import CuPyPreparedConjugateGradientBackend
-
-            backend = CuPyPreparedConjugateGradientBackend(
-                operator, device_id=backend.device_id
+            # A full-grid CG |G| times the one of the SCF wedge, made after
+            # the SCF with its arrays still held: on the device only where
+            # it takes at most half of what the device has free, and on the
+            # host where it does not or where making it fails for want of
+            # memory.
+            from .gpu_memory import (
+                FREE_SHARE_OF_PAIR_SOLVES,
+                cuda_allocation_errors,
+                device_free_bytes,
+                planned_cg_bytes,
             )
-        else:
-            from ..backends.native import NativeConjugateGradientBackend
 
-            backend = NativeConjugateGradientBackend(operator)
+            planned = planned_cg_bytes(size, reference.grid.settings.stencil_half_width)
+            free = device_free_bytes(backend.device_id)
+            device_backend = None
+            if free is not None and planned > FREE_SHARE_OF_PAIR_SOLVES * free:
+                origin = (
+                    "prepared for the full grid on the host: the GPU CG of "
+                    f"{planned / 2**20:.0f} MiB would take more than half of the "
+                    f"{free / 2**20:.0f} MiB free on device {backend.device_id}"
+                )
+            else:
+                from .cupy_prepared import CuPyPreparedConjugateGradientBackend
+
+                try:
+                    device_backend = CuPyPreparedConjugateGradientBackend(
+                        operator, device_id=backend.device_id
+                    )
+                except cuda_allocation_errors() as error:
+                    origin = (
+                        "prepared for the full grid on the host: the GPU CG could "
+                        f"not be built ({type(error).__name__}: {error})"
+                    )
+            if device_backend is not None:
+                return device_backend, describe(device_backend, origin)
+        from ..backends.native import NativeConjugateGradientBackend
+
+        backend = NativeConjugateGradientBackend(operator)
     except BackendUnavailableError:
         return None
-    return backend, describe(backend, "prepared for the full grid")
+    return backend, describe(backend, origin)
 
 
 def _boundary_description(grid, settings) -> str:

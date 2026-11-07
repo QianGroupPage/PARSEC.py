@@ -46,6 +46,10 @@ def hybrid_correlation_lines(scf) -> list[str]:
             f"{settings.max_iterations} outer iterations, {settings.batch_size} pair "
             f"densities per Poisson batch, pair solver {settings.pair_solver}"
         ),
+        (
+            f"   inner criterion {settings.inner_criterion}, mixer history {settings.mixer_history}, "
+            f"outer mixing {settings.outer_mixing}"
+        ),
         f" Pseudopotentials: files of {hybrid_pseudopotential_family(scf.xc_functional)}",
     ]
 
@@ -89,8 +93,13 @@ def exchange_loop_lines(record: ExchangeLoopIteration) -> list[str]:
         f"({record.pair_solver})"
     )
     if record.iteration == 0:
+        criterion = getattr(record, "inner_criterion", None)
         source = (
-            f"the converged {record.start_functional.upper()} orbitals"
+            (
+                f"the {record.start_functional.upper()} start orbitals"
+                if criterion is not None
+                else f"the converged {record.start_functional.upper()} orbitals"
+            )
             if record.start_functional
             else "the orbitals of the structure before the move"
         )
@@ -110,6 +119,13 @@ def exchange_loop_lines(record: ExchangeLoopIteration) -> list[str]:
                 f"SCF did not converge in {record.inner_iterations} iterations; the Fock loop starts "
                 "from its last orbitals"
             )
+        if criterion is not None:
+            lines.append(
+                f"   The start stopped below a residual of {criterion:.2E} Ry (adaptive criterion): its energy "
+                "is that of a start, not a converged semilocal energy"
+            )
+        if getattr(record, "outer_note", ""):
+            lines.append(f"   Start: {record.outer_note}")
         lines.extend([line for line in (operator_line, work) if line is not None])
         lines.append("")
         return lines
@@ -138,8 +154,33 @@ def exchange_loop_lines(record: ExchangeLoopIteration) -> list[str]:
         ),
         f"   Total Energy ({record.functional})".ljust(34) + f"= {record.total_energy:20.8f} [Ry]",
     ]
+    lines.extend(inner_loop_control_lines(record))
     lines.extend([line for line in (operator_line, work) if line is not None])
     lines.append("")
+    return lines
+
+
+def inner_loop_control_lines(record: ExchangeLoopIteration) -> list[str]:
+    """How the inner loop of an outer iteration was run (``Exx_Inner_Criterion``, ``Exx_Mixer_History``)."""
+
+    parts = []
+    criterion = getattr(record, "inner_criterion", None)
+    if criterion is not None:
+        parts.append(f"stopped below a residual of {criterion:.2E} Ry (adaptive criterion)")
+    seeds = int(getattr(record, "mixer_seeds", 0) or 0)
+    if seeds:
+        parts.append(f"{seeds} secant pairs carried into its mixer")
+    passes = int(getattr(record, "level_passes", 0) or 0)
+    if passes:
+        parts.append(
+            f"levels converged by {passes} eigensolver passes at its last Hamiltonian "
+            f"(last move {float(getattr(record, 'level_change', 0.0)):.1E} Ry)"
+        )
+    lines = [f"   Inner SCF: {'; '.join(parts)}"] if parts else []
+    if getattr(record, "extrapolated", False):
+        lines.append("   Outer step: the next operator is that of the DIIS-extrapolated density matrix")
+    elif getattr(record, "outer_note", ""):
+        lines.append(f"   Outer step: {record.outer_note}")
     return lines
 
 

@@ -121,20 +121,20 @@ import the SCF driver. Physics components must remain independently callable.
 | `Laplacian` | finite-difference coefficients and kinetic application | effective potentials |
 | `Pseudopotential` | POTRE, old-format POTR, Martins-Wang POTRW and FHIPP parsing, radial data, Fourier filters, interpolation-ready models | placement on a molecular grid |
 | `V_ion` | local potential, KB projectors, atomic density, ion-ion energy | SCF state |
-| `Hartree` | isolated boundary values and Poisson solution; the Kronecker-product Poisson solver of batches of pair densities for exact exchange (`kronecker`: 1/r, erfc and erf kernels, multipole boundary on the padded bounding box) | density mixing |
+| `Hartree` | isolated boundary values and Poisson solution; the Kronecker-product Poisson solver of batches of pair densities for exact exchange (`kronecker`: 1/r, erfc and erf kernels, multipole boundary on the padded bounding box; reflection-parity classes on the octant of a symmetric box) | density mixing |
 | `V_xc` | LDA (CA/PZ, PW92, X-alpha, Wigner, Hedin-Lundqvist), GGA (PBE, PW91) and asymptotically corrected (LB94, Casida-Salahub) potentials and energy densities, unpolarized and spin-polarized; the Fock exchange operator of orbital blocks, its adaptively compressed form (ACE) and the exchange energy (`exchange_operator`); the hybrid functionals: label registry, exact-exchange fractions and kernels, semilocal parts (`hybrid`, `semilocal`, `semilocal_components`) | total-energy assembly |
 | `Hamiltonian` | composition and block matrix-vector products | choosing an eigensolver |
 | `Eigensolvers` | PARSEC-selected eigensolver control flow and reusable subspaces | occupations or SCF mixing |
 | `Occupations` | Fermi level, occupations (searched, or fixed by `occup.in`), and density from orbitals | eigensolution |
-| `Mixer` | explicit mixer history and PARSEC SRE metrics | convergence policy selection |
+| `Mixer` | explicit mixer history and PARSEC SRE metrics; the Anderson history carried through the inner loops of a Fock loop (`carried`, `Exx_Mixer_History: carry`) | convergence policy selection |
 | `Energy` | named Rydberg energy components and total energy | text formatting |
-| `SCF` | ordering the component calls and applying stopping policy; the Fock loop of the hybrid functionals around the SCF loop (`hybrid`) | hidden algorithm substitution |
+| `SCF` | ordering the component calls and applying stopping policy; the Fock loop of the hybrid functionals around the SCF loop (`hybrid`), its controls (`fock_controls`: adaptive inner criterion, carried mixer; `fock_diis`: Anderson extrapolation of the density matrix with a saddle guard) | hidden algorithm substitution |
 | `Forces` | ion-ion, local, nonlocal forces, their symmetrization and net-force removal | moving atoms |
 | `Relaxation` | L-BFGS-B, steepest-descent and manual ionic steps, the ionic loop, relaxation files | electronic structure of a structure |
 | `MolecularDynamics` | the integrator of `moldyn.f90`, its input, random numbers and files | energies or forces |
 | `Embedding` | PARSEC 1.5's frozen-density embedding (FDET) of a tip in a frozen sample: the sample field on the tip grid, non-additive kinetic functionals, FDET energy terms, the tip sphere, the warm starts of scans, the AFM scan points and `k_ts` | the SCF loop (it calls these), file formats (`Output/pot_dat.py`) |
 | `Output` | PARSEC-shaped reporting and optional serialization | numerical decisions |
-| `acceleration` | backend selection, symmetry sectors, GPU eigensolvers, native kernels, and timing provenance; the exact exchange of the hybrid functionals on the devices (`Hamiltonian/exchange_device`: ACE per symmetry sector, pair solves on every device; `SCF/hybrid`: the device pieces of `SCF.hybrid.run_hybrid_scf`) | independent physical formulas or silent accuracy changes |
+| `acceleration` | backend selection, symmetry sectors, GPU eigensolvers, native kernels, and timing provenance; the exact exchange of the hybrid functionals on the devices (`Hamiltonian/exchange_device`: ACE per symmetry sector, pair solves on every device, sector pair densities in parity classes without the full grid; `SCF/hybrid`: the device pieces of `SCF.hybrid.run_hybrid_scf`; `SCF/fock_device`: the sector blocks of the outer DIIS and the free-memory test of its window); spin-polarized loops in the symmetry sectors (`SCF/spin_sectors`: the orbit fields of two channels for `SCF.spin_polarized.run_spin_scf`, the occupation guard; `Eigensolvers/symmetry`: one sector subspace per channel) | independent physical formulas or silent accuracy changes |
 
 ## Public API rules
 

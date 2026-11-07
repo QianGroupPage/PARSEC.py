@@ -99,6 +99,10 @@ _RECONSTRUCTED = frozenset(
         "exx_tolerance",
         "exx_batch_size",
         "exx_pair_solver",
+        "exx_inner_criterion",
+        "exx_mixer_history",
+        "exx_outer_mixing",
+        "spin_symmetry_sectors",
         "atom_types_num",
         "total_atom_num",
         "add_point_charges",
@@ -430,6 +434,12 @@ def complete_input_text(
         f"Spin_Polarization  {_logical(bool(scf.spin_polarized))}",
         f"Correlation_Type  {FORTRAN_CORRELATION_CODES.get(scf.xc_functional, scf.xc_functional)}",
     ]
+    if scf.spin_polarized and (scf.is_hybrid or getattr(scf, "spin_symmetry_sectors", None) is not None):
+        # The spin channels of the accelerated driver (PARSEC.py): the value of
+        # every spin-polarized hybrid, and of another run where the input sets
+        # it away from the default (auto), so that the completed input of a
+        # semilocal run at the default stays what it was.
+        lines.append(f"Spin_Symmetry_Sectors  {scf.spin_symmetry_sector_mode}")
     if scf.xc_functional == "casida_salahub":
         lines.append(f"Ion_Energy_Diff  {_number(scf.ionization_energy_difference)} Ry")
     exact_exchange = getattr(scf, "exact_exchange", None)
@@ -444,6 +454,9 @@ def complete_input_text(
             f"Exx_Tolerance  {_number(exact_exchange.tolerance)} Ry",
             f"Exx_Batch_Size  {int(exact_exchange.batch_size)}",
             f"Exx_Pair_Solver  {exact_exchange.pair_solver}",
+            f"Exx_Inner_Criterion  {exact_exchange.inner_criterion}",
+            f"Exx_Mixer_History  {exact_exchange.mixer_history}",
+            f"Exx_Outer_Mixing  {exact_exchange.outer_mixing}",
         ]
     if problem.point_charges:
         counts = tuple(getattr(translation, "point_charge_type_counts", ())) or (len(problem.point_charges),)

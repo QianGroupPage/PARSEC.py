@@ -31,19 +31,33 @@ sector's own columns).  ``W_G = U_G^T W`` and ``xi_G`` therefore take the
 memory of the sector's orbitals on the sector's device, nothing more.
 
 Pair densities.  A pair density ``q_j q_k`` of two orbitals of sectors ``A``
-and ``B`` lies in sector ``A B`` and needs the full grid for the
-Kronecker-product Poisson solver
-(:class:`parsec_python.acceleration.Hartree.kronecker_device.DeviceKroneckerPoisson`).
+and ``B`` lies in sector ``A B``; the Kronecker-product Poisson solver
+(:class:`parsec_python.acceleration.Hartree.kronecker_device.DeviceKroneckerPoisson`)
+solves it on the box of the domain.
 The occupied columns of every sector are cut into blocks of
 ``Exx_Batch_Size`` columns; a tile is a pair of blocks (each unordered pair
 once, a block with itself for its pairs ``i <= j``, an empty target block
 with every occupied block).  Tiles go to the devices of the process, the
-most expensive first, each to the least loaded device; a device unfolds the
-two blocks of a tile to the full grid, solves its pair densities
-``Exx_Batch_Size`` at a time, accumulates both blocks' parts of ``W`` on the
-full grid and folds them back into their sectors.  The folded parts are
-added to ``W_G`` on the device of the sector, with a lock per sector.  Every
-pair is solved once, wherever its two orbitals are.
+most expensive first, each to the least loaded device.  The folded parts of
+``W`` are added to ``W_G`` on the device of the sector, with a lock per
+sector.  Every pair is solved once, wherever its two orbitals are.
+
+Two paths form a tile.  Orbitals on the full grid, and sector orbitals with
+``PARSEC_CUPY_EXCHANGE_PARITY=off``: the device unfolds the two blocks to the
+full grid, solves their pair densities ``Exx_Batch_Size`` at a time,
+accumulates both blocks' parts of ``W`` on the full grid and folds them back.
+Sector orbitals of a box symmetric about the origin (the default): the
+sectors are irreducible representations of a group of diagonal reflections
+(or contain one), so a sector function is a sum of ``m = 8/g`` reflection
+parity classes and is fixed by its values at the images ``h_c r`` of the
+octant points ``r`` under one operation ``h_c`` of each coset of the group
+(:class:`ParityGroup`).  A tile gathers its blocks into that coset form
+(``m R`` rows, ``R`` the octant points, about ``N/g``), forms the class
+components of its pair densities (:func:`parity_densities`), solves each
+class on the octant (:meth:`DevicePairSolvers.solve_parity`), accumulates
+``W`` in coset form (:func:`parity_update`) and folds it with one gather per
+sector row (:class:`ParitySector`).  No full-grid block is formed; the
+result is the full-grid path's to round-off.
 
 Nothing here prints or opens files.
 """
@@ -53,6 +67,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import math
+import os
 from threading import Lock
 from time import perf_counter
 from typing import Any, Sequence
@@ -146,8 +161,11 @@ class SectorExpansion:
         self.orbit_weights = np.zeros((self.rows, width), dtype=np.float64)
         self.orbit_points[rows_of, slot] = points
         self.orbit_weights[rows_of, slot] = weights[points]
+        # 1/sqrt|O_w| of every row (the parity classes fold W with it).
+        self.row_scales = np.ascontiguousarray(scales)
         self._device: dict[int, tuple] = {}
         self._lock = Lock()
+        self._parity: dict = {}
 
     def _arrays(self, cp):
         device = int(cp.cuda.Device().id)
@@ -459,7 +477,13 @@ class DevicePairSolvers:
         *,
         single_solve: bool = True,
         background: bool = False,
+        parity: bool = False,
     ) -> None:
+        # Both switches of the parity path are read here, so that a wrong
+        # value is refused when the solver is made, not at a later build.
+        self.parity = bool(parity) and exchange_parity_setting() != "off"
+        exchange_parity_box_setting()
+        self._paths: set[str] = set()
         self.batch_size = max(1, int(batch_size))
         self.terms = tuple((str(kernel), float(weight), omega) for kernel, weight, omega in terms)
         self.multipole_order = int(multipole_order)
@@ -517,6 +541,13 @@ class DevicePairSolvers:
                 for kernel, weight, omega in self.terms
             )
             labels = [f"{weight:g} x {kernel}" for kernel, weight, _omega in self.terms] if weighted else []
+        if self.parity and all(host.parity_symmetric for _weight, host in parts):
+            # A run whose sector orbitals will take the parity path: the plans
+            # of the eight classes (host arrays, a fraction of the full plan)
+            # on this thread rather than in the first build.
+            for _weight, host in parts:
+                for parity in range(8):
+                    host.parity_plan(parity)
         self.setup_seconds = perf_counter() - started
         base = str(getattr(parts[0][1], "description", "Kronecker-product FD solver")).replace(
             "Kronecker-product", "FP64 CUDA Kronecker-product", 1
@@ -545,7 +576,23 @@ class DevicePairSolvers:
 
     @property
     def description(self) -> str:
-        return self._ready()[1]
+        """The solver, and the path its builds took so far (parity classes, the full grid or both)."""
+
+        text = self._ready()[1]
+        if "parity" in self._paths:
+            octant = "x".join(str(value) for value in self.hosts[0].parity_layout.half_shape)
+            text += (
+                "; the pair densities of symmetry-sector orbitals in reflection-parity classes on the "
+                f"{octant} octant"
+            )
+            if "full" in self._paths:
+                text += ", the others on the full grid"
+        return text
+
+    def record_path(self, path: str) -> None:
+        """Note that a build took ``path`` (``"parity"`` or ``"full"``) for :attr:`description`."""
+
+        self._paths.add(str(path))
 
     def solvers(self, device: int):
         from ..Hartree.kronecker_device import WORK_ARRAYS_PER_DENSITY, DeviceKroneckerPoisson
@@ -555,9 +602,11 @@ class DevicePairSolvers:
         if found is not None:
             return found
         per_density = 8 * (WORK_ARRAYS_PER_DENSITY * self.hosts[0].box_size + 3 * self.size)
+        # Lazy: the full-box plans are uploaded by the first full-grid solve;
+        # a run of parity classes never holds them (parity_plan).
         made = tuple(
             DeviceKroneckerPoisson(
-                host, device_id=int(device), memory_budget=per_density * self.batch_size
+                host, device_id=int(device), memory_budget=per_density * self.batch_size, lazy=True
             )
             for host in self.hosts
         )
@@ -614,6 +663,49 @@ class DevicePairSolvers:
             total = values if total is None else total + values
         return total
 
+    def parity_layout(self):
+        """The octant layout shared by every part, or ``None`` (no symmetric box, or parts that differ)."""
+
+        layouts = []
+        for host in self.hosts:
+            if not host.parity_symmetric:
+                return None
+            layouts.append(host.parity_layout)
+        first = layouts[0]
+        for other in layouts[1:]:
+            if other.images.shape != first.images.shape or not np.array_equal(other.images, first.images):
+                return None
+        return first
+
+    def solve_parity_box(self, cp, device: int, parity: int, box):
+        """Potentials ``(nb, R)`` (Ry) of class densities times ``8 pi`` on the octant box ``(nb, hx, hy, hz)``.
+
+        One part only (the box is the right-hand side of its solve, in place):
+        :func:`parsec_python.Hartree.kronecker.solve_box` with ``prescaled``.
+        """
+
+        from parsec_python.Hartree.kronecker import solve_box
+
+        ((weight, _host),) = self.parts
+        (solver,) = self.solvers(device)
+        values = solve_box(solver.parity_plan(parity), box, cp, prescaled=True)
+        if weight != 1.0:
+            values *= weight
+        return values
+
+    def solve_parity(self, cp, device: int, parity: int, densities):
+        """Potentials ``(nb, R)`` (Ry, C order) of class densities ``(R, nb)`` on ``device``."""
+
+        from parsec_python.Hartree.kronecker import solve_block
+
+        total = None
+        for (weight, _host), solver in zip(self.parts, self.solvers(device)):
+            values = solve_block(solver.parity_plan(parity), densities, cp)
+            if weight != 1.0:
+                values *= weight
+            total = values if total is None else total + values
+        return total
+
 
 # ---------------------------------------------------------------------------
 # Device memory of the exchange.
@@ -633,27 +725,77 @@ _TILE_ARRAYS = 9
 def estimated_box_points(grid, kernels, multipole_order: int) -> int:
     """Points of the Kronecker box of ``grid`` (bounding box and automatic padding, no plan built)."""
 
-    import math
-
-    from parsec_python.Hartree import kronecker
-
     try:
-        integers = np.asarray(grid.integer_coordinates, dtype=np.int64)
-        lower, upper = integers.min(axis=0), integers.max(axis=0)
-        spacing = float(grid.spacing)
-        source_squared = float(np.max(np.einsum("ij,ij->i", grid.coordinates, grid.coordinates)))
-        smearing = 0.0
-        if any(kernel != "coulomb" for kernel in kernels):
-            argument = kronecker._smearing_exponent_argument(int(multipole_order))
-            smearing = spacing * math.sqrt(argument / kronecker.DEFAULT_SMEARING_LIMIT)
-        below, above = kronecker._automatic_padding(
-            lower, upper, np.asarray(grid.settings.shift, dtype=np.float64), spacing, source_squared, smearing
-        )
-        shape = (upper + above) - (lower - below) + 1
-        return int(np.prod(shape))
+        lower, upper = _estimated_box(grid, kernels, multipole_order)
+        return int(np.prod(upper - lower + 1))
     except Exception:  # an estimate only: the bounding box of the grid
         integers = np.asarray(grid.integer_coordinates, dtype=np.int64)
         return int(np.prod(integers.max(axis=0) - integers.min(axis=0) + 1))
+
+
+#: Bytes per point of the full box of the device plans of the eight parity
+#: classes (measured on the k03 grid: 35 Coulomb, 88 erfc), rounded up.
+_PARITY_PLAN_BYTES_PER_BOX_POINT = {"coulomb": 50, "screened": 120}
+
+
+def planned_parity(grid, kernels, multipole_order: int, reduction) -> dict | None:
+    """What the parity path of a sector run will hold (an estimate for the memory rules), or ``None``.
+
+    ``reduction`` is the symmetry reduction of the sectors; the path is
+    planned where its diagonal reflections are two or more, the Kronecker
+    box (bounding box and automatic padding) is symmetric about the origin
+    and ``PARSEC_CUPY_EXCHANGE_PARITY`` is not ``off``.  Returns the cosets
+    ``m``, the octant points ``R`` with an active image, the octant box and
+    the full box.
+    """
+
+    from parsec_python.Hartree import kronecker
+
+    if exchange_parity_setting() == "off" or reduction is None:
+        return None
+    operations = getattr(reduction, "operations", None)
+    if operations is None:
+        diagonal = int(reduction.group_order)
+    else:
+        diagonal = sum(
+            1 for operation in np.asarray(operations) if np.array_equal(np.abs(operation), np.eye(3))
+        )
+    if diagonal < 2:
+        return None
+    try:
+        lower, upper = _estimated_box(grid, kernels, multipole_order)
+        shift = np.asarray(grid.settings.shift, dtype=np.float64)
+        if not np.all(lower + upper + 2.0 * shift == 0.0):
+            return None
+        shape = tuple(int(v) for v in upper - lower + 1)
+        layout = kronecker._parity_layout(grid.integer_coordinates, lower, shape)
+    except Exception:  # an estimate only
+        return None
+    return {
+        "cosets": 8 // diagonal,
+        "octant_points": int(layout.size),
+        "octant_box": int(layout.half_size),
+        "box_points": int(np.prod(shape)),
+    }
+
+
+def _estimated_box(grid, kernels, multipole_order: int):
+    """``(lower, upper)`` integer corners of the Kronecker box of ``grid`` (no plan built)."""
+
+    from parsec_python.Hartree import kronecker
+
+    integers = np.asarray(grid.integer_coordinates, dtype=np.int64)
+    lower, upper = integers.min(axis=0), integers.max(axis=0)
+    spacing = float(grid.spacing)
+    source_squared = float(np.max(np.einsum("ij,ij->i", grid.coordinates, grid.coordinates)))
+    smearing = 0.0
+    if any(kernel != "coulomb" for kernel in kernels):
+        argument = kronecker._smearing_exponent_argument(int(multipole_order))
+        smearing = spacing * math.sqrt(argument / kronecker.DEFAULT_SMEARING_LIMIT)
+    below, above = kronecker._automatic_padding(
+        lower, upper, np.asarray(grid.settings.shift, dtype=np.float64), spacing, source_squared, smearing
+    )
+    return lower - below, upper + above
 
 
 def planned_exchange_bytes(
@@ -667,6 +809,7 @@ def planned_exchange_bytes(
     states: int,
     channels: int,
     batch_size: int,
+    parity: dict | None = None,
 ) -> dict[int, int]:
     """Device bytes the exchange of a hybrid keeps or takes beside the orbitals, by device.
 
@@ -680,6 +823,10 @@ def planned_exchange_bytes(
     ``sector_rows``/``sector_devices`` map each sector (``None``: the full
     grid) to its rows and device.  The grouped filter's work is not counted:
     it takes what the device has free (:func:`.chebyshev._exchange_block_filter`).
+
+    ``parity`` (:func:`planned_parity`) plans the path of the parity classes
+    instead: the class plans, the coset maps (32 bytes per grid point in all)
+    and the tile of :func:`parity_tile_bytes`.
     """
 
     total_rows = max(1, sum(int(rows) for rows in sector_rows.values()))
@@ -689,15 +836,64 @@ def planned_exchange_bytes(
         share = int(math.ceil(int(states) * int(rows) / total_rows)) + 8
         counts[device] = counts.get(device, 0) + 8 * int(rows) * min(int(states), share) * int(channels)
     screened = any(kernel != "coulomb" for kernel in kernels)
-    plan = _PLAN_BYTES_PER_BOX_POINT["screened" if screened else "coulomb"] * int(box_points)
-    work = 8 * int(batch_size) * (_TILE_ARRAYS * int(full_size) + _WORK_PER_DENSITY * int(box_points))
-    expansions = 32 * int(full_size) * sum(1 for key in sector_rows if key is not None)
+    kind = "screened" if screened else "coulomb"
+    if parity is None:
+        plan = _PLAN_BYTES_PER_BOX_POINT[kind] * int(box_points)
+        work = 8 * int(batch_size) * (_TILE_ARRAYS * int(full_size) + _WORK_PER_DENSITY * int(box_points))
+        expansions = 32 * int(full_size) * sum(1 for key in sector_rows if key is not None)
+    else:
+        box = int(parity["box_points"])
+        octant_box = int(parity["octant_box"])
+        cosets = int(parity["cosets"])
+        plan = _PARITY_PLAN_BYTES_PER_BOX_POINT[kind] * box
+        work = parity_tile_bytes(
+            coset_rows=cosets * int(parity["octant_points"]),
+            octant_points=int(parity["octant_points"]),
+            octant_box=octant_box,
+            classes=cosets,
+            batch_size=int(batch_size),
+            densities_per_solve=parity_densities_per_solve(int(batch_size), box, octant_box, cosets),
+        )
+        expansions = 32 * int(full_size)
     for device in devices:
         counts[int(device)] = counts.get(int(device), 0) + plan + work + expansions
     return counts
 
 
-def require_exchange_memory(orbitals: ChannelOrbitals, solvers, devices) -> None:
+def parity_densities_per_solve(batch_size: int, box_points: int, octant_box: int, classes: int) -> int:
+    """``D``, the pair densities of one class solve of the parity path.
+
+    A chunk holds the densities (on the octant box) and the potentials (on
+    ``R``) of all ``m`` classes of its pairs at once.  ``D = b B/B_oct``
+    (about ``8 b``) for one or two classes keeps that at the size of the
+    ``b`` full-box densities of the full-grid path's solve; with four classes
+    (Cs, Ci, C2) ``D`` is halved, so that ``m D`` stays the same and the
+    parity path never holds more than the full-grid path.
+    """
+
+    ratio = max(1, int(box_points) // max(1, int(octant_box)))
+    return max(int(batch_size), (2 * int(batch_size) * ratio) // max(2, int(classes)))
+
+
+def parity_tile_bytes(*, coset_rows: int, octant_points: int, octant_box: int, classes: int,
+                      batch_size: int, densities_per_solve: int, box_work: bool = True) -> int:
+    """Device bytes of one tile of the parity path on a solving device.
+
+    Two blocks and their ``W`` in coset form (``4 m R b``), the class
+    densities of a chunk on the octant box and their potentials on ``R``
+    (``m D (B_oct + R)``) and, with ``box_work``, the work of one class
+    solve on the octant box (``8 B_oct D``); ``D`` densities per class solve
+    (:func:`parity_densities_per_solve`).
+    """
+
+    rows = 4 * int(coset_rows) * int(batch_size)
+    rows += int(classes) * int(densities_per_solve) * (int(octant_box) + int(octant_points))
+    if box_work:
+        rows += _WORK_PER_DENSITY * int(octant_box) * int(densities_per_solve)
+    return 8 * rows
+
+
+def require_exchange_memory(orbitals: ChannelOrbitals, solvers, devices, *, parity=None) -> None:
     """Refuse, with the numbers, a build whose ``W`` cannot be held where its sectors are."""
 
     from ..backends.cupy import require_cupy
@@ -706,7 +902,18 @@ def require_exchange_memory(orbitals: ChannelOrbitals, solvers, devices) -> None
     needed: dict[int, int] = {}
     for sector in orbitals.sectors:
         needed[sector.device] = needed.get(sector.device, 0) + 8 * sector.rows * int(sector.local.size)
-    work = 8 * int(solvers.batch_size) * _TILE_ARRAYS * int(orbitals.full_size)
+    if parity is None:
+        work = 8 * int(solvers.batch_size) * _TILE_ARRAYS * int(orbitals.full_size)
+    else:
+        work = parity_tile_bytes(
+            coset_rows=parity.coset_rows,
+            octant_points=int(parity.layout.size),
+            octant_box=int(parity.layout.half_size),
+            classes=len(parity.group.cosets),
+            batch_size=int(solvers.batch_size),
+            densities_per_solve=parity.densities_per_solve,
+            box_work=False,
+        )
     for device in devices:
         needed[int(device)] = needed.get(int(device), 0) + work
     for device, count in sorted(needed.items()):
@@ -790,6 +997,591 @@ def _accumulate_row(cp, second, potentials, first, weights, first_weight, first_
             np.int32(width),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Pair densities in reflection-parity classes (sector orbitals, no full grid).
+# ---------------------------------------------------------------------------
+
+#: ``auto`` (default): the pair densities of sector orbitals are solved in
+#: reflection-parity classes on the octant of a symmetric box; ``off``: on
+#: the full grid, the sectors unfolded (the path of runs without sectors).
+PARITY_SETTING = "PARSEC_CUPY_EXCHANGE_PARITY"
+
+
+def exchange_parity_setting() -> str:
+    """``PARSEC_CUPY_EXCHANGE_PARITY``: ``auto`` (default) or ``off``."""
+
+    raw = os.environ.get(PARITY_SETTING, "auto").strip().lower() or "auto"
+    if raw not in ("auto", "off"):
+        raise ValueError(f"{PARITY_SETTING} must be auto or off, not {raw!r}")
+    return raw
+
+
+def exchange_parity_box_setting() -> bool:
+    """``PARSEC_CUPY_EXCHANGE_PARITY_BOX``: ``1`` (default) forms the class densities on the octant box, ``0`` on ``R``."""
+
+    raw = os.environ.get("PARSEC_CUPY_EXCHANGE_PARITY_BOX", "1").strip() or "1"
+    if raw not in ("0", "1"):
+        raise ValueError("PARSEC_CUPY_EXCHANGE_PARITY_BOX must be 0 or 1")
+    return raw == "1"
+
+
+@dataclass(frozen=True)
+class ParityGroup:
+    """The diagonal reflections of the sectors and their cosets among the eight sign operations.
+
+    ``operations`` are the indices (:data:`parsec_python.Hartree.kronecker.SIGN_OPERATIONS`;
+    composition is the exclusive or of the indices) of the sign operations
+    that map every orbit of the sectors onto itself; ``cosets`` holds one
+    operation of every coset of that group, the identity first.  A sector
+    function ``f`` with character ``chi`` on the group is fixed on the
+    octant point ``r`` by its ``m = len(cosets)`` values ``f(h_c r)``, and
+    its parity components are ``f_t(r) = (1/m) sum_c chi_t(h_c) f(h_c r)``
+    for the ``m`` classes ``t`` that restrict to ``chi``
+    (:meth:`classes`); back, ``f(h_c r) = sum_t chi_t(h_c) f_t(r)``.
+    """
+
+    operations: tuple[int, ...]
+    cosets: tuple[int, ...]
+
+    def classes(self, character: dict) -> tuple[int, ...]:
+        """The parity classes whose character restricted to the group is ``character`` (op -> +-1)."""
+
+        from parsec_python.Hartree.kronecker import parity_character
+
+        return tuple(
+            t for t in range(8)
+            if all(parity_character(t, op) == character[op] for op in self.operations)
+        )
+
+    def table(self, classes) -> np.ndarray:
+        """``chi_t(h_c)`` for the classes (rows) and the cosets (columns)."""
+
+        from parsec_python.Hartree.kronecker import parity_character
+
+        return np.array(
+            [[parity_character(t, h) for h in self.cosets] for t in classes], dtype=np.float64
+        )
+
+
+def _sector_operations(expansion: SectorExpansion, layout) -> tuple[tuple[int, ...], dict] | None:
+    """The sign operations that keep every orbit of a sector, and the sector's character on them.
+
+    Decided on the octant points whose eight images are distinct active
+    points admitted by the sector (no stabilizer): operation ``s`` belongs to
+    the group when ``s r`` and ``r`` lie in the same orbit (sector row) for
+    all of them, and ``chi(s)`` is the sign of the ratio of their phases.
+    """
+
+    images = layout.images
+    generic = np.all(images >= 0, axis=0)
+    for d in range(3):
+        if layout.on_plane[d]:
+            generic &= layout.octant_coordinates[:, d] != 0
+    points = images[:, generic]
+    if not points.size:
+        return None
+    weights = expansion.point_weights[points]
+    admitted = np.all(weights != 0.0, axis=0)
+    points, weights = points[:, admitted], weights[:, admitted]
+    if not points.shape[1]:
+        return None
+    rows = expansion.point_rows[points]
+    operations, character = [], {}
+    for operation in range(8):
+        if not np.all(rows[operation] == rows[0]):
+            continue
+        signs = np.sign(weights[operation]) * np.sign(weights[0])
+        if not np.all(signs == signs[0]):
+            return None
+        operations.append(operation)
+        character[operation] = int(signs[0])
+    return tuple(operations), character
+
+
+def _parity_group(operations: tuple[int, ...]) -> ParityGroup:
+    covered: set[int] = set()
+    cosets = []
+    for operation in range(8):
+        if operation in covered:
+            continue
+        cosets.append(operation)
+        covered.update(operation ^ element for element in operations)
+    return ParityGroup(tuple(operations), tuple(cosets))
+
+
+@dataclass
+class ParitySector:
+    """The coset form of one sector's orbitals and the fold of ``W`` back into its rows.
+
+    The coset form of a block of sector columns has ``m * size`` rows, row
+    ``c * size + k`` the value at ``h_c r_k`` (``r_k`` the octant points of
+    the solver's :class:`~parsec_python.Hartree.kronecker.ParityLayout``):
+    ``rows``/``weights`` gather it from the sector rows (``U_G`` at those
+    points: phase over ``sqrt|O|``, zero where the image is not active).
+    ``W`` of a sector function is fixed by any point of each orbit,
+    ``(U_G^T W)_w = sqrt|O_w| phase(e) W(e)``: ``fold_entries[w]`` is the
+    first coset row in orbit ``w`` and ``fold_weights[w]`` that factor.
+    """
+
+    character: dict
+    rows: np.ndarray
+    weights: np.ndarray
+    fold_entries: np.ndarray
+    fold_weights: np.ndarray
+    _device: dict = field(default_factory=dict, repr=False)
+    _lock: Lock = field(default_factory=Lock, repr=False)
+
+    def arrays(self, cp):
+        device = int(cp.cuda.Device().id)
+        with self._lock:
+            found = self._device.get(device)
+            if found is None:
+                found = tuple(
+                    cp.asarray(array)
+                    for array in (self.rows, self.weights, self.fold_entries, self.fold_weights)
+                )
+                self._device[device] = found
+        return found
+
+    def device_bytes(self) -> int:
+        return int(self.rows.nbytes + self.weights.nbytes + self.fold_entries.nbytes + self.fold_weights.nbytes)
+
+
+def _parity_sector(expansion: SectorExpansion, layout, group: ParityGroup, character: dict) -> ParitySector:
+    points = layout.images[list(group.cosets)]
+    present = points >= 0
+    safe = np.where(present, points, 0)
+    rows = np.where(present, expansion.point_rows[safe], 0).reshape(-1)
+    weights = np.where(present, expansion.point_weights[safe], 0.0).reshape(-1)
+    entries = np.flatnonzero(weights != 0.0)
+    order = np.argsort(rows[entries], kind="stable")
+    entries = entries[order]
+    sorted_rows = rows[entries]
+    first = np.ones(sorted_rows.size, dtype=bool)
+    first[1:] = sorted_rows[1:] != sorted_rows[:-1]
+    if not np.array_equal(sorted_rows[first], np.arange(expansion.rows)):
+        raise RuntimeError("the coset points of the octant do not reach every orbit of a sector")
+    chosen = entries[first]
+    return ParitySector(
+        character=dict(character),
+        rows=np.ascontiguousarray(rows.astype(np.int64)),
+        weights=np.ascontiguousarray(weights),
+        fold_entries=np.ascontiguousarray(chosen.astype(np.int64)),
+        fold_weights=np.ascontiguousarray(weights[chosen] / expansion.row_scales**2),
+    )
+
+
+@dataclass
+class ParityContext:
+    """What the parity path of one channel needs: octant, group, the sectors' coset maps."""
+
+    layout: Any
+    group: ParityGroup
+    sectors: tuple[ParitySector, ...]
+    densities_per_solve: int
+    _tables: dict = field(default_factory=dict, repr=False)
+    _box_maps: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def coset_rows(self) -> int:
+        return len(self.group.cosets) * int(self.layout.size)
+
+    def box_map(self, cp):
+        """Device ``int32`` map of the octant box: the index in ``R`` of each point, ``-1`` elsewhere."""
+
+        device = int(cp.cuda.Device().id)
+        found = self._box_maps.get(device)
+        if found is None:
+            values = np.full(int(self.layout.half_size), -1, dtype=np.int32)
+            values[self.layout.box_index] = np.arange(int(self.layout.size), dtype=np.int32)
+            found = cp.asarray(values)
+            self._box_maps[device] = found
+        return found
+
+    def target_classes(self, first: int, second: int) -> tuple[int, ...]:
+        """Parity classes of the pair densities of sectors ``first`` and ``second`` (indices)."""
+
+        a, b = self.sectors[first].character, self.sectors[second].character
+        return self.group.classes({op: a[op] * b[op] for op in self.group.operations})
+
+    def tables(self, cp, classes: tuple[int, ...], inverse_volume: float):
+        """Device ``chi_t(h_c)`` of the classes: densities (``1/(m h^3)``), ``W``, box densities (``8 pi/(m h^3)``)."""
+
+        key = (int(cp.cuda.Device().id), classes)
+        found = self._tables.get(key)
+        if found is None:
+            table = self.group.table(classes)
+            scale = inverse_volume / len(self.group.cosets)
+            found = (cp.asarray(table * scale), cp.asarray(table), cp.asarray(table * (8.0 * math.pi * scale)))
+            self._tables[key] = found
+        return found
+
+
+def parity_context(orbitals: ChannelOrbitals, solvers) -> ParityContext | None:
+    """The :class:`ParityContext` of a channel, or ``None`` where the full-grid path is taken.
+
+    ``None`` with ``PARSEC_CUPY_EXCHANGE_PARITY=off``, for orbitals on the
+    full grid, a solver box that is not symmetric about the origin, and a
+    group of fewer than two diagonal reflections (no gain).
+    """
+
+    if exchange_parity_setting() == "off":
+        return None
+    if not orbitals.sectors or any(sector.expansion is None for sector in orbitals.sectors):
+        return None
+    layout = solvers.parity_layout()
+    if layout is None:
+        return None
+    found = []
+    for sector in orbitals.sectors:
+        expansion = sector.expansion
+        key = ("operations", id(layout))
+        cached = expansion._parity.get(key)
+        if cached is None:
+            cached = _sector_operations(expansion, layout)
+            expansion._parity[key] = cached if cached is not None else False
+        if not cached:
+            return None
+        found.append(cached)
+    operations = found[0][0]
+    if any(item[0] != operations for item in found) or len(operations) < 2:
+        return None
+    group = _parity_group(operations)
+    sectors = []
+    for sector, (_operations, character) in zip(orbitals.sectors, found):
+        key = ("sector", id(layout), group.cosets)
+        cached = sector.expansion._parity.get(key)
+        if cached is None:
+            cached = _parity_sector(sector.expansion, layout, group, character)
+            sector.expansion._parity[key] = cached
+        sectors.append(cached)
+    host = solvers.hosts[0]
+    step = parity_densities_per_solve(
+        int(solvers.batch_size), int(host.box_size), int(layout.half_size), len(group.cosets)
+    )
+    return ParityContext(layout, group, tuple(sectors), step)
+
+
+def parity_columns(cp, context: ParityContext, orbitals: ChannelOrbitals, block) -> Any:
+    """The coset form of a block's columns on the current device (``m * size`` x columns, F order)."""
+
+    sector = orbitals.sectors[block.sector]
+    columns = sector.columns(cp, block.positions)
+    rows, weights, _, _ = context.sectors[block.sector].arrays(cp)
+    values = cp.asfortranarray(columns[rows, :])
+    values *= weights[:, None]
+    return values
+
+
+def parity_fold(cp, context: ParityContext, block, values) -> Any:
+    """``U_G^T W`` of the coset form of a sector block's ``W`` (sector rows x columns, F order)."""
+
+    _, _, entries, weights = context.sectors[block.sector].arrays(cp)
+    folded = cp.asfortranarray(values[entries, :])
+    folded *= weights[:, None]
+    return folded
+
+
+_PARITY_KERNEL_SOURCE = r"""
+extern "C" __global__ void parity_pair_densities(
+    const double* __restrict__ first,    // coset form of block 1 (m n_r x columns)
+    const double* __restrict__ second,   // coset form of block 2
+    const long long* __restrict__ left,  // pair k: column of block 1
+    const long long* __restrict__ right, // pair k: column of block 2
+    const double* __restrict__ table,    // chi_t(h_c) / (m h^3), classes x m
+    double* __restrict__ out,            // classes x count x n_r
+    const long long n_r, const int cosets, const int classes, const int count, const int per_thread)
+{
+    const long long r = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_r) return;
+    const long long ld = (long long)cosets * n_r;
+    const int k0 = blockIdx.y * per_thread;
+    const int k1 = min(count, k0 + per_thread);
+    double products[8];
+    for (int k = k0; k < k1; ++k) {
+        const double* a = first + left[k] * ld + r;
+        const double* b = second + right[k] * ld + r;
+        for (int c = 0; c < cosets; ++c) products[c] = a[c * n_r] * b[c * n_r];
+        for (int t = 0; t < classes; ++t) {
+            double sum = 0.0;
+            for (int c = 0; c < cosets; ++c) sum += table[t * cosets + c] * products[c];
+            out[((long long)t * count + k) * n_r + r] = sum;
+        }
+    }
+}
+
+extern "C" __global__ void parity_pair_box_densities(
+    const double* __restrict__ first, const double* __restrict__ second,
+    const long long* __restrict__ left, const long long* __restrict__ right,
+    const double* __restrict__ table,    // 8 pi chi_t(h_c) / (m h^3), classes x m
+    const int* __restrict__ box_map,     // octant box point -> index in R, -1 elsewhere
+    double* __restrict__ out,            // classes x count x octant box (zero outside R)
+    const long long n_r, const long long n_box, const int cosets, const int classes, const int count,
+    const int per_thread)
+{
+    const long long b = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_box) return;
+    const long long r = box_map[b];
+    const long long ld = (long long)cosets * n_r;
+    const int k0 = blockIdx.y * per_thread;
+    const int k1 = min(count, k0 + per_thread);
+    double products[8];
+    for (int k = k0; k < k1; ++k) {
+        if (r < 0) {
+            for (int t = 0; t < classes; ++t) out[((long long)t * count + k) * n_box + b] = 0.0;
+            continue;
+        }
+        const double* a = first + left[k] * ld + r;
+        const double* q = second + right[k] * ld + r;
+        for (int c = 0; c < cosets; ++c) products[c] = a[c * n_r] * q[c * n_r];
+        for (int t = 0; t < classes; ++t) {
+            double sum = 0.0;
+            for (int c = 0; c < cosets; ++c) sum += table[t * cosets + c] * products[c];
+            out[((long long)t * count + k) * n_box + b] = sum;
+        }
+    }
+}
+
+extern "C" __global__ void parity_pair_update(
+    const double* p0, const double* p1, const double* p2, const double* p3,
+    const double* p4, const double* p5, const double* p6, const double* p7,
+    const double* __restrict__ table,    // chi_t(h_c), classes x m
+    const double* first, const double* second,
+    const long long* __restrict__ left, const long long* __restrict__ right,
+    const double* __restrict__ first_weights, const double* __restrict__ second_weights,
+    const signed char* __restrict__ second_update,
+    double* first_acc, double* second_acc,  // may be the same block (a diagonal tile)
+    const long long n_r, const int cosets, const int classes, const int count)
+{
+    const long long ld = (long long)cosets * n_r;
+    const long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= ld) return;
+    const int c = (int)(p / n_r);
+    const long long r = p - (long long)c * n_r;
+    const double* potentials[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
+    double coefficient[8];
+    for (int t = 0; t < classes; ++t) coefficient[t] = table[t * cosets + c];
+    double sum = 0.0;
+    long long current = -1;
+    for (int k = 0; k < count; ++k) {
+        double v = 0.0;
+        for (int t = 0; t < classes; ++t) v += coefficient[t] * potentials[t][(long long)k * n_r + r];
+        const long long i = left[k];
+        const long long j = right[k];
+        if (i != current) {
+            if (current >= 0) first_acc[p + current * ld] -= sum;
+            sum = 0.0;
+            current = i;
+        }
+        sum += second_weights[j] * second[p + j * ld] * v;
+        if (second_update[k]) second_acc[p + j * ld] -= first_weights[i] * first[p + i * ld] * v;
+    }
+    if (current >= 0) first_acc[p + current * ld] -= sum;
+}
+"""
+_PARITY_KERNELS: dict[int, Any] = {}
+_PARITY_DENSITIES_PER_THREAD = 8
+
+
+def _parity_kernels(cp):
+    device = int(cp.cuda.Device().id)
+    found = _PARITY_KERNELS.get(device)
+    if found is None:
+        module = cp.RawModule(code=_PARITY_KERNEL_SOURCE, options=("--fmad=false",))
+        found = (
+            module.get_function("parity_pair_densities"),
+            module.get_function("parity_pair_update"),
+            module.get_function("parity_pair_box_densities"),
+        )
+        _PARITY_KERNELS[device] = found
+    return found
+
+
+def parity_densities(cp, context: ParityContext, first, second, left, right, table):
+    """Class densities ``(classes, count, size)`` of the pairs ``(left[k], right[k])`` of two coset blocks.
+
+    ``rho_t(r) = (1/m) sum_c chi_t(h_c) q_i(h_c r) q_j(h_c r) / h^3``
+    (``table`` holds ``chi_t(h_c) / (m h^3)``).
+    """
+
+    kernel = _parity_kernels(cp)[0]
+    size = int(context.layout.size)
+    cosets = len(context.group.cosets)
+    classes = int(table.shape[0])
+    count = int(left.size)
+    out = cp.empty((classes, count, size), dtype=cp.float64)
+    threads = 256
+    per_thread = _PARITY_DENSITIES_PER_THREAD
+    grid = ((size + threads - 1) // threads, (count + per_thread - 1) // per_thread)
+    kernel(
+        grid,
+        (threads,),
+        (first, second, left, right, table, out, np.int64(size), np.int32(cosets), np.int32(classes),
+         np.int32(count), np.int32(per_thread)),
+    )
+    return out
+
+
+def parity_box_densities(cp, context: ParityContext, first, second, left, right, table):
+    """``8 pi`` times the class densities of :func:`parity_densities`, on the octant box.
+
+    Shape ``(classes, count, hx, hy, hz)``, zero outside ``R`` (``table``
+    holds ``8 pi chi_t(h_c) / (m h^3)``): each class block is the
+    right-hand side of :meth:`DevicePairSolvers.solve_parity_box`, without a
+    scatter.
+    """
+
+    kernel = _parity_kernels(cp)[2]
+    layout = context.layout
+    size = int(layout.size)
+    boxed = int(layout.half_size)
+    cosets = len(context.group.cosets)
+    classes = int(table.shape[0])
+    count = int(left.size)
+    out = cp.empty((classes, count) + tuple(layout.half_shape), dtype=cp.float64)
+    threads = 256
+    per_thread = _PARITY_DENSITIES_PER_THREAD
+    grid = ((boxed + threads - 1) // threads, (count + per_thread - 1) // per_thread)
+    kernel(
+        grid,
+        (threads,),
+        (first, second, left, right, table, context.box_map(cp), out, np.int64(size), np.int64(boxed),
+         np.int32(cosets), np.int32(classes), np.int32(count), np.int32(per_thread)),
+    )
+    return out
+
+
+def parity_update(cp, context: ParityContext, potentials, table, first, second, left, right,
+                  first_weights, second_weights, second_update, first_acc, second_acc) -> None:
+    """``W_i -= sum_j f_j q_j v_ij`` and, where ``second_update``, ``W_j -= f_i q_i v_ij``, in coset form.
+
+    ``potentials[t]`` are the class potentials ``(count, size)`` (C order);
+    ``v_ij(h_c r) = sum_t chi_t(h_c) v_t(r)``.  One thread per coset row
+    runs the pairs in their order (fixed-order sums; ``second_acc`` may be
+    ``first_acc``).
+    """
+
+    kernel = _parity_kernels(cp)[1]
+    rows = context.coset_rows
+    classes = len(potentials)
+    if classes > 8:
+        raise ValueError("at most eight parity classes")
+    for array in (first, second, first_acc) + (() if second_acc is None else (second_acc,)):
+        if not array.flags.f_contiguous or int(array.shape[0]) != rows:
+            raise ValueError("the parity update needs F-contiguous coset blocks")
+    pointers = list(potentials) + [potentials[0]] * (8 - classes)
+    threads = 256
+    kernel(
+        ((rows + threads - 1) // threads,),
+        (threads,),
+        tuple(pointers)
+        + (
+            table, first, second, left, right, first_weights, second_weights, second_update,
+            first_acc, first_acc if second_acc is None else second_acc,
+            np.int64(context.layout.size), np.int32(len(context.group.cosets)), np.int32(classes),
+            np.int32(int(left.size)),
+        ),
+    )
+
+
+def _tile_pairs(kind: str, first_count: int, second_count: int):
+    """Pairs ``(left, right, second_update)`` of a tile, row by row (``i`` outer)."""
+
+    if kind == "diagonal":
+        left, right = np.triu_indices(first_count)
+        update = left != right
+    else:
+        left = np.repeat(np.arange(first_count), second_count)
+        right = np.tile(np.arange(second_count), first_count)
+        update = np.full(left.size, kind == "pair")
+    return left.astype(np.int64), right.astype(np.int64), update.astype(np.int8)
+
+
+def _run_parity_tiles(cp, context: ParityContext, orbitals: ChannelOrbitals, solvers, blocks, work,
+                      device: int, deliver, timing: dict) -> None:
+    """The tiles ``work`` of ``device`` in parity classes (the module text; no full-grid array).
+
+    The two blocks of a tile are gathered into coset form, the pair
+    densities of up to ``context.densities_per_solve`` pairs are formed per
+    class, solved on the octant class by class, and both blocks' ``W`` are
+    accumulated in coset form and folded into their sectors.
+    """
+
+    inverse_volume = 1.0 / float(orbitals.volume_element)
+    pending: list = []
+    step = int(context.densities_per_solve)
+    # One solver part (every hybrid but the two-solve variant): the class
+    # densities are formed on the octant box itself (no scatter, no copy).
+    boxed = len(solvers.parts) == 1 and exchange_parity_box_setting()
+
+    def settle() -> None:
+        for begin, finish in pending:
+            finish.synchronize()
+            timing[device] += cp.cuda.get_elapsed_time(begin, finish) * 1.0e-3
+        pending.clear()
+
+    def weights_of(block):
+        sector = orbitals.sectors[block.sector]
+        return cp.asarray(orbitals.occupations[sector.states[block.positions]])
+
+    with cp.cuda.Device(device), solvers.stream(device):
+        # The builds of a channel meet (nearly) all eight classes: their
+        # plans go to the device at its first build, outside the timed solves.
+        for solver in solvers.solvers(device):
+            for parity in range(8):
+                solver.parity_plan(parity)
+        first_index = None
+        first = first_acc = first_weights = None
+        for tile in work:
+            if tile.first != first_index:
+                if first_acc is not None:
+                    deliver(blocks[first_index], parity_fold(cp, context, blocks[first_index], first_acc))
+                first_index = tile.first
+                first = parity_columns(cp, context, orbitals, blocks[first_index])
+                first_acc = cp.zeros(first.shape, dtype=cp.float64, order="F")
+                first_weights = weights_of(blocks[first_index])
+            second_block = blocks[tile.second]
+            if tile.kind == "diagonal":
+                second, second_acc, second_weights = first, first_acc, first_weights
+            else:
+                second = parity_columns(cp, context, orbitals, second_block)
+                second_acc = (
+                    cp.zeros(second.shape, dtype=cp.float64, order="F") if tile.kind == "pair" else None
+                )
+                second_weights = weights_of(second_block)
+            classes = context.target_classes(blocks[first_index].sector, second_block.sector)
+            density_table, table, box_table = context.tables(cp, classes, inverse_volume)
+            left, right, update = (
+                cp.asarray(values) for values in _tile_pairs(tile.kind, first.shape[1], second.shape[1])
+            )
+            for begin in range(0, int(left.size), step):
+                i, j, u = left[begin : begin + step], right[begin : begin + step], update[begin : begin + step]
+                if boxed:
+                    densities = parity_box_densities(cp, context, first, second, i, j, box_table)
+                else:
+                    densities = parity_densities(cp, context, first, second, i, j, density_table)
+                start, finish = cp.cuda.Event(), cp.cuda.Event()
+                start.record()
+                potentials = [
+                    solvers.solve_parity_box(cp, device, parity, densities[index])
+                    if boxed
+                    else solvers.solve_parity(cp, device, parity, densities[index].T)
+                    for index, parity in enumerate(classes)
+                ]
+                finish.record()
+                pending.append((start, finish))
+                del densities
+                parity_update(cp, context, potentials, table, first, second, i, j, first_weights,
+                              second_weights, u, first_acc, second_acc)
+                del potentials
+            settle()
+            if tile.kind == "pair":
+                deliver(second_block, parity_fold(cp, context, second_block, second_acc))
+            del second, second_acc
+        if first_acc is not None:
+            deliver(blocks[first_index], parity_fold(cp, context, blocks[first_index], first_acc))
 
 
 @dataclass
@@ -898,11 +1690,16 @@ def apply_device_exchange(
                     "empty",
                 )
             )
+    # Sector orbitals of a symmetric box: the pair densities in parity classes.
+    parity = parity_context(orbitals, solvers)
+    record = getattr(solvers, "record_path", None)
+    if callable(record):
+        record("full" if parity is None else "parity")
     # W of every sector on its device.
     if known is not None:
         applied = known.applied
     else:
-        require_exchange_memory(orbitals, solvers, devices)
+        require_exchange_memory(orbitals, solvers, devices, parity=parity)
         applied = []
         for sector in orbitals.sectors:
             with cp.cuda.Device(sector.device):
@@ -1075,6 +1872,12 @@ def apply_device_exchange(
                 del second_full, second_acc
             if first_acc is not None:
                 deliver(blocks[first_index], folded(blocks[first_index], first_acc))
+
+    if parity is not None:
+
+        def run(device: int) -> None:  # noqa: F811 -- the parity path replaces the full-grid loop
+            if assigned[device]:
+                _run_parity_tiles(cp, parity, orbitals, solvers, blocks, assigned[device], device, deliver, timing)
 
     try:
         if len(devices) == 1:

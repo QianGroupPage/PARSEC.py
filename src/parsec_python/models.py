@@ -1267,6 +1267,19 @@ DEFAULT_EXX_MAX_ITERATIONS = 100
 DEFAULT_EXX_TOLERANCE = 1.0e-6
 #: ``Exx_Batch_Size``: pair densities per batched Poisson solve.
 DEFAULT_EXX_BATCH_SIZE = 32
+#: ``Exx_Inner_Criterion``: ``adaptive`` (the inner loops stop at a share of their
+#: first residual while the Fock loop is far from converged, the last one at
+#: ``Convergence_Criterion``) or ``fixed`` (every inner loop at it).
+EXX_INNER_CRITERIA = ("adaptive", "fixed")
+DEFAULT_EXX_INNER_CRITERION = "adaptive"
+#: ``Exx_Mixer_History``: ``carry`` (the inner loops continue one Anderson
+#: history with its secant pairs) or ``restart`` (a new mixer per inner loop).
+EXX_MIXER_HISTORIES = ("carry", "restart")
+DEFAULT_EXX_MIXER_HISTORY = "restart"
+#: ``Exx_Outer_Mixing``: ``diis`` (Anderson extrapolation of the density matrix
+#: of the Fock loop, with a saddle guard) or ``none`` (the plain fixed point).
+EXX_OUTER_MIXINGS = ("diis", "none")
+DEFAULT_EXX_OUTER_MIXING = "diis"
 
 
 @dataclass(frozen=True)
@@ -1282,7 +1295,11 @@ class ExactExchangeSettings:
     densities each Poisson call solves.  ``pair_solver`` (``Exx_Pair_Solver``)
     is ``"kronecker"`` (the direct solver on the bounding box, every kernel)
     or ``"cg"`` (the conjugate gradients of the Hartree solver, 1/r only).
-    The text of the settings names only what differs from the defaults.
+    ``inner_criterion`` (``Exx_Inner_Criterion``), ``mixer_history``
+    (``Exx_Mixer_History``) and ``outer_mixing`` (``Exx_Outer_Mixing``)
+    choose how the Fock loop gets there (:mod:`parsec_python.SCF.fock_controls`),
+    not where it stops.  The text of the settings names only what differs
+    from the defaults.
     """
 
     fraction: float | None = None
@@ -1291,10 +1308,20 @@ class ExactExchangeSettings:
     tolerance: float = DEFAULT_EXX_TOLERANCE
     batch_size: int = DEFAULT_EXX_BATCH_SIZE
     pair_solver: str = "kronecker"
+    inner_criterion: str = DEFAULT_EXX_INNER_CRITERION
+    mixer_history: str = DEFAULT_EXX_MIXER_HISTORY
+    outer_mixing: str = DEFAULT_EXX_OUTER_MIXING
 
     def __post_init__(self) -> None:
         if self.pair_solver not in ("kronecker", "cg"):
             raise ValueError("the pair solver must be 'kronecker' or 'cg'")
+        for name, choices, label in (
+            ("inner_criterion", EXX_INNER_CRITERIA, "Exx_Inner_Criterion"),
+            ("mixer_history", EXX_MIXER_HISTORIES, "Exx_Mixer_History"),
+            ("outer_mixing", EXX_OUTER_MIXINGS, "Exx_Outer_Mixing"),
+        ):
+            if getattr(self, name) not in choices:
+                raise ValueError(f"{label} must be one of {', '.join(choices)}, got {getattr(self, name)!r}")
         if self.fraction is not None:
             fraction = float(self.fraction)
             if not np.isfinite(fraction) or not 0.0 < fraction <= 1.0:
@@ -1326,6 +1353,9 @@ class ExactExchangeSettings:
             "tolerance": DEFAULT_EXX_TOLERANCE,
             "batch_size": DEFAULT_EXX_BATCH_SIZE,
             "pair_solver": "kronecker",
+            "inner_criterion": DEFAULT_EXX_INNER_CRITERION,
+            "mixer_history": DEFAULT_EXX_MIXER_HISTORY,
+            "outer_mixing": DEFAULT_EXX_OUTER_MIXING,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -1432,12 +1462,32 @@ class SCFSettings:
     # The Fock-loop controls of a hybrid ``xc_functional``
     # (:class:`ExactExchangeSettings`); ``None`` for every other functional.
     exact_exchange: ExactExchangeSettings | None = None
+    # ``Spin_Symmetry_Sectors`` (PARSEC.py): whether the accelerated driver
+    # solves the two channels of a spin-polarized run in the symmetry sectors
+    # (``"auto"``) or on the full grid (``"off"``); ``None`` is the default of
+    # the run, :attr:`spin_symmetry_sector_mode`.
+    spin_symmetry_sectors: str | None = None
 
     @property
     def is_hybrid(self) -> bool:
         """Whether ``xc_functional`` has a nonlocal exact-exchange term."""
 
         return self.xc_functional in HYBRID_XC_FUNCTIONALS
+
+    @property
+    def spin_symmetry_sector_mode(self) -> str:
+        """``Spin_Symmetry_Sectors`` of this run: the value given, else its default.
+
+        The default is ``auto`` for every ``xc_functional`` (the sectors, with
+        the symmetry guard of
+        :mod:`parsec_python.acceleration.SCF.spin_sectors`); ``off`` keeps
+        both channels on the full grid.  The reference solver keeps the full
+        grid in every case.
+        """
+
+        if self.spin_symmetry_sectors is not None:
+            return self.spin_symmetry_sectors
+        return "auto"
 
     def __repr__(self) -> str:
         # The text of these settings is hashed by the cache keys of the
@@ -1461,6 +1511,7 @@ class SCFSettings:
             "zero_average_xc_potential": not self.zero_average_xc_potential,
             "degree_decrease_after": self.degree_decrease_after == 4,
             "exact_exchange": self.exact_exchange is None,
+            "spin_symmetry_sectors": self.spin_symmetry_sectors is None,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -1537,6 +1588,8 @@ class SCFSettings:
                 "exact_exchange settings belong to a hybrid xc_functional, not "
                 f"to {self.xc_functional!r}"
             )
+        if self.spin_symmetry_sectors not in (None, "auto", "off"):
+            raise ValueError("spin_symmetry_sectors must be None, 'auto' or 'off'")
         energy_difference = float(self.ionization_energy_difference)
         if not np.isfinite(energy_difference):
             raise ValueError("ionization_energy_difference must be finite")
@@ -2346,6 +2399,30 @@ class HybridEnergyBreakdown(EnergyBreakdown):
 
 
 @dataclass(frozen=True)
+class SpinSectorFallbackRecord:
+    """A spin-polarized loop in the symmetry sectors left them (``Spin_Symmetry_Sectors``).
+
+    The accelerated driver hands it to the iteration callback before it
+    starts the run again on the full grid: after ``stage`` (``the SCF loop``,
+    ``the semilocal start of the Fock loop``, ``the end of the Fock loop``)
+    an occupation of a channel was fractional, ``min(f, 1 - f)`` as large as
+    ``largest_fractional_occupation`` against ``tolerance``.  ``multiplets``
+    describe the levels that hold fractional occupations.  It is no SCF
+    iteration and carries no levels of its own.
+    """
+
+    stage: str
+    largest_fractional_occupation: float
+    tolerance: float
+    multiplets: tuple[str, ...] = ()
+    # What the guard found (``fractional occupations``, ``a partly filled
+    # multiplet``, ``a channel density that breaks the point group of the
+    # atoms``) and the quantity ``largest_fractional_occupation`` holds.
+    reason: str = "fractional occupations"
+    measure: str = "largest min(f, 1-f)"
+
+
+@dataclass(frozen=True)
 class ExchangeLoopIteration:
     """One outer iteration of the Fock loop of a hybrid SCF (energies in Ry).
 
@@ -2361,7 +2438,17 @@ class ExchangeLoopIteration:
     orbitals of this iteration.  ``pair_solves`` and the times are those of
     this iteration's exchange evaluation; ``operator_ranks`` the number of
     orbitals of the operator built after it, per spin channel (empty when no
-    operator was built).
+    operator was built).  ``inner_criterion`` is the residual the inner loop
+    stopped at with ``Exx_Inner_Criterion: adaptive`` (Ry; ``None``: the
+    fixed ``Convergence_Criterion``), ``mixer_seeds`` the secant pairs its
+    mixer carried in from the loop before (``Exx_Mixer_History: carry``).
+    ``extrapolated`` says that the operator built after this iteration is that
+    of the extrapolated density matrix (``Exx_Outer_Mixing: diis``),
+    ``outer_note`` why a plain step was taken instead (empty otherwise; for
+    iteration 0 a note on the start), and ``level_passes`` the eigensolver
+    passes that converged the levels of the inner loop at its last
+    Hamiltonian (``SCFWarmStart.level_tolerance``; 0: none) and
+    ``level_change`` the largest move of a level in the last of them (Ry).
     """
 
     iteration: int
@@ -2383,6 +2470,12 @@ class ExchangeLoopIteration:
     start_functional: str | None = None
     pair_solver: str = ""
     operator_asymmetry: float = 0.0
+    inner_criterion: float | None = None
+    mixer_seeds: int = 0
+    extrapolated: bool = False
+    outer_note: str = ""
+    level_passes: int = 0
+    level_change: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -2514,6 +2607,10 @@ class SCFIteration:
     # Dynamic_Diag_Tol only: the eigensolver tolerance of the next
     # iteration (parsec.F90:1304-1311, "New tolerance").
     next_eigensolver_tolerance: float | None = None
+    # SCFWarmStart.level_tolerance only: the iteration after the converged one,
+    # on the same V_in, whose eigensolver passes converge the levels; the loop
+    # converged at the iteration before (its residual is the loop's).
+    level_refinement: bool = field(default=False, repr=False)
 
     @property
     def spin_polarized(self) -> bool:

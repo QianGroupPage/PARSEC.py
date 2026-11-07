@@ -400,6 +400,123 @@ class BoundaryConvergenceTests(unittest.TestCase):
         self.assertGreater(np.abs(uncapped.solve_batch(density) - exact).max(), 1e-4)
 
 
+class ParityClassTests(unittest.TestCase):
+    """Reflection-parity classes on the octant (added 2026-11-06, hybrid speed-up round).
+
+    A density of each class, solved on the octant with the half-size even/odd
+    blocks, the class moments and the octant rows of the faces, must give the
+    full-box potential to round-off: random densities under a Gaussian
+    envelope, sphere and box domains, even counts (shift 1/2) and odd counts
+    with points on the mirror planes (shift 0), the three kernels and a
+    weighted kernel.
+    """
+
+    DOMAINS = (
+        GridSettings(spacing=0.5, radius=4.0, expansion_order=6),
+        GridSettings(spacing=0.5, radius=4.0, expansion_order=6, shift=(0.0, 0.0, 0.0)),
+        GridSettings(spacing=0.5, radius=4.0, expansion_order=6, domain_shape="box",
+                     box_lengths=(7.0, 6.0, 5.0), shift=(0.0, 0.5, 0.0)),
+    )
+    KERNELS = (
+        ("coulomb", None, None, 1e-13),
+        ("erfc", 0.11, None, 1e-12),
+        ("erf", 0.4, None, 1e-12),
+        ("erfc", 0.2, (0.2, 0.25), 1e-12),
+    )
+
+    @staticmethod
+    def _densities(grid, count=3, seed=1):
+        rng = np.random.default_rng(seed)
+        points = grid.coordinates
+        envelope = np.exp(-0.15 * np.einsum("ij,ij->i", points, points))
+        return rng.standard_normal((grid.size, count)) * envelope[:, None]
+
+    def test_class_solves_are_the_box_solves(self) -> None:
+        for settings in self.DOMAINS:
+            grid = build_cluster_grid(settings)
+            densities = self._densities(grid)
+            for kernel, omega, weights, tolerance in self.KERNELS:
+                with self.subTest(shape=settings.domain_shape, shift=settings.shift, kernel=kernel, weights=weights):
+                    solver = KroneckerPoisson(grid, kernel=kernel, omega=omega, multipole_order=9, weights=weights)
+                    self.assertTrue(solver.parity_symmetric)
+                    layout = solver.parity_layout
+                    full = solver.solve_batch(densities)
+                    components = layout.components(densities)
+                    np.testing.assert_allclose(layout.values(components, grid.size), densities, atol=1e-15)
+                    potentials = np.stack([solver.solve_parity(t, components[t]) for t in range(8)])
+                    # Each class potential has its class: zero on the planes it makes odd.
+                    for t in range(8):
+                        self.assertEqual(float(np.abs(potentials[t][layout.plane_mask(t)]).max(initial=0.0)), 0.0)
+                    combined = layout.values(potentials, grid.size)
+                    scale = float(np.abs(full).max())
+                    self.assertLess(float(np.abs(combined - full).max()), tolerance * scale)
+
+    def test_blocks_hold_the_spectrum_of_the_box(self) -> None:
+        # The even and odd blocks of every axis together have the eigenvalues
+        # of the full one-dimensional matrix (no eigenvector sorted by parity).
+        for settings in self.DOMAINS:
+            solver = KroneckerPoisson(build_cluster_grid(settings))
+            for axis in range(3):
+                blocks = solver._parity_axis(axis)
+                values = np.sort(np.concatenate([blocks[1]["eigenvalues"], blocks[-1]["eigenvalues"]]))
+                full = np.linalg.eigvalsh(
+                    dirichlet_second_derivative_matrix(solver.box_shape[axis], 6, settings.spacing)
+                )
+                np.testing.assert_allclose(values, full, rtol=0.0, atol=1e-12 * np.abs(full).max())
+                for parity, block in blocks.items():
+                    forward, inverse = block["forward"], block["inverse"]
+                    np.testing.assert_allclose(forward @ (inverse), np.eye(forward.shape[0]), atol=1e-13)
+
+    def test_padding_stays_symmetric_and_unsymmetric_boxes_have_no_classes(self) -> None:
+        grid = build_cluster_grid(
+            GridSettings(spacing=0.5, radius=12.0, expansion_order=6, domain_shape="box",
+                         box_lengths=(24.0, 8.0, 8.0))
+        )
+        solver = KroneckerPoisson(grid, kernel="erf", omega=0.4)
+        below, above = solver.automatic_padding
+        self.assertEqual(below, above)
+        self.assertTrue(solver.parity_symmetric)
+        densities = self._densities(grid, count=1)
+        layout = solver.parity_layout
+        components = layout.components(densities)
+        combined = layout.values(np.stack([solver.solve_parity(t, components[t]) for t in range(8)]), grid.size)
+        full = solver.solve_batch(densities)
+        self.assertLess(float(np.abs(combined - full).max()), 1e-12 * float(np.abs(full).max()))
+        shifted = KroneckerPoisson(
+            build_cluster_grid(GridSettings(spacing=0.35, radius=6.0, expansion_order=8, shift=(0.5, 0.0, 0.25)))
+        )
+        self.assertFalse(shifted.parity_symmetric)
+        with self.assertRaisesRegex(ValueError, "symmetric about the origin"):
+            shifted.parity_layout
+
+
+class SolveMemoryTests(unittest.TestCase):
+    """The scattered density box is freed after the forward transform (review of 2026-11-06, F1)."""
+
+    def test_peak_of_a_scattering_solve(self) -> None:
+        import tracemalloc
+
+        from parsec_python.Hartree.kronecker import solve_block
+
+        grid = build_cluster_grid(GridSettings(spacing=0.5, radius=7.0, expansion_order=6))
+        # Peaks in box arrays: 4.05 (Coulomb) and 4.45 (erfc) with the box
+        # freed; one array more while the caller kept it.
+        for kernel, omega, limit in (("coulomb", None, 4.5), ("erfc", 0.11, 4.95)):
+            solver = KroneckerPoisson(grid, kernel=kernel, omega=omega)
+            nb = 16
+            densities = np.random.default_rng(0).standard_normal((grid.size, nb))
+            solve_block(solver.plan, densities)
+            tracemalloc.start()
+            try:
+                tracemalloc.reset_peak()
+                base = tracemalloc.get_traced_memory()[0]
+                solve_block(solver.plan, densities)
+                peak = tracemalloc.get_traced_memory()[1] - base
+            finally:
+                tracemalloc.stop()
+            self.assertLess(peak / (8 * nb * solver.box_size), limit, kernel)
+
+
 class RefusalTests(unittest.TestCase):
     def test_what_is_refused(self) -> None:
         grid = build_cluster_grid(GridSettings(spacing=0.5, radius=4.0, expansion_order=6))

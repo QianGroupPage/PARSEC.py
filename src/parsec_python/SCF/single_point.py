@@ -395,6 +395,18 @@ class SCFWarmStart:
     structure before (one :class:`parsec_python.SCF.hybrid.OrbitalSet` per
     spin channel set): the first exchange operator of the Fock loop is built
     from them instead of a semilocal start.  ``None`` otherwise.
+
+    ``mixer`` is a mixer whose history this loop continues instead of a fresh
+    one (the inner loops of a hybrid's Fock loop,
+    :class:`parsec_python.Mixer.carried.CarriedAndersonMixer`); ``None``
+    starts afresh, as PARSEC does.  ``relative_criterion`` lets the loop also
+    stop once its residual fell below that share of its first residual (an
+    inexact inner loop of the Fock loop, :func:`loop_criterion`); ``None``
+    keeps the stop test of the input.  ``level_tolerance`` (Ry): once the loop
+    has converged, one more iteration solves the same ``H[V_in]`` until no
+    level moves by more than that (:func:`refine_levels`) and takes its
+    density and energies from those eigenpairs; ``None`` stops at the
+    converged iteration, as PARSEC does.
     """
 
     input_potential: np.ndarray
@@ -404,6 +416,70 @@ class SCFWarmStart:
     hxc_reference: np.ndarray | None = None
     first_iteration_degree: int | None = None
     exchange_orbitals: tuple | None = None
+    mixer: object | None = None
+    relative_criterion: float | None = None
+    level_tolerance: float | None = None
+
+
+#: Eigensolver passes of a level refinement (``SCFWarmStart.level_tolerance``) at most.
+LEVEL_PASSES = 40
+
+
+def refine_levels(solve, operator, count: int, settings, state, eigenvalues, vectors, tolerance: float, *, release=True):
+    """More eigensolver passes with the Hamiltonian of a converged loop's last iteration.
+
+    ``operator`` is that Hamiltonian (``H[V_in]`` of the last iteration, with
+    its fixed terms); each pass is one call of ``solve`` on the loop's
+    subspace ``state``.  The passes stop once no one of the ``count`` levels
+    moved by more than ``tolerance`` (Ry) in the last one, after
+    ``LEVEL_PASSES`` at most: the eigenpairs that the stop test of the loop
+    does not see (the empty levels).  ``vectors`` are the orbitals the first
+    pass replaces (``None``: already released).  Returns ``(solution,
+    passes, seconds, change)``, ``change`` the largest move of a level in
+    the last pass (Ry).
+    """
+
+    started = time.perf_counter()
+    previous = np.asarray(eigenvalues, dtype=np.float64)
+    solution = None
+    passes = 0
+    change = float("inf")
+    while passes < LEVEL_PASSES:
+        drop = getattr(vectors, "release_intermediate_storage", None) if release else None
+        if callable(drop):
+            # The views of the last orbitals are no state once the next solve begins.
+            drop()
+        solution = solve(operator, count, settings=settings, state=state)
+        passes += 1
+        state, vectors = solution.state, solution.vectors
+        values = np.asarray(solution.eigenvalues, dtype=np.float64)
+        change = (
+            float(np.max(np.abs(values - previous), initial=0.0))
+            if values.shape == previous.shape
+            else float("inf")
+        )
+        previous = values
+        if change < tolerance:
+            break
+    return solution, passes, time.perf_counter() - started, change
+
+
+def warm_start_mixer(warm_start: SCFWarmStart | None, build: Callable[[], object]) -> object:
+    """The mixer of a loop: the one ``warm_start`` carries, or ``build()``."""
+
+    carried = getattr(warm_start, "mixer", None)
+    return build() if carried is None else carried
+
+
+def loop_criterion(warm_start: SCFWarmStart | None, criterion: float, first_residual: float) -> float:
+    """The stop threshold of an SCF loop (Ry): ``criterion``, or for a loop with
+    ``warm_start.relative_criterion`` ``max(criterion, share * first_residual)``,
+    ``first_residual`` the selected residual of the loop's first iteration."""
+
+    share = getattr(warm_start, "relative_criterion", None)
+    if share is None:
+        return criterion
+    return max(float(criterion), float(share) * float(first_residual))
 
 
 @dataclass(frozen=True)
@@ -2020,6 +2096,7 @@ def run_scf(
             **({} if exchange_term is None else {"exchange_term": exchange_term}),
         )
     scf_start = time.perf_counter()
+    level_detail = None
     # The validated reference path always selects ``solve_eigval`` here.  The
     # optional callable is a narrow execution hook used by the sibling
     # accelerated package to retain the same SCF/mixing/energy control flow
@@ -2175,7 +2252,7 @@ def run_scf(
                     np.array(warm_start.hxc_reference, dtype=np.float64)
                 )
             )
-    mixer = build_mixer(system.input.mixing)
+    mixer = warm_start_mixer(warm_start, lambda: build_mixer(system.input.mixing))
     history: list[SCFIteration] = []
     # This is the later-SCF SUBSPACE polynomial degree.  The first-solver
     # degree is a separate setting.  Near SCF convergence PARSEC lowers the
@@ -2203,7 +2280,13 @@ def run_scf(
     xc_total = 0.0
     mixing_energy_total = 0.0
 
-    for iteration in range(1, settings.max_iterations + 1):
+    # SCFWarmStart.level_tolerance: after the converged iteration one more
+    # (``refining``) on the same V_in, its eigenpairs to that tolerance.
+    level_tolerance = None if warm_start is None else getattr(warm_start, "level_tolerance", None)
+    refining = False
+    for iteration in range(1, settings.max_iterations + 1 + int(level_tolerance is not None)):
+        if iteration > settings.max_iterations and not refining:
+            break
         iteration_start = time.perf_counter()
         # 3. Solve the Kohn--Sham eigenproblem with PARSEC's fixed number of
         # first-filter cycles or one later-filter pass.
@@ -2265,12 +2348,31 @@ def run_scf(
         )
         if callable(release_previous_orbitals):
             release_previous_orbitals()
-        eigensolution = solve_current_eigenproblem(
-            hamiltonian_operator,
-            number_of_states,
-            settings=eigval_settings,
-            state=eigval_state,
-        )
+        if refining:
+            # The loop converged at the iteration before: the same H[V_in]
+            # until no level moves by more than level_tolerance.
+            eigensolution, level_passes, level_seconds, level_change = refine_levels(
+                solve_current_eigenproblem,
+                hamiltonian_operator,
+                number_of_states,
+                eigval_settings,
+                eigval_state,
+                eigenvalues,
+                None,
+                float(level_tolerance),
+            )
+            level_detail = {
+                "level_passes": float(level_passes),
+                "level_seconds": float(level_seconds),
+                "level_change": float(level_change),
+            }
+        else:
+            eigensolution = solve_current_eigenproblem(
+                hamiltonian_operator,
+                number_of_states,
+                settings=eigval_settings,
+                state=eigval_state,
+            )
         # Persist all buffered Ritz pairs and filter history, not only the
         # number_of_states columns returned below.  This is what makes later
         # SCF diagonalizations saved-subspace updates instead of fresh solves.
@@ -2454,7 +2556,11 @@ def run_scf(
             filter_degree -= 1
         # The strict inequality is PARSEC's fixed-point stop rule.  Energy,
         # Hartree, and eigenpair residuals remain diagnostics only.
-        iteration_converged = selected_residual < settings.convergence_criterion
+        if iteration == 1:
+            first_residual = selected_residual
+        iteration_converged = selected_residual < loop_criterion(
+            warm_start, settings.convergence_criterion, first_residual
+        )
         if eigensolver_settings.dynamic_tolerance:
             diagonalization_tolerance = dynamic_diagonalization_tolerance(
                 diagonalization_tolerance,
@@ -2504,6 +2610,7 @@ def run_scf(
             mixing_energy_seconds=mixing_energy_seconds,
             total_seconds=iteration_seconds,
             density_symmetrization=symmetrization,
+            **({"level_refinement": True} if refining else {}),
             **hubbard_iteration_record(hubbard_state),
             **iteration_eigensolver_fields(
                 (getattr(eigensolution, "iterative_counts", None),),
@@ -2528,7 +2635,11 @@ def run_scf(
                 )
             )
 
-        if iteration_converged:
+        if iteration_converged or refining:
+            if level_tolerance is not None and not refining:
+                # V_in stays: the next iteration solves the same Hamiltonian.
+                refining = True
+                continue
             converged = True
             break
         input_potential = mixed_potential
@@ -2556,6 +2667,7 @@ def run_scf(
         xc_seconds=xc_total,
         mixing_energy_seconds=mixing_energy_total,
         total_seconds=time.perf_counter() - scf_start,
+        **({} if level_detail is None else {"detail": level_detail}),
     )
     return SinglePointResult(
         converged=converged,

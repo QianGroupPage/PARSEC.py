@@ -581,9 +581,10 @@ self-consistent PBE. The exact exchange
 pair with the Hartree solver of the calculation, on the full grid, with the
 boundary values of the pair density at the order in use and without the
 atomic tail, which belongs to the total density. Its cost is
-`N (N + 1) / 2` Poisson solves for `N` occupied orbitals; with
-`PARSEC_HARTREE_LINEAR_BACKEND=cupy` they run on the GPU like those of the
-SCF.
+`N (N + 1) / 2` Poisson solves for `N` occupied orbitals; they run where
+the conjugate gradients of the SCF do, on the GPU of a GPU run (the default
+since 2026-11-07; `PARSEC_HARTREE_LINEAR_BACKEND=native` keeps both on the
+host, see [acceleration/Hartree/GPU_HARTREE.md](acceleration/Hartree/GPU_HARTREE.md)).
 
 Limits, each stated in the output where it applies: isolated systems only
 (a periodic input and molecular dynamics refuse the keyword, as does the
@@ -656,8 +657,11 @@ ESPRESSO differ (`HybridFunctional.variants`).
 | `Exx_Tolerance` | `1e-6 Ry` | the estimated exchange error below which the Fock loop stops (an energy, in the units of the other energy keywords) |
 | `Exx_Batch_Size` | 32 | pair densities per batched Poisson solve, a positive integer |
 | `Exx_Pair_Solver` | `kronecker` | `kronecker` (every kernel) or `cg` (the conjugate gradients of the Hartree solver, `1/r` only) |
+| `Exx_Inner_Criterion` | `adaptive` | `adaptive`: while the Fock loop is far from converged an inner SCF stops at a share of its first residual (a tenth of the next loop's expected first residual), the two last loops at `Convergence_Criterion` and with every one of the `States_Num` levels converged at their last Hamiltonian, a spin-unpolarized PBE start with integer occupations at `max(Convergence_Criterion, 1e-4 Ry)`; `fixed`: every inner SCF and the start at `Convergence_Criterion` |
+| `Exx_Mixer_History` | `restart` | `restart`: a new mixer per inner loop, as PARSEC starts every SCF loop; `carry`: the inner loops continue one Anderson history (the first secant pairs of each loop carried into the next, the first loop seeded by the PBE start), measured slower with the adaptive criterion (opt-in). The Broyden and multisecant `Mixing_Method`s always restart |
+| `Exx_Outer_Mixing` | `diis` | `diis`: Anderson (Pulay) extrapolation of the density matrix of the outer loop, through natural orbitals, where the loop is slow; `none`: the plain fixed point |
 
-The six keywords without a hybrid `Correlation_Type` are refused.
+The nine keywords without a hybrid `Correlation_Type` are refused.
 `Convergence_Criterion`, `Max_Iter`, the mixer and the eigensolver settings
 apply to every SCF loop of the Fock loop. `Generate_Complete_Parsec_In`
 writes the Fock-loop keywords with their values (the fraction and omega where
@@ -689,6 +693,74 @@ the input sets them).
    loop converged; otherwise the operator of `P` is built and the next inner
    loop starts from the last one. The last outer iteration evaluates only
    the occupied pairs.
+5. **Fock-loop controls** (where the loop goes is set by `Exx_Tolerance`
+   and `Convergence_Criterion`; these keywords set how it gets there, see
+   [SCF/fock_controls.py](SCF/fock_controls.py) and
+   [SCF/fock_diis.py](SCF/fock_diis.py)).
+   *Adaptive inner criterion*: the inner loop `k` only has to be accurate
+   against the change the next operator brings, which shows as the first
+   residual of the next loop and falls by a factor `rho` per outer iteration
+   (0.06-0.25 for 20-25 % exact exchange, 0.25-0.47 for HF on the 49 cases of
+   `examples/0d_hybrid_functionals`); it stops at
+   `max(Convergence_Criterion, 0.1 rho r_k)`, `r_k` its own first residual
+   (an inexact Newton forcing term; Quantum ESPRESSO's `adaptive_thr` does the
+   same with its energy threshold). A loop whose dexx is expected below thirty
+   times `Exx_Tolerance` runs at `Convergence_Criterion`, and a loop that
+   ended loose never ends the Fock loop: the final state is always an inner
+   loop at `Convergence_Criterion` with `dexx < Exx_Tolerance`. Fewer SCF
+   iterations filter the empty states less, so a loop run at
+   `Convergence_Criterion` (with this criterion or with the outer DIIS) ends
+   with one more iteration on its last `V_in`: eigensolver passes until no
+   one of the `States_Num` levels moves by more than `Exx_Tolerance`, its
+   density and energies from those eigenpairs (no pair solves; `levels
+   converged by n eigensolver passes` in `parsec.out`). A spin-unpolarized
+   PBE start stops at `max(Convergence_Criterion, 1e-4 Ry)` (QE's
+   `conv_thr_init`) when its occupations are integer (largest `min(f, 1 - f)`
+   below 1e-3): the first inner loop starts from a residual of 3e-3..4e-2 Ry,
+   and the start's energy, within ~1e-6 Ry of the converged PBE energy, is a
+   start (run PBE for that energy). A spin-polarized start, and an
+   unpolarized one with a partly filled level (which then goes on from where
+   it stopped), run to `Convergence_Criterion` on any grid: an open shell can
+   keep a soft rotation among degenerate partners (the O atom's occupied p
+   orbital on the full grid; in the sectors d_z2 and d_x2-y2 share a
+   representation of D2h, p partners one of Cs, C2 or Ci), which an
+   unfinished start leaves turned and the Fock loop then holds (1.1e-7 Ry
+   above the converged state at `Exx_Tolerance` 1e-8).
+   *Carried mixer* (`Exx_Mixer_History: carry`, opt-in): the operator
+   changes the inner SCF map mostly by an offset, not its Jacobian, so the
+   secant pairs `(dV, dF)` of one inner loop stay valid in the next (absolute
+   pairs do not); the first secant pairs of each loop enter the Anderson
+   least squares of the next one. On the 49 hybrid examples it cost more
+   inner iterations than a fresh mixer per loop (with the adaptive
+   criterion: N2 293 against 242, H2O 291 against 231), hence the default
+   `restart`.
+   *Outer DIIS*: `X_{n+1} = sum_k c_k Y_k`, `c = argmin ||sum c_k (Y_k - X_k)||`
+   (Frobenius, from the overlaps of the stored orbitals), `sum c_k = 1`, with
+   `X_k` the density matrix of the operator of loop `k` and `Y_k` that of its
+   orbitals; the operator of `X_{n+1}` is built from its natural orbitals with
+   fractional occupations (the `n_occ` largest; the empty states of the last
+   loop complete the ACE) by the same pair solves. It is used only when the
+   last orbitals have integer occupations (a symmetric half-filled ensemble
+   is a saddle that an extrapolation is drawn to), dexx did not rise in the
+   last step, the plain loop converges slowly (dexx ratio above 0.05) and the
+   next loop is neither expected to be the last nor the last allowed
+   (`Exx_Max_Iter`); a step that raises dexx or the energy is rejected and
+   taken back (its output is dropped and the next operator is that of the
+   output the step started from). The last operator is always the plain ACE
+   of the last orbitals, so the stop test is unchanged. The window keeps
+   copies of the occupied orbitals of up to four loops (each sector on its
+   device), and only while that gate is open (integer occupations, no rise,
+   a slow loop, the end not in sight): a run that never extrapolates holds no
+   copy, and the first extrapolation of a slow phase follows two loops after
+   the output that opened the gate (two residuals take three outputs). The
+   copies are not in the device plan of the
+   exchange that the memory rules of the sectors see: a copy is made only
+   where the device has the copy, the build of the extrapolated operator
+   (three sets of `States_Num` columns) and a tenth of its memory free, and
+   a copy or a build that does not fit stops DIIS (plain steps, said in
+   `parsec.out`). `parsec.out` prints an `Inner SCF:` line (the criterion
+   used, the carried pairs, the level passes) and an `Outer step:` line per
+   outer iteration.
 
 The total energy after each inner loop is that of the hybrid functional,
 `E_formula - 2 a_x E_x(P, P0) + a_x E_x(P)`: the band energy holds
@@ -733,7 +805,24 @@ formed once.
   every symmetry sector (`-xi_G xi_G^T` per sector), and the pair densities
   of all sectors are solved by the device Kronecker solver on every GPU of
   the process, in tiles of `Exx_Batch_Size` columns, each pair once. Its
-  records, energies and stop test are those of the reference loop.
+  records, energies and stop test are those of the reference loop. A
+  spin-polarized hybrid runs both channels in the sectors by default
+  (`Spin_Symmetry_Sectors: auto`, with the symmetry guard of
+  [Spin channels in the symmetry sectors](#spin-channels-in-the-symmetry-sectors)).
+- Orbitals of symmetry sectors are never unfolded to the full grid for the
+  pair densities: where the Kronecker box is symmetric about the origin
+  (every cluster domain with the default grid shift 1/2 or shift 0), a pair
+  density is split into its reflection-parity classes `(t_x, t_y, t_z)`,
+  formed directly from the sector data, and each class is solved on the
+  octant of the box with the half-size even or odd blocks of the
+  one-dimensional Laplacian (`Hartree/kronecker.py`, "Reflection-parity
+  classes"). A group of `g` diagonal reflections (D2h 8, D2/C2v 4, Cs/Ci/C2 2)
+  leaves `8/g` classes per pair, each 1/16 of the flops of the full box: on
+  the nanodiamonds (D2) the ACE builds are about 5x faster. The result is
+  that of the full-box solve to round-off; `PARSEC_CUPY_EXCHANGE_PARITY=off`
+  takes the full-grid path instead (comparisons), as do orbitals on the full
+  grid and groups of one diagonal reflection. The two channels of a
+  spin-polarized run in the sectors take the parity classes as well.
 - The device bytes of the exchange (`xi` of every channel and sector, the
   sector expansions, the Kronecker plans and the tile work) are counted by
   the memory rules of the sectors, which spill sector states to the host
@@ -843,11 +932,98 @@ occupation of one is one electron. Forces, relaxation, molecular dynamics and
 `Energy_Refinement: b3lyp` work as without spin.
 
 Every execution path runs it: `reference_main.py`, and `main.py` with the
-SciPy, native and CuPy backends. The two channels are solved on the full
-grid: a GPU run does not use the symmetry representations, and the
-multi-node runner refuses a spin-polarized input unless it runs in one
-process (`--serial-control`). A spin-polarized periodic cell runs the
-periodic spin drivers of the readable solver (see "Physical scope").
+SciPy, native and CuPy backends. The multi-node runner refuses a
+spin-polarized input unless it runs in one process (`--serial-control`). A
+spin-polarized periodic cell runs the periodic spin drivers of the readable
+solver (see "Physical scope").
+
+### Spin channels in the symmetry sectors
+
+```text
+Spin_Symmetry_Sectors: auto      # or off
+```
+
+decides whether `main.py` on the CuPy backend solves the two channels in the
+symmetry sectors of the point group of the atoms (`auto`), as it solves an
+unpolarized run, or on the full grid (`off`). The default is `auto` for every
+`Correlation_Type` (until 7 November 2026 it was `off` for the semilocal
+functionals; `off` gives their earlier results bit for bit). With
+`auto` each channel has its own subspace in every sector, the channel and
+total densities, the Hartree potential (solved on the symmetry wedge), the
+spin functional (on the device for PBE, PW91, PW92, LB94, Casida-Salahub and
+the semilocal part of a hybrid; expanded to the full grid on the host for the
+others), the mixer, the residual norms and the energies keep one value per
+symmetry orbit, and a hybrid's exchange operator is that of each channel in
+every sector. Energies, levels and forces are those of the full grid
+(differences within the SCF tolerance: `1e-13 Ry` in the energy of the test
+cases; over the spin-polarized inputs of the repository at most `1e-9 Ry` in
+the energy and `1e-6 Ry` in an occupied level of a semilocal run, `3e-9 Ry`
+for the PBE0 example of O2 at its Fock-loop tolerance). The sectors pay from
+some 2e5 grid points on: O2 with PBE on one A100, 1.41 M points, 169 s on the
+full grid and 19 s in the sectors; 46 k points, 5.9 s and 7.2 s (the
+eigensolver of the sectors does more, smaller solves).
+
+The sectors cannot represent a density that breaks the point group of the
+sectors, and they hold a state that breaks the larger point group of the atoms
+only in the directions that group allows. A partly filled degenerate level
+breaks it on the full grid: the oxygen atom with one minority p electron in
+three p levels (at 80 K the sectors keep the symmetric ensemble, 68 mRy above;
+at integer occupations an axis-aligned p orbital, 14 mRy above on a coarse
+grid), an open 3d shell (Sc 14.8 mRy, V 6.2 mRy above the full grid with PBE0
+at h 0.30). The sectors can only be wrong where degenerate partners lie in
+different sectors (partners within one sector mix there as on the full grid).
+A multiplet is therefore a run of levels of one channel whose neighbours lie
+within 0.01 Ry, whose whole spread is at most 0.03 Ry (a longer run is a band
+of levels, such as the valence band of a large cluster or the unconverged top
+of a first subspace) and whose levels lie in two or more sectors. A sector run
+goes to the full grid when one of three tests fails: (1) the start Hamiltonian
+(first SCF iteration, from the atomic densities, which has the full point
+group of the atoms) has a partly filled multiplet in a channel, `n` electrons
+in `d` levels with `min(n, d - n) > 0.05` (a partly filled shell holds a
+third of an electron or more per level, a Fermi-Dirac tail of empty levels a
+few 1e-3), under every occupation rule
+(Fermi-Dirac, `Fermi_Temp: 0`, `occup.in`; an `occup.in` that fills all levels
+of a multiplet equally is kept), once the levels are converged (the start
+Hamiltonian is solved again from its subspaces, up to four times, until the
+levels up to the Fermi level move by at most 1e-4 Ry; a report on the
+unconverged first levels of a large cluster disappears or keeps moving and is
+left to the tests at the end); (2) at the end of a loop without an exchange
+operator or of the run, a channel density differs by 0.01 electrons or more
+from its image under an operation of the point group of the atoms that the
+grid keeps (a signed permutation of the axes, also outside the sectors' group;
+a domain or grid shift with less symmetry than the atoms keeps a subgroup,
+which is what is tested). The sectors enforce only the abelian subgroup, so
+the other operations also show the SCF error of a symmetric state (C185H124
+and C459H204: 4e-3 and 3e-3 electrons at a criterion of 2e-4 Ry, 2e-2 and 1e-2
+at 2e-3 Ry, the first steps of a relaxation with `Relaxation_SCF_Upscale`), while
+a broken state differs by about an electron (V 1.25, Co 1.17); a converged loop
+whose asymmetry lies between 0.01 and 0.2 electrons therefore goes on to a ten
+times tighter criterion (at most three times) and measures again, and only an
+asymmetry that does not shrink to half leaves the sectors; (3) with
+Fermi-Dirac occupations, a level of a
+multiplet (as above, or levels equal to 1e-4 Ry in two or more sectors) holds
+a fractional occupation at the end, `min(f, 1-f) >= 0.05`. Then `parsec.out`
+says so (a `NOTE` with the levels or the operation) and the calculation starts
+again on the full grid: from the atomic densities, as with `off`, bit for bit;
+in a later step of a relaxation from the potentials of the previous structure,
+as an `off` relaxation, with new subspaces (equal to `off` within the SCF
+tolerance). Forces, outputs and the next steps of a relaxation then use the
+full grid. `auto` keeps the full grid, and says why in `orbital_symmetry`,
+without a point group, with `--symmetry off`, on a CPU backend, with LDA+U,
+`Symmetrize_Charge_Density`, `PARSEC_CUPY_RITZ_HANDOVER=triangular` or
+`PARSEC_CUPY_DISTRIBUTED_FILTER=1`. A restart (`Restart_Run`) of a
+spin-polarized run solves both channels on the full grid (a `NOTE` says so),
+and with `--symmetry on` a run that leaves the sectors drops the forced
+symmetry for the full grid. What the tests cannot see: a partly filled
+multiplet whose partners no grid operation relates (the `e` levels of a
+threefold or sixfold axis) and that is not partly filled at the start; one
+that the first filter of a large system leaves unresolved and whose sector
+state ends invariant and integer; a state that passes through a partly filled
+multiplet during the SCF and returns to an invariant integer one.
+The reference solver (`reference_main.py`) and the MPI runner keep the
+full grid in every case; without `Spin_Polarization` the keyword is ignored
+with a WARNING. `Generate_Complete_Parsec_In` writes it for a spin-polarized hybrid
+and wherever the input sets it to `off`.
 
 With `ca`, energies, levels and forces agree with Fortran PARSEC to the
 digits it prints, and so do `pl`, `lb` and `cs`. With `pbe` and `pw` they

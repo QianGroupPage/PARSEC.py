@@ -391,22 +391,37 @@ class CuPyBackendTests(_BackendCases, unittest.TestCase):
 
     backend = "cupy"
 
-    def test_symmetric_molecule_is_solved_on_the_full_grid(self) -> None:
-        # Without spin polarization this molecule is solved in the symmetry
-        # representations of its two mirror planes.
-        case, system, result = self.assert_case("h2o_spin_ca", forces=True)
-        details = dict(result.backend.details)
-        self.assertTrue(details["orbital_symmetry"].startswith("full grid (spin-polarized"))
-        self.assertIn("local spin density", details["xc_implementation"])
-        self.assertIsNone(system.scalar_field_adapter)
+    def test_symmetric_molecule_in_the_sectors_and_on_the_full_grid(self) -> None:
+        # As without spin polarization, the default (Spin_Symmetry_Sectors:
+        # auto) solves this molecule in the symmetry representations of its
+        # two mirror planes; off keeps both channels on the full grid.
+        case = load_cases()["h2o_spin_ca"]
+        totals = {}
+        for mode in ("auto", "off"):
+            extra = () if mode == "auto" else ("Spin_Symmetry_Sectors: off",)
+            _, system, result = _solve("h2o_spin_ca", self.backend, extra=extra)
+            assert_matches_fortran(self, result, case)
+            assert_forces_match(self, driver.compute_forces(system, result), case)
+            details = dict(result.backend.details)
+            if mode == "auto":
+                self.assertTrue(details["orbital_symmetry"].startswith("CuPy real"))
+                self.assertIn("sectors", details["spin_symmetry_sectors"])
+            else:
+                self.assertTrue(details["orbital_symmetry"].startswith("full grid (spin-polarized"))
+                self.assertIn("local spin density", details["xc_implementation"])
+                self.assertIsNone(system.scalar_field_adapter)
+            totals[mode] = result.energies.total
         _, plain_system, plain = _solve("h2o_nospin_ca", self.backend)
         self.assertTrue(
             dict(plain.backend.details)["orbital_symmetry"].startswith("CuPy real")
         )
-        self.assertAlmostEqual(result.energies.total, plain.energies.total, delta=2.0e-8)
+        for mode in totals:
+            self.assertAlmostEqual(totals[mode], plain.energies.total, delta=2.0e-8)
+        self.assertAlmostEqual(totals["auto"], totals["off"], delta=1.0e-9)
 
     def test_each_channel_has_its_own_device_subspace(self) -> None:
-        _, system, result = _solve("n_ca", self.backend)
+        # Both channels on the full grid (in the sectors: test_spin_sectors.py).
+        _, system, result = _solve("n_ca", self.backend, extra=("Spin_Symmetry_Sectors: off",))
         solver = system.eigenproblem_solver
         first, second = solver.for_spin_channel(0), solver.for_spin_channel(1)
         self.assertIsNot(first, second)

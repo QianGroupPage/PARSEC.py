@@ -56,7 +56,7 @@ the potentials from the two libraries and takes `Local_Component` and
 beside the potential.
 
 The kept logs are first runs without cache, double precision, with the Poisson
-solves on the GPU (`PARSEC_HARTREE_LINEAR_BACKEND=cupy`), on A100 GPUs with
+solves on the GPU (`PARSEC_HARTREE_LINEAR_BACKEND=cupy`, the default since 2026-11-07), on A100 GPUs with
 80 GB, one run per GPU: 10–20 s per CH4 case, 59–120 s per CF4 case
 (3.1 million grid points). On a laptop with an RTX 5070 Laptop GPU (8 GB) the
 same cases took 20–33 s and 336–402 s with the library files as they were

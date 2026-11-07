@@ -180,6 +180,10 @@ _SERIAL_CONTROL_SETTINGS = {
     'PARSEC_FAST_GRID': '0',
     'PARSEC_HARTREE_BOUNDARY_KERNEL': 'full',
     'PARSEC_HARTREE_ATOMIC_TAIL_VALUES': 'host',
+    # The conjugate gradients of the Hartree solve on the host, the default
+    # before 2026-11-07 (a launcher that names cupy keeps it; with the device
+    # entry above off, a GPU CG would lie on the first device of the sectors).
+    'PARSEC_HARTREE_LINEAR_BACKEND': 'native',
     'PARSEC_CUPY_PROJECTOR_BLOCK_COLUMNS': '1',
     # The former recurrence kernel of the filter: the pipelined one gives the
     # same bits, and a defect of it would otherwise be in both sides.

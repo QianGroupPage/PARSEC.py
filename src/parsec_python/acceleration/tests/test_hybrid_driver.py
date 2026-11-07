@@ -682,9 +682,14 @@ class HybridHartreeWiringTests(unittest.TestCase):
                     "openmp_thread_source": "detected_processors_minus_4",
                 },
             ),
+            # The C++ CG by name: the GPU CG of the default cannot pack the
+            # stand-in operator of this test of the native wiring.
             patch.dict(
                 driver_module.os.environ,
-                {"PARSEC_OVERLAP_HARTREE_SETUP": "1"},
+                {
+                    "PARSEC_OVERLAP_HARTREE_SETUP": "1",
+                    "PARSEC_HARTREE_LINEAR_BACKEND": "native",
+                },
             ),
             _stand_in_input(),
         ):
@@ -750,6 +755,233 @@ class HybridHartreeWiringTests(unittest.TestCase):
         self.assertEqual(details["native_openmp_detected_processors"], "32")
         self.assertEqual(details["native_openmp_reserved_threads"], "4")
         self.assertEqual(details["native_openmp_max_threads"], "28")
+
+    def _prepare_with_gpu_cg_failing(self, environment, failure=None, free=10**12):
+        """Prepare the stand-in system while the GPU CG cannot allocate its arrays.
+
+        ``failure`` is raised by the GPU CG (an out-of-memory ``MemoryError``
+        by default), ``free`` is what the device reports free.
+        """
+
+        # Imported before ``NativePoissonSolver`` is replaced below: a first
+        # import under that patch would derive the GPU solver class of the
+        # whole process from the double.
+        import parsec_python.acceleration.Hartree.cupy_prepared  # noqa: F401
+
+        selection = _hybrid_selection()
+        negative_laplacian = object()
+        reference = SimpleNamespace(
+            negative_laplacian=negative_laplacian,
+            grid=SimpleNamespace(
+                size=1000,
+                settings=SimpleNamespace(domain_shape="sphere", stencil_half_width=4),
+            ),
+            input=SimpleNamespace(
+                hartree=SimpleNamespace(boundary_method="auto", multipole_order=9)
+            ),
+        )
+        implementation = self._cupy_backend_shell()
+        native_solver = MagicMock(name="native_poisson_solver")
+        if failure is None:
+            failure = MemoryError("out of memory allocating 42 bytes")
+        with (
+            patch.object(driver_module, "resolve_backend", return_value=selection),
+            patch.object(
+                driver_module, "_prepare_reference_physics", return_value=reference
+            ),
+            patch.object(driver_module, "_build_backend", return_value=implementation),
+            patch(
+                "parsec_python.acceleration.Hartree.native_poisson.NativePoissonSolver",
+                return_value=native_solver,
+            ) as solver_type,
+            patch(
+                "parsec_python.acceleration.Hartree.cupy_prepared."
+                "CuPyPreparedPoissonSolver",
+                side_effect=failure,
+            ) as gpu_type,
+            patch(
+                "parsec_python.acceleration.Hartree.gpu_memory.device_free_bytes",
+                return_value=free,
+            ),
+            patch(
+                "parsec_python.acceleration.Hartree.native_boundary."
+                "NativeMultipoleBoundaryBuilder",
+                return_value=MagicMock(name="native_boundary_builder"),
+            ),
+            patch(
+                "parsec_python.acceleration.backends.native.native_build_info",
+                return_value={"openmp_detected_processors": 8},
+            ),
+            _stand_in_input(),
+            # No device is chosen for the Hartree objects and the boundary of
+            # the stand-in grid stays with the native double: the test needs
+            # no CUDA.
+            patch.dict(
+                driver_module.os.environ,
+                {
+                    "PARSEC_HARTREE_DEVICE": "off",
+                    "PARSEC_HARTREE_BOUNDARY_BACKEND": "native",
+                    **environment,
+                },
+            ),
+        ):
+            if "PARSEC_HARTREE_LINEAR_BACKEND" not in environment:
+                driver_module.os.environ.pop("PARSEC_HARTREE_LINEAR_BACKEND", None)
+            system = driver_module.prepare_single_point(object(), backend="auto")
+        return system, solver_type, gpu_type, negative_laplacian
+
+    def test_default_gpu_cg_gives_way_to_the_host_cg_where_it_does_not_fit(self) -> None:
+        system, solver_type, gpu_type, operator = self._prepare_with_gpu_cg_failing({})
+        gpu_type.assert_called_once_with(operator, device_id=None)
+        solver_type.assert_called_once_with(operator)
+        details = dict(system.backend_info.details)
+        self.assertEqual(details["hartree_backend"], "native")
+        self.assertTrue(
+            details["hartree_linear_backend"].startswith(
+                "native (auto: the host CG, the GPU CG could not be built (MemoryError"
+            ),
+            details["hartree_linear_backend"],
+        )
+        self.assertIn("C++/OpenMP CG", details["hartree_implementation"])
+
+    def test_gpu_cg_asked_for_by_name_does_not_give_way(self) -> None:
+        with self.assertRaisesRegex(MemoryError, "out of memory"):
+            self._prepare_with_gpu_cg_failing({"PARSEC_HARTREE_LINEAR_BACKEND": "cupy"})
+
+    @unittest.skipUnless(cupy_available(), "CuPy is not installed")
+    def test_a_cuda_allocation_error_is_given_way_to_like_an_out_of_memory_error(self) -> None:
+        import cupy
+
+        error = cupy.cuda.runtime.CUDARuntimeError(2)  # cudaErrorMemoryAllocation
+        self.assertNotIsInstance(error, MemoryError)
+        system, solver_type, _gpu_type, operator = self._prepare_with_gpu_cg_failing(
+            {}, failure=error
+        )
+        solver_type.assert_called_once_with(operator)
+        self.assertIn(
+            "CUDARuntimeError", dict(system.backend_info.details)["hartree_linear_backend"]
+        )
+        # Another RuntimeError is no allocation failure: it stops the run.
+        with self.assertRaisesRegex(RuntimeError, "a defect"):
+            self._prepare_with_gpu_cg_failing({}, failure=RuntimeError("a defect"))
+
+    def test_without_sector_rules_the_gpu_arrays_keep_to_a_share_of_the_free_memory(self) -> None:
+        """A full-grid eigensolver plans nothing around the GPU CG: ``auto`` checks it up front."""
+
+        from parsec_python.acceleration.Hartree.gpu_memory import planned_gpu_hartree_bytes
+
+        planned = planned_gpu_hartree_bytes(1000, 4, gpu_boundary=True)
+        self.assertEqual(planned, 1000 * (5 * 25 + 40 + 60))
+        # Twenty times the arrays free: the GPU CG is made (and fails here).
+        _system, solver_type, gpu_type, operator = self._prepare_with_gpu_cg_failing(
+            {}, free=20 * planned
+        )
+        gpu_type.assert_called_once()
+        # Less: the host CG from the start, the GPU CG never made.
+        system, solver_type, gpu_type, operator = self._prepare_with_gpu_cg_failing(
+            {}, free=20 * planned - 1
+        )
+        gpu_type.assert_not_called()
+        solver_type.assert_called_once_with(operator)
+        self.assertIn(
+            "would take more than 1/20 of the",
+            dict(system.backend_info.details)["hartree_linear_backend"],
+        )
+        # A device that does not answer plans nothing; by name the GPU CG is made.
+        _system, _solver_type, gpu_type, _operator = self._prepare_with_gpu_cg_failing(
+            {}, free=None
+        )
+        gpu_type.assert_called_once()
+        with self.assertRaisesRegex(MemoryError, "out of memory"):
+            self._prepare_with_gpu_cg_failing(
+                {"PARSEC_HARTREE_LINEAR_BACKEND": "cupy"}, free=0
+            )
+
+
+class HartreeLinearBackendChoiceTests(unittest.TestCase):
+    """``PARSEC_HARTREE_LINEAR_BACKEND``: the GPU CG by default where it applies."""
+
+    def choose(self, value, selection, periodic=False):
+        with patch.dict(driver_module.os.environ):
+            driver_module.os.environ.pop("PARSEC_HARTREE_LINEAR_BACKEND", None)
+            if value is not None:
+                driver_module.os.environ["PARSEC_HARTREE_LINEAR_BACKEND"] = value
+            return driver_module._hartree_linear_backend(selection, periodic=periodic)
+
+    def test_default_and_auto_take_the_gpu_cg_beside_gpu_orbitals(self) -> None:
+        for value in (None, "", "auto", " AUTO "):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self.choose(value, _hybrid_selection()),
+                    ("cupy", "auto: the GPU of the orbitals"),
+                )
+
+    def test_default_keeps_the_cg_of_other_selections(self) -> None:
+        cpu = BackendSelection(
+            requested="auto", selected="native",
+            finite_difference_builder="native", hartree_backend="native",
+        )
+        pure_cupy = BackendSelection(
+            requested="cupy", selected="cupy",
+            finite_difference_builder="reference", hartree_backend="cupy",
+        )
+        scipy = BackendSelection(
+            requested="scipy", selected="scipy",
+            finite_difference_builder="reference", hartree_backend="scipy",
+        )
+        for selection in (cpu, pure_cupy, scipy):
+            with self.subTest(selection=selection.selected + "/" + selection.hartree_backend):
+                backend, reason = self.choose(None, selection)
+                self.assertEqual(backend, "native")
+                self.assertTrue(reason.startswith("auto: no GPU CG"), reason)
+
+    def test_named_values(self) -> None:
+        self.assertEqual(
+            self.choose("native", _hybrid_selection()),
+            ("native", "PARSEC_HARTREE_LINEAR_BACKEND=native"),
+        )
+        self.assertEqual(
+            self.choose("cupy", _hybrid_selection()),
+            ("cupy", "PARSEC_HARTREE_LINEAR_BACKEND=cupy"),
+        )
+        scipy = BackendSelection(
+            requested="scipy", selected="scipy",
+            finite_difference_builder="reference", hartree_backend="scipy",
+        )
+        with self.assertRaisesRegex(ValueError, "requires the auto/hybrid CUDA"):
+            self.choose("cupy", scipy)
+        with self.assertRaisesRegex(ValueError, "must be auto, native or cupy"):
+            self.choose("gpu", _hybrid_selection())
+
+    def test_a_periodic_cell_keeps_its_own_solver(self) -> None:
+        for value in (None, "cupy", "native"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self.choose(value, _hybrid_selection(), periodic=True)[0], "native"
+                )
+
+    def test_the_report_names_the_cg_that_runs(self) -> None:
+        def report(selection, periodic=False):
+            backend, reason = self.choose(None, selection, periodic=periodic)
+            return driver_module._hartree_linear_report(
+                selection, periodic=periodic, backend=backend, reason=reason
+            )
+
+        self.assertEqual(report(_hybrid_selection()), "cupy (auto: the GPU of the orbitals)")
+        self.assertTrue(report(_hybrid_selection(), periodic=True).startswith("periodic ("))
+        for selection, label in (
+            (BackendSelection(requested="scipy", selected="scipy",
+                              finite_difference_builder="reference", hartree_backend="scipy"),
+             "scipy ("),
+            (BackendSelection(requested="cupy", selected="cupy",
+                              finite_difference_builder="reference", hartree_backend="cupy"),
+             "cupy-csr ("),
+            (BackendSelection(requested="auto", selected="native",
+                              finite_difference_builder="native", hartree_backend="native"),
+             "native (the C++/OpenMP CG of a CPU run"),
+        ):
+            with self.subTest(label=label):
+                self.assertTrue(report(selection).startswith(label), report(selection))
 
 
 class MPIRolePreparationTests(unittest.TestCase):
@@ -3958,15 +4190,26 @@ class RealHybridAccuracyTests(unittest.TestCase):
 
         problem = parse_parsec_input(SMOKE_INPUT).problem
         expected = run_scf(prepare_single_point(problem, backend="scipy"))
-        system = prepare_single_point(
-            problem, backend="auto", symmetry="off"
-        )
+        environment = {
+            key: value for key, value in os.environ.items()
+            if key != "PARSEC_HARTREE_LINEAR_BACKEND"
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            system = prepare_single_point(
+                problem, backend="auto", symmetry="off"
+            )
         actual = run_scf(system)
 
         self.assertEqual(actual.backend.selected, "cupy")
         details = dict(actual.backend.details)
         self.assertIn("C++17", details["finite_difference_builder"])
-        self.assertEqual(details["hartree_backend"], "native")
+        # The default CG of the composition runs on the GPU of the orbitals,
+        # and with it the boundary of this full grid, which the native
+        # builder has no orbit table for.
+        self.assertEqual(details["hartree_backend"], "cupy-boundary/cupy-linear")
+        self.assertEqual(
+            details["hartree_linear_backend"], "cupy (auto: the GPU of the orbitals)"
+        )
         np.testing.assert_allclose(
             actual.eigenvalues,
             expected.eigenvalues,
@@ -3980,6 +4223,54 @@ class RealHybridAccuracyTests(unittest.TestCase):
             atol=2.0e-9,
         )
         self.assertAlmostEqual(actual.energies.total, expected.energies.total, 7)
+
+    def test_gpu_cg_failing_on_the_wedge_leaves_the_wedge_to_the_host_cg(self) -> None:
+        """``auto``: the host CG on the same wedge, not a full-grid GPU CG."""
+
+        problem = parse_parsec_input(SMOKE_INPUT).problem
+        environment = {
+            key: value for key, value in os.environ.items()
+            if key not in ("PARSEC_HARTREE_LINEAR_BACKEND", "PARSEC_HARTREE_BOUNDARY_BACKEND")
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch(
+                "parsec_python.acceleration.Hartree.cupy_prepared.CuPyPreparedPoissonSolver",
+                side_effect=RuntimeError("no slot-major stencil for this wedge"),
+            ),
+        ):
+            system = prepare_single_point(problem, backend="auto")
+        details = dict(system.backend_info.details)
+        self.assertEqual(details["hartree_symmetry"], "normalized Cartesian axis-reflection wedge")
+        self.assertTrue(details["hartree_linear_backend"].startswith(
+            "native (auto: the host CG, the GPU CG could not be built (RuntimeError"
+        ), details["hartree_linear_backend"])
+        self.assertIn("symmetry-wedge C++/OpenMP CG", details["hartree_implementation"])
+
+    def test_sector_memory_rules_count_the_gpu_hartree_arrays(self) -> None:
+        problem = parse_parsec_input(SMOKE_INPUT).problem
+        environment = {
+            key: value for key, value in os.environ.items()
+            if key != "PARSEC_HARTREE_LINEAR_BACKEND"
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            system = prepare_single_point(problem, backend="auto")
+            with patch.dict(os.environ, {"PARSEC_HARTREE_LINEAR_BACKEND": "native"}):
+                host = prepare_single_point(problem, backend="auto")
+        details = dict(system.backend_info.details)
+        solver = system.backend.symmetry_eigensolver
+        self.assertIsNotNone(solver)
+        device = int(details["hartree_cg_device"])
+        resident = solver.resident_device_bytes
+        host_resident = host.backend.symmetry_eigensolver.resident_device_bytes
+        self.assertEqual(
+            resident.get(device, 0) - host_resident.get(device, 0),
+            int(details["hartree_cg_device_bytes"])
+            + int(details["hartree_boundary_device_bytes"]),
+        )
+        for operator in solver._operators:
+            if operator is not None:
+                self.assertEqual(operator.resident_device_bytes, resident)
 
     def test_auto_hybrid_uses_reflection_representations(self) -> None:
         problem = parse_parsec_input(SMOKE_INPUT).problem

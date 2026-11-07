@@ -161,9 +161,10 @@ python src\parsec_python\main.py parsec.in --device cpu --threads all
 ```
 
 `--gpus` or `--gpu-ids` alone asks for a GPU run. `--threads` sets the team
-of the C++/OpenMP kernels (setup and Hartree on a GPU run, the whole solver
-on a CPU run with the native extension); the BLAS of NumPy keeps its own
-variables (`OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`).
+of the C++/OpenMP kernels (setup and the Hartree boundary on a GPU run, whose
+Hartree conjugate gradients run on the GPU since 2026-11-07, and the whole
+solver on a CPU run with the native extension); the BLAS of NumPy keeps its
+own variables (`OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`).
 
 What ran is at the top of `parsec.out`, and `--dry-run` prints the same plan
 without starting a calculation:

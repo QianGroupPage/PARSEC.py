@@ -326,13 +326,25 @@ def restart_warm_start(system, fields: RestartFields) -> SCFWarmStart:
             density_guess=np.array(fields.densities[0], dtype=np.float64),
             hxc_reference=np.zeros_like(ionic),
         )
-    hartree = system.solve_hartree(fields.total_density, initial_potential=-ionic)
-    xc = system.evaluate_spin_xc(fields.densities[0], fields.densities[1])
+    # A loop that keeps its fields on symmetry orbits (the spin channels of
+    # the accelerated driver in the sectors) evaluates them there; the warm
+    # start holds full-grid fields.
+    adapter = getattr(system, "scalar_field_adapter", None)
+    inward = (lambda values: values) if adapter is None else adapter.from_full
+    outward = (
+        (lambda values: values)
+        if adapter is None
+        else (lambda values: adapter.to_full(values))
+    )
+    hartree = system.solve_hartree(
+        inward(fields.total_density), initial_potential=inward(-ionic)
+    )
+    xc = system.evaluate_spin_xc(inward(fields.densities[0]), inward(fields.densities[1]))
     return SCFWarmStart(
         input_potential=tuple(
-            ionic + hartree.potential + potential for potential in xc.potentials
+            ionic + outward(hartree.potential) + outward(potential) for potential in xc.potentials
         ),
-        hartree_potential=np.asarray(hartree.potential, dtype=np.float64),
+        hartree_potential=np.asarray(outward(hartree.potential), dtype=np.float64),
     )
 
 

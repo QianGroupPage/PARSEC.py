@@ -445,8 +445,10 @@ class DeviceSCFTests(unittest.TestCase):
     def test_spin_polarized_functionals(self) -> None:
         for name, mode, label in (
             ("ch3_default", "auto", "CuPy float64 spin-polarized PW92-LDA"),
-            # ``on`` up to 2026-10-30; the default since.
-            ("h2o_spin_pb", "auto", "CuPy float64 spin-polarized discrete-variational PBE"),
+            # ``on`` up to 2026-10-30; the default since.  Water has a point
+            # group: both channels in its sectors (Spin_Symmetry_Sectors: auto,
+            # the default since 2026-11-07), the functional on the orbits.
+            ("h2o_spin_pb", "auto", "CuPy float64 spin-polarized discrete-variational PBE on the symmetry orbits"),
         ):
             case = _xc_case(name)
             device, device_label, _ = _solve(case, mode)

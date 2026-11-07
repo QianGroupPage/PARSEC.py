@@ -109,6 +109,58 @@ class PairPoissonTests(unittest.TestCase):
                     )
 
 
+class DevicePairPoissonTests(unittest.TestCase):
+    """The pair solves of a GPU CG on a wedge: a full-grid GPU CG, or the host where it does not fit."""
+
+    @unittest.skipUnless(
+        native_available() and cupy_available(), "the native extension and CuPy/CUDA are required"
+    )
+    def test_full_grid_gpu_cg_gives_way_to_the_host_cg(self) -> None:
+        import os
+
+        problem = hydrogen_molecule()
+        environment = {
+            key: value for key, value in os.environ.items()
+            if key != "PARSEC_HARTREE_LINEAR_BACKEND"
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            system = prepare_single_point(problem, backend="auto", symmetry="auto")
+        details = dict(system.backend_info.details)
+        self.assertIn("symmetry wedge", details["hartree_implementation"])
+        grid = system.grid
+        points = grid.coordinates
+        shifted = points - np.array([0.4, -0.3, 0.2])
+        density = (points[:, 0] + 0.3) * np.exp(-0.6 * np.einsum("ij,ij->i", shifted, shifted))
+        reference = reference_pair_poisson(
+            grid, build_negative_laplacian(grid), system.input.hartree
+        )(density)
+        scale = np.max(np.abs(reference.potential))
+        gpu = "parsec_python.acceleration.Hartree.cupy_prepared.CuPyPreparedConjugateGradientBackend"
+        free = "parsec_python.acceleration.Hartree.gpu_memory.device_free_bytes"
+        cases = (
+            ((), "FP64 CUDA conjugate gradients on device", "(prepared for the full grid)"),
+            ((patch(free, return_value=1000),), "C++/OpenMP conjugate gradients",
+             "on the host: the GPU CG of"),
+            ((patch(gpu, side_effect=MemoryError("out of memory allocating 8 bytes")),),
+             "C++/OpenMP conjugate gradients", "could not be built (MemoryError"),
+        )
+        for patches, solver_text, origin in cases:
+            with self.subTest(origin=origin):
+                for item in patches:
+                    item.start()
+                try:
+                    solver = build_pair_poisson(system)
+                finally:
+                    for item in patches:
+                        item.stop()
+                self.assertIn(solver_text, solver.description)
+                self.assertIn(origin, solver.description)
+                np.testing.assert_allclose(
+                    np.asarray(solver(density).potential), reference.potential,
+                    rtol=0.0, atol=1.0e-8 * scale,
+                )
+
+
 class BoxDomainPairPoissonTests(unittest.TestCase):
     def test_box_pair_solver_uses_the_direct_boundary_of_the_pair_density(self) -> None:
         """A box has no multipole boundary: the direct Coulomb sum of the pair."""

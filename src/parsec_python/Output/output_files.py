@@ -30,7 +30,12 @@ from typing import Callable
 
 import numpy as np
 
-from ..models import ExchangeLoopIteration, OutputFileSettings, WavefunctionSelection
+from ..models import (
+    ExchangeLoopIteration,
+    OutputFileSettings,
+    SpinSectorFallbackRecord,
+    WavefunctionSelection,
+)
 from .cube import CUBE_FILE_STEMS, grid_data_fields, write_parsec_cube
 from .eigen_dat import (
     EigenDatFile,
@@ -244,8 +249,9 @@ class RunOutputFiles:
         )
 
     def iteration(self, step) -> None:
-        if isinstance(step, ExchangeLoopIteration):
-            # An outer iteration of a hybrid's Fock loop: no levels of its own.
+        if isinstance(step, (ExchangeLoopIteration, SpinSectorFallbackRecord)):
+            # An outer iteration of a hybrid's Fock loop, or the note that a
+            # spin loop leaves the symmetry sectors: no levels of its own.
             # (A spin-polarized record has eigenvalues_up/_down and no
             # eigenvalues: it is not one.)
             return

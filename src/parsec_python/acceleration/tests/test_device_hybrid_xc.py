@@ -170,7 +170,6 @@ class DeviceHybridSemilocalTests(unittest.TestCase):
 
     def test_refusals(self) -> None:
         from parsec_python.acceleration.V_xc.device_hybrid_xc import (
-            DeviceSpinHybridXCEvaluator,
             component_parameters,
             device_hybrid_supported,
         )
@@ -179,8 +178,8 @@ class DeviceHybridSemilocalTests(unittest.TestCase):
         self.assertTrue(device_hybrid_supported(functional, self.grid))
         with self.assertRaises(ValueError):
             component_parameters(object())
-        with self.assertRaises(ValueError):
-            DeviceSpinHybridXCEvaluator(functional, self.grid, reducer=object())
+        # (The spin evaluator takes the orbits of the symmetry sectors since
+        # Spin_Symmetry_Sectors: test_spin_sectors.py.)
 
 
 if __name__ == "__main__":

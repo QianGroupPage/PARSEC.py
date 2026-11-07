@@ -746,19 +746,7 @@ class CuPySymmetrySCFEigensolver:
                 sector_local_potentials.append(operator.effective_potential)
                 self._sector_timing_stats.append(sector_timing)
                 self._operators.append(operator)
-                self._solvers.append(
-                    CuPyEigvalSolver(
-                        operator,
-                        settings=EigvalSettings(safety_buffer=0),
-                        timing_stats=sector_timing,
-                        retain_vectors_on_device=True,
-                        compute_subspace_residuals=False,
-                        # The density and the forces of the sectors know
-                        # the hand-over; a basis that MPI ranks share does
-                        # not hold one (mpi_shared_basis), see _record_handover.
-                        handover_capable=getattr(operator, "_mpi_shared_group", None) is None,
-                    )
-                )
+                self._solvers.append(self._new_sector_solver(representation))
         self._sector_local_potentials = tuple(sector_local_potentials)
         local_potential_buffer_count = len(
             {
@@ -804,6 +792,125 @@ class CuPySymmetrySCFEigensolver:
             if neighbors_are_shared and shared_device_neighbors is not None
             else "private_per_representation"
         )
+
+    def _new_sector_solver(self, representation: int) -> CuPyEigvalSolver:
+        """A persistent eigensolver of one sector, on its operator (no subspace yet)."""
+
+        operator = self._operators[representation]
+        return CuPyEigvalSolver(
+            operator,
+            settings=EigvalSettings(safety_buffer=0),
+            timing_stats=self._sector_timing_stats[representation],
+            retain_vectors_on_device=True,
+            compute_subspace_residuals=False,
+            # The density and the forces of the sectors know the hand-over; a
+            # basis that MPI ranks share does not hold one (mpi_shared_basis),
+            # see _record_handover.
+            handover_capable=getattr(operator, "_mpi_shared_group", None) is None,
+        )
+
+    # ----- spin channels ------------------------------------------------
+
+    def for_spin_channel(self, index: int) -> "SectorSpinChannel":
+        """The eigensolver of one channel of a spin-polarized loop (``Spin_Symmetry_Sectors``).
+
+        The two channels share the sector operators: stencils, projectors,
+        the local-potential buffer of each device, which the loop binds to
+        the channel it solves, and an exact-exchange term bound for that
+        channel.  Each channel has sector solvers of its own (the saved
+        subspaces), its own state and sector counts.  The first call makes
+        the second channel's solvers; channel 0 keeps those of the
+        construction.  The loop solves the channels in turn, and each call of
+        a channel's solver puts that channel's attributes in place
+        (:meth:`_activate_spin_channel`).
+        """
+
+        if index not in (0, 1):
+            raise ValueError("a spin channel is 0 (up) or 1 (down)")
+        if getattr(self, "mpi_context", None) is not None:
+            raise NotImplementedError(
+                "the symmetry sectors of an MPI run serve one spin channel; a spin-polarized "
+                "calculation runs in one process"
+            )
+        channels = getattr(self, "_spin_channels", None)
+        if channels is None:
+            cp, _ = require_cupy()
+            solvers = []
+            for representation, solver in enumerate(self._solvers):
+                if solver is None:
+                    solvers.append(None)
+                    continue
+                with cp.cuda.Device(self._sector_device_ids[representation]):
+                    solvers.append(self._new_sector_solver(representation))
+            self._channel_store = [None, {"_solvers": solvers, "_state": None, "_sector_counts": None}]
+            self._active_spin_channel = 0
+            channels = self._spin_channels = (SectorSpinChannel(self, 0), SectorSpinChannel(self, 1))
+        return channels[index]
+
+    _SPIN_CHANNEL_ATTRIBUTES = ("_solvers", "_state", "_sector_counts")
+
+    def _activate_spin_channel(self, index: int) -> None:
+        """Put the sector solvers, state and counts of channel ``index`` in place."""
+
+        current = self._active_spin_channel
+        if index == current:
+            return
+        self._channel_store[current] = {name: getattr(self, name) for name in self._SPIN_CHANNEL_ATTRIBUTES}
+        for name, value in self._channel_store[index].items():
+            setattr(self, name, value)
+        self._channel_store[index] = None
+        self._active_spin_channel = index
+
+    @property
+    def spin_channel_count(self) -> int:
+        """2 once the solver serves the channels of a spin-polarized loop, else 1."""
+
+        return 1 if getattr(self, "_spin_channels", None) is None else 2
+
+    def _channel_value(self, index: int, name: str):
+        if index == self._active_spin_channel:
+            return getattr(self, name)
+        return self._channel_store[index][name]
+
+    @property
+    def sector_state_counts_record(self) -> str | None:
+        """The vectors kept per sector after the last solve, as the backend details list them.
+
+        One count per sector; ``up: ...; down: ...`` for the two channels of
+        a spin-polarized loop.  ``None`` before any solve.
+        """
+
+        if getattr(self, "_spin_channels", None) is None:
+            state = self._state
+            return None if state is None else " ".join(str(value) for value in state.sector_state_counts)
+        parts = []
+        for index, name in enumerate(("up", "down")):
+            state = self._channel_value(index, "_state")
+            if state is not None:
+                parts.append(f"{name}: " + " ".join(str(value) for value in state.sector_state_counts))
+        return "; ".join(parts) or None
+
+    def spin_projector_force_terms(self, selections) -> np.ndarray:
+        """Nonlocal force terms per projector of both spin channels, summed.
+
+        ``selections`` holds per channel what :meth:`projector_force_terms`
+        takes (sectors and sector columns of the selected states, and their
+        occupations with the weight of one channel, half the electrons of a
+        state).  The projector gradients are built once for both.
+        """
+
+        gradients = self._force_gradients_now()
+        total = None
+        for index, (representations, columns, occupations) in enumerate(selections):
+            self._activate_spin_channel(index)
+            terms = self._projector_force_terms_local(
+                np.ascontiguousarray(representations, dtype=np.int32),
+                np.ascontiguousarray(columns, dtype=np.int32),
+                np.ascontiguousarray(occupations, dtype=np.float64),
+                gradients=gradients,
+            )
+            total = terms if total is None else total + terms
+        return total
 
     def _sector_filter_work(
         self,
@@ -1237,29 +1344,36 @@ class CuPySymmetrySCFEigensolver:
             return context.execute(self, "forces", payload)
         return self._projector_force_terms_local(*payload)
 
-    def _projector_force_terms_local(
-        self,
-        representations: np.ndarray,
-        columns: np.ndarray,
-        occupations: np.ndarray,
-    ) -> np.ndarray:
-        from time import perf_counter
+    def _force_gradients_now(self):
+        """``(projectors, transposes, phases)`` of the present atoms: those built beside the SCF loop where a thread did."""
 
-        from ..Forces.nonlocal_device import projector_force_terms
+        from time import perf_counter
 
         started = perf_counter()
         prepared = getattr(self, "_prepared_force_gradients", None)
         self._prepared_force_gradients = None
         if prepared is None:
-            count, transposes, phases = self._sector_force_gradients()
-        else:
-            count, transposes, phases = prepared.result()
-            # Built beside the SCF loop: what remains here is the wait.
-            phases = {
-                "gradients": perf_counter() - started,
-                "reduction": 0.0,
-                "background": phases["gradients"] + phases["reduction"],
-            }
+            return self._sector_force_gradients()
+        count, transposes, phases = prepared.result()
+        # Built beside the SCF loop: what remains here is the wait.
+        return count, transposes, {
+            "gradients": perf_counter() - started,
+            "reduction": 0.0,
+            "background": phases["gradients"] + phases["reduction"],
+        }
+
+    def _projector_force_terms_local(
+        self,
+        representations: np.ndarray,
+        columns: np.ndarray,
+        occupations: np.ndarray,
+        gradients=None,
+    ) -> np.ndarray:
+        from time import perf_counter
+
+        from ..Forces.nonlocal_device import projector_force_terms
+
+        count, transposes, phases = self._force_gradients_now() if gradients is None else gradients
         reduced_at = perf_counter()
         total = np.zeros((count, 3), dtype=np.float64)
         for representation in self._owned_representations:
@@ -1484,13 +1598,14 @@ class CuPySymmetrySCFEigensolver:
                     self._operators[representation], int(count)
                 )
             if shared is None:
-                states[owner] += rows * int(count) * np.dtype(np.float64).itemsize
+                # The subspaces of both channels of a spin-polarized loop.
+                states[owner] += rows * int(count) * np.dtype(np.float64).itemsize * self.spin_channel_count
                 buffers[owner] = max(
                     buffers[owner], streaming_workspace_bytes(rows, count)
                 )
                 continue
             for device_id in shared:
-                states[device_id] += shared_block_bytes(rows, count, len(shared))
+                states[device_id] += shared_block_bytes(rows, count, len(shared)) * self.spin_channel_count
         return {
             device_id: states[device_id] + buffers[device_id] + resident.get(device_id, 0)
             for device_id in self.device_ids
@@ -1610,6 +1725,11 @@ class CuPySymmetrySCFEigensolver:
         # those of its staging, which the density step reads as well.
         spill_download_order()
         staging = spill_buffer_mode()
+        if self.spin_channel_count > 1:
+            # The persistent host buffers are one per sector; the two
+            # channels of a spin-polarized loop move their states by the
+            # former calls.
+            staging = "fresh"
         spill_pinned_pool()
         spill_pinned_bytes()
         # Read by the Ritz step of a sector on one device, inside the first
@@ -1628,6 +1748,7 @@ class CuPySymmetrySCFEigensolver:
                 self.decomposition.sector_size(representation)
                 * int(count)
                 * np.dtype(np.float64).itemsize
+                * self.spin_channel_count
             )
         totals: dict[int, int] = {}
         for device_id in self.device_ids:
@@ -2673,10 +2794,47 @@ class CuPySymmetrySCFEigensolver:
         )
 
 
+class SectorSpinChannel:
+    """One spin channel of a :class:`CuPySymmetrySCFEigensolver` (see ``for_spin_channel``).
+
+    A callable with the interface of the solver itself for the SCF loop of
+    one channel: every call first puts the channel's sector solvers, state
+    and counts in place in the shared solver.
+    """
+
+    def __init__(self, solver: CuPySymmetrySCFEigensolver, index: int) -> None:
+        self.solver = solver
+        self.index = int(index)
+
+    def _active(self) -> CuPySymmetrySCFEigensolver:
+        self.solver._activate_spin_channel(self.index)
+        return self.solver
+
+    def __call__(self, operator, requested_states, *, settings, state=None):
+        return self._active()(operator, requested_states, settings=settings, state=state)
+
+    @property
+    def state(self):
+        return self.solver._channel_value(self.index, "_state")
+
+    def reset(self) -> None:
+        self._active().reset()
+
+    def start_new_scf_loop(self):
+        return self._active().start_new_scf_loop()
+
+    def projector_force_terms(self, representations, columns, occupations) -> np.ndarray:
+        return self._active().projector_force_terms(representations, columns, occupations)
+
+    def ensure_ritz_vectors(self) -> int:
+        return self._active().ensure_ritz_vectors()
+
+
 __all__ = [
     "CuPySymmetryEigvalResult",
     "CuPySymmetryEigvalState",
     "CuPySymmetryOrbitals",
     "CuPySymmetrySCFEigensolver",
+    "SectorSpinChannel",
     "selected_device_ids",
 ]

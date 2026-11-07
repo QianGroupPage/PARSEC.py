@@ -279,12 +279,15 @@ Explicit `--log` and `--output` controls select other paths. Use
 | `scipy` | Canonical float64 CSR/CSC operators, allocation-reduced fused host action, and fast recurrence multipoles | NumPy and SciPy | Portable accelerated baseline and numerical reference for other backends |
 | `native` | Cached C++17 finite-difference construction plus OpenMP-capable fused Hamiltonian action and Poisson CG | Compiled `parsec_accelerated_native` extension | Multicore CPU acceleration without changing SCF physics |
 | `cupy` | Float64 device-resident Hamiltonian, CHEBFF/CHEBDAV/SUBSPACE state, an opt-in FP32 later filter, and shared-CSR Poisson CG | CuPy build matching the installed CUDA runtime and a usable GPU | GPU eigensolver and Hartree linear algebra |
-| `auto` | Accuracy-preserving hybrid when possible: native finite-difference construction and Hartree, plus a device-resident CuPy Hamiltonian and eigensolver | Native extension and CuPy for the complete hybrid; missing components fall back with recorded provenance | Fastest default execution while retaining a reproducible component-by-component fallback trail |
+| `auto` | Accuracy-preserving hybrid when possible: native finite-difference construction and Hartree boundary, plus a device-resident CuPy Hamiltonian and eigensolver and the Hartree CG on the same GPU | Native extension and CuPy for the complete hybrid; missing components fall back with recorded provenance | Fastest default execution while retaining a reproducible component-by-component fallback trail |
 
 `auto` selects components independently. When both optional runtimes are
-available, finite-difference construction and Hartree use the native C++
-kernels, while Hamiltonian applications and CHEBFF/CHEBDAV/SUBSPACE use
-CuPy. If only one accelerator is available, `auto` uses the compatible
+available, finite-difference construction and the Hartree boundary of a
+symmetry wedge use the native C++ kernels, while Hamiltonian applications,
+CHEBFF/CHEBDAV/SUBSPACE and, since 2026-11-07, the conjugate gradients of the
+Hartree solve, with the boundary of a full grid, use CuPy
+(`PARSEC_HARTREE_LINEAR_BACKEND`, `Hartree/GPU_HARTREE.md`; `native` keeps
+both on the host). If only one accelerator is available, `auto` uses the compatible
 combination and records each choice. Explicit `scipy`, `native`, and `cupy`
 remain clean end-to-end comparison modes rather than hybrid aliases.
 
@@ -295,14 +298,21 @@ remain clean end-to-end comparison modes rather than hybrid aliases.
 Hartree solver and, on a GPU, the eigensolver and the density of each
 channel.
 
-- The two channels and the Hartree potential are solved on the full grid.
-  With symmetry `auto` a run reports `orbital_symmetry = full grid
-  (spin-polarized: ...)` and `hartree_symmetry = full grid (spin-polarized:
-  ...)`: a partly filled degenerate level may take a density that the point
-  group does not leave invariant, which the symmetry wedge of the Hartree
-  solver would average away. Symmetry `on` is refused. The representation
-  eigensolver (`CuPySymmetrySCFEigensolver`) keeps one subspace per
-  representation and is not used.
+- With the CuPy backend and a point group, both channels are solved in the
+  symmetry sectors by default (`Spin_Symmetry_Sectors: auto`, for every
+  functional; `../README.md`, "Spin channels in the symmetry sectors"): each
+  channel has its own subspace in every sector of
+  `CuPySymmetrySCFEigensolver` (`for_spin_channel`), and the channel
+  densities, the Hartree potential (on the symmetry wedge), the spin
+  functional and the mixer keep one value per symmetry orbit
+  (`SCF/spin_sectors.py`). The symmetry guard of that module sends a run
+  whose start Hamiltonian has a partly filled multiplet, whose channel
+  density breaks the point group of the atoms or whose occupations end
+  fractional back to the full grid, with a `NOTE`.
+- With `Spin_Symmetry_Sectors: off`, a CPU backend, `--symmetry off` or no
+  point group, the two channels and the Hartree potential are solved on the
+  full grid; the run reports `orbital_symmetry = full grid (spin-polarized:
+  ...)` where symmetry would otherwise apply.
 - On a GPU the channels share one Hamiltonian allocation, whose local
   potential is bound before each solve, and each keeps its own buffered
   subspace on the device (`CuPySCFEigensolver.for_spin_channel`). The device
@@ -318,8 +328,9 @@ channel.
   `--serial-control`) refuses a spin-polarized input: its ranks divide the
   symmetry sectors.
 - An eigensolver hook that keeps a subspace of its own and has no
-  `for_spin_channel` is refused by the SCF loop, as are the symmetry-reduced
-  scalar-field hooks.
+  `for_spin_channel` is refused by the SCF loop, as are symmetry-reduced
+  scalar-field hooks without the two-channel interface of
+  `SCF/spin_sectors.py`.
 
 Forces, relaxation, molecular dynamics and the B3LYP refinement take a
 spin-polarized result on every backend.
@@ -1565,7 +1576,8 @@ them; both have run there since (`result.hartree_boundary` in the
 | `PARSEC_HARTREE_BOUNDARY_TOLERANCE`, `PARSEC_HARTREE_ATOMIC_TAIL` | unset: the input keywords `Hartree_Boundary_Tolerance` (`1e-3 Ry`) and `Hartree_Atomic_Tail` (`auto`) | `off` and `off` | changed by design | `hartree_boundary_tolerance`; `hartree_atomic_tail` with `hartree_atomic_tail_max` and `hartree_atomic_tail_seconds` | `Hartree/GPU_HARTREE.md` |
 | `PARSEC_HARTREE_LPOLE` | unset: the input keyword `Solver_Lpole` (0 to 60, default 9; orders above 9 need native extension 0.6.0 or newer) |  | changed by design | `hartree_multipole_order` | `Hartree/GPU_HARTREE.md` |
 | `PARSEC_HARTREE_BOUNDARY_KERNEL` | `auto`: the GPU boundary of an engaged plan is evaluated once per unique exterior point, on the wedge of an axis-reflection group or, without one, on the full grid (round-off change against the full-grid kernels; see `Hartree/GPU_HARTREE.md`). On the laptop GPU the raised order costs less than the former boundary on the D2 wedge and, without such a group, up to about twice as much at order 34 | `full`: the full-grid kernels (the serial control of the MPI runner takes them) | round-off | `hartree_boundary_kernel`, `hartree_boundary_device_bytes` | `Hartree/GPU_HARTREE.md` |
-| `PARSEC_HARTREE_BOUNDARY_BACKEND` | unset: the native builders; where the plan is engaged and they have no orbit table (no reduction, or the table of the raised order above 512 MiB) the GPU kernels if the orbital backend is CuPy. `cupy`: the GPU boundary. `auto`: see `GPU_SFC_OPTIMIZATION.md` | `native`: the native builders whatever they cost | round-off where the GPU kernels take the boundary | `hartree_boundary_kernel`, `hartree_backend` | `Hartree/GPU_HARTREE.md` |
+| `PARSEC_HARTREE_LINEAR_BACKEND` | unset or `auto` (since 2026-11-07): the conjugate gradients of the cluster Hartree solve, and the pair solves of `Energy_Refinement`, on the GPU of the orbitals wherever CuPy orbitals have the native Hartree components; the CG of the selected backend elsewhere (CPU runs, `--backend scipy` or `cupy`, periodic cells). The host CG, on the same wedge, also where the GPU CG cannot be made (out-of-memory, CUDA runtime or driver errors) and, beside a full-grid eigensolver, where the GPU Hartree arrays would take more than 1/20 of the free device memory; with symmetry sectors the arrays are counted by the memory rules of the sectors instead (`Hartree/GPU_HARTREE.md`). `cupy`: the GPU CG by name (refused where it does not apply) | `native`: the C++/OpenMP CG on the host | within the CG tolerance: totals of 109 example inputs within 1.3e-11 Ry, forces within 1.5e-11 Ry/bohr (1e-9 for CA CF4), C459H204 within 1e-9 Ry; the boundary of a full grid follows the CG onto the GPU (`PARSEC_HARTREE_BOUNDARY_BACKEND`) | `hartree_linear_backend`, `hartree_backend`, `hartree_cg_device`, `hartree_cg_device_bytes` | `Hartree/GPU_HARTREE.md` |
+| `PARSEC_HARTREE_BOUNDARY_BACKEND` | unset: the native builders; where they have no orbit table (no reduction, or the table of the raised order above 512 MiB) the GPU kernels if the orbital backend is CuPy and the plan is engaged or, since 2026-11-07, the Hartree CG runs on the GPU (`PARSEC_HARTREE_LINEAR_BACKEND`). `cupy`: the GPU boundary. `auto`: see `GPU_SFC_OPTIMIZATION.md` | `native`: the native builders whatever they cost | round-off where the GPU kernels take the boundary | `hartree_boundary_kernel`, `hartree_backend` | `Hartree/GPU_HARTREE.md` |
 | `PARSEC_HARTREE_ATOMIC_TAIL_VALUES` | `auto`: the values of the atomic tail at the exterior points come from an FP64 device kernel where the orbital backend is CuPy and from host threads elsewhere | `host`: host threads on every backend (the serial control of the MPI runner takes them); there is no former route, the tail is new | round-off | `hartree_atomic_tail_values` | `Hartree/GPU_HARTREE.md` |
 | `PARSEC_HARTREE_BOUNDARY_CHECK` | `0`: off. `n` compares, after the SCF, the boundary values of the final density at a sample of `n` unique exterior points (the innermost, those of the largest atomic tail, those nearest to an atom, random ones) with its direct Coulomb sum on the Hartree device and reports `hartree_boundary_check_*`; the maximum is that of the sample, and `n` at or above the number of points checks all (GPU boundary only; no effect on the results; its seconds are kept out of the SCF wall time) |  | none | `hartree_boundary_check_*` | `Hartree/GPU_HARTREE.md` |
 
@@ -2956,9 +2968,13 @@ final true-residual diagnostics are preserved.
 The native iteration fuses `A @ p` with the canonical-block
 `p dot (A @ p)` reduction, eliminating a second traversal while retaining the
 original CSR row order and deterministic 4,096-row reduction topology.
-In the default hybrid, the native CG implementation is selected for Hartree
-while the Kohn--Sham Hamiltonian and eigensolver remain on the GPU; this avoids
-the reduction-heavy GPU CG path without moving eigensolver state off-device.
+In the default hybrid this native CG solved the Hartree problem until
+2026-11-07, while the Kohn--Sham Hamiltonian and eigensolver stayed on the
+GPU. Since then the same recurrence runs on the GPU of the orbitals
+(`Hartree/cupy_prepared.py`: the slot-major stencil, fixed-order block
+reductions, CUDA graphs of eight steps), and
+`PARSEC_HARTREE_LINEAR_BACKEND=native` selects the host CG described here;
+`Hartree/GPU_HARTREE.md` has the measurements behind the change.
 After two completed SCF solves, native CG forms a clipped two-step
 chronological prediction from the two preceding right-hand sides and Hartree
 solutions. CG still solves the unchanged linear system to the unchanged

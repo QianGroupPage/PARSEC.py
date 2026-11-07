@@ -701,15 +701,16 @@ class DeviceSpinXCEvaluator(_DeviceEvaluatorBase):
     """A spin-polarized functional on a device: ``evaluator(up, down) -> SpinXCResult``.
 
     The counterpart of :meth:`PreparedSinglePointSystem.evaluate_spin_xc`
-    (full-grid channels; each sees half of the frozen core density).
+    (each channel sees half of the frozen core density): full-grid channels,
+    or with ``reducer`` the orbit fields of a spin loop in the symmetry
+    sectors (``Spin_Symmetry_Sectors``), whose results are orbit fields.  Both
+    channel densities of the sectors are invariant, so the orbit geometry of
+    the unpolarized functional applies to each: the gradient of a channel
+    from its orbit values, ``D n_a . D n_b`` invariant, and each channel's
+    flux a vector field carried by the reflection signs.
     """
 
     spin_polarized = True
-
-    def __init__(self, functional: str, grid, **keywords) -> None:
-        if keywords.get("reducer") is not None:
-            raise ValueError("the spin channels are evaluated on the full grid")
-        super().__init__(functional, grid, **keywords)
 
     def __call__(self, valence_up, valence_down) -> SpinXCResult:
         cp = self._cp
@@ -785,9 +786,9 @@ class DeviceSpinXCEvaluator(_DeviceEvaluatorBase):
                 )
             total_energy = self._integral(energy_density)
             return SpinXCResult(
-                potential_up=cp.asnumpy(potential_up),
-                potential_down=cp.asnumpy(potential_down),
-                energy_density=cp.asnumpy(energy_density),
+                potential_up=self._field(potential_up),
+                potential_down=self._field(potential_down),
+                energy_density=self._field(energy_density),
                 total_energy=total_energy,
             )
 
@@ -830,10 +831,11 @@ def accelerated_xc_evaluators(
     shift = getattr(reference, "_zero_average", None)
     zero_average = callable(shift) and shift(None) is True
     if spin:
-        # The loop of two channels evaluates the spin functional only.
+        # The loop of two channels evaluates the spin functional only; on the
+        # orbits where the channels are solved in the symmetry sectors.
         if not device_xc_selected(functional, spin_polarized=True):
             return None, None
-        evaluator = DeviceSpinXCEvaluator(functional, grid, **keywords)
+        evaluator = DeviceSpinXCEvaluator(functional, grid, reducer=reducer, **keywords)
         return None, (ZeroAverageXC(evaluator) if zero_average else evaluator)
     if not device_xc_selected(functional):
         return None, None

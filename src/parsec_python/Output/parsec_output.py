@@ -189,6 +189,21 @@ def density_symmetrization_lines(reports) -> list[str]:
     return lines
 
 
+def spin_sector_fallback_lines(record) -> list[str]:
+    """``parsec.out`` lines of a :class:`parsec_python.models.SpinSectorFallbackRecord`."""
+
+    return [
+        "",
+        f" NOTE: Spin_Symmetry_Sectors: {getattr(record, 'reason', 'fractional occupations')} after {record.stage}",
+        f"       ({getattr(record, 'measure', 'largest min(f, 1-f)')} = {record.largest_fractional_occupation:.3E}, "
+        f"kept only below {record.tolerance:.0E}).",
+        "       The symmetry sectors cannot hold a density that breaks the point group of the atoms;",
+        "       the calculation starts again on the full grid (Spin_Symmetry_Sectors: off).",
+        *(f"       {line}" for line in record.multiplets),
+        "",
+    ]
+
+
 def dynamic_tolerance_lines(step) -> list[str]:
     """``parsec.F90:1307-1310`` after ``getsre``: the eigensolver tolerance of
     the next iteration with ``Dynamic_Diag_Tol``, nothing without it."""
@@ -2422,10 +2437,18 @@ class ParsecTextReporter:
             self.iteration_spin_polarized(step)
             return
         # (The spinor records also carry diagonalization_seconds now: test the type.)
-        from ..models import ExchangeLoopIteration, SelfConsistentSOCIteration
+        from ..models import (
+            ExchangeLoopIteration,
+            SelfConsistentSOCIteration,
+            SpinSectorFallbackRecord,
+        )
 
         if isinstance(step, SelfConsistentSOCIteration):
             self.iteration_self_consistent_soc(step)
+            return
+        if isinstance(step, SpinSectorFallbackRecord):
+            # Spin_Symmetry_Sectors: the sector run is not kept.
+            self.write("\n".join(spin_sector_fallback_lines(step)))
             return
         if isinstance(step, ExchangeLoopIteration):
             # An outer (Fock) iteration of a hybrid functional.

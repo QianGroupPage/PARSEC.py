@@ -14,15 +14,24 @@ Densities may be host or device arrays of shape ``(n_active, nb)``; the
 potentials come back as the same kind of array.  A request is split into
 batches whose work arrays fit ``memory_budget`` bytes (half the free device
 memory by default).  CuPy is imported only when a solver is constructed.
+
+The reflection-parity classes of a symmetric box
+(:meth:`~parsec_python.Hartree.kronecker.KroneckerPoisson.parity_plan`) are
+uploaded one class at a time when first solved (:meth:`DeviceKroneckerPoisson.parity_plan`,
+:meth:`DeviceKroneckerPoisson.solve_parity`), with the same
+:func:`~parsec_python.Hartree.kronecker.solve_block`.  With ``lazy=True``
+the full-box plan, too, is uploaded only when a full-box solve needs it, so
+that a caller that solves classes only never holds it.
 """
 
 from __future__ import annotations
 
+from threading import Lock
 from time import perf_counter
 
 import numpy as np
 
-from parsec_python.Hartree.kronecker import KroneckerPoisson, solve_block
+from parsec_python.Hartree.kronecker import KroneckerPoisson, parity_index, solve_block
 
 from ..backends.cupy import require_cupy
 
@@ -55,7 +64,9 @@ class DeviceKroneckerPoisson:
     ``source`` is a :class:`~parsec_python.Hartree.kronecker.KroneckerPoisson`
     to upload, or a cluster grid from which one is built with the remaining
     arguments (same meaning as there).  ``device_id`` selects the device
-    (the current one by default).
+    (the current one by default).  ``lazy=True`` defers the upload of the
+    full-box plan to its first use (:attr:`plan`); ``memory_budget`` must
+    then be given.
     """
 
     def __init__(
@@ -72,6 +83,7 @@ class DeviceKroneckerPoisson:
         device_id: int | None = None,
         memory_budget: int | None = None,
         weights: tuple[float, float] | None = None,
+        lazy: bool = False,
     ) -> None:
         cp, _ = require_cupy()
         self.cp = cp
@@ -97,17 +109,95 @@ class DeviceKroneckerPoisson:
         self.box_shape = host.box_shape
         self.box_size = host.box_size
         self.device_id = int(cp.cuda.Device().id if device_id is None else device_id)
-        started = perf_counter()
-        with cp.cuda.Device(self.device_id):
-            self.plan = host.plan.mapped(lambda array: _upload(cp, array))
-            cp.cuda.Device(self.device_id).synchronize()
+        self._lock = Lock()
+        self._plan = None
+        self._parity_plans: dict[int, object] = {}
+        self.upload_seconds = 0.0
+        if lazy:
             if memory_budget is None:
-                free, _total = cp.cuda.runtime.memGetInfo()
-                pool = cp.get_default_memory_pool()
-                memory_budget = int(0.5 * (free + pool.free_bytes()))
-        self.upload_seconds = perf_counter() - started
+                raise ValueError("a lazy device solver needs its memory budget")
+        else:
+            self._upload_plan()
+            if memory_budget is None:
+                with cp.cuda.Device(self.device_id):
+                    free, _total = cp.cuda.runtime.memGetInfo()
+                    pool = cp.get_default_memory_pool()
+                    memory_budget = int(0.5 * (free + pool.free_bytes()))
         self.memory_budget = int(memory_budget)
-        self.plan_bytes = int(self.plan.nbytes())
+
+    def _upload_plan(self):
+        cp = self.cp
+        with self._lock:
+            if self._plan is None:
+                started = perf_counter()
+                with cp.cuda.Device(self.device_id):
+                    plan = self.host.plan.mapped(lambda array: _upload(cp, array))
+                    cp.cuda.Device(self.device_id).synchronize()
+                self.upload_seconds += perf_counter() - started
+                self._plan = plan
+        return self._plan
+
+    @property
+    def plan(self):
+        """The full-box plan on the device (uploaded on first use for a lazy solver)."""
+
+        return self._plan if self._plan is not None else self._upload_plan()
+
+    @property
+    def plan_bytes(self) -> int:
+        """Device bytes of the plans uploaded so far (full box and parity classes)."""
+
+        with self._lock:
+            plans = ([] if self._plan is None else [self._plan]) + list(self._parity_plans.values())
+        return int(sum(plan.nbytes() for plan in plans))
+
+    def parity_plan(self, parity):
+        """The plan of a parity class (index or signs) on the device, uploaded on first use."""
+
+        index = int(parity) if np.isscalar(parity) else parity_index(parity)
+        found = self._parity_plans.get(index)
+        if found is not None:
+            return found
+        cp = self.cp
+        host = self.host.parity_plan(index)
+        with self._lock:
+            found = self._parity_plans.get(index)
+            if found is None:
+                started = perf_counter()
+                with cp.cuda.Device(self.device_id):
+                    found = host.mapped(lambda array: _upload(cp, array))
+                    cp.cuda.Device(self.device_id).synchronize()
+                self.upload_seconds += perf_counter() - started
+                self._parity_plans[index] = found
+        return found
+
+    def solve_parity(self, parity, densities, *, batch_size: int | None = None):
+        """Potentials (Ry) on the octant points ``R`` of class densities ``(R, nb)``, host or device."""
+
+        cp = self.cp
+        plan = self.parity_plan(parity)
+        size = int(self.host.parity_layout.size)
+        on_device = isinstance(densities, cp.ndarray)
+        per_density = 8 * (WORK_ARRAYS_PER_DENSITY * int(np.prod(plan.box_shape)) + 3 * size)
+        step = int(max(1, self.memory_budget // per_density) if batch_size is None else batch_size)
+        if step < 1:
+            raise ValueError("batch_size must be positive")
+        with cp.cuda.Device(self.device_id):
+            data = cp.asarray(densities, dtype=cp.float64) if on_device else np.asarray(densities, dtype=np.float64)
+            single = data.ndim == 1
+            if single:
+                data = data[:, None]
+            if data.ndim != 2 or data.shape[0] != size:
+                raise ValueError("class densities must have shape (octant points R, densities)")
+            count = int(data.shape[1])
+            result = cp.empty((size, count), dtype=cp.float64)
+            for start in range(0, count, step):
+                stop = min(start + step, count)
+                block = cp.asarray(data[:, start:stop])
+                result[:, start:stop] = solve_block(plan, block, cp).T
+            if single:
+                result = result[:, 0]
+            return result if on_device else cp.asnumpy(result)
 
     @property
     def batch_size(self) -> int:

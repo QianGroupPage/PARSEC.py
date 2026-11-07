@@ -1338,7 +1338,9 @@ class SectorStateStorageTests(unittest.TestCase):
         # And, since, the former staging of a spill: the download by the former call belongs to it.
         self.assertEqual((control["PARSEC_CUPY_SPILL_BUFFERS"], control["PARSEC_CUPY_SPILL_PINNED_POOL"]),
                          ("fresh", "release"))
-        self.assertEqual(len(control), 27 + len(preparation))
+        # And the host CG of the Hartree potential, the default before the GPU CG.
+        self.assertEqual(control["PARSEC_HARTREE_LINEAR_BACKEND"], "native")
+        self.assertEqual(len(control), 28 + len(preparation))
 
     def test_the_former_values_of_the_switches_of_the_round_after_select_every_former_route_together(self):
         import importlib

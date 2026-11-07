@@ -154,6 +154,38 @@ and adds the boundary correction of the screened multipole values
 ``Y_lm Q(l+1/2, w**2 r**2)/r**(l+1)`` (erfc) with ``1/lambda``.  It needs
 a large padding at small ``w``.
 
+Reflection-parity classes
+-------------------------
+Where the box is symmetric about the origin along all three axes (a domain
+centred at the origin with points at ``(i + 1/2) h`` or ``i h``), the
+reflections ``x -> -x``, ``y -> -y``, ``z -> -z`` map it onto itself and
+commute with ``A_B`` and with the Gaussian matrices ``G_d``.  A density of
+definite parity ``t = (t_x, t_y, t_z)`` (``f(s r) = chi_t(s) f(r)`` for the
+eight sign operations ``s``, ``chi_t(s)`` the product of ``t_d`` over the
+flipped axes) has a potential of the same parity, and both are fixed by
+their values on the octant ``x, y, z >= 0`` of the box
+(:meth:`KroneckerPoisson.parity_plan`).  Along an axis of ``n`` points the
+even and odd functions are the ranges of the isometries ``E_+`` and ``E_-``
+with columns ``(delta_i + t delta_i')/sqrt(2)`` for a point ``i >= 0`` and
+its mirror ``i'`` (and ``delta_0`` for the point on the plane of an odd
+``n``, even functions only); ``D_t = E_t^T D E_t`` are the two half-size
+blocks of the one-dimensional factor, diagonalized on their own (so no
+numerical eigenvector is ever sorted by parity).  The class solve is the
+Kronecker solve of ``-(D_x,tx (+) D_y,ty (+) D_z,tz)`` on the octant
+(``(n/2)**3`` points, one sixteenth of the flops of the box transforms);
+octant values ``a`` and subspace coordinates are related by
+``alpha = sqrt(2) a`` (``a`` on the plane of an odd axis, even class), which
+the forward and inverse matrices absorb.  The boundary values and the
+exterior tails of a class-``t`` density involve only the moments ``q_lm``
+of the harmonics of parity ``t`` (``r**l Y_lm`` is a polynomial of definite
+parity in each coordinate) and only the octant rows of the box's face
+correction, the Cartesian moments only the monomials ``x**a`` with
+``(-1)**a = t_x`` (weighted 2 for a point and its mirror).  The result is
+the potential of the full-box solve to round-off.  A pair density of two
+orbitals of reflection symmetry sectors has the parities of the sector's
+character; :mod:`parsec_python.acceleration.Hamiltonian.exchange_device`
+forms them from the sector orbitals without the full grid.
+
 Units and conventions follow :func:`parsec_python.Hartree.solve_hartree`:
 densities in electrons/bohr**3, potentials in Rydberg,
 ``-nabla_h**2 V = 8 pi rho`` for the Coulomb kernel, so the solver can
@@ -205,6 +237,12 @@ def _automatic_padding(lower, upper, shift, spacing, source_squared, smearing_di
     The squared distances are summed in the order of the grid
     (``x**2 + y**2 + z**2``), so that a sphere domain, whose exterior points
     are by construction farther than its radius, gets no plane.
+
+    An axis whose box is symmetric about the origin gets the same number of
+    planes on both sides (the larger count), so that the padded box keeps the
+    reflection symmetry the parity classes of :meth:`KroneckerPoisson.parity_plan`
+    need.  The two counts of such an axis are equal anyway (the conditions
+    are mirror images); the rule only makes it explicit.
     """
 
     lower = np.asarray(lower, dtype=np.int64)
@@ -230,6 +268,8 @@ def _automatic_padding(lower, upper, shift, spacing, source_squared, smearing_di
                 below[d] = added
             else:
                 above[d] = added
+        if lower[d] + upper[d] + 2.0 * shift[d] == 0.0:
+            below[d] = above[d] = max(below[d], above[d])
     return below, above
 
 
@@ -583,14 +623,46 @@ def solve_block(plan: SolvePlan, densities, xp=np):
     box_size = nx * ny * nz
     box = xp.zeros((nb, box_size), dtype=xp.float64)
     box[:, plan.box_index] = densities.T
-    box = box.reshape(nb, nx, ny, nz)
+    # The solve holds the only reference to the scattered box, so that it is
+    # freed after the forward transform (the peak of the work arrays).
+    holder = [box.reshape(nb, nx, ny, nz)]
+    del box
+    return _solve_held_box(plan, holder, xp, prescaled=False)
+
+
+def solve_box(plan: SolvePlan, box, xp=np, *, prescaled: bool = False):
+    """Potentials (Ry) of box densities ``(nb, nx, ny, nz)`` as ``(nb, n_active)``: :func:`solve_block` after its scatter.
+
+    With ``prescaled`` the box holds ``8 pi`` times the densities and becomes
+    the right-hand side in place (the moments are scaled back); a caller
+    that forms its densities on the box itself (the parity classes of
+    :mod:`parsec_python.acceleration.Hamiltonian.exchange_device`) saves the
+    scatter and a copy so.  The spectral screening takes unscaled densities.
+    """
+
+    return _solve_held_box(plan, [box], xp, prescaled=prescaled)
+
+
+def _solve_held_box(plan: SolvePlan, holder: list, xp, *, prescaled: bool):
+    """:func:`solve_box` of the box in ``holder`` (taken out: the solve drops it after the forward transform)."""
+
+    box = holder.pop()
+    nb = int(box.shape[0])
+    nx, ny, nz = plan.box_shape
+    box_size = nx * ny * nz
     cartesian = _separable(box, *plan.monomials_t)
     moments = cartesian.reshape(nb, -1) @ plan.moment_map
+    if prescaled:
+        if plan.density_factor is not None:
+            raise ValueError("the spectral screening solves unscaled densities")
+        moments *= 1.0 / (8.0 * math.pi)
 
     qx, qy, qz = plan.eigenvectors
     qxt, qyt, qzt = plan.eigenvectors_t
     if plan.density_factor is None:
-        right_hand_side = (8.0 * math.pi) * box.reshape(nb, box_size)
+        right_hand_side = (
+            box.reshape(nb, box_size) if prescaled else (8.0 * math.pi) * box.reshape(nb, box_size)
+        )
         for rows, matrix in plan.faces:
             right_hand_side[:, rows] += moments @ matrix
         spectral = _separable(right_hand_side.reshape(nb, nx, ny, nz), qxt, qyt, qzt)
@@ -629,6 +701,215 @@ def solve_block(plan: SolvePlan, densities, xp=np):
         long_range *= plan.long_range_weight
         coulomb += long_range
     return coulomb
+
+
+# ---------------------------------------------------------------------------
+# Reflection-parity classes (module docstring).
+# ---------------------------------------------------------------------------
+
+#: The eight sign operations: index ``4 b_x + 2 b_y + b_z``, axis ``d`` flipped where ``b_d = 1``.
+SIGN_OPERATIONS: tuple[tuple[int, int, int], ...] = tuple(
+    tuple(-1 if (index >> (2 - d)) & 1 else 1 for d in range(3)) for index in range(8)
+)
+#: The eight parity classes, in the same order: ``t_d = -1`` where bit ``d`` is set.
+PARITY_CLASSES: tuple[tuple[int, int, int], ...] = SIGN_OPERATIONS
+
+
+def parity_index(parity) -> int:
+    """Index of a parity class ``(t_x, t_y, t_z)`` in :data:`PARITY_CLASSES`."""
+
+    values = tuple(int(value) for value in parity)
+    if len(values) != 3 or any(value not in (-1, 1) for value in values):
+        raise ValueError("a parity class is three signs (t_x, t_y, t_z)")
+    return PARITY_CLASSES.index(values)
+
+
+def parity_character(parity: int, operation: int) -> int:
+    """``chi_t(s)``: the sign of a class-``t`` function under operation ``s`` (both indices)."""
+
+    return -1 if bin(int(parity) & int(operation)).count("1") % 2 else 1
+
+
+def parity_character_table() -> np.ndarray:
+    """``(8, 8)`` table ``chi[t, s]`` (a Sylvester--Hadamard matrix, ``chi chi^T = 8``)."""
+
+    return np.array(
+        [[parity_character(t, s) for s in range(8)] for t in range(8)], dtype=np.float64
+    )
+
+
+@dataclass(frozen=True)
+class ParityLayout:
+    """The octant of a box symmetric about the origin and its images on the active grid.
+
+    Along axis ``d`` the box has ``n_d`` points; the octant keeps the
+    ``half_shape[d] = n_d - centre[d]`` points from box index
+    ``centre[d] = n_d // 2`` on (coordinates ``>= 0``; for odd ``n_d`` the
+    first one lies on the mirror plane, ``on_plane[d]``).  ``box_index``
+    are the flat octant indices (increasing) of the points ``R`` whose
+    images include an active point; ``images[s, k]`` is the active-grid row
+    of the image of point ``k`` under sign operation ``s``
+    (:data:`SIGN_OPERATIONS`), ``-1`` where that image is not active.
+    """
+
+    box_shape: tuple[int, int, int]
+    centre: tuple[int, int, int]
+    half_shape: tuple[int, int, int]
+    on_plane: tuple[bool, bool, bool]
+    box_index: np.ndarray
+    images: np.ndarray
+    octant_coordinates: np.ndarray
+
+    @property
+    def size(self) -> int:
+        """Points ``R`` of the octant."""
+
+        return int(self.box_index.size)
+
+    @property
+    def half_size(self) -> int:
+        return int(np.prod(self.half_shape))
+
+    def plane_mask(self, parity: int) -> np.ndarray:
+        """Points of ``R`` on a mirror plane of an axis that class ``parity`` makes odd (they vanish)."""
+
+        mask = np.zeros(self.size, dtype=bool)
+        for d in range(3):
+            if self.on_plane[d] and PARITY_CLASSES[int(parity)][d] < 0:
+                mask |= self.octant_coordinates[:, d] == 0
+        return mask
+
+    def components(self, values: np.ndarray) -> np.ndarray:
+        """Parity components ``f_t`` on ``R`` of functions on the active grid: ``(8, size, ...)``.
+
+        ``f_t(r) = (1/8) sum_s chi_t(s) f(s r)``, with ``f = 0`` at images
+        that are not active.
+        """
+
+        values = np.asarray(values, dtype=np.float64)
+        images = np.zeros((8, self.size) + values.shape[1:], dtype=np.float64)
+        for operation in range(8):
+            rows = self.images[operation]
+            present = rows >= 0
+            images[operation][present] = values[rows[present]]
+        table = parity_character_table()
+        return np.tensordot(table, images, axes=(1, 0)) / 8.0
+
+    def values(self, components: np.ndarray, active_points: int) -> np.ndarray:
+        """Functions on the ``active_points`` of the grid from their parity components ``(8, size, ...)``.
+
+        ``f(s r) = sum_t chi_t(s) f_t(r)`` at every active image.
+        """
+
+        components = np.asarray(components, dtype=np.float64)
+        result = np.zeros((int(active_points),) + components.shape[2:], dtype=np.float64)
+        table = parity_character_table()
+        for operation in range(8):
+            rows = self.images[operation]
+            present = rows >= 0
+            image = np.tensordot(table[:, operation], components, axes=(0, 0))
+            result[rows[present]] = image[present]
+        return result
+
+
+def _parity_layout(integer_coordinates, box_lower, box_shape) -> ParityLayout:
+    """The :class:`ParityLayout` of active points (integer coordinates) in a symmetric box."""
+
+    local = np.asarray(integer_coordinates, dtype=np.int64) - np.asarray(box_lower, dtype=np.int64)
+    shape = np.asarray(box_shape, dtype=np.int64)
+    centre = shape // 2
+    half = shape - centre
+    mirrored = local < centre
+    octant = np.where(mirrored, (shape - 1 - local) - centre, local - centre)
+    flat = (octant[:, 0] * half[1] + octant[:, 1]) * half[2] + octant[:, 2]
+    # The occupied octant points in increasing order and each active point's
+    # position among them, by a lookup over the octant box (no sort).
+    occupied = np.zeros(int(np.prod(half)), dtype=bool)
+    occupied[flat] = True
+    box_index = np.flatnonzero(occupied)
+    lookup = np.full(occupied.size, -1, dtype=np.int64)
+    lookup[box_index] = np.arange(box_index.size, dtype=np.int64)
+    position = lookup[flat]
+    operation = (mirrored[:, 0].astype(np.int64) << 2) | (mirrored[:, 1].astype(np.int64) << 1) | mirrored[:, 2]
+    # A point on the plane of an odd axis is its own mirror image.
+    plane_bits = np.zeros(local.shape[0], dtype=np.int64)
+    for d in range(3):
+        if shape[d] % 2 == 1:
+            plane_bits |= (octant[:, d] == 0).astype(np.int64) << (2 - d)
+    images = np.full((8, box_index.size), -1, dtype=np.int64)
+    rows = np.arange(local.shape[0], dtype=np.int64)
+    for subset in range(8):
+        selected = (subset & ~plane_bits) == 0
+        images[operation[selected] ^ subset, position[selected]] = rows[selected]
+    coordinates = np.empty((box_index.size, 3), dtype=np.int64)
+    coordinates[:, 0] = box_index // (half[1] * half[2])
+    coordinates[:, 1] = (box_index // half[2]) % half[1]
+    coordinates[:, 2] = box_index % half[2]
+    return ParityLayout(
+        box_shape=tuple(int(v) for v in shape),
+        centre=tuple(int(v) for v in centre),
+        half_shape=tuple(int(v) for v in half),
+        on_plane=tuple(bool(v % 2) for v in shape),
+        box_index=box_index,
+        images=images,
+        octant_coordinates=coordinates,
+    )
+
+
+def _reflection_bases(points: int):
+    """Even and odd isometries of an axis of ``points`` points symmetric about its middle.
+
+    Returns ``{t: (E, octant, scale)}`` for ``t = +1, -1``: ``E`` (``points
+    x dim``) has orthonormal columns ``(delta_i + t delta_i')/sqrt(2)`` for
+    the box index ``i = centre + k`` and its mirror ``i' = points - 1 - i``
+    (``delta_i`` alone where ``i = i'``, even class only); ``octant[j] = k``
+    is the octant index of column ``j`` and ``scale[j]`` (``sqrt(2)`` or 1)
+    turns octant values of a class function into its coordinates,
+    ``alpha_j = scale_j a_(octant_j)``.
+    """
+
+    centre = points // 2
+    half = points - centre
+    bases = {}
+    for parity in (1, -1):
+        columns, octant, scale = [], [], []
+        for k in range(half):
+            index = centre + k
+            mirror = points - 1 - index
+            column = np.zeros(points)
+            if mirror == index:
+                if parity < 0:
+                    continue
+                column[index] = 1.0
+                scale.append(1.0)
+            else:
+                column[index] = math.sqrt(0.5)
+                column[mirror] = parity * math.sqrt(0.5)
+                scale.append(math.sqrt(2.0))
+            columns.append(column)
+            octant.append(k)
+        bases[parity] = (
+            np.column_stack(columns) if columns else np.zeros((points, 0)),
+            np.asarray(octant, dtype=np.int64),
+            np.asarray(scale, dtype=np.float64),
+        )
+    return bases
+
+
+def _octant_matrices(vectors: np.ndarray, octant: np.ndarray, scale: np.ndarray, half: int):
+    """Forward ``(dim x half)`` and inverse ``(half x dim)`` matrices of a block's eigenvectors.
+
+    Forward: octant values -> coefficients, ``c = V^T (scale o a[octant])``;
+    inverse: ``a[octant] = (V c) / scale`` (zero rows elsewhere: the plane
+    point of an odd class).
+    """
+
+    dim = vectors.shape[1]
+    forward = np.zeros((dim, half))
+    forward[:, octant] = (vectors * scale[:, None]).T
+    inverse = np.zeros((half, dim))
+    inverse[octant, :] = vectors / scale[:, None]
+    return np.ascontiguousarray(forward), np.ascontiguousarray(inverse)
 
 
 class KroneckerPoisson:
@@ -1088,18 +1369,261 @@ class KroneckerPoisson:
             raise ValueError("density does not match the active grid")
         return self.solve_batch(density)
 
+    # ------------------------------------------------------------ parity classes
+
+    @property
+    def parity_symmetric(self) -> bool:
+        """Whether the box is symmetric about the origin along every axis (parity classes exist)."""
+
+        return all(float(axis[0]) == -float(axis[-1]) for axis in self.axes)
+
+    @property
+    def parity_layout(self) -> ParityLayout:
+        """The octant of the box and the active images of its points (module docstring)."""
+
+        layout = getattr(self, "_parity_layout", None)
+        if layout is None:
+            if not self.parity_symmetric:
+                raise ValueError(
+                    "the parity classes need a box symmetric about the origin along every axis"
+                )
+            layout = _parity_layout(self.grid.integer_coordinates, self.box_lower, self.box_shape)
+            self._parity_layout = layout
+        return layout
+
+    def _parity_axis(self, axis: int) -> dict:
+        """Per parity ``+1``/``-1`` of one axis: block eigenvalues, octant matrices, monomials, Gaussians."""
+
+        cache = self.__dict__.setdefault("_parity_axes", {})
+        found = cache.get(axis)
+        if found is not None:
+            return found
+        points = self.box_shape[axis]
+        centre = points // 2
+        half = points - centre
+        bases = _reflection_bases(points)
+        operator = dirichlet_second_derivative_matrix(points, self.finite_difference_order, self.spacing)
+        size = self.multipole_order + 1
+        vander = np.vander(self.axes[axis][centre:] / self.length_scale, size, increasing=True)
+        weights = np.full(half, 2.0)
+        if points % 2:
+            weights[0] = 1.0  # the plane point is its own mirror
+        gaussian = None
+        if self.kernel != "coulomb" and self.screening == "split":
+            coordinates = self.axes[axis]
+            gaussian = (self.spacing * self.omega / math.sqrt(math.pi)) * np.exp(
+                -(self.omega * (coordinates[:, None] - coordinates[None, :])) ** 2
+            )
+            spectra = {}
+            for parity, (isometry, _octant, _scale) in bases.items():
+                spectra[parity] = np.linalg.eigh(isometry.T @ gaussian @ isometry)
+            largest = max(float(values.max()) for values, _ in spectra.values() if values.size)
+        result = {}
+        for parity, (isometry, octant, scale) in bases.items():
+            values, vectors = np.linalg.eigh(isometry.T @ operator @ isometry)
+            forward, inverse = _octant_matrices(vectors, octant, scale, half)
+            rows = [power for power in range(size) if (-1) ** power == parity]
+            entry = {
+                "eigenvalues": values,
+                "forward": forward,
+                "inverse": inverse,
+                "powers": rows,
+                "monomials": np.ascontiguousarray((vander[:, rows] * weights[:, None]).T),
+            }
+            if gaussian is not None:
+                kernel_values, kernel_vectors = spectra[parity]
+                keep = kernel_values > self.rank_tolerance * largest
+                kernel_values, kernel_vectors = kernel_values[keep], kernel_vectors[:, keep]
+                # On spectral coefficients diag(s) U^T V; back to octant values U / scale.
+                entry["contract"] = np.ascontiguousarray(
+                    (kernel_values[:, None] * kernel_vectors.T) @ vectors
+                )
+                entry["expand"] = _octant_matrices(kernel_vectors, octant, scale, half)[1]
+            result[parity] = entry
+        cache[axis] = result
+        return result
+
+    def _harmonic_parities(self) -> np.ndarray:
+        """Parity class index of every real harmonic column ``(l, m)`` (from its monomials)."""
+
+        found = getattr(self, "_harmonic_parity", None)
+        if found is not None:
+            return found
+        coefficients = solid_harmonic_coefficients(self.multipole_order)
+        classes = np.empty(coefficients.shape[0], dtype=np.int64)
+        for column in range(coefficients.shape[0]):
+            a, b, c = np.nonzero(coefficients[column])
+            bits = np.stack([a % 2, b % 2, c % 2], axis=1)
+            if not np.all(bits == bits[0]):
+                raise RuntimeError("a real solid harmonic without definite parity")
+            classes[column] = (int(bits[0, 0]) << 2) | (int(bits[0, 1]) << 1) | int(bits[0, 2])
+        self._harmonic_parity = classes
+        return classes
+
+    def _parity_faces(self) -> tuple[np.ndarray, np.ndarray]:
+        """The octant rows of the merged face correction and its columns there, ``(rows, (K, rows))``.
+
+        All faces (near the inner planes only for boxes thinner than the
+        stencil); each class keeps the rows of its moments.
+        """
+
+        found = getattr(self, "_parity_face_cache", None)
+        if found is not None:
+            return found
+        layout = self.parity_layout
+        face_rows, face_matrix = self.plan.faces[0]
+        i, j, k = np.unravel_index(np.asarray(face_rows), self.box_shape)
+        cx, cy, cz = layout.centre
+        _hx, hy, hz = layout.half_shape
+        inside = np.flatnonzero((i >= cx) & (j >= cy) & (k >= cz))
+        rows = ((i[inside] - cx) * hy + (j[inside] - cy)) * hz + (k[inside] - cz)
+        found = (np.ascontiguousarray(rows.astype(np.int64)), np.asarray(face_matrix)[:, inside])
+        self._parity_face_cache = found
+        return found
+
+    def _parity_tails(self) -> np.ndarray:
+        """The exterior tails ``T_lm`` on ``R``, ``(K, R)``.
+
+        ``T_lm`` has the parity of its moment: at a point of ``R`` it is
+        ``chi_t(s) T(s r)`` at its first active image ``s r`` (the point
+        itself on a symmetric domain).  One gather serves all eight classes.
+        (The full-box tails carry a round-off asymmetry of ~1e-10 of their
+        largest value, from the cancellation in ``g * I~ - G_B I~``; averaging
+        over the images changed no class solve beyond round-off.)
+        """
+
+        found = getattr(self, "_parity_tail_cache", None)
+        if found is not None:
+            return found
+        layout = self.parity_layout
+        source = np.asarray(self.plan.exterior_tail)
+        classes = self._harmonic_parities()
+        present = layout.images >= 0
+        first = np.argmax(present, axis=0)
+        rows = layout.images[first, np.arange(layout.size)]
+        tails = np.take(source, rows, axis=1)
+        for operation in np.unique(first):
+            if operation == 0:
+                continue
+            signs = np.array([parity_character(t, int(operation)) for t in classes], dtype=np.float64)
+            where = np.flatnonzero(first == operation)
+            tails[:, where] *= signs[:, None]
+        self._parity_tail_cache = tails
+        return tails
+
+    def parity_plan(self, parity) -> SolvePlan:
+        """The :class:`SolvePlan` of class ``parity`` (index or signs) on the octant.
+
+        Its box is the octant (:attr:`ParityLayout.half_shape`) and its
+        active points the points ``R`` of :attr:`parity_layout`;
+        :func:`solve_block` with it takes the class densities on ``R``
+        (octant values) and returns their potentials there, and
+        :func:`solve_box` takes them on the octant box.  Built once per
+        class.
+        """
+
+        index = int(parity) if np.isscalar(parity) else parity_index(parity)
+        if not 0 <= index < 8:
+            raise ValueError("a parity class index is 0 ... 7")
+        plans = self.__dict__.setdefault("_parity_plans", {})
+        found = plans.get(index)
+        if found is not None:
+            return found
+        layout = self.parity_layout
+        signs = PARITY_CLASSES[index]
+        axes = [self._parity_axis(d)[signs[d]] for d in range(3)]
+        eigenvalues = -(
+            axes[0]["eigenvalues"][:, None, None]
+            + axes[1]["eigenvalues"][None, :, None]
+            + axes[2]["eigenvalues"][None, None, :]
+        )
+        if np.any(eigenvalues <= 0.0):
+            raise RuntimeError("the octant Laplacian of a parity class is not positive definite")
+        size = self.multipole_order + 1
+        columns = np.flatnonzero(self._harmonic_parities() == index)
+        rows = [
+            (a * size + b) * size + c
+            for a in axes[0]["powers"]
+            for b in axes[1]["powers"]
+            for c in axes[2]["powers"]
+        ]
+        moment_map = np.ascontiguousarray(self._moment_map[np.ix_(rows, columns)])
+        octant_rows, octant_faces = self._parity_faces()
+        face = (octant_rows, np.ascontiguousarray(octant_faces[columns]))
+        density_factor = boundary_factor = None
+        if self.kernel != "coulomb" and self.screening == "spectral":
+            density_factor = 8.0 * math.pi * spectral_function(self.kernel, eigenvalues, self.omega)
+            boundary_factor = 1.0 / eigenvalues
+        contract = expand = tails = None
+        if self.plan.exterior_tail is not None:
+            contract = tuple(entry["contract"] for entry in axes)
+            expand = tuple(entry["expand"] for entry in axes)
+            tails = np.ascontiguousarray(self._parity_tails()[columns])
+            tails[:, layout.plane_mask(index)] = 0.0
+        plan = SolvePlan(
+            kernel=self.kernel,
+            screening=self.screening,
+            box_shape=layout.half_shape,
+            box_index=layout.box_index,
+            eigenvectors=tuple(entry["inverse"] for entry in axes),
+            eigenvectors_t=tuple(entry["forward"] for entry in axes),
+            inverse_eigenvalues=1.0 / eigenvalues,
+            density_factor=density_factor,
+            boundary_factor=boundary_factor,
+            monomials_t=tuple(entry["monomials"] for entry in axes),
+            moment_map=moment_map,
+            faces=(face,),
+            gaussian_contract=contract,
+            gaussian_expand=expand,
+            exterior_tail=tails,
+            coulomb_weight=self.plan.coulomb_weight,
+            long_range_weight=self.plan.long_range_weight,
+        )
+        plans[index] = plan
+        return plan
+
+    def solve_parity(self, parity, densities: np.ndarray) -> np.ndarray:
+        """Potentials (Ry) on ``R`` of class-``parity`` densities on ``R``, shape ``(size, nb)``.
+
+        The densities are the octant values of functions of that parity
+        (:meth:`ParityLayout.components`); the potentials are the octant
+        values of their full-box potentials.
+        """
+
+        plan = self.parity_plan(parity)
+        layout = self.parity_layout
+        densities = np.asarray(densities, dtype=np.float64)
+        single = densities.ndim == 1
+        if single:
+            densities = densities[:, None]
+        if densities.ndim != 2 or densities.shape[0] != layout.size:
+            raise ValueError("class densities must have shape (octant points R, densities)")
+        result = np.empty_like(densities)
+        step = max(1, int(self.batch_memory // (4 * 8 * layout.half_size)))
+        for start in range(0, densities.shape[1], step):
+            stop = min(start + step, densities.shape[1])
+            result[:, start:stop] = solve_block(plan, densities[:, start:stop]).T
+        return result[:, 0] if single else result
+
 
 __all__ = [
     "DEFAULT_BATCH_MEMORY",
     "KERNELS",
+    "PARITY_CLASSES",
     "SCREENINGS",
+    "SIGN_OPERATIONS",
     "BoxFace",
     "KroneckerPoisson",
+    "ParityLayout",
     "SolvePlan",
     "dirichlet_second_derivative_matrix",
     "harmonic_index",
+    "parity_character",
+    "parity_character_table",
+    "parity_index",
     "real_harmonics",
     "solid_harmonic_coefficients",
     "solve_block",
+    "solve_box",
     "spectral_function",
 ]

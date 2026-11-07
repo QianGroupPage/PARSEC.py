@@ -69,6 +69,10 @@ class AcceleratedPreparedSinglePointSystem:
     # the device pieces of the Fock loop (.hybrid.DeviceExchange); ``None``
     # without a hybrid.
     exchange_device: object | None = None
+    # Spin_Symmetry_Sectors: how a spin-polarized loop in the symmetry
+    # sectors goes back to the full grid when its occupations are
+    # fractional (driver._SpinSectorFallback); ``None`` everywhere else.
+    spin_sector_fallback: object | None = None
 
     def __getattr__(self, name: str):
         return getattr(self.reference, name)
@@ -246,6 +250,15 @@ def materialize_wavefunctions(system, result) -> None:
                 )
 
 
+def _final_state_counts(symmetry_eigensolver, symmetry_state) -> str:
+    """The vectors kept per sector after the last solve; of both channels of a spin-polarized loop."""
+
+    record = getattr(symmetry_eigensolver, "sector_state_counts_record", None)
+    if isinstance(record, str) and getattr(symmetry_eigensolver, "spin_channel_count", 1) == 2:
+        return record
+    return " ".join(str(value) for value in symmetry_state.sector_state_counts)
+
+
 def _finalize_result(system, result, symmetry_eigensolver):
     """Finalize output inside the allocator-restoration scope, including OOMs."""
     if system.materialize_final_wavefunctions:
@@ -299,10 +312,7 @@ def _finalize_result(system, result, symmetry_eigensolver):
         ) + (
             (
                 "orbital_sector_final_state_counts",
-                " ".join(
-                    str(value)
-                    for value in symmetry_state.sector_state_counts
-                ),
+                _final_state_counts(symmetry_eigensolver, symmetry_state),
             ),
             (
                 "orbital_memory_allocator",

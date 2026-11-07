@@ -113,6 +113,9 @@ _HYBRID_KEYS = (
     "exx_tolerance",
     "exx_batch_size",
     "exx_pair_solver",
+    "exx_inner_criterion",
+    "exx_mixer_history",
+    "exx_outer_mixing",
 )
 
 
@@ -474,6 +477,13 @@ def _exact_exchange_settings(scalar, one, xc_functional: str) -> ExactExchangeSe
             keywords["batch_size"] = int(value)
         if "exx_pair_solver" in scalar:
             keywords["pair_solver"] = _normalize_label(one("exx_pair_solver"))
+        for key, field in (
+            ("exx_inner_criterion", "inner_criterion"),
+            ("exx_mixer_history", "mixer_history"),
+            ("exx_outer_mixing", "outer_mixing"),
+        ):
+            if key in scalar:
+                keywords[field] = _normalize_label(one(key))
         settings = ExactExchangeSettings(**keywords)
     except ValueError as error:
         raise ParsecInputError(str(error)) from error
@@ -487,6 +497,30 @@ def _exact_exchange_settings(scalar, one, xc_functional: str) -> ExactExchangeSe
     except ValueError as error:
         raise ParsecInputError(str(error)) from error
     return settings
+
+
+def _spin_symmetry_sectors(scalar, one, *, spin_polarized: bool, warnings: list) -> str | None:
+    """``Spin_Symmetry_Sectors``: ``auto`` or ``off``, ``None`` where the input gives the run's default.
+
+    The default is ``auto`` for every ``Correlation_Type``
+    (:attr:`parsec_python.models.SCFSettings.spin_symmetry_sector_mode`); a
+    value equal to it is stored as ``None``, so that the settings of a run at
+    the default keep their text (cache keys) and the completed input reads
+    back as the same problem.  Without ``Spin_Polarization`` the keyword has
+    nothing to decide and is ignored with a warning.
+    """
+
+    if "spin_symmetry_sectors" not in scalar:
+        return None
+    value = _normalize_label(one("spin_symmetry_sectors"))
+    if value not in ("auto", "off"):
+        raise ParsecInputError(f"Spin_Symmetry_Sectors must be auto or off, got {one('spin_symmetry_sectors')!r}")
+    if not spin_polarized:
+        warnings.append(
+            "Spin_Symmetry_Sectors is set, but the run is not spin-polarized (Spin_Polarization); it is ignored."
+        )
+        return None
+    return None if value == "auto" else value
 
 
 def _plain_float(text: str, label: str) -> float:
@@ -2220,6 +2254,9 @@ def _parse_parsec_input(
         "dynamic_diag_tol",
         # PARSEC.py extension: the start of the SCF loop after a move.
         "potential_extrapolation",
+        # PARSEC.py extension: the spin channels of the accelerated driver in
+        # the symmetry sectors (SCFSettings.spin_symmetry_sectors).
+        "spin_symmetry_sectors",
         # PARSEC.py extension: the input structure relaxed with a
         # machine-learned force field first (parsec_python.MLFF).
         "initial_structure",
@@ -4165,6 +4202,9 @@ def _parse_parsec_input(
             "and are ignored"
         )
 
+    spin_symmetry_sectors = _spin_symmetry_sectors(
+        scalar, one, spin_polarized=spin_polarized, warnings=warnings
+    )
     scf = SCFSettings(
         max_iterations=_integer(one("max_iter", "50"), label="Max_Iter"),
         convergence_criterion=_energy_rydberg(
@@ -4194,6 +4234,7 @@ def _parse_parsec_input(
         xc_functional=xc_functional,
         ionization_energy_difference=ionization_energy_difference,
         **({} if exact_exchange is None else {"exact_exchange": exact_exchange}),
+        **({} if spin_symmetry_sectors is None else {"spin_symmetry_sectors": spin_symmetry_sectors}),
         self_consistent_spin_orbit=self_consistent_spin_orbit
         or (
             noncollinear

@@ -39,7 +39,9 @@ class KPointJob:
 
     n_tasks: int
     number_of_states: int
-    eigval_settings: Callable[[int], EigvalSettings]
+    # (filter degree) -> settings; with Dynamic_Diag_Tol also called as
+    # (filter degree, tolerance).
+    eigval_settings: Callable[..., EigvalSettings]
     make_hamiltonian: Callable[[int, dict], Any]
     accumulate: Callable[[int, np.ndarray, np.ndarray], dict[str, np.ndarray]]
     extras: Callable[[int, np.ndarray], Any] | None = None
@@ -57,9 +59,16 @@ class SerialKPointSolver:
         self._vectors: dict[int, np.ndarray] = {}
         self._residuals: dict[int, float] = {}
 
-    def solve(self, potentials: dict, filter_degree: int) -> list[np.ndarray]:
-        """One eigenvalue array per task (task order), vectors kept in the solver."""
-        settings = self.job.eigval_settings(filter_degree)
+    def solve(
+        self, potentials: dict, filter_degree: int, tolerance: float | None = None
+    ) -> list[np.ndarray]:
+        """One eigenvalue array per task (task order), vectors kept in the solver.
+
+        ``tolerance`` replaces ``Diag_Tolerance`` for this call
+        (``Dynamic_Diag_Tol``); the job's ``eigval_settings`` then takes it as
+        a second argument.
+        """
+        settings = job_eigval_settings(self.job, filter_degree, tolerance)
         eigenvalues = []
         for task in range(self.job.n_tasks):
             operator = self.job.make_hamiltonian(task, potentials).as_linear_operator()
@@ -115,6 +124,66 @@ class SerialKPointSolver:
 
     def __exit__(self, *exc_info) -> None:
         self.close()
+
+
+def job_eigval_settings(
+    job: KPointJob, filter_degree: int, tolerance: float | None = None
+) -> EigvalSettings:
+    """The eigensolver settings of one SCF step: ``Diag_Tolerance`` unless the
+    step gives its own ``tolerance`` (``Dynamic_Diag_Tol``)."""
+    if tolerance is None:
+        return job.eigval_settings(filter_degree)
+    return job.eigval_settings(filter_degree, tolerance)
+
+
+DEVICE_FIRST_SOLVERS = ("chebff", "chebdav")
+"""First solvers the device-resident eigensolver
+(:func:`parsec_python.acceleration.Eigensolvers.chebff_spinor.solve_spinor_eigval`)
+implements: CHEBFF, and CHEBDAV as CHEBFF cycles to CHEBDAV's residual test,
+each followed by SUBSPACE steps."""
+
+
+def device_solver_supports(settings: EigvalSettings) -> bool:
+    """Whether the device-resident eigensolver carries ``settings``.
+
+    ARPACK and DIAGLA (``Eigensolver: arpack`` / ``diagla``) are host
+    eigensolvers: a device worker runs them with the host route (the device
+    Hamiltonian as a linear operator), as before the device solver existed.
+    """
+    return getattr(settings, "initial_method", "chebff") in DEVICE_FIRST_SOLVERS
+
+
+def kept_vectors(solver, task: int, what: str) -> np.ndarray:
+    """The final eigenvectors of ``task`` as a host array, for a driver that keeps them.
+
+    The row-distributed MPI solver does not gather the orbitals (its
+    ``vectors`` is an empty block): a driver that needs them (forces, the
+    Ylm-projected DOS, Output_GW, spinor parsec.dat) stops here instead of
+    computing with an empty set.
+    """
+    vectors = solver.vectors(task)
+    host = getattr(vectors, "get", None)
+    vectors = np.asarray(host() if host is not None else vectors)
+    if vectors.ndim != 2 or vectors.shape[1] == 0:
+        raise NotImplementedError(
+            f"{what} needs the orbitals of the k-point eigenproblems, which the "
+            "MPI-distributed k-point solver does not gather (run without --mpi)"
+        )
+    return vectors
+
+
+def whole_orbitals(vectors, grid_size: int, what: str) -> np.ndarray:
+    """``vectors`` as host orbitals of the whole grid (``grid_size`` rows, or twice that
+    for spinors), for a density part that is not a sum over grid rows (the LDA+U
+    occupation matrices of :mod:`parsec_python.SCF.kpoint_hubbard`)."""
+    rows = int(vectors.shape[0])
+    if rows not in (grid_size, 2 * grid_size):
+        raise NotImplementedError(
+            f"{what} needs the orbitals on every grid point; the MPI-distributed "
+            "k-point solver holds a block of grid rows on each rank (run without --mpi)"
+        )
+    host = getattr(vectors, "get", None)
+    return np.asarray(host() if host is not None else vectors)
 
 
 def residual_max(norms) -> float:
@@ -199,8 +268,12 @@ def map_tasks(
 
 
 __all__ = [
+    "DEVICE_FIRST_SOLVERS",
     "KPointJob",
     "SerialKPointSolver",
+    "device_solver_supports",
+    "job_eigval_settings",
+    "kept_vectors",
     "make_kpoint_solver",
     "map_tasks",
     "parallel_backend_report",
@@ -208,4 +281,5 @@ __all__ = [
     "residual_max",
     "set_parallel_backend",
     "split_pooled",
+    "whole_orbitals",
 ]

@@ -538,12 +538,14 @@ class SectorStateStorageTests(unittest.TestCase):
         for devices in ((0,), (0, 1), (0, 1, 2, 3))
     }
 
-    def decide(self, sector, groups, owned=None, total=None, operators=None, **environment):
+    def decide(self, sector, groups, owned=None, total=None, operators=None, resident=None, **environment):
         """What a process decides for sectors of ``sector`` rows and columns on the devices of ``groups``.
 
         A sector outside ``owned`` is another rank's.  Every ``PARSEC_CUPY_*`` variable of the launch is
         removed and ``environment`` set.  Returns the solver and what it did to the allocator and the pools.
         The stand-in for cupy reports ``total`` bytes of memory per device and none of them free.
+        ``resident`` is what the driver tells the solver that another object keeps on a device (the
+        device XC evaluator).
         """
         from parsec_python.acceleration.Eigensolvers import distributed_state, symmetry
         rows, columns = sector
@@ -582,6 +584,8 @@ class SectorStateStorageTests(unittest.TestCase):
             for index, group in enumerate(groups)
         ] if operators is None else list(operators)
         solver._solvers = [None if operator is None else object() for operator in solver._operators]
+        if resident is not None:
+            solver.resident_device_bytes = resident
         with patch.object(symmetry, "require_cupy", return_value=(cp, None)), \
              patch.object(distributed_state, "require_cupy", return_value=(cp, None)), \
              patch.object(distributed_state, "_devices_can_filter", return_value=True), patch.dict(os.environ):
@@ -751,6 +755,59 @@ class SectorStateStorageTests(unittest.TestCase):
                 self.assertEqual((solver._host_spill_sector_states, solver.sector_state_storage),
                                  (True, self.SPILLED))
                 self.assertEqual(events, self.LEFT_POOL[0, 1, 2, 3])
+
+    def test_the_device_xc_evaluator_is_counted_on_its_device(self):
+        """What the driver names for the device XC evaluator (since 2026-10-30) is counted where it lies.
+
+        The bytes are ``planned_device_bytes`` of a PBE evaluator on the D2 orbits: 5 per box point and 12
+        + 88 per orbit (``V_xc/device_xc.py``), 381.0 MiB for 19,392 electrons (box 22,425,768 points,
+        2,873,400 orbits) and 547.3 MiB for 29,576 (box 32,157,432, 4,130,510 orbits).
+        """
+        from parsec_python.acceleration.Eigensolvers import distributed_state
+        from parsec_python.acceleration.Eigensolvers.rayleigh_ritz import streaming_workspace_bytes
+
+        xc11 = 5 * 22_425_768 + 100 * 2_873_400
+        xc13 = 5 * 32_157_432 + 100 * 4_130_510
+        self.assertEqual((xc11, xc13), (399_468_840, 573_838_160))
+        layout = (self.K11, self.ONE_PER_DEVICE)
+        former, _ = self.decide(*layout)
+        # Nothing named (CA, whose evaluator runs on the host, or PARSEC_CUPY_XC=off): the former count.
+        empty, _ = self.decide(*layout, resident={})
+        self.assertEqual(empty.state_fit_bytes, former.state_fit_bytes)
+        # Named on device 3, where the driver puts the Hartree objects of four devices with one sector each.
+        counted, _ = self.decide(*layout, resident={3: xc11})
+        self.assertEqual(counted.state_fit_bytes, {**former.state_fit_bytes, 3: former.state_fit_bytes[3] + xc11})
+        self.assertFalse(counted._host_spill_sector_states)
+        # A device whose sector fits only without the evaluator spills: the count stops below the share.
+        count = 8 * self.K11[0] * self.K11[1] + streaming_workspace_bytes(*self.K11)
+        total = int((count + xc11 // 2) / 0.974)
+        self.assertTrue(count <= 0.974 * total < count + xc11)
+        kept, _ = self.decide(*layout, total=total)
+        spilled, _ = self.decide(*layout, total=total, resident={3: xc11})
+        elsewhere, _ = self.decide(*layout, total=total, resident={7: xc11})
+        self.assertEqual(
+            [solver._host_spill_sector_states for solver in (kept, spilled, elsewhere)], [False, True, False]
+        )
+        # The rule that shares a basis counts it on the devices of the groups that hold it.  29,576
+        # electrons on 8 GPUs: 0.7475 of a device for the blocks on each of two devices; a device whose
+        # share stops between the blocks and the blocks with the evaluator shares the three other sectors,
+        # and leaves the sector on (3, 7) on its owner.
+        pairs = ((0, 4), (1, 5), (2, 6), (3, 7))
+        with patch.dict(os.environ):
+            for name in tuple(os.environ):
+                if name.startswith("PARSEC_CUPY_"):
+                    del os.environ[name]
+            blocks = distributed_state.shared_block_bytes(*self.K13, 2)
+        self.assertAlmostEqual(blocks / self.TOTAL, 0.7475, places=4)
+        total = int((blocks + xc13 // 2) / 0.85)
+        plain, _ = self.decide(self.K13, pairs, total=total)
+        named, _ = self.decide(self.K13, pairs, total=total, resident={7: xc13})
+        self.assertEqual(plain.state_fit_bytes, dict.fromkeys(range(8), blocks))
+        alone = 8 * self.K13[0] * self.K13[1] + streaming_workspace_bytes(*self.K13)
+        self.assertEqual(named.state_fit_bytes, {**dict.fromkeys(range(8), blocks), 3: alone, 7: xc13})
+        # On an A100 node the evaluator changes no decision of the series: 0.7475 -> 0.7543 of a device.
+        on_a100, _ = self.decide(self.K13, pairs, resident={7: xc13})
+        self.assertEqual(on_a100.state_fit_bytes, {**plain.state_fit_bytes, 7: blocks + xc13})
 
     def test_sectors_that_cannot_fit_are_spilled_and_leave_the_pool(self):
         # 14,680 electrons on one device: four sectors of 35.75 GiB.

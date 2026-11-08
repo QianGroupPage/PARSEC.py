@@ -45,12 +45,13 @@ from ..V_xc.exact_exchange import (
     reference_pair_poisson,
     spin_exact_exchange_energy,
 )
+from ..V_xc.selection import XC_DISPLAY_NAMES
 
 
 #: Functionals ``Energy_Refinement`` accepts.
 REFINEMENT_FUNCTIONALS = ("b3lyp",)
 
-_SCF_FUNCTIONAL_NAMES = {"ca": "CA-LDA", "pbe": "PBE"}
+_SCF_FUNCTIONAL_NAMES = XC_DISPLAY_NAMES
 
 
 def normalize_refinement(value: str | None) -> str | None:

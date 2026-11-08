@@ -8,6 +8,11 @@ For pseudopotential ionic charges ``Z_a`` the Rydberg pair energy is
 There is no Ewald or minimum-image sum: this is the nonperiodic molecular
 expression that goes with :func:`parsec_python.V_ion.ion_ion_energy`.
 
+Point charges ``q`` at ``R_q`` (``Add_Point_Charges``) push the atoms with
+``F_a = sum_q 2*q*Z_a*(R_a-R_q)/|R_a-R_q|**3`` (``forcept.f90``), the
+gradient of :func:`parsec_python.V_ion.point_charge_ion_energy`; PARSEC adds
+it to the ion-ion forces.
+
 :func:`ewald_ion_ion_forces` is the periodic counterpart (``ewald_sum.f90``): the exact derivative of
 :func:`parsec_python.V_ion.ewald.ewald_ion_ion_energy`, from the same real-space translations and reciprocal vectors.
 """
@@ -20,7 +25,7 @@ import numpy as np
 
 from scipy.special import erfc
 
-from ..models import Atom
+from ..models import Atom, PointCharge
 from ..Pseudopotential import ParsecPseudopotential
 from ..V_ion.ewald import ewald_image_sets
 
@@ -47,6 +52,29 @@ def ion_ion_forces(
             raise ValueError("two nuclei occupy the same position")
         scale = 2.0 * charges[index] * charges / (squared * np.sqrt(squared))
         scale[index] = 0.0
+        forces[index] = scale @ delta
+    return forces
+
+
+def point_charge_forces(
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    point_charges: Sequence[PointCharge],
+) -> np.ndarray:
+    """Return the ``(atoms, 3)`` forces of the point charges in Ry/bohr."""
+
+    forces = np.zeros((len(atoms), 3), dtype=np.float64)
+    if not point_charges:
+        return forces
+    charges = np.array([item.charge for item in point_charges], dtype=np.float64)
+    sites = np.array([item.position for item in point_charges], dtype=np.float64)
+    for index, atom in enumerate(atoms):
+        delta = np.asarray(atom.position, dtype=np.float64) - sites
+        squared = np.einsum("ij,ij->i", delta, delta)
+        if np.any(squared <= 0.0):
+            raise ValueError("a point charge lies on a nucleus")
+        ionic = float(potentials[atom.symbol].ionic_charge)
+        scale = 2.0 * charges * ionic / (squared * np.sqrt(squared))
         forces[index] = scale @ delta
     return forces
 
@@ -113,4 +141,4 @@ def ewald_ion_ion_forces(
     return 2.0 * forces  # Hartree -> Rydberg
 
 
-__all__ = ["ewald_ion_ion_forces", "ion_ion_forces"]
+__all__ = ["ewald_ion_ion_forces", "ion_ion_forces", "point_charge_forces"]

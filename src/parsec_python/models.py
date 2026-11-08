@@ -14,15 +14,49 @@ from typing import Literal, Mapping, Sequence
 import numpy as np
 
 
-DomainShape = Literal["sphere", "box"]
-EigensolverName = Literal["chebff", "chebdav", "arpack"]
+DomainShape = Literal["sphere", "box", "ellipsoid", "cylinder"]
+# ``none`` is PARSEC's TEST mode (``Eigensolver: none``): setup only.
+EigensolverName = Literal["chebff", "chebdav", "arpack", "diagla", "none"]
+# Eigensolvers whose first solve PARSEC always follows by the later-SCF
+# Chebyshev SUBSPACE filter (usrinputfile.F90 forces Chebyshev_Filtering).
+ALWAYS_FILTERING_EIGENSOLVERS = frozenset({"chebff", "chebdav"})
+# Maximum_matvec default of usrinputfile.F90.
+DEFAULT_MAXIMUM_MATVEC = 30000
 HartreeBoundaryMethod = Literal["auto", "multipole", "direct"]
 HartreeAtomicTail = Literal["auto", "on", "off"]
 # The largest multipole order of the Hartree boundary every builder accepts.
 # The recurrences are sound beyond it; the normalization prefactor of Y_lm
 # becomes subnormal at l = m = 86 and would silently drop terms.
 MAXIMUM_MULTIPOLE_ORDER = 60
-XCFunctional = Literal["ca", "pbe"]
+# ``Correlation_Type`` of PARSEC: ca, pl (pw92), xa (xalpha), wi (wigner),
+# hl (hedin_lundqvist), pb (pbe), pw (pw91), lb (lb94), cs (casida_salahub);
+# see ``parsec_python.V_xc.selection``.
+XCFunctional = Literal[
+    "ca",
+    "pbe",
+    "pw92",
+    "xalpha",
+    "wigner",
+    "hedin_lundqvist",
+    "pw91",
+    "lb94",
+    "casida_salahub",
+]
+XC_FUNCTIONAL_NAMES = frozenset(
+    (
+        "ca",
+        "pbe",
+        "pw92",
+        "xalpha",
+        "wigner",
+        "hedin_lundqvist",
+        "pw91",
+        "lb94",
+        "casida_salahub",
+    )
+)
+# Functionals without a spin-polarized form (none in Fortran's exc_spn.f90).
+UNPOLARIZED_ONLY_XC_FUNCTIONALS = frozenset(("xalpha", "wigner", "hedin_lundqvist"))
 # ``sad``, ``file``, or a density model of ``MLDensity.registry`` (built in:
 # ``charge3net``, ``scdp``, ``custom``).
 InitialDensityMethod = str
@@ -70,6 +104,56 @@ class Atom:
 
 
 @dataclass(frozen=True)
+class PointCharge:
+    """A classical point charge of a confined system (``Add_Point_Charges``).
+
+    ``charge`` in e (positive for a positive charge, as ``Pt_Chg``) and
+    ``position`` in Cartesian bohr.  It acts on the electrons through the
+    local potential and on the nuclei through a Coulomb energy and force
+    (:mod:`parsec_python.V_ion.external`); it is held fixed.
+    """
+
+    charge: float
+    position: np.ndarray | Sequence[float]
+
+    def __post_init__(self) -> None:
+        charge = float(self.charge)
+        position = np.asarray(self.position, dtype=float)
+        if not np.isfinite(charge):
+            raise ValueError("a point charge must be finite")
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise ValueError(
+                "a point charge position must contain three finite Cartesian coordinates"
+            )
+        object.__setattr__(self, "charge", charge)
+        object.__setattr__(self, "position", position)
+
+
+@dataclass(frozen=True)
+class ChargedSheet:
+    """A uniformly charged plane ``z = height`` of a slab (``add_charged_sheets``).
+
+    ``charge`` is the charge of the sheet per surface cell in e (positive
+    for a positive charge, as ``sheet_charge``) and ``height`` its ``z`` in
+    bohr (the third component of a ``Sheet_Coord`` line, F
+    ``usrinputfile.F90:2222-2299``).  It adds ``4*pi*(q/A)*|z - height|``
+    (Ry) to the local potential of the electrons and an electrostatic energy
+    and force on the ions (:mod:`parsec_python.V_ion.wire_slab`).
+    """
+
+    charge: float
+    height: float
+
+    def __post_init__(self) -> None:
+        charge = float(self.charge)
+        height = float(self.height)
+        if not (np.isfinite(charge) and np.isfinite(height)):
+            raise ValueError("a charged sheet needs a finite charge and height")
+        object.__setattr__(self, "charge", charge)
+        object.__setattr__(self, "height", height)
+
+
+@dataclass(frozen=True)
 class SpeciesPotential:
     """Location and input-only choices for one pseudopotential species.
 
@@ -108,6 +192,36 @@ class SpeciesPotential:
     starting density of the species is multiplied by one plus it for the
     up channel and by one minus it for the down channel
     (``initchrg.f90``).  The default is that of ``usrinputfile.F90``.
+
+    ``atomic_radius`` is PARSEC's ``Atomic_Radius`` in bohr: the radius of
+    the sphere around each atom of the species within which a non-collinear
+    calculation sums the magnetization into an atomic moment (``nclmom`` of
+    ``bxc.F90``).  It is a diagnostic and changes nothing of the calculation.
+
+    ``hubbard_u`` and ``hubbard_j`` are PARSEC's per-species ``ldaplusu_u``
+    and ``ldaplusu_j`` in Ry: the on-site Coulomb and exchange parameters
+    of the LDA+U term of the d channel (``usrinputfile.F90``,
+    :mod:`parsec_python.Hamiltonian.hubbard`).  Both zero, the default,
+    is no LDA+U term.
+
+    ``"martins_wang"`` (``*_POTRW.DAT``) takes everything from its file but
+    the projector radius: ``core_cutoff_radius`` is required, the other two
+    are refused, and ``local_angular_momentum`` must be the local channel
+    the file names.  ``"fhipp"`` (``*_FHIPP.DAT``) needs all three, like
+    ``"martins_old"``, and reads its core density only with
+    ``nonlinear_core_correction`` (``Nonlinear_Core_Correction``, refused
+    for the other formats, which say it in the file).
+
+    ``old_interpolation`` is ``Old_Interpolation_Format`` of the input, set
+    for every species of a cluster: the local potential and its radial
+    derivative are interpolated directly instead of as ``r*V`` and
+    ``r**2*dV/dr`` (``ionpot.f90``, ``forcloc.f90``).
+
+    ``fourier_filter_alpha``, ``fourier_filter_beta1`` and
+    ``fourier_filter_core`` are ``Alpha_Filter``, ``Beta1_Filter`` and
+    ``Core_Filter`` of a species of a periodic system (``None`` for the last
+    is ``Alpha_Filter``); zero filters nothing
+    (:mod:`parsec_python.Pseudopotential.fourier_filter`).
     """
 
     path: str | Path
@@ -122,6 +236,29 @@ class SpeciesPotential:
     electrons_per_orbital: tuple[float, ...] | None = None
     core_cutoff_radius: float | None = None
     initial_spin_polarization: float = DEFAULT_INITIAL_SPIN_POLARIZATION
+    atomic_radius: float = 0.0
+    hubbard_u: float = 0.0
+    hubbard_j: float = 0.0
+    nonlinear_core_correction: bool = False
+    old_interpolation: bool = False
+    fourier_filter_alpha: float = 0.0
+    fourier_filter_beta1: float = 0.0
+    fourier_filter_core: float | None = None
+
+    @property
+    def has_hubbard(self) -> bool:
+        """Whether the species carries an LDA+U term (``U`` or ``J`` nonzero)."""
+
+        return self.hubbard_u != 0.0 or self.hubbard_j != 0.0
+
+    @property
+    def has_fourier_filter(self) -> bool:
+        core = (
+            self.fourier_filter_alpha
+            if self.fourier_filter_core is None
+            else self.fourier_filter_core
+        )
+        return self.fourier_filter_alpha > 0.0 or core > 0.0
 
     def __repr__(self) -> str:
         # Fields added later print nothing at their defaults, so the text of
@@ -132,6 +269,14 @@ class SpeciesPotential:
             "initial_spin_polarization": (
                 self.initial_spin_polarization == DEFAULT_INITIAL_SPIN_POLARIZATION
             ),
+            "atomic_radius": self.atomic_radius == 0.0,
+            "hubbard_u": self.hubbard_u == 0.0,
+            "hubbard_j": self.hubbard_j == 0.0,
+            "nonlinear_core_correction": not self.nonlinear_core_correction,
+            "old_interpolation": not self.old_interpolation,
+            "fourier_filter_alpha": self.fourier_filter_alpha == 0.0,
+            "fourier_filter_beta1": self.fourier_filter_beta1 == 0.0,
+            "fourier_filter_core": self.fourier_filter_core is None,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -166,6 +311,22 @@ class SpeciesPotential:
                 f"atomic density, got {polarization:g}"
             )
         object.__setattr__(self, "initial_spin_polarization", polarization)
+        radius = float(self.atomic_radius)
+        if not np.isfinite(radius):
+            raise ValueError("atomic_radius must be finite")
+        object.__setattr__(self, "atomic_radius", radius)
+
+        filters = [float(self.fourier_filter_alpha), float(self.fourier_filter_beta1)]
+        if self.fourier_filter_core is not None:
+            filters.append(float(self.fourier_filter_core))
+        if not all(np.isfinite(value) and value >= 0.0 for value in filters):
+            raise ValueError("the Fourier filter parameters must be nonnegative")
+        object.__setattr__(self, "fourier_filter_alpha", filters[0])
+        object.__setattr__(self, "fourier_filter_beta1", filters[1])
+        if self.fourier_filter_core is not None:
+            object.__setattr__(self, "fourier_filter_core", filters[2])
+        object.__setattr__(self, "nonlinear_core_correction", bool(self.nonlinear_core_correction))
+        object.__setattr__(self, "old_interpolation", bool(self.old_interpolation))
         object.__setattr__(self, "path", Path(self.path))
         object.__setattr__(self, "local_angular_momentum", local_l)
         object.__setattr__(
@@ -174,16 +335,27 @@ class SpeciesPotential:
             None if element is None else element.strip(),
         )
         object.__setattr__(self, "atomic_energy_correction", correction)
+        for name in ("hubbard_u", "hubbard_j"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value):
+                raise ValueError(f"{name} must be finite")
+            object.__setattr__(self, name, value)
 
     def _check_format_input(self, local_l: int) -> None:
         """Validate what the input adds to a pseudopotential file."""
 
         pseudo_format = str(self.pseudopotential_format).strip().lower()
-        if pseudo_format not in {"martins_new", "martins_old"}:
+        if pseudo_format not in {"martins_new", "martins_old", "martins_wang", "fhipp"}:
             raise ValueError(
-                "pseudopotential_format must be 'martins_new' or 'martins_old'"
+                "pseudopotential_format must be 'martins_new', 'martins_old', "
+                "'martins_wang' or 'fhipp'"
             )
         object.__setattr__(self, "pseudopotential_format", pseudo_format)
+        if self.nonlinear_core_correction and pseudo_format != "fhipp":
+            raise ValueError(
+                "nonlinear_core_correction belongs to an fhipp pseudopotential; "
+                "the other formats say in their file whether the core is corrected"
+            )
         given = (
             self.number_of_channels,
             self.electrons_per_orbital,
@@ -196,9 +368,24 @@ class SpeciesPotential:
                     "core_cutoff_radius belong to a martins_old pseudopotential"
                 )
             return
+        if pseudo_format == "martins_wang":
+            if self.number_of_channels is not None or self.electrons_per_orbital is not None:
+                raise ValueError(
+                    "a martins_wang pseudopotential takes its channels and "
+                    "occupations from its file; give only core_cutoff_radius"
+                )
+            if self.core_cutoff_radius is None:
+                raise ValueError(
+                    "a martins_wang pseudopotential needs core_cutoff_radius"
+                )
+            radius = float(self.core_cutoff_radius)
+            if not np.isfinite(radius) or radius <= 0.0:
+                raise ValueError("core_cutoff_radius must be positive")
+            object.__setattr__(self, "core_cutoff_radius", radius)
+            return
         if any(value is None for value in given):
             raise ValueError(
-                "a martins_old pseudopotential needs number_of_channels, "
+                f"a {pseudo_format} pseudopotential needs number_of_channels, "
                 "electrons_per_orbital and core_cutoff_radius"
             )
         channels = int(self.number_of_channels)
@@ -222,12 +409,43 @@ class SpeciesPotential:
         object.__setattr__(self, "core_cutoff_radius", radius)
 
 
+def _repr_without_defaults(settings, defaults: Mapping[str, object]) -> str:
+    """The dataclass ``repr`` without the fields that hold the given defaults."""
+
+    shown = [
+        f"{item.name}={getattr(settings, item.name)!r}"
+        for item in fields(settings)
+        if not (item.name in defaults and getattr(settings, item.name) == defaults[item.name])
+    ]
+    return f"{type(settings).__qualname__}({', '.join(shown)})"
+
+
+def _check_double_grid_order(settings) -> None:
+    order = int(settings.double_grid_order)
+    if order != settings.double_grid_order or order < 1:
+        # usrinputfile.F90 error 113.
+        raise ValueError("double_grid_order must be a positive integer")
+    object.__setattr__(settings, "double_grid_order", order)
+
+
 @dataclass(frozen=True)
 class GridSettings:
     """PARSEC cluster-grid settings.
 
     ``expansion_order`` is the user-facing PARSEC order.  It must be even;
     half that many neighbors are used on each side of a point.
+
+    ``double_grid_order`` is PARSEC's ``Double_Grid_Order`` ``N``: with
+    ``N > 1`` the nonlocal projectors are averaged over ``(2N-1)**3``
+    points of a grid ``N`` times finer around every grid point
+    (Ono and Hirose, :mod:`parsec_python.V_ion.double_grid`).
+
+    ``domain_shape`` is PARSEC's ``Cluster_Domain_Shape`` (``grid_partition.f90``
+    ``outside_domain``): ``sphere`` of ``radius``, ``box`` of the full side
+    lengths ``box_lengths``, ``ellipsoid`` with the semi-axes
+    ``domain_parameters = (r_x, r_y, r_z)`` and ``cylinder`` with
+    ``domain_parameters = (radius, length, axis)`` (axis 1, 2 or 3 for x, y,
+    z; ``|coordinate| <= length/2`` along it), all in bohr.
     """
 
     spacing: float
@@ -236,12 +454,23 @@ class GridSettings:
     shift: tuple[float, float, float] = (0.5, 0.5, 0.5)
     domain_shape: DomainShape = "sphere"
     box_lengths: tuple[float, float, float] | None = None
+    double_grid_order: int = 1
+    domain_parameters: tuple[float, float, float] | None = None
+
+    def __repr__(self) -> str:
+        # The double grid and the parameters of an ellipsoid or a cylinder
+        # print nothing at their defaults, so the text of every calculation
+        # without them stays what it was (cache keys hash it).
+        return _repr_without_defaults(
+            self, {"double_grid_order": 1, "domain_parameters": None}
+        )
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.spacing) or self.spacing <= 0:
             raise ValueError("grid spacing must be positive")
         if not np.isfinite(self.radius) or self.radius <= 0:
             raise ValueError("domain radius must be positive")
+        _check_double_grid_order(self)
         order = int(self.expansion_order)
         if order != self.expansion_order:
             raise ValueError("PARSEC expansion_order must be an integer")
@@ -249,8 +478,30 @@ class GridSettings:
             raise ValueError("PARSEC expansion_order must be an even integer from 2 to 20")
         if len(self.shift) != 3 or not np.all(np.isfinite(self.shift)):
             raise ValueError("grid shift must have three finite entries")
-        if self.domain_shape not in {"sphere", "box"}:
-            raise ValueError("only sphere and box cluster domains are supported")
+        if self.domain_shape not in {"sphere", "box", "ellipsoid", "cylinder"}:
+            raise ValueError(
+                "cluster domains are sphere, box, ellipsoid or cylinder"
+            )
+        if self.domain_shape in {"ellipsoid", "cylinder"}:
+            parameters = self.domain_parameters
+            if parameters is None or len(parameters) != 3:
+                raise ValueError(
+                    f"a {self.domain_shape} domain needs three domain_parameters"
+                )
+            values = tuple(float(value) for value in parameters)
+            if self.domain_shape == "ellipsoid" and (
+                not np.all(np.isfinite(values)) or min(values) <= 0.0
+            ):
+                raise ValueError("the radii of an ellipsoid must be positive")
+            if self.domain_shape == "cylinder" and (
+                not np.all(np.isfinite(values[:2]))
+                or min(values[:2]) <= 0.0
+                or values[2] not in (1.0, 2.0, 3.0)
+            ):
+                raise ValueError(
+                    "a cylinder needs a positive radius and length and an axis 1, 2 or 3"
+                )
+            object.__setattr__(self, "domain_parameters", values)
         if self.domain_shape == "box":
             lengths = self.box_lengths
             if lengths is None:
@@ -278,6 +529,13 @@ class GridSettings:
         """PARSEC ``rmax`` used only to size the underlying Cartesian box."""
         if self.domain_shape == "box":
             return 0.5 * float(np.linalg.norm(np.asarray(self.box_lengths)))
+        if self.domain_shape == "ellipsoid":
+            # usrinputfile.F90: rmax = maxval(d_shape_param).
+            return float(max(self.domain_parameters))
+        if self.domain_shape == "cylinder":
+            # usrinputfile.F90: rmax = sqrt((length/2)**2 + radius**2).
+            radius, length, _ = self.domain_parameters
+            return float(np.sqrt((length / 2.0) ** 2 + radius**2))
         return self.radius
 
 
@@ -289,6 +547,14 @@ class PeriodicCell:
     lattice_vectors: np.ndarray
     """Rows are the lattice vectors ``a1``, ``a2``, ``a3``."""
 
+    dimensions: int = 3
+    """Periodic directions: 3 (bulk) or 2 (slab: ``a1``, ``a2`` periodic in the xy plane, ``a3 = (0, 0, 2R)`` the
+    height of the non-periodic z direction, where the wavefunctions vanish beyond the box)."""
+
+    def __repr__(self) -> str:
+        # A bulk cell prints what it printed before slabs had a cell of their own (cache keys hash it).
+        return _repr_without_defaults(self, {"dimensions": 3})
+
     def __post_init__(self) -> None:
         vectors = np.asarray(self.lattice_vectors, dtype=np.float64)
         if vectors.shape != (3, 3):
@@ -297,6 +563,14 @@ class PeriodicCell:
             raise ValueError("lattice_vectors must be finite")
         if abs(float(np.linalg.det(vectors))) <= 0.0:
             raise ValueError("lattice_vectors must span a nondegenerate cell")
+        if self.dimensions not in (2, 3):
+            raise ValueError("a periodic cell has 2 (slab) or 3 (bulk) periodic dimensions")
+        if self.dimensions == 2:
+            in_plane = vectors[:2]
+            if np.any(np.abs(in_plane[:, 2]) > 1.0e-12) or np.any(np.abs(vectors[2, :2]) > 1.0e-12) or vectors[2, 2] <= 0.0:
+                raise ValueError(
+                    "a slab cell needs two lattice vectors in the xy plane and a third (0, 0, 2R) along z"
+                )
         object.__setattr__(self, "lattice_vectors", vectors)
 
     @property
@@ -319,20 +593,122 @@ class PeriodicGridSettings:
     ``(i, j, k)`` is at ``(i + shift_0) a_0/n_0 + (j + shift_1) a_1/n_1 + (k + shift_2) a_2/n_2``."""
     domain_shape: DomainShape = "PBC_Orthorhombic"
     box_lengths: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # ``Double_Grid_Order``, as for :class:`GridSettings`.
+    double_grid_order: int = 1
+    # Number of periodic lattice directions: 3 (bulk), 2 (slab: a1, a2
+    # periodic, z confined to |z| <= confinement_radius) or 1 (wire: a1 = x
+    # periodic, sqrt(y**2 + z**2) <= confinement_radius); F ``pbc%per``.
+    periodicity: int = 3
+    # ``Boundary_Sphere_Radius`` of a wire or slab (bohr), None for bulk.
+    confinement_radius: float | None = None
+    # Fortran ``adjust_step`` (inipbc.f90:327-429) on the general grid: per
+    # lattice direction, the fractional translations |M t| of the space
+    # group that the step must be commensurate with.  Empty: none (a
+    # symmorphic group, Ignore_Symmetry, or the orthorhombic grid, which
+    # keeps its own rule).
+    fractional_translations: tuple[tuple[float, ...], ...] = ()
+    # The local pseudopotential of a 3-D cell: ``"real_space"``, this port's
+    # Ewald split (:func:`parsec_python.V_ion.ewald_local_ionic_potential`),
+    # or ``"g_space"``, Fortran's reciprocal-space potential of
+    # ``v_first.f90``/``pot_local.f90`` (:mod:`parsec_python.V_ion.gspace_local`)
+    # with its alpha term ``alpha_term``: ``"analytic"`` (the q -> 0 limit) or
+    # ``"finite_difference"`` (Fortran's two-point difference of its q table).
+    local_potential: str = "real_space"
+    alpha_term: str = "analytic"
     points_rule: str = "round"
     """How the number of points along a lattice vector follows from ``spacing``.  ``"round"``: the nearest integer
     (an orthorhombic cell then needs one common spacing) or the nearest even integer (an oblique cell).  ``"fortran"``:
     the largest even number of points whose step is not below ``spacing``, per direction (Fortran's ``adjust_step``),
     so the steps of a cell may differ.  The input-file parser selects ``"fortran"``."""
+    # ``Use_Fortran_Routines`` (parsec_python.Input.routines): ``True`` builds
+    # the grid and every periodic term with the Fortran-derived routines of
+    # the parity round, ``False`` (the
+    # default) with Andrew Grieder's routines.
+    fortran_routines: bool = True
+
+    def __repr__(self) -> str:
+        # The wire/slab fields, the fractional translations and the local
+        # potential print nothing at their defaults, so the text of every
+        # earlier calculation stays what it was (cache keys hash it).  The
+        # Fortran-derived routines keep that text exactly (the prepared
+        # systems of the Fortran parity round are theirs); Andrew Grieder's
+        # routines always show their ``points_rule``, so the two never share
+        # a cache key.
+        hidden = {
+            "double_grid_order": 1,
+            "periodicity": 3,
+            "confinement_radius": None,
+            "fractional_translations": (),
+            "local_potential": "real_space",
+            "alpha_term": "analytic",
+            "fortran_routines": self.fortran_routines,
+        }
+        if self.fortran_routines:
+            hidden["points_rule"] = "round"
+        return _repr_without_defaults(self, hidden)
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.spacing) or self.spacing <= 0:
             raise ValueError("grid spacing must be positive")
+        periodicity = int(self.periodicity)
+        if periodicity != self.periodicity or periodicity not in (1, 2, 3):
+            raise ValueError("periodicity must be 1 (wire), 2 (slab) or 3 (bulk)")
+        object.__setattr__(self, "periodicity", periodicity)
+        if periodicity < 3:
+            radius = self.confinement_radius
+            if radius is None or not np.isfinite(radius) or radius <= 0:
+                raise ValueError(
+                    "a wire or slab needs a positive confinement_radius "
+                    "(Boundary_Sphere_Radius)"
+                )
+            object.__setattr__(self, "confinement_radius", float(radius))
+        elif self.confinement_radius is not None:
+            raise ValueError("confinement_radius applies to a wire or slab only")
+        _check_double_grid_order(self)
+        translations = tuple(
+            tuple(float(value) for value in direction)
+            for direction in self.fractional_translations
+        )
+        if translations and (
+            len(translations) != 3
+            or any(
+                not np.isfinite(value) or value <= 0.0
+                for direction in translations
+                for value in direction
+            )
+        ):
+            raise ValueError(
+                "fractional_translations needs three lists of positive numbers "
+                "(one per lattice direction)"
+            )
+        if not any(translations):
+            translations = ()
+        object.__setattr__(self, "fractional_translations", translations)
+        if self.local_potential not in ("real_space", "g_space"):
+            raise ValueError("local_potential must be 'real_space' or 'g_space'")
+        if self.alpha_term not in ("analytic", "finite_difference"):
+            raise ValueError("alpha_term must be 'analytic' or 'finite_difference'")
+        if self.alpha_term != "analytic" and self.local_potential != "g_space":
+            raise ValueError(
+                "alpha_term belongs to the g_space local potential (the real-space "
+                "Ewald split carries the average of the potential itself)"
+            )
+        if self.local_potential != "real_space" and periodicity != 3:
+            raise ValueError(
+                "the g_space local potential is that of a 3-D periodic cell; a wire "
+                "or slab has its own (Fortran ionpot_wire/ionpot_slab)"
+            )
         if self.points_rule not in ("round", "fortran"):
             raise ValueError("points_rule must be 'round' or 'fortran'")
-        if len(self.shift) != 3 or not np.all(np.isfinite(self.shift)):
-            raise ValueError("grid shift must have three finite entries")
-        object.__setattr__(self, "shift", tuple(float(value) for value in self.shift))
+        if self.fortran_routines and self.points_rule != "round":
+            raise ValueError(
+                "points_rule belongs to the default routines; the Fortran-derived routines "
+                "(fortran_routines=True) choose their own points"
+            )
+        if not self.fortran_routines:
+            if len(self.shift) != 3 or not np.all(np.isfinite(self.shift)):
+                raise ValueError("grid shift must have three finite entries")
+            object.__setattr__(self, "shift", tuple(float(value) for value in self.shift))
         order = int(self.expansion_order)
         if order != self.expansion_order:
             raise ValueError("PARSEC expansion_order must be an integer")
@@ -373,6 +749,12 @@ class HartreeSettings:
     ``minimum_multipole_order`` is ``None`` in an input.  A prepared system
     whose order was raised keeps the ``Solver_Lpole`` that was asked there,
     so that its input, prepared again, gets the same boundary.
+
+    ``periodic_g_space`` is PARSEC's ``Calc_Hartree_G`` (3-D periodic cells
+    only): ``V_H(G) = 8 pi rho(G)/|G|^2`` by FFT
+    (:mod:`parsec_python.Hartree.gspace`) instead of the finite-difference
+    Poisson solve.  It is not printed by ``repr`` at its default (the
+    accelerated driver hashes the settings text).
     """
 
     multipole_order: int = 9
@@ -384,6 +766,10 @@ class HartreeSettings:
     boundary_tolerance: float | None = 1.0e-3
     atomic_tail: HartreeAtomicTail = "auto"
     minimum_multipole_order: int | None = None
+    periodic_g_space: bool = False
+
+    def __repr__(self) -> str:
+        return _repr_without_defaults(self, {"periodic_g_space": False})
 
     def __post_init__(self) -> None:
         order = int(self.multipole_order)
@@ -445,6 +831,30 @@ class EigensolverSettings:
     filter.  The input translator resolves PARSEC's ``Matvec_Blocksize``
     default from ``States_Num`` and stores the resulting positive integer in
     ``matvec_block_size``.
+
+    ``method`` may also be ``arpack`` (``arpk.f90z``), ``diagla``
+    (``diagla.f90z``) or ``none`` (PARSEC's TEST mode: setup only).
+    ``chebyshev_filtering`` is ``Chebyshev_Filtering``: ``None`` keeps the
+    rule of ``usrinputfile.F90`` (always on for CHEBFF and CHEBDAV, off
+    otherwise); for ARPACK and DIAGLA ``True`` runs the selected solver for
+    the first solve only and the later-SCF SUBSPACE filter afterwards, as
+    after CHEBFF, ``False`` runs the solver in every SCF iteration.
+    ``dynamic_tolerance`` is ``Dynamic_Diag_Tol``: the first SCF iteration
+    uses a tolerance of 0.1 and every later one
+    ``max(min(tol, min_s SRE_s / 10), tolerance)`` (parsec.F90:1304-1311,
+    the rule Fortran intends; see :mod:`parsec_python.Eigensolvers.eigval`).
+    ``maximum_matvec`` is ``Maximum_matvec``: ARPACK and DIAGLA fail when a
+    solve uses ``max(maximum_matvec, n_grid * n_states)`` matrix-vector
+    products or more (eigval.F90 ierr 402).  ``fixed_state_count`` is
+    ``Fix_Number_Eigenvalues`` of a ``Restart_Run``: PARSEC skips
+    ``initeigval`` and keeps the number of eigenpairs per representation that
+    the restart file gave (``nn = nec`` of ``restart_run.F90``, the stored
+    ``States_Num`` levels; ``eigval.F90:679-685`` resets ``nn = nec = mm``
+    after every solve), so the eigensolver works with ``States_Num`` vectors
+    and no ``subspace_buffer`` (see :attr:`working_buffer`).  The new fields
+    print nothing at their defaults, so the text of the settings of every
+    earlier calculation is unchanged (it enters cache keys of the
+    accelerated driver).
     """
 
     method: EigensolverName = "chebff"
@@ -457,12 +867,74 @@ class EigensolverSettings:
     filter_degree_delta: int = 3
     lanczos_steps: int = 5
     random_seed: int = 7
+    chebyshev_filtering: bool | None = None
+    dynamic_tolerance: bool = False
+    maximum_matvec: int = DEFAULT_MAXIMUM_MATVEC
+    fixed_state_count: bool = False
+
+    def __repr__(self) -> str:
+        # Hidden at their defaults: the text of these settings is hashed by
+        # the cache keys of the accelerated driver.
+        hidden = {
+            "chebyshev_filtering": self.chebyshev_filtering is None,
+            "dynamic_tolerance": not self.dynamic_tolerance,
+            "maximum_matvec": self.maximum_matvec == DEFAULT_MAXIMUM_MATVEC,
+            "fixed_state_count": not self.fixed_state_count,
+        }
+        shown = [
+            f"{item.name}={getattr(self, item.name)!r}"
+            for item in fields(self)
+            if not hidden.get(item.name, False)
+        ]
+        return f"{type(self).__qualname__}({', '.join(shown)})"
+
+    @property
+    def filters_later_iterations(self) -> bool:
+        """Whether later SCF iterations run the Chebyshev SUBSPACE filter.
+
+        ``solver%do_subsp`` of ``usrinputfile.F90``: forced on for CHEBFF
+        and CHEBDAV, ``Chebyshev_Filtering`` (default off) otherwise.
+        """
+
+        if self.method in ALWAYS_FILTERING_EIGENSOLVERS:
+            return True
+        return bool(self.chebyshev_filtering)
+
+    @property
+    def working_buffer(self) -> int:
+        """Working vectors beyond ``States_Num`` (the eigensolver's buffer).
+
+        ``subspace_buffer``, or none with ``fixed_state_count``
+        (``Fix_Number_Eigenvalues``: PARSEC keeps the stored number of
+        eigenpairs, ``States_Num``, in every solve).
+        """
+
+        return 0 if self.fixed_state_count else self.subspace_buffer
 
     def __post_init__(self) -> None:
-        if self.method not in {"chebff", "chebdav", "arpack"}:
+        if self.method not in {"chebff", "chebdav", "arpack", "diagla", "none"}:
             raise ValueError(
-                "eigensolver method must be 'chebff', 'chebdav', or 'arpack'"
+                "eigensolver method must be 'chebff', 'chebdav', 'arpack', "
+                "'diagla', or 'none'"
             )
+        if self.chebyshev_filtering is not None:
+            object.__setattr__(
+                self, "chebyshev_filtering", bool(self.chebyshev_filtering)
+            )
+            if (
+                self.method in ALWAYS_FILTERING_EIGENSOLVERS
+                and not self.chebyshev_filtering
+            ):
+                raise ValueError(
+                    f"PARSEC always runs the Chebyshev subspace filter after "
+                    f"{self.method}; chebyshev_filtering cannot be False"
+                )
+        object.__setattr__(self, "dynamic_tolerance", bool(self.dynamic_tolerance))
+        object.__setattr__(self, "fixed_state_count", bool(self.fixed_state_count))
+        maximum_matvec = int(self.maximum_matvec)
+        if maximum_matvec != self.maximum_matvec or maximum_matvec < 1:
+            raise ValueError("maximum_matvec must be a positive integer")
+        object.__setattr__(self, "maximum_matvec", maximum_matvec)
         if not np.isfinite(self.tolerance) or self.tolerance <= 0:
             raise ValueError("eigensolver tolerance must be positive")
         integer_fields = (
@@ -481,7 +953,12 @@ class EigensolverSettings:
                 raise ValueError(f"{name} must be an integer")
             object.__setattr__(self, name, int(value))
         minimum_first_degree = 15 if self.method == "chebdav" else 10
-        if self.first_filter_degree < minimum_first_degree:
+        # Chebdav_Degree belongs to the CHEBFF and CHEBDAV first solves;
+        # usrinputfile.F90 does not read it for the other eigensolvers.
+        if (
+            self.method in ALWAYS_FILTERING_EIGENSOLVERS
+            and self.first_filter_degree < minimum_first_degree
+        ):
             raise ValueError(
                 f"first_filter_degree must be at least {minimum_first_degree} "
                 f"for {self.method}"
@@ -492,7 +969,7 @@ class EigensolverSettings:
             raise ValueError("matvec_block_size must be positive")
         if self.subspace_buffer < 0:
             raise ValueError("subspace_buffer cannot be negative")
-        if self.method in {"chebff", "chebdav"} and self.subspace_buffer < 6:
+        if self.filters_later_iterations and self.subspace_buffer < 6:
             raise ValueError(
                 "PARSEC filtering requires a subspace buffer of at least 6"
             )
@@ -505,9 +982,38 @@ class EigensolverSettings:
             raise ValueError("random_seed must be nonnegative")
 
 
+# PARSEC's Mixing_Method values (const.f90: ANDERSON, BROYDEN, MSECANT1-3).
+MIXING_METHODS = ("anderson", "broyden", "msecant1", "msecant2", "msecant3")
+
+
 @dataclass(frozen=True)
 class MixingSettings:
-    """Anderson mixing settings used by the SCF driver."""
+    """Potential mixing settings used by the SCF driver.
+
+    ``method`` is PARSEC's ``Mixing_Method``: ``anderson`` (the default,
+    :class:`parsec_python.Mixer.AndersonMixer`), ``broyden`` (the generalized
+    Broyden mixer of ``genbro.f90``) or ``msecant1``/``msecant2``/``msecant3``
+    (the multisecant mixers of ``msecant1-3.f90``, Type-I, Type-II and the
+    hybrid of the two); :func:`parsec_python.Mixer.make_mixer` builds it.
+    ``parameter`` (``Mixing_Param``), ``memory`` (``Memory_Param``) and
+    ``restart`` (``Restart_Mixing``) are read by every method as PARSEC
+    reads them; the multisecant mixers take ``memory`` as the first size of
+    their history only and never read ``restart``.  The last five fields are
+    the multisecant keywords of ``usrinputfile.F90:1584-1600`` with their
+    PARSEC defaults: ``group_size`` (``Mixing_Group_Size``, 0 for one group
+    of every secant pair), ``en_like`` (``Mixing_EN_Like``), ``restart_factor``
+    (``Mixing_Restart_Factor``), ``expand_factor``
+    (``Mixing_Memory_Expand_Factor``) and ``preferred_type``
+    (``Mixing_Preferred_Type``, 1 for Type-I, any other value Type-II).
+
+    The Anderson mixer keeps its validation: ``parameter`` in (0, 1],
+    positive ``memory`` and ``restart``.  PARSEC checks none of these numbers;
+    for the other methods only what their algebra needs is required: a
+    finite ``parameter``, a nonnegative ``memory`` (0 is linear mixing for
+    the Broyden mixer) and, for the Broyden mixer, a positive ``restart``.
+    ``regularization`` and the safeguard are options of the Anderson mixer
+    of this port and are refused for the others.
+    """
 
     parameter: float = 0.30
     memory: int = 4
@@ -517,19 +1023,73 @@ class MixingSettings:
     step_limit: float = 2.0
     growth_trigger: float = 2.0
     backoff: float = 0.5
+    method: str = "anderson"
+    group_size: int = 1
+    en_like: int = 0
+    restart_factor: float = 0.3
+    expand_factor: float = 2.0
+    preferred_type: int = 1
+
+    def __repr__(self) -> str:
+        # The text of these settings is hashed by the cache keys of the
+        # accelerated driver and stored in test records.  The method and the
+        # multisecant fields at their defaults print nothing, so that the
+        # text of every Anderson calculation stays what it was before the
+        # fields existed.
+        defaults = {
+            "method": "anderson",
+            "group_size": 1,
+            "en_like": 0,
+            "restart_factor": 0.3,
+            "expand_factor": 2.0,
+            "preferred_type": 1,
+        }
+        shown = [
+            f"{item.name}={getattr(self, item.name)!r}"
+            for item in fields(self)
+            if not (
+                item.name in defaults
+                and getattr(self, item.name) == defaults[item.name]
+            )
+        ]
+        return f"{type(self).__qualname__}({', '.join(shown)})"
 
     def __post_init__(self) -> None:
-        if not np.isfinite(self.parameter) or not 0 < self.parameter <= 1:
-            raise ValueError("mixing parameter must be in (0, 1]")
-        memory = int(self.memory)
-        restart = int(self.restart)
-        if (
-            memory != self.memory
-            or restart != self.restart
-            or memory < 1
-            or restart < 1
-        ):
-            raise ValueError("mixing memory and restart must be positive")
+        method = str(self.method).strip().lower()
+        if method not in MIXING_METHODS:
+            raise ValueError(
+                f"unknown mixing method {self.method!r}; PARSEC's mixers are "
+                + ", ".join(MIXING_METHODS)
+            )
+        object.__setattr__(self, "method", method)
+        if method == "anderson":
+            if not np.isfinite(self.parameter) or not 0 < self.parameter <= 1:
+                raise ValueError("mixing parameter must be in (0, 1]")
+            memory = int(self.memory)
+            restart = int(self.restart)
+            if (
+                memory != self.memory
+                or restart != self.restart
+                or memory < 1
+                or restart < 1
+            ):
+                raise ValueError("mixing memory and restart must be positive")
+        else:
+            if not np.isfinite(self.parameter):
+                raise ValueError("mixing parameter must be finite")
+            memory = int(self.memory)
+            restart = int(self.restart)
+            if memory != self.memory or restart != self.restart:
+                raise ValueError("mixing memory and restart must be integers")
+            if memory < 0:
+                raise ValueError("mixing memory cannot be negative")
+            if method == "broyden" and restart < 1:
+                raise ValueError("Broyden mixing restart must be positive")
+            if self.regularization or self.safeguard:
+                raise ValueError(
+                    "mixing regularization and the safeguard are options of "
+                    "the Anderson mixer only"
+                )
         if not np.isfinite(self.regularization) or self.regularization < 0:
             raise ValueError("mixing regularization cannot be negative")
         if not np.isfinite(self.step_limit) or self.step_limit <= 0:
@@ -540,11 +1100,32 @@ class MixingSettings:
             raise ValueError("mixing safeguard backoff must be in (0, 1]")
         object.__setattr__(self, "memory", memory)
         object.__setattr__(self, "restart", restart)
+        integers = {}
+        for name in ("group_size", "en_like", "preferred_type"):
+            value = getattr(self, name)
+            integer = int(value)
+            if integer != value:
+                raise ValueError(f"mixing {name} must be an integer")
+            integers[name] = integer
+        if integers["group_size"] < 0:
+            raise ValueError("mixing group size cannot be negative")
+        for name in ("restart_factor", "expand_factor"):
+            if not np.isfinite(getattr(self, name)):
+                raise ValueError(f"mixing {name} must be finite")
+        for name, value in integers.items():
+            object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True)
 class SCFSettings:
     """Isolated single-point SCF controls.
+
+    ``xc_functional`` is PARSEC's ``Correlation_Type`` (the names and the
+    Fortran labels are listed in :mod:`parsec_python.V_xc.selection`);
+    ``xalpha``, ``wigner`` and ``hedin_lundqvist`` have no spin-polarized
+    form.  ``ionization_energy_difference`` is ``Ion_Energy_Diff`` in
+    Rydberg, the cap of the ``casida_salahub`` potential correction, and is
+    read by that functional only.
 
     ``fixed_occupations`` holds one occupation per state of
     ``number_of_states``, in ascending order of energy and with one standing
@@ -582,6 +1163,19 @@ class SCFSettings:
     added on top when ``self_consistent_spin_orbit`` is also set (as in
     Fortran, a species with ``SO_PSP`` together with ``Non_Collinear_magnetism``
     switches the self-consistent spin-orbit term on).
+
+    ``symmetrize_density`` is PARSEC's ``Symmetrize_Charge_Density``: every
+    new density of an isolated SCF loop is replaced by its average over the
+    point group of the atoms (``symm_scalar`` of ``newrho.F90``), and every
+    new density of a periodic loop by its average over the space group of
+    ``SinglePointInput.space_group`` (:mod:`parsec_python.Grid.space_group`).
+
+    ``van_der_waals`` is PARSEC's ``Van_Der_Waals``: the Tkatchenko-Scheffler
+    dispersion correction evaluated once on the converged density
+    (:mod:`parsec_python.Energy.dispersion`).  ``hirshfeld_cells`` are
+    ``Hf_One``, ``Hf_Two`` and ``Hf_Three`` of a periodic cell: the free-atom
+    densities of the Hirshfeld partition are summed over
+    ``(2*Hf_One+1)*(2*Hf_Two+1)*(2*Hf_Three+1)`` cells.
     """
 
     max_iterations: int = 50
@@ -597,6 +1191,19 @@ class SCFSettings:
     fixed_occupations_down: tuple[float, ...] | None = None
     self_consistent_spin_orbit: bool = False
     noncollinear: bool = False
+    symmetrize_density: bool = False
+    van_der_waals: bool = False
+    hirshfeld_cells: tuple[int, int, int] = (0, 0, 0)
+    # ``Convergence_Criterion_Approach`` (Ry): ``None`` is PARSEC's default
+    # ``100 * Convergence_Criterion`` (usrinputfile.F90), see
+    # :attr:`approach_criterion`.
+    convergence_criterion_approach: float | None = None
+    ionization_energy_difference: float = 0.0
+    # Fortran's ``potshift`` (rho_hart.F90 l.243-257, a 3-D periodic cell):
+    # the exchange-correlation potential of each spin channel is shifted to
+    # a zero average every time it is evaluated (the Hartree potential has a
+    # zero average anyway).  Applied by the periodic prepared system.
+    zero_average_xc_potential: bool = False
 
     def __repr__(self) -> str:
         # The text of these settings is hashed by the cache keys of the
@@ -610,6 +1217,14 @@ class SCFSettings:
             "fixed_occupations_down": self.fixed_occupations_down is None,
             "self_consistent_spin_orbit": not self.self_consistent_spin_orbit,
             "noncollinear": not self.noncollinear,
+            "symmetrize_density": not self.symmetrize_density,
+            "van_der_waals": not self.van_der_waals,
+            "hirshfeld_cells": tuple(self.hirshfeld_cells) == (0, 0, 0),
+            "convergence_criterion_approach": (
+                self.convergence_criterion_approach is None
+            ),
+            "ionization_energy_difference": self.ionization_energy_difference == 0.0,
+            "zero_average_xc_potential": not self.zero_average_xc_potential,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -617,6 +1232,21 @@ class SCFSettings:
             if not hidden.get(item.name, False)
         ]
         return f"{type(self).__qualname__}({', '.join(shown)})"
+
+    @property
+    def approach_criterion(self) -> float:
+        """The SRE below which later SCF iterations lower the filter degree.
+
+        ``vconv_approach`` of parsec.F90:1452-1454: once the iteration is
+        beyond the fifth and the weighted SRE (the larger of the spin
+        channels) falls below it, the later-SCF Chebyshev degree drops by one
+        per iteration, down to 10.  The default ``100 * vconv`` follows the
+        criterion of this loop (``Relaxation_SCF_Upscale`` replaces it).
+        """
+
+        if self.convergence_criterion_approach is None:
+            return 100.0 * self.convergence_criterion
+        return self.convergence_criterion_approach
 
     def __post_init__(self) -> None:
         max_iterations = int(self.max_iterations)
@@ -636,8 +1266,33 @@ class SCFSettings:
             )
         if not np.isfinite(self.net_charge):
             raise ValueError("net_charge must be finite")
-        if self.xc_functional not in {"ca", "pbe"}:
-            raise ValueError("xc_functional must be 'ca' or 'pbe'")
+        if self.convergence_criterion_approach is not None:
+            approach = float(self.convergence_criterion_approach)
+            if not np.isfinite(approach):
+                raise ValueError("convergence_criterion_approach must be finite")
+            object.__setattr__(self, "convergence_criterion_approach", approach)
+        if self.xc_functional not in XC_FUNCTIONAL_NAMES:
+            raise ValueError(
+                "xc_functional must be one of "
+                + ", ".join(repr(name) for name in sorted(XC_FUNCTIONAL_NAMES))
+            )
+        if self.xc_functional in UNPOLARIZED_ONLY_XC_FUNCTIONALS and (
+            self.spin_polarized or self.noncollinear
+        ):
+            raise ValueError(
+                f"xc_functional={self.xc_functional!r} has no spin-polarized "
+                "form; it cannot be used with spin polarization or "
+                "non-collinear magnetism"
+            )
+        energy_difference = float(self.ionization_energy_difference)
+        if not np.isfinite(energy_difference):
+            raise ValueError("ionization_energy_difference must be finite")
+        if energy_difference != 0.0 and self.xc_functional != "casida_salahub":
+            raise ValueError(
+                "ionization_energy_difference is read by the casida_salahub "
+                "functional only"
+            )
+        object.__setattr__(self, "ionization_energy_difference", energy_difference)
         if self.number_of_states is not None:
             states = int(self.number_of_states)
             if states != self.number_of_states or states < 1:
@@ -656,6 +1311,7 @@ class SCFSettings:
                 )
             object.__setattr__(self, "fixed_occupations", fixed)
         object.__setattr__(self, "spin_polarized", bool(self.spin_polarized))
+        object.__setattr__(self, "symmetrize_density", bool(self.symmetrize_density))
         if self.fixed_occupations_down is not None:
             if not self.spin_polarized or self.fixed_occupations is None:
                 raise ValueError(
@@ -674,7 +1330,18 @@ class SCFSettings:
                 "a spin-polarized calculation with fixed occupations needs "
                 "them for both channels: give fixed_occupations_down"
             )
+        object.__setattr__(self, "van_der_waals", bool(self.van_der_waals))
+        cells = tuple(int(value) for value in self.hirshfeld_cells)
+        if len(cells) != 3 or any(
+            cell != value or cell < 0
+            for cell, value in zip(cells, self.hirshfeld_cells)
+        ):
+            raise ValueError("hirshfeld_cells must be three non-negative integers")
+        object.__setattr__(self, "hirshfeld_cells", cells)
         object.__setattr__(self, "max_iterations", max_iterations)
+        object.__setattr__(
+            self, "zero_average_xc_potential", bool(self.zero_average_xc_potential)
+        )
 
 
 @dataclass(frozen=True)
@@ -909,6 +1576,190 @@ class BandStructureSettings:
         object.__setattr__(self, "points", int(self.points))
 
 
+#: Values of ``Output_Grid_Data`` (``usrinputfile.F90`` l.2598-2638), in the
+#: order of ``all``; each names one cube file of ``export_grid_data.f90``.
+GRID_DATA_FIELDS = ("charge_density", "v_external", "v_hartree", "v_external+v_hartree")
+
+
+@dataclass(frozen=True)
+class WavefunctionSelection:
+    """Which wavefunctions ``parsec.dat`` holds (``elec_st%nsave``/``indxsave``).
+
+    ``mode`` is ``"occupied"`` (no ``Save_Wfn_Bands`` block: ``nsave = -1``,
+    states ``1..ifmax`` of each spin channel), ``"all"``
+    (``Output_All_States``: every computed state) or ``"list"`` (the 1-based
+    state numbers of a ``Save_Wfn_Bands`` block; an empty block gives none).
+    ``explicit`` says that the input chose it; the default choice may be
+    narrowed to no wavefunctions where the file would be very large (see
+    :mod:`parsec_python.Output.output_files`).
+    """
+
+    mode: Literal["occupied", "all", "list"] = "occupied"
+    indices: tuple[int, ...] = ()
+    explicit: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"occupied", "all", "list"}:
+            raise ValueError("wavefunction selection must be occupied, all or list")
+        indices = tuple(int(value) for value in self.indices)
+        if self.mode != "list" and indices:
+            raise ValueError("only a list selection holds state numbers")
+        if any(value < 1 for value in indices):
+            raise ValueError("Save_Wfn_Bands state numbers start at 1")
+        object.__setattr__(self, "indices", indices)
+
+
+@dataclass(frozen=True)
+class OutputFileSettings:
+    """The output files of ``usrinputfile.F90`` l.317-318 and 2413-2666.
+
+    ``output_data`` (``Output_Data``, default true) gates ``parsec.dat`` and
+    ``eigen.dat``; ``wavefunctions`` selects the wavefunctions of
+    ``parsec.dat``; ``intermediate_density``
+    (``Save_Intermediate_Charge_Density``) writes ``parsec.dat`` after every
+    SCF iteration.  ``eigenvalues`` (``Output_Eigenvalues``, forced on with
+    k-points) writes ``eigen.dat``, with every state when ``all_states``
+    (``Output_All_States``) and one block per SCF iteration when
+    ``intermediate_eigenvalues`` (``Save_Intermediate_Eigenvalues``).
+    ``grid_data`` lists the fields of ``Output_Grid_Data`` in the order of
+    the input (values of :data:`GRID_DATA_FIELDS`), ``output_file_name``
+    is ``Output_File_Name``.  ``keywords`` holds the names of these keywords
+    that the input gives, so that a run that gives none reports nothing new.
+
+    These settings describe files only; they are not part of the problem
+    and change no number of the calculation.
+    """
+
+    output_data: bool = True
+    wavefunctions: WavefunctionSelection = field(default_factory=WavefunctionSelection)
+    intermediate_density: bool = False
+    eigenvalues: bool = False
+    all_states: bool = False
+    intermediate_eigenvalues: bool = False
+    grid_data: tuple[str, ...] = ()
+    output_file_name: str = "parsec.out"
+    keywords: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        unknown = [name for name in self.grid_data if name not in GRID_DATA_FIELDS]
+        if unknown:
+            raise ValueError(f"unknown Output_Grid_Data field(s): {', '.join(unknown)}")
+        name = str(self.output_file_name).strip()
+        if not name:
+            raise ValueError("Output_File_Name cannot be empty")
+        object.__setattr__(self, "output_file_name", name)
+        object.__setattr__(self, "grid_data", tuple(self.grid_data))
+        object.__setattr__(self, "keywords", frozenset(self.keywords))
+
+    @property
+    def writes_parsec_dat(self) -> bool:
+        return bool(self.output_data)
+
+    @property
+    def writes_eigen_dat(self) -> bool:
+        return bool(self.output_data and self.eigenvalues)
+
+
+@dataclass(frozen=True)
+class NSCFSettings:
+    """A non-self-consistent run (Fortran ``calc_nscf.F90``, ``nscf_*`` keys).
+
+    ``k_points`` are Cartesian (1/bohr, one per row) after ``nscf_kpoint_unit``
+    (reciprocal lattice vectors of the input cell, as ``usrinputfile.F90``
+    l.1071-1085 converts them), ``weights`` the ``nscf_kpoints`` weights
+    renormalized to sum 1, ``number_of_states`` is ``nscf_states_num``
+    (default ``States_Num``).  The potential comes from ``parsec.dat``
+    (``Restart_Run``); no SCF loop runs.  These settings are not part of the
+    problem: the SCF problem of the input stays what it is.
+    """
+
+    k_points: np.ndarray
+    weights: np.ndarray
+    number_of_states: int
+
+    def __post_init__(self) -> None:
+        k_points = np.asarray(self.k_points, dtype=float)
+        weights = np.asarray(self.weights, dtype=float)
+        if k_points.ndim != 2 or k_points.shape[1] != 3 or k_points.shape[0] < 1:
+            raise ValueError("nscf k_points must have shape (n, 3) with n >= 1")
+        if weights.shape != (k_points.shape[0],) or not np.all(np.isfinite(weights)):
+            raise ValueError("nscf weights must hold one finite value per k-point")
+        if int(self.number_of_states) != self.number_of_states or self.number_of_states < 1:
+            raise ValueError("nscf_states_num must be a positive integer")
+        object.__setattr__(self, "k_points", k_points)
+        object.__setattr__(self, "weights", weights)
+        object.__setattr__(self, "number_of_states", int(self.number_of_states))
+
+
+@dataclass(frozen=True)
+class DOSSettings:
+    """``Create_DOS`` and its keywords (``usrinputfile.F90`` l.1122-1197, 1913).
+
+    ``points`` is ``DOS_Pnum`` (energy mesh points).  For a periodic system
+    ``monkhorst_pack_grid`` is the grid of the tetrahedra (``DOS_MP_Grid``,
+    else the SCF grid) and ``monkhorst_pack_shift`` its ``DOS_MP_Shift``
+    (``None`` without the block).  ``ylm_l`` is ``YLM_DOS_L`` (``-1``: no
+    projected DOS; ``0..3``: the real harmonics s to f) and
+    ``ylm_cutoffs`` the per-species ``ylm_dos_cutoff`` in bohr (default 1),
+    as ``(symbol, radius)`` pairs in the order of the input.
+    ``fortran_projection`` reproduces the projection of ``ylm_eig`` with its
+    two defects (an s channel without the radial Gaussian and no Bloch phase
+    of the image cells; a Python extension switch, see
+    :mod:`parsec_python.Output.dos`).  A report setting: not part of the
+    problem.
+    """
+
+    points: int = 1000
+    monkhorst_pack_grid: tuple[int, int, int] | None = None
+    monkhorst_pack_shift: tuple[float, float, float] | None = None
+    ylm_l: int = -1
+    ylm_cutoffs: tuple[tuple[str, float], ...] = ()
+    fortran_projection: bool = False
+
+    def __post_init__(self) -> None:
+        if int(self.points) != self.points or self.points < 1:
+            raise ValueError("DOS_Pnum must be a positive integer")
+        if not -1 <= int(self.ylm_l) <= 3:
+            raise ValueError("YLM_DOS_L must be -1 (off) or 0, 1, 2, 3")
+        object.__setattr__(self, "points", int(self.points))
+        object.__setattr__(self, "ylm_l", int(self.ylm_l))
+        object.__setattr__(
+            self,
+            "ylm_cutoffs",
+            tuple((str(symbol), float(radius)) for symbol, radius in self.ylm_cutoffs),
+        )
+
+
+@dataclass(frozen=True)
+class GWSettings:
+    """``Output_GW``: the WFN, RHO and VXC files of BerkeleyGW (``gw_write.F90``).
+
+    ``space_group`` is the :class:`parsec_python.Grid.space_group.SpaceGroup`
+    of the files (PARSEC's ``symm``: the full group, the identity with
+    ``Ignore_Symmetry``).  ``kgrid``/``kshift`` go to the WFN header: with a
+    non-self-consistent run ``nscf_kgrid``/``nscf_kgrid_shift``
+    (``parsec.F90`` l.2133-2134), with an SCF the Monkhorst-Pack grid of the
+    SCF (see :mod:`parsec_python.Output.berkeleygw`).  ``fermi_level`` is
+    ``nscf_fermi_level`` (Ry, the fixed Fermi level of the NSCF occupations),
+    ``None`` with an SCF.  A report setting: not part of the problem.
+    """
+
+    space_group: object
+    kgrid: tuple[int, int, int] = (0, 0, 0)
+    kshift: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    fermi_level: float | None = None
+
+    def __post_init__(self) -> None:
+        kgrid = tuple(int(value) for value in self.kgrid)
+        kshift = tuple(float(value) for value in self.kshift)
+        if len(kgrid) != 3 or len(kshift) != 3:
+            raise ValueError("the GW k-grid and its shift need three entries each")
+        object.__setattr__(self, "kgrid", kgrid)
+        object.__setattr__(self, "kshift", kshift)
+        if self.fermi_level is not None:
+            object.__setattr__(self, "fermi_level", float(self.fermi_level))
+
+
 @dataclass(frozen=True)
 class SinglePointInput:
     """
@@ -939,11 +1790,49 @@ class SinglePointInput:
     ``monkhorst_pack_dimensions`` and requiring ``periodic_cell``.  Convert
     user units with :func:`~parsec_python.Grid.kpoints.explicit_kpoints`."""
     kpoint_weights: np.ndarray | None = None
-    """Sampling weights for ``kpoints`` (non-negative, normalized to sum 1;
-    equal if omitted).  The SCF drivers currently require them equal."""
+    """Sampling weights for ``kpoints`` (non-negative, normalized to sum 1 as
+    PARSEC's ``init_var`` does; equal if omitted).  Unequal weights use the
+    per-state weights of the Fermi level (Fortran ``flevel``)."""
     bands: BandStructureSettings | None = None
     """Non-self-consistent band structure to compute after the SCF (periodic
     systems only); see :class:`BandStructureSettings`."""
+    point_charges: tuple[PointCharge, ...] = ()
+    """Fixed classical point charges of an isolated system (PARSEC's
+    ``Add_Point_Charges``), at the coordinates of the input: they are
+    recentred with the atoms where ``recenter_geometry`` moves them."""
+    charged_sheets: tuple[ChargedSheet, ...] = ()
+    """Charged planes of a slab (PARSEC's ``add_charged_sheets``), in the
+    order of the input."""
+    monkhorst_pack_shift: tuple[float, float, float] | None = None
+    """PARSEC's ``Monkhorst_Pack_Shift`` block.  Given, the grid of
+    ``monkhorst_pack_dimensions`` is Fortran's ``k = ((i-1) + s_i)/n_i`` and
+    is reduced to the irreducible wedge by ``space_group`` and time reversal
+    (:func:`~parsec_python.Grid.kpoints.irreducible_monkhorst_pack`,
+    ``irrbz.f90``).  ``None``: this port's unreduced grid, as before."""
+    space_group: object | None = None
+    """The :class:`~parsec_python.Grid.space_group.SpaceGroup` of a periodic
+    cell (Fortran ``symm``), found by the input reader where the
+    calculation uses it: the irreducible wedge of a ``monkhorst_pack_shift``
+    grid and ``SCFSettings.symmetrize_density``.  ``None`` stands for the
+    identity alone."""
+
+    def __repr__(self) -> str:
+        # Point charges and charged sheets that are not there, and the
+        # k-point shift and space group where they are not given, print
+        # nothing, so that the text of every calculation without them
+        # stays what it was.
+        hidden = {
+            "point_charges": not self.point_charges,
+            "charged_sheets": not self.charged_sheets,
+            "monkhorst_pack_shift": self.monkhorst_pack_shift is None,
+            "space_group": self.space_group is None,
+        }
+        shown = [
+            f"{item.name}={getattr(self, item.name)!r}"
+            for item in fields(self)
+            if not hidden.get(item.name, False)
+        ]
+        return f"{type(self).__qualname__}({', '.join(shown)})"
 
     @property
     def has_kpoint_sampling(self) -> bool:
@@ -974,6 +1863,18 @@ class SinglePointInput:
             if len(dims) != 3 or any(value < 1 for value in dims):
                 raise ValueError("monkhorst_pack_dimensions must be three positive integers")
             object.__setattr__(self, "monkhorst_pack_dimensions", dims)
+        if self.monkhorst_pack_shift is not None:
+            if self.monkhorst_pack_dimensions is None:
+                raise ValueError("monkhorst_pack_shift requires monkhorst_pack_dimensions")
+            shift = tuple(float(value) for value in self.monkhorst_pack_shift)
+            if len(shift) != 3 or any(
+                not np.isfinite(value) or value < 0.0 for value in shift
+            ):
+                # usrinputfile.F90 error 117.
+                raise ValueError("monkhorst_pack_shift must be three non-negative numbers")
+            object.__setattr__(self, "monkhorst_pack_shift", shift)
+        if self.space_group is not None and self.periodic_cell is None:
+            raise ValueError("space_group belongs to a periodic cell")
         if self.kpoints is not None:
             if self.periodic_cell is None:
                 raise ValueError("an explicit k-point list requires periodic_cell")
@@ -1002,6 +1903,22 @@ class SinglePointInput:
             raise ValueError("kpoint_weights given without kpoints")
         if self.bands is not None and self.periodic_cell is None:
             raise ValueError("a band structure requires periodic_cell")
+        charges = tuple(
+            item if isinstance(item, PointCharge) else PointCharge(**item)
+            for item in self.point_charges
+        )
+        if charges and self.periodic_cell is not None:
+            # usrinputfile.F90 stops with error 145.
+            raise ValueError("point charges are supported for isolated systems only")
+        object.__setattr__(self, "point_charges", charges)
+        sheets = tuple(
+            item if isinstance(item, ChargedSheet) else ChargedSheet(**item)
+            for item in self.charged_sheets
+        )
+        if sheets and getattr(self.grid, "periodicity", None) != 2:
+            # usrinputfile.F90 stops with error 145.
+            raise ValueError("charged sheets are supported for slab systems only")
+        object.__setattr__(self, "charged_sheets", sheets)
 
 
 @dataclass
@@ -1058,6 +1975,23 @@ class EnergyBreakdown:
     ion_ion: float
     electronic: float
     total: float
+
+
+@dataclass(frozen=True)
+class CorrectedEnergyBreakdown(EnergyBreakdown):
+    """:class:`EnergyBreakdown` with the LDA+U and dispersion terms, in Ry.
+
+    ``hubbard`` is ``etot_plusu`` of ``calcden.f90z``, which ``totnrg.f90``
+    adds to the electronic energy: it is part of ``electronic`` and of
+    ``total``.  ``dispersion`` is the Tkatchenko-Scheffler energy of
+    ``efvdw.f90``, which the report after convergence adds to ``total``
+    only.  A calculation with neither keeps the plain
+    :class:`EnergyBreakdown`, whose fields (and archive members) stay what
+    they were.
+    """
+
+    hubbard: float = 0.0
+    dispersion: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1141,6 +2075,23 @@ class SCFIteration:
     spin_electrons: tuple[float, ...] = ()
     spin_density_minimum: tuple[float, ...] = ()
     spin_density_maximum: tuple[float, ...] = ()
+    # Symmetrize_Charge_Density only: what symm_scalar reports of each
+    # density it symmetrized (parsec_python.Grid.ScalarSymmetrization), the
+    # total density first and, with spin, the up and the down channel.
+    density_symmetrization: tuple = ()
+    # LDA+U only, from the second iteration on: the two terms
+    # ``calcden.f90z`` prints before the eigenproblem of the iteration, from
+    # the orbitals of the iteration before (Ry).  ``None`` otherwise.
+    hubbard_first_contribution: float | None = None
+    hubbard_energy: float | None = None
+    # ARPACK and DIAGLA only: (converged pairs, matrix-vector products) of
+    # the solve of each spin channel, as eigval.F90 reports them; each a
+    # tuple of one count per representation where the accelerated solver
+    # solved symmetry sectors.
+    eigensolver_counts: tuple[tuple, ...] = ()
+    # Dynamic_Diag_Tol only: the eigensolver tolerance of the next
+    # iteration (parsec.F90:1304-1311, "New tolerance").
+    next_eigensolver_tolerance: float | None = None
 
     @property
     def spin_polarized(self) -> bool:
@@ -1197,6 +2148,16 @@ class SpinPolarizedSCFIteration:
     occupations_up: tuple[float, ...] = ()
     occupations_down: tuple[float, ...] = ()
     fermi_level: float = float("nan")
+    # Symmetrize_Charge_Density: the symm_scalar reports of the total, up and
+    # down densities (``isp = 1, 2, 3``), empty without it.
+    density_symmetrization: tuple = ()
+    # LDA+U only, from the second iteration on: the two terms calcden.f90z
+    # prints (Ry), as in SCFIteration; ``None`` otherwise.
+    hubbard_first_contribution: float | None = None
+    hubbard_energy: float | None = None
+    # Dynamic_Diag_Tol only: the eigensolver tolerance of the next iteration
+    # (parsec.F90:1302-1311), as in SCFIteration.
+    next_eigensolver_tolerance: float | None = None
     diagonalization_seconds: float = 0.0
     total_seconds: float = 0.0
     eigen_residual_max: float = float("nan")
@@ -1258,6 +2219,22 @@ class SinglePointResult:
     eigensolver_state: object | None = None
     # The two channels of a spin-polarized calculation, up first.
     spin: tuple[SpinChannelResult, SpinChannelResult] | None = None
+    # LDA+U: the :class:`parsec_python.Hamiltonian.hubbard.HubbardTerms` of the
+    # last iteration (from the orbitals of the iteration before it), ``None``
+    # without LDA+U or before its second iteration.
+    hubbard: object | None = None
+    # Van_Der_Waals: the :class:`parsec_python.Energy.dispersion.DispersionResult`
+    # of the converged density, ``None`` otherwise.
+    dispersion: object | None = None
+    # A k-point loop asked to keep its orbitals (``keep_wavefunctions`` of
+    # parsec_python.SCF.kpoints: the Ylm-projected DOS, the forces of a
+    # periodic cell): the final Bloch factors ``u_nk`` of every k-point, one
+    # ``(n_grid, n_states)`` array per k-point in the order of ``k_points``,
+    # and the input potential of the last iteration
+    # (``input_effective_potential`` of a k-point loop is the mixed potential
+    # of the next one).  ``None`` otherwise.
+    k_wavefunctions: tuple[np.ndarray, ...] | None = None
+    scf_input_potential: np.ndarray | None = None
     nonlocal_forces: np.ndarray | None = None
     """``(atoms, 3)`` nonlocal (Kleinman-Bylander) forces in Ry/bohr, summed over the k-points from the converged
     eigenvectors of the last SCF step.  A k-point run does not keep its eigenvectors, so it accumulates this term
@@ -1326,6 +2303,27 @@ class SpinPolarizedSinglePointResult:
     k-major: entries ``i*n_states:(i+1)*n_states`` belong to ``k_points[i]``."""
     k_weights: np.ndarray | None = None
     """Normalized k-point weights, shape ``(n_k,)``."""
+    k_wavefunctions: tuple[tuple[np.ndarray, ...], ...] | None = None
+    """With ``keep_wavefunctions`` of the k-point driver: the final ``u_nk`` of
+    every (spin channel, k-point), up first; ``None`` otherwise."""
+    scf_input_potentials: tuple[np.ndarray, np.ndarray] | None = None
+    """With ``keep_wavefunctions``: the (up, down) input potentials of the
+    last iteration (the forces' self-consistency term); ``None`` otherwise."""
+    next_potentials: tuple[np.ndarray, np.ndarray] | None = None
+    """With ``keep_wavefunctions``: the (up, down) mixed potentials the next
+    iteration would take (the warm start of an ionic step)."""
+    xc_potentials: tuple[np.ndarray, np.ndarray] | None = None
+    """With ``keep_wavefunctions``: the (up, down) exchange-correlation
+    potentials of the last iteration (the core-correction force)."""
+    scf_hartree_potential: np.ndarray | None = None
+    """With ``keep_wavefunctions``: the Hartree potential of the last
+    iteration (the Gaussian-charge term of the wire and slab forces)."""
+    hubbard: object | None = None
+    """LDA+U: the :class:`parsec_python.Hamiltonian.hubbard.HubbardTerms` of the
+    last iteration, ``None`` otherwise (as :class:`SinglePointResult`)."""
+    dispersion: object | None = None
+    """Van_Der_Waals: the TS correction of the converged density, ``None``
+    otherwise (as :class:`SinglePointResult`)."""
     timings: RunTimings | None = None
     """Stage timings, recorded by the k-point driver (``None`` where not measured)."""
 
@@ -1333,6 +2331,18 @@ class SpinPolarizedSinglePointResult:
     def magnetic_moment(self) -> float:
         """``N_up - N_down`` in Bohr magnetons (PARSEC's ``<S>`` diagnostic),
         summed with each pooled state's k-point weight."""
+        weights = self.k_weights
+        if weights is not None and len(weights) > 1 and np.any(
+            np.asarray(weights) != np.asarray(weights)[0]
+        ):
+            # Unequal weights (an irreducible wedge or a weighted list): each
+            # k-point's states carry their own weight.
+            per_k = np.asarray(self.occupations_up).size // len(weights)
+            state_weights = np.repeat(np.asarray(weights, dtype=float), per_k)
+            return float(
+                np.dot(state_weights, self.occupations_up)
+                - np.dot(state_weights, self.occupations_down)
+            )
         return float(
             self.occupation_weight
             * (np.sum(self.occupations_up) - np.sum(self.occupations_down))
@@ -1356,6 +2366,17 @@ class SelfConsistentSOCIteration:
     eigenvalues: tuple[float, ...] = ()
     occupations: tuple[float, ...] = ()
     fermi_level: float = float("nan")
+    # Non-collinear runs only: the moments bxc.F90 prints after flevel
+    # (parsec_python.SCF.noncollinear.NoncollinearMoments).
+    magnetic_moments: object | None = None
+    # Symmetrize_Charge_Density of a periodic spin-orbit run: the symm_scalar
+    # reports (total density, then up and down where spin-polarized).
+    density_symmetrization: tuple = ()
+    # LDA+U only, from the second iteration on (Ry), as in SCFIteration.
+    hubbard_first_contribution: float | None = None
+    hubbard_energy: float | None = None
+    # Dynamic_Diag_Tol only: the eigensolver tolerance of the next iteration.
+    next_eigensolver_tolerance: float | None = None
     eigen_residual_max: float = float("nan")
     """Largest ``||H x - e x||`` of the requested pairs after this iteration's solve (NaN if not measured)."""
     diagonalization_seconds: float = 0.0
@@ -1409,6 +2430,41 @@ class SelfConsistentSOCResult:
     state_moments: np.ndarray | None = None
     """``<S_z>`` of every pooled state (same k-major layout as ``eigenvalues``)
     for k-point runs, where ``spinors`` only holds the first k-point."""
+    scf_input_potential: np.ndarray | None = None
+    """Spin-independent input potential of the last iteration (the channel
+    average of collinear spin, the scalar part of a non-collinear potential),
+    for the self-consistency term of the forces."""
+    scf_output_potential: np.ndarray | None = None
+    """The output potential of the last iteration, as ``scf_input_potential``."""
+    xc_potential: np.ndarray | None = None
+    """Spin-independent exchange-correlation potential of the last output
+    (the core-correction term of the forces)."""
+    k_spinors: tuple[np.ndarray, ...] | None = None
+    """With ``keep_wavefunctions`` of a k-point driver: the converged spinors
+    of every k-point, in the order of ``k_points``; ``None`` otherwise."""
+    hubbard: object | None = None
+    """LDA+U: the spinor terms of the last iteration, ``None`` otherwise."""
+    parsec_dat_fields: dict | None = None
+    """What ``wfnsave.F90`` stores of a spinor run: ``kind`` (``stype(2)``: 2
+    spin-orbit, 3 non-collinear, 4 both), ``potentials`` (``vnew(:,1:2)``, the
+    last mixed potential of each spin component, Ry) and ``densities``
+    (``rho(:,2:3)``); ``None`` for a result made elsewhere."""
+    dispersion: object | None = None
+    """Van_Der_Waals: the TS correction of the converged density, ``None``
+    otherwise (as :class:`SinglePointResult`)."""
+    next_potential: object | None = None
+    """The last mixed potential (``pot%vnew`` after the last iteration), in
+    the form the driver's ``initial_potential`` takes: one array (spin-orbit),
+    the up and down potentials (spin-orbit with collinear spin), or the
+    scalar potential and the exchange-correlation field ``(V, B)`` with ``B``
+    of shape ``(3, n_grid)`` (non-collinear).  What the next structure of an
+    ionic loop starts from (``parsec.F90``: ``vnew - vion_old + vion_new``);
+    ``None`` for a result made elsewhere."""
+    eigensolver_state: object | None = None
+    """The eigensolver subspace of the last iteration of the isolated
+    spin-orbit loops (``run_self_consistent_soc`` and its spin-polarized
+    form), which the next structure of an ionic loop filters again
+    (``solver%firstfilt``); ``None`` for the drivers that keep none."""
     timings: dict[str, float] | None = None
     """Seconds per SCF stage (``hamiltonian``, ``diagonalization``, ``density``,
     ``hartree``, ``xc``, ``mixing_energy``) plus the eigensolver's own counters

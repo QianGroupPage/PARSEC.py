@@ -27,7 +27,7 @@ from ..Forces import (
     operations_preserving,
     symmetrize_positions,
 )
-from .backend import IonicBackend, reference_backend, release_orbitals
+from .backend import IonicBackend, moved_atoms, reference_backend, release_orbitals
 from .domove import MoveReport, MovementState, RelaxationSettings, domove
 from .files import RYDBERG_TO_EV, RelaxRestart
 
@@ -230,7 +230,10 @@ def _relaxation_loop(
     operations = None
     if symmetrize and settings.method != "manual":
         operations = operations_preserving(
-            atom_symmetry_operations(system.atoms), mask
+            atom_symmetry_operations(system.atoms)
+            if backend.symmetry_operations is None
+            else backend.symmetry_operations(system),
+            mask,
         )
 
     state = MovementState()
@@ -378,10 +381,8 @@ def _relaxation_loop(
             outcome.movements_exhausted = True
             break
 
-        atoms = tuple(
-            replace(atom, position=position)  # keeps the initial moment of a non-collinear calculation
-            for atom, position in zip(system.atoms, report.positions)
-        )
+        # Andrew Grieder's loops keep the initial moment of a non-collinear calculation
+        atoms = moved_atoms(system.atoms, report.positions, getattr(backend, "keep_atom_fields", True))
         # The eigensolver keeps the subspace the next loop continues from;
         # views of it held by the result of this structure would only pin
         # device memory.  The result of the last structure keeps its own.

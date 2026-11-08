@@ -379,10 +379,20 @@ class CommandLineTests(unittest.TestCase):
         self.assertLess(max(total) - min(total), 5.0e-3)
 
     def test_a_spin_polarized_cell_with_kpoints_has_no_forces(self) -> None:
+        # With both sets of routines: the default routines still do not compute these forces, and the input now runs
+        # on the Fortran-derived routines by itself (parsec_python.Input.routines) instead of being refused, so the
+        # test reads the choice of the parser (the run itself is that of the Fortran-derived routines).
+        from parsec_python.Input.parsec_input import parse_parsec_input
+
         extra = self._SPIN + "Skip_Force: .false.\nKpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 1 1\nend Monkhorst_Pack_Grid"
-        code, error, _ = self._run(extra)
-        self.assertEqual(code, 2)
-        self.assertIn("spin-polarized periodic calculation with k-points", error)
+        with tempfile.TemporaryDirectory() as name:
+            folder = Path(name)
+            (folder / "parsec.in").write_text(_INPUT.format(extra=extra, mixing="0.1"))
+            (folder / "H_POTRE.DAT").write_bytes(_H.read_bytes())
+            routines = parse_parsec_input(folder / "parsec.in").routines
+        self.assertTrue(routines.fortran)
+        self.assertFalse(routines.requested)
+        self.assertIn("spin-polarized cell with k-points", "; ".join(routines.reasons))
 
 
 if __name__ == "__main__":

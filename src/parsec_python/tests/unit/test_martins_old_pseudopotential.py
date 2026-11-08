@@ -496,7 +496,9 @@ class SpeciesInputTests(unittest.TestCase):
             SpeciesPotential("Si_POTR.DAT", 1, pseudopotential_format="martins_old")
         with self.assertRaisesRegex(ValueError, "belong to a martins_old"):
             SpeciesPotential("H_POTRE.DAT", 0, core_cutoff_radius=2.5)
-        with self.assertRaisesRegex(ValueError, "martins_new' or 'martins_old"):
+        with self.assertRaisesRegex(ValueError, "'martins_wang' or 'fhipp'"):
+            SpeciesPotential("X_POT.DAT", 0, pseudopotential_format="martins_older")
+        with self.assertRaisesRegex(ValueError, "a fhipp pseudopotential needs"):
             SpeciesPotential("X_FHIPP.DAT", 0, pseudopotential_format="fhipp")
         old = dict(
             pseudopotential_format="martins_old",
@@ -708,14 +710,24 @@ class InputTranslationTests(unittest.TestCase):
             load_pseudopotentials(translation.problem.pseudopotentials)
 
     def test_other_formats_and_missing_files(self) -> None:
-        for name in ("martins_wang", "fhipp"):
-            with self.assertRaisesRegex(UnsupportedParsecOptionError, "martins_new or martins_old"):
+        # The other two formats read files of their own names
+        # (Pseudopotential/potrw.py and fhipp.py have their own tests).
+        for name, suffix in (("martins_wang", "POTRW"), ("fhipp", "FHIPP")):
+            with self.assertRaisesRegex(ParsecInputError, f"Si_{suffix}.DAT"):
                 self.parse(
                     self.replaced(
                         "Pseudopotential_Format: martins_old",
                         f"Pseudopotential_Format: {name}",
                     )
                 )
+        # usrinputfile.F90 error 134.
+        with self.assertRaisesRegex(ParsecInputError, "unknown Pseudopotential_Format"):
+            self.parse(
+                self.replaced(
+                    "Pseudopotential_Format: martins_old",
+                    "Pseudopotential_Format: martins_older",
+                )
+            )
         translation_path = write_case(self.case, self.directory)
         (self.directory / "Si_POTR.DAT").unlink()
         with self.assertRaisesRegex(ParsecInputError, "Si_POTR.DAT"):

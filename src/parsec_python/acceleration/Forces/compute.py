@@ -17,6 +17,7 @@ from typing import Sequence
 
 import numpy as np
 
+from parsec_python.Grid.pbc import uses_fortran_routines
 from parsec_python.Forces import (
     AtomSymmetryOperation,
     ForceResult,
@@ -26,6 +27,7 @@ from parsec_python.Forces import (
     ion_ion_forces,
     local_forces,
     nonlocal_forces,
+    point_charge_forces,
 )
 
 
@@ -144,6 +146,31 @@ def _spin_nonlocal_forces(system, channels, operator, atom_count: int) -> np.nda
     return forces
 
 
+def correction_forces(system, result) -> dict[str, np.ndarray]:
+    """The LDA+U and TS force terms of an accelerated result, by their field names.
+
+    Empty without LDA+U and TS, so that :func:`assemble_forces` is called as
+    before.  The LDA+U term is formed where the orbitals are
+    (``system.hubbard_device``, Hamiltonian.hubbard_device) or, on the CPU
+    backends, by :func:`parsec_python.Forces.total.correction_forces` from
+    the host orbitals; the TS forces are those of the correction of the
+    converged density.
+    """
+
+    device = getattr(system, "hubbard_device", None)
+    if device is None:
+        if getattr(system, "hubbard", None) is None and getattr(result, "dispersion", None) is None:
+            return {}
+        from parsec_python.Forces.total import correction_forces as host_correction_forces
+
+        return host_correction_forces(system, result)
+    terms = {"hubbard": device.forces(system, result)}
+    dispersion = getattr(result, "dispersion", None)
+    if dispersion is not None:
+        terms["dispersion"] = np.asarray(dispersion.forces, dtype=np.float64)
+    return terms
+
+
 def _array_module(system):
     """``(xp, erf, device)`` of the sums of a periodic cell: CuPy on the current device when the calculation ran on a GPU."""
 
@@ -231,6 +258,14 @@ def compute_forces(
     """
 
     if getattr(system.input, "periodic_cell", None) is not None:
+        if uses_fortran_routines(system.grid):
+            # The Fortran-derived routines (Use_Fortran_Routines): the device builders of
+            # their Ewald terms and projectors with their lattice images.
+            from .periodic_device import compute_device_periodic_forces
+
+            return compute_device_periodic_forces(
+                system, result, symmetrize=symmetrize, operations=operations
+            )
         return compute_periodic_forces(system, result, symmetrize=symmetrize, operations=operations)
     started = perf_counter()
     clock: dict[str, float] = {}
@@ -238,6 +273,13 @@ def compute_forces(
     specifications = system.input.pseudopotentials
     positions = np.array([atom.position for atom in atoms], dtype=np.float64)
     repulsion = ion_ion_forces(atoms, system.pseudopotentials)
+    point_charges = getattr(system, "point_charges", ())
+    charged = None
+    if point_charges:
+        # forcept.f90 adds the forces of the point charges on the nuclei to
+        # the ion-ion forces (Forces.compute_forces does the same).
+        charged = point_charge_forces(atoms, system.pseudopotentials, point_charges)
+        repulsion = repulsion + charged
     clock["ion_ion"] = perf_counter() - started
     mark = perf_counter()
     residual = np.asarray(result.output_effective_potential) - np.asarray(
@@ -280,6 +322,10 @@ def compute_forces(
     separable = _nonlocal_forces(system, result, clock)
     clock["nonlocal"] = perf_counter() - mark
     mark = perf_counter()
+    corrections = correction_forces(system, result)
+    if corrections:
+        clock["corrections"] = perf_counter() - mark
+    mark = perf_counter()
     if not symmetrize:
         operations = None
     elif operations is None:
@@ -291,9 +337,11 @@ def compute_forces(
         separable,
         operations,
         phase_seconds=clock,
+        **corrections,
+        **({} if charged is None else {"point_charge": charged}),
     )
     clock["symmetrization"] = perf_counter() - mark
     return replace(forces, seconds=perf_counter() - started)
 
 
-__all__ = ["compute_forces", "compute_periodic_forces", "sector_columns"]
+__all__ = ["compute_forces", "compute_periodic_forces", "correction_forces", "sector_columns"]

@@ -6,6 +6,7 @@ from .symmetry_fields import (
     SymmetryResidualMetrics,
     SymmetrySCFReducer,
     SymmetryScalarField,
+    SymmetryWeightedMixer,
 )
 
 __all__ = [
@@ -14,5 +15,6 @@ __all__ = [
     "SymmetryResidualMetrics",
     "SymmetrySCFReducer",
     "SymmetryScalarField",
+    "SymmetryWeightedMixer",
     "run_scf",
 ]

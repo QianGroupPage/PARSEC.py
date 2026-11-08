@@ -3,7 +3,11 @@
 The order is PARSEC's: ion-ion forces (``forceion.f90``), the three local
 pseudopotential terms (``forcloc.f90``), the nonlocal term
 (``forcnloc.f90``), symmetrization over the point group of the atoms
-(``symm_forces.f90``) and removal of the net force.  The torque that
+(``symm_forces.f90``) and removal of the net force.  With LDA+U the forces of
+:mod:`parsec_python.Forces.hubbard_force` and with ``Van_Der_Waals`` the TS
+forces of :mod:`parsec_python.Energy.dispersion` join the nonlocal term
+before the symmetrization, where ``forcnloc.f90`` adds ``forcnloc_u`` and
+``2 * vdw_forces``.  The torque that
 ``forcnloc.f90`` reports is taken, as there, from the symmetrized forces
 before the net force is removed.
 """
@@ -15,7 +19,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .ion_ion import ewald_ion_ion_forces, ion_ion_forces
+from .ion_ion import ewald_ion_ion_forces, ion_ion_forces, point_charge_forces
 from .local import LocalForceTerms, local_forces
 from .nonlocal_force import (
     build_nonlocal_projector_gradients,
@@ -40,7 +44,10 @@ class ForceResult:
     Every array has shape ``(atoms, 3)`` unless noted.  ``total`` is what a
     relaxation or a dynamics step uses: symmetrized, with zero net force.
     ``phase_seconds`` holds, where the path that computed the forces measured
-    them, the wall seconds of its parts.
+    them, the wall seconds of its parts.  With point charges ``ion_ion``
+    holds, as PARSEC's ion-ion table, the forces of the other ions and of the
+    point charges together, and ``point_charge`` the part of the point
+    charges; it is ``None`` without them.
     """
 
     positions: np.ndarray
@@ -55,6 +62,16 @@ class ForceResult:
     symmetry_operations: int = 1
     seconds: float = 0.0
     phase_seconds: dict | None = None
+    point_charge: np.ndarray | None = None
+    # LDA+U and TS dispersion terms (Ry/bohr), ``None`` without them.
+    hubbard: np.ndarray | None = None
+    dispersion: np.ndarray | None = None
+    # A periodic cell (``forcnloc.f90`` with ``is_pbc``): the ion-ion term is
+    # the Ewald force, and no torque is reported.
+    periodic: bool = False
+    # The spin-orbit term of a spinor calculation (``forcso`` of
+    # ``soforc.F90``), Ry/bohr; ``None`` without spin-orbit coupling.
+    spin_orbit: np.ndarray | None = None
 
     @property
     def local_with_ion_ion(self) -> np.ndarray:
@@ -78,14 +95,32 @@ def assemble_forces(
     *,
     seconds: float = 0.0,
     phase_seconds: dict | None = None,
+    point_charge: np.ndarray | None = None,
+    hubbard: np.ndarray | None = None,
+    dispersion: np.ndarray | None = None,
     periodic: bool = False,
+    spin_orbit: np.ndarray | None = None,
+    keep_torque: bool = False,
 ) -> ForceResult:
     """Combine the force terms as ``forcnloc.f90`` does at its end.
 
-    ``periodic`` is for a crystal: the torque, which has no meaning in a periodic cell, is reported as zero.
+    ``ion_ion`` includes the forces of the point charges where there are
+    any; ``point_charge`` is that part alone, kept for the report.
+    ``periodic`` marks the forces of a periodic cell (Ewald ion-ion term);
+    ``spin_orbit`` is the spin-orbit term, which ``forcnloc.f90`` adds with
+    the nonlocal one.  The torque of a periodic cell has no meaning and is
+    reported as zero (Andrew Grieder's routines); the Fortran-derived routines
+    keep the value of the symmetrized forces (``keep_torque``), which their
+    report does not print.
     """
 
     unsymmetrized = ion_ion + local.total + nonlocal_pseudopotential
+    if spin_orbit is not None:
+        unsymmetrized = unsymmetrized + spin_orbit
+    if hubbard is not None:
+        unsymmetrized = unsymmetrized + hubbard
+    if dispersion is not None:
+        unsymmetrized = unsymmetrized + dispersion
     symmetrized = (
         unsymmetrized.copy()
         if operations is None
@@ -100,11 +135,18 @@ def assemble_forces(
         unsymmetrized=unsymmetrized,
         symmetrized=symmetrized,
         net_force=net,
-        torque=np.zeros(3) if periodic else total_torque(positions, symmetrized),
+        torque=(
+            np.zeros(3) if periodic and not keep_torque else total_torque(positions, symmetrized)
+        ),
         total=total,
         symmetry_operations=1 if operations is None else len(operations),
         seconds=seconds,
         phase_seconds=phase_seconds,
+        point_charge=point_charge,
+        hubbard=hubbard,
+        dispersion=dispersion,
+        periodic=periodic,
+        spin_orbit=spin_orbit,
     )
 
 
@@ -131,7 +173,37 @@ def compute_forces(
     are the fields of such a result; ``forcnloc.f90`` sums the nonlocal term
     over the states of both channels with the weight ``4/nspin``, which is
     that of the unpolarized case for half the occupations.
+
+    A wire or slab goes to
+    :func:`parsec_python.Forces.wire_slab.compute_wire_slab_forces`, a bulk
+    cell (``system.input.periodic_cell``) to
+    :func:`parsec_python.Forces.periodic.compute_periodic_forces`, and the
+    result of a spinor driver (spin-orbit coupling, non-collinear magnetism,
+    isolated or periodic) to
+    :func:`parsec_python.Forces.spin_orbit_fortran.compute_spin_orbit_forces`.
     """
+
+    if hasattr(result, "spinors"):
+        from .spin_orbit_fortran import compute_spin_orbit_forces
+
+        return compute_spin_orbit_forces(
+            system, result, symmetrize=symmetrize, operations=operations
+        )
+    if getattr(system.grid, "is_confined_periodic", False):
+        # A wire or slab: forcloc_wire.f90 / forcloc_slab.f90 and the
+        # periodic ion-ion forces.  It has a periodic_cell too, so this test
+        # comes first.
+        from .wire_slab import compute_wire_slab_forces
+
+        return compute_wire_slab_forces(
+            system, result, symmetrize=symmetrize, operations=operations
+        )
+    if getattr(system.input, "periodic_cell", None) is not None:
+        from .periodic import compute_periodic_forces
+
+        return compute_periodic_forces(
+            system, result, symmetrize=symmetrize, operations=operations
+        )
 
     from time import perf_counter
 
@@ -141,6 +213,12 @@ def compute_forces(
     positions = np.array([atom.position for atom in atoms], dtype=np.float64)
 
     repulsion = ion_ion_forces(atoms, system.pseudopotentials)
+    point_charges = getattr(system, "point_charges", ())
+    charged = None
+    if point_charges:
+        # forcept.f90 adds them to the ion-ion forces.
+        charged = point_charge_forces(atoms, system.pseudopotentials, point_charges)
+        repulsion = repulsion + charged
     local = local_forces(
         system.grid,
         atoms,
@@ -176,7 +254,41 @@ def compute_forces(
         separable,
         operations,
         seconds=perf_counter() - started,
+        point_charge=charged,
+        **correction_forces(system, result),
     )
+
+
+def correction_forces(system, result) -> dict[str, np.ndarray]:
+    """The LDA+U and TS force terms of a result, by their field names.
+
+    Empty without LDA+U and without a TS correction, so the call of
+    :func:`assemble_forces` stays what it was.  The TS forces are those of
+    the correction of the converged density (an unconverged loop has none).
+    """
+
+    terms: dict[str, np.ndarray] = {}
+    if getattr(system, "hubbard", None) is not None:
+        from .hubbard_force import hubbard_forces
+
+        if getattr(result, "k_points", None) is not None:
+            raise NotImplementedError(
+                "LDA+U forces of a k-point calculation are not implemented (the "
+                "Bloch projector gradients); PARSEC's LDA+U forces are zero"
+            )
+
+        channels = getattr(result, "spin", None)
+        if channels is None:
+            orbitals = [result.wavefunctions]
+            occupations = [result.occupations]
+        else:
+            orbitals = [np.asarray(channel.wavefunctions) for channel in channels]
+            occupations = [channel.occupations for channel in channels]
+        terms["hubbard"] = hubbard_forces(system, orbitals, occupations)
+    dispersion = getattr(result, "dispersion", None)
+    if dispersion is not None:
+        terms["dispersion"] = np.asarray(dispersion.forces, dtype=np.float64)
+    return terms
 
 
 def compute_spinor_forces(
@@ -317,4 +429,5 @@ __all__ = [
     "compute_forces",
     "compute_periodic_forces",
     "compute_spinor_forces",
+    "correction_forces",
 ]

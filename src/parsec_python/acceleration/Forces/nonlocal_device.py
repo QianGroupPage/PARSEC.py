@@ -116,6 +116,11 @@ class DeviceProjectorGradients:
             signed = operator._signed_nonlocal_coefficients_or_none(columns)
             if signed is None:
                 continue
+            if int(signed.shape[0]) > self.projector_count:
+                # The LDA+U columns appended to the factor of the operator
+                # (Hamiltonian.hubbard_device) follow the KB ones; their
+                # forces are formed there.
+                signed = signed[: self.projector_count]
             signed = signed * cp.asarray(4.0 * occupied, dtype=cp.float64)[None, :]
             for component, projection in enumerate(self.projections):
                 total[:, component] += cp.sum(signed * projection(columns), axis=1)

@@ -80,3 +80,26 @@ _install_kpoint_parallelism()
 from .V_ion.periodic_setup import install as _install_periodic_setup  # noqa: E402
 
 _install_periodic_setup()
+
+# The tetrahedron sums of Create_DOS run on the host unless the device provider is installed.
+from .Output.device_dos import install as _install_device_dos  # noqa: E402
+
+_install_device_dos()
+
+# The wire, slab, Calc_Hartree_G and 3-D cell Hartree solves of the reference drivers run on
+# the device where those put their eigenproblems (PARSEC_PERIODIC_HARTREE).
+from .Hartree.periodic_device import install as _install_periodic_hartree  # noqa: E402
+
+_install_periodic_hartree()
+
+# The spin functionals of a periodic cell that PARSEC_CUPY_XC puts on the device (PBE only
+# with PARSEC_CUPY_XC=on), in the reference periodic drivers that put their eigenproblems there.
+from .V_xc.periodic_xc import install as _install_periodic_spin_xc  # noqa: E402
+
+_install_periodic_spin_xc()
+
+# The TS correction of a periodic cell whose k-point eigenproblems run on a GPU
+# forms its grid and pair sums there.
+from .Energy.dispersion_device import install as _install_device_dispersion  # noqa: E402
+
+_install_device_dispersion()

@@ -197,35 +197,51 @@ def apply_spin_orbit(
     block = np.asarray(spinor, dtype=complex)
     n_grid = block.shape[0] // 2
     output = np.zeros_like(block)
-    n_vectors = block.shape[1]
     for atom in projectors:
         rows = atom.support_rows
         # (2, n_support, n_vectors): spin-up then spin-down rows of the support.
         gathered = np.stack((block[rows], block[rows + n_grid]))
         overlaps = atom.stacked_conj_transpose @ gathered  # (2, 16, n_vectors)
-        sign = np.where(_LM_TO_L == 1, atom.sign[0], atom.sign[1])[:, None]
-        # dotio / dotso of the sign-included overlaps, per spin: (8, n_vectors).
-        io_up, so_up = sign * overlaps[0, :8], sign * overlaps[0, 8:]
-        io_dn, so_dn = sign * overlaps[1, :8], sign * overlaps[1, 8:]
-
-        coefficients = np.empty((2, 16, n_vectors), dtype=complex)
-        for spin, (sigma, io_same, so_same, ladder, io_other, so_other) in enumerate(
-            (
-                (+1.0, io_up, so_up, _LADDER_FROM_DOWN, io_dn, so_dn),
-                (-1.0, io_dn, so_dn, _LADDER_FROM_UP, io_up, so_up),
-            )
-        ):
-            lz = (sigma * _LZ_HALF)[:, None]
-            coefficients[spin, :8] = lz * so_same + ladder @ so_other
-            coefficients[spin, 8:] = (
-                lz * io_same
-                + (_QUARTER_LL1[:, None] - 0.5 * lz) * so_same
-                + ladder @ (io_other - 0.5 * so_other)
-            )
+        coefficients = spin_orbit_coefficients(atom, overlaps)
         contribution = atom.stacked @ coefficients  # (2, n_support, n_vectors)
         output[rows] += contribution[0]
         output[rows + n_grid] += contribution[1]
     return output
+
+
+def spin_orbit_coefficients(atom: AtomSpinOrbitProjectors, overlaps: np.ndarray) -> np.ndarray:
+    """The coefficients of ``[v_ion | v_so]`` in ``H_SO Psi`` of one atom.
+
+    ``overlaps`` are ``[v_ion | v_so]^H Psi`` per spin, shape
+    ``(2, 16, n_vectors)``; the result ``C`` (same shape) gives the atom's
+    contribution ``[v_ion | v_so] C[spin]`` to each spin half of ``H_SO Psi``
+    (``lzsz`` and ``lsxy`` of ``zmatvec_so.f90``).  ``C`` is linear in the
+    overlaps, ``C = M o`` with ``M`` Hermitian, so the atom's spin-orbit
+    energy of a spinor is ``sum_spin o^H C`` (what the forces of
+    :mod:`parsec_python.Forces.spin_orbit` differentiate).
+    """
+
+    n_vectors = overlaps.shape[2]
+    sign = np.where(_LM_TO_L == 1, atom.sign[0], atom.sign[1])[:, None]
+    # dotio / dotso of the sign-included overlaps, per spin: (8, n_vectors).
+    io_up, so_up = sign * overlaps[0, :8], sign * overlaps[0, 8:]
+    io_dn, so_dn = sign * overlaps[1, :8], sign * overlaps[1, 8:]
+
+    coefficients = np.empty((2, 16, n_vectors), dtype=complex)
+    for spin, (sigma, io_same, so_same, ladder, io_other, so_other) in enumerate(
+        (
+            (+1.0, io_up, so_up, _LADDER_FROM_DOWN, io_dn, so_dn),
+            (-1.0, io_dn, so_dn, _LADDER_FROM_UP, io_up, so_up),
+        )
+    ):
+        lz = (sigma * _LZ_HALF)[:, None]
+        coefficients[spin, :8] = lz * so_same + ladder @ so_other
+        coefficients[spin, 8:] = (
+            lz * io_same
+            + (_QUARTER_LL1[:, None] - 0.5 * lz) * so_same
+            + ladder @ (io_other - 0.5 * so_other)
+        )
+    return coefficients
 
 
 def apply_zeeman_field(
@@ -353,5 +369,6 @@ __all__ = [
     "apply_lzsz",
     "apply_lsxy",
     "apply_spin_orbit",
+    "spin_orbit_coefficients",
     "apply_zeeman_field",
 ]

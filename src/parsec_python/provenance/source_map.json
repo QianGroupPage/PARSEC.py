@@ -25,7 +25,8 @@
       "component": "grid",
       "python_package": "Grid",
       "python_modules": [
-        "Grid/cluster.py"
+        "Grid/cluster.py",
+        "Grid/neighbors.py"
       ],
       "parsec_sources": [
         "init_var.F90",
@@ -127,13 +128,18 @@
       "component": "hamiltonian",
       "python_package": "Hamiltonian",
       "python_modules": [
-        "Hamiltonian/operator.py"
+        "Hamiltonian/operator.py",
+        "Hamiltonian/hubbard.py",
+        "Hamiltonian/hubbard_tensors.py"
       ],
       "parsec_sources": [
-        "matvecB.f90z"
+        "matvecB.f90z",
+        "upot.F90",
+        "calcden.f90z",
+        "plusu.f90z"
       ],
       "concept_package_status": "implemented_unverified",
-      "existing_python_assessment": "A Python linear operator exists, but exact PARSEC block-matvec semantics and state layout are not yet certified.",
+      "existing_python_assessment": "A Python linear operator exists, but exact PARSEC block-matvec semantics and state layout are not yet certified. The LDA+U term of the d channel (upot.F90 projectors, calcden.f90z matrices and energies, plusu.f90z action) joins it for the scalar Gamma-point loops; converged ZnO, Ag and VO runs agree with Fortran PARSEC to 1e-8 Ry in the total energy and 5e-7 Ry in the LDA+U energy (tests/unit/test_hubbard.py, report the report of the parity round of the 2026-10-27 parity round).",
       "literal_parsec_status": "not_verified",
       "verification_evidence": []
     },
@@ -149,23 +155,31 @@
         "Eigensolvers/spectral_bounds.py",
         "Eigensolvers/orthogonalize.py",
         "Eigensolvers/rayleigh_ritz.py",
-        "Eigensolvers/lapack_random.py"
+        "Eigensolvers/lapack_random.py",
+        "Eigensolvers/arpack.py",
+        "Eigensolvers/diagla.py",
+        "Eigensolvers/iterative.py"
       ],
       "parsec_sources": [
         "eigval.F90",
         "chebff.f90z",
         "chebdav.f90z",
         "subspace.f90z",
-        "matvecB.f90z"
+        "matvecB.f90z",
+        "arpk.f90z",
+        "diagla.f90z",
+        "fdo5scl.f90z",
+        "peig_inter.f90z"
       ],
       "concept_package_status": "implemented_unverified",
-      "existing_python_assessment": "The native selected-CHEBFF-or-CHEBDAV-first/SUBSPACE-later path implements the audited real non-BETA control flow without ARPACK fallback. Symmetry-representation dispatch, MPI reduction order, and compiler RANDOM_NUMBER identity are not yet ported or certified.",
+      "existing_python_assessment": "The native selected-CHEBFF-or-CHEBDAV-first/SUBSPACE-later path implements the audited real non-BETA control flow without ARPACK fallback. Explicitly selected ARPACK (SciPy eigsh with the arpk.f90z parameters) and DIAGLA (a line-by-line port of diagla.f90z with the fdo5scl preconditioner) run in every SCF iteration, or once before SUBSPACE with Chebyshev_Filtering; Fortran references for them are unavailable (the WSL build lacks ARPACK, the input reader refuses DIAGLA), so they are verified by agreement with CHEBFF/CHEBDAV. Symmetry-representation dispatch, MPI reduction order, and compiler RANDOM_NUMBER identity are not yet ported or certified.",
       "literal_parsec_status": "partially_verified",
       "verification_evidence": [
         "tests/unit/test_strict_eigensolver_primitives.py",
         "tests/unit/test_strict_eigval_policy.py",
         "tests/unit/test_chebdav_dispatch.py",
         "tests/unit/test_strict_scf_eigensolver.py",
+        "tests/unit/test_iterative_eigensolvers.py",
         "../../examples/h2_canonical_nodg/parsec_python.out"
       ]
     },
@@ -208,13 +222,16 @@
       "component": "energy",
       "python_package": "Energy",
       "python_modules": [
-        "Energy/total_energy.py"
+        "Energy/total_energy.py",
+        "Energy/dispersion.py"
       ],
       "parsec_sources": [
-        "totnrg.f90"
+        "totnrg.f90",
+        "initchrg_f.f90",
+        "efvdw.f90"
       ],
       "concept_package_status": "implemented_unverified",
-      "existing_python_assessment": "Energy components reproduce current benchmarks closely, but that agreement does not establish a literal routine port. spin_total_energy sums the band energy and the double-counting integrals of totnrg.f90 over two spin channels.",
+      "existing_python_assessment": "Energy components reproduce current benchmarks closely, but that agreement does not establish a literal routine port. spin_total_energy sums the band energy and the double-counting integrals of totnrg.f90 over two spin channels. The Tkatchenko-Scheffler correction of efvdw.f90 gives Fortran's volumes, energy and forces to 1e-14 relative on the same density (tests/unit/test_dispersion.py).",
       "literal_parsec_status": "not_verified",
       "verification_evidence": []
     },
@@ -224,7 +241,8 @@
       "python_modules": [
         "SCF/single_point.py",
         "driver.py",
-        "SCF/spin_polarized.py"
+        "SCF/spin_polarized.py",
+        "SCF/restart.py"
       ],
       "parsec_sources": [
         "parsec.F90",
@@ -237,10 +255,11 @@
         "flevel.f90",
         "exc_spn.f90",
         "spinmix.f90",
-        "spinunmix.f90"
+        "spinunmix.f90",
+        "restart_run.F90"
       ],
       "concept_package_status": "implemented_unverified",
-      "existing_python_assessment": "The runnable SCF loop now uses the selected strict CHEBFF/CHEBDAV first solve followed by SUBSPACE, but unsupported symmetry reduction, double-grid integration, forces, and dipoles prevent a complete literal PARSEC workflow claim. SCF/spin_polarized.py runs the loop for collinear spin polarization of isolated systems: one potential, eigenproblem and saved subspace per channel and one Fermi level. With the CA functional the total energy, every energy term, the levels of both channels, the Fermi level and every force table agree with Fortran PARSEC within its printed digits (1e-8 Ry, 1e-6 Ry/bohr) for a hydrogen atom and an oxygen atom with fixed occupations, the nitrogen atom, O2, a methyl radical without symmetry, closed-shell water with spin on and a BFGS relaxation of O2 (tests/unit/test_spin_parsec_reference.py, acceleration/tests/test_spin_polarized.py, tests/data/spin_parsec_reference.json), which is not yet recorded as verification evidence here. With PBE the two programs differ by 1e-4 to 1e-3 Ry on those coarse grids, as much as without spin, because the PBE potential is discretized differently. Reproduced as it is in the Fortran: the two starting spin densities of initchrg.f90 add up to twice the total starting density. Not unique in either program: the orientation of a partly filled degenerate shell (oxygen atom at 80 K) and the sign of the moment. The two channels are solved on the full grid; the GPU symmetry sectors are bypassed and the MPI SCF refuses.",
+      "existing_python_assessment": "The runnable SCF loop now uses the selected strict CHEBFF/CHEBDAV first solve followed by SUBSPACE, but unsupported symmetry reduction, double-grid integration, forces, and dipoles prevent a complete literal PARSEC workflow claim. SCF/spin_polarized.py runs the loop for collinear spin polarization of isolated systems: one potential, eigenproblem and saved subspace per channel and one Fermi level. With the CA functional the total energy, every energy term, the levels of both channels, the Fermi level and every force table agree with Fortran PARSEC within its printed digits (1e-8 Ry, 1e-6 Ry/bohr) for a hydrogen atom and an oxygen atom with fixed occupations, the nitrogen atom, O2, a methyl radical without symmetry, closed-shell water with spin on and a BFGS relaxation of O2 (tests/unit/test_spin_parsec_reference.py, acceleration/tests/test_spin_polarized.py, tests/data/spin_parsec_reference.json), which is not yet recorded as verification evidence here. With PBE the two programs differ by 1e-4 to 1e-3 Ry on those coarse grids, as much as without spin, because the PBE potential is discretized differently. Reproduced as it is in the Fortran: the two starting spin densities of initchrg.f90 add up to twice the total starting density. Not unique in either program: the orientation of a partly filled degenerate shell (oxygen atom at 80 K) and the sign of the moment. The two channels are solved on the full grid; the GPU symmetry sectors are bypassed and the MPI SCF refuses. SCF/restart.py implements Restart_Run (restart_run.F90): the stored vnew of parsec.dat (written by PARSEC or by Python, symmetry wedge unfolded) starts the first SCF iteration without eigensolver state, as PARSEC does.",
       "literal_parsec_status": "not_verified",
       "verification_evidence": []
     },
@@ -253,6 +272,7 @@
         "Forces/nonlocal_force.py",
         "Forces/symmetry.py",
         "Forces/total.py",
+        "Forces/hubbard_force.py",
         "Pseudopotential/radial_derivatives.py"
       ],
       "parsec_sources": [
@@ -266,7 +286,7 @@
         "spline.f90"
       ],
       "concept_package_status": "verified_component",
-      "existing_python_assessment": "Ion-ion, local (ionic, SCF-correction, core-correction) and nonlocal forces of isolated systems with PARSEC's radial derivative tables, symmetrization over the cubic point-group operations of the atoms and removal of the net force. Every force table agrees with Fortran PARSEC within its six printed decimals for LDA structures with s, p and d projectors, a nonlinear core correction and cubic splines when both SCF loops are converged to 1e-8 Ry. Intentional deviation: for a species with Cubic_Spline the atomic valence density of the SCF-correction term is interpolated linearly, because forcloc.f90 combines the derivative table with the spline coefficients of the density there. Spin-polarized results use the same formulas with the spin-averaged potentials of forcloc.f90 and the 4/nspin weight of forcnloc.f90 (see the scf component); the force tables of a spin-polarized methyl radical, O2 and water agree with Fortran PARSEC within its six printed decimals. Periodic cells, point charges, LDA+U, van der Waals and spin-orbit forces are not translated. PBE forces have no Fortran reference because this package discretizes the PBE potential differently.",
+      "existing_python_assessment": "Ion-ion, local (ionic, SCF-correction, core-correction) and nonlocal forces of isolated systems with PARSEC's radial derivative tables, symmetrization over the cubic point-group operations of the atoms and removal of the net force. Every force table agrees with Fortran PARSEC within its six printed decimals for LDA structures with s, p and d projectors, a nonlinear core correction and cubic splines when both SCF loops are converged to 1e-8 Ry. Intentional deviation: for a species with Cubic_Spline the atomic valence density of the SCF-correction term is interpolated linearly, because forcloc.f90 combines the derivative table with the spline coefficients of the density there. Spin-polarized results use the same formulas with the spin-averaged potentials of forcloc.f90 and the 4/nspin weight of forcnloc.f90 (see the scf component); the force tables of a spin-polarized methyl radical, O2 and water agree with Fortran PARSEC within its six printed decimals. Periodic cells, point charges and spin-orbit forces are not translated. LDA+U forces (J = 0) are computed from the projector gradients instead of PARSEC's forcnloc_u, which yields zero; TS forces are those of efvdw.f90. PBE forces have no Fortran reference because this package discretizes the PBE potential differently.",
       "literal_parsec_status": "partially_verified",
       "verification_evidence": [
         "tests/unit/test_forces.py",
@@ -344,15 +364,24 @@
       "component": "output",
       "python_package": "Output",
       "python_modules": [
-        "Output/parsec_output.py"
+        "Output/parsec_output.py",
+        "Output/parsec_dat.py",
+        "Output/eigen_dat.py",
+        "Output/cube.py",
+        "Output/output_files.py"
       ],
       "parsec_sources": [
         "parsec.F90",
         "eigval.F90",
-        "totnrg.f90"
+        "totnrg.f90",
+        "wfnsave.F90",
+        "eigensave.f90",
+        "export_grid_data.f90",
+        "initial.f90",
+        "usrinputfile.F90"
       ],
       "concept_package_status": "implemented_unverified",
-      "existing_python_assessment": "A PARSEC-shaped text report exists and explicitly identifies PARSEC-PYTHON; full formatting and unavailable sections are not claimed as identical. A spin-polarized run is reported with the layout of flevel.f90, rho_hart.F90 and getsre.f90: electrons and moment, the levels of each channel, and the residuals of each channel.",
+      "existing_python_assessment": "A PARSEC-shaped text report exists and explicitly identifies PARSEC-PYTHON; full formatting and unavailable sections are not claimed as identical. A spin-polarized run is reported with the layout of flevel.f90, rho_hart.F90 and getsre.f90: electrons and moment, the levels of each channel, and the residuals of each channel. parsec.dat (wfnsave.F90 record layout, gfortran sequential records), eigen.dat (eigensave.f90 formats 11/12) and the cube files of Output_Grid_Data (export_grid_data.f90) are written by both command lines; the PARSEC executable read a Python parsec.dat (cluster, spin, periodic) and restarted from it, and eigen.dat and the cube files of an H2O run match PARSEC's line for line in format (the report of the parity round), which is not yet recorded as verification evidence here. Python writes the full grid with one symmetry operation.",
       "literal_parsec_status": "not_verified",
       "verification_evidence": []
     }

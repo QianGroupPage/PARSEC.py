@@ -104,6 +104,9 @@ class CuPySymmetryEigvalResult:
     restart_reason: str | None
     representations: np.ndarray
     representation_columns: np.ndarray
+    # ``(nec, maxmvs)`` of an ARPACK solve of every sector, each a tuple of
+    # one count per representation (eigval.F90 lists them so); else None.
+    iterative_counts: tuple[tuple[int, ...], tuple[int, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -397,8 +400,21 @@ def _vectors_on_host(solver: Any) -> bool:
     return state is not None and isinstance(state.subspace.vectors, np.ndarray)
 
 
+def fixed_state_count_requested(reference) -> bool:
+    """Whether the input of a prepared system asks for ``Fix_Number_Eigenvalues``."""
+
+    eigensolver = getattr(getattr(reference, "input", None), "eigensolver", None)
+    return bool(getattr(eigensolver, "fixed_state_count", False))
+
+
 class CuPySymmetrySCFEigensolver:
-    """Merge persistent wedge eigensolvers into one SCF eigensolver callable."""
+    """Merge persistent wedge eigensolvers into one SCF eigensolver callable.
+
+    ``fixed_state_count`` is ``Fix_Number_Eigenvalues`` (set by the driver
+    that prepared the system; see :meth:`_fix_sector_states`).
+    """
+
+    fixed_state_count = False
 
     def __init__(
         self,
@@ -867,6 +883,29 @@ class CuPySymmetrySCFEigensolver:
         for operator in self._operators:
             if operator is not None:
                 operator.hartree_device = device_id
+
+    @property
+    def resident_device_bytes(self) -> dict[int, int]:
+        """Bytes that other objects of this process keep on a device, by device, as the driver names them.
+
+        The device exchange-correlation evaluator (``V_xc/device_xc.py``,
+        ``planned_device_bytes``) on its device; empty where the driver
+        named none (CA, a functional on the host).  The memory rules of the
+        sectors count them: the rule of the state storage
+        (:meth:`_state_fit_bytes`) on that device, and the rule that shares
+        a basis, through every sector operator, which is told
+        (:func:`distributed_state.resident_bytes_of`).
+        """
+
+        return dict(getattr(self, "_resident_device_bytes", {}))
+
+    @resident_device_bytes.setter
+    def resident_device_bytes(self, counts: dict[int, int] | None) -> None:
+        counts = {int(device): int(count) for device, count in dict(counts or {}).items()}
+        self._resident_device_bytes = counts
+        for operator in self._operators:
+            if operator is not None:
+                operator.resident_device_bytes = dict(counts)
 
     @property
     def state(self) -> CuPySymmetryEigvalState | None:
@@ -1411,9 +1450,18 @@ class CuPySymmetrySCFEigensolver:
 
         The count reads the memory of no device and no state of the run, so
         two launches of one calculation count the same.
+
+        A device also counts what other objects keep there
+        (:attr:`resident_device_bytes`, the device XC evaluator of a
+        functional other than CA, since 2026-10-30): 749.5 MiB at 39,368
+        electrons with PBE, 90.2 MiB at 3,480, which is no part of the
+        measured ratio of peak to count above (those runs were CA, whose
+        evaluator runs on the host).  10,456 electrons on one device count
+        0.9795 of it with PBE instead of 0.9763, spilled either way.
         """
 
         cp, _ = require_cupy()
+        resident = self.resident_device_bytes
         states = {device_id: 0 for device_id in self.device_ids}
         buffers = dict(states)
         for representation, count in enumerate(counts):
@@ -1444,7 +1492,7 @@ class CuPySymmetrySCFEigensolver:
             for device_id in shared:
                 states[device_id] += shared_block_bytes(rows, count, len(shared))
         return {
-            device_id: states[device_id] + buffers[device_id]
+            device_id: states[device_id] + buffers[device_id] + resident.get(device_id, 0)
             for device_id in self.device_ids
         }
 
@@ -2402,6 +2450,48 @@ class CuPySymmetrySCFEigensolver:
         if context is not None and changes:
             context.execute(self, "trim", changes)
 
+    def _fix_sector_states(
+        self,
+        results: list[CuPyEigvalResult],
+        counts: list[int],
+        requested_states: int,
+    ) -> None:
+        """``Fix_Number_Eigenvalues``: every sector keeps its share of ``States_Num``.
+
+        PARSEC solves, per representation, the number of levels the restart
+        file holds there and keeps it in every later solve, without the
+        ``Subspace_Buffer_Size`` buffer (``restart_run.F90``,
+        ``eigval.F90:679-685``).  The sectors of this solver are found by
+        the first solve of the run, whose spectral bracket identifies the
+        lowest ``States_Num`` levels: each sector then keeps exactly the
+        levels it holds among them (at least one; PARSEC fails with a
+        representation of none), ``States_Num`` vectors in all, and no
+        later solve grows or trims it.
+        """
+
+        _, representations, _ = self._global_order(results)
+        share = np.bincount(
+            representations[:requested_states], minlength=self.representation_count
+        )
+        desired = np.maximum(1, share)
+        context = getattr(self, "mpi_context", None)
+        changes = []
+        for representation, solver in enumerate(self._solvers):
+            new_count = min(counts[representation], int(desired[representation]))
+            if new_count < counts[representation]:
+                step = getattr(results[representation], "handover_step", None)
+                if step is not None and step.get("holds"):
+                    entry = (getattr(self, "_handover_passes", None) or {}).get(representation)
+                    if entry is not None:
+                        entry["deferred_trims"] += 1
+                if context is None:
+                    solver.truncate_state(new_count)
+                else:
+                    changes.append((representation, new_count))
+                counts[representation] = new_count
+        if context is not None and changes:
+            context.execute(self, "trim", changes)
+
     def _pack_selected_wedge_vectors(
         self,
         results: list[CuPyEigvalResult],
@@ -2505,9 +2595,15 @@ class CuPySymmetrySCFEigensolver:
         results, restarted, reasons = self._solve_sectors(
             settings, counts, previous
         )
-        results, bracket_restarted, bracket_reasons = self._ensure_spectral_bracket(
-            results, counts, requested_states, settings
-        )
+        # Fix_Number_Eigenvalues: the counts of the sectors stay those of the
+        # first solve of the run (eigval.F90: nn = nec = mm after every solve).
+        frozen = bool(getattr(self, "fixed_state_count", False)) and previous
+        if frozen:
+            bracket_restarted, bracket_reasons = False, []
+        else:
+            results, bracket_restarted, bracket_reasons = self._ensure_spectral_bracket(
+                results, counts, requested_states, settings
+            )
         restarted = restarted or bracket_restarted
         reasons.extend(bracket_reasons)
 
@@ -2533,12 +2629,22 @@ class CuPySymmetrySCFEigensolver:
                 dtype=np.float64,
             )
 
-        self._trim_sector_states_like_parsec(
-            results,
-            counts,
-            requested_states,
-            settings.safety_buffer,
-        )
+        if getattr(self, "fixed_state_count", False):
+            if not frozen:
+                self._fix_sector_states(results, counts, requested_states)
+        else:
+            self._trim_sector_states_like_parsec(
+                results,
+                counts,
+                requested_states,
+                settings.safety_buffer,
+            )
+        iterative_counts = None
+        if all(getattr(result, "iterative_counts", None) is not None for result in results):
+            iterative_counts = (
+                tuple(int(result.iterative_counts[0]) for result in results),
+                tuple(int(result.iterative_counts[1]) for result in results),
+            )
 
         solves_completed = 1 if self._state is None else self._state.solves_completed + 1
         self._state = CuPySymmetryEigvalState(
@@ -2563,6 +2669,7 @@ class CuPySymmetrySCFEigensolver:
             restart_reason="; ".join(reasons) if reasons else None,
             representations=np.asarray(selected_representations, dtype=np.int32),
             representation_columns=np.asarray(selected_columns, dtype=np.int32),
+            iterative_counts=iterative_counts,
         )
 
 

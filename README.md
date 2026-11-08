@@ -581,7 +581,12 @@ and the local potential is evaluated as an Ewald split whose reciprocal part is 
 factor (the Gaussian width is chosen so the series ends below the Nyquist frequency of the grid, which makes
 it exact on the grid). The 864-atom cell is prepared in about a minute. The potential equals the direct sum
 once that sum is converged; the direct sum at its default tolerance leaves out images that still contribute a
-few 1e-6 Ry, so the two differ by that much (`acceleration/tests/test_periodic_setup.py`).
+few 1e-6 Ry, so the two differ by that much (`acceleration/tests/test_periodic_setup.py`). Both replacements
+are for the orthorhombic grid with one spacing; Fortran's general grid (oblique cells, a step per lattice
+direction, the 0.5 shift) and the wire/slab grids keep the direct scan and the direct Ewald sum. Where the FFT
+potential is used, the periodic local forces differentiate the converged Ewald sum
+(`V_ion.ewald.local_potential_tolerance`), so that they stay the derivative of the energy the SCF computed (with
+the default truncation they missed about 1e-7 Ry/bohr in a Si2 cube and 5e-7 in the Si8 cube).
 
 ## Parallel k-points, band paths and GPUs (periodic systems)
 
@@ -626,7 +631,10 @@ start when the residual stays above the band tolerance. The eigenvectors come to
 the density. If the subspaces of a worker's k-points would take more than 75% of the device memory they
 stay on the host between solves (`PARSEC_KPOINT_STATE_STORAGE=auto|device|host`).
 `PARSEC_KPOINT_SOLVER=host` restores the former route (host eigensolver, only the filter on the
-device). The k-point drivers print an `SCF timing analysis` (initial potentials, diagonalization,
+device); `Eigensolver: arpack` and `diagla` always take that route (they are host eigensolvers; the device
+solver implements CHEBFF and CHEBDAV), and `Dynamic_Diag_Tol` hands the tolerance of every iteration to the
+device workers (the residual test of the converged first solve). LDA+U keeps the k-point eigenproblems on the
+CPU workers (the device operator has no LDA+U term). The k-point drivers print an `SCF timing analysis` (initial potentials, diagonalization,
 density, Hartree, XC, mixing), the diagonalization time of every iteration and a `K-point solver detail`
 block (worker start-up, Bloch projectors, operator upload, eigensolver, eigenvector download and the
 device eigensolver's own seconds and counters, summed over the workers). A Gamma-only periodic
@@ -676,7 +684,10 @@ the copy to the host is synchronous. The log's eigensolver detail gives the time
 waiting for halo rows and summing over the ranks.
 `acceleration/tests/test_kpoint_mpi.py` runs the distributed operator, the drivers and the command line
 on 2 and 3 ranks (the device code on the host) against the single-process solver; it has not been run on
-GPUs or on more than one node.
+GPUs or on more than one node. Because no rank holds whole orbitals, `--mpi` refuses (input error) LDA+U,
+`Eigensolver: arpack`/`diagla`, forces, relaxation and molecular dynamics of periodic or non-collinear runs,
+the Ylm-projected DOS and `Output_GW`; a non-collinear cluster's `parsec.dat` is written without
+wavefunction records.
 
 ## Band structures (periodic systems)
 
@@ -757,12 +768,56 @@ python -m parsec_python.Output.bands noso/bands.dat soc/bands.dat \
     --labels "no SOC" "with SOC" --names "G-X,X-M,M-G" -o bands.png
 ```
 
+With `Use_Fortran_Routines: .true.` (see "Two sets of periodic routines" below), primitive fcc, bcc,
+hexagonal or triclinic cells (`Cell_Shape` with three lattice vectors, `Coordinate_Unit: lattice_vectors`,
+`Super_Cell`, `Super_Cell_Vac`) use Fortran's grid along the lattice directions with the auxiliary-direction
+Laplacian of `pbc_grid_coefs`; they run on the reference solver (`main.py` hands them over), and their bands
+follow the primitive Brillouin zone. An orthorhombic cell whose sides share one grid spacing keeps this port's
+original grid there.
+
+### Non-self-consistent runs, density of states, Calc_Hartree_G, BerkeleyGW files
+
+* `nscf_kpoints` (rows `kx ky kz weight`, `nscf_kpoint_unit`, `nscf_states_num`) with
+  `Restart_Run: .true.` is Fortran's `calc_nscf`: no SCF loop, one eigensolve per k-point in
+  the potential of `parsec.dat` (also one written by Fortran PARSEC, any cell shape), the
+  eigenvalue table of every k-point in `parsec.out`, the levels in `parsec_python_nscf.npz`;
+  no `parsec.dat`/`eigen.dat` is written. The occupations use the Fermi level of the SCF that
+  wrote `parsec.dat` (Fortran without `Output_GW` uses an uninitialized 0 Ry). `nscf_kgrid`,
+  `nscf_kgrid_shift` and `nscf_fermi_level` belong to `Output_GW` and have no effect without it.
+* `Output_GW: .true.` writes BerkeleyGW's `WFN`, `RHO` and `VXC` (binary, complex flavour,
+  BerkeleyGW 4.0 header) beside the input, as Fortran's `gw_write`: after a non-self-consistent
+  run (which then needs `nscf_kgrid`, `nscf_kgrid_shift` and `nscf_fermi_level`, the Fermi level
+  of the NSCF occupations) or after an SCF with k-points. G-vector lists, star-averaged `RHO`
+  and `VXC` and the k-spheres follow Fortran record by record (`tests/BGW_interface`: identical
+  G lists, `RHO`/`VXC` to 5e-16). Spin-polarized files have BerkeleyGW's layout (Fortran's spin
+  records are not readable by BerkeleyGW); clusters, wire/slab, spinors, `bandstruc`, forces and
+  Gamma-only SCF runs are refused by name.
+* `Create_DOS` writes Fortran's `DOS` file after the SCF: the linear-tetrahedron DOS of the
+  Monkhorst-Pack grid for a cell (`DOS_Pnum`, `DOS_MP_Grid`; with `Restart_Run` the SCF runs on
+  `DOS_MP_Grid`), with `YLM_DOS_L` (0-3) and the per-species `ylm_dos_cutoff` the s-f projected
+  DOS of every atom, and for a cluster the histogram of the occupations. The projection fixes two
+  defects of `ylm_eig` (s channel without the radial factor, no Bloch phase);
+  `YLM_DOS_Fortran_Projection: .true.` reproduces Fortran's numbers.
+* `Calc_Hartree_G` (bulk) solves `V_H(G) = 8 pi rho(G)/|G|^2` by FFT. Fortran's own routine is
+  broken (it says so and diverges); the default finite-difference solve is unchanged.
+
+These run on the reference solver (`main.py` hands them over); its k-point drivers and the
+band machinery put their eigenproblems on the device k-point workers when a GPU is visible (the
+NSCF k-points, the k-point SCF of the DOS and of `Output_GW`, band paths, and the k-point levels
+that `Save_Intermediate_Eigenvalues` writes every iteration). The tetrahedron sums of a large DOS
+(the Ylm-projected one on a fine mesh) run on the same GPU with the numbers of the host
+(`acceleration/Output/device_dos.py`, `PARSEC_DOS_DEVICE=auto|on|off`); what stays on the host
+(Bloch projectors, Ylm projections, the FFTs of `WFN`) is a few percent of such a run. Two
+combinations run on the accelerated path instead: `Create_DOS` of a cluster and `bandstruc` after
+the Gamma-point SCF of a scalar orthorhombic cell (the bands then on the device workers), both
+without `--mpi` (`acceleration/Output/post_scf.py`).
+
 The cell may have any shape (see "Periodic cells of any shape" below): fcc, bcc and hexagonal crystals can
 use their primitive cells, and the k-points of a path are given in the primitive reciprocal-lattice
 coordinates. Fortran's `nscf_kpoints` (an explicit k-point list read from a `parsec.dat` restart) is not
 implemented.
 
-## Periodic cells of any shape
+## Periodic cells of any shape (the default routines)
 
 `Boundary_Conditions: bulk` takes the three lattice vectors of a `Cell_Shape` block (one line with three
 numbers still means an orthorhombic box), so primitive fcc, bcc, hexagonal and triclinic cells work like the
@@ -793,6 +848,43 @@ energy to 7e-5 Ry for the two atoms on a 24-point grid; two descriptions of one 
 cell on the same grid points) give the same energy to 1e-8 Ry. The GPU solvers use the same sparse operators; the
 fast neighbour search and local-potential routines of the acceleration package fall back to the exact direct
 sums for such cells, which is slower for large cells.
+
+## Two sets of periodic routines
+
+Two implementations exist for the periodic cells (grid rule and shift, oblique-cell operator, local potential,
+symmetry, forces, relaxation and molecular dynamics, slabs) and for the forces and ionic loops of spinor
+orbitals: Andrew Grieder's and the Fortran-derived routines of the parity round (`Input/routines.py`). The input
+parameter `Use_Fortran_Routines` chooses:
+
+- not given: the default of each feature. That is Andrew Grieder's routines, except for these inputs, whose
+  default is the Fortran-derived routines (parsec.out names that default in its routines line):
+  - slabs (`Boundary_Conditions: slab`);
+  - a shifted Monkhorst-Pack grid of a bulk cell (`Monkhorst_Pack_Shift`);
+  - forces, a relaxation or molecular dynamics of a bulk cell at the Gamma point (no k-point input), with or
+    without spin polarization, where the orthorhombic grid of the Fortran-derived routines has the points of
+    Andrew Grieder's grid (the same counts and steps, no shift: `Ignore_Symmetry`, sides that `round(L/h)`
+    divides into an even number of points) and every species uses `Cubic_Spline` (his local potential is the
+    cubic spline), so that the run with forces has the energy of the run without them: the accelerated path of
+    the Fortran-derived routines is 2.5-5 times faster there, and their forces are the derivative of their
+    energy. In practice that is `Ignore_Symmetry` inputs with spline species; widening it needs the orthorhombic
+    grid of the Fortran-derived routines to be Fortran's and the same local potential;
+  - a bulk cell on Fortran's general grid whose space group's fractional translations change the number of grid
+    points (diamond in the fcc cell: 16 points per vector at a spacing of 0.4 bohr, against 18 without the space
+    group), in a run with k-points, spin polarization or spinors and without forces.
+
+  Andrew Grieder's routines stay the default where the grids differ (a cell without `Ignore_Symmetry`, whose
+  grid is half a step off the origin as in Fortran), for linear radial tables, and where the Fortran-derived ones would be slower: an oblique
+  cell at the Gamma point (his accelerated oblique path), the Gamma point given as a one-point k-point grid,
+  forces on an oblique cell, forces with k-points, and the forces and ionic loops of spinor orbitals;
+- `.false.`: Andrew Grieder's routines wherever his code accepts the input, his slab and his full shifted mesh
+  (equal weights, no reduction to the irreducible wedge) included;
+- `.true.`: the Fortran-derived routines.
+
+An input that Andrew Grieder's routines do not compute (wires, charged sheets, forces of a slab, unequal k-point
+weights, LDA+U, NSCF, other pseudopotential formats or functionals, ...) runs on the Fortran-derived routines by
+itself, also with `.false.`, with a warning in the log and in parsec.out. A
+Restart_Run, NSCF or DOS input runs on the Fortran-derived routines, so the SCF that writes its `parsec.dat`
+should run on them too (a file of another grid is refused).
 
 ## Modular Python API
 

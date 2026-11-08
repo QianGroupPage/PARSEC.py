@@ -1054,6 +1054,52 @@ class ExchangePlanTests(unittest.TestCase):
                     asked += found == 3
             self.assertTrue(0 < asked < 24)
 
+    def test_the_device_xc_evaluator_is_counted_with_the_blocks(self):
+        """What another object keeps on a device of the group (the device XC evaluator, since 2026-10-30)."""
+        rows, states = 4130510, 3704
+        blocks, estimate = 64683595824, 525746240
+        xc = 573838160  # planned_device_bytes of PBE for 29,576 electrons (V_xc/device_xc.py)
+        names = ('PARSEC_CUPY_RITZ_CONDITION_HELPER', 'PARSEC_CUPY_RITZ_CONDITION',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION', 'PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE_RANGES', 'PARSEC_CUPY_STREAMING_RITZ_BYTES', 'PARSEC_CUPY_EXCHANGE_CHUNK_BYTES',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES', 'PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS', 'PARSEC_CUPY_DISTRIBUTED_STATE_SLABS',
+                 'PARSEC_CUPY_DISTRIBUTED_STATE')
+
+        def helper(total, resident):
+            cp, _runtime = _stand_in(total_bytes=total)
+            with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)):
+                owner = _Owner(cp, (2, 3))
+                owner.hartree_device = 3
+                if resident is not None:
+                    owner.resident_device_bytes = resident
+                return distributed_state.SectorDeviceGroup(owner, (2, 3))._condition_helper(rows, states)
+
+        def fits(total, reserved):
+            cp, _runtime = _stand_in(total_bytes=total)
+            with patch.object(distributed_state, 'require_cupy', lambda: (cp, None)):
+                return distributed_state.shared_basis_fits(rows, states, 2, reserved)
+
+        with patch.dict(os.environ):
+            for name in names:
+                os.environ.pop(name, None)
+            os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = 'any'
+            self.assertEqual(distributed_state.shared_block_bytes(rows, states, 2), blocks)
+            # The helper that holds the evaluator needs its room too: from 77,391,976,735 bytes on, not 76,716,873,017.
+            least = -(-(blocks + estimate) * 20 // 17)
+            with_xc = -(-(blocks + estimate + xc) * 20 // 17)
+            self.assertEqual((least, with_xc), (76716873017, 77391976735))
+            self.assertEqual([helper(least, None), helper(least, {}), helper(least, {3: xc}), helper(least, {2: xc})],
+                             [3, 3, None, 3])
+            self.assertEqual([helper(with_xc, {3: xc}), helper(with_xc - 1, {3: xc})], [3, None])
+            # The blocks alone and with the evaluator, against 0.85 of a device; 0 counts nothing.
+            share = -(-blocks * 20 // 17)
+            self.assertEqual([fits(share, 0), fits(share, xc), fits(share + -(-xc * 20 // 17), xc)], [True, False, True])
+            # The operator tells the rule, by device: only a device of the group counts.
+            operator = SimpleNamespace(resident_device_bytes={3: xc, 5: 7})
+            self.assertEqual(distributed_state.resident_bytes_of(operator), {3: xc, 5: 7})
+            self.assertEqual(distributed_state.resident_bytes_of(SimpleNamespace()), {})
+
     @patch.dict(os.environ, PARSEC_CUPY_DISTRIBUTED_STATE_BLOCKS='3')
     def test_fit_counts_three_tall_blocks_and_one_chunk_where_three_are_named(self):
         gib = 1 << 30
@@ -3695,8 +3741,10 @@ class RitzStandInTests(unittest.TestCase):
             return 5 if wide else 2
 
         def fit(answer):
-            def fits(rows, columns, devices):
+            # ``reserved`` (since 2026-10-30): what another object keeps on a device of the group, none here.
+            def fits(rows, columns, devices, reserved=0):
                 asked.append((rows, columns, devices))
+                self.assertEqual(reserved, 0)
                 return answer
             return fits
 

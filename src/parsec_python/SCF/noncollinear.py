@@ -23,13 +23,19 @@ the energy is invariant under a global rotation of all moments, which the
 tests use as an independent check.
 
 :func:`run_self_consistent_noncollinear` handles an isolated system;
-:func:`run_self_consistent_noncollinear_kpoints` a periodic cell sampled on the
-full, unreduced Monkhorst-Pack grid (magnetism breaks time-reversal symmetry,
-so ``k`` and ``-k`` must both appear).
+:func:`run_self_consistent_noncollinear_kpoints` a periodic cell sampled on a
+k-point set (magnetism breaks time-reversal symmetry, so ``k`` and ``-k``
+must both appear: Fortran's reduced grid uses no time reversal here,
+``irrbz.f90``); unequal weights weight every level by its k-point
+(:mod:`~parsec_python.SCF.kpoint_weights`).  The magnetization is a vector
+field, which ``Symmetrize_Charge_Density`` (a scalar average) does not
+treat: the input reader refuses that combination with a non-trivial group.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from itertools import product
 from typing import Callable
 
 import numpy as np
@@ -37,18 +43,20 @@ import numpy as np
 from ..Eigensolvers import EigvalState, solve_eigval
 from ..Energy import total_energy_noncollinear
 from ..Hamiltonian.spinor_operator import SpinorKohnShamHamiltonian
-from ..Mixer import AndersonMixer, potential_residual_metrics
-from ..Occupations import fermi_occupations
+from ..Mixer import make_mixer, potential_residual_metrics
 from ..V_ion import superpose_atomic_density
 from ..models import SelfConsistentSOCIteration, SelfConsistentSOCResult
-from .kpoint_solver import KPointJob, make_kpoint_solver, split_pooled
+from .kpoint_solver import KPointJob, kept_vectors, make_kpoint_solver, split_pooled
+from .kpoint_weights import KPointWeights
 from .orbital_density import spinor_sums
+from .single_point import first_diagonalization_tolerance, next_diagonalization_tolerance
 from .stage_timer import StageTimer, solver_residual_max, solver_timings
 from .kpoints_soc import (
     SpinorForceExtras,
     _eigval_settings,
     _k_point_operators,
     _number_of_states,
+    _result_weights,
     _spinor_hamiltonian,
     _state_sz,
     _validated_k_points,
@@ -90,6 +98,68 @@ def spinor_density_and_magnetization(
     return density, magnetization
 
 
+@dataclass(frozen=True)
+class NoncollinearMoments:
+    """The magnetization diagnostics of ``bxc.F90`` (``bxc`` and ``nclmom``).
+
+    ``absolute`` is ``Integral{|m|} = h^3 sum_i |m_i|``, ``atomic`` the
+    ``(atoms, 3)`` sums ``h^3 sum m_i`` over the grid points within the
+    ``Atomic_Radius`` of each atom (the Wigner-Seitz lists ``wsindw`` of
+    ``nonloc.F90``, with the periodic images of a point in the neighbouring
+    cells) and ``total`` the ``h^3 sum_i m_i`` of all points, all in Bohr
+    magnetons.
+    """
+
+    absolute: float
+    atomic: np.ndarray
+    total: np.ndarray
+
+
+def atomic_sphere_masks(
+    coordinates: np.ndarray,
+    atoms,
+    radii,
+    lattice_vectors: np.ndarray | None = None,
+) -> np.ndarray:
+    """``(atoms, points)``: the grid points within ``radii[a]`` of atom ``a``.
+
+    A point is inside where it or one of its images in the 26 neighbouring
+    cells (rows of ``lattice_vectors``, for a periodic system) is at most
+    the radius from the nucleus (``nonloc.F90``: ``rr <= p_pot%rws``).
+    """
+
+    coordinates = np.asarray(coordinates, dtype=np.float64)
+    shifts = [np.zeros(3)]
+    if lattice_vectors is not None:
+        vectors = np.asarray(lattice_vectors, dtype=np.float64)
+        shifts = [
+            np.asarray(cell, dtype=np.float64) @ vectors
+            for cell in product((-1, 0, 1), repeat=3)
+        ]
+    masks = np.zeros((len(atoms), coordinates.shape[0]), dtype=bool)
+    for index, (atom, radius) in enumerate(zip(atoms, radii)):
+        for shift in shifts:
+            distance = np.linalg.norm(
+                coordinates + shift - np.asarray(atom.position), axis=1
+            )
+            masks[index] |= distance <= float(radius)
+    return masks
+
+
+def noncollinear_moments(
+    magnetization: np.ndarray, masks: np.ndarray, volume_element: float
+) -> NoncollinearMoments:
+    """The moments of a magnetization density ``(3, points)`` in mu_B/bohr^3."""
+
+    magnetization = np.asarray(magnetization, dtype=np.float64)
+    weight = float(volume_element)
+    return NoncollinearMoments(
+        absolute=weight * float(np.sum(np.linalg.norm(magnetization, axis=0))),
+        atomic=weight * (np.asarray(masks, dtype=np.float64) @ magnetization.T),
+        total=weight * np.sum(magnetization, axis=1),
+    )
+
+
 def _initial_magnetization(system) -> np.ndarray:
     """Per-atom seed ``m(r) = sum_a p_a * d_a * rho_a(r)`` (shape ``(3, n_grid)``).
 
@@ -129,13 +199,44 @@ def _initial_magnetization(system) -> np.ndarray:
     return magnetization
 
 
+def symmetrize_noncollinear(density, magnetization, group, volume_element):
+    """``Symmetrize_Charge_Density`` of a non-collinear density (PARSEC's rule).
+
+    ``newrho.F90`` hands ``symm_scalar`` the total density and the densities
+    of the local frame ``(rho +- |m|)/2`` (``isp = 1, 2, 3``); the direction
+    of the magnetization (``spin3d`` of ``bxc.F90``) is not averaged.  This is
+    the same: ``rho`` and ``|m|`` are averaged as scalars and ``m`` keeps its
+    direction, ``m <- <|m|> m/|m|`` (zero where ``|m| = 0``).  Without
+    spin-orbit coupling a spatial operation does not act on the spin, so the
+    scalar average is the symmetry of the problem; with it the operations act
+    on ``m`` as on an axial vector and the symmetry of a magnetic state is a
+    subgroup, which neither this nor a full-group axial average respects
+    (PARSEC's choice is kept).  Returns the density, the magnetization and
+    the three reports.
+    """
+
+    from ..Grid.point_group import symmetrize_density
+
+    magnetization = np.asarray(magnetization, dtype=np.float64)
+    length = np.sqrt(np.sum(magnetization * magnetization, axis=0))
+    new_density, total_report = symmetrize_density(density, group, volume_element)
+    _, up_report = symmetrize_density(0.5 * (density + length), group, volume_element)
+    _, down_report = symmetrize_density(0.5 * (density - length), group, volume_element)
+    new_length, _ = symmetrize_density(length, group, volume_element)
+    scale = np.divide(new_length, length, out=np.zeros_like(length), where=length > 0.0)
+    return new_density, magnetization * scale[None, :], (total_report, up_report, down_report)
+
+
 def _run_noncollinear(
     system,
     hamiltonian_for_k: Callable[[int, np.ndarray, np.ndarray], object],
     n_kpoints: int,
-    weight: float,
+    weighting: KPointWeights,
     callback: Callable[[SelfConsistentSOCIteration], None] | None,
     k_points: np.ndarray | None = None,
+    keep_wavefunctions: bool = False,
+    iteration_state_callback: Callable[[object], None] | None = None,
+    initial_potential: tuple[np.ndarray, np.ndarray] | None = None,
     extras: SpinorForceExtras | None = None,
     warm_start=None,
 ) -> SelfConsistentSOCResult:
@@ -144,12 +245,14 @@ def _run_noncollinear(
     volume_element = system.grid.volume_element
     number_of_states = _number_of_states(system)
     ionic_potential = system.ionic_potential
+    density_symmetry = getattr(system, "density_symmetry", None)
 
     timer = StageTimer()
     density = system.initial_density
     if warm_start is None:
         with timer.stage("initial_magnetization"):
             magnetization = _initial_magnetization(system)
+    if initial_potential is None and warm_start is None:
         with timer.stage("setup_potentials"):
             hartree = system.solve_hartree(density, initial_potential=-ionic_potential)
             hartree_potential = hartree.potential
@@ -157,13 +260,25 @@ def _run_noncollinear(
         input_potential = ionic_potential + hartree_potential + xc.potential
         input_field = xc.field
     else:
-        # the exchange-correlation field of the previous structure carries the moments to the moved atoms
-        hartree_potential = np.array(warm_start.hartree_potential, dtype=np.float64)
-        input_potential, input_field = (np.array(part, dtype=np.float64) for part in warm_start.input_potential)
+        if warm_start is not None:
+            # Andrew Grieder's ionic loops: the structure before
+            # the exchange-correlation field of the previous structure carries the moments to the moved atoms
+            hartree_potential = np.array(warm_start.hartree_potential, dtype=np.float64)
+            input_potential, input_field = (np.array(part, dtype=np.float64) for part in warm_start.input_potential)
+        else:
+            # The warm start of an ionic step (parsec.F90 after domove: vnew with
+            # the ionic part replaced, the magnetization direction kept): the
+            # scalar potential and the exchange-correlation field of the first
+            # eigenproblem; -V_ion starts the first Poisson solve, as a restart.
+            hartree_potential = -np.asarray(ionic_potential, dtype=np.float64)
+            input_potential = np.array(initial_potential[0], dtype=np.float64)
+            input_field = np.array(initial_potential[1], dtype=np.float64).reshape(3, n_grid)
+            if input_potential.shape != np.shape(ionic_potential):
+                raise ValueError("initial_potential must hold one value per grid point")
 
     def accumulate(task, vectors, occupations, xp=np):
         density_k, magnetization_k = spinor_density_and_magnetization(
-            vectors, occupations, volume_element, weight, xp
+            vectors, occupations, volume_element, weighting.of_k(task), xp
         )
         return {"density": density_k, "magnetization": magnetization_k}
 
@@ -171,7 +286,7 @@ def _run_noncollinear(
         KPointJob(
             n_kpoints,
             number_of_states,
-            lambda degree: _eigval_settings(system, degree),
+            lambda degree, tolerance=None: _eigval_settings(system, degree, tolerance),
             lambda task, potentials: hamiltonian_for_k(
                 task, potentials["V"], potentials["field"]
             ),
@@ -185,15 +300,26 @@ def _run_noncollinear(
             "the nonlocal force of the row-distributed MPI k-point solver is not implemented: its extras are "
             "sums over row blocks, which does not apply to a product of overlaps"
         )
-    mixer = AndersonMixer(system.input.mixing)
+    mixer = make_mixer(system.input.mixing)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
+    # Dynamic_Diag_Tol: 0.1 for the first iteration (parsec.F90:1106-1111).
+    dynamic_tolerance = system.input.eigensolver.dynamic_tolerance
+    diagonalization_tolerance = first_diagonalization_tolerance(system.input.eigensolver)
 
     pooled_eigenvalues = np.empty(0)
     pooled_occupations = np.empty(0)
     fermi_level = float("nan")
     energies = None
     converged = False
+    specifications = system.input.pseudopotentials
+    periodic_cell = getattr(system.input, "periodic_cell", None)
+    sphere_masks = atomic_sphere_masks(
+        system.grid.coordinates,
+        system.atoms,
+        [getattr(specifications[atom.symbol], "atomic_radius", 0.0) for atom in system.atoms],
+        None if periodic_cell is None else periodic_cell.lattice_vectors,
+    )
     with solver:
         import_subspaces(solver, warm_start)
         timer.lap()  # what came before the loop (potentials, solver start-up) is not part of iteration 1
@@ -201,27 +327,38 @@ def _run_noncollinear(
             used_potential = input_potential  # what enters this eigenproblem (the mixed one replaces it below)
 
             with timer.stage("diagonalization"):
-                eigenvalues_by_k = solver.solve({"V": input_potential, "field": input_field}, filter_degree)
+                eigenvalues_by_k = solver.solve(
+                    {"V": input_potential, "field": input_field},
+                    filter_degree,
+                    diagonalization_tolerance if dynamic_tolerance else None,
+                )
             residual_max = solver_residual_max(solver)
 
             with timer.stage("density"):
                 stacked = np.concatenate(eigenvalues_by_k)
-                order = np.argsort(stacked, kind="stable")
-                occupation_result = fermi_occupations(
-                    stacked[order],
+                state_weights = (
+                    None
+                    if weighting.uniform
+                    else weighting.state_weights(eigenvalues_by_k, range(n_kpoints))
+                )
+                stacked_occupations, fermi_level = weighting.occupy(
+                    stacked,
                     system.electron_count,
                     settings.fermi_temperature_kelvin,
-                    degeneracy=weight,
+                    1.0,
+                    state_weights,
                 )
-                stacked_occupations = np.empty_like(stacked)
-                stacked_occupations[order] = occupation_result.occupations
-                fermi_level = occupation_result.fermi_level
                 pooled_eigenvalues = stacked
                 pooled_occupations = stacked_occupations
 
                 parts = solver.accumulate(split_pooled(stacked_occupations, eigenvalues_by_k))
                 density = parts["density"]
                 magnetization = parts["magnetization"]
+                symmetrization = ()
+                if density_symmetry is not None:
+                    density, magnetization, symmetrization = symmetrize_noncollinear(
+                        density, magnetization, density_symmetry, volume_element
+                    )
 
             with timer.stage("hartree"):
                 hartree = system.solve_hartree(density, initial_potential=hartree_potential)
@@ -241,9 +378,12 @@ def _run_noncollinear(
                     volume_element,
                     system.electron_count,
                 )
+                energy_occupations, band_energy_weight = weighting.band_energy_terms(
+                    pooled_occupations, state_weights
+                )
                 energies = total_energy_noncollinear(
                     pooled_eigenvalues,
-                    pooled_occupations,
+                    energy_occupations,
                     density,
                     magnetization,
                     input_potential,
@@ -256,7 +396,7 @@ def _run_noncollinear(
                     system.ion_ion_energy,
                     volume_element,
                     alpha_z_energy=system.alpha_z_energy,
-                    band_energy_weight=weight,
+                    band_energy_weight=band_energy_weight,
                 )
 
                 mixed = mixer.mix(input_combined, output_combined, iteration=iteration)
@@ -264,6 +404,11 @@ def _run_noncollinear(
             selected_residual = (
                 metrics.plain if settings.use_plain_residual else metrics.weighted
             )
+            if dynamic_tolerance:
+                # parsec.F90:1302-1311 with this loop's SRE.
+                diagonalization_tolerance = next_diagonalization_tolerance(
+                    system.input.eigensolver, diagonalization_tolerance, (metrics.weighted,)
+                )
             if callback is not None:
                 first_k = eigenvalues_by_k[0].size
                 callback(
@@ -278,13 +423,49 @@ def _run_noncollinear(
                         eigen_residual_max=residual_max,
                         diagonalization_seconds=lap.get("diagonalization", 0.0),
                         total_seconds=sum(lap.values()),
+                        magnetic_moments=noncollinear_moments(
+                            magnetization, sphere_masks, volume_element
+                        ),
+                        density_symmetrization=symmetrization,
+                        **(
+                            {"next_eigensolver_tolerance": diagonalization_tolerance}
+                            if dynamic_tolerance
+                            else {}
+                        ),
                     )
                 )
+            if iteration_state_callback is not None:
+                # Save_Intermediate_*: the local-frame fields of the final
+                # parsec.dat after mixing; the spinors of an isolated loop.
+                from .single_point import SpinorIterationFields
+
+                iteration_state_callback(
+                    SpinorIterationFields(
+                        iteration=iteration,
+                        eigenvalues=pooled_eigenvalues,
+                        occupations=pooled_occupations,
+                        # (the MPI solver gathers no spinors: an empty block, which
+                        # parsec.dat then writes without wavefunction records)
+                        spinors=None if k_points is not None else solver.vectors(0),
+                        parsec_dat_fields=_noncollinear_parsec_dat_fields(
+                            system,
+                            mixed[:n_grid],
+                            mixed[n_grid:].reshape(3, n_grid),
+                            density,
+                            magnetization,
+                        ),
+                        k_points=k_points,
+                        k_weights=(
+                            None if k_points is None else _result_weights(weighting, n_kpoints)
+                        ),
+                    )
+                )
+            last_input_potential = input_potential
             input_potential = mixed[:n_grid]
             input_field = mixed[n_grid:].reshape(3, n_grid)
             if (
                 iteration > 5
-                and metrics.weighted < 100.0 * settings.convergence_criterion
+                and metrics.weighted < settings.approach_criterion
                 and filter_degree > minimum_filter_degree
             ):
                 filter_degree -= 1
@@ -293,6 +474,11 @@ def _run_noncollinear(
                 break
 
         moment_vector = volume_element * np.sum(magnetization, axis=1)
+        from .single_point import dispersion_after_convergence, dispersion_wanted
+        dispersion = None
+        if dispersion_wanted(settings, converged):
+            # efvdw.f90 after a converged loop: the TS correction of the density.
+            dispersion, energies = dispersion_after_convergence(system, density, energies)
         subspaces = export_subspaces(solver)
         nonlocal_forces = None
         state_moments = None
@@ -319,14 +505,32 @@ def _run_noncollinear(
             magnetic_moment_vector=moment_vector,
             magnetization=magnetization,
             k_points=k_points,
-            k_weights=None if k_points is None else np.full(n_kpoints, weight),
+            k_weights=None if k_points is None else _result_weights(weighting, n_kpoints),
             state_moments=state_moments,
             timings=solver_timings(timer, solver),
             scf_potentials={
                 "effective_potential": output_potential,
                 "xc_field": output_field,
             },
+            # The scalar parts the forces read (parsec_python.Forces.spin_orbit).
+            scf_input_potential=last_input_potential,
+            scf_output_potential=output_potential,
             xc_potential=xc.potential,
+            k_spinors=(
+                tuple(
+                    kept_vectors(solver, task, "the non-collinear forces")
+                    for task in range(n_kpoints)
+                )
+                if keep_wavefunctions and k_points is not None
+                else None
+            ),
+            dispersion=dispersion,
+            parsec_dat_fields=_noncollinear_parsec_dat_fields(
+                system, input_potential, input_field, density, magnetization
+            ),
+            # pot%vnew and the field: where the next structure of an ionic
+            # loop starts.
+            next_potential=(input_potential, input_field),
             input_effective_potential=used_potential,
             output_effective_potential=output_potential,
             nonlocal_forces=nonlocal_forces,
@@ -336,11 +540,37 @@ def _run_noncollinear(
         )
 
 
+def _noncollinear_parsec_dat_fields(system, potential, field, density, magnetization) -> dict:
+    """``vnew(:,1:2)`` and ``rho(:,2:3)`` of a non-collinear run (``wfnsave.F90``).
+
+    PARSEC stores the local-frame quantities: the potentials of the spin
+    along and against the local magnetization, ``V +- |B|``, and the
+    densities ``(rho +- |m|)/2`` (``newrho.F90``); the direction of ``m``
+    (``spin3d``) is not written.  ``stype(2)`` is 4 with spin-orbit species,
+    3 without.
+    """
+
+    potential = np.asarray(potential, dtype=np.float64)
+    strength = np.sqrt(np.sum(np.asarray(field, dtype=np.float64) ** 2, axis=0))
+    length = np.sqrt(np.sum(np.asarray(magnetization, dtype=np.float64) ** 2, axis=0))
+    spin_orbit = any(
+        getattr(specification, "spin_orbit", False)
+        for specification in system.input.pseudopotentials.values()
+    )
+    return {
+        "kind": 4 if spin_orbit else 3,
+        "potentials": (potential + strength, potential - strength),
+        "densities": (0.5 * (density + length), 0.5 * (density - length)),
+    }
+
+
 def run_self_consistent_noncollinear(
     system,
     soc_projectors: tuple = (),
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
+    iteration_state_callback: Callable[[object], None] | None = None,
+    initial_potential: tuple[np.ndarray, np.ndarray] | None = None,
     warm_start=None,
 ) -> SelfConsistentSOCResult:
     """Non-collinear SCF for an isolated system.
@@ -351,7 +581,20 @@ def run_self_consistent_noncollinear(
     ``soc_projectors`` is
     :func:`~parsec_python.Eigensolvers.perturbative_soc.build_spin_orbit_projectors`'s
     output; leave it empty for non-collinear magnetism without spin-orbit.
+    ``initial_potential`` is ``(V, B)``, the scalar potential and the
+    exchange-correlation field (shape ``(3, n_grid)``) of the first
+    eigenproblem in place of those of the initial density and moments (the
+    warm start of an ionic step, ``result.next_potential`` of the structure
+    before with its ionic part replaced).
+    ``iteration_state_callback`` receives a
+    :class:`parsec_python.SCF.single_point.SpinorIterationFields` after every
+    iteration (``Save_Intermediate_*``).
     """
+    from .single_point import refuse_hubbard_and_dispersion
+
+    refuse_hubbard_and_dispersion(
+        system, "run_self_consistent_noncollinear", dispersion=False
+    )
 
     if not system.input.scf.noncollinear:
         raise ValueError(
@@ -369,7 +612,16 @@ def run_self_consistent_noncollinear(
             xc_field=field,
         )
 
-    return _run_noncollinear(system, hamiltonian_for_k, 1, 1.0, callback, warm_start=warm_start)
+    return _run_noncollinear(
+        system,
+        hamiltonian_for_k,
+        1,
+        KPointWeights(weights=np.ones(1), uniform=True, weight=1.0),
+        callback,
+        iteration_state_callback=iteration_state_callback,
+        initial_potential=initial_potential,
+        warm_start=warm_start,
+    )
 
 
 def run_self_consistent_noncollinear_kpoints(
@@ -378,6 +630,9 @@ def run_self_consistent_noncollinear_kpoints(
     weights: np.ndarray,
     *,
     callback: Callable[[SelfConsistentSOCIteration], None] | None = None,
+    keep_wavefunctions: bool = False,
+    iteration_state_callback: Callable[[object], None] | None = None,
+    initial_potential: tuple[np.ndarray, np.ndarray] | None = None,
     compute_forces: bool = False,
     warm_start=None,
 ) -> SelfConsistentSOCResult:
@@ -386,17 +641,29 @@ def run_self_consistent_noncollinear_kpoints(
     ``warm_start`` continues from the loop of the previous structure, as for the isolated driver.
 
     Spin-orbit projectors are built for every k-point from the species with
-    ``SO_PSP`` (none gives plain non-collinear magnetism).  ``compute_forces``
+    ``SO_PSP`` (none gives plain non-collinear magnetism).
+    ``keep_wavefunctions`` keeps the spinors of every k-point
+    (``k_spinors``, for the forces); ``initial_potential`` is ``(V, B)`` as
+    in :func:`run_self_consistent_noncollinear`; ``iteration_state_callback``
+    receives a :class:`parsec_python.SCF.single_point.SpinorIterationFields`
+    after every iteration (``Save_Intermediate_*``).
+    ``compute_forces``
     also returns the nonlocal force (``result.nonlocal_forces``), accumulated from the orbitals of every k-point by
-    a last pass after the SCF loop (see :class:`~parsec_python.SCF.kpoints_soc.SpinorForceExtras`).
+    a last pass after the SCF loop (see :class:`~parsec_python.SCF.kpoints_soc.SpinorForceExtras`); ``warm_start``
+    continues from the structure before (Andrew Grieder's ionic loops).
     """
+    from .single_point import refuse_hubbard_and_dispersion
+
+    refuse_hubbard_and_dispersion(
+        system, "run_self_consistent_noncollinear_kpoints", dispersion=False
+    )
 
     if not system.input.scf.noncollinear:
         raise ValueError(
             "run_self_consistent_noncollinear_kpoints requires "
             "SCFSettings.noncollinear=True"
         )
-    k_points, weight = _validated_k_points(
+    k_points, weighting = _validated_k_points(
         k_points, weights, "run_self_consistent_noncollinear_kpoints"
     )
     operator_cache: dict[int, tuple] = {}
@@ -419,14 +686,35 @@ def run_self_consistent_noncollinear_kpoints(
             xc_field=field,
         )
 
-    extras = SpinorForceExtras(system, k_points, weight, operators_for, compute_forces)
+    if compute_forces and not weighting.uniform:
+        raise NotImplementedError(
+            "the nonlocal force of a non-collinear k-point run accumulated in the SCF step (compute_forces, "
+            "Andrew Grieder's ionic loops) needs equal k-point weights"
+        )
+    extras = SpinorForceExtras(
+        system, k_points, weighting.weight if weighting.uniform else 1.0, operators_for, compute_forces
+    )
     return _run_noncollinear(
-        system, hamiltonian_for_k, k_points.shape[0], weight, callback, k_points, extras, warm_start
+        system,
+        hamiltonian_for_k,
+        k_points.shape[0],
+        weighting,
+        callback,
+        k_points,
+        keep_wavefunctions=keep_wavefunctions,
+        iteration_state_callback=iteration_state_callback,
+        initial_potential=initial_potential,
+        extras=extras,
+        warm_start=warm_start,
     )
 
 
 __all__ = [
+    "NoncollinearMoments",
+    "atomic_sphere_masks",
+    "noncollinear_moments",
     "run_self_consistent_noncollinear",
     "run_self_consistent_noncollinear_kpoints",
     "spinor_density_and_magnetization",
+    "symmetrize_noncollinear",
 ]

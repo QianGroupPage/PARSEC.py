@@ -490,6 +490,26 @@ PERIODIC_DOMAIN = (
     "  9.0  9.0  9.0",
     "end Cell_Shape",
 )
+# A wire with an irreducible k-point wedge (Monkhorst_Pack_Shift): its forces
+# are completed over the wire's group, so a relaxation whose Move_Flag the
+# group does not respect (one hydrogen fixed, the mirror x -> -x exchanges
+# them) is refused by the input reader, as for a bulk cell.
+WIRE_REDUCED_KPOINT_DOMAIN = (
+    "Boundary_Conditions: wire",
+    "begin Cell_Shape",
+    "  9.0",
+    "end Cell_Shape",
+    "Boundary_Sphere_Radius: 5.5",
+    "Kpoint_Method: mp",
+    "begin Monkhorst_Pack_Grid",
+    "  2",
+    "end Monkhorst_Pack_Grid",
+    "begin Monkhorst_Pack_Shift",
+    "  0.5",
+    "end Monkhorst_Pack_Shift",
+)
+#: The message of that refusal.
+WIRE_REDUCED_KPOINT_REFUSAL = "Move_Flag fixes atoms that a space-group operation exchanges"
 
 
 def _water_lines(
@@ -3574,17 +3594,60 @@ class RelaxationInputTests(_ScratchCase):
             with self.assertRaisesRegex(ParsecInputError, message):
                 self.parse(_water_lines(f"Minimization: bfgs\nRelaxation_SCF_Upscale: {value}"))
 
-    def test_periodic_relaxation_is_accepted_without_symmetry(self) -> None:
-        """A periodic cell relaxes (forces: Forces.compute_periodic_forces), with no point-group symmetrization."""
+    def test_periodic_relaxation_is_accepted(self) -> None:
+        """A periodic cell relaxes with a fixed cell (Forces/periodic.py).
+
+        Every bulk combination has periodic forces now (the double grid too);
+        a wire relaxation whose Move_Flag breaks the group of its irreducible
+        k-point wedge is the refused periodic input.
+        """
 
         for scheme in ("BFGS", "simple", "manual"):
             with self.subTest(scheme=scheme):
                 translation = self.parse(
                     _water_lines(f"Minimization: {scheme}", domain=PERIODIC_DOMAIN)
                 )
+                self.assertIsNotNone(translation.problem.periodic_cell)
+                self.assertEqual(translation.relaxation.method, scheme.lower())
+        double_grid = self.parse(
+            _water_lines("Minimization: BFGS\nDouble_Grid_Order: 2", domain=PERIODIC_DOMAIN)
+        )
+        self.assertEqual(double_grid.relaxation.method, "bfgs")
+        with self.assertRaisesRegex(
+            UnsupportedParsecOptionError,
+            WIRE_REDUCED_KPOINT_REFUSAL,
+        ):
+            self.parse(_water_lines(
+                "Minimization: BFGS",
+                oxygen_flag="0",
+                hydrogen_flag="1",
+                domain=WIRE_REDUCED_KPOINT_DOMAIN,
+            ))
+        # The same cell without a relaxation has none.
+        translation = self.parse(_water_lines(domain=PERIODIC_DOMAIN))
+        self.assertIsNotNone(translation.problem.periodic_cell)
+        self.assertIsNone(translation.relaxation)
+
+
+    def test_periodic_relaxation_is_accepted_without_symmetry(self) -> None:
+        """A periodic cell relaxes (forces: Forces.compute_periodic_forces), with no point-group symmetrization."""
+
+        # With both sets of routines: the molecule sits inside the cell.  The default routines refuse atoms outside
+        # it when they prepare the cell, so the water at the origin runs on the Fortran-derived routines
+        # (parsec_python.Input.routines), which search the space group.
+        inside = {"oxygen": ("4.5  4.5  4.5",), "hydrogen": ("6.1  4.9  4.5", "2.9  4.9  4.5")}
+        for scheme in ("BFGS", "simple", "manual"):
+            with self.subTest(scheme=scheme):
+                translation = self.parse(
+                    _water_lines(f"Minimization: {scheme}", domain=PERIODIC_DOMAIN, **inside)
+                )
+                self.assertFalse(translation.routines.fortran, translation.routines.reasons)
                 self.assertIsNotNone(translation.relaxation)
                 self.assertEqual(translation.relaxation.method, scheme.lower())
                 self.assertFalse(translation.use_symmetry)  # the cluster's point group does not apply to a crystal
+        outside = self.parse(_water_lines("Minimization: BFGS", domain=PERIODIC_DOMAIN))
+        self.assertTrue(outside.routines.fortran)
+        self.assertIn("outside the cell", "; ".join(outside.routines.reasons))
         # forces on request and molecular dynamics are accepted as well
         forces = self.parse(_water_lines("Skip_Force: .false.", domain=PERIODIC_DOMAIN))
         self.assertTrue(forces.compute_forces)
@@ -3673,6 +3736,18 @@ class CommandLineTests(_ScratchCase):
     def test_input_errors_end_before_any_calculation(self) -> None:
         """Exit code 2 and one line on standard error; no file is written."""
 
+        periodic = _water_lines(
+                "Minimization: BFGS",
+                oxygen_flag="0",
+                hydrogen_flag="1",
+                domain=WIRE_REDUCED_KPOINT_DOMAIN,
+            )
+        code, _, error = _run_cli([self.write_input(periodic), "--quiet"])
+        self.assertEqual(code, 2)
+        self.assertIn(
+            "Input error: " + WIRE_REDUCED_KPOINT_REFUSAL, error
+        )
+
         source = self.write_input(CASES["water_coarse_bfgs_part1"]["input"])
         code, _, error = _run_cli([source, "--quiet", "--restart-from", "missing.dat"])
         self.assertEqual(code, 2)
@@ -3701,9 +3776,11 @@ class CommandLineTests(_ScratchCase):
         """The accelerated driver takes the same restart and symmetry decisions.
 
         These branches end with exit code 2 before a backend is chosen, so
-        no accelerator is touched: a restart file for other atoms, a
-        periodic relaxation, and ``--symmetry on`` where the relaxation
-        cannot keep the point group.
+        no accelerator is touched: a restart file for other atoms, a wire
+        relaxation whose Move_Flag breaks the group of its irreducible
+        k-point wedge (refused by the input reader), and ``--symmetry on``
+        where the relaxation cannot
+        keep the point group.
         """
 
         from parsec_python.acceleration.cli import main as accelerated_main
@@ -3722,6 +3799,15 @@ class CommandLineTests(_ScratchCase):
             refused(relaxation, "--restart-from", "two.xyz"),
         )
         self.assertIn("missing.dat", refused(relaxation, "--restart-from", "missing.dat"))
+        self.assertIn(
+            WIRE_REDUCED_KPOINT_REFUSAL,
+            refused(_water_lines(
+                "Minimization: BFGS",
+                oxygen_flag="0",
+                hydrogen_flag="1",
+                domain=WIRE_REDUCED_KPOINT_DOMAIN,
+            )),
+        )
         one_fixed = _water_lines("Minimization: BFGS", oxygen_flag="0", hydrogen_flag="1")
         self.assertIn(
             "--symmetry on cannot be used here: Move_Flag fixes atoms",

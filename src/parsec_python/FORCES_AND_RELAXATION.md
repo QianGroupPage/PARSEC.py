@@ -22,12 +22,39 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
   (`Non_Collinear_magnetism`, with or without spin-orbit), isolated or periodic at the Gamma point or with k-points:
   forces, relaxation and molecular dynamics. See "Spin-orbit coupling and non-collinear magnetism" below. The
   perturbative spin-orbit correction (`SO_PSP` without `SO_from_scratch`) has none.
+- With `Use_Fortran_Routines: .true.` (and for the inputs that run on those routines by default - slabs, shifted bulk grids, forces of a bulk cell at the
+  Gamma point on a grid both sets share with Cubic_Spline species, bulk cells whose space group sets Fortran's grid -
+  or by themselves, see
+  `Input/routines.py`), the Fortran-derived routines:
+  - Periodic (bulk) cells with a fixed cell: forces, relaxation and molecular
+    dynamics at Gamma and with k-points (also with collinear spin, with an
+    irreducible k-point wedge and with `Double_Grid_Order > 1`), on the
+    orthorhombic and on Fortran's general grid; see
+    [Periodic cells](#periodic-cells).
+  - Wires and slabs (`Boundary_Conditions: wire` / `slab`): forces (Gamma,
+    collinear spin, k-points with any weights, spin with k-points), relaxation
+    and molecular dynamics; see
+    [Wires and slabs](#wires-and-slabs). Spin-orbit coupling, non-collinear
+    magnetism and `Double_Grid_Order > 1` are refused for wires and slabs.
+  - Spin-orbit coupling (`SO_from_scratch`/`SCF_SO`, also with collinear spin)
+    and non-collinear magnetism, isolated or periodic (bulk); see
+    [Spin-orbit coupling and non-collinear magnetism](#spin-orbit-coupling-and-non-collinear-magnetism).
+    Refused: forces with the perturbative spin-orbit correction (`SO_PSP`
+    without `SO_from_scratch`).
 - A spin-polarized calculation uses the same routines: `forcloc.f90` reads
   the total density and the averages over the two channels of the potential
   difference and of the exchange-correlation potential, and `forcnloc.f90`
   sums over the states of both channels with the weight `4/nspin`.
 - Not translated from `forcloc.f90` and `forcnloc.f90`: point charges,
   LDA+U and van der Waals corrections.
+- With `Use_Fortran_Routines: .true.` (and for the inputs that run on those routines by default - slabs, shifted bulk grids, forces of a bulk cell at the
+  Gamma point on a grid both sets share with Cubic_Spline species, bulk cells whose space group sets Fortran's grid -
+  or by themselves, see
+  `Input/routines.py`), the Fortran-derived routines:
+  - The spin-orbit term of `forcnloc.f90` (`forcso`) is in
+    `Forces/spin_orbit.py` (section below); the point-charge, LDA+U and TS
+    terms are those of `Forces/total.py::correction_forces` and
+    `Forces/ion_ion.py`.
 - Every execution path computes the same numbers: the readable NumPy path
   (`reference_main.py`), the accelerated single-node path (`main.py`, CPU or
   GPUs) and the multi-node GPU runner
@@ -453,6 +480,227 @@ trajectories can be compared, and is listed in the module documentation of
 `MolecularDynamics/moldyn.py`: `Time_Step` is taken in atomic units whatever
 unit the input names, masses use 1836 electron masses per atomic mass unit,
 and kinetic and potential energies are reported per different atom counts.
+
+## Periodic cells
+
+`Forces/periodic.py` evaluates the forces of a bulk cell with the structure of
+Fortran's `forpbc.f90`/`force_loc_pb.f90` (local and core-correction terms),
+`ewald_sum.f90` (ion-ion) and `forcnloc.f90` (projectors with their lattice
+replicas and, for k-points, the Bloch phases `right`), then symmetrizes them
+and removes the net force. Each term is the exact derivative of the energy this
+package computes, which differs from Fortran's in its local potential (a
+real-space Ewald split instead of the G-space `v_first`/`pot_local`):
+
+- local: `dV sum_r rho(r) [sum_T f'(|d_T|) d_T/|d_T| + 2Z (4 pi/V) sum_G w_G G sin(G.(r - R))]`
+  with `f = V_loc + 2Z erf(eta r)/r` and the translations and G vectors of
+  `ewald_local_ionic_potential`; ion-ion: the derivative of
+  `ewald_ion_ion_energy` with its translations (both sums keep every image a
+  pair or a grid point reaches, for any cell shape, so an atom that crosses a
+  cell face and is translated back changes no energy);
+- radial functions are differentiated as the energy samples them (slope of the
+  linear interpolant of `r V`, of the densities and of the projectors, or the
+  spline derivative). `PARSEC_PERIODIC_FORCE_SLOPES=tabulated` takes for the
+  projectors Fortran's `dvw` table instead, which reproduces Fortran's nonlocal
+  forces but is not the derivative of the sampled projector (the two differ by
+  up to 1e-2 Ry/bohr on Si cells at h = 0.6 bohr; the forces of an isolated
+  system use the table);
+- the self-consistency correction of `forcloc.f90` is added (Fortran's periodic
+  routine has none; it vanishes at convergence); LDA+U (J = 0) and TS-vdW forces
+  at Gamma as for clusters;
+- with fractional occupations the forces are the derivative of the Mermin free
+  energy `E - TS`, not of the printed total energy (as in Fortran).
+
+Symmetrization (`symm_forces.f90`): where the problem carries Fortran's space
+group (`Monkhorst_Pack_Shift`, `Symmetrize_Charge_Density`, or a weighted
+`Kpoint_List` with forces) the forces are averaged over its operations,
+non-symmorphic ones included (`T(r) = U (r - A t)`: the image of an atom is
+found modulo lattice vectors as `symm_forces` finds it, the force turns with
+`U`), and a relaxation averages its positions over the same operations with
+their translations. Otherwise the point operations about the origin that map
+the lattice, the grid, the atoms (modulo lattice vectors) and the k-points onto
+themselves are used, as before. Molecular dynamics and manual movements use
+none, as in PARSEC (`parsec.F90` sets no symmetry for them: with
+`Monkhorst_Pack_Shift` their wedge is that of time reversal alone); no torque
+is reported.
+
+An irreducible k-point wedge gives the nonlocal forces of its own points
+only; summed over the zone they are `(1/N) sum_g U_g F(g^-1 a)` of the wedge
+forces, which `Forces.periodic.reduced_kpoint_operations` applies to the
+k-dependent terms whatever the `symmetrize` flag (Fortran gets the same sum from
+`symm_forces`). A relaxation whose `Move_Flag` the group does not respect is
+refused with a reduced k-point set, and molecular dynamics with a weighted
+`Kpoint_List`: the structure would leave the group the wedge stands for.
+
+Collinear spin with k-points runs `run_scf_kpoints_spin_polarized` keeping its
+orbitals and potentials; the forces sum the nonlocal term over both channels
+(one electron per orbital) and the local terms take the total density and the
+channel averages, as `forpbc.f90`. With `Double_Grid_Order > 1` the projector
+gradients are those of the fine points with their images and the Bloch phase
+of the coarse point (`nonloc.F90`).
+
+Relaxation and dynamics use `Relaxation.periodic_backend`: `run_scf` at Gamma
+(`run_spin_scf` with collinear spin, started from the periodic spin densities),
+`run_scf_kpoints` keeping its orbitals with k-points (with collinear spin
+`run_scf_kpoints_spin_polarized`, started from the two channel potentials of
+the structure before), and
+`SCF.pbc.update_periodic_geometry` after every move (local potential,
+projectors, LDA+U projectors, densities, Ewald energy). Atoms that leave the
+cell are translated back (`back_to_cell`); the optimizer and the integrator keep
+the unwrapped coordinates. The next SCF loop starts from the last mixed
+potential with the ionic part replaced (and at Gamma from the saved orbitals).
+
+On a GPU the accelerated command line (`main.py`) runs the forces,
+relaxation and dynamics of a bulk cell on Fortran's orthorhombic grid at
+Gamma without spin itself, and hands the other periodic inputs (k-points,
+collinear spin, LDA+U, TS, wires and slabs, the general grid, ...) to the
+reference solver, whose k-point eigenproblems run on the device workers.
+For every bulk cell on the orthorhombic grid whose forces are asked for or
+whose atoms move, on either route, the ionic fields and their forces are
+built on the device (`acceleration/V_ion/periodic_device.py`,
+`acceleration/Forces/periodic_device.py`):
+
+- the readable builders sum the local potential and the atomic densities
+  over every lattice image out to the end of the radial tables (118 bohr for
+  the POTRE files: about 6000 images of each atom of an 8-atom silicon cube,
+  70 s for each of the two fields at h 0.45 bohr on the host of an A100 node,
+  before the first SCF loop and after every move); the device sums stop where
+  the terms vanish: the
+  short-ranged piece of the Ewald split `V_a + 2 Z erf(eta r)/r` (with the
+  `eta` of the FFT potential of `periodic_setup.py`) where the table of
+  `r V_a` is the Coulomb tail and `erfc(eta r)` is below the Ewald tolerance,
+  an atomic density where it is below `1e-16` of its peak. The fields equal
+  the readable ones to round-off (potential 1e-13 Ry, densities 5e-16);
+- the local, core-correction and self-consistency forces are the exact
+  derivatives of those fields (short range in one CUDA kernel, the
+  reciprocal part from one FFT of the density), so the forces remain the
+  derivative of the energy computed;
+- at Gamma the nonlocal term is contracted with the orbitals where the
+  eigensolver keeps them, with the projector gradients of the lattice images
+  (`acceleration/Forces/nonlocal_device.py`); the moved atoms replace the
+  projectors of the device Hamiltonian in place, and the next SCF loop
+  continues from the saved subspace, as for a cluster.
+
+`Cubic_Spline` species and the G-space local potential keep the readable
+fields and forces. A plain single point (no forces, no moving atoms) keeps
+the readable fields bit for bit on both command lines. The projector
+gradients of the forces find their grid points with the grid-ball query of
+`periodic_setup.py` (the same matrices). Si8 cube (h 0.64 bohr, laptop RTX
+5070): forces equal to the reference solver within 1.3e-12 Ry/bohr, a BFGS
+run of four structures within 1.2e-10 bohr (7 s against 272 s). One later
+ionic step on an A100 (h 0.45 bohr, Gamma): 149 s before, 0.65 s now for the
+8-atom cube; 1473 s and 5.3 s for the 64-atom cube; with 8 k-points the
+8-atom cube goes from 151 s to 9.2 s, nearly all of it the k-point SCF
+loop.
+
+Validation against Fortran PARSEC (Si2 fcc and Si8 cube at Gamma, Si2 with 8
+k-points, spin-polarized Na3, BFGS relaxation and Verlet dynamics of Si2): with
+Fortran's G-space local potential emulated and Fortran's projector slopes,
+the total forces agree to 2.5e-6 Ry/bohr (Si cells; 6.5e-6 for spin-polarized
+Na3) and the relaxation and dynamics trajectories to 1e-6 bohr; the report
+The report of the parity round has the numbers. The same comparison
+for the space group and the wedge (fcc Si2 with eight operations, half of them
+with the translation (1/4, 1/4, 1/4), and an hcp cell, both on reduced
+Monkhorst-Pack grids), collinear spin with k-points and the double grid gives
+1.3e-7 to 1.8e-6 Ry/bohr, and symmetric BFGS relaxations take Fortran's
+structures; numbers in the report of the parity round.
+
+## Spin-orbit coupling and non-collinear magnetism
+
+`Forces/spin_orbit.py` gives the forces of the spinor drivers
+(`run_self_consistent_soc`, its collinear-spin form, `run_self_consistent_noncollinear`
+and the k-point forms of all three): the ion-ion and local terms with the
+total density and the spin-independent part of the potentials, the
+Kleinman-Bylander term on both spinor components (one electron per spinor),
+and the spin-orbit term, the derivative of the `lzsz`/`lsxy` energy
+`sum_n f_n <psi_n|H_SO|psi_n>` with the gradients of the `v_ion`/`v_so`
+projectors (Fortran's `forcso` of `soforc.F90`). Every term is the derivative
+of the energy the drivers compute (finite differences: 1e-9 Ry/bohr). The
+Zeeman terms of collinear spin and of the non-collinear field depend on the
+atoms through the density only.
+
+Fortran's spin-orbit term is not the derivative of its energy:
+`pseudo.f90` tabulates `dvr_ion` as a value (`(l+1) vlj(l) + l vlj(l+2)`) and
+`dvr_so` without the factor `sqrt(h^3)/(2l+1)` of `vsor`, `forcso` multiplies
+both overlaps of each product by the KB sign (which then cancels) and
+`flsxy` pairs the same `m_l` in both spin components (the Hamiltonian's
+`lsxy` shifts it). On AuH (`examples/0d_AuH`) the local and Kleinman-Bylander
+tables equal Fortran's, the spin-orbit term on Au is +0.0053 Ry/bohr here and
+-0.0580 in Fortran, which a line-by-line port of `soforc.F90` with those
+tables reproduces (-0.0577). `forcnloc.f90` sums the Kleinman-Bylander term
+over the up components only (times four): equal to both components for
+Kramers pairs, not with a magnetization.
+
+Relaxation and dynamics use `Relaxation.spinor_backend`. As in `parsec.F90`
+every structure after the first starts from the last mixed potential of the
+structure before with its ionic part replaced (`vnew - vion_old + vion_new`
+for every spin component; a non-collinear loop keeps its exchange-correlation
+field, the direction of the magnetization), and the isolated spin-orbit loops
+(with and without collinear spin) also filter the spinors of the structure
+before, as PARSEC filters its saved wavefunctions; the k-point and
+non-collinear loops keep no subspace between loops and start their first
+eigenproblem from random vectors. The first structure of a `Restart_Run` from
+a spin-orbit `parsec.dat` starts from the potentials of the file as the single
+point does. On AuH (manual movements of 0.03-0.06 bohr) the second and third
+structures take 12 and 15 iterations (16 from the atomic densities; PARSEC 11
+and 13); after a large BFGS step (0.7 bohr) the warm start costs more
+iterations than the atomic densities, in PARSEC as here. The TS-vdW term of a
+converged spinor loop is added as for a scalar calculation. The forces are
+symmetrized as for a scalar calculation (PARSEC
+does so with spin-orbit coupling and non-collinear magnetism too; a magnetic
+structure whose moments break the atoms' group needs `Ignore_Symmetry`). The
+perturbative correction (`SO_PSP` without `SO_from_scratch`) has spinor
+eigenvalues but no spin-orbit total energy here, and PARSEC flags its forces
+as inaccurate: forces, relaxation and dynamics are refused with it. With
+`Double_Grid_Order > 1` the spin-orbit term uses the gradients of the
+double-grid spin-orbit projectors (the fine-point sum of `nonloc.F90`, each
+fine sample with the slope of its radial interpolant). With `Polarizability`
+and `Skip_Force: false` the forces are those of the last of the seven field
+loops (field along -z), as `parsec.F90` computes them after `polar.f90`.
+Refused: forces with LDA+U and k-points (scalar or spinor; PARSEC's LDA+U
+forces are zero).
+
+## Wires and slabs
+
+`Forces/wire_slab.py` follows `forcloc_wire.f90`/`forcloc_slab.f90` (the
+short-range local term, the force on the Gaussian charges in the Hartree field,
+the core and self-consistency terms), `forceion_wire.f90`/`ewald_slab.f90`
+(ion-ion, with the charged sheets of a slab) and `forcnloc.f90` (projectors
+with their images along the periodic directions, Bloch phases for k-points).
+With collinear spin the local terms read the total density and the channel
+averages, the nonlocal term sums both channels; with spin and k-points it uses
+the orbitals the spin k-point loop keeps (`keep_wavefunctions`). LDA+U forces
+(J = 0) are added as for clusters (Fortran's are zero).
+
+Symmetrization (`symm_forces.f90`): over the space group the input reader
+finds for the wire or slab (`symmetries.f90` with `alatt` = `latt_vec` and
+`4 rmax` along the confined directions), non-symmorphic operations included;
+operations whose translation moves the cylinder or slab off itself are dropped
+(PARSEC applies them). A slab has no group unless bandstruc, spin-orbit or an
+NSCF run turns PARSEC's symmetry on; molecular dynamics, manual movements and
+Polarizability have none. The averaged forces also complete a k-point set
+reduced to the irreducible wedge; as for a bulk cell, the movements such a
+wedge cannot follow are refused: molecular dynamics and manual movements with
+an unequally weighted `Kpoint_List` when the structure has a group (PARSEC
+switches the group off for them; a slab without bands, spin-orbit coupling or
+NSCF has none, its list is a plain quadrature), and a relaxation with a
+reduced set whose `Move_Flag` a group operation does not respect.
+
+Relaxation and dynamics use `Relaxation.wire_slab_backend` (the periodic
+backend with `SCF.wire_slab.update_wire_slab_geometry`): after every move
+`back_to_cell` (periodic fractional coordinates into `[-1/2, 1/2]`, the
+confined ones kept), `isolat` (an atom outside the cylinder or slab stops the
+run, error 291), then the local potential, projectors, LDA+U projectors,
+densities and ion-ion terms through the same function as a fresh preparation
+(bit for bit). With collinear spin and k-points the spin k-point loop starts
+every structure from the two channel potentials of the structure before
+(`vnew - vion_old + vion_new`, as the bulk cell).
+
+Validation against Fortran PARSEC (the report of the parity round):
+BFGS of a Na4 wire (with and without its D2h group), of an H2 slab (Gamma and a
+2x2 shifted grid) and of a three-H slab with collinear spin, of polyacetylene
+with 4 shifted k-points; Verlet dynamics of the Na4 wire; manual movements of
+`tests/chain_Na`: positions agree to 1e-5 bohr, energies and forces to the
+printed digits (LDA; PBE cases differ by the known EASYPBE potential).
 
 ## On GPUs and several nodes
 

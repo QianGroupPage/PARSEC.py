@@ -18,15 +18,16 @@ This module also builds the superposed atomic starting density, the nonlinear
 core density used by exchange-correlation, and the isolated ion-ion energy.
 Lengths are in bohr, potentials and energies are in Rydberg, and volume
 densities are in electrons/bohr**3.  Its scope is the scalar, nonperiodic
-single-point path: spin-orbit projectors, periodic replicas, point charges,
-forces, and PARSEC's optional ``Double_grid_order > 1`` fine-grid projector
-averaging are not handled here.
+single-point path: spin-orbit projectors, periodic replicas, point charges
+and forces are not handled here; PARSEC's optional ``Double_grid_order > 1``
+fine-grid projector averaging lives in :mod:`.double_grid`.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Mapping, Sequence
+import warnings
 
 import numpy as np
 import scipy.sparse as sp
@@ -35,13 +36,24 @@ if TYPE_CHECKING:
     from scipy.sparse.linalg import LinearOperator
 
 from ..Grid import RealSpaceGrid
+from ..Grid.cell import is_diagonal_lattice, lattice_plane_spacings
+from ..Grid.pbc import uses_fortran_routines
 from ..models import Atom, SpeciesPotential
 from ..Pseudopotential import (
     ParsecPseudopotential,
     ParsecRadialSpline,
+    apply_fourier_filter,
+    read_fhipp_pseudopotential,
     read_martins_old_pseudopotential,
+    read_martins_wang_pseudopotential,
     read_parsec_pseudopotential,
 )
+from ..Pseudopotential.radial_derivatives import valence_density_table
+
+#: ``eps`` of ``corecd.f90``: a superposed core density whose most negative
+#: value is above ``-CORE_DENSITY_TOLERANCE`` electrons/bohr**3 is set to zero
+#: where negative; a more negative one stops the run (error 381).
+CORE_DENSITY_TOLERANCE = 0.1
 
 
 def load_pseudopotentials(
@@ -59,7 +71,10 @@ def load_pseudopotentials(
     * a species requesting ``SO_PSP`` has a relativistic POTRE file carrying
       the matching p/d spin-orbit channels (without ``SO_PSP`` only the scalar
       components of a relativistic file are used); and
-    * the pseudopotential was generated for the selected XC family.
+    * the pseudopotential was generated for the selected XC family.  A file
+      of another functional is refused for CA and PBE; for the other
+      functionals it is used with a ``UserWarning``, as ``pseudo.f90``
+      (lines 383-394) only warns.
 
     A file's spin-orbit channels (if present) are always parsed into
     :attr:`~parsec_python.Pseudopotential.ParsecPseudopotential.spin_orbit_channel_potentials`
@@ -77,14 +92,46 @@ def load_pseudopotentials(
     """
     result: dict[str, ParsecPseudopotential] = {}
     requested = xc_functional.strip().lower()
-    compatible = {
-        "ca": {"ca", "pz", "lda"},
-        "pbe": {"pb", "pbe"},
-    }
-    if requested not in compatible:
+    if requested not in _REQUIRED_PSEUDOPOTENTIAL_LABELS and (
+        requested not in _EXPECTED_PSEUDOPOTENTIAL_LABELS
+    ):
         raise ValueError(f"unsupported XC functional {xc_functional!r}")
     for symbol, specification in specifications.items():
         physical_element = specification.element_symbol or symbol
+        if specification.pseudopotential_format in {"martins_wang", "fhipp"}:
+            if specification.spin_orbit:
+                # usrinputfile.F90 error 135 for FHIPP; pseudo.f90 reads the
+                # spin-orbit columns of a Martins-Wang file into the wrong
+                # array index.
+                raise ValueError(
+                    f"species {symbol!r}: SO_PSP is not supported for a "
+                    f"{specification.pseudopotential_format} pseudopotential"
+                )
+            if specification.pseudopotential_format == "martins_wang":
+                potential = read_martins_wang_pseudopotential(
+                    specification.path,
+                    symbol=physical_element,
+                    core_cutoff_radius=specification.core_cutoff_radius,
+                )
+                # The file names its local channel; the input names none.
+                if potential.local_channel != specification.local_angular_momentum:
+                    raise ValueError(
+                        f"species {symbol!r}: {specification.path} names the local "
+                        f"channel l={potential.local_channel}, not "
+                        f"l={specification.local_angular_momentum}"
+                    )
+            else:
+                potential = read_fhipp_pseudopotential(
+                    specification.path,
+                    symbol=physical_element,
+                    number_of_channels=specification.number_of_channels,
+                    electrons_per_orbital=specification.electrons_per_orbital,
+                    core_cutoff_radius=specification.core_cutoff_radius,
+                    nonlinear_core_correction=specification.nonlinear_core_correction,
+                )
+                potential.validate_local_channel(specification.local_angular_momentum)
+            result[symbol] = potential
+            continue
         if specification.pseudopotential_format == "martins_old":
             # An old Martins file names neither its element nor its
             # functional, so there is nothing to check them against, as in
@@ -118,14 +165,76 @@ def load_pseudopotentials(
                 f"does not contain spin-orbit potentials (relativity="
                 f"{potential.relativity!r})"
             )
-        pp_xc = potential.correlation.strip().lower()
-        if pp_xc not in compatible[requested]:
-            raise ValueError(
-                f"{specification.path} was generated for {potential.correlation!r}, "
-                f"not the requested {requested.upper()} functional"
+        if not pseudopotential_matches_functional(potential, requested):
+            if requested in _REQUIRED_PSEUDOPOTENTIAL_LABELS:
+                raise ValueError(
+                    f"{specification.path} was generated for {potential.correlation!r}, "
+                    f"not the requested {requested.upper()} functional"
+                )
+            warnings.warn(
+                f"{specification.path} was generated for "
+                f"{potential.correlation!r}, not for the requested {requested} "
+                "functional; PARSEC warns ('correlation potential does not "
+                "match') and uses the file, and so does this run",
+                UserWarning,
+                stacklevel=2,
             )
         result[symbol] = potential
     return result
+
+
+def cluster_centering_shift(
+    atoms: Sequence[Atom], threshold: float = 0.1
+) -> np.ndarray | None:
+    """The translation :func:`center_cluster_geometry` subtracts, or ``None``.
+
+    ``(R_min + R_max)/2`` of the nuclei where its length exceeds
+    ``threshold`` (bohr), ``None`` where the atoms stay where they are.
+    ``initial.f90`` moves the point charges of the input by the same vector.
+    """
+    positions = np.asarray([atom.position for atom in atoms], dtype=float)
+    shift = 0.5 * (positions.min(axis=0) + positions.max(axis=0))
+    if np.linalg.norm(shift) <= threshold:
+        return None
+    return shift
+
+
+# The correlation labels a pseudopotential file must carry for the CA and
+# PBE functionals: any other label is refused.
+_REQUIRED_PSEUDOPOTENTIAL_LABELS = {
+    "ca": frozenset({"ca", "pz", "lda"}),
+    "pbe": frozenset({"pb", "pbe"}),
+}
+# For the other functionals pseudo.f90 (lines 383-394) only warns when the
+# label of the file differs from the two-letter code of the functional.
+_EXPECTED_PSEUDOPOTENTIAL_LABELS = {
+    "pw92": frozenset({"pl", "pw92", "pwlda"}),
+    "pw91": frozenset({"pw", "pw91", "pwgga"}),
+    "xalpha": frozenset({"xa"}),
+    "wigner": frozenset({"wi"}),
+    "hedin_lundqvist": frozenset({"hl"}),
+    "lb94": frozenset({"lb"}),
+    "casida_salahub": frozenset({"cs"}),
+}
+
+
+def pseudopotential_matches_functional(
+    potential: ParsecPseudopotential, xc_functional: str
+) -> bool:
+    """Whether the correlation label of a POTRE file names ``xc_functional``.
+
+    An old Martins file names no functional and matches every one.
+    """
+
+    labels = _REQUIRED_PSEUDOPOTENTIAL_LABELS.get(
+        xc_functional, _EXPECTED_PSEUDOPOTENTIAL_LABELS.get(xc_functional)
+    )
+    if labels is None:
+        raise ValueError(f"unsupported XC functional {xc_functional!r}")
+    correlation = getattr(potential, "correlation", None)
+    if not correlation:
+        return True
+    return correlation.strip().lower() in labels
 
 
 def center_cluster_geometry(atoms: Sequence[Atom], threshold: float = 0.1) -> tuple[Atom, ...]:
@@ -150,6 +259,41 @@ def center_cluster_geometry(atoms: Sequence[Atom], threshold: float = 0.1) -> tu
     if np.linalg.norm(shift) <= threshold:
         return tuple(atoms)
     return tuple(Atom(atom.symbol, atom.position - shift) for atom in atoms)
+
+
+def center_slab_geometry(
+    atoms: Sequence[Atom], threshold: float = 0.1
+) -> tuple[tuple[Atom, ...], float]:
+    """PARSEC's re-centring of a slab along its confined direction, in bohr.
+
+    Translation of ``initial.f90:201-228`` (``pbc%per == 2``): with ``z_min``
+    and ``z_max`` the extreme z coordinates of all atoms, the shift is
+    ``z_mov = (z_min + z_max)/2``; when ``|z_mov| > threshold`` every atom
+    moves by ``-z_mov`` along z, so that the highest and the lowest atom are
+    equally far from the mid-plane ``z = 0`` of the slab box.  The in-plane
+    coordinates are kept.  Returns ``(atoms, z_mov)``, with the atoms
+    unchanged and ``z_mov = 0.0`` below the threshold.
+
+    PARSEC applies it in a first run only (``istart == 0``) and not to
+    ``manual`` movements, and moves neither point charges nor charged sheets
+    (a cluster's point charges move with its atoms, a slab's do not); the
+    caller decides when it applies.  Wires are not re-centred.
+    """
+
+    if not atoms:
+        return tuple(atoms), 0.0
+    heights = [float(np.asarray(atom.position, dtype=float)[2]) for atom in atoms]
+    shift = 0.5 * (min(heights) + max(heights))
+    if abs(shift) <= threshold:
+        return tuple(atoms), 0.0
+    offset = np.array([0.0, 0.0, shift])
+    return (
+        tuple(
+            replace(atom, position=np.asarray(atom.position, dtype=float) - offset)
+            for atom in atoms
+        ),
+        shift,
+    )
 
 
 def build_local_ionic_potential(
@@ -185,6 +329,7 @@ def build_local_ionic_potential(
             specification.local_angular_momentum,
             use_spline=specification.use_spline,
             spline_padding_width=grid.settings.stencil_half_width,
+            direct=specification.old_interpolation,
         )
     return total
 
@@ -253,6 +398,7 @@ def superpose_atomic_density(
     lattice_vectors: np.ndarray | None = None,
     *,
     core: bool = False,
+    periodic_dimensions: int = 3,
 ) -> np.ndarray:
     """Superpose spherical atomic densities on the molecular grid.
 
@@ -278,7 +424,17 @@ def superpose_atomic_density(
     Stored valence densities follow PARSEC's linear ``initchrg`` interpolation
     and all atomic-density contributions are zero beyond their radial-table
     cutoff.  Core density may use the optional spline setting.
+
+    A builder installed with :func:`set_atomic_density_provider` takes a
+    periodic cell first (importing :mod:`parsec_python.acceleration` installs
+    one that returns this sum bit for bit).
     """
+    if _atomic_density_provider is not None and lattice_vectors is not None:
+        provided = _atomic_density_provider(
+            grid, atoms, potentials, specifications, lattice_vectors, core
+        )
+        if provided is not None:
+            return provided
     density = np.zeros(grid.size, dtype=float)
     for atom in atoms:
         specification = specifications[atom.symbol]
@@ -289,21 +445,47 @@ def superpose_atomic_density(
             continue
 
         position = np.asarray(atom.position, dtype=np.float64)
-        # A periodic cell sums images of the atom out to where its density is below 1e-16; an isolated system has
-        # one center and keeps the cutoff of the table.
-        support = (
-            potential.interpolation_cutoff
-            if lattice_vectors is None
-            else atomic_density_support_radius(potential, specification, core=core)
-        )
-        translations = (
-            np.zeros((1, 3))  # No translations if 0D
-            if lattice_vectors is None
-            else _periodic_image_translations(lattice_vectors, support)
-        )
+        if lattice_vectors is not None and periodic_dimensions == 2:
+            # a slab of Andrew Grieder's slab_boundary: the images along the in-plane vectors, to the table's end
+            support = potential.interpolation_cutoff
+            translations = _periodic_image_translations(lattice_vectors, support, periodic_dimensions)
+        elif lattice_vectors is not None and (
+            not uses_fortran_routines(grid)
+            # Two sums of the Fortran-derived routines take his too (the same fields to 2.4e-10 Ry):
+            # Fortran's general (oblique) grid, whose readable sum to the end of the table took 34-300 s, and a
+            # Cubic_Spline core density of a bulk cell (the spline of the whole table at every image: 137 s, Ge3)
+            or (
+                not getattr(grid, "is_confined_periodic", False)
+                and (getattr(grid, "is_general_periodic", False) or (core and specification.use_spline))
+            )
+        ):
+            # Andrew Grieder's periodic sum: the images of the atom out to where its density is below 1e-16
+            support = atomic_density_support_radius(potential, specification, core=core)
+            translations = _periodic_image_translations(lattice_vectors, support)
+        else:
+            # an isolated system (one centre), and the Fortran-derived routines: the cutoff of the table
+            support = potential.interpolation_cutoff
+            translations = _image_translations(grid, lattice_vectors, position, support)
         reconstruct_from_wavefunctions = not core and not specification.read_valence_density
-        if reconstruct_from_wavefunctions:
-            radial_density = _valence_density_table(potential, specification)
+        # A table interpolated linearly below: the density rebuilt from the
+        # radial functions, or the one fourier_f.f90 filtered, which replaces
+        # either valence density.
+        tabulated = reconstruct_from_wavefunctions
+        if not core and potential.filtered_valence_density is not None:
+            tabulated = True
+            radial_density = np.asarray(potential.filtered_valence_density, dtype=float)
+        elif reconstruct_from_wavefunctions:
+            # u_l is the reduced radial function: the normalized spherical
+            # orbital is u_l(r)Y_lm(Omega)/r.  Spherical occupation averaging
+            # produces f_l*u_l(r)**2/(4*pi*r**2).
+            radial_density = np.zeros_like(potential.radii)
+            for angular_momentum, wavefunction in potential.radial_wavefunctions.items():
+                radial_density += (
+                    potential.channel_occupations.get(angular_momentum, 0.0)
+                    * wavefunction
+                    * wavefunction
+                    / (4.0 * np.pi * potential.radii * potential.radii)
+                )
 
         for translation in translations:
             rows, _, radius = _support_finder(grid, position + translation, support)
@@ -311,7 +493,7 @@ def superpose_atomic_density(
             if not np.any(inside):
                 continue
             rows, radius = rows[inside], radius[inside]
-            if reconstruct_from_wavefunctions:
+            if tabulated:
                 density[rows] += np.interp(
                     radius,
                     potential.radii,
@@ -329,6 +511,61 @@ def superpose_atomic_density(
                     spline_padding_width=grid.settings.stencil_half_width,
                 )
     return density
+
+
+def check_core_density(core_density: np.ndarray) -> np.ndarray:
+    """Apply the sign check of ``corecd.f90:193-213`` to a core density.
+
+    A superposed core density with negative values whose most negative one
+    lies within ``CORE_DENSITY_TOLERANCE`` of zero is set to zero there (a
+    new array); a more negative one raises ``ValueError`` (Fortran error
+    381).  Without negative values the array itself is returned.
+    """
+
+    values = np.asarray(core_density)
+    if values.size == 0:
+        return values
+    lowest = float(np.min(values))
+    if lowest >= 0.0:
+        return values
+    if abs(lowest) < CORE_DENSITY_TOLERANCE:
+        return np.maximum(values, 0.0)
+    raise ValueError(
+        "negative core-correction charge density: its most negative value is "
+        f"{lowest:.6g} electrons/bohr**3 (PARSEC stops with error 381 below "
+        f"-{CORE_DENSITY_TOLERANCE:g})"
+    )
+
+
+def apply_fourier_filters(
+    potentials: Mapping[str, ParsecPseudopotential],
+    specifications: Mapping[str, SpeciesPotential],
+    spacing: float,
+) -> dict[str, ParsecPseudopotential]:
+    """Fourier-filter the species that ask for it (``fourier_f.f90``).
+
+    ``spacing`` is the grid spacing of the periodic grid in bohr.  Species
+    without ``Alpha_Filter``/``Core_Filter`` keep their tables; see
+    :func:`parsec_python.Pseudopotential.apply_fourier_filter`.
+    """
+
+    result = dict(potentials)
+    for symbol, specification in specifications.items():
+        if not specification.has_fourier_filter:
+            continue
+        potential = potentials[symbol]
+        result[symbol] = apply_fourier_filter(
+            potential,
+            specification.local_angular_momentum,
+            spacing=spacing,
+            alpha=specification.fourier_filter_alpha,
+            beta1=specification.fourier_filter_beta1,
+            core_alpha=specification.fourier_filter_core,
+            valence_density=valence_density_table(
+                potential, read_from_file=specification.read_valence_density
+            ),
+        )
+    return result
 
 
 def normalize_density(
@@ -591,8 +828,26 @@ def set_support_finder(finder=None) -> None:
     _support_finder = dense_support if finder is None else finder
 
 
+_atomic_density_provider = None
+
+
+def set_atomic_density_provider(provider=None) -> None:
+    """Install (or, with ``None``, remove) a builder of the superposed densities of a periodic cell.
+
+    ``provider(grid, atoms, potentials, specifications, lattice_vectors, core)`` returns the
+    density of :func:`superpose_atomic_density`, or ``None`` for an input it does not take (the
+    sum of :func:`superpose_atomic_density` then runs).  Importing :mod:`parsec_python.acceleration`
+    installs the host builder of ``parsec_python.acceleration.V_ion.periodic_setup`` (the same
+    sum in blocks of images, bit for bit); the accelerated command line installs the device builder
+    of ``parsec_python.acceleration.V_ion.periodic_device`` for the forces, relaxation and dynamics
+    of a periodic cell.
+    """
+    global _atomic_density_provider
+    _atomic_density_provider = provider
+
+
 def _periodic_image_translations(
-    lattice_vectors: np.ndarray, support_radius: float
+    lattice_vectors: np.ndarray, support_radius: float, dimensions: int = 3
 ) -> np.ndarray:
     """Enumerate periodic translations whose projector image can reach the cell.
 
@@ -603,23 +858,57 @@ def _periodic_image_translations(
     plain, exact finite sum; an image whose support ball cannot reach any grid
     point contributes exactly zero, not approximately.
 
-    Every atom position lies inside the cell (validated by the caller), so in
-    fractional coordinates an image ``n`` cells away along lattice vector ``i``
-    is offset by at least ``|n_i|-1`` from any point of the cell, and the
-    fractional coordinate along ``i`` of a point at distance ``R`` changes by
-    at most ``R/d_i`` with ``d_i`` the distance between the lattice planes
-    ``i`` (``1/|b_i|``, ``b`` the reciprocal vectors without ``2 pi``).
-    Translations with ``|n_i|`` beyond ``ceil(R/d_i) + 1`` cannot reach the
-    cell and are excluded.  For an orthorhombic cell ``d_i`` is the side length.
+    For each axis of an orthorhombic cell (diagonal ``lattice_vectors``), an
+    image ``n`` cells away is offset by at least ``(n-1)`` times that axis's
+    side length from a point already inside the cell (every atom position is
+    translated into ``[0, side_length)`` by the periodic preparation), so
+    translations with ``n`` beyond ``ceil(support_radius/side_length) + 1``
+    cannot reach the cell and are excluded.
+
+    A general cell uses the same bound with the distance between lattice
+    planes, ``2*pi/|b_i|``, in place of the side length: grid points and
+    atoms have fractional coordinates in ``[0, 1)``, so an image ``n_i``
+    planes away along ``b_i`` lies at least ``(|n_i|-1)`` plane distances
+    from every grid point.  (Fortran's ``nonloc.F90``, ``initchrg.f90`` and
+    ``corecd.f90`` use ``+-1`` replicas only; this bound includes them.)
     """
 
-    lattice_vectors = np.asarray(lattice_vectors, dtype=float)
-    plane_spacing = 1.0 / np.linalg.norm(np.linalg.inv(lattice_vectors), axis=0)
-    max_index = np.ceil(support_radius / plane_spacing).astype(int) + 1
+    if not is_diagonal_lattice(lattice_vectors) or np.any(np.diag(lattice_vectors) <= 0.0):
+        vectors = np.asarray(lattice_vectors, dtype=float)
+        spacing = lattice_plane_spacings(vectors)
+        max_index = np.ceil(support_radius / spacing).astype(int) + 1
+        max_index[dimensions:] = 0  # a slab repeats only along its in-plane lattice vectors
+        ranges = [np.arange(-m, m + 1) for m in max_index]
+        grid = np.meshgrid(*ranges, indexing="ij")
+        integer_combinations = np.column_stack([axis.reshape(-1) for axis in grid])
+        return integer_combinations @ vectors
+    side_lengths = np.diag(lattice_vectors)
+    max_index = np.ceil(support_radius / side_lengths).astype(int) + 1
+    max_index[dimensions:] = 0  # a slab repeats only along its in-plane lattice vectors
     ranges = [np.arange(-m, m + 1) for m in max_index]
     grid = np.meshgrid(*ranges, indexing="ij")
     integer_combinations = np.column_stack([axis.reshape(-1) for axis in grid])
-    return integer_combinations @ lattice_vectors
+    return integer_combinations * side_lengths
+
+
+def _image_translations(
+    grid, lattice_vectors: np.ndarray | None, position: np.ndarray, radius: float
+) -> np.ndarray:
+    """The translations of an atom's images that a radial function can reach.
+
+    No translation for an isolated grid, those of
+    :func:`_periodic_image_translations` for a periodic cell, and for the grid
+    of a wire or slab
+    (:class:`~parsec_python.Grid.confined.ConfinedPeriodicGrid`) the
+    translations along its periodic directions only, from the atom's own
+    position (``lattice_vectors`` is then not used).
+    """
+
+    if getattr(grid, "is_confined_periodic", False):
+        return grid.image_translations(position, radius)
+    if lattice_vectors is None:
+        return np.zeros((1, 3))  # No translations if 0D
+    return _periodic_image_translations(lattice_vectors, radius)
 
 
 def build_nonlocal_projectors(
@@ -629,6 +918,7 @@ def build_nonlocal_projectors(
     specifications: Mapping[str, SpeciesPotential],
     lattice_vectors: np.ndarray | None = None,
     k_point: np.ndarray | None = None,
+    periodic_dimensions: int = 3,
 ) -> NonlocalProjectorOperator:
     """Construct the separable nonlocal pseudopotential on the active grid.
 
@@ -657,9 +947,10 @@ def build_nonlocal_projectors(
     One sparse CSC column is created for every ``(atom,l,m)``.  The selected
     local channel is skipped because it is already included by
     :func:`build_local_ionic_potential`.  Projectors are sampled directly on
-    the active grid, matching PARSEC's default ``Double_grid_order=1``.  Its
-    optional finer ``Double_grid_order > 1`` subgrid averaging is not part of
-    this implementation.
+    the active grid, matching PARSEC's default ``Double_grid_order=1``.  With
+    ``grid.settings.double_grid_order > 1`` they are averaged over PARSEC's
+    finer subgrid instead
+    (:func:`parsec_python.V_ion.double_grid.build_double_grid_projectors`).
 
     ``lattice_vectors``, if given, sums each ``(atom, l, m)`` projector over
     every periodic image whose support ball can reach the grid (see
@@ -677,6 +968,12 @@ def build_nonlocal_projectors(
     ``projectors`` become complex.  ``None`` (the default) is the Gamma-point case, where every
     phase is exactly 1 and the projectors stay real.
     """
+    if int(getattr(grid.settings, "double_grid_order", 1)) > 1:
+        from .double_grid import build_double_grid_projectors
+
+        return build_double_grid_projectors(
+            grid, atoms, potentials, specifications, lattice_vectors, k_point
+        )
     rows: list[np.ndarray] = []
     columns: list[np.ndarray] = []
     values: list[np.ndarray] = []
@@ -700,11 +997,11 @@ def build_nonlocal_projectors(
         position = np.asarray(atom.position, dtype=np.float64)
 
         support_radius = _projector_support_radius(potential)
-        translations = (
-            np.zeros((1, 3))  # No translations if 0D
-            if lattice_vectors is None
-            else _periodic_image_translations(lattice_vectors, support_radius)
-        )
+        if lattice_vectors is not None and periodic_dimensions == 2:
+            # a slab of Andrew Grieder's slab_boundary: images along its in-plane vectors only
+            translations = _periodic_image_translations(lattice_vectors, support_radius, periodic_dimensions)
+        else:
+            translations = _image_translations(grid, lattice_vectors, position, support_radius)
 
         # KB projectors are localized.  Restrict all following interpolation
         # and harmonic work to grid points within their radial support.

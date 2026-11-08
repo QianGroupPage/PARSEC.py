@@ -180,8 +180,15 @@ def build_nonlocal_projector_gradients(
     those of :func:`parsec_python.V_ion.build_nonlocal_projectors` for an
     isolated system.  As in ``nonloc.F90``, a distance below the first radial
     sample is replaced by that sample, also in the direction ``d/|d|``.
+    With ``Double_Grid_Order > 1`` the gradients are averaged over the double
+    grid as the projectors are (:func:`double_grid_projector_gradients`).
     """
 
+    order = int(getattr(grid.settings, "double_grid_order", 1))
+    if order > 1:
+        return double_grid_projector_gradients(
+            grid, atoms, potentials, specifications, order=order
+        )
     rows: list[np.ndarray] = []
     columns: list[np.ndarray] = []
     values: tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]] = ([], [], [])
@@ -247,6 +254,112 @@ def build_nonlocal_projector_gradients(
                 columns.append(np.full(support_rows.size, column, dtype=np.int64))
                 for component in range(3):
                     values[component].append(gradient[:, component])
+                column += 1
+
+    def assemble(component: int) -> sp.csc_matrix:
+        if column == 0:
+            return sp.csc_matrix((grid.size, 0), dtype=float)
+        return sp.coo_matrix(
+            (
+                np.concatenate(values[component]),
+                (np.concatenate(rows), np.concatenate(columns)),
+            ),
+            shape=(grid.size, column),
+        ).tocsc()
+
+    return NonlocalProjectorGradients(
+        components=(assemble(0), assemble(1), assemble(2)),
+        signs=np.asarray(signs, dtype=float),
+        labels=tuple(labels),
+    )
+
+
+def double_grid_projector_gradients(
+    grid: RealSpaceGrid,
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    specifications: Mapping[str, SpeciesPotential],
+    *,
+    order: int,
+) -> NonlocalProjectorGradients:
+    """Projector gradients averaged over the Ono-Hirose double grid.
+
+    ``nonloc.F90:544-568``: every fine point of a coarse point that lies
+    within the projector radius adds ``w(dx) w(dy) w(dz)`` times
+    ``w(|d|)*grad Y + w'(|d|)*Y*d/|d|``, with ``|d|`` clamped below to the
+    first radial sample.  The coarse points and the column order are those of
+    :func:`parsec_python.V_ion.double_grid.build_double_grid_projectors`;
+    ``order = 1`` gives :func:`build_nonlocal_projector_gradients` exactly.
+    """
+
+    from ..V_ion.double_grid import double_grid_support
+
+    rows: list[np.ndarray] = []
+    columns: list[np.ndarray] = []
+    values: tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]] = ([], [], [])
+    signs: list[float] = []
+    labels: list[tuple[int, int, int]] = []
+    column = 0
+    sqrt_dv = np.sqrt(grid.volume_element)
+    tables: dict[tuple[str, int], tuple] = {}
+
+    for atom_index, atom in enumerate(atoms):
+        potential = potentials[atom.symbol]
+        specification = specifications[atom.symbol]
+        local_l = specification.local_angular_momentum
+        support = double_grid_support(
+            grid.coordinates,
+            np.asarray(atom.position, dtype=np.float64),
+            _projector_support_radius(potential),
+            order,
+            float(grid.spacing),
+        )
+        points, fine = support.radius.shape
+        relative = support.relative.reshape(-1, 3)
+        clamped = np.maximum(support.radius.reshape(-1), potential.radii[0])
+        inverse = 1.0 / clamped
+        unit = relative * inverse[:, None]
+
+        for angular_momentum in sorted(potential.radial_wavefunctions):
+            if angular_momentum == local_l:
+                continue
+            key = (atom.symbol, angular_momentum)
+            if key not in tables:
+                radial_grid, radial_slope, sign = radial_projector_with_derivative(
+                    potential, angular_momentum, local_l
+                )
+                spline = (
+                    ParsecRadialSpline.from_positive_grid(
+                        potential.radii, radial_grid, grid.settings.stencil_half_width
+                    )
+                    if specification.use_spline
+                    else None
+                )
+                tables[key] = (radial_grid, radial_slope, sign, spline)
+            radial_grid, radial_slope, sign, spline = tables[key]
+            if spline is not None:
+                radial = spline(clamped)
+                slope = spline_derivative(spline, clamped)
+            else:
+                radial = np.interp(clamped, potential.radii, radial_grid, right=0.0)
+                slope = np.interp(clamped, potential.radii, radial_slope, right=0.0)
+            harmonics, harmonic_gradients = real_harmonics_with_gradients(
+                angular_momentum, unit, inverse
+            )
+            for harmonic_index in range(2 * angular_momentum + 1):
+                signs.append(sign)
+                labels.append((atom_index, angular_momentum, harmonic_index))
+                gradient = sqrt_dv * (
+                    radial[:, None] * harmonic_gradients[:, harmonic_index, :]
+                    + (slope * harmonics[:, harmonic_index])[:, None] * unit
+                )
+                summed = np.einsum(
+                    "pm,pmc->pc", support.weights, gradient.reshape(points, fine, 3)
+                )
+                rows.append(support.rows)
+                columns.append(np.full(support.rows.size, column, dtype=np.int64))
+                for component in range(3):
+                    values[component].append(summed[:, component])
                 column += 1
 
     def assemble(component: int) -> sp.csc_matrix:
@@ -507,6 +620,7 @@ __all__ = [
     "build_nonlocal_projector_gradients",
     "build_periodic_projector_gradients",
     "contract_nonlocal_forces",
+    "double_grid_projector_gradients",
     "gradient_columns_for",
     "nonlocal_forces",
     "real_harmonics_with_gradients",

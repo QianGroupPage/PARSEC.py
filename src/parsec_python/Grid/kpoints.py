@@ -1,24 +1,43 @@
-"""Brillouin-zone k-point sampling for an orthorhombic periodic cell.
+"""Brillouin-zone k-point sampling for a periodic cell.
 
-Two sources are supported: a uniform, unreduced Monkhorst-Pack grid
-(:func:`monkhorst_pack_grid`) and a user-supplied explicit list
-(:func:`explicit_kpoints`, :func:`read_kpoint_file`, Fortran's
-``Kpoint_Method: manual``).  The SCF drivers currently require every
-k-point to carry the *same* weight (no symmetry-reduced weighted lists); the
-Monkhorst-Pack grid satisfies that by construction and an explicit list must
-too.  This deliberately keeps :mod:`~parsec_python.SCF.kpoints`'s Fermi-level
-pooling simple: reusing
-:func:`~parsec_python.Occupations.fermi_dirac.fermi_occupations`'s existing
-scalar ``degeneracy`` parameter (``degeneracy = 2*weight``, spin-unpolarized)
-requires every pooled eigenvalue to share one scale factor, which only holds
-when every k-point's weight is identical.
+Three sources are supported:
+
+* this port's uniform, unreduced Monkhorst-Pack grid
+  (:func:`monkhorst_pack_grid`, fractions ``(2i-n-1)/(2n)``, equal weights),
+  used by a ``Kpoint_Method: mp`` input without a ``Monkhorst_Pack_Shift``
+  block;
+* Fortran PARSEC's grid ``k = ((i-1) + s_i)/n_i`` reduced to the irreducible
+  wedge by the space group and time reversal
+  (:func:`irreducible_monkhorst_pack`, ``irrbz.f90``), used by an input that
+  gives ``Monkhorst_Pack_Shift``: unequal weights ``count/N``;
+* a user-supplied explicit list (:func:`explicit_kpoints`,
+  :func:`read_kpoint_file`, Fortran's ``Kpoint_Method: manual``), whose
+  weights are normalized to one as ``init_var.F90`` does.
+
+For odd ``n`` the first grid equals Fortran's with ``s = 0`` modulo
+reciprocal lattice vectors, for even ``n`` Fortran's with ``s = 0.5``; Fortran
+without a shift block uses ``s = 0`` (Gamma-centred) for every ``n``.  The
+finite-difference Bloch Hamiltonian is not exactly periodic in ``k``, so
+equivalent points give slightly different eigenvalues; the Fortran path keeps
+Fortran's representatives.
+
+Equal weights keep the scalar-``degeneracy`` Fermi-level pooling of the SCF
+drivers (``degeneracy = 2*weight``); unequal weights use the per-state
+weights of :func:`~parsec_python.Occupations.fermi_dirac.fermi_occupations`
+(Fortran ``flevel``).
 """
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+from functools import lru_cache
+
 import numpy as np
 
 from ..models import PeriodicCell
+from .cell import is_diagonal_lattice, reciprocal_lattice
+from .space_group import fortran_anint, fortran_reciprocal_lattice
 
 
 def monkhorst_pack_grid(
@@ -44,16 +63,30 @@ def monkhorst_pack_grid(
 
     ``k_points`` has shape ``(n1*n2*n3, 3)``, ``weights`` has shape
     ``(n1*n2*n3,)`` and sums to 1.
+
+    A general (non-orthorhombic) cell uses the same fractions of its
+    reciprocal lattice vectors, ``k = sum_a f_a b_a`` with
+    ``b = 2*pi*inv(A)^T`` (rows), in Cartesian 1/bohr.  (Fortran's set is
+    ``f = (i-1+s)/n`` in ``[0, 1)``, see report section 1.3: equal modulo
+    ``G`` to this one for odd ``n`` without a shift.)
     """
     dims = tuple(int(value) for value in dimensions)
     if len(dims) != 3 or any(value < 1 for value in dims):
         raise ValueError("dimensions must be three positive integers")
-    if np.allclose(cell.lattice_vectors, np.diag(np.diag(cell.lattice_vectors)), atol=1.0e-10):
-        side_lengths = np.diag(cell.lattice_vectors)
-        reciprocal = 2.0 * np.pi / side_lengths
-    else:
-        # rows b_i of 2 pi A^{-T}: k = sum_i f_i b_i
-        reciprocal = 2.0 * np.pi * np.linalg.inv(np.asarray(cell.lattice_vectors)).T
+    if not is_diagonal_lattice(cell.lattice_vectors):
+        shift = np.asarray(shift, dtype=float)
+        if shift.shape != (3,):
+            raise ValueError("shift must have shape (3,)")
+        fractional_axes = [
+            (2.0 * np.arange(1, n + 1) - n - 1) / (2.0 * n) for n in dims
+        ]
+        grids = np.meshgrid(*fractional_axes, indexing="ij")
+        fractional = np.column_stack([axis.reshape(-1) for axis in grids])
+        k_points = fractional @ reciprocal_lattice(cell.lattice_vectors) + shift[None, :]
+        n_total = int(np.prod(dims))
+        return k_points, np.full(n_total, 1.0 / n_total, dtype=float)
+    side_lengths = np.diag(cell.lattice_vectors)
+    reciprocal = 2.0 * np.pi / side_lengths
     shift = np.asarray(shift, dtype=float)
     if shift.shape != (3,):
         raise ValueError("shift must have shape (3,)")
@@ -203,10 +236,330 @@ def band_path_kpoints(
     return segments
 
 
+IBZ_TOLERANCE = 1.0e-8
+"""``tol_bz`` of ``irrbz.f90`` (and of ``translate01``)."""
+
+
+def translate01(vector) -> list[float]:
+    """Fortran ``translate01`` (``irrbz.f90:213-254``), component by component.
+
+    ``q = mod(k + 1/2, 1) - 1/2``, set to zero below ``1e-8`` in magnitude and
+    raised by one when negative.  The result lies in ``[0, 1)`` for
+    ``k > -1/2`` (every input of ``irrbz``); the operations are those of the
+    Fortran, so the bits agree.
+    """
+
+    result = []
+    for value in vector:
+        shifted = float(value) + 0.5
+        shifted = math.fmod(shifted, 1.0)
+        shifted = shifted - 0.5
+        if abs(shifted) < IBZ_TOLERANCE:
+            shifted = 0.0
+        if shifted < 0.0:
+            shifted = shifted + 1.0
+        result.append(shifted)
+    return result
+
+
+def _times(matrix, vector) -> list[float]:
+    """``matvec3('N', matrix, vector)`` from ``+0.0``, in Fortran's order."""
+
+    return [
+        ((0.0 + matrix[i][0] * vector[0]) + matrix[i][1] * vector[1]) + matrix[i][2] * vector[2]
+        for i in range(3)
+    ]
+
+
+def _dot(vector) -> float:
+    return ((0.0 + vector[0] * vector[0]) + vector[1] * vector[1]) + vector[2] * vector[2]
+
+
+def _translate01_rows(values: np.ndarray) -> np.ndarray:
+    """:func:`translate01` of every row of ``values`` (elementwise the same)."""
+
+    shifted = np.fmod(values + 0.5, 1.0) - 0.5
+    shifted = np.where(np.abs(shifted) < IBZ_TOLERANCE, 0.0, shifted)
+    return np.where(shifted < 0.0, shifted + 1.0, shifted)
+
+
+def _first_equivalent(krot, representatives: np.ndarray, inversions, bvec) -> int | None:
+    """The first representative ``k_IBZ`` with ``|B translate01(krot - inv k_IBZ)|^2 < tol``.
+
+    In Fortran's order: representatives in turn, for each ``inv = +1`` then
+    ``-1`` (``irrbz.f90:96-127``).
+    """
+
+    if representatives.shape[0] == 0:
+        return None
+    found = None
+    for inv in inversions:
+        difference = _translate01_rows(np.asarray(krot)[None, :] - inv * representatives)
+        cartesian = [
+            ((0.0 + bvec[i][0] * difference[:, 0]) + bvec[i][1] * difference[:, 1])
+            + bvec[i][2] * difference[:, 2]
+            for i in range(3)
+        ]
+        norm2 = ((0.0 + cartesian[0] * cartesian[0]) + cartesian[1] * cartesian[1]) + (
+            cartesian[2] * cartesian[2]
+        )
+        hits = np.flatnonzero(norm2 < IBZ_TOLERANCE)
+        if hits.size and (found is None or hits[0] < found):
+            found = int(hits[0])
+    return found
+
+
+@dataclass(frozen=True)
+class MonkhorstPackSampling:
+    """Fortran PARSEC's Monkhorst-Pack sampling, reduced to the irreducible wedge.
+
+    ``fractional`` are the representatives in reciprocal-lattice
+    coordinates, unfolded as ``irrbz`` keeps them (each is the first grid
+    point met of its star); ``k_points = B f`` are Cartesian (1/bohr, rows),
+    the k-points of the Bloch Hamiltonians.  ``counts`` are the numbers of
+    full-grid points each represents, ``weights`` the normalized weights
+    ``counts/N`` (renormalized to sum one as ``init_var.F90:365-367``).
+    ``kinetic_energies`` are irrbz's ``E_kin`` column (Ry; see
+    :func:`irreducible_monkhorst_pack` for what it measures).
+
+    ``grid_map`` is Fortran's ``kptgrid``: ``grid_map[i, j, l]`` is the
+    0-based index into ``k_points`` of the full-grid point
+    ``((i + s1)/n1, (j + s2)/n2, (l + s3)/n3)``, ``i = 0 .. n1-1`` (Fortran's
+    ``kptgrid(i+1, j+1, l+1) - 1``); :meth:`full_grid_fractional` lists those
+    points.  The tetrahedron DOS needs it.  ``time_reversal`` says whether
+    ``k`` and ``-k`` were identified; ``operations`` is the order of the group
+    used.
+    """
+
+    dimensions: tuple[int, int, int]
+    shift: tuple[float, float, float]
+    fractional: np.ndarray
+    k_points: np.ndarray
+    weights: np.ndarray
+    counts: np.ndarray
+    kinetic_energies: np.ndarray
+    grid_map: np.ndarray
+    time_reversal: bool = True
+    operations: int = 1
+
+    @property
+    def count(self) -> int:
+        return int(self.k_points.shape[0])
+
+    @property
+    def full_grid_size(self) -> int:
+        return int(np.prod(self.dimensions))
+
+    @property
+    def printed_weights(self) -> np.ndarray:
+        """``count/N`` as ``irrbz`` prints it (before the renormalization)."""
+
+        return np.asarray(self.counts, dtype=np.float64) / float(self.full_grid_size)
+
+    def full_grid_fractional(self) -> np.ndarray:
+        """``(n1, n2, n3, 3)``: the fractional coordinates of every full-grid point."""
+
+        n1, n2, n3 = self.dimensions
+        s1, s2, s3 = self.shift
+        axes = [
+            (np.arange(n, dtype=np.float64) + s) / float(n)
+            for n, s in ((n1, s1), (n2, s2), (n3, s3))
+        ]
+        grids = np.meshgrid(*axes, indexing="ij")
+        return np.stack(grids, axis=-1)
+
+
+def irreducible_monkhorst_pack(
+    lattice_vectors,
+    dimensions,
+    shift,
+    reciprocal_rotations=None,
+    *,
+    time_reversal: bool = True,
+) -> MonkhorstPackSampling:
+    """Translation of ``irrbz.f90`` (lines 12-213): the IBZ of a shifted MP grid.
+
+    The full grid is ``k = ((i-1) + s_i)/n_i`` (reciprocal-lattice
+    coordinates), visited with the last index fastest.  A point is rotated by
+    every ``G`` of ``reciprocal_rotations`` (Fortran ``symm%gmtrx``, the
+    identity first; ``None`` is the identity alone), folded by
+    :func:`translate01`, and compared with every representative found so far,
+    directly and (``time_reversal``) with the sign reversed:
+    ``|B translate01(G k - inv k_IBZ)|^2 < 1e-8``.  The first match counts the
+    point to that representative; a point without one becomes a new
+    representative, stored unfolded.  Fortran's "replace by the shortest
+    member" branch is kept as written, which makes it dead (``norm2`` has
+    ``+ 8`` added): the representative is the first member met.  ``E_kin``
+    of a new representative is ``|B (k' - anint(k'))|^2`` with ``k'`` the
+    point rotated by the *last* operation, as the Fortran computes it.
+
+    ``lattice_vectors`` are rows in bohr; ``B`` is the reciprocal lattice of
+    ``inipbc.f90`` (:func:`~parsec_python.Grid.space_group.fortran_reciprocal_lattice`).
+    Raises ``ValueError`` where the counts do not add up to the grid (PARSEC
+    error 241).
+    """
+
+    dims = tuple(int(value) for value in dimensions)
+    if len(dims) != 3 or any(value < 1 for value in dims):
+        raise ValueError("dimensions must be three positive integers")
+    shifts = tuple(float(value) for value in shift)
+    if len(shifts) != 3 or any(not math.isfinite(value) or value < 0.0 for value in shifts):
+        raise ValueError("the Monkhorst-Pack shift must be three non-negative numbers")
+    if reciprocal_rotations is None:
+        rotations = [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]]
+    else:
+        rotations = [
+            [[float(value) for value in row] for row in matrix]
+            for matrix in np.asarray(reciprocal_rotations).reshape(-1, 3, 3)
+        ]
+    # bvec(i, j): component i of reciprocal vector j; rows of B are the vectors.
+    b_rows = fortran_reciprocal_lattice(lattice_vectors)
+    bvec = [[float(b_rows[j][i]) for j in range(3)] for i in range(3)]
+    n1, n2, n3 = dims
+    kibz: list[list[float]] = []
+    counts: list[int] = []
+    ekin: list[float] = []
+    grid_map = np.zeros(dims, dtype=np.int64)
+    inversions = (1.0, -1.0) if time_reversal else (1.0,)
+    # The representatives so far, one row each, for the comparisons below
+    # (elementwise the same arithmetic as the scalar Fortran loop).
+    stored = np.zeros((n1 * n2 * n3 + 1, 3))
+    for ii in range(n1):
+        for jj in range(n2):
+            for ll in range(n3):
+                kprot = [
+                    (float(ii) + shifts[0]) / float(n1),
+                    (float(jj) + shifts[1]) / float(n2),
+                    (float(ll) + shifts[2]) / float(n3),
+                ]
+                new_point = True
+                krot = kprot
+                for gmtrx in rotations:
+                    krot = translate01(_times(gmtrx, kprot))
+                    if not kibz:
+                        kibz.append(list(krot))
+                        stored[0] = krot
+                        ktest = [value - fortran_anint(value) for value in krot]
+                        ekin.append(_dot(_times(bvec, ktest)))
+                        counts.append(0)
+                        grid_map[ii, jj, ll] = 0
+                    itest = _first_equivalent(krot, stored[: len(kibz)], inversions, bvec)
+                    if itest is None:
+                        continue
+                    # The first match ends the search: Fortran goes on through
+                    # the remaining operations with new_kpt false, which
+                    # changes nothing (the E_kin of the last operation is
+                    # used for new points only).
+                    new_point = False
+                    ktest = [value - fortran_anint(value) for value in kprot]
+                    norm2 = _dot(_times(bvec, ktest)) + 8.0
+                    grid_map[ii, jj, ll] = itest
+                    norm1 = _dot(_times(bvec, kibz[itest]))
+                    if norm2 < norm1:
+                        kibz[itest] = translate01(kprot)
+                        stored[itest] = kibz[itest]
+                        ekin[itest] = norm2
+                    counts[itest] += 1
+                    break
+                if new_point:
+                    kibz.append(list(kprot))
+                    stored[len(kibz) - 1] = kprot
+                    ktest = [value - fortran_anint(value) for value in krot]
+                    ekin.append(_dot(_times(bvec, ktest)))
+                    counts.append(1)
+                    grid_map[ii, jj, ll] = len(kibz) - 1
+    total = n1 * n2 * n3
+    if sum(counts) != total:
+        raise ValueError(
+            f"incorrect Brillouin zone: {sum(counts)} of {total} grid points "
+            "counted (PARSEC error 241)"
+        )
+    fractional = np.array(kibz, dtype=np.float64)
+    k_points = np.array([_times(bvec, point) for point in kibz], dtype=np.float64)
+    weights = np.array([float(count) / float(total) for count in counts], dtype=np.float64)
+    norm = 0.0
+    for value in weights:
+        norm = norm + float(value)
+    weights = weights / norm
+    return MonkhorstPackSampling(
+        dimensions=dims,
+        shift=shifts,
+        fractional=fractional,
+        k_points=k_points,
+        weights=weights,
+        counts=np.asarray(counts, dtype=np.int64),
+        kinetic_energies=np.asarray(ekin, dtype=np.float64),
+        grid_map=grid_map,
+        time_reversal=bool(time_reversal),
+        operations=len(rotations),
+    )
+
+
+def kpoint_sampling_details(problem) -> MonkhorstPackSampling | None:
+    """The Fortran-path sampling of a ``SinglePointInput``, or ``None``.
+
+    Only an input with ``monkhorst_pack_shift`` (PARSEC's
+    ``Monkhorst_Pack_Shift`` block) takes it: the grid of
+    ``monkhorst_pack_dimensions`` with that shift, reduced by the input's
+    ``space_group`` (the identity where it is ``None``, e.g. with
+    ``Ignore_Symmetry``) and by time reversal unless the calculation is
+    non-collinear (``irrbz.f90:96-99``).
+    """
+
+    shift = getattr(problem, "monkhorst_pack_shift", None)
+    if shift is None or problem.monkhorst_pack_dimensions is None:
+        return None
+    group = getattr(problem, "space_group", None)
+    lattice = tuple(
+        tuple(float(value) for value in row)
+        for row in np.asarray(problem.periodic_cell.lattice_vectors, dtype=float)
+    )
+    rotations = (
+        None
+        if group is None
+        else tuple(tuple(tuple(int(v) for v in row) for row in matrix) for matrix in group.reciprocal_rotations)
+    )
+    return _cached_irreducible_monkhorst_pack(
+        lattice,
+        tuple(problem.monkhorst_pack_dimensions),
+        tuple(float(value) for value in shift),
+        rotations,
+        not problem.scf.noncollinear,
+    )
+
+
+@lru_cache(maxsize=8)
+def _cached_irreducible_monkhorst_pack(lattice, dimensions, shift, rotations, time_reversal):
+    """One computation per input for the CLI, the report and ``qpoints.dat``.
+
+    Callers must not modify the arrays of the returned (shared) object.
+    """
+
+    sampling = irreducible_monkhorst_pack(
+        np.asarray(lattice, dtype=float),
+        dimensions,
+        shift,
+        None if rotations is None else np.asarray(rotations, dtype=np.int64),
+        time_reversal=time_reversal,
+    )
+    for array in (
+        sampling.fractional,
+        sampling.k_points,
+        sampling.weights,
+        sampling.counts,
+        sampling.kinetic_energies,
+        sampling.grid_map,
+    ):
+        array.flags.writeable = False
+    return sampling
+
+
 def kpoint_sampling(problem) -> tuple[np.ndarray, np.ndarray] | None:
     """``(k_points, weights)`` requested by a ``SinglePointInput``, or ``None``.
 
-    An explicit list (``problem.kpoints``) or a Monkhorst-Pack grid
+    An explicit list (``problem.kpoints``), Fortran's reduced grid
+    (``problem.monkhorst_pack_shift`` given, :func:`kpoint_sampling_details`)
+    or this port's unreduced Monkhorst-Pack grid
     (``problem.monkhorst_pack_dimensions``); ``None`` means Gamma only.
     """
 
@@ -214,16 +567,24 @@ def kpoint_sampling(problem) -> tuple[np.ndarray, np.ndarray] | None:
         return np.asarray(problem.kpoints, dtype=float), np.asarray(
             problem.kpoint_weights, dtype=float
         )
+    details = kpoint_sampling_details(problem)
+    if details is not None:
+        return details.k_points.copy(), details.weights.copy()
     if problem.monkhorst_pack_dimensions is not None:
         return monkhorst_pack_grid(problem.periodic_cell, problem.monkhorst_pack_dimensions)
     return None
 
 
 __all__ = [
+    "IBZ_TOLERANCE",
     "KPOINT_UNITS",
+    "MonkhorstPackSampling",
     "explicit_kpoints",
     "band_path_kpoints",
+    "irreducible_monkhorst_pack",
     "kpoint_sampling",
+    "kpoint_sampling_details",
     "monkhorst_pack_grid",
     "read_kpoint_file",
+    "translate01",
 ]

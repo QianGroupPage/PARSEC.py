@@ -116,9 +116,55 @@ def symmetrize_positions(
     Positions transform like forces.  Averaging them removes round-off that
     accumulates over many ionic steps, so that the structure keeps the group
     it started with.
+
+    The operations of a periodic system (:class:`SpaceGroupAtomOperation`:
+    bulk cells, wires and slabs) map an atom onto another one plus a lattice
+    vector; that vector, the nearest one to ``U (R_a - tau) - R_image`` along
+    the periodic directions, is removed before the average.  A space-group
+    operation with a fractional translation ``tau`` maps ``R_a`` to
+    ``U (R_a - tau)`` (``symop``), the image the average takes.
     """
 
-    return symmetrize_forces(positions, operations)
+    if not any(getattr(item, "lattice_vectors", None) is not None for item in operations):
+        return symmetrize_forces(positions, operations)
+    positions = np.asarray(positions, dtype=np.float64)
+    if len(operations) <= 1:
+        return positions.copy()
+    total = np.zeros_like(positions)
+    for operation in operations:
+        translation = getattr(operation, "translation", None)
+        if translation is None:
+            rotated = positions @ operation.matrix.T
+        else:
+            rotated = (positions - np.asarray(translation, dtype=np.float64)) @ operation.matrix.T
+        vectors = np.asarray(operation.lattice_vectors, dtype=np.float64)
+        offset = rotated - positions[operation.image]
+        steps = np.round(np.linalg.solve(vectors.T, offset.T).T)
+        periodicity = getattr(operation, "periodicity", None)
+        if periodicity is not None:
+            # Only the periodic directions hold lattice vectors.
+            steps[:, int(periodicity):] = 0.0
+        total[operation.image] += rotated - steps @ vectors
+    return total / float(len(operations))
+
+
+@dataclass(frozen=True)
+class SpaceGroupAtomOperation(AtomSymmetryOperation):
+    """A space-group operation of a periodic system acting on the atoms.
+
+    ``matrix @ (R_a - translation) = R_image[a] + T`` (``symop`` of
+    ``symmetries.f90``: ``T(r) = U (r - A t)``), with ``translation`` the
+    Cartesian fractional translation ``A t`` (``None`` for a point operation
+    about the origin) and ``T`` a combination of the first ``periodicity``
+    rows of ``lattice_vectors`` (3 for a bulk cell, 1 for a wire, 2 for a
+    slab, whose confined rows are ``alatt``'s ``4 rmax`` and never stepped).
+    Forces transform with ``matrix`` alone (``symm_forces.f90``);
+    :func:`symmetrize_positions` uses the translation and the lattice.
+    """
+
+    lattice_vectors: np.ndarray = None  # type: ignore[assignment]
+    translation: np.ndarray | None = None
+    periodicity: int = 3
 
 
 def operations_preserving(
@@ -155,6 +201,7 @@ def total_torque(positions: np.ndarray, forces: np.ndarray) -> np.ndarray:
 __all__ = [
     "AtomSymmetryOperation",
     "POSITION_TOLERANCE",
+    "SpaceGroupAtomOperation",
     "atom_symmetry_operations",
     "cubic_point_operations",
     "operations_preserving",

@@ -284,7 +284,8 @@ def _oblique_gradient(field: np.ndarray, grid, weights: np.ndarray, mix: np.ndar
 
     box = _to_box(field, grid)
     along_axes = [
-        _from_box(correlate1d(box, weights, axis=axis, mode="wrap"), grid) for axis in range(3)
+        _from_box(correlate1d(box, weights, axis=axis, mode=grid.boundary_modes[axis]), grid)
+        for axis in range(3)
     ]
     return np.einsum("ki,ij->kj", mix, np.asarray(along_axes))
 
@@ -299,7 +300,9 @@ def _oblique_divergence_adjoint(fluxes, grid, weights: np.ndarray, mix: np.ndarr
     index_fluxes = np.einsum("ki,kj->ij", mix, np.asarray(fluxes))
     total = np.zeros(grid.size, dtype=np.float64)
     for axis in range(3):
-        adjoint_box = correlate1d(_to_box(index_fluxes[axis], grid), -weights, axis=axis, mode="wrap")
+        adjoint_box = correlate1d(
+            _to_box(index_fluxes[axis], grid), -weights, axis=axis, mode=grid.boundary_modes[axis]
+        )
         total += _from_box(adjoint_box, grid)
     return total
 
@@ -321,6 +324,150 @@ def _gather_active(values: np.ndarray, grid: RealSpaceGrid) -> np.ndarray:
     return np.ascontiguousarray(values[local[:, 0], local[:, 1], local[:, 2]])
 
 
+def _derivative_stencil(grid) -> tuple[np.ndarray, str]:
+    """Weights of ``d/dx`` in 1/bohr and the boundary mode of ``correlate1d``."""
+
+    weights = first_derivative_coefficients(grid.settings.expansion_order)
+    weights = weights / grid.spacing
+    # Periodic cells wrap the stencil around; clusters zero-pad outside.
+    boundary = "wrap" if _is_periodic(grid) else "constant"
+    return weights, boundary
+
+
+def density_gradient(values: np.ndarray, grid) -> np.ndarray:
+    """Centered finite-difference gradient ``D f`` of a grid field, shape ``(3, n)``.
+
+    This is ``gradmvs`` of ``hpotcg.F90`` (lines 363-473): along each axis
+    ``(D f)_i = sum_{s=1..M} c_s [f(i+s) - f(i-s)] / h`` with
+    ``M = Expansion_Order/2`` and the centered first-derivative weights of
+    :func:`first_derivative_coefficients` (``fornberg.f90``; the Fortran
+    tables keep ten decimals for ``M >= 5``).  Samples outside an isolated
+    cluster domain are zero; a periodic grid wraps around its orthorhombic
+    cell.  The result is in units of ``f`` per bohr.
+    """
+
+    if getattr(grid, "is_general_periodic", False):
+        from ..Laplacian.nonorthogonal import cartesian_gradient
+
+        return cartesian_gradient(
+            np.asarray(values, dtype=np.float64),
+            grid,
+            first_derivative_coefficients(grid.settings.expansion_order),
+        )
+    mix = _oblique_mix(grid)
+    if mix is not None:
+        return _oblique_gradient(
+            values, grid, first_derivative_coefficients(grid.settings.expansion_order), mix
+        )
+    weights, boundary = _derivative_stencil(grid)
+    box = _to_box(values, grid)
+    gradients = np.empty((3, grid.size), dtype=np.float64)
+    for axis in range(3):
+        gradients[axis] = _from_box(
+            correlate1d(box, weights, axis=axis, mode=boundary, cval=0.0),
+            grid,
+        )
+    return gradients
+
+
+def discrete_gga(
+    density: np.ndarray,
+    grid,
+    partials,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Energy density and exact discrete potential of an unpolarized GGA.
+
+    ``partials(n, sigma)`` returns the energy per volume ``f`` and its
+    derivatives ``df/dn`` and ``df/dsigma`` (Hartree) for ``sigma = |D n|**2``
+    with ``D`` of :func:`density_gradient`.  The returned potential is the
+    derivative of ``h**3 * sum_i f_i`` with respect to ``n_i``,
+
+    ``v = df/dn + D.T @ (2 df/dsigma D n)``,
+
+    also in Hartree.  ``density`` already includes any frozen core density.
+    On a non-orthogonal periodic grid (``GeneralPeriodicGrid``) ``D`` is the
+    derivative along each lattice direction, with its own step, made
+    Cartesian by ``inv(A_n)^T`` (Fortran ``gradmvs`` with
+    ``grad_bvec_norm``), and the potential uses its exact transpose.
+    """
+
+    if getattr(grid, "is_general_periodic", False):
+        from ..Laplacian.nonorthogonal import (
+            cartesian_gradient,
+            cartesian_gradient_transpose,
+        )
+
+        weights = first_derivative_coefficients(grid.settings.expansion_order)
+        gradients = cartesian_gradient(density, grid, weights)
+        sigma = np.einsum("ij,ij->j", gradients, gradients)
+        energy_hartree, fn_hartree, fsigma_hartree = partials(density, sigma)
+        potential_hartree = fn_hartree + cartesian_gradient_transpose(
+            2.0 * fsigma_hartree[None, :] * gradients, grid, weights
+        )
+        return energy_hartree, potential_hartree
+
+    mix = _oblique_mix(grid)
+    if mix is not None:
+        # a periodic grid with oblique axes (Andrew Grieder's routines): derivatives along the grid axes in
+        # index units, mixed into Cartesian ones by ``C``; the transpose for the potential
+        weights = first_derivative_coefficients(grid.settings.expansion_order)
+        gradients = np.empty((3, grid.size), dtype=np.float64)
+        gradients[:] = _oblique_gradient(density, grid, weights, mix)
+        sigma = np.einsum("kj,kj->j", gradients, gradients)
+        energy_hartree, fn_hartree, fsigma_hartree = partials(density, sigma)
+        potential_hartree = fn_hartree.copy()
+        potential_hartree += _oblique_divergence_adjoint(2.0 * fsigma_hartree * gradients, grid, weights, mix)
+        return energy_hartree, potential_hartree
+
+    weights, boundary = _derivative_stencil(grid)
+    full_density = _to_box(density, grid)
+    gradients = np.empty((3, grid.size), dtype=np.float64)
+    sigma = np.zeros(grid.size, dtype=np.float64)
+    for axis in range(3):
+        derivative_box = correlate1d(
+            full_density,
+            weights,
+            axis=axis,
+            mode=boundary,
+            cval=0.0,
+        )
+        gradient = _from_box(derivative_box, grid)
+        gradients[axis] = gradient
+        sigma += gradient * gradient
+
+    energy_hartree, fn_hartree, fsigma_hartree = partials(density, sigma)
+    potential_hartree = fn_hartree.copy()
+    for axis in range(3):
+        flux_box = _to_box(2.0 * fsigma_hartree * gradients[axis], grid)
+        # For the antisymmetric centered stencil D.T = -D.  Applying the
+        # reversed weights is the exact transpose of the zero-padded action.
+        adjoint_box = correlate1d(
+            flux_box,
+            -weights,
+            axis=axis,
+            mode=boundary,
+            cval=0.0,
+        )
+        potential_hartree += _from_box(adjoint_box, grid)
+    return energy_hartree, potential_hartree
+
+
+def _gga_density(valence_density, core_density, grid, name: str) -> np.ndarray:
+    valence = np.asarray(valence_density, dtype=np.float64)
+    if valence.shape != (grid.size,):
+        raise ValueError(f"{name} density does not match the active real-space grid")
+    if core_density is None:
+        density = valence
+    else:
+        core = np.asarray(core_density, dtype=np.float64)
+        if core.shape != valence.shape:
+            raise ValueError("core and valence densities must have the same shape")
+        density = valence + core
+    if np.any(density < -1.0e-14):
+        raise ValueError(f"{name} requires a nonnegative density")
+    return density
+
+
 def pbe(
     valence_density: np.ndarray,
     grid: RealSpaceGrid,
@@ -339,62 +486,10 @@ def pbe(
     potential is still the exact derivative of the summed energy.
     """
 
-    valence = np.asarray(valence_density, dtype=np.float64)
-    if valence.shape != (grid.size,):
-        raise ValueError("PBE density does not match the active real-space grid")
-    if core_density is None:
-        density = valence
-    else:
-        core = np.asarray(core_density, dtype=np.float64)
-        if core.shape != valence.shape:
-            raise ValueError("core and valence densities must have the same shape")
-        density = valence + core
-    if np.any(density < -1.0e-14):
-        raise ValueError("PBE requires a nonnegative density")
-
-    weights = first_derivative_coefficients(grid.settings.expansion_order)
-    mix = _oblique_mix(grid)
-    # Periodic cells wrap the stencil around; clusters zero-pad outside.
-    boundary = "wrap" if _is_periodic(grid) else "constant"
-    gradients = np.empty((3, grid.size), dtype=np.float64)
-    sigma = np.zeros(grid.size, dtype=np.float64)
-    if mix is not None:
-        gradients[:] = _oblique_gradient(density, grid, weights, mix)
-        sigma = np.einsum("kj,kj->j", gradients, gradients)
-    else:
-        weights = weights / grid.spacing
-        full_density = _to_box(density, grid)
-        for axis in range(3):
-            derivative_box = correlate1d(
-                full_density,
-                weights,
-                axis=axis,
-                mode=boundary,
-                cval=0.0,
-            )
-            gradient = _from_box(derivative_box, grid)
-            gradients[axis] = gradient
-            sigma += gradient * gradient
-
-    energy_hartree, fn_hartree, fsigma_hartree = pbe_energy_partials(
-        density, sigma
+    density = _gga_density(valence_density, core_density, grid, "PBE")
+    energy_hartree, potential_hartree = discrete_gga(
+        density, grid, pbe_energy_partials
     )
-    potential_hartree = fn_hartree.copy()
-    if mix is not None:
-        potential_hartree += _oblique_divergence_adjoint(2.0 * fsigma_hartree * gradients, grid, weights, mix)
-    else:
-        for axis in range(3):
-            flux_box = _to_box(2.0 * fsigma_hartree * gradients[axis], grid)
-            # For the antisymmetric centered stencil D.T = -D.  Applying the
-            # reversed weights is the exact transpose of the zero-padded action.
-            adjoint_box = correlate1d(
-                flux_box,
-                -weights,
-                axis=axis,
-                mode=boundary,
-                cval=0.0,
-            )
-            potential_hartree += _from_box(adjoint_box, grid)
 
     # Convert Hartree -> Rydberg only at the public boundary.
     energy_density = 2.0 * energy_hartree
@@ -568,6 +663,8 @@ def pbe_spin_polarized(
         down = down + 0.5 * core
     if np.any(up < -1.0e-14) or np.any(down < -1.0e-14):
         raise ValueError("PBE requires nonnegative spin densities")
+    if getattr(grid, "is_general_periodic", False):
+        return _pbe_spin_polarized_general_periodic(up, down, grid)
 
     weights = first_derivative_coefficients(grid.settings.expansion_order)
     mix = _oblique_mix(grid)
@@ -628,7 +725,46 @@ def pbe_spin_polarized(
     )
 
 
+def _pbe_spin_polarized_general_periodic(up, down, grid) -> SpinPolarizedXCResult:
+    """:func:`pbe_spin_polarized` on a non-orthogonal periodic grid.
+
+    Same construction as the general-grid branch of :func:`discrete_gga`: lattice-direction
+    derivatives made Cartesian by ``inv(A_n)^T`` and the exact transpose for
+    the potential.  ``up`` and ``down`` already hold the core density.
+    """
+
+    from ..Laplacian.nonorthogonal import (
+        cartesian_gradient,
+        cartesian_gradient_transpose,
+    )
+
+    weights = first_derivative_coefficients(grid.settings.expansion_order)
+    grad_up = cartesian_gradient(up, grid, weights)
+    grad_down = cartesian_gradient(down, grid, weights)
+    s_uu = np.einsum("ij,ij->j", grad_up, grad_up)
+    s_dd = np.einsum("ij,ij->j", grad_down, grad_down)
+    s_ud = np.einsum("ij,ij->j", grad_up, grad_down)
+    f, f_up, f_down, f_uu, f_ud, f_dd = pbe_spin_polarized_partials(
+        up, down, s_uu, s_ud, s_dd
+    )
+    potential_up = f_up + cartesian_gradient_transpose(
+        2.0 * f_uu[None, :] * grad_up + f_ud[None, :] * grad_down, grid, weights
+    )
+    potential_down = f_down + cartesian_gradient_transpose(
+        2.0 * f_dd[None, :] * grad_down + f_ud[None, :] * grad_up, grid, weights
+    )
+    energy_density = 2.0 * f
+    return SpinPolarizedXCResult(
+        potential_up=2.0 * potential_up,
+        potential_down=2.0 * potential_down,
+        energy_density=energy_density,
+        total_energy=float(grid.volume_element * np.sum(energy_density)),
+    )
+
+
 __all__ = [
+    "density_gradient",
+    "discrete_gga",
     "first_derivative_coefficients",
     "pbe",
     "pbe_energy_partials",

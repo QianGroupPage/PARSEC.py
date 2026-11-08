@@ -21,7 +21,13 @@ import os
 
 import numpy as np
 
-from .native_ionic import NativeIonicBuilders, _density_table, _spline_payload, _values64
+from .native_ionic import (
+    NativeIonicBuilders,
+    _density_table,
+    _direct_interpolation,
+    _spline_payload,
+    _values64,
+)
 from ..backends.cupy import require_cupy
 from ..backends.cupy_compile import compile_cupy_raw
 
@@ -78,6 +84,41 @@ extern "C" __global__ void ionic_sum(
 def _kernel():
     cp, _ = require_cupy()
     return cp.RawKernel(_SOURCE, "ionic_sum", options=("--std=c++17", "--fmad=false"))
+
+
+def _direct_source() -> str:
+    """``ionic_sum`` with a per-species flag ``d[7]`` for ``Old_Interpolation_Format``.
+
+    A flagged species interpolates ``V`` itself between the radial samples
+    (``ionpot.f90:107-112``) instead of ``r*V``; its first value below the
+    first sample and the Coulomb tail beyond ``rs(ns-1)`` are those of the
+    other species.  Only calculations with the option compile this kernel.
+    """
+
+    replacements = (
+        ("void ionic_sum(", "void ionic_sum_direct("),
+        ("descriptors+7*species", "descriptors+8*species"),
+        (
+            "double va=local ? r[a]*v[a] : v[a], vb=local ? r[b]*v[b] : v[b];",
+            "const int rv=local && !d[7];\n"
+            "            double va=rv ? r[a]*v[a] : v[a], vb=rv ? r[b]*v[b] : v[b];",
+        ),
+        ("if(local) value/=distance;", "if(rv) value/=distance;"),
+    )
+    source = _SOURCE
+    for old, new in replacements:
+        if source.count(old) != 1:
+            raise RuntimeError(f"the ionic kernel source changed near {old!r}")
+        source = source.replace(old, new)
+    return source
+
+
+@lru_cache(maxsize=1)
+def _direct_kernel():
+    cp, _ = require_cupy()
+    return cp.RawKernel(
+        _direct_source(), "ionic_sum_direct", options=("--std=c++17", "--fmad=false")
+    )
 
 
 def ionic_gpu_count_setting() -> str:
@@ -222,6 +263,11 @@ class CupyIonicBuilders(NativeIonicBuilders):
             return np.zeros(grid.size, dtype=np.float64)
         symbols = list(dict.fromkeys(a.symbol for a in active))
         parts, descriptors, charges = [], [], []
+        # Old_Interpolation_Format (local potential of a species without spline).
+        direct = [
+            int(local and _direct_interpolation(specifications[symbol]))
+            for symbol in symbols
+        ]
         cursor = 0
 
         def append(values):
@@ -246,6 +292,10 @@ class CupyIonicBuilders(NativeIonicBuilders):
             ])
             charges.append(potential.ionic_charge)
         tables = np.concatenate(parts)
+        kernel = _kernel
+        if any(direct):
+            descriptors = [row + [flag] for row, flag in zip(descriptors, direct)]
+            kernel = _direct_kernel
         descriptors = np.asarray(descriptors, dtype=np.int32)
         positions = _values64([a.position for a in active])
         types = np.asarray([symbols.index(a.symbol) for a in active], dtype=np.int32)
@@ -283,7 +333,7 @@ class CupyIonicBuilders(NativeIonicBuilders):
                 xyz = cp.asarray(points[start:stop], order="C")
                 inputs = [cp.asarray(a) for a in (positions, types, tables, descriptors, charges)]
                 result = cp.empty(stop-start, dtype=cp.float64)
-                _kernel()(((stop-start+127)//128,), (128,), (
+                kernel()(((stop-start+127)//128,), (128,), (
                     xyz, np.int64(stop-start), inputs[0], inputs[1], np.int32(len(active)),
                     inputs[2], inputs[3], inputs[4], np.int32(local), result,
                 ))
@@ -298,7 +348,7 @@ class CupyIonicBuilders(NativeIonicBuilders):
                 # Compile here once, so that the device threads find the
                 # kernel in CuPy's cache instead of compiling it side by side.
                 with cp.cuda.Device(devices[0]):
-                    compile_cupy_raw(_kernel())
+                    compile_cupy_raw(kernel())
                 with ThreadPoolExecutor(max_workers=len(devices)) as executor:
                     list(executor.map(slab, enumerate(devices)))
         if orbits is None:

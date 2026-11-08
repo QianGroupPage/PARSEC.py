@@ -23,6 +23,11 @@ imported, give the same numbers:
     Here ``eta`` is the largest one whose reciprocal series ends below the Nyquist frequency of the
     grid, so the series is represented exactly on the grid and the short-ranged sum needs only a ball
     around every atom, as wide as the pseudopotential table or the Gaussian tail, whichever is larger.
+
+These are the routines of the default (Andrew Grieder's).  A grid of the Fortran-derived routines
+(``Use_Fortran_Routines``, :func:`parsec_python.Grid.pbc.uses_fortran_routines`) is handed to
+:mod:`.periodic_setup_fortran`, the module of the parity round, and :func:`install` installs both sets: each
+grid gets its own routine, so the two kinds of calculation can run in one process.
 """
 
 from __future__ import annotations
@@ -33,13 +38,18 @@ from typing import Sequence
 import numpy as np
 from scipy.special import erfcinv
 
-from parsec_python.Grid.pbc import PeriodicRealSpaceGrid
+from parsec_python.Grid.pbc import PeriodicRealSpaceGrid, SlabRealSpaceGrid, uses_fortran_routines
 from parsec_python.V_ion import ewald as _ewald
 from parsec_python.V_ion import ionic_potential as _ionic
 
 _NYQUIST_FRACTION = 0.85  # the reciprocal series ends at this fraction of the grid's Nyquist frequency
 _POINTS_PER_CALL = 1_000_000  # grid points evaluated together (the radial spline is built once per call)
 _STRUCTURE_FACTOR_ELEMENTS = 4_000_000  # complex numbers of one structure-factor block
+
+
+def _is_full_periodic(grid) -> bool:
+    """A grid periodic in all three lattice vectors (a slab has a box along z at an offset: the dense scan)."""
+    return isinstance(grid, PeriodicRealSpaceGrid) and not isinstance(grid, SlabRealSpaceGrid)
 
 
 def _cell_geometry(grid: PeriodicRealSpaceGrid, lattice_vectors=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -78,8 +88,20 @@ def grid_ball(grid, centre: np.ndarray, radius: float):
     centre along fractional axis ``m``, in an oblique cell as well as a rectangular one.  Other grids use
     the dense scan.
     """
-    if not isinstance(grid, PeriodicRealSpaceGrid):
+    if uses_fortran_routines(grid):
+        from . import periodic_setup_fortran as _fortran
+
+        return _fortran.grid_ball(grid, centre, radius)
+    if not _is_full_periodic(grid):
         return _ionic.dense_support(grid, centre, radius)
+    return lattice_ball(grid, centre, radius)
+
+
+def lattice_ball(grid, centre: np.ndarray, radius: float):
+    """The index-box ball of :func:`grid_ball` for any grid whose point ``(i, j, k)`` (row ``(i n_1 + j) n_2 + k``)
+    lies at ``sum_m (i_m + s_m) a_m / n_m`` (``s = grid.shift``): this module's grids and the general grid of the
+    Fortran-derived routines (:class:`parsec_python.Grid.pbc.GeneralPeriodicGrid`), which takes it instead of the
+    dense scan (the same rows in the same order)."""
     n, _, inverse = _cell_geometry(grid)
     fractional = np.asarray(centre, dtype=float) @ inverse
     half_width = radius * np.linalg.norm(inverse, axis=0)
@@ -206,7 +228,13 @@ def fft_local_ionic_potential(
     grid, atoms: Sequence, potentials, specifications, lattice_vectors, eta, tolerance
 ):
     """The local ionic potential of :func:`~parsec_python.V_ion.ewald.ewald_local_ionic_potential`."""
-    if not isinstance(grid, PeriodicRealSpaceGrid):
+    if uses_fortran_routines(grid):
+        from . import periodic_setup_fortran as _fortran
+
+        return _fortran.fft_local_ionic_potential(
+            grid, atoms, potentials, specifications, lattice_vectors, eta, tolerance
+        )
+    if not _is_full_periodic(grid):
         return None
     n, lattice, _ = _cell_geometry(grid, lattice_vectors)
     volume = abs(float(np.linalg.det(lattice)))
@@ -269,15 +297,34 @@ def fft_local_ionic_potential(
     return total
 
 
+def _fortran_converged(grid, lattice_vectors) -> bool:
+    """For the forces of the Fortran-derived routines: whether their FFT potential (the converged sum) built it."""
+    from . import periodic_setup_fortran as _fortran
+
+    return uses_fortran_routines(grid) and _fortran._fft_handles(grid, lattice_vectors)
+
+
 def install() -> None:
-    """Make the fast replacements the ones the reference drivers use."""
+    """Make the fast replacements the ones the reference drivers use.
+
+    The default routines' (:func:`grid_ball`, :func:`fft_local_ionic_potential`, which hand a grid of the
+    Fortran-derived routines to :mod:`.periodic_setup_fortran`, and the local forces of
+    :mod:`parsec_python.Forces.periodic_local`), the atomic densities of :mod:`.periodic_setup_fortran` for
+    those grids and for the default routines' bulk grids of cells with diagonal lattice vectors (the same
+    density, from index boxes: 4-6 times faster than the readable sum); the threads of the Ewald terms keep
+    every sum's order.
+    """
     from parsec_python.Forces import periodic_local as _force_sums
 
     from ..Forces.periodic_local import local_force_provider
+    from . import periodic_setup_fortran as _fortran
 
     _ionic.set_support_finder(grid_ball)
-    _ewald.set_local_potential_provider(fft_local_ionic_potential)
+    _ewald.set_local_potential_provider(fft_local_ionic_potential, converged_for=_fortran_converged)
     _force_sums.set_local_force_provider(local_force_provider)
+    # the image sums of the atomic densities (None, the readable sum, for the other grids)
+    _ionic.set_atomic_density_provider(_fortran._density_provider)
+    _ewald.set_translation_map(_fortran._translation_map)
 
 
 def uninstall() -> None:
@@ -286,6 +333,8 @@ def uninstall() -> None:
     _ionic.set_support_finder(None)
     _ewald.set_local_potential_provider(None)
     _force_sums.set_local_force_provider(None)
+    _ionic.set_atomic_density_provider(None)
+    _ewald.set_translation_map(None)
 
 
 __all__ = ["fast_splitting", "fft_local_ionic_potential", "grid_ball", "install", "uninstall"]

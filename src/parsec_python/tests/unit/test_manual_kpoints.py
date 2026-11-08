@@ -287,9 +287,6 @@ class ManualKpointCliTests(unittest.TestCase):
             "negative weight": (
                 "Kpoint_Method: manual\nbegin Kpoint_List\n0 0 0 -1\n0 0 1 2\nend Kpoint_List\n"
             ),
-            "unequal weights": (
-                "Kpoint_Method: manual\nbegin Kpoint_List\n0 0 0 1\n0 0 1 2\nend Kpoint_List\n"
-            ),
             "list without manual": "begin Kpoint_List\n0 0 0\nend Kpoint_List\n",
             "unit without manual": "Kpoint_Unit: reciprocal_lattice_vectors\n",
         }
@@ -297,6 +294,13 @@ class ManualKpointCliTests(unittest.TestCase):
         for name, text in cases.items():
             with self.subTest(name):
                 self.assertEqual(self._dry_run_code(text, files), 2, msg=name)
+        # Unequal weights are normalized to one, as PARSEC's init_var does.
+        self.assertEqual(
+            self._dry_run_code(
+                "Kpoint_Method: manual\nbegin Kpoint_List\n0 0 0 1\n0 0 1 2\nend Kpoint_List\n"
+            ),
+            0,
+        )
 
     def test_cluster_input_with_a_kpoint_list_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -23,6 +23,7 @@ from parsec_python.SCF.single_point import (
 from parsec_python.SCF.pbc import (
     prepare_periodic_single_point as prepare_reference_periodic_single_point,
 )
+from parsec_python.Grid.pbc import uses_fortran_routines
 from parsec_python.V_ion import ion_ion_energy
 from parsec_python.models import (
     PreparationTimings,
@@ -41,6 +42,7 @@ from .SCF.symmetry_fields import scf_buffers_requested
 # Imported here and not where it is read: the module binds ``require_cupy``
 # when it is first imported, and a preparation may run under a double of it.
 from .V_ion.cupy_ionic import ionic_gpu_count_setting, ionic_sum_grid_setting
+from .V_ion.periodic_setup_fortran import reach_rule as periodic_reach_rule
 from .backends.implicit_stencil import (
     FilterPlan,
     counted_filter_applications,
@@ -108,6 +110,11 @@ def _reference_cache_key(
     digest.update(selection.finite_difference_builder.encode("ascii"))
     digest.update(os.environ.get("PARSEC_IONIC_BACKEND", "native").lower().encode("ascii"))
     digest.update(os.environ.get("PARSEC_NATIVE_PROJECTOR_LOOKUP", "1").encode("ascii"))
+    # The physical reach of the periodic radial sums (the default since 2026-10-30) changes their
+    # last bits: its key differs from that of the table reach, which adds nothing (the key of a cell
+    # before 2026-10-30, when the table reach was the default).
+    if getattr(problem, "periodic_cell", None) is not None and periodic_reach_rule() != "table":
+        digest.update(f"periodic-reach-{periodic_reach_rule()}".encode("ascii"))
     digest.update(bytes((int(bool(defer_native_laplacian)),)))
     cache_path = (
         "disabled"
@@ -169,6 +176,10 @@ def _reference_cache_key(
             int(bool(specification.read_valence_density)),
             int(bool(specification.use_spline)),
         )))
+        # Old_Interpolation_Format, Fourier filters: nothing at their defaults.
+        from .V_ion.setup_options import hash_pseudopotential_setup
+
+        hash_pseudopotential_setup(digest, specification)
         if specification.pseudopotential_format != "martins_new":
             # What the input adds to an old Martins file: the occupations,
             # hence the ionic charge, and the radius of the projectors.
@@ -180,6 +191,11 @@ def _reference_cache_key(
                 specification.electrons_per_orbital,
                 specification.core_cutoff_radius,
             )).encode("utf-8"))
+            if specification.pseudopotential_format == "fhipp":
+                # Whether the core density of the FHIPP file is read.
+                digest.update(
+                    bytes((int(bool(specification.nonlinear_core_correction)),))
+                )
         if getattr(problem.scf, "spin_polarized", False):
             # The starting polarization of the species shapes the starting
             # spin densities of the prepared system.  Nothing is hashed
@@ -191,6 +207,14 @@ def _reference_cache_key(
             while chunk := stream.read(1024 * 1024):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def _setup_option_details(problem, selection) -> tuple[tuple[str, str], ...]:
+    """Backend details of the pseudopotential set-up options (:mod:`.V_ion.setup_options`)."""
+
+    from .V_ion.setup_options import setup_option_details
+
+    return setup_option_details(problem, selection)
 
 
 def _cached_reference_view(
@@ -432,6 +456,19 @@ def _orbital_reduction(symmetry_reduction, stabilizer_disabled: bool):
     ):
         return None
     return symmetry_reduction
+
+
+def _readable_xc_label(xc_functional: str, *, spin_polarized: bool) -> str:
+    """Backend label of a functional the readable ``V_xc`` package evaluates."""
+
+    from parsec_python.V_xc.selection import XC_DISPLAY_NAMES
+
+    name = XC_DISPLAY_NAMES.get(xc_functional, xc_functional)
+    if xc_functional == "pw91":
+        name = f"discrete-variational {name}"
+    return (
+        f"vectorized NumPy {'spin-polarized ' if spin_polarized else ''}{name}"
+    )
 
 
 def _same_atoms(left, right) -> bool:
@@ -1306,15 +1343,25 @@ def _build_backend(
     selection: BackendSelection,
     *,
     defer_cupy_device_operator: bool = False,
+    nonlocal_operator=None,
 ):
+    """The Hamiltonian backend of ``selection``.
+
+    ``nonlocal_operator`` is the separable factor of the device
+    Hamiltonians where it is not the KB factor of ``reference`` (the LDA+U
+    columns appended, Hamiltonian.hubbard_device).
+    """
+
     common = {
         "requested": selection.requested,
         "fallback_reasons": selection.fallback_reasons,
     }
+    if nonlocal_operator is None:
+        nonlocal_operator = reference.nonlocal_operator
     if selection.selected == "scipy":
         return ScipyHamiltonianBackend(
             reference.negative_laplacian,
-            reference.nonlocal_operator,
+            nonlocal_operator,
             **common,
         )
     if selection.selected == "native":
@@ -1322,7 +1369,7 @@ def _build_backend(
 
         return NativeHamiltonianBackend(
             reference.negative_laplacian,
-            reference.nonlocal_operator,
+            nonlocal_operator,
             **common,
         )
     if selection.selected == "cupy":
@@ -1330,7 +1377,7 @@ def _build_backend(
 
         return CuPyHamiltonianBackend(
             reference.negative_laplacian,
-            reference.nonlocal_operator,
+            nonlocal_operator,
             defer_device_operator=defer_cupy_device_operator,
             **common,
         )
@@ -2378,6 +2425,27 @@ def _prepare_single_point(
             "not implemented for two spin channels. Run it in one process "
             "(--serial-control)"
         )
+    _refuse_corrections(problem, is_periodic=is_periodic, mpi_context=mpi_context)
+    point_charges = bool(getattr(problem, "point_charges", ()))
+    if mpi_context is not None and (
+        point_charges
+        or getattr(getattr(problem, "scf", None), "symmetrize_density", False)
+    ):
+        # The ranks of the MPI runner have not run these: refused, not ignored.
+        raise NotImplementedError(
+            "point charges (Add_Point_Charges) and Symmetrize_Charge_Density do "
+            "not run as an MPI SCF; run the input in one process (main.py)"
+        )
+    if point_charges:
+        # The potential of the point charges is in the ionic potential of the
+        # reference preparation (ionpot.f90), which has no point group of the
+        # atoms and charges: the sectors of the atoms alone would average it.
+        if _normalize_symmetry_mode(symmetry) == "on":
+            raise ValueError(
+                "symmetry='on' cannot be used with point charges (Add_Point_Charges): "
+                "the calculation uses no point group"
+            )
+        symmetry = "off"
     # A periodic cell has no Hartree boundary values.  The switches are read
     # for it too, so that a value they do not know is refused in every run,
     # and leave its input as it is.
@@ -2797,10 +2865,16 @@ def _prepare_single_point(
     defer_full_gpu_operator = orbital_decomposition is not None and (
         selection.hartree_backend != "cupy" or sector_worker
     )
+    # The KB factor with the LDA+U columns appended on CuPy (None: the KB
+    # factor of the reference system).
+    from .Hamiltonian.hubbard_device import device_hubbard_for, orbital_nonlocal_operator
+
+    orbital_nonlocal = orbital_nonlocal_operator(reference, selection.selected)
     implementation = stages.timed("backend_build", _build_backend)(
         reference,
         selection,
         defer_cupy_device_operator=defer_full_gpu_operator,
+        nonlocal_operator=orbital_nonlocal,
     )
     native_kernel_names: tuple[str, ...] = ()
     if (
@@ -2818,6 +2892,8 @@ def _prepare_single_point(
     native_symmetry_boundary = False
     hartree_boundary_tail = None
     resident_hartree = None
+    # The GPU direct boundary of an ellipsoid or a cylinder, where one is built.
+    direct_boundary = None
     native_xc_evaluator = None
     scf_reducer = None
     symmetry_eigensolver = None
@@ -2828,7 +2904,7 @@ def _prepare_single_point(
         symmetry_eigensolver = CuPySymmetrySCFEigensolver(
             implementation.eigensolver_operator,
             reference.negative_laplacian,
-            reference.nonlocal_operator,
+            reference.nonlocal_operator if orbital_nonlocal is None else orbital_nonlocal,
             orbital_decomposition,
             timing_stats=implementation.timing_stats,
             local_potential_getter=lambda: implementation.local_potential,
@@ -2855,6 +2931,10 @@ def _prepare_single_point(
         )
         implementation.symmetry_eigensolver = symmetry_eigensolver
         implementation.eigenproblem_solver = symmetry_eigensolver
+        # Fix_Number_Eigenvalues: the sectors keep their counts.
+        from .Eigensolvers.symmetry import fixed_state_count_requested
+
+        symmetry_eigensolver.fixed_state_count = fixed_state_count_requested(reference)
         # A sector that shares its basis gives the device with the Hartree
         # objects work beside its own only where it has no other device for
         # it and the sharing rule counts the room for it there.
@@ -2902,6 +2982,28 @@ def _prepare_single_point(
                 reference.grid.volume_element,
                 scf_reducer,
             )
+
+    spin_xc_evaluator = None
+    if native_xc_evaluator is None:
+        # The other functionals on the device where PARSEC_CUPY_XC puts them
+        # there (V_xc/device_xc.py); None leaves them to the host below.
+        from .V_xc import accelerated_xc_evaluators
+
+        native_xc_evaluator, spin_xc_evaluator = accelerated_xc_evaluators(
+            reference,
+            backend=selection.selected,
+            reducer=scf_reducer,
+            device_id=hartree_device,
+            # The structure of the present atoms (move_atoms rebinds it).
+            core_density=lambda: reference.core_density,
+        )
+        planned = getattr(native_xc_evaluator, "planned_device_bytes", None)
+        if symmetry_eigensolver is not None and planned is not None:
+            # The memory rules of the sectors count what the device
+            # evaluator keeps and takes on its device.
+            symmetry_eigensolver.resident_device_bytes = {
+                int(native_xc_evaluator.device_id): int(planned)
+            }
 
     if scf_reducer is not None and native_xc_evaluator is None:
         # The readable XC evaluators accept complete Cartesian arrays.  PBE
@@ -3147,6 +3249,20 @@ def _prepare_single_point(
         implementation.native_poisson_solver = poisson_solver
         implementation.native_boundary_builder = native_boundary_builder
         hartree_boundary_tail = _attached_boundary_tail(native_boundary_builder)
+        # The direct boundary sum of an ellipsoid or a cylinder, on a GPU.
+        from .Hartree.cupy_direct_boundary import direct_boundary_for
+
+        direct_boundary = (
+            None
+            if native_boundary_builder is not None
+            else direct_boundary_for(
+                reference.grid,
+                reference.input.hartree,
+                selected=selection.selected,
+                device_id=hartree_device,
+            )
+        )
+        implementation.direct_boundary = direct_boundary
 
         def accelerated_hartree(density, initial_potential=None, **kwargs):
             total_started = perf_counter()
@@ -3162,17 +3278,27 @@ def _prepare_single_point(
                     density
                 )
             elif native_boundary_builder is None:
-                boundary_density = (
-                    density
-                    if hartree_reduction is None
-                    else hartree_reduction.project_invariant(density)
-                )
-                right_hand_side, boundary = build_hartree_problem(
-                    boundary_density,
-                    reference.grid,
-                    reference.input.hartree,
-                    hartree_boundary_tail,
-                )
+                from .SCF.symmetry_fields import SymmetryScalarField
+
+                if isinstance(density, SymmetryScalarField):
+                    # The orbit values of the SCF loop: the field they expand
+                    # to is invariant already.
+                    boundary_density = scf_reducer.to_full(density)
+                elif hartree_reduction is not None:
+                    boundary_density = hartree_reduction.project_invariant(density)
+                if direct_boundary is not None:
+                    right_hand_side, boundary = direct_boundary.build(
+                        boundary_density,
+                        reference.input.hartree,
+                        hartree_boundary_tail,
+                    )
+                else:
+                    right_hand_side, boundary = build_hartree_problem(
+                        boundary_density,
+                        reference.grid,
+                        reference.input.hartree,
+                        hartree_boundary_tail,
+                    )
             else:
                 # The size-adaptive full-grid C++ multipole builder can be
                 # selected even when the nonlinear SCF stores an invariant
@@ -3347,10 +3473,16 @@ def _prepare_single_point(
         "native": "C++17 compressed-grid CSR builder (exact stencil parity)",
     }[selection.finite_difference_builder]
     if is_periodic:
-        hartree_implementation = (
+        from .Hartree.periodic_device import describe_periodic_hartree
+
+        # Where a wire, slab, Calc_Hartree_G or (since 2026-10-30 by default) plain
+        # cell solve runs (the device solver of Hartree/periodic_device.py); a
+        # plain cell solved on the host keeps the text below.
+        hartree_implementation = describe_periodic_hartree(
+            reference,
             "periodic Ewald-consistent conjugate-gradient solve "
             "(SCF.pbc.solve_periodic_hartree); no accelerated periodic "
-            "Hartree backend yet"
+            "Hartree backend yet",
         )
         finite_difference_implementation = (
             "validated vectorized Python/SciPy periodic-wraparound CSR "
@@ -3423,6 +3555,8 @@ def _prepare_single_point(
                 else "vectorized NumPy radial interpolation and KB sampling"
             ),
         ),
+        # Double_Grid_Order > 1 and Old_Interpolation_Format: nothing otherwise.
+        *_setup_option_details(problem, selection),
         ("ionic_gpu_count_requested", ionic_gpu_count_setting()),
         (
             # The devices the GPU ionic sums of this preparation ran on.
@@ -3467,17 +3601,26 @@ def _prepare_single_point(
             if native_symmetry_boundary
             else "native full grid (C++)"
             if native_boundary_builder is not None
+            else "direct Coulomb sum (GPU, unique exterior points)"
+            if direct_boundary is not None
             else "python",
         ),
         (
             "xc_implementation",
-            (
+            getattr(
+                spin_xc_evaluator if spin_polarized else native_xc_evaluator,
+                "implementation_label",
+                None,
+            )
+            or (
                 # The SCF loop of two spin channels evaluates the readable
                 # spin functionals on the full grid.
                 (
                     "vectorized NumPy discrete-variational spin-polarized PBE"
                     if xc_functional == "pbe"
                     else "vectorized NumPy CA/PZ local spin density"
+                    if xc_functional == "ca"
+                    else _readable_xc_label(xc_functional, spin_polarized=True)
                 )
                 if spin_polarized
                 else "cached C++/OpenMP float64 CA/PZ-LDA"
@@ -3487,6 +3630,8 @@ def _prepare_single_point(
                     "vectorized NumPy discrete-variational PBE"
                     if xc_functional == "pbe"
                     else "vectorized NumPy CA/PZ-LDA"
+                    if xc_functional == "ca"
+                    else _readable_xc_label(xc_functional, spin_polarized=False)
                 )
             ),
         ),
@@ -4050,12 +4195,31 @@ def _prepare_single_point(
 
         from parsec_python.Forces import (
             NonlocalProjectorGradients,
-            build_nonlocal_projector_gradients,
             gradient_columns_for,
         )
+        # The readable builder, or the double-grid one for Double_Grid_Order > 1.
+        from .V_ion.double_grid import build_projector_gradients
 
         operator = reference.nonlocal_operator
+
+        def _matching_columns(gradients):
+            columns = gradient_columns_for(operator.labels, gradients.labels)
+            if isinstance(columns, slice):
+                return gradients
+            return NonlocalProjectorGradients(
+                components=tuple(
+                    component[:, columns] for component in gradients.components
+                ),
+                signs=gradients.signs[columns],
+                labels=tuple(operator.labels),
+            )
+
         if is_periodic:
+            if uses_fortran_routines(reference.grid):
+                # The Fortran-derived routines: the gradients of the projectors with their lattice images.
+                from .Forces.periodic_device import periodic_projector_gradients
+
+                return _matching_columns(periodic_projector_gradients(reference))
             from parsec_python.Forces.nonlocal_force import (
                 build_periodic_projector_gradients,
             )
@@ -4069,22 +4233,13 @@ def _prepare_single_point(
                 reference.input.periodic_cell.lattice_vectors,
             )
         else:
-            gradients = build_nonlocal_projector_gradients(
+            gradients = build_projector_gradients(
                 reference.grid,
                 reference.atoms,
                 reference.pseudopotentials,
                 reference.input.pseudopotentials,
             )
-        columns = gradient_columns_for(operator.labels, gradients.labels)
-        if isinstance(columns, slice):
-            return gradients
-        return NonlocalProjectorGradients(
-            components=tuple(
-                component[:, columns] for component in gradients.components
-            ),
-            signs=gradients.signs[columns],
-            labels=tuple(operator.labels),
-        )
+        return _matching_columns(gradients)
 
     def move_atoms(positions):
         """Rebuild in this process what depends on the atom positions.
@@ -4105,7 +4260,8 @@ def _prepare_single_point(
             Atom(atom.symbol, position)
             for atom, position in zip(reference.atoms, positions)
         )
-        if is_periodic:
+        if is_periodic and not uses_fortran_routines(reference.grid):
+            # Andrew Grieder's routines.
             # No Hartree boundary, symmetry sectors or native XC evaluator: the projectors are replaced on the device
             # operator and the reference system (ionic potential, densities, Ewald terms) is rebuilt for the new
             # positions; the Hartree closure reads the rebound ``reference``.
@@ -4120,18 +4276,30 @@ def _prepare_single_point(
             from .Forces.local_device import sector_atom_images
 
             sector_atom_images(symmetry_reduction, atoms)
-        moved = update_reference_geometry(
-            reference,
-            atoms,
-            **_geometry_builder_hooks(
-                selection, ionic_sector_rank=mpi_context is not None
-            ),
-            build_atomic_tail=False,
+        if is_periodic:
+            # parsec.F90 after domove for a bulk cell (back_to_cell, nonloc,
+            # corecd, ionpbc, ewald_sum): SCF.pbc.update_periodic_geometry.
+            from .Forces.periodic_device import update_periodic_reference
+
+            moved = update_periodic_reference(reference, atoms)
+        else:
+            moved = update_reference_geometry(
+                reference,
+                atoms,
+                **_geometry_builder_hooks(
+                    selection, ionic_sector_rank=mpi_context is not None
+                ),
+                build_atomic_tail=False,
+            )
+        moved_nonlocal = (
+            moved.nonlocal_operator
+            if hubbard_device is None
+            else hubbard_device.move(moved)
         )
-        implementation.replace_nonlocal_operator(moved.nonlocal_operator)
+        implementation.replace_nonlocal_operator(moved_nonlocal)
         if symmetry_eigensolver is not None:
-            symmetry_eigensolver.replace_nonlocal_operator(moved.nonlocal_operator)
-        if not sector_worker:
+            symmetry_eigensolver.replace_nonlocal_operator(moved_nonlocal)
+        if not sector_worker and not is_periodic:
             tail_on_gpu = (
                 selection.selected == "cupy"
                 and selection.hartree_backend in {"native", "cupy"}
@@ -4185,6 +4353,17 @@ def _prepare_single_point(
     if symmetry_eigensolver is not None:
         symmetry_eigensolver.projector_gradient_provider = projector_gradients
         symmetry_eigensolver.geometry_handler = move_atoms
+    # LDA+U in the device Hamiltonians and the TS sums on a device.
+    hubbard_device = device_hubbard_for(
+        reference, implementation, symmetry_eigensolver, selection.selected
+    )
+    dispersion_device = None
+    if selection.selected == "cupy" and getattr(
+        getattr(problem, "scf", None), "van_der_waals", False
+    ):
+        from .Energy import device_dispersion_correction
+
+        dispersion_device = device_dispersion_correction
 
     return AcceleratedPreparedSinglePointSystem(
         reference=reference,
@@ -4196,12 +4375,17 @@ def _prepare_single_point(
         ),
         hartree_solver=accelerated_hartree,
         boundary_tail_maximum=tail_maximum(),
+        # A periodic cell moves its atoms on the Gamma-point path of
+        # Forces/periodic_device.py (Ewald terms, projectors with images) with
+        # the Fortran-derived routines, else with Andrew Grieder's
+        # update_periodic_geometry (move_atoms).
         geometry_updater=update_system,
         projector_gradients=projector_gradients,
         orbital_density_builder=getattr(
             implementation, "orbital_density_builder", None
         ),
         xc_evaluator=native_xc_evaluator,
+        spin_xc_evaluator=spin_xc_evaluator,
         mixer_factory=(None if scf_reducer is None else scf_reducer.mixer),
         residual_metrics_evaluator=(
             None
@@ -4212,7 +4396,43 @@ def _prepare_single_point(
             None if scf_reducer is None else scf_reducer.total_energy
         ),
         scalar_field_adapter=scf_reducer,
+        hubbard_device=hubbard_device,
+        dispersion_device=dispersion_device,
     )
+
+
+def _refuse_corrections(problem, *, is_periodic: bool, mpi_context) -> None:
+    """Refuse the LDA+U and TS cases the accelerated driver does not cover.
+
+    It covers both for clusters, unpolarized and spin-polarized, and for the
+    Gamma point of a bulk cell, in one process (Hamiltonian.hubbard_device,
+    Energy.dispersion_device); the accelerated command line sends the others
+    to the reference solver, whose k-point drivers run them on its device
+    workers.
+    """
+
+    species = getattr(problem, "pseudopotentials", {}).values()
+    hubbard = [item for item in species if getattr(item, "has_hubbard", False)]
+    if hubbard and any(float(item.hubbard_j) != 0.0 for item in hubbard):
+        raise NotImplementedError(
+            "LDA+U with ldaplusu_j != 0 is not implemented on the accelerated path: "
+            "PARSEC's J term gives a potential matrix that is not symmetric; run "
+            "the input with parsec_python/reference_main.py"
+        )
+    if hubbard and mpi_context is not None:
+        raise NotImplementedError(
+            "LDA+U is not implemented for the MPI SCF of several ranks; run it in "
+            "one process (--serial-control)"
+        )
+    if (
+        hubbard
+        and is_periodic
+        and getattr(getattr(problem, "grid", None), "periodicity", 3) in (1, 2)
+    ):
+        raise NotImplementedError(
+            "LDA+U of a wire or slab is not implemented on the accelerated path; run "
+            "the input with parsec_python/reference_main.py"
+        )
 
 
 def profile_hamiltonian_components(
@@ -4272,13 +4492,15 @@ def run_scf(
     callback: Callable[[SCFIteration], None] | None = None,
     warm_start=None,
     convergence_criterion: float | None = None,
+    iteration_state_callback: Callable[..., None] | None = None,
 ) -> AcceleratedSinglePointResult:
     """Run the validated SCF loop using the selected execution backend.
 
     ``warm_start`` continues from the loop of the structure before an ionic
     move; :func:`warm_start_for_moved_atoms` builds it.
     ``convergence_criterion`` replaces the criterion of the input for this
-    loop.
+    loop.  ``iteration_state_callback`` receives the fields of every
+    iteration (``Save_Intermediate_Charge_Density``).
     """
 
     result = run_accelerated_scf(
@@ -4286,6 +4508,11 @@ def run_scf(
         callback=callback,
         warm_start=warm_start,
         convergence_criterion=convergence_criterion,
+        **(
+            {}
+            if iteration_state_callback is None
+            else {"iteration_state_callback": iteration_state_callback}
+        ),
     )
     boundary_check = _hartree_boundary_check(system, result)
     if boundary_check:

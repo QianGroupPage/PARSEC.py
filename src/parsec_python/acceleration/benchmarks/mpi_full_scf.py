@@ -682,6 +682,10 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         # Refused here by name: the sphere and the symmetry sectors read below are those of a cluster.
         raise ValueError('the full-SCF runner divides the symmetry sectors of an isolated cluster; a periodic input '
                          '(Boundary_Conditions: bulk) is not supported: run it with parsec_python/main.py')
+    if getattr(translation, 'polarizability_field', None) is not None:
+        # Refused rather than ignored: the seven field loops run in one process (main.py).
+        raise ValueError('Polarizability is not available in the full-SCF runner: run it with '
+                         'parsec_python/main.py, which runs its seven field loops in one process')
     if getattr(translation, 'energy_refinement', None) is not None:
         # Refused rather than ignored: the orbitals of this runner stay divided among ranks and devices.
         raise ValueError('Energy_Refinement is not available in the full-SCF runner, whose orbitals stay divided '

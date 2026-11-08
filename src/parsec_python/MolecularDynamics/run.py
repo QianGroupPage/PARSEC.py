@@ -16,13 +16,14 @@ force is removed before the integrator sees the forces.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import os
 from pathlib import Path
 import time
 from typing import Callable, Sequence
 
 import numpy as np
 
-from ..Relaxation.backend import IonicBackend, release_orbitals
+from ..Relaxation.backend import IonicBackend, moved_atoms, release_orbitals
 from .atomic_masses import atomic_masses
 from .md_files import (
     MD_NRG_HEADER,
@@ -47,6 +48,11 @@ MD_MECH = "md_mech.dat"
 MD_RESTART = "mdinit.dat"
 ATOM_COR = "atom.cor"
 MOVIE = "movie.xyz"
+#: Opt-in, one frame per computed structure with the DFT energy and the raw DFT forces (see :func:`_dft_frame`).
+FRAMES = "md_frames.extxyz"
+FRAMES_ENVIRONMENT = "PARSEC_MD_FRAMES"
+_RY_EV = 13.605693122994
+_BOHR_ANGSTROM = 0.529177210903
 
 
 @dataclass(frozen=True)
@@ -102,12 +108,19 @@ def restart_structure(translation, input_directory: Path):
     restart = parse_md_restart(
         path.read_text(encoding="utf-8", errors="replace"), len(problem.atoms)
     )
-    atoms = tuple(
-        replace(atom, position=position)
-        for atom, position in zip(problem.atoms, restart.current_positions)
+    # the atoms keep their other fields with Andrew Grieder's routines (parsec_python.Input.routines)
+    atoms = moved_atoms(
+        problem.atoms,
+        restart.current_positions,
+        not getattr(getattr(translation, "routines", None), "fortran", False),
     )
+    # A slab continues in the frame of the run that wrote the file (PARSEC
+    # would re-centre the current positions of mdinit.dat but not the
+    # previous ones, initial.f90:201-228): nothing is shifted or reported.
     translation = replace(
-        translation, problem=replace(problem, atoms=atoms, recenter_geometry=True)
+        translation,
+        problem=replace(problem, atoms=atoms, recenter_geometry=True),
+        slab_shift=0.0,
     )
     return translation, restart, [
         f" Molecular dynamics restarted from {MD_RESTART}, step {restart.frame}"
@@ -162,6 +175,35 @@ def _seeded_compiler(settings, random) -> str | None:
     if random is not None or settings.use_test_rng or settings.rng_seed <= 0:
         return None
     return "gfortran" if seeded_random_numbers() == "gfortran" else None
+
+
+def _dft_frame(system, elements, energy_ry: float, forces_ry_bohr, index: int) -> str | None:
+    """One extended-XYZ frame of a periodic structure: cell, positions, DFT energy and DFT forces.
+
+    ``md_mech.dat`` and ``movie.xyz`` do not hold what a fitted interatomic potential is trained on: ``md_mech.dat``
+    has the accelerations after the mean force is removed and, in a Langevin run, the friction and random force are
+    part of them, and no file has the energy of each structure at full precision.  The frame holds the unmodified
+    Hellmann-Feynman forces of the structure (eV/A, mean force kept), the total energy ``E`` of ``parsec.out``
+    (eV; internal energy, with no -TS term: zero for an insulator, see the notes of the run), the lattice and the
+    positions in A as the calculation holds them (wrapped into the cell when the move wrapped them), and the
+    stress is absent because this code does not compute it.  Returns ``None`` for an isolated system.
+    """
+
+    cell = getattr(getattr(system, "input", None), "periodic_cell", None)
+    if cell is None or getattr(cell, "dimensions", 3) != 3:
+        return None
+    lattice = np.asarray(cell.lattice_vectors, dtype=np.float64) * _BOHR_ANGSTROM
+    positions = np.array([atom.position for atom in system.atoms], dtype=np.float64) * _BOHR_ANGSTROM
+    forces = np.asarray(forces_ry_bohr, dtype=np.float64) * (_RY_EV / _BOHR_ANGSTROM)
+    lines = [
+        str(len(positions)),
+        'Lattice="' + " ".join(f"{x:.10f}" for x in lattice.reshape(-1)) + '" '
+        "Properties=species:S:1:pos:R:3:forces:R:3 "
+        f"energy={energy_ry * _RY_EV:.8f} pbc=\"T T T\" step={index}",
+    ]
+    for symbol, r, f in zip(elements, positions, forces):
+        lines.append(f"{symbol} " + " ".join(f"{x:.8f}" for x in r) + " " + " ".join(f"{x:.8f}" for x in f))
+    return "\n".join(lines) + "\n"
 
 
 def run_recorded_molecular_dynamics(
@@ -219,6 +261,17 @@ def run_recorded_molecular_dynamics(
         energy = float(result.energies.total)
         outcome.system, outcome.result, outcome.forces = system, result, forces
         outcome.scf_failed = outcome.scf_failed or not result.converged
+        if directory is not None and os.environ.get(FRAMES_ENVIRONMENT, "") not in ("", "0"):
+            frame = _dft_frame(
+                system,
+                [(e or "").strip() or sym for e, sym in zip(elements, species)],
+                energy,
+                forces.total,
+                index + (restart.frame if restart is not None else 0),
+            )
+            if frame is not None:
+                with open(Path(directory) / FRAMES, "a", encoding="utf-8", newline="\n") as handle:
+                    handle.write(frame)
         step = None
         if settings.step_num != 0:
             step = moldyn_step(settings, state, forces.total, energy, random=source)
@@ -255,10 +308,8 @@ def run_recorded_molecular_dynamics(
         outcome.positions = np.asarray(step.positions, dtype=np.float64)
         if step.finished:
             break
-        atoms = tuple(
-            replace(atom, position=position)  # keeps the initial moment of a non-collinear calculation
-            for atom, position in zip(system.atoms, step.positions)
-        )
+        # Andrew Grieder's loops keep the initial moment of a non-collinear calculation
+        atoms = moved_atoms(system.atoms, step.positions, getattr(backend, "keep_atom_fields", True))
         release_orbitals(result)
         moved = backend.update_geometry(system, atoms)
         carried = backend.warm_start(system, result, moved)

@@ -38,7 +38,11 @@ from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
 from .spill_buffers import SpillBuffer, copies_directly
 
 
-SolverPath = Literal["chebff", "chebdav", "subspace"]
+SolverPath = Literal["chebff", "chebdav", "subspace", "arpack"]
+
+# Eigensolver: arpack on the device (.arpack); DIAGLA stays on the reference
+# solver (see the accelerated CLI).
+DEVICE_ITERATIVE_SOLVERS = frozenset({"arpack"})
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,9 @@ class CuPyEigvalDeviceState:
     initial_method: str
     subspace: DeviceSubspaceState
     solves_completed: int
+    # ARPACK: the LAPACK seed of dgetv0 after the last start vector, which the
+    # next solve continues (None for the other solvers).
+    start_seed: tuple[int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,9 @@ class CuPyEigvalResult:
     # each step) and ``holds`` (whether the state now holds a hand-over).
     # None where no hand-over was asked for.
     handover_step: dict | None = None
+    # ``(nec, maxmvs)`` of an ARPACK solve, as eigval.F90 reports them; None
+    # for the other solvers.
+    iterative_counts: tuple[int, int] | None = None
 
     @property
     def wavefunctions(self) -> np.ndarray:
@@ -89,6 +99,8 @@ class CuPyEigvalResult:
 
 
 def _reject_unsupported_settings(settings: EigvalSettings) -> None:
+    if settings.initial_method in DEVICE_ITERATIVE_SOLVERS:
+        return
     if settings.initial_method not in {"chebff", "chebdav"}:
         raise ValueError("CuPy initial_method must be 'chebff' or 'chebdav'")
 
@@ -461,6 +473,11 @@ class CuPyEigvalSolver:
         working_states = self._working_state_count(int(requested_states))
         reason = self._incompatibility(int(requested_states), working_states)
         first = reset or self._state is None or reason is not None
+        if self.settings.initial_method in DEVICE_ITERATIVE_SOLVERS and (
+            first or not self.settings.later_subspace_filter
+        ):
+            # An ARPACK solve takes no filter bound.
+            return None
         if first:
             options = (
                 self.settings.chebff
@@ -543,6 +560,83 @@ class CuPyEigvalSolver:
             solves_completed=1,
         )
 
+    def _solve_iterative(
+        self,
+        requested_states: int,
+        working_states: int,
+        previous_state: CuPyEigvalDeviceState | None,
+        reason: str | None,
+    ) -> CuPyEigvalResult:
+        """One ARPACK solve of ``working_states`` pairs on the device.
+
+        The counterpart of ``_solve_iterative`` of
+        :mod:`parsec_python.Eigensolvers.eigval`: the budget is
+        ``max(Maximum_matvec, n * n_states)`` of this operator, the start
+        vectors continue the LAPACK stream of the saved state, and the pairs
+        become the saved subspace exactly as after CHEBFF, so a run with
+        ``Chebyshev_Filtering`` continues with SUBSPACE.
+        """
+
+        from .arpack import matvec_budget, run_device_arpack
+
+        dimension = int(self.operator.shape[0])
+        arpack = self.settings.arpack
+        solved, solve_seconds = synchronized_call(
+            run_device_arpack,
+            self.operator,
+            working_states,
+            settings=arpack,
+            matvec_budget=matvec_budget(
+                arpack.maximum_matvec, dimension, requested_states
+            ),
+            start_seed=None if previous_state is None else previous_state.start_seed,
+        )
+        reusable = previous_state is not None and reason is None
+        self._state = CuPyEigvalDeviceState(
+            operator_dimension=dimension,
+            requested_states=requested_states,
+            working_states=working_states,
+            initial_method=self.settings.initial_method,
+            subspace=DeviceSubspaceState(
+                operator_dimension=dimension,
+                working_states=working_states,
+                eigenvalues=solved.eigenvalues,
+                vectors=solved.vectors,
+                # subspace.f90z recomputes this from max(saved Ritz) on firstfilt.
+                filter_lower_bound=None,
+                first_filter=True,
+                filters_completed=0,
+            ),
+            solves_completed=previous_state.solves_completed + 1 if reusable else 1,
+            start_seed=solved.start_seed,
+        )
+        self.timing_stats.first_solve_seconds += solve_seconds
+        self.timing_stats.first_solve_calls += 1
+        self.timing_stats.solve_calls += 1
+        cp, _ = require_cupy()
+        download_started = perf_counter()
+        saved = self._state.subspace
+        eigenvalues = cp.asnumpy(saved.eigenvalues[:requested_states])
+        vectors = (
+            saved.vectors[:, :requested_states]
+            if self.retain_vectors_on_device
+            else np.asarray(cp.asnumpy(saved.vectors[:, :requested_states]), dtype=np.float64)
+        )
+        self.timing_stats.download_seconds += perf_counter() - download_started
+        return CuPyEigvalResult(
+            eigenvalues=np.asarray(eigenvalues, dtype=np.float64),
+            vectors=vectors,
+            residual_norms=None,
+            state=self._state,
+            solver_path="arpack",
+            restarted=previous_state is not None and reason is not None,
+            restart_reason=reason,
+            requested_states=requested_states,
+            working_states=working_states,
+            solve_seconds=float(solve_seconds),
+            iterative_counts=(int(solved.converged_states), int(solved.matvecs)),
+        )
+
     def solve(
         self,
         requested_states: int,
@@ -559,6 +653,16 @@ class CuPyEigvalSolver:
         previous_state = self._state
         reason = self._incompatibility(requested_states, working_states)
         restart = previous_state is not None and reason is not None
+        if self.settings.initial_method in DEVICE_ITERATIVE_SOLVERS and (
+            previous_state is None
+            or reason is not None
+            or not self.settings.later_subspace_filter
+        ):
+            # Eigensolver: arpack, in every call or (Chebyshev_Filtering) in
+            # the first; the later passes are the SUBSPACE below.
+            return self._solve_iterative(
+                requested_states, working_states, previous_state, reason
+            )
         fallback_reason = None
         # A first solve filters in FP64 whatever the later filter is set to.
         filter_precision = "float64"

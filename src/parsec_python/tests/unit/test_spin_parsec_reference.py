@@ -433,12 +433,12 @@ class SpinInputTests(unittest.TestCase):
         self.assertLess(moment, 2.0 * 0.5 * 7.0)
         self.assertAlmostEqual(moment, 2.5, delta=0.35)
 
-    def test_default_functional_of_a_spin_polarized_run_is_refused(self) -> None:
-        from parsec_python.Input import UnsupportedParsecOptionError
-
-        # usrinputfile.F90 then takes the Perdew-Wang LSDA.
-        with self.assertRaisesRegex(UnsupportedParsecOptionError, "Perdew-Wang LSDA"):
-            self.parse(self.cases["ch3_ca"], drop=("Correlation_Type",))
+    def test_default_functional_of_a_spin_polarized_run_is_perdew_wang(self) -> None:
+        # usrinputfile.F90 takes the Perdew-Wang LSDA ("pl") without the line.
+        translation = self.parse(self.cases["ch3_ca"], drop=("Correlation_Type",))
+        self.assertEqual(translation.problem.scf.xc_functional, "pw92")
+        unpolarized = self.parse(self.cases["h2o_nospin_ca"], drop=("Correlation_Type",))
+        self.assertEqual(unpolarized.problem.scf.xc_functional, "ca")
 
     def test_imported_starting_density_is_refused(self) -> None:
         translation = self.parse(

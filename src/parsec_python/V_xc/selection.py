@@ -17,6 +17,12 @@ PARSEC (``usrinputfile.F90``:2308-2361):
 ``casida_salahub``     ``cs``     CA with the Casida-Salahub potential
 =====================  =========  ==========================================
 
+A libxc functional (``libxc:<name>[+<name>...]``, :mod:`.libxc`, the
+optional library) of family LDA or GGA is evaluated by
+:func:`.semilocal.semilocal_xc` (``semilocal_xc_spin``) with its
+:class:`~.libxc.LibxcSemilocal`: the discrete variational potential and the
+frozen core density of every functional of this code.
+
 The X-alpha, Wigner and Hedin-Lundqvist functionals have no spin-polarized
 form (neither in Fortran).  The CA and PBE branches of the SCF systems call
 their functions directly; this module adds the others.
@@ -33,6 +39,8 @@ from .local_density import hedin_lundqvist_lda, wigner_lda, xalpha_lda
 from .pbe import pbe
 from .pw91 import pw91, pw91_spin
 from .pw92_lda import pw92_lda, pw92_lda_spin
+from .libxc import is_libxc_functional
+from .semilocal import semilocal_xc, semilocal_xc_spin
 
 
 #: ``xc_functional`` -> the two-letter ``icorr`` code of Fortran PARSEC.
@@ -78,6 +86,22 @@ UNPOLARIZED_ONLY_FUNCTIONALS = frozenset({"xalpha", "wigner", "hedin_lundqvist"}
 POTENTIAL_ONLY_CORRECTIONS = frozenset({"lb94", "casida_salahub"})
 
 
+def _libxc_density_functional(functional: str):
+    """The evaluator of a libxc LDA/GGA (meta-GGAs and hybrids take other routes, refused here)."""
+
+    from .libxc import libxc_semilocal, parse_libxc_spec
+
+    spec = parse_libxc_spec(functional)
+    if spec.is_hybrid:
+        raise ValueError(f"{functional} is a hybrid: its semilocal part belongs to the Fock loop (SCF.hybrid)")
+    if spec.is_meta_gga:
+        raise NotImplementedError(
+            f"{functional} is a meta-GGA: it needs the kinetic-energy density of the orbitals and the "
+            "meta-GGA Hamiltonian, which this evaluation does not have"
+        )
+    return libxc_semilocal(functional)
+
+
 def _cap(functional: str, ionization_energy_difference: float) -> float | None:
     return float(ionization_energy_difference) if functional == "casida_salahub" else None
 
@@ -98,6 +122,10 @@ def evaluate_unpolarized_xc(
     ``casida_salahub`` only.
     """
 
+    if is_libxc_functional(functional):
+        return semilocal_xc(
+            _libxc_density_functional(functional), valence_density, grid, core_density, name=functional
+        )
     volume_element = grid.volume_element
     if functional == "ca":
         return ca_lda(valence_density, volume_element, core_density)
@@ -138,6 +166,10 @@ def evaluate_spin_xc(
     select themselves; the functionals without a spin form are refused.
     """
 
+    if is_libxc_functional(functional):
+        return semilocal_xc_spin(
+            _libxc_density_functional(functional), valence_up, valence_down, grid, core_density, name=functional
+        )
     if functional == "pw92":
         return pw92_lda_spin(valence_up, valence_down, grid.volume_element, core_density)
     if functional == "pw91":

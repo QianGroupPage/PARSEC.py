@@ -16,7 +16,11 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 - Self-consistent hybrid functionals of isolated systems (PBE0, HSE06,
   B3LYP, HF, ...), without or with spin polarization: forces, relaxation and
   molecular dynamics on both command lines (`main.py` on the GPUs of one
-  node); see [Hybrid functionals](#hybrid-functionals) below.
+  node) and on several nodes (the MPI runner of
+  [acceleration/MULTI_GPU.md](acceleration/MULTI_GPU.md#hybrid-functionals-on-several-nodes));
+  of periodic cells (bulk at the Gamma point, also with spin, and with
+  k-points; slabs) on the readable solver and on the GPUs of one node; see
+  [Hybrid functionals](#hybrid-functionals) below.
 - Periodic cells (`Boundary_Conditions: bulk`), without spin-orbit coupling, at the Gamma point or with a Monkhorst-Pack
   k-point sampling (collinear spin polarization at the Gamma point only): forces, `Minimization: bfgs | simple | manual`
   and molecular dynamics. See "Periodic cells" below; the spin-unpolarized Gamma-point cell also runs on the accelerated
@@ -214,6 +218,75 @@ the same analytic-minus-numeric difference for PBE0 as for PBE, 1.2e-3 to
 In a relaxation or in molecular dynamics the Fock loop of a moved structure
 builds its first exchange operator from the orbitals of the structure
 before, so only the first structure runs the PBE start.
+
+On several nodes (`scripts/run_multi_gpu_scf.sh`) the ranks keep the orbitals
+of their sectors between the structures as well, and the nonlocal force terms
+come from the sectors of every rank as for a semilocal functional; a
+structure without symmetry (molecular dynamics, `manual` moves) has its sector
+on one GPU of the root and the pair densities of its exchange on the GPUs of
+all ranks. Measured on A100 nodes: two BFGS moves of C185H124 (PBE0, forces
+of every structure) on 2 nodes against one node, energies within 6.7e-10 Ry,
+forces within 1.2e-11 Ry/bohr, the same SCF iterations; three steps of
+molecular dynamics of H2O (PBE0, one sector) on 2 nodes, the trajectory of one
+node to the last bit.
+
+Periodic cells ([README.md](README.md#periodic-cells)) take the same forces:
+at the Gamma point from the real orbitals of the Fock loop (also with
+collinear spin), with k-points from the Bloch factors of every k-point the
+loop solved (the time-reversal representatives of the mesh, whose weights
+count their partners); on Andrew Grieder's routines the nonlocal force is
+accumulated from them after the loop
+(`SCF/hybrid_periodic.bloch_nonlocal_forces`), on the Fortran-derived ones
+`Forces/periodic.py` reads them. A moved structure starts its Fock loop
+from the potentials, the eigensubspaces of every k-point and the Bloch
+orbitals of the structure before. There is no stress.
+
+### Meta-GGA functionals
+
+With a meta-GGA ([README.md](README.md#meta-gga-functionals)) the forces keep
+the form above as well: `tau` is a functional of the orbitals alone, and the
+orbital term `-div(vtau grad)` (with the first-order term of `W = de/dg` in
+the orbital form of the density gradient) has no explicit dependence on the
+ions. The only term that sees the frozen core density is the core
+correction. The core density enters the density `n` and the density
+gradient, never `tau` (as in Quantum ESPRESSO and PARSEC 1.5 with libxc), so
+the force reads `dE_xc/dn_core`:
+
+- density form: the exchange-correlation potential `vrho + D^T (2 vsigma D n)`
+  of the total density, as for a GGA;
+- orbital form: `vrho + D^T W` with `W` formed from the gradient of the valence
+  orbitals plus that of the core density
+  (`MetaGGARecord.core_potential`, half the core density per channel with
+  spin), since the potential of that form holds `vrho` alone.
+
+The SCF test of `tests/unit/test_meta_gga_scf.py` compares this force with
+the derivative of the meta-GGA energy with respect to the position of the
+core density (LiH, both forms): 2e-4 relative, as for PBE. The SCF
+correction force uses `V_out - V_in` as for every functional; the residual
+of `vtau` (and `W`) is not part of it. In a relaxation or in molecular
+dynamics the next structure starts from the mixed `vtau` (and `W`) of the
+structure before, so only the first one runs the PBE start.
+
+Periodic cells (bulk at Gamma and with k-points, slabs and wires) take the same terms: the periodic and slab
+forces read `dE_xc/dn_core` through `Forces.periodic.meta_gga_core_potential` (the core potential of the orbital form,
+the exchange-correlation potential otherwise), and the k-point loops carry `vtau` and `W` to the next structure
+(Andrew Grieder's backend through `SCFWarmStart`, the Fortran-derived one through `meta_gga_start` of
+`run_scf_kpoints`). Central differences of the total energy of a Si cell (fcc, two atoms, one displaced by
+(0.1, 0.05, -0.08) bohr, Andrew Grieder's routines, step 0.01 bohr, SCF to 1e-9 Ry) against the forces of
+`compute_periodic_forces`, largest component difference in Ry/bohr (forces ~0.03-0.06):
+
+| functional | Gamma, h 0.4 | 2 k-points, h 0.4 | Gamma, h 0.3 |
+|---|---|---|---|
+| PBE | 3.5e-4 | 2.7e-4 | 1.7e-4 |
+| smooth test meta-GGA (`tests/unit/test_meta_gga.py`) | 3.4e-4 | - | - |
+| SCAN, density form | 1.8e-3 | 2.5e-3 | 3.8e-4 |
+| SCAN, orbital form | - | 2.6e-3 | - |
+
+The meta-GGA terms of the forces are complete: the smooth meta-GGA matches PBE, and SCAN's larger difference at
+h 0.4 falls by a factor of five at h 0.3 (PBE's by two), the grid sensitivity of SCAN rather than a missing term. On
+the Fortran-derived routines (`Use_Fortran_Routines: .true.`, the same cell with the FHI98PP potential of
+`examples/3d_meta_gga`, two k-points, h 0.3, `Forces.compute_forces`) the differences are 2.1e-3 (PBE) and 2.6e-3
+Ry/bohr (SCAN): the meta-GGA adds nothing to what those routines show for PBE.
 
 ## Periodic cells
 
@@ -615,8 +688,21 @@ built on the device (`acceleration/V_ion/periodic_device.py`,
   projectors of the device Hamiltonian in place, and the next SCF loop
   continues from the saved subspace, as for a cluster.
 
-`Cubic_Spline` species and the G-space local potential keep the readable
-fields and forces. A plain single point (no forces, no moving atoms) keeps
+The G-space local potential keeps the readable fields and forces.
+`Cubic_Spline` species keep the fields of the host preparation
+(`periodic_setup.py`); their local forces are the derivatives of those fields
+(`acceleration/Forces/periodic_spline.py`, since 2026-11-07: the short-ranged
+terms on the host over the balls of the potential, the reciprocal part from
+one FFT, the self-consistency and core terms in the CUDA kernel above). The
+readable routine they replace summed every grid point of every image within
+`erfcinv(1e-26)/eta`: 34 s against 3.5 s for the local forces of the 8-atom cube
+at h 0.25 on an A100 node, 892 s against 5.2 s for the 64-atom cube at h 0.30.
+On Fortran's general (oblique) grid, whose `Cubic_Spline` potential takes the
+same split by default (`PARSEC_PERIODIC_OBLIQUE_SPLIT`), the same routine
+differentiates it over the lattice balls (the density terms in a lattice
+kernel on the device; within 2.2e-8 Ry/bohr of fourth-order differences of
+the energy of the potential for a distorted fcc Si16 cell at h 0.30, 4.5e-7 of
+the readable forces for a distorted Si2 cell). A plain single point (no forces, no moving atoms) keeps
 the readable fields bit for bit on both command lines. The projector
 gradients of the forces find their grid points with the grid-ball query of
 `periodic_setup.py` (the same matrices). Si8 cube (h 0.64 bohr, laptop RTX

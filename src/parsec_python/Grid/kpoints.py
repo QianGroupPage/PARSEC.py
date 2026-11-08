@@ -549,13 +549,15 @@ def kpoint_sampling_details(problem) -> MonkhorstPackSampling | None:
     ``monkhorst_pack_dimensions`` with that shift, reduced by the input's
     ``space_group`` (the identity where it is ``None``, e.g. with
     ``Ignore_Symmetry``) and by time reversal unless the calculation is
-    non-collinear (``irrbz.f90:96-99``).
+    non-collinear (``irrbz.f90:96-99``).  A hybrid functional takes time
+    reversal only (its exchange operator sums over the full mesh,
+    :mod:`parsec_python.SCF.hybrid_periodic`).
     """
 
     shift = getattr(problem, "monkhorst_pack_shift", None)
     if shift is None or problem.monkhorst_pack_dimensions is None:
         return None
-    group = getattr(problem, "space_group", None)
+    group = None if _hybrid(problem) else getattr(problem, "space_group", None)
     lattice = tuple(
         tuple(float(value) for value in row)
         for row in np.asarray(problem.periodic_cell.lattice_vectors, dtype=float)
@@ -600,24 +602,66 @@ def _cached_irreducible_monkhorst_pack(lattice, dimensions, shift, rotations, ti
     return sampling
 
 
+def _hybrid(problem) -> bool:
+    return bool(getattr(getattr(problem, "scf", None), "is_hybrid", False))
+
+
+def time_reversal_reduced(k_points, weights, lattice_vectors) -> tuple[np.ndarray, np.ndarray]:
+    """The representatives of a uniform mesh of equal weights under time reversal (``k ~ -k``).
+
+    The first point of each pair is kept with twice the weight; a point with
+    ``-k = k`` modulo the reciprocal lattice of ``lattice_vectors`` keeps its
+    own.  The order of the first members is kept.
+    """
+
+    k_points = np.atleast_2d(np.asarray(k_points, dtype=float))
+    weights = np.asarray(weights, dtype=float)
+    fractions = k_points @ np.linalg.inv(reciprocal_lattice(lattice_vectors))
+    taken = np.zeros(k_points.shape[0], dtype=bool)
+    kept, kept_weights = [], []
+    for index in range(k_points.shape[0]):
+        if taken[index]:
+            continue
+        taken[index] = True
+        weight = float(weights[index])
+        total = fractions + fractions[index]
+        partners = np.flatnonzero(np.all(np.abs(total - np.round(total)) < 1.0e-8, axis=1) & ~taken)
+        if partners.size:
+            taken[partners[0]] = True
+            weight += float(weights[partners[0]])
+        kept.append(index)
+        kept_weights.append(weight)
+    return k_points[kept].copy(), np.asarray(kept_weights, dtype=float)
+
+
 def kpoint_sampling(problem) -> tuple[np.ndarray, np.ndarray] | None:
     """``(k_points, weights)`` requested by a ``SinglePointInput``, or ``None``.
 
     An explicit list (``problem.kpoints``), Fortran's reduced grid
     (``problem.monkhorst_pack_shift`` given, :func:`kpoint_sampling_details`)
     or this port's unreduced Monkhorst-Pack grid
-    (``problem.monkhorst_pack_dimensions``); ``None`` means Gamma only.
+    (``problem.monkhorst_pack_dimensions``); ``None`` means Gamma only.  For a
+    hybrid functional the port's grid and a list of equal weights are reduced
+    by time reversal (:func:`time_reversal_reduced`) and Fortran's grid by
+    time reversal only; the exchange checks that the set is a uniform mesh
+    (:mod:`parsec_python.SCF.hybrid_periodic`).
     """
 
     if getattr(problem, "kpoints", None) is not None:
-        return np.asarray(problem.kpoints, dtype=float), np.asarray(
-            problem.kpoint_weights, dtype=float
-        )
+        k_points = np.asarray(problem.kpoints, dtype=float)
+        weights = np.asarray(problem.kpoint_weights, dtype=float)
+        if _hybrid(problem) and np.allclose(weights, weights[0], rtol=1.0e-12, atol=0.0):
+            # a list of equal weights (a full mesh written out): its time-reversal representatives
+            return time_reversal_reduced(k_points, weights, problem.periodic_cell.lattice_vectors)
+        return k_points, weights
     details = kpoint_sampling_details(problem)
     if details is not None:
         return details.k_points.copy(), details.weights.copy()
     if problem.monkhorst_pack_dimensions is not None:
-        return monkhorst_pack_grid(problem.periodic_cell, problem.monkhorst_pack_dimensions)
+        k_points, weights = monkhorst_pack_grid(problem.periodic_cell, problem.monkhorst_pack_dimensions)
+        if _hybrid(problem):
+            return time_reversal_reduced(k_points, weights, problem.periodic_cell.lattice_vectors)
+        return k_points, weights
     return None
 
 
@@ -633,5 +677,6 @@ __all__ = [
     "kpoint_sampling_details",
     "monkhorst_pack_grid",
     "read_kpoint_file",
+    "time_reversal_reduced",
     "translate01",
 ]

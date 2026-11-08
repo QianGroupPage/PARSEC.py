@@ -366,15 +366,29 @@ class SciPyBackendTests(_BackendCases, unittest.TestCase):
         self.assertIn("2.00", moments)
 
     def test_mpi_sectors_are_refused(self) -> None:
+        # The ranks of an MPI SCF divide the symmetry sectors of both channels;
+        # channels that stay on the full grid are refused there, with or without
+        # the exchange of a hybrid.
         case = load_cases()["n_ca"]
         with tempfile.TemporaryDirectory() as directory:
             translation = parse_parsec_input(write_case(case, Path(directory)))
-        with self.assertRaisesRegex(NotImplementedError, "cannot run as an MPI SCF"):
-            driver.prepare_single_point(
-                translation.problem,
-                backend=self.backend,
-                mpi_context=SimpleNamespace(rank=0, root=0),
-            )
+        problem = replace(translation.problem, scf=replace(translation.problem.scf, spin_symmetry_sectors="off"))
+        for context in (SimpleNamespace(rank=0, root=0), SimpleNamespace(rank=0, root=0, exchange=True)):
+            with self.assertRaisesRegex(NotImplementedError, "cannot run as an MPI SCF"):
+                driver.prepare_single_point(problem, backend=self.backend, mpi_context=context)
+
+    def test_mpi_runner_refuses_ionic_steps_of_spin_runs_on_several_ranks(self) -> None:
+        from parsec_python.acceleration.benchmarks.mpi_full_scf import _refuse_spin_ionic_steps
+
+        scf = SimpleNamespace(spin_polarized=True)
+        single = SimpleNamespace(problem=SimpleNamespace(scf=scf), compute_forces=False,
+                                 relaxation=None, molecular_dynamics=None)
+        _refuse_spin_ionic_steps(single, 2)  # a single point is divided among the ranks
+        for changed in (dict(compute_forces=True), dict(relaxation=object()), dict(molecular_dynamics=object())):
+            translation = SimpleNamespace(**{**vars(single), **changed})
+            with self.assertRaisesRegex(ValueError, "spin-polarized calculation are not available on several ranks"):
+                _refuse_spin_ionic_steps(translation, 2)
+            _refuse_spin_ionic_steps(translation, 1)  # one rank (a serial control) is one process
 
 
 @unittest.skipUnless(native_available(), "native extension is unavailable")

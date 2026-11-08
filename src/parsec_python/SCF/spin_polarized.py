@@ -80,6 +80,7 @@ from .single_point import (
     hubbard_terms_of_iteration,
     iteration_eigensolver_fields,
     loop_criterion,
+    meta_gga_loop,
     preconditioner_neighbors,
     refine_levels,
     refuse_exchange_hooks,
@@ -292,6 +293,14 @@ def run_spin_scf(
         )
     # LDA+U potential matrices of both channels, zero in the first iteration.
     hubbard_state = None
+    # A meta-GGA: tau and vtau of each channel (SCF.meta_gga).
+    meta = meta_gga_loop(
+        system,
+        channels=2,
+        adapter=scalar_field_adapter,
+        warm_start=warm_start,
+        exchange_term=exchange_term,
+    )
 
     scf_start = time.perf_counter()
     level_detail = None
@@ -323,8 +332,11 @@ def run_spin_scf(
         initial_hartree_seconds = time.perf_counter() - stage_start
         hartree_potential = initial_hartree.potential
         stage_start = time.perf_counter()
-        xc = system.evaluate_spin_xc(
-            *(to_internal(density) for density in system.initial_spin_densities)
+        start_densities = tuple(to_internal(density) for density in system.initial_spin_densities)
+        xc = (
+            system.evaluate_spin_xc(*start_densities)
+            if meta is None
+            else meta.start_spin_xc(*start_densities)
         )
         initial_xc_seconds = time.perf_counter() - stage_start
         input_potentials = [
@@ -352,7 +364,12 @@ def run_spin_scf(
         eigval_states = [None, None] if states is None else list(states)
 
     # The mixer a warm start carries (the Fock loop's Exx_Mixer_History), else a new one.
-    mixer = warm_start_mixer(warm_start, lambda: build_mixer(system.input.mixing))
+    mixer = warm_start_mixer(
+        warm_start,
+        (lambda: build_mixer(system.input.mixing))
+        if meta is None
+        else (lambda: meta.mixer(build_mixer, system.input.mixing)),
+    )
     if reduced:
         # The orbit values of both channels, up first, and back.
         join_channels = scalar_field_adapter.join_channels
@@ -427,7 +444,16 @@ def run_spin_scf(
         solver_counts: list[tuple[int, int] | None] = []
         for spin in range(2):
             binding_start = time.perf_counter()
-            if hubbard_projectors is None and exchange_term is None:
+            if meta is not None and meta.kinetic_potential(spin) is not None:
+                # A meta-GGA hybrid: the orbital term and the fixed exchange operator.
+                hamiltonian = system.hamiltonian(
+                    input_potentials[spin],
+                    None,
+                    None if exchange_term is None else exchange_term.operator(spin),
+                    kinetic_potential=meta.kinetic_potential(spin),
+                    **meta.flux_keywords(spin),
+                )
+            elif hubbard_projectors is None and exchange_term is None:
                 hamiltonian = system.hamiltonian(input_potentials[spin])
             elif hubbard_projectors is None:
                 hamiltonian = system.hamiltonian(
@@ -526,7 +552,15 @@ def run_spin_scf(
                 window = fermi_level + START_LEVEL_WINDOW
                 diagonalization_start = time.perf_counter()
                 for spin in range(2):
-                    if exchange_term is None:
+                    if meta is not None and meta.kinetic_potential(spin) is not None:
+                        hamiltonian = system.hamiltonian(
+                            input_potentials[spin],
+                            None,
+                            None if exchange_term is None else exchange_term.operator(spin),
+                            kinetic_potential=meta.kinetic_potential(spin),
+                            **meta.flux_keywords(spin),
+                        )
+                    elif exchange_term is None:
                         hamiltonian = system.hamiltonian(input_potentials[spin])
                     else:
                         hamiltonian = system.hamiltonian(
@@ -579,6 +613,12 @@ def run_spin_scf(
                 )
                 # (A reduced builder returns the field of the orbits.)
                 densities[spin] = built if reduced else np.asarray(built, dtype=np.float64)
+        # A meta-GGA: tau of each channel, one electron per state.
+        taus = (
+            None
+            if meta is None
+            else [meta.tau(wavefunctions[spin], occupations[spin], 1.0, spin) for spin in range(2)]
+        )
         symmetrization = ()
         density_symmetry = getattr(system, "density_symmetry", None)
         if density_symmetry is not None and reduced:
@@ -597,6 +637,9 @@ def run_spin_scf(
                     densities[spin], density_symmetry, volume_element
                 )
                 reports.append(report)
+                if taus is not None:
+                    taus[spin], _ = symmetrize_density(taus[spin], density_symmetry, volume_element)
+                    meta.symmetrize_gradient(spin, density_symmetry)
             symmetrization = tuple(reports)
         density = densities[0] + densities[1]
         occupations_density_seconds = time.perf_counter() - occupations_density_start
@@ -610,7 +653,12 @@ def run_spin_scf(
         hartree_total += hartree_seconds
         hartree_potential = hartree.potential
         xc_start = time.perf_counter()
-        xc = system.evaluate_spin_xc(densities[0], densities[1])
+        if meta is None:
+            xc = system.evaluate_spin_xc(densities[0], densities[1])
+        else:
+            xc = system.evaluate_spin_xc(
+                densities[0], densities[1], tau_up=taus[0], tau_down=taus[1], **meta.spin_gradient_keywords()
+            )
         xc_seconds = time.perf_counter() - xc_start
         xc_total += xc_seconds
         xc_potentials = list(xc.potentials)
@@ -658,19 +706,36 @@ def run_spin_scf(
                 else {}
             ),
         )
+        if meta is not None:
+            energies = meta.energies(energies, taus, getattr(xc, "fermi_hole_clamped", 0), xc=xc)
         if exchange_term is not None:
+            # (After the meta-GGA's double counting: a meta-GGA hybrid keeps the
+            # hybrid breakdown of its inner loops.)
             energies = exchange_term.iteration_energies(
                 energies, tuple(wavefunctions), tuple(occupations)
             )
 
         # 6. Mix the two potentials as one vector, up first, and test the
         # larger residual of the two channels.
-        mixed = mixer.mix(
-            join_channels(input_potentials),
-            join_channels(output_potentials),
-            iteration=iteration,
-        )
-        mixed_potentials = split_channels(mixed)
+        if meta is None:
+            mixed = mixer.mix(
+                join_channels(input_potentials),
+                join_channels(output_potentials),
+                iteration=iteration,
+            )
+            mixed_potentials = split_channels(mixed)
+        else:
+            # The vtau of both channels joins the vector (SCF.meta_gga).
+            mixed_potentials = meta.mix(
+                mixer,
+                input_potentials,
+                output_potentials,
+                xc.kinetic_potentials,
+                iteration=iteration,
+                join=join_channels,
+                split=split_channels,
+                densities=densities,
+            )
         selected_residual = (
             metrics.plain if settings.use_plain_residual else metrics.weighted
         )
@@ -805,6 +870,8 @@ def run_spin_scf(
                 last_asymmetry = asymmetry
                 criterion_scale *= 0.1
                 input_potentials = mixed_potentials
+                if meta is not None:
+                    meta.advance()
                 continue
         if iteration_converged or refining:
             if level_tolerance is not None and not refining:
@@ -814,6 +881,8 @@ def run_spin_scf(
             converged = True
             break
         input_potentials = mixed_potentials
+        if meta is not None:
+            meta.advance()
 
     if energies is None:
         raise RuntimeError("SCF loop did not execute")
@@ -901,6 +970,7 @@ def run_spin_scf(
         spin=channels,
         hubbard=hubbard_state,
         dispersion=dispersion,
+        **({} if meta is None else {"meta_gga": meta.record()}),
     )
     check = getattr(scalar_field_adapter, "check_spin_result", None)
     if exchange_term is None and callable(check):
@@ -1052,6 +1122,11 @@ def run_scf_spin_polarized(
         raise ValueError(
             "run_scf_spin_polarized requires SCFSettings.spin_polarized=True"
         )
+    if getattr(settings, "is_meta_gga", False):
+        raise NotImplementedError(
+            f"run_scf_spin_polarized has no meta-GGA term ({settings.xc_functional!r}): a meta-GGA runs on "
+            "run_spin_scf, or for a periodic cell on the k-point spin loop at the Gamma point"
+        )
     hubbard_projectors = getattr(system, "hubbard", None)
     hubbard_state = None
 
@@ -1150,18 +1225,27 @@ def run_scf_spin_polarized(
         # (flevel.f90): each pooled level is one non-degenerate orbital, so
         # degeneracy=1 here (contrast the unpolarized path's degeneracy=2).
         pooled = np.concatenate([eigenvalues_up, eigenvalues_down])
-        order = np.argsort(pooled, kind="stable")
-        occupation_result = fermi_occupations(
-            pooled[order],
-            system.electron_count,
-            settings.fermi_temperature_kelvin,
-            degeneracy=1.0,
-        )
-        pooled_occupations = np.empty_like(pooled)
-        pooled_occupations[order] = occupation_result.occupations
-        occupations_up = pooled_occupations[: eigenvalues_up.size]
-        occupations_down = pooled_occupations[eigenvalues_up.size :]
-        fermi_level = occupation_result.fermi_level
+        if settings.fixed_occupations is not None:
+            # occup.in (a negative Fermi_Temp): each channel takes its own
+            # section in order of energy, as run_spin_scf does; no Fermi level.
+            fixed = _spin_occupations((eigenvalues_up, eigenvalues_down), system, settings)
+            occupations_up, occupations_down = (
+                np.asarray(values, dtype=np.float64) for values in fixed.occupations
+            )
+            fermi_level = fixed.fermi_level
+        else:
+            order = np.argsort(pooled, kind="stable")
+            occupation_result = fermi_occupations(
+                pooled[order],
+                system.electron_count,
+                settings.fermi_temperature_kelvin,
+                degeneracy=1.0,
+            )
+            pooled_occupations = np.empty_like(pooled)
+            pooled_occupations[order] = occupation_result.occupations
+            occupations_up = pooled_occupations[: eigenvalues_up.size]
+            occupations_down = pooled_occupations[eigenvalues_up.size :]
+            fermi_level = occupation_result.fermi_level
 
         density_up = density_from_orbitals(
             wavefunctions_up, occupations_up, system.grid.volume_element, degeneracy=1.0

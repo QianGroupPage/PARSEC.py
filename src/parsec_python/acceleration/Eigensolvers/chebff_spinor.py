@@ -276,7 +276,38 @@ def _lanczos_upper_bound(cp, operator, dimension: int, steps: int, rng: np.rando
     elif residual_scale < 1.0e-1:
         residual_scale *= 5.0
     upper_bound = spectral_radius + residual_scale
+    margin = _orbital_term_margin(operator)
+    if margin > 0.0:
+        # A meta-GGA's orbital terms (DeviceBlochOperator.kinetic): the policy of the cluster
+        # path (acceleration.Eigensolvers.spectral_bounds.with_orbital_term), max(lanczos,
+        # bare + margin), with ``bare`` the Lanczos bound of the same operator without the
+        # terms (a second short run from its own start vector; the caller's generator is
+        # left as it was).
+        holder = _term_holder(operator)
+        saved = holder.kinetic
+        holder.kinetic = None
+        try:
+            bare, _ = _lanczos_upper_bound(cp, operator, dimension, steps, np.random.default_rng(20261108))
+        finally:
+            holder.kinetic = saved
+        upper_bound = max(upper_bound, bare + margin)
     return float(upper_bound), lower_bound
+
+
+def _term_holder(operator):
+    """The operator that holds the orbital terms behind the wrappers of the solve (``_CountingOperator``)."""
+    while "kinetic" not in vars(operator) and getattr(operator, "_operator", None) is not None:
+        operator = operator._operator
+    return operator
+
+
+def _orbital_term_margin(operator) -> float:
+    """The Gershgorin bound of a meta-GGA's orbital terms an operator holds (0 without them)."""
+    if getattr(operator, "kinetic", None) is None:
+        return 0.0
+    from parsec_python.Eigensolvers.spectral_bounds import orbital_term_margin
+
+    return orbital_term_margin(operator)
 
 
 def _chebyshev_filter(

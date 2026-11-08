@@ -117,10 +117,20 @@ class PeriodicPreparedSinglePointSystem:
             # a slab of Andrew Grieder's slab_boundary: its atoms sit inside the box (|z| < R), which the 3-D fold
             # would move by the box height
             return tuple(self.atoms)
-        return fold_atoms_into_cell(self.atoms, self.input.periodic_cell.lattice_vectors)
+        # a wire or slab of the Fortran-derived routines (grid periodicity 1 or 2): folded along its periodic
+        # vectors only; its cell has unit vectors along the confined directions, and a fold along them moved the
+        # atoms of the k-point loops (and of the forces) away from those of the preparation (to 2026-11-08)
+        periodicity = int(getattr(self.input.grid, "periodicity", 3))
+        return fold_atoms_into_cell(self.atoms, self.input.periodic_cell.lattice_vectors, periodic_axes=periodicity)
 
     def hamiltonian(
-        self, effective_potential: np.ndarray, hubbard: object | None = None
+        self,
+        effective_potential: np.ndarray,
+        hubbard: object | None = None,
+        exchange: object | None = None,
+        *,
+        kinetic_potential: np.ndarray | None = None,
+        gradient_flux=None,
     ) -> KohnShamHamiltonian:
         """Compose the current SCF Hamiltonian without forming a dense matrix.
 
@@ -133,8 +143,36 @@ class PeriodicPreparedSinglePointSystem:
 
         ``H = -nabla_FD^2 + diag(V_eff) + V_NL``,
 
-        plus the Gamma-point LDA+U term ``hubbard`` where it is given.
+        plus the Gamma-point LDA+U term ``hubbard`` where it is given, the
+        exact-exchange term ``a_x V_ACE`` of a hybrid functional at the Gamma
+        point (``exchange``, :mod:`parsec_python.SCF.hybrid`) and the
+        orbital term ``-div(vtau grad)`` of a meta-GGA at the Gamma point
+        (``kinetic_potential`` = ``vtau``, :mod:`parsec_python.V_xc.meta_gga`;
+        ``gradient_flux`` = ``W`` of its orbital density gradient).  A
+        periodic cell runs no meta-GGA hybrid (refused by the input), so the
+        two terms never come together here.
         """
+        if exchange is not None and kinetic_potential is not None:
+            raise NotImplementedError("a meta-GGA hybrid of a periodic cell is not implemented")
+        if kinetic_potential is not None:
+            from ..V_xc.meta_gga import KineticPotentialOperator, grid_gradient
+
+            return KohnShamHamiltonian(
+                self.negative_laplacian,
+                effective_potential,
+                self.nonlocal_operator,
+                hubbard,
+                None,
+                KineticPotentialOperator(grid_gradient(self.grid), kinetic_potential, gradient_flux=gradient_flux),
+            )
+        if exchange is not None:
+            return KohnShamHamiltonian(
+                self.negative_laplacian,
+                effective_potential,
+                self.nonlocal_operator,
+                hubbard,
+                exchange,
+            )
         if hubbard is None:
             return KohnShamHamiltonian(
                 self.negative_laplacian,
@@ -180,16 +218,48 @@ class PeriodicPreparedSinglePointSystem:
             zero_average = getattr(self.input.scf, "zero_average_xc_potential", False)
         return bool(zero_average) and getattr(self.input.grid, "periodicity", 3) == 3
 
-    def evaluate_xc(self, density: np.ndarray, *, zero_average: bool | None = None) -> XCResult:
+    def evaluate_xc(
+        self,
+        density: np.ndarray,
+        tau: np.ndarray | None = None,
+        density_gradient=None,
+        *,
+        zero_average: bool | None = None,
+    ) -> XCResult:
         """Evaluate the selected XC functional including frozen NLCC.
 
         With ``SCFSettings.zero_average_xc_potential`` (``zero_average=None``
         follows it) the potential is shifted to a zero average, as
         ``potshift`` does in every ``rho_har`` call of a 3-D periodic cell; the
-        energy is that of the functional either way.
+        energy is that of the functional either way.  A meta-GGA needs
+        ``tau`` of the valence orbitals (:meth:`kinetic_energy_density`, or
+        the k-point sum of :func:`parsec_python.SCF.kpoints.run_scf_kpoints`)
+        and returns a :class:`~parsec_python.V_xc.meta_gga.MetaGGAXCResult`
+        (``vtau`` is not shifted); ``density_gradient`` is ``g`` of the orbital
+        form of the density gradient (three fields).
         """
 
-        if self.input.scf.xc_functional == "ca":
+        if getattr(self.input.scf, "is_meta_gga", False):
+            from ..V_xc.meta_gga import meta_gga_evaluator, meta_gga_xc
+
+            if tau is None:
+                raise ValueError("a meta-GGA needs the kinetic-energy density of the orbitals")
+            result = meta_gga_xc(
+                meta_gga_evaluator(self.input.scf),
+                density,
+                tau,
+                self.grid,
+                self.core_density,
+                negative_laplacian=self.negative_laplacian,
+                name=self.input.scf.xc_functional,
+                density_gradient=None if density_gradient is None else np.stack(density_gradient),
+            )
+        elif getattr(self.input.scf, "is_hybrid", False):
+            # The semilocal part of a hybrid; the exact exchange is the operator of SCF/hybrid.py.
+            from .hybrid import scf_semilocal_xc
+
+            result = scf_semilocal_xc(self.input.scf, density, self.grid, self.core_density)
+        elif self.input.scf.xc_functional == "ca":
             result = ca_lda(density, self.grid.volume_element, self.core_density)
         elif self.input.scf.xc_functional == "pbe":
             result = pbe(density, self.grid, self.core_density)
@@ -215,11 +285,24 @@ class PeriodicPreparedSinglePointSystem:
         """Collinear spin-polarized XC (LSDA or PBE) including frozen NLCC.
 
         ``zero_average``: as :meth:`evaluate_xc`, each channel by its own
-        average (``potshift`` per ``isp``).
+        average (``potshift`` per ``isp``).  A meta-GGA needs the ``tau`` of
+        both channels: :meth:`evaluate_spin_xc`.
         """
 
         functional = self.input.scf.xc_functional
-        result = _provided_spin_xc(self, "spin_polarized", density_up, density_down)
+        if getattr(self.input.scf, "is_meta_gga", False):
+            raise NotImplementedError(
+                f"the meta-GGA {functional!r} needs the kinetic-energy densities of the orbitals: "
+                "its spin loops call evaluate_spin_xc with tau_up and tau_down"
+            )
+        if getattr(self.input.scf, "is_hybrid", False):
+            from .hybrid import scf_semilocal_spin_xc
+
+            result = as_spin_polarized_result(
+                scf_semilocal_spin_xc(self.input.scf, density_up, density_down, self.grid, self.core_density)
+            )
+        else:
+            result = _provided_spin_xc(self, "spin_polarized", density_up, density_down)
         if result is None:
             if functional == "ca":
                 result = ca_lda_spin_polarized(
@@ -255,6 +338,9 @@ class PeriodicPreparedSinglePointSystem:
         self,
         density_up: np.ndarray,
         density_down: np.ndarray,
+        tau_up: np.ndarray | None = None,
+        tau_down: np.ndarray | None = None,
+        density_gradients=None,
         *,
         zero_average: bool | None = None,
     ):
@@ -262,11 +348,37 @@ class PeriodicPreparedSinglePointSystem:
 
         What :func:`parsec_python.SCF.run_spin_scf` evaluates; each channel
         sees its valence density plus half of the frozen NLCC density.
-        ``zero_average``: as :meth:`evaluate_xc_spin_polarized`.
+        ``zero_average``: as :meth:`evaluate_xc_spin_polarized`.  A meta-GGA
+        needs the ``tau`` of both channels and returns a
+        :class:`~parsec_python.V_xc.meta_gga.MetaGGASpinXCResult`.
         """
 
         functional = self.input.scf.xc_functional
-        result = _provided_spin_xc(self, "spin", density_up, density_down)
+        if getattr(self.input.scf, "is_meta_gga", False):
+            from ..V_xc.meta_gga import meta_gga_evaluator, meta_gga_xc_spin
+
+            if tau_up is None or tau_down is None:
+                raise ValueError("a meta-GGA needs the kinetic-energy densities of both channels")
+            result = meta_gga_xc_spin(
+                meta_gga_evaluator(self.input.scf),
+                density_up,
+                density_down,
+                tau_up,
+                tau_down,
+                self.grid,
+                self.core_density,
+                negative_laplacian=self.negative_laplacian,
+                name=functional,
+                density_gradients=None
+                if density_gradients is None
+                else tuple(np.stack(gradient) for gradient in density_gradients),
+            )
+        elif getattr(self.input.scf, "is_hybrid", False):
+            from .hybrid import scf_semilocal_spin_xc
+
+            result = scf_semilocal_spin_xc(self.input.scf, density_up, density_down, self.grid, self.core_density)
+        else:
+            result = _provided_spin_xc(self, "spin", density_up, density_down)
         if result is None:
             if functional == "ca":
                 result = ca_lda_spin(
@@ -302,6 +414,58 @@ class PeriodicPreparedSinglePointSystem:
                 "non-collinear magnetism"
             )
         return noncollinear_xc(density, magnetization, self.evaluate_xc_spin_polarized)
+
+    # ----- the hooks of a meta-GGA loop (parsec_python.SCF.meta_gga) -----
+
+    def kinetic_energy_density(self, wavefunctions, occupations, degeneracy: float = 2.0, gradient: bool = False):
+        """``tau`` (Hartree) of the Euclidean-normalized real grid orbitals of a Gamma-point loop.
+
+        :func:`parsec_python.V_xc.meta_gga.kinetic_energy_density` with the
+        gradient of this cell (wrapped on the periodic axes, zero outside a
+        slab or wire); with ``gradient`` also the orbital form of the density
+        gradient, ``(tau, (g_x, g_y, g_z))``
+        (:func:`parsec_python.V_xc.meta_gga.orbital_density_gradient`).  The
+        k-point loops form both from the Bloch factors
+        (:func:`parsec_python.SCF.meta_gga_periodic.bloch_orbital_fields`).
+        """
+
+        from ..V_xc.meta_gga import grid_gradient, kinetic_energy_density, orbital_density_gradient
+
+        operators = grid_gradient(self.grid)
+        tau = kinetic_energy_density(
+            wavefunctions, occupations, operators, self.grid.volume_element, degeneracy=degeneracy
+        )
+        if not gradient:
+            return tau
+        values = orbital_density_gradient(
+            wavefunctions, occupations, operators, self.grid.volume_element, degeneracy=degeneracy
+        )
+        if self.density_symmetry is not None:
+            # Symmetrize_Charge_Density: the loop averages tau with the density; g is a vector field.
+            from .meta_gga_periodic import symmetrized_gradient
+
+            values = symmetrized_gradient(values, self.density_symmetry, self.input.periodic_cell.lattice_vectors)
+        return tau, tuple(values)
+
+    def evaluate_meta_gga_start_xc(self, density: np.ndarray) -> XCResult:
+        """PBE of the start density of a meta-GGA loop (PARSEC 1.5's first iteration), with the zero-average shift."""
+
+        result = pbe(density, self.grid, self.core_density)
+        if not self._zero_average(None):
+            return result
+        return replace(result, potential=_without_average(result.potential))
+
+    def evaluate_meta_gga_start_spin_xc(self, density_up: np.ndarray, density_down: np.ndarray):
+        """Spin PBE of the start densities of a meta-GGA loop, with the zero-average shift."""
+
+        result = pbe_spin(density_up, density_down, self.grid, self.core_density)
+        if not self._zero_average(None):
+            return result
+        return replace(
+            result,
+            potential_up=_without_average(result.potential_up),
+            potential_down=_without_average(result.potential_down),
+        )
 
 
 # A faster evaluator of the spin functionals of a periodic cell (a CUDA
@@ -731,26 +895,31 @@ def fortran_update_periodic_geometry(
     )
 
 
-def fold_atoms_into_cell(atoms, lattice_vectors: np.ndarray) -> tuple:
+def fold_atoms_into_cell(atoms, lattice_vectors: np.ndarray, *, periodic_axes: int = 3) -> tuple:
     """Atoms with their positions moved by lattice vectors into the cell (fractional coordinates in ``[0, 1)``).
 
     A periodic image of an atom is the same atom: the energy and the forces do not depend on which one the
     coordinates name, but the builders of image sums are written for atoms inside the cell.  Atoms already inside are
-    returned as they are, bit for bit.
+    returned as they are, bit for bit.  ``periodic_axes`` (1 for a wire, 2 for a slab) folds along the first lattice
+    vectors only and leaves the confined coordinates as they are.
     """
 
     lattice = np.asarray(lattice_vectors, dtype=np.float64)
     inverse = np.linalg.inv(lattice)
+    axes = int(periodic_axes)
     folded = []
     for atom in atoms:
         position = np.asarray(atom.position, dtype=np.float64)
-        fraction = position @ inverse
+        fraction = (position @ inverse)[:axes]
         inside = np.all(fraction >= -1.0e-12) and np.all(fraction < 1.0 + 1.0e-12)
         if inside:
             folded.append(atom)
             continue
-        wrapped = fraction - np.floor(fraction)
-        folded.append(replace(atom, position=wrapped @ lattice))
+        if axes == 3:
+            wrapped = fraction - np.floor(fraction)
+            folded.append(replace(atom, position=wrapped @ lattice))
+        else:
+            folded.append(replace(atom, position=position - np.floor(fraction) @ lattice[:axes]))
     return tuple(folded)
 
 

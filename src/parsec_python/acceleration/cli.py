@@ -868,9 +868,24 @@ def _mpi_unsupported_features(translation) -> list[str]:
         # FDET of PARSEC 1.5: one process holds the frozen sample field.
         features.append("FDET (Potential_Field)")
     if getattr(problem.scf, "is_hybrid", False):
-        # The exchange operator needs every orbital on every grid point.
+        # The rows of every orbital are divided among the ranks here; the
+        # hybrid of a cluster runs on several nodes in the MPI runner, whose
+        # ranks divide the symmetry sectors (SCF/hybrid_mpi.py).
         features.append(
-            f"the self-consistent hybrid functional (Correlation_Type: {problem.scf.xc_functional})"
+            f"the self-consistent hybrid functional (Correlation_Type: {problem.scf.xc_functional}; "
+            "on several nodes a cluster's hybrid runs with scripts/run_multi_gpu_scf.sh)"
+        )
+    if str(getattr(problem.scf, "xc_functional", "")).startswith("libxc:") and not (
+        getattr(problem.scf, "is_hybrid", False) or getattr(problem.scf, "is_meta_gga", False)
+    ):
+        # Not tested with the distributed solvers (their XC paths on rows of the grid).
+        features.append(f"the libxc functional {problem.scf.xc_functional} (not tested with --mpi)")
+    if getattr(problem.scf, "is_meta_gga", False):
+        # tau (and g) are sums over the orbitals on every grid point, and the
+        # orbital terms of the Hamiltonian reach the neighbours' rows.
+        features.append(
+            f"the meta-GGA {problem.scf.xc_functional} (its kinetic-energy density needs the orbitals "
+            "on every grid point)"
         )
     return features
 
@@ -880,21 +895,32 @@ def _hybrid_on_device(arguments: argparse.Namespace, translation) -> bool:
 
     The input has one, its pairs are solved by the Kronecker solver (the
     default ``Exx_Pair_Solver``), the backend resolves to CuPy and the run is
-    one process (no ``--mpi``): the GPUs of one node.  ``False`` for every
-    other input, which the reference solver then runs.
+    one process (no ``--mpi``): the GPUs of one node.  A periodic cell
+    (bulk or slab) takes this loop at the Gamma point, unpolarized (real
+    orbitals, pair densities by cuFFT); with k-points or spin it runs the
+    Fock loop of :mod:`parsec_python.SCF.hybrid_periodic` on the reference
+    solver, whose k-point workers and exchange use the GPUs
+    (:mod:`parsec_python.acceleration.SCF.hybrid_periodic`).  ``False`` for
+    every other input, which the reference solver then runs.
     """
 
     from .Parallel import mpi
 
-    if not getattr(translation.problem.scf, "is_hybrid", False):
+    problem = translation.problem
+    if not getattr(problem.scf, "is_hybrid", False):
         return False
     if getattr(arguments, "mpi", False) or mpi.requested():
         return False
-    # The device solves the pair densities with the Kronecker solver only;
-    # Exx_Pair_Solver: cg runs on the reference solver.
-    settings = getattr(translation.problem.scf, "exact_exchange", None)
-    if getattr(settings, "pair_solver", "kronecker") != "kronecker":
-        return False
+    if problem.periodic_cell is not None:
+        if problem.scf.spin_polarized or (problem.has_kpoint_sampling and not _gamma_point_only(problem)):
+            # The Bloch Fock loop on the reference solver (its device k-point pool and exchange).
+            return False
+    else:
+        # The device solves the pair densities of a cluster with the Kronecker solver only;
+        # Exx_Pair_Solver: cg runs on the reference solver.
+        settings = getattr(problem.scf, "exact_exchange", None)
+        if getattr(settings, "pair_solver", "kronecker") != "kronecker":
+            return False
     try:
         selection = resolve_backend(arguments.backend, translation.problem)
     except (BackendUnavailableError, NotImplementedError, ValueError):
@@ -1226,8 +1252,8 @@ def _run(
             f"NOTE: {features} is not implemented on the accelerated path; "
             "running the reference parsec_python.cli solver instead"
             + (
-                " (its k-point eigensolvers, and the force sums of a periodic cell, use the GPUs when CuPy and a device "
-                "are available; the output names the device)"
+                " (its k-point eigensolvers, the exchange of a periodic hybrid and the force sums of a periodic cell "
+                "use the GPUs when CuPy and a device are available; the output names the device)"
                 if reference_uses_gpu and resources.device != "cpu"
                 else ""
             ),

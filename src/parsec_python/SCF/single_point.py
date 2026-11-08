@@ -192,6 +192,8 @@ class PreparedSinglePointSystem:
         effective_potential: np.ndarray,
         hubbard: object | None = None,
         exchange: object | None = None,
+        kinetic_potential: np.ndarray | None = None,
+        gradient_flux: np.ndarray | None = None,
     ) -> KohnShamHamiltonian:
         """Compose the current SCF Hamiltonian without forming a dense matrix.
 
@@ -204,10 +206,25 @@ class PreparedSinglePointSystem:
 
         ``H = -nabla_FD^2 + diag(V_eff) + V_NL``,
 
-        plus the LDA+U term ``hubbard`` of the channel where it is given and
+        plus the LDA+U term ``hubbard`` of the channel where it is given,
         the exact-exchange term ``a_x V_ACE`` of a hybrid functional
-        (``exchange``, :mod:`parsec_python.SCF.hybrid`).
+        (``exchange``, :mod:`parsec_python.SCF.hybrid`) and the orbital term
+        ``-div(vtau grad)`` of a meta-GGA (``kinetic_potential`` = ``vtau``,
+        :mod:`parsec_python.V_xc.meta_gga`).
         """
+        if kinetic_potential is not None:
+            from ..V_xc.meta_gga import KineticPotentialOperator, grid_gradient
+
+            return KohnShamHamiltonian(
+                self.negative_laplacian,
+                effective_potential,
+                self.nonlocal_operator,
+                hubbard,
+                exchange,
+                KineticPotentialOperator(
+                    grid_gradient(self.grid), kinetic_potential, gradient_flux=gradient_flux
+                ),
+            )
         if exchange is not None:
             return KohnShamHamiltonian(
                 self.negative_laplacian,
@@ -262,14 +279,34 @@ class PreparedSinglePointSystem:
             boundary_tail=self.hartree_boundary_tail,
         )
 
-    def evaluate_xc(self, density: np.ndarray) -> XCResult:
+    def evaluate_xc(
+        self, density: np.ndarray, tau: np.ndarray | None = None, density_gradient: np.ndarray | None = None
+    ) -> XCResult:
         """Evaluate the selected XC functional including frozen NLCC.
 
         For a hybrid functional this is its semilocal part (the reduced
         semilocal exchange and the correlation); the exact exchange is the
-        operator of :mod:`parsec_python.SCF.hybrid`.
+        operator of :mod:`parsec_python.SCF.hybrid`.  A meta-GGA needs
+        ``tau``, the kinetic-energy density of the valence orbitals
+        (:meth:`kinetic_energy_density`), and returns a
+        :class:`~parsec_python.V_xc.meta_gga.MetaGGAXCResult`.
         """
 
+        if getattr(self.input.scf, "is_meta_gga", False):
+            from ..V_xc.meta_gga import meta_gga_evaluator, meta_gga_xc
+
+            if tau is None:
+                raise ValueError("a meta-GGA needs the kinetic-energy density of the orbitals")
+            return meta_gga_xc(
+                meta_gga_evaluator(self.input.scf),
+                density,
+                tau,
+                self.grid,
+                self.core_density,
+                negative_laplacian=self.negative_laplacian,
+                name=self.input.scf.xc_functional,
+                density_gradient=None if density_gradient is None else np.stack(density_gradient),
+            )
         if getattr(self.input.scf, "is_hybrid", False):
             from .hybrid import scf_semilocal_xc
 
@@ -318,6 +355,30 @@ class PreparedSinglePointSystem:
             )
         )
 
+    def kinetic_energy_density(self, wavefunctions, occupations, degeneracy: float = 2.0, gradient: bool = False):
+        """``tau`` (Hartree) of Euclidean-normalized grid orbitals (:func:`parsec_python.V_xc.meta_gga.kinetic_energy_density`).
+
+        With ``gradient`` also the orbital form of the density gradient,
+        ``(tau, (g_x, g_y, g_z))`` (:func:`parsec_python.V_xc.meta_gga.orbital_density_gradient`).
+        """
+
+        from ..V_xc.meta_gga import grid_gradient, kinetic_energy_density, orbital_density_gradient
+
+        operators = grid_gradient(self.grid)
+        tau = kinetic_energy_density(
+            wavefunctions,
+            occupations,
+            operators,
+            self.grid.volume_element,
+            degeneracy=degeneracy,
+        )
+        if not gradient:
+            return tau
+        values = orbital_density_gradient(
+            wavefunctions, occupations, operators, self.grid.volume_element, degeneracy=degeneracy
+        )
+        return tau, tuple(values)
+
     def evaluate_xc_noncollinear(
         self, density: np.ndarray, magnetization: np.ndarray
     ) -> NoncollinearXCResult:
@@ -325,14 +386,40 @@ class PreparedSinglePointSystem:
 
         return noncollinear_xc(density, magnetization, self.evaluate_xc_spin_polarized)
     def evaluate_spin_xc(
-        self, density_up: np.ndarray, density_down: np.ndarray
+        self,
+        density_up: np.ndarray,
+        density_down: np.ndarray,
+        tau_up: np.ndarray | None = None,
+        tau_down: np.ndarray | None = None,
+        density_gradients=None,
     ) -> SpinXCResult:
         """Evaluate the selected spin-polarized XC functional.
 
         Each channel sees its valence density plus half of the frozen NLCC
         density (``rho_hart.F90``).  For a hybrid functional, its semilocal
-        part.
+        part.  A meta-GGA needs the ``tau`` of both channels and returns a
+        :class:`~parsec_python.V_xc.meta_gga.MetaGGASpinXCResult`.
         """
+
+        if getattr(self.input.scf, "is_meta_gga", False):
+            from ..V_xc.meta_gga import meta_gga_evaluator, meta_gga_xc_spin
+
+            if tau_up is None or tau_down is None:
+                raise ValueError("a meta-GGA needs the kinetic-energy densities of both channels")
+            return meta_gga_xc_spin(
+                meta_gga_evaluator(self.input.scf),
+                density_up,
+                density_down,
+                tau_up,
+                tau_down,
+                self.grid,
+                self.core_density,
+                negative_laplacian=self.negative_laplacian,
+                name=self.input.scf.xc_functional,
+                density_gradients=None
+                if density_gradients is None
+                else tuple(np.stack(gradient) for gradient in density_gradients),
+            )
 
         if getattr(self.input.scf, "is_hybrid", False):
             from .hybrid import scf_semilocal_spin_xc
@@ -419,6 +506,10 @@ class SCFWarmStart:
     mixer: object | None = None
     relative_criterion: float | None = None
     level_tolerance: float | None = None
+    # A meta-GGA: the mixed vtau of the loop before (a pair for spin), full grid; None starts with PBE.
+    kinetic_potential: object | None = None
+    # ... and in the orbital form of the density gradient the mixed W of each channel (the loop's layout).
+    gradient_flux: object | None = None
 
 
 #: Eigensolver passes of a level refinement (``SCFWarmStart.level_tolerance``) at most.
@@ -693,7 +784,9 @@ def warm_start_for_moved_atoms(
     density further along the trajectory that ``history`` follows.
     """
 
-    warm_start = _parsec_warm_start(previous_system, previous_result, system)
+    warm_start = meta_gga_warm_start(
+        _parsec_warm_start(previous_system, previous_result, system), previous_result
+    )
     if getattr(previous_result, "exact_exchange", None) is not None:
         # A hybrid functional: the orbitals before the move start the Fock loop.
         from .hybrid import exchange_start_orbitals
@@ -714,6 +807,25 @@ def warm_start_for_moved_atoms(
         system,
         extrapolation,
         history,
+    )
+
+
+def meta_gga_warm_start(warm_start: SCFWarmStart, previous_result) -> SCFWarmStart:
+    """``warm_start`` with the mixed ``vtau`` of a meta-GGA loop before the move (a pair for spin).
+
+    ``vtau`` is a grid field of the electrons like the mixed potential, which
+    the loop of the moved atoms also takes over.  Without a meta-GGA the
+    warm start is returned unchanged.
+    """
+
+    record = getattr(previous_result, "meta_gga", None)
+    if record is None:
+        return warm_start
+    fields = tuple(np.asarray(field, dtype=np.float64) for field in record.next_kinetic_potentials)
+    return replace(
+        warm_start,
+        kinetic_potential=fields[0] if len(fields) == 1 else fields,
+        gradient_flux=getattr(record, "next_gradient_fluxes", None),
     )
 
 
@@ -1868,6 +1980,26 @@ def eigval_settings_for(
     )
 
 
+def meta_gga_loop(system, *, channels: int, adapter, warm_start, exchange_term=None):
+    """The :class:`parsec_python.SCF.meta_gga.MetaGGALoop` of a meta-GGA, ``None`` for another functional."""
+
+    if not getattr(system.input.scf, "is_meta_gga", False):
+        return None
+    # A meta-GGA hybrid (``exchange_term``, the inner loops of SCF.hybrid): the
+    # Hamiltonians hold the orbital term and the exchange operator; the energies
+    # remove the band energy of both (MetaGGALoop.energies, then the operator's).
+    if warm_start is not None and (
+        getattr(warm_start, "density_guess", None) is not None or getattr(warm_start, "mixer", None) is not None
+    ):
+        raise NotImplementedError(
+            "a meta-GGA needs the orbitals of a density: Potential_Extrapolation: atomic (a guessed "
+            "density without orbitals) is not implemented for it"
+        )
+    from .meta_gga import MetaGGALoop
+
+    return MetaGGALoop(system, channels=channels, adapter=adapter, warm_start=warm_start)
+
+
 def refuse_exchange_hooks(**hooks) -> None:
     """Stop an SCF loop that would leave out the exchange operator of a hybrid.
 
@@ -2151,6 +2283,9 @@ def run_scf(
         total_energy_evaluator=total_energy_evaluator,
         scalar_field_adapter=scalar_field_adapter,
     )
+    # A meta-GGA: tau of the orbitals, -div(vtau grad) in every Hamiltonian,
+    # (V, vtau) mixed together, PBE in the first iteration (SCF.meta_gga).
+    meta = meta_gga_loop(system, channels=1, adapter=scalar_field_adapter, warm_start=warm_start, exchange_term=exchange_term)
     # LDA+U potential matrices of the present iteration: zero (None) in the
     # first iteration of every SCF loop, as upot.F90 leaves them.
     hubbard_state = None
@@ -2196,7 +2331,9 @@ def run_scf(
         # XC sees rho_valence + frozen rho_core (CA-LDA or PBE, as selected).
         # The Hartree solve immediately above sees rho_valence only.
         stage_start = time.perf_counter()
-        if embedding is None:
+        if meta is not None:
+            xc = meta.start_xc(density)
+        elif embedding is None:
             xc = system.evaluate_xc(density)
         else:
             xc, nonadditive = embedded_exchange_correlation(system, density)
@@ -2252,7 +2389,12 @@ def run_scf(
                     np.array(warm_start.hxc_reference, dtype=np.float64)
                 )
             )
-    mixer = warm_start_mixer(warm_start, lambda: build_mixer(system.input.mixing))
+    mixer = warm_start_mixer(
+        warm_start,
+        (lambda: build_mixer(system.input.mixing))
+        if meta is None
+        else (lambda: meta.mixer(build_mixer, system.input.mixing)),
+    )
     history: list[SCFIteration] = []
     # This is the later-SCF SUBSPACE polynomial degree.  The first-solver
     # degree is a separate setting.  Near SCF convergence PARSEC lowers the
@@ -2312,7 +2454,16 @@ def run_scf(
         # KB terms; LinearOperator routes all Lanczos and Chebyshev H@Q calls
         # through that same three-term action.
         binding_start = time.perf_counter()
-        if hubbard_projectors is None and exchange_term is None:
+        if meta is not None and meta.kinetic_potential(0) is not None:
+            # A meta-GGA hybrid: the orbital term and the fixed exchange operator.
+            hamiltonian = system.hamiltonian(
+                input_potential,
+                None,
+                None if exchange_term is None else exchange_term.operator(0),
+                kinetic_potential=meta.kinetic_potential(0),
+                **meta.flux_keywords(0),
+            )
+        elif hubbard_projectors is None and exchange_term is None:
             hamiltonian = system.hamiltonian(input_potential)
         elif hubbard_projectors is None:
             # A hybrid functional: the fixed exchange operator of the loop.
@@ -2424,6 +2575,7 @@ def run_scf(
         density = build_orbital_density(
             wavefunctions, occupations, system.grid.volume_element
         )
+        tau = None if meta is None else meta.tau(wavefunctions, occupations, 2.0)
         symmetrization = ()
         density_symmetry = getattr(system, "density_symmetry", None)
         if density_symmetry is not None:
@@ -2440,6 +2592,15 @@ def run_scf(
                 )
             )
             symmetrization = (report,)
+            if tau is not None:
+                # tau is a scalar field of the same group: averaged alike, and
+                # the orbital form's g as a vector field.
+                tau, _ = (
+                    symmetrize(tau, system.grid.volume_element)
+                    if callable(symmetrize)
+                    else symmetrize_density(tau, density_symmetry, system.grid.volume_element)
+                )
+                meta.symmetrize_gradient(0, density_symmetry)
         occupations_density_seconds = (
             time.perf_counter() - occupations_density_start
         )
@@ -2456,7 +2617,9 @@ def run_scf(
         hartree_total += hartree_seconds
         hartree_potential = hartree.potential
         xc_start = time.perf_counter()
-        if embedding is None:
+        if meta is not None:
+            xc = system.evaluate_xc(density, tau=tau, **meta.gradient_keywords(0))
+        elif embedding is None:
             xc = system.evaluate_xc(density)
         else:
             # FDET: XC of rho + rho_core + rho_A and T_nad, v_nad (exc.f90:816-822).
@@ -2520,6 +2683,9 @@ def run_scf(
             energies = embedding_energies(
                 energies, embedding, density, ionic_potential, nonadditive, system.grid.volume_element
             )
+        if meta is not None:
+            # The band energy holds 2 h^3 sum vtau_in tau of the orbital term.
+            energies = meta.energies(energies, (tau,), getattr(xc, "fermi_hole_clamped", 0), xc=xc)
         if exchange_term is not None:
             # The exchange operator's part of the band energy is removed and
             # the exact exchange of the functional this loop minimizes added.
@@ -2534,9 +2700,19 @@ def run_scf(
         # V_in).  Later calls use the retained residual/input history and its
         # configured restart schedule.  PARSEC also performs mixing before the
         # stop test, so a converged result still has a diagnostic V_next.
-        mixed_potential = mixer.mix(
-            input_potential, output_potential, iteration=iteration
-        )
+        if meta is None:
+            mixed_potential = mixer.mix(
+                input_potential, output_potential, iteration=iteration
+            )
+        else:
+            mixed_potential = meta.mix(
+                mixer,
+                [input_potential],
+                [output_potential],
+                [xc.kinetic_potential],
+                iteration=iteration,
+                densities=[density],
+            )[0]
         # SCF convergence is a local-potential fixed-point test, not an energy
         # difference and not the Ritz residual reported above.
         selected_residual = (
@@ -2643,6 +2819,8 @@ def run_scf(
             converged = True
             break
         input_potential = mixed_potential
+        if meta is not None:
+            meta.advance()
 
     if energies is None:
         raise RuntimeError("SCF loop did not execute")
@@ -2702,4 +2880,5 @@ def run_scf(
         hubbard=hubbard_state,
         dispersion=dispersion,
         embedding=None if embedding is None else nonadditive,
+        **({} if meta is None else {"meta_gga": meta.record()}),
     )

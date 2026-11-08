@@ -102,6 +102,12 @@ _CORRELATION_LABELS = {
     "lb": "lb94",
     "cs": "casida_salahub",
 }
+# Meta-GGAs of this package (PARSEC.py; PARSEC 1.5 reaches meta-GGAs through
+# libxc only): Correlation_Type label -> SCFSettings.xc_functional
+# (parsec_python.V_xc.meta_gga).
+_META_GGA_LABELS = {
+    "scan": "scan",
+}
 # Self-consistent hybrid functionals (PARSEC.py; no Fortran PARSEC label), the
 # Fock loop of parsec_python.SCF.hybrid: the labels and aliases of
 # parsec_python.V_xc.hybrid (canonical_hybrid_label), read before the table above.
@@ -116,6 +122,9 @@ _HYBRID_KEYS = (
     "exx_inner_criterion",
     "exx_mixer_history",
     "exx_outer_mixing",
+    "exx_divergence",
+    "exx_slab_coulomb",
+    "exx_auxiliary_exponent",
 )
 
 
@@ -405,10 +414,14 @@ _INPUT15_ACCEPTED_GLOBAL = frozenset(
     {
         *_INPUT15_INERT_KEYS,
         *_INPUT15_ALIASES,
-        # usrinputfile.F90:3895-3911: libxc (refused when true, see _input15_keywords)
+        # usrinputfile.F90:3895-3911: libxc (see _input15_keywords), and this port's names of it
         "use_libxc",
         "func_id_x",
         "func_id_c",
+        "libxc_functional",
+        "libxc_enforce_fhc",
+        "libxc_density_threshold",
+        "libxc_tau_threshold",
         # usrinputfile.F90:2836-2842: the Poisson CG of potential/hartree.F90
         "hartree_cg_tolerance",
         "hartree_cg_criterion",
@@ -448,7 +461,7 @@ def _exact_exchange_settings(scalar, one, xc_functional: str) -> ExactExchangeSe
     """
 
     given = [key for key in _HYBRID_KEYS if key in scalar]
-    if xc_functional not in HYBRID_XC_FUNCTIONALS:
+    if not SCFSettings(xc_functional=xc_functional).is_hybrid:
         if given:
             raise ParsecInputError(
                 ", ".join(given)
@@ -484,6 +497,14 @@ def _exact_exchange_settings(scalar, one, xc_functional: str) -> ExactExchangeSe
         ):
             if key in scalar:
                 keywords[field] = _normalize_label(one(key))
+        for key, field in (("exx_divergence", "divergence"), ("exx_slab_coulomb", "slab_coulomb")):
+            # periodic cells (parsec_python.SCF.hybrid_periodic): labels with dashes; auto is the default
+            if key in scalar:
+                value = str(one(key)).strip().lower().replace("_", "-")
+                if not (key == "exx_divergence" and value == "auto"):
+                    keywords[field] = value
+        if "exx_auxiliary_exponent" in scalar:
+            keywords["auxiliary_exponent"] = _plain_float(one("exx_auxiliary_exponent"), "Exx_Auxiliary_Exponent")
         settings = ExactExchangeSettings(**keywords)
     except ValueError as error:
         raise ParsecInputError(str(error)) from error
@@ -546,10 +567,69 @@ def _inverse_length_bohr(text: str) -> float:
     raise ValueError(f"Screening_Parameter: unknown unit {unit!r} (bohr^-1 or ang^-1)")
 
 
+def _check_meta_gga_request(
+    scf,
+    *,
+    is_periodic: bool,
+    specifications,
+    energy_refinement,
+    embedding: bool,
+    polarizability: bool,
+    nscf: bool,
+    output_gw: bool,
+    bands: bool,
+    restart: bool = False,
+) -> None:
+    """Refuse by name what the meta-GGAs do not cover yet (:mod:`parsec_python.V_xc.meta_gga`)."""
+
+    hubbard = any(
+        specification.hubbard_u != 0.0 or specification.hubbard_j != 0.0
+        for specification in specifications.values()
+    )
+    refused = [
+        label
+        for condition, label in (
+            # A meta-GGA hybrid (libxc's hyb_mgga_): the Fock loop with the meta-GGA loop as its
+            # inner loops; the inner loops restart their mixer (the joined (V, vtau) history).
+            (
+                scf.is_hybrid and getattr(scf.exact_exchange, "mixer_history", "restart") == "carry",
+                "Exx_Mixer_History: carry (the inner loops of a meta-GGA hybrid restart their mixer)",
+            ),
+            # Periodic meta-GGAs run the k-point and Gamma loops of SCF/meta_gga_periodic.py; the
+            # exact exchange of periodic cells is not joined with them.
+            (scf.is_hybrid and is_periodic, "a periodic Boundary_Conditions with a meta-GGA hybrid"),
+            (
+                scf.self_consistent_spin_orbit
+                or any(specification.spin_orbit for specification in specifications.values()),
+                "spin-orbit coupling (SO_PSP, SO_from_scratch)",
+            ),
+            (scf.noncollinear, "non-collinear magnetism"),
+            (embedding, "FDET (Potential_Field)"),
+            (hubbard, "LDA+U (ldaplusu_u, ldaplusu_j)"),
+            (energy_refinement is not None, "Energy_Refinement"),
+            (polarizability, "Polarizability"),
+            (nscf, "a non-self-consistent calculation (nscf)"),
+            (output_gw, "Output_GW"),
+            (bands, "a band structure (bandstruc)"),
+            # The restart file holds V, not vtau and W: the loop would start
+            # without the orbital terms (and, in the orbital form of the
+            # density gradient, without the gradient part of the potential).
+            (restart, "Restart_Run (the restart file, parsec.dat, holds no vtau or W)"),
+        )
+        if condition
+    ]
+    if refused:
+        raise UnsupportedParsecOptionError(
+            f"Correlation_Type: {scf.xc_functional} (a meta-GGA) is not implemented together "
+            "with " + ", ".join(refused)
+        )
+
+
 def _check_hybrid_request(
     scf,
     *,
     is_periodic: bool,
+    periodicity: int = 0,
     specifications,
     energy_refinement,
     embedding: bool,
@@ -561,7 +641,11 @@ def _check_hybrid_request(
     """Refuse by name what the hybrid functionals do not cover yet.
 
     The Fock loop is that of an isolated system with real orbitals on the
-    full grid (spin-unpolarized or collinear spin).
+    full grid, or of a bulk cell or a slab (``periodicity`` 3 or 2) at the
+    Gamma point or with a uniform k-point mesh (:mod:`parsec_python.SCF.hybrid_periodic`),
+    spin-unpolarized or collinear spin.  A wire is refused, and so is
+    ``Exx_Pair_Solver: cg`` on a periodic cell (its pair potentials are
+    solved by FFT with the cell's exchange kernel).
     """
 
     hubbard = any(
@@ -571,7 +655,23 @@ def _check_hybrid_request(
     refused = [
         label
         for condition, label in (
-            (is_periodic, "a periodic Boundary_Conditions (bulk, wire or slab)"),
+            (is_periodic and periodicity == 1, "Boundary_Conditions: wire"),
+            (
+                is_periodic and getattr(scf.exact_exchange, "pair_solver", "kronecker") != "kronecker",
+                "Exx_Pair_Solver: cg on a periodic cell (its pair potentials are solved by FFT)",
+            ),
+            (
+                not is_periodic
+                and (
+                    getattr(scf.exact_exchange, "divergence", None) is not None
+                    or getattr(scf.exact_exchange, "auxiliary_exponent", None) is not None
+                ),
+                "Exx_Divergence or Exx_Auxiliary_Exponent on an isolated system (they belong to periodic cells)",
+            ),
+            (
+                periodicity != 2 and getattr(scf.exact_exchange, "slab_coulomb", "padded") != "padded",
+                "Exx_Slab_Coulomb outside a slab",
+            ),
             (
                 scf.self_consistent_spin_orbit
                 or any(specification.spin_orbit for specification in specifications.values()),
@@ -592,7 +692,34 @@ def _check_hybrid_request(
     if refused:
         raise UnsupportedParsecOptionError(
             f"Correlation_Type: {scf.xc_functional} (a self-consistent hybrid functional) is "
-            "implemented for isolated systems, spin-unpolarized or collinear spin; not "
+            "implemented for isolated systems, bulk cells and slabs, spin-unpolarized or collinear spin; not "
+            "together with " + ", ".join(refused)
+        )
+
+
+def _check_libxc_request(scf, *, specifications, embedding: bool) -> None:
+    """Refuse by name what the libxc functionals are not run with (untested combinations).
+
+    Spin-orbit coupling and non-collinear magnetism (the local spin frame of
+    ``V_xc.noncollinear``) and FDET (its own XC terms of the subsystems).
+    """
+
+    refused = [
+        label
+        for condition, label in (
+            (
+                scf.self_consistent_spin_orbit
+                or any(specification.spin_orbit for specification in specifications.values()),
+                "spin-orbit coupling (SO_PSP, SO_from_scratch)",
+            ),
+            (scf.noncollinear, "non-collinear magnetism"),
+            (embedding, "FDET (Potential_Field)"),
+        )
+        if condition
+    ]
+    if refused:
+        raise UnsupportedParsecOptionError(
+            f"the libxc functional {scf.xc_functional} runs unpolarized or with collinear spin; not "
             "together with " + ", ".join(refused)
         )
 
@@ -1792,14 +1919,34 @@ class _Input15:
     warnings: tuple[str, ...]
     hartree_controls: dict
     complete_input: bool
+    libxc: "_LibxcRequest | None" = None
+
+
+@dataclass(frozen=True)
+class _LibxcRequest:
+    """A libxc functional asked for: ``LibXC_Functional`` (``items``) or 1.5's ``Func_Id_X``/``Func_Id_C``.
+
+    ``func_ids`` are 1.5's integers (-1 when not given: 1.5's defaults, 0 =
+    none); ``enforce_fhc`` is ``LibXC_Enforce_FHC`` (``None``: the default of
+    :func:`_libxc_xc_functional`).
+    """
+
+    items: tuple[str, ...] | None
+    func_ids: tuple[int, int] | None
+    enforce_fhc: bool | None
+    density_threshold: float | None = None
+    tau_threshold: float | None = None
 
 
 def _input15_keywords(scalar, one, optional_bool, *, states_text: str | None) -> _Input15:
     """Check the PARSEC 1.5 keywords of this layer (1.5's ``src/io/usrinputfile.F90``) with 1.5's validation.
 
-    * ``Use_LibXC: .true.`` is refused (no libxc in this port yet); with
-      ``.false.`` (1.5's default) ``Func_Id_X``/``Func_Id_C`` are read and
-      ignored, as 1.5 does (3895-3948).
+    * ``Use_LibXC: .true.`` with ``Func_Id_X``/``Func_Id_C`` (3895-3948) and this
+      port's ``LibXC_Functional`` (names or numbers) and ``LibXC_Enforce_FHC``
+      are returned as a :class:`_LibxcRequest` (the functional is resolved
+      against the library with the spin of the run, :func:`_libxc_xc_functional`);
+      with ``Use_LibXC: .false.`` (1.5's default) ``Func_Id_X``/``Func_Id_C`` are
+      read and ignored, as 1.5 does.
     * ``Hartree_CG_Tolerance``/``Hartree_CG_Criterion`` (2836-2842): written
       in the input, either one gives 1.5's Poisson CG, ``potential/hartree.F90``
       2096-2108: relative tolerance (1.5's default 1e-13), the test (2 against
@@ -1819,25 +1966,68 @@ def _input15_keywords(scalar, one, optional_bool, *, states_text: str | None) ->
     """
 
     notes: list[str] = []
-    # Use_LibXC and the libxc functional ids (usrinputfile.F90:3895-3948).
+    # Use_LibXC and the libxc functional ids (usrinputfile.F90:3895-3948), and this
+    # port's LibXC_Functional / LibXC_Enforce_FHC.
     func_ids = []
-    for key, label in (("func_id_x", "Func_Id_X"), ("func_id_c", "Func_Id_C")):
+    id_values = [-1, -1]
+    for index, (key, label) in enumerate((("func_id_x", "Func_Id_X"), ("func_id_c", "Func_Id_C"))):
         if key in scalar:
-            _integer(one(key), label=label)  # esdf_integer
+            id_values[index] = _integer(one(key), label=label)  # esdf_integer
             func_ids.append(label)
-    if optional_bool("use_libxc"):
-        raise UnsupportedParsecOptionError(
-            "Use_LibXC: .true. (the libxc functionals of PARSEC 1.5, Func_Id_X/Func_Id_C) is not "
-            "implemented in this port yet; PARSEC 1.5 built without -DUSE_LIBXC prints 'use_libxc "
-            "is true, but PARSEC wasn't compiled with -DUSE_LIBXC' and runs the functional of "
-            "Correlation_Type, which Use_LibXC: .false. selects here"
+    use_libxc = optional_bool("use_libxc") if "use_libxc" in scalar else None
+    enforce_fhc = optional_bool("libxc_enforce_fhc") if "libxc_enforce_fhc" in scalar else None
+    density_threshold = None
+    if "libxc_density_threshold" in scalar:
+        density_threshold = _strict_float(one("libxc_density_threshold"), label="LibXC_Density_Threshold")
+        if not (np.isfinite(density_threshold) and density_threshold > 0.0):
+            raise ParsecInputError("LibXC_Density_Threshold must be positive (e/bohr^3)")
+    tau_threshold = None
+    if "libxc_tau_threshold" in scalar:
+        tau_threshold = _strict_float(one("libxc_tau_threshold"), label="LibXC_Tau_Threshold")
+        if not (np.isfinite(tau_threshold) and tau_threshold > 0.0):
+            raise ParsecInputError("LibXC_Tau_Threshold must be positive (Hartree/bohr^3)")
+    libxc = None
+    if "libxc_functional" in scalar:
+        if use_libxc is False:
+            raise ParsecInputError(
+                "LibXC_Functional names libxc functionals, Use_LibXC: .false. switches libxc off: "
+                "give one of them"
+            )
+        if func_ids:
+            raise ParsecInputError(
+                "give the libxc functional as LibXC_Functional or as PARSEC 1.5's "
+                f"{' and '.join(func_ids)}, not both"
+            )
+        items = tuple(item for item in re.split(r"[\s,+]+", one("libxc_functional").strip()) if item)
+        if not items:
+            raise ParsecInputError("LibXC_Functional names no functional")
+        libxc = _LibxcRequest(
+            items=items,
+            func_ids=None,
+            enforce_fhc=enforce_fhc,
+            density_threshold=density_threshold,
+            tau_threshold=tau_threshold,
         )
-    if func_ids:
-        notes.append(
-            f"{' and '.join(func_ids)} name libxc functionals, which PARSEC 1.5 reads only with "
-            "Use_LibXC: .true. (usrinputfile.F90:3909-3948); they are ignored, as there: the "
-            "functional is that of Correlation_Type"
+    elif use_libxc:
+        libxc = _LibxcRequest(
+            items=None,
+            func_ids=(id_values[0], id_values[1]),
+            enforce_fhc=enforce_fhc,
+            density_threshold=density_threshold,
+            tau_threshold=tau_threshold,
         )
+    else:
+        if enforce_fhc is not None or density_threshold is not None or tau_threshold is not None:
+            raise ParsecInputError(
+                "LibXC_Enforce_FHC, LibXC_Density_Threshold and LibXC_Tau_Threshold belong to a libxc "
+                "functional (LibXC_Functional)"
+            )
+        if func_ids:
+            notes.append(
+                f"{' and '.join(func_ids)} name libxc functionals, which PARSEC 1.5 reads only with "
+                "Use_LibXC: .true. (usrinputfile.F90:3909-3948); they are ignored, as there: the "
+                "functional is that of Correlation_Type"
+            )
 
     # Keywords that tune the parallel layout and libraries of PARSEC 1.5.
     given = [key for key in _INPUT15_INERT_KEYS if key in scalar]
@@ -1971,7 +2161,90 @@ def _input15_keywords(scalar, one, optional_bool, *, states_text: str | None) ->
         warnings=tuple(notes),
         hartree_controls=hartree_controls,
         complete_input=optional_bool("generate_complete_parsec_in"),
+        libxc=libxc,
     )
+
+
+def _libxc_xc_functional(
+    request: _LibxcRequest, *, spin_polarized: bool, correlation_given: bool, notes: list[str]
+) -> str:
+    """The ``libxc:`` spec of a :class:`_LibxcRequest`, checked against the library.
+
+    1.5's ids: ``-1`` takes 1.5's defaults (``Func_Id_X`` 1 = LDA_X, ``Func_Id_C``
+    9 = LDA_C_PZ, 12 = LDA_C_PW with spin), ``0`` leaves the slot empty.  A
+    missing library, a functional libxc does not have and the functionals this
+    code refuses (:meth:`parsec_python.V_xc.libxc.LibxcFunctionalInfo.refusal`)
+    stop the input; a meta-GGA needs the meta-GGA Hamiltonian
+    (:mod:`parsec_python.V_xc.meta_gga`).
+    """
+
+    import importlib.util
+    import warnings as python_warnings
+
+    from ..V_xc.libxc import LibxcRefusal, canonical_libxc_functional, parse_libxc_spec
+    from ..V_xc.libxc_library import LibxcUnavailable
+
+    if request.items is not None:
+        items: tuple = request.items
+        source = "LibXC_Functional"
+    else:
+        exchange, correlation = request.func_ids
+        default_correlation = correlation == -1
+        exchange = 1 if exchange == -1 else exchange
+        correlation = (12 if spin_polarized else 9) if correlation == -1 else correlation
+        if default_correlation and exchange > 0:
+            try:
+                from ..V_xc.libxc import libxc_functional_info
+
+                kind = libxc_functional_info(exchange).kind
+            except (LibxcUnavailable, ValueError):
+                kind = None
+            if kind == "exchange-correlation":
+                notes.append(
+                    f"Func_Id_X: {exchange} is an exchange-correlation functional and Func_Id_C is not given: "
+                    f"PARSEC 1.5's default correlation {correlation} ({'LDA_C_PW' if correlation == 12 else 'LDA_C_PZ'}) "
+                    "is added to it, as 1.5 does; give Func_Id_C: 0 for the functional alone"
+                )
+        items = tuple(value for value in (exchange, correlation) if value != 0)
+        source = "Use_LibXC (Func_Id_X/Func_Id_C)"
+        if not items:
+            raise ParsecInputError("Use_LibXC: .true. with Func_Id_X: 0 and Func_Id_C: 0 names no functional")
+        notes.append(
+            "Use_LibXC: PARSEC 1.5 evaluates the first SCF iteration of every libxc run with PBE "
+            "(101 + 130, potential/hartree.F90:1932-1937); this port uses the libxc functional "
+            "from the first iteration (a meta-GGA starts with PBE, as there) and adds the exact "
+            "exchange of a libxc hybrid, which 1.5 leaves out"
+        )
+    try:
+        with python_warnings.catch_warnings(record=True) as caught:
+            python_warnings.simplefilter("always")
+            spec = canonical_libxc_functional(
+                items,
+                enforce_fhc=request.enforce_fhc,
+                density_threshold=request.density_threshold,
+                tau_threshold=request.tau_threshold,
+            )
+        notes.extend(str(warning.message) for warning in caught)
+    except LibxcUnavailable as error:
+        raise UnsupportedParsecOptionError(f"{source}: {error}") from error
+    except LibxcRefusal as error:
+        raise UnsupportedParsecOptionError(f"{source}: {error}") from error
+    except ValueError as error:
+        raise ParsecInputError(f"{source}: {error}") from error
+    parsed = parse_libxc_spec(spec)
+    if parsed.is_meta_gga and importlib.util.find_spec("parsec_python.V_xc.meta_gga") is None:
+        raise UnsupportedParsecOptionError(
+            f"{source}: {spec} is a meta-GGA; it needs the kinetic-energy density of the orbitals "
+            "and the meta-GGA Hamiltonian (parsec_python.V_xc.meta_gga), which this build does not have"
+        )
+    if request.enforce_fhc is not None and not parsed.is_meta_gga:
+        notes.append("LibXC_Enforce_FHC acts on meta-GGAs only; it changes nothing for " + spec)
+    if correlation_given:
+        notes.append(
+            f"Correlation_Type does not select the functional: it is libxc's {spec} ({source}), "
+            "as in PARSEC 1.5 with Use_LibXC"
+        )
+    return spec
 
 
 def _input15_pseudopotential_notes(
@@ -2531,13 +2804,28 @@ def _parse_parsec_input(
     # the Perdew-Wang LSDA ("pl"), an unpolarized one CA.
     correlation_text = one("correlation_type", "pl" if spin_polarized else "ca")
     correlation = _normalize_label(correlation_text)
-    xc_functional = _CORRELATION_LABELS.get(correlation) or _hybrid_label(correlation_text)
+    libxc_notes: list[str] = []
+    if input15.libxc is not None:
+        xc_functional = _libxc_xc_functional(
+            input15.libxc,
+            spin_polarized=spin_polarized or noncollinear,
+            correlation_given="correlation_type" in scalar,
+            notes=libxc_notes,
+        )
+    else:
+        xc_functional = (
+            _CORRELATION_LABELS.get(correlation)
+            or _META_GGA_LABELS.get(correlation)
+            or _hybrid_label(correlation_text)
+        )
     if xc_functional is None:
         raise ParsecInputError(
             f"Correlation_Type={correlation!r} is unknown; PARSEC accepts "
             + ", ".join(sorted(_CORRELATION_LABELS))
             + "; the hybrid functionals are "
             + ", ".join(sorted(HYBRID_XC_FUNCTIONALS))
+            + "; the meta-GGAs are "
+            + ", ".join(sorted(_META_GGA_LABELS))
         )
     if xc_functional in UNPOLARIZED_ONLY_XC_FUNCTIONALS and (
         spin_polarized or noncollinear
@@ -2551,8 +2839,8 @@ def _parse_parsec_input(
         )
     exact_exchange = _exact_exchange_settings(scalar, one, xc_functional)
     # Notes of the PARSEC 1.5 keywords (input layer), added to the warnings below.
-    input15_notes = list(input15.warnings)
-    if correlation == "wb":
+    input15_notes = list(input15.warnings) + libxc_notes
+    if correlation == "wb" and input15.libxc is None:
         # exc.f90:975-1045 (unpolarized) and 363-452 (spin), pbe.f90 new_exchpbe/new_corpbe.
         # The same discretisation as 1.5's wb for an unpolarized cluster without symmetry: H2O
         # -34.56585964 Ry here, -34.56585973 Ry with 1.5 wb, -34.56506807 Ry with 1.5 pb.
@@ -4173,10 +4461,13 @@ def _parse_parsec_input(
     hirshfeld_cells = (0, 0, 0)
     hirshfeld_keys = [key for key in ("hf_one", "hf_two", "hf_three") if key in scalar]
     if van_der_waals:
-        if correlation not in {"pb", "pbe"}:
+        # usrinputfile.F90:4100: (icorr /= 'pb') .or. use_libxc -> ierr 158 (the TS
+        # damping s_R is PBE's, and Correlation_Type does not name a libxc functional).
+        if correlation not in {"pb", "pbe"} or input15.libxc is not None:
             raise ParsecInputError(
                 "Van_Der_Waals: the TS correction is implemented only for the "
-                "GGA-PBE functional (Correlation_Type pb; PARSEC error 158)"
+                "GGA-PBE functional of this code (Correlation_Type pb, no libxc functional; "
+                "PARSEC error 158)"
             )
         if not ignore_symmetry:
             raise ParsecInputError(
@@ -5191,10 +5482,26 @@ def _parse_parsec_input(
         extrapolation=potential_extrapolation,
         grid_shift=tuple(float(value) for value in getattr(grid, "shift", (0.0, 0.0, 0.0))),
     )
+    if scf.is_libxc:
+        _check_libxc_request(scf, specifications=specifications, embedding=fdet.embedding is not None)
+    if scf.is_meta_gga:
+        _check_meta_gga_request(
+            scf,
+            is_periodic=is_periodic,
+            specifications=specifications,
+            energy_refinement=energy_refinement,
+            embedding=fdet.embedding is not None,
+            polarizability=polarizability,
+            nscf=post_processing.nscf is not None,
+            output_gw=output_gw,
+            bands=band_settings is not None,
+            restart=bool(restart_run),
+        )
     if scf.is_hybrid:
         _check_hybrid_request(
             scf,
             is_periodic=is_periodic,
+            periodicity=periodicity,
             specifications=specifications,
             energy_refinement=energy_refinement,
             embedding=fdet.embedding is not None,
@@ -6964,6 +7271,8 @@ _DEFAULT_CORRELATIONS = frozenset(
         "wb",
     }
 )
+# The meta-GGAs of this port (SCF/meta_gga.py, SCF/meta_gga_periodic.py) run on either set of routines.
+_DEFAULT_CORRELATIONS = _DEFAULT_CORRELATIONS | frozenset(_META_GGA_LABELS)
 _DEFAULT_EIGENSOLVERS = frozenset({"chebff", "chebdav"})
 _DEFAULT_FIELD_UNITS = frozenset({"", "ry/bohr/e", "rydberg/bohr/e", "ha/bohr/e", "hartree/bohr/e", "ev/ang/e"})
 
@@ -7001,7 +7310,8 @@ def _default_routines_value_refusal(scalar, one, optional_bool) -> str | None:
     if "spin_polarization" in scalar and optional_bool("spin_polarization") and "correlation_type" not in scalar:
         return "Spin_Polarization without Correlation_Type (PARSEC's default PW LSDA)"
     correlation = _normalize_label(one("correlation_type", "ca"))
-    if correlation not in _DEFAULT_CORRELATIONS:
+    # A hybrid functional runs the Fock loop of SCF/hybrid.py and SCF/hybrid_periodic.py on either set of routines.
+    if correlation not in _DEFAULT_CORRELATIONS and _hybrid_label(one("correlation_type", "ca")) is None:
         return f"Correlation_Type: {correlation}"
     shape = _normalize_label(one("cluster_domain_shape", "sphere"))
     if shape not in {"sphere", "box"}:

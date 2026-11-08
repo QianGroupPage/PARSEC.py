@@ -644,6 +644,36 @@ def _stack_phases(result, scf_seconds, reported_seconds, check_seconds=0.0):
     return phases
 
 
+def _input_has_hybrid(path) -> bool:
+    """Whether the input names a hybrid functional (its Correlation_Type), read before MPI starts.
+
+    The MPI library is told before its initialization whether device arrays will reach it; the input is
+    parsed in full later, on every rank.  An input that cannot be read here says no.
+    """
+    try:
+        from parsec_python.Input.parsec_input import _hybrid_label, _read_items
+
+        values = [item.value for item in _read_items(Path(path)) if item.key == 'correlation_type']
+        return bool(values) and _hybrid_label(str(values[-1]).split()[0]) is not None
+    except Exception:
+        return False
+
+
+def _refuse_spin_ionic_steps(translation, size: int) -> None:
+    """Refuse forces, relaxation and molecular dynamics of a spin-polarized calculation on several ranks.
+
+    The single point of both channels in the sectors of several ranks is validated against one process
+    (O2 PBE and PBE0, O2 Hartree-Fock); the nonlocal force terms of both channels summed over the ranks
+    (the spin_forces command) are not yet.
+    """
+    if (translation.problem.scf.spin_polarized and int(size) > 1
+            and (getattr(translation, 'compute_forces', False) or getattr(translation, 'relaxation', None) is not None
+                 or getattr(translation, 'molecular_dynamics', None) is not None)):
+        raise ValueError('forces, relaxation and molecular dynamics of a spin-polarized calculation are not '
+                         'available on several ranks (their force terms of both channels have not been validated '
+                         'there): run them with parsec_python/main.py or with --serial-control')
+
+
 def _ranks_per_node_of_launch() -> int:
     """Ranks per node that Slurm started (``SLURM_NTASKS_PER_NODE``, e.g. ``4`` or ``4(x2)``); 1 outside Slurm."""
     raw = os.environ.get('SLURM_NTASKS_PER_NODE', '1').strip()
@@ -698,10 +728,12 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         # Refused rather than ignored: the orbitals of this runner stay divided among ranks and devices.
         raise ValueError('Energy_Refinement is not available in the full-SCF runner, whose orbitals stay divided '
                          'among ranks: run the refinement with parsec_python/main.py')
-    if translation.problem.scf.spin_polarized and not args.serial_control:
-        # The ranks of this runner divide the symmetry sectors, which hold one subspace per representation.
-        raise ValueError('a spin-polarized calculation solves its two channels on the full grid and so cannot be '
-                         'divided among ranks: run it with parsec_python/main.py or with --serial-control')
+    # A hybrid functional: the ranks divide the sectors, each basis on one device, and every GPU of every rank
+    # solves pair densities of the exchange (SCF/hybrid_mpi.py); a rank may own no sector.
+    hybrid = bool(getattr(translation.problem.scf, 'is_hybrid', False))
+    # A spin-polarized calculation divides the sectors of both channels (Spin_Symmetry_Sectors): single points;
+    # the driver refuses one whose channels stay on the full grid.
+    _refuse_spin_ionic_steps(translation, size)
     # Relax_Restart, or --restart-from, replaces the coordinates of the input on every rank alike.
     problem_of_input = translation.problem
     translation, relax_restart, restart_notes = restart_structure(
@@ -710,7 +742,10 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
     # No point group for manual movements, or where the movable flags do not respect it. One rank can still
     # solve such a run as the single sector of the identity, whose basis the GPUs of its node then share.
     from parsec_python.acceleration.driver import single_sector_setting
-    one_sector = single_sector_setting() != 'off' and (size == 1 or shared_ranks) and not args.serial_control
+    # A hybrid's ranks need not share a basis: the sector lies on the root's first device and the other ranks
+    # solve pair densities of its exchange.
+    one_sector = (single_sector_setting() != 'off' and (size == 1 or shared_ranks or hybrid)
+                  and not args.serial_control)
     if translation.molecular_dynamics is not None and not args.serial_control and not one_sector:
         # The ranks of this runner divide the symmetry sectors, and molecular dynamics uses no symmetry.
         raise ValueError('molecular dynamics uses no symmetry and so cannot be divided among the sectors of '
@@ -737,7 +772,7 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                          + (f' ({symmetry_note})' if symmetry_note else '')
                          + ', so its sectors cannot be divided among ranks: run it with one rank (one node), '
                          'with one rank per GPU, or on one node with --serial-control')
-    if shared_ranks and symmetry != 'off':
+    if shared_ranks and symmetry != 'off' and not hybrid:
         # Several ranks per node share one sector; the sectors of a symmetric run go to one rank per node.
         raise ValueError('several ranks per node share the basis of a run without symmetry; this run uses its '
                          'point group: launch it with one rank per node')
@@ -752,8 +787,11 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         raise FileExistsError('use a new output directory; previous SCF artifacts are protected')
     inputs = {str(path): _digest(path) for path in sorted(protected)}
     source = _source_provenance() if rank == 0 else None
-    identical_inputs = comm.allgather(inputs)
-    if any(item != inputs for item in identical_inputs):
+    # The contents are compared, by file name: ranks may read the same files from copies at other paths
+    # (a tree unpacked on the local disk of each node).
+    contents = sorted((Path(path).name, digest) for path, digest in inputs.items())
+    identical_inputs = comm.allgather(contents)
+    if any(item != contents for item in identical_inputs):
         raise ValueError('input or pseudopotential content differs across ranks')
     _require_same_domain(comm.allgather(_parsed_domain(translation)))
     if translation.mlff is not None:
@@ -774,7 +812,7 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
             raise RuntimeError(f'MLFF error: {outcome[1]}')
         translation = with_positions(translation, outcome[1])
         restart_notes = [*restart_notes, *outcome[2]]
-    context = None if args.serial_control else MPISectorContext(comm)
+    context = None if args.serial_control else MPISectorContext(comm, exchange=hybrid)
     memory = []
     # As in acceleration.cli, this clock begins after imports, input parsing
     # and output-path resolution. All rank readiness/preparation waits follow.
@@ -801,10 +839,16 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
             if translation.output_all_states:
                 log.write('BENCHMARK: Output_All_States overridden false; no full orbital materialization/archive.')
             mode = ('serial production control' if args.serial_control
+                    else 'MPI symmetry sectors and the exchange of a hybrid on every GPU' if hybrid
                     else 'one sector shared by the ranks' if shared_ranks else 'MPI symmetry sectors')
-            transport = ('host-fields and ' + ('device' if os.environ.get('MPICH_GPU_SUPPORT_ENABLED') == '1'
-                                               else 'host-staged') + ' orbital exchanges'
-                         if shared_ranks else 'host-fields')
+            if hybrid and not args.serial_control:
+                from parsec_python.acceleration.SCF.hybrid_mpi import exchange_transport
+                transport = ('host-fields and ' + ('device' if exchange_transport() == 'cuda' else 'host-staged')
+                             + ' exchange orbitals')
+            else:
+                transport = ('host-fields and ' + ('device' if os.environ.get('MPICH_GPU_SUPPORT_ENABLED') == '1'
+                                                   else 'host-staged') + ' orbital exchanges'
+                             if shared_ranks else 'host-fields')
             log.write(f'Full SCF mode: {mode}; '
                       f'{size} ranks on {len(set(hosts))} nodes, {size*len(args.devices)} GPUs total; '
                       f'devices/rank={args.devices}; MPI transport={transport}')
@@ -829,7 +873,7 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         if system.backend_info.selected != 'cupy':
             raise RuntimeError('full-SCF GPU benchmark may not silently fall back to a CPU backend')
         solver = getattr(system.backend, 'symmetry_eigensolver', None)
-        if context is not None and (solver is None or not context.owned_sectors):
+        if context is not None and (solver is None or not (context.owned_sectors or context.exchange)):
             raise RuntimeError('MPI full SCF requires the configured symmetry-sector eigensolver')
         memory.append(_observe_memory(cp, args.devices, 'after_preparation'))
         ready_started = time.perf_counter()
@@ -854,7 +898,10 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
             reporter.setup(system)
             def iteration(item):
                 reporter.iteration(item)
-                memory.append(_observe_memory(cp, args.devices, f'iteration_{item.iteration}'))
+                # A record without an iteration number (a spin run that leaves the symmetry sectors) has none.
+                label = getattr(item, 'iteration', None)
+                if label is not None:
+                    memory.append(_observe_memory(cp, args.devices, f'iteration_{label}'))
             scf_started = time.perf_counter()
             forces = outcome = dynamics = None
             moves = ionic_backend(translation.potential_extrapolation)
@@ -1084,7 +1131,11 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         sector_state_fit_bytes=getattr(solver, 'state_fit_bytes', None),
         # How sector states that the rank keeps on the host went there and back (PARSEC_CUPY_SPILL_BUFFERS);
         # None where they stay on their devices.
-        spill_staging=getattr(solver, 'spill_staging', None))
+        spill_staging=getattr(solver, 'spill_staging', None),
+        # What the rank spent on the exchange of a hybrid (SCF/hybrid_mpi.py): seconds of each command and of
+        # its phases, the bytes it broadcast and summed and how they travelled; None without a hybrid.
+        exchange=(None if context is None or getattr(context, 'exchange_service', None) is None
+                  else context.exchange_service.record()))
     ranks = comm.gather(local, root=0)
     exit_code = None
     if rank == 0:
@@ -1128,6 +1179,7 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                 'orbital_sector_ritz_handover of a rank says what the Ritz steps of the sectors handed over (PARSEC_CUPY_RITZ_HANDOVER, an unset variable included): rotation, or under triangular the steps of the first solves and of the later passes by mode (values, factor, triangular, rotation, with the reason where a step rotated), the trims that a later pass carried out (deferred trims), the products of the hand-over (columns or tiles) and, of the rank, the Ritz vectors formed for an export and the corrections of its densities; the root counts the steps of every sector and the deferred trims, which it decides, a worker the steps of its own sectors. ritz_handover holds the record behind it: policy, per sector the counts and the condition estimates of the first-solve cycles and the largest of the later passes, per solver of the rank its Ritz-vector rotations, deferred trims and whether a density turned the hand-over off, and the density corrections of the rank (calls, the largest number of Ritz vectors corrected, fallbacks, rotations, seconds). In distributed_state, handover_counts, handover_band, handover_slab_columns and handover_product are those of the shared sectors where a step was asked for a hand-over (absent under rotation), and seconds.handover and seconds.correction the time of their triangular products and corrections; seconds.rotate counts full rotations only, so a comparison of the two settings adds handover to rotate. backend_statistics.subspace_ritz_handover_seconds is the triangular product of every sector (of a shared one with its way back to the columns, as for the rotation).',
                 'spill_staging of a rank says how sector states that it keeps on the host went there and back; it is null where they stay on their devices. buffers is the staging (PARSEC_CUPY_SPILL_BUFFERS): persistent, one host buffer per sector that lasts and direct copies both ways, or fresh, a new host array for every download and a block of CuPy\'s pinned pool for every upload, as before. restores and offloads count the calls that moved the states of a sector to its device before a solve and to the host behind it, with their wall seconds; a basis that the devices of its sector share is not moved and not counted; under fresh the seconds of a restore end where cupy.asarray returns, which can be before its copy to the device has completed. With persistent, bound_bytes is the most that the buffers page-lock and bound_from where that comes from (half of the available host memory, RLIMIT_MEMLOCK where that is less, or PARSEC_CUPY_SPILL_PINNED_BYTES); page_locked_bytes and pageable_bytes are what the buffers hold of each kind, lock_seconds the page-locking, which lies inside the first offload of each sector, lock_failures what the driver said where it refused, upload_bytes and download_bytes what went through the buffers around the solves, and sectors the buffer of each sector. The uploads of the density step are under density_pool_release: host_uploads counts the orbitals that the device builder was handed on the host, their bytes and the wall seconds of the calls (direct says whether they were copied directly), spill_pinned_pool says whether the pinned pool is emptied where sector states are on the host (PARSEC_CUPY_SPILL_PINNED_POOL: keep, the default, or release), and pinned_kept counts the densities after which it was left. A serial control names fresh and release where its launcher names neither.',
                 'distributed_state lists the sectors whose basis the devices of the rank share. slab_columns is the widest slab of H X that the last Ritz step of a sector cut: in the step with one tall block and no PARSEC_CUPY_STREAMING_RITZ_BYTES set, at most PARSEC_CUPY_DISTRIBUTED_STATE_PAIR_SLAB_BYTES (1 GiB; 2147483648 gives the 2 GiB of before, 4294967296 the slabs before those) on two devices and an even share of PARSEC_CUPY_DISTRIBUTED_STATE_ROUND_BYTES (4 GiB; 8589934592 gives the 8 GiB of before) on four or more, but no narrower than PARSEC_CUPY_DISTRIBUTED_STATE_MIN_SLAB_COLUMNS columns (32; 1 leaves the slabs as the limits cut them) where the former 2 GiB per slab allow that width. slab_cut says how that step cut them. With one tall block: multiple where every device gave the same slab to a whole round, so that the round is a multiple of PARSEC_CUPY_RITZ_GRAM_MULTIPLE columns (64) and what the blocks hold beyond those rounds went first, or equal where no such slab exists and under a multiple of 1, which gives the former rounds beside the former slabs. With two: equal or full (PARSEC_CUPY_DISTRIBUTED_STATE_SLABS), a slab of that many columns and more cut down to a whole multiple either way; null with three, which cut none. projection_columns is the widest right-hand side of a product of the projection, a round with one tall block and a slab with two. overlap_seconds is the part of seconds.gram that the overlap took: what is left of gram is the projection (0 before the first step and with three tall blocks, which form both matrices in one call). overlap_columns is the widest slab of that overlap in the last step: 128 columns (PARSEC_CUPY_DISTRIBUTED_STATE_OVERLAP_COLUMNS), cut down to a whole multiple like every slab, or the whole basis where it has no more, and the columns that a count of slabs gives where PARSEC_CUPY_RITZ_GRAM_SLABS names one (8 gives the former slabs, an eighth of the columns); null before the first step and where PARSEC_CUPY_RITZ_SYRK forms the overlap without slabs. A sector on one device has no entry here: its overlap keeps the count of slabs, and the multiple cuts the slabs of its two Gram matrices, inside subspace_ritz_projection_seconds of the backend statistics. to_rows_copies is the order in which the devices issued the copies between them on the last way to their rows: pairs (four devices take a chunk that all of them send in three turns of two pairs, PARSEC_CUPY_EXCHANGE_PAIRS), together, or queued on the one stream of each (PARSEC_CUPY_EXCHANGE_CONCURRENT=0). It names the order that the switches chose, not what every chunk did, and is null before the first. exchange_buffer_bytes is the largest buffer through which a device of the sector has sent the rows of its columns to the others: a chunk of PARSEC_CUPY_EXCHANGE_CHUNK_BYTES where that is set (1073741824 for the former chunks), and where it is not 1 GiB or what a slab needs that is up to an eighth wider outside the rows of its device, which then goes to the rows in one chunk; less where a whole block is less, and 0 before the first step and where every conversion sent its pieces pitched (PARSEC_CUPY_EXCHANGE_STRIDED, the default since 2026-10-22), which takes no buffer.',
+                'per_rank[].exchange is what a rank spent on the exchange of a hybrid functional (null without one; SCF/hybrid_mpi.py): seconds per exx_* command (its collective calls included) and per phase of a build of W (apply_solver_wait: the wait for the host plans of the pair solver, inside apply_plan; apply_plan: blocks, tiles and buffers; apply_replicas: the broadcast of the orbitals of the other ranks, during which the devices already solve the tiles whose orbitals are there (PARSEC_MPI_EXCHANGE_OVERLAP=1, the default; 0 broadcasts first); apply_tiles: from the start of the broadcasts to the end of the pair solves of the tiles of the rank on its devices; apply_reduce: the parts of W sent to the owners of their sectors and those received and added; apply_energy: E_x of the owned sectors and the gather on the root), the counts of the commands, transport (cuda: device arrays to MPI, host: staged through the host; PARSEC_MPI_EXCHANGE_TRANSPORT) with its chunk_bytes, transport_seconds and transport_bytes (sent and received by broadcast and by the owner sums), the pair solves of the tiles of the rank and tile_solve_seconds, the summed CUDA-event seconds of its Kronecker solves over its devices (concurrent: no wall time), and solver_setup_seconds, the build of the host plans of the pair solver on its thread.',
                 'gpu_memory holds per-rank peaks from continuous nvidia-smi sampling (default every 200 ms) from CUDA initialization to the final join; it includes CUDA contexts and CuPy pool caches. A peak shorter than the interval can be missed.',
                 'Process RSS high water uses OS ru_maxrss; default CuPy pool observations exclude alternate/async allocators. Device-used observations include CUDA/library allocations.',
                 'Memory callback overhead is inside SCF wall time. CPU/thread resources per rank are recorded; total host CPU allocation can increase with node count.',
@@ -1172,10 +1224,14 @@ def main(argv=None):
     # CUDA initialize inside the same measured setup region as the CLI.
     # Several ranks per node share the basis of one sector, whose exchanges
     # pass device arrays to MPI unless PARSEC_MPI_SHARED_TRANSPORT=host.
+    # The exchange of a hybrid functional moves orbitals between the ranks too, as device arrays unless
+    # PARSEC_MPI_EXCHANGE_TRANSPORT=host (SCF/hybrid_mpi.py); a serial control has one rank.
     shared_launch = _ranks_per_node_of_launch() > 1
+    exchange_launch = (not args.serial_control and _input_has_hybrid(args.input)
+                       and os.environ.get('PARSEC_MPI_EXCHANGE_TRANSPORT', 'auto').strip().lower() != 'host')
     os.environ['MPICH_GPU_SUPPORT_ENABLED'] = (
-        '1' if shared_launch and os.environ.get('PARSEC_MPI_SHARED_TRANSPORT', 'auto').strip().lower() != 'host'
-        else '0')
+        '1' if (shared_launch and os.environ.get('PARSEC_MPI_SHARED_TRANSPORT', 'auto').strip().lower() != 'host')
+        or exchange_launch else '0')
     os.environ['PARSEC_CUPY_DEVICES'] = ','.join(map(str, args.devices))
     if args.serial_control:
         _keep_former_routes(os.environ)

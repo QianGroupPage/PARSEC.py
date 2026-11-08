@@ -55,6 +55,10 @@ class KohnShamHamiltonian:
     functional (:class:`parsec_python.V_xc.exchange_operator.CompressedExchange`
     of the channel being solved, built from the orbitals of the outer Fock
     iteration before), ``None`` otherwise; a fifth low-rank term.
+
+    ``kinetic`` is the orbital term ``-div(vtau grad)`` of a meta-GGA
+    (:class:`parsec_python.V_xc.meta_gga.KineticPotentialOperator`), ``None``
+    otherwise; a sixth term.
     """
 
     negative_laplacian: sp.csr_matrix
@@ -62,6 +66,7 @@ class KohnShamHamiltonian:
     nonlocal_operator: NonlocalProjectorOperator
     hubbard: object | None = None
     exchange: object | None = None
+    kinetic: object | None = None
 
     def __post_init__(self) -> None:
         # This class intentionally represents PARSEC's real scalar path.  The
@@ -79,11 +84,26 @@ class KohnShamHamiltonian:
             raise ValueError("LDA+U term does not match the kinetic operator")
         if self.exchange is not None and tuple(self.exchange.shape) != (size, size):
             raise ValueError("exact-exchange term does not match the kinetic operator")
+        if self.kinetic is not None and tuple(self.kinetic.shape) != (size, size):
+            raise ValueError("meta-GGA orbital term does not match the kinetic operator")
         object.__setattr__(self, "effective_potential", potential)
 
     @property
     def shape(self) -> tuple[int, int]:
         return self.negative_laplacian.shape
+
+    def without_orbital_term(self) -> "KohnShamHamiltonian":
+        """The same Hamiltonian without the meta-GGA orbital term (the bare spectral bound)."""
+
+        from dataclasses import replace
+
+        return self if self.kinetic is None else replace(self, kinetic=None)
+
+    @property
+    def spectral_margin(self) -> float:
+        """Gershgorin's bound of the meta-GGA orbital term (Ry; 0 without), for the filter's upper bound."""
+
+        return 0.0 if self.kinetic is None else float(self.kinetic.spectral_margin)
 
     def apply_kinetic(self, vectors: np.ndarray) -> np.ndarray:
         """Apply the complete central and off-diagonal FD ``-nabla^2``."""
@@ -115,6 +135,8 @@ class KohnShamHamiltonian:
             result = result + self.hubbard.apply(vectors)
         if self.exchange is not None:
             result = result + self.exchange.apply(vectors)
+        if self.kinetic is not None:
+            result = result + self.kinetic.apply(vectors)
         return result
 
     def as_linear_operator(self) -> "LinearOperator":
@@ -150,4 +172,6 @@ class KohnShamHamiltonian:
             matrix = matrix + self.hubbard.as_sparse()
         if self.exchange is not None:
             matrix = matrix + self.exchange.as_sparse()
+        if self.kinetic is not None:
+            matrix = matrix + self.kinetic.as_sparse()
         return matrix.tocsr()

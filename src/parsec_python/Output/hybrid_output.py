@@ -9,6 +9,8 @@ module formats them; it computes nothing.
 
 from __future__ import annotations
 
+import numpy as np
+
 from ..models import ExchangeLoopIteration, HybridEnergyBreakdown
 
 #: Kernel names of the report.
@@ -19,8 +21,12 @@ _KERNELS = {
 }
 
 
-def hybrid_correlation_lines(scf) -> list[str]:
-    """The functional lines under "Correlation data" for a hybrid."""
+def hybrid_correlation_lines(scf, *, periodic: bool = False) -> list[str]:
+    """The functional lines under "Correlation data" for a hybrid.
+
+    ``periodic``: a periodic cell, whose pair potentials are solved by FFT
+    with the cell's exchange kernel (:mod:`parsec_python.V_xc.bloch_exchange`).
+    """
 
     from ..SCF.hybrid import hybrid_definition
     from ..V_ion.ionic_potential import hybrid_pseudopotential_family
@@ -44,14 +50,31 @@ def hybrid_correlation_lines(scf) -> list[str]:
         (
             f"   stop at an estimated exchange error below {settings.tolerance:.2E} Ry or after "
             f"{settings.max_iterations} outer iterations, {settings.batch_size} pair "
-            f"densities per Poisson batch, pair solver {settings.pair_solver}"
+            f"densities per Poisson batch, pair solver "
+            + ("FFT with the exchange kernel of the cell" if periodic else settings.pair_solver)
         ),
         (
             f"   inner criterion {settings.inner_criterion}, mixer history {settings.mixer_history}, "
             f"outer mixing {settings.outer_mixing}"
         ),
         f" Pseudopotentials: files of {hybrid_pseudopotential_family(scf.xc_functional)}",
-    ]
+    ] + (_libxc_lines(scf.xc_functional) if getattr(scf, "is_libxc", False) else []) + _meta_gga_lines(scf)
+
+
+def _meta_gga_lines(scf) -> list[str]:
+    """tau and the form of the density gradient of a meta-GGA hybrid's inner loops."""
+
+    if not getattr(scf, "is_meta_gga", False):
+        return []
+    from ..V_xc.meta_gga import meta_gga_lines
+
+    return meta_gga_lines(scf)[2:]
+
+
+def _libxc_lines(functional: str) -> list[str]:
+    from ..V_xc.libxc import libxc_citation_lines
+
+    return libxc_citation_lines(functional)
 
 
 def hybrid_energy_lines(energies) -> list[str]:
@@ -232,8 +255,81 @@ def hybrid_finish_lines(result) -> list[str]:
         ),
         f" Pair-density Poisson solver: {summary.pair_solver}",
     ]
+    lines.extend(band_edge_lines(result))
     lines.extend(fock_loop_warning_lines(summary))
     lines.append("")
+    return lines
+
+
+def _level_blocks(result):
+    """``(eigenvalues, occupations, k index, channel)`` of every k-point (and channel) of a periodic result."""
+
+    k_points = getattr(result, "k_points", None)
+    count = 1 if k_points is None else len(k_points)
+    if hasattr(result, "eigenvalues_up"):
+        channels = (
+            ("up", result.eigenvalues_up, result.occupations_up),
+            ("down", result.eigenvalues_down, result.occupations_down),
+        )
+    elif getattr(result, "spin", None) is not None:
+        channels = tuple(
+            (name, channel.eigenvalues, channel.occupations) for name, channel in zip(("up", "down"), result.spin)
+        )
+    else:
+        channels = ((None, result.eigenvalues, result.occupations),)
+    for name, eigenvalues, occupations in channels:
+        eigenvalues = np.asarray(eigenvalues, dtype=np.float64)
+        occupations = np.asarray(occupations, dtype=np.float64)
+        per_k = eigenvalues.size // count
+        for index in range(count):
+            block = slice(index * per_k, (index + 1) * per_k)
+            yield eigenvalues[block], occupations[block], index, name
+
+
+def band_edge_lines(result) -> list[str]:
+    """The band edges of a periodic hybrid result: VBM, CBM and the gaps (nothing for a cluster).
+
+    A state with occupation above one half counts as occupied.  The k-points
+    are those of the loop (the time-reversal representatives; the band edges
+    of the full mesh are the same).
+    """
+
+    grid = getattr(result, "grid", None)
+    if getattr(result, "k_points", None) is None and getattr(grid, "cell", None) is None:
+        return []
+    from . import RYDBERG_TO_EV
+
+    highest = lowest = None
+    direct = None
+    for eigenvalues, occupations, index, channel in _level_blocks(result):
+        occupied = eigenvalues[occupations > 0.5]
+        empty = eigenvalues[occupations <= 0.5]
+        if occupied.size and (highest is None or occupied.max() > highest[0]):
+            highest = (float(occupied.max()), index, channel)
+        if empty.size and (lowest is None or empty.min() < lowest[0]):
+            lowest = (float(empty.min()), index, channel)
+        if occupied.size and empty.size:
+            gap = float(empty.min() - occupied.max())
+            if direct is None or gap < direct[0]:
+                direct = (gap, index, channel)
+    if highest is None or lowest is None:
+        return []
+
+    def where(index, channel) -> str:
+        return f"k-point {index + 1}" + ("" if channel is None else f", spin {channel}")
+
+    gap = lowest[0] - highest[0]
+    lines = [
+        f" Valence band maximum          = {highest[0]:20.8f} [Ry] = {highest[0] * RYDBERG_TO_EV:12.6f} [eV] ({where(*highest[1:])})",
+        f" Conduction band minimum       = {lowest[0]:20.8f} [Ry] = {lowest[0] * RYDBERG_TO_EV:12.6f} [eV] ({where(*lowest[1:])})",
+        f" Band gap ({'direct' if highest[1] == lowest[1] else 'indirect'})".ljust(31)
+        + f"= {gap:20.8f} [Ry] = {gap * RYDBERG_TO_EV:12.6f} [eV]",
+    ]
+    if direct is not None and highest[1] != lowest[1]:
+        lines.append(
+            " Smallest direct gap           = "
+            f"{direct[0]:20.8f} [Ry] = {direct[0] * RYDBERG_TO_EV:12.6f} [eV] ({where(*direct[1:])})"
+        )
     return lines
 
 
@@ -270,6 +366,7 @@ def fock_loop_warning_lines(summary) -> list[str]:
 __all__ = [
     "exchange_loop_lines",
     "fock_loop_warning_lines",
+    "band_edge_lines",
     "hybrid_correlation_lines",
     "hybrid_energy_lines",
     "hybrid_finish_lines",

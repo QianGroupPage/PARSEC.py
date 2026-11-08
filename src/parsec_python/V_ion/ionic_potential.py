@@ -96,7 +96,14 @@ def load_pseudopotentials(
     file is used with a warning, as in a PBE run, any other is refused.
     ``check_correlation=False`` reads the files without that check (the input
     reader makes it itself, to refuse by name before the run).
+    A libxc functional (``libxc:...``) reads the files of its family: CA/LDA
+    files for an LDA, PBE files for everything else
+    (:func:`parsec_python.V_xc.libxc.libxc_pseudopotential_functional`); a
+    file of another label is used with a warning.
     """
+    from ..V_xc.libxc import is_libxc_functional
+
+    libxc = is_libxc_functional(xc_functional)
     result: dict[str, ParsecPseudopotential] = {}
     hybrid_labels = hybrid_pseudopotential_labels(xc_functional.strip().lower())
     requested = pseudopotential_functional(xc_functional.strip().lower())
@@ -190,6 +197,16 @@ def load_pseudopotentials(
                     stacklevel=2,
                 )
         elif not pseudopotential_matches_functional(potential, requested):
+            if libxc:
+                warnings.warn(
+                    f"{specification.path} was generated for {potential.correlation!r}, not for "
+                    f"{requested.upper()}, the pseudopotentials of the libxc functional {xc_functional}; "
+                    "it is used",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                result[symbol] = potential
+                continue
             if requested in _REQUIRED_PSEUDOPOTENTIAL_LABELS and not (
                 requested == "pbe" and potential.correlation.strip().lower() in _CA_LABELS
             ):
@@ -255,12 +272,20 @@ def pseudopotential_functional(xc_functional: str) -> str:
     pseudopotentials, as Quantum ESPRESSO's hybrid runs usually do: there are
     no hybrid norm-conserving pseudopotentials in the libraries of this code
     (B3PW91 also takes PW91 files, :func:`hybrid_pseudopotential_labels`).
-    Every other functional reads its own.
+    A meta-GGA of this package (``parsec_python.V_xc.meta_gga``) reads PBE
+    pseudopotentials too, as its plane-wave references do.  A libxc
+    functional reads CA files (an LDA) or PBE files (the others).  Every
+    other functional reads its own.
     """
 
-    from ..models import HYBRID_XC_FUNCTIONALS
+    from ..models import HYBRID_XC_FUNCTIONALS, META_GGA_XC_FUNCTIONALS
+    from ..V_xc.libxc import is_libxc_functional, libxc_pseudopotential_functional
 
-    return "pbe" if xc_functional in HYBRID_XC_FUNCTIONALS else xc_functional
+    if is_libxc_functional(xc_functional):
+        return libxc_pseudopotential_functional(xc_functional)
+    if xc_functional in HYBRID_XC_FUNCTIONALS or xc_functional in META_GGA_XC_FUNCTIONALS:
+        return "pbe"
+    return xc_functional
 
 
 #: The correlation labels of the files each hybrid reads beyond PBE's: its semilocal family.
@@ -467,11 +492,88 @@ def atomic_density_support_radius(
     return float(min(potential.radii[index], potential.interpolation_cutoff))
 
 
+#: ``|r V + 2 Z| <= COULOMB_ROUND_OFF_TOLERANCE x 2 Z``: the table is the Coulomb tail to round-off from there on (the
+#: POTRE files), the rule of :func:`parsec_python.acceleration.V_ion.periodic_device.coulomb_radius` and of
+#: :func:`_coulomb_to_round_off`, which must stay equal for the POTRE tables to keep their radii.
+COULOMB_ROUND_OFF_TOLERANCE = 1.0e-15
+
+#: The Coulomb tail of a table written with fewer digits (:func:`coulomb_tail_radius`): ``|r V + 2 Z|`` within this
+#: multiple of its largest value over the outer half of the table, and never below ``_COULOMB_TAIL_PRECISION 2 Z``;
+#: a table whose outer half deviates by more than ``_COULOMB_TAIL_NOISE_LIMIT 2 Z`` has no Coulomb tail.
+_COULOMB_TAIL_NOISE_FACTOR = 10.0
+_COULOMB_TAIL_PRECISION = 1.0e-10
+_COULOMB_TAIL_NOISE_LIMIT = 1.0e-6
+
+
+def coulomb_tail_radius(potential: ParsecPseudopotential, local_l: int) -> float | None:
+    """Radius from which ``r V_loc`` is ``-2 Z`` to the precision of its file, or ``None`` (bohr).
+
+    For the tables whose ``r V`` never reaches ``-2 Z`` to the last bit: the FHIPP files of FHI98PP carry
+    ``|r V + 2 Z| / 2 Z`` of 1e-13 to 1e-11 out to the end of the table (406 files of ``src/pp_generation/NCPPs``),
+    the MARTINS_OLD and MARTINS_WANG files of the tree 5e-10 and 5e-8; the POTRE files are ``-2 Z`` to round-off
+    (4e-15) beyond their core and never need this.  With the noise floor ``f = max |r V + 2 Z|`` over the outer half
+    of the table (``r >= rs(ns)/2``, beyond any pseudopotential core), the tail starts at the sample after the last
+    one with ``|r V + 2 Z| > max(10 f, 1e-10 x 2 Z)``: from 1.3 bohr (H) to 14 bohr (Cs) for the FHIPP files of the
+    library, 6.1 bohr for its silicon.  Beyond it a periodic image adds
+    to the Ewald split of the local potential only ``-2 Z erfc(eta r)/r`` and the noise of the file (below
+    ``1e-9/r`` Ry per image for the FHIPP files), and, for a ``Cubic_Spline`` species, the error of the spline of
+    ``V`` between the samples of ``-2 Z/r``, which grows to 1e-5 Ry near the end of the table and must not be summed
+    over the images.  ``None`` where the outer half deviates by more than ``1e-6 x 2 Z`` (no Coulomb tail, such as
+    ``examples/h2_full_nonlocal/H_POTRE.DAT``: 4.6e-5 x 2 Z) or no sample settles: the callers then sum to the end
+    of the table, the deviation being part of the potential, and :func:`warn_spline_without_coulomb_tail` warns
+    that a ``Cubic_Spline`` species adds the spline error of that tail too.
+    """
+
+    radii = np.asarray(potential.radii, dtype=float)
+    two_z = 2.0 * float(potential.ionic_charge)
+    deviation = np.abs(radii * np.asarray(potential.channel_potentials[local_l], dtype=float) + two_z)
+    scale = max(two_z, 1.0)
+    floor = float(np.max(deviation[radii >= 0.5 * radii[-1]], initial=0.0))
+    if floor > _COULOMB_TAIL_NOISE_LIMIT * scale:
+        return None
+    tolerance = max(_COULOMB_TAIL_NOISE_FACTOR * floor, _COULOMB_TAIL_PRECISION * scale)
+    significant = np.flatnonzero(deviation > tolerance)
+    if significant.size == 0:
+        return float(radii[0])
+    following = int(significant[-1]) + 1
+    if following >= radii.size - 1:
+        return None
+    return float(radii[following])
+
+
+def warn_spline_without_coulomb_tail(potential: ParsecPseudopotential, local_l: int, reach: float) -> None:
+    """Warn where the periodic sum of a ``Cubic_Spline`` local potential reaches the end of its table.
+
+    A table that is not ``-2 Z/r`` at its end (:func:`coulomb_tail_radius` is ``None``) is summed over the images out
+    to ``rs(ns-1)``, where the cubic spline of ``V`` misses ``-2 Z/r`` by up to 1e-5 Ry: the error enters every image
+    (for a silicon crystal 0.05 Ry in the mean potential).  The linear interpolation of ``r V`` has no such error.
+    A table with a Coulomb tail is silent even where the erfc reach passes its end (beyond it the sums take
+    ``-2 Z/r`` itself).
+    """
+
+    if reach < float(potential.interpolation_cutoff):
+        return
+    if _coulomb_to_round_off(potential, local_l) or coulomb_tail_radius(potential, local_l) is not None:
+        return
+    import warnings
+
+    warnings.warn(
+        f"{potential.symbol}: the local potential (l={local_l}) of {getattr(potential, 'source', 'its file')} is not "
+        f"-2Z/r at the end of its table, so its periodic images are summed out to {reach:.1f} bohr, where the cubic "
+        "spline of Cubic_Spline: .true. adds its interpolation error (up to 1e-5 Ry per image); Cubic_Spline: .false. "
+        "interpolates r V linearly without it",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 def coulomb_onset_radius(potential: ParsecPseudopotential, local_l: int) -> float:
     """Radius beyond which the local potential table is ``-2 Z/r`` to ``1e-14`` Ry (2 to 7 bohr for the tables in use).
 
     Beyond it a periodic image of the atom adds, to the Ewald split of the local potential, only the short-ranged
-    ``-2 Z erfc(eta r)/r``; the tables themselves run to 118 bohr or more.
+    ``-2 Z erfc(eta r)/r``; the tables themselves run to 118 bohr or more.  A table whose ``r V`` is ``-2 Z`` only to
+    the digits of its file (FHIPP, MARTINS_OLD, MARTINS_WANG; not to ``1e-15`` relative) meets ``1e-14`` Ry late
+    (25 bohr for a FHIPP silicon) or never: it takes :func:`coulomb_tail_radius` where that is smaller.
     """
 
     radii = np.asarray(potential.radii, dtype=float)
@@ -479,7 +581,26 @@ def coulomb_onset_radius(potential: ParsecPseudopotential, local_l: int) -> floa
     significant = np.flatnonzero(deviation > _COULOMB_ONSET_TOLERANCE)
     if significant.size == 0:
         return float(radii[1])
-    return float(min(radii[min(int(significant[-1]) + 1, radii.size - 1)], potential.interpolation_cutoff))
+    onset = float(min(radii[min(int(significant[-1]) + 1, radii.size - 1)], potential.interpolation_cutoff))
+    if not _coulomb_to_round_off(potential, local_l):
+        tail = coulomb_tail_radius(potential, local_l)
+        if tail is not None:
+            return min(onset, tail)
+    return onset
+
+
+def _coulomb_to_round_off(potential: ParsecPseudopotential, local_l: int) -> bool:
+    """Whether ``|r V + 2 Z| <= 1e-15 x 2 Z`` from a radius below ``rs(ns-1)`` on (the POTRE files): the rule of
+    :func:`parsec_python.acceleration.V_ion.periodic_device.coulomb_radius` settles inside the table."""
+
+    radii = np.asarray(potential.radii, dtype=float)
+    two_z = 2.0 * float(potential.ionic_charge)
+    deviation = np.abs(radii * np.asarray(potential.channel_potentials[local_l], dtype=float) + two_z)
+    deviating = np.flatnonzero(deviation > COULOMB_ROUND_OFF_TOLERANCE * max(two_z, 1.0))
+    if deviating.size == 0:
+        return True
+    following = int(deviating[-1]) + 1
+    return following < radii.size and float(radii[following]) < potential.interpolation_cutoff
 
 
 def superpose_atomic_density(

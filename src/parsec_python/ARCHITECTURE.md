@@ -78,12 +78,21 @@ the last bits (1e-11 Ry in energies); `PARSEC_PERIODIC_SETUP_REACH=table` reache
 bit the definitions (the default before).
 `acceleration/tests/test_periodic_setup.py` checks them against the definitions. The replacements serve the
 orthorhombic grid of `Grid.pbc.build_periodic_grid` only; `GeneralPeriodicGrid` and `ConfinedPeriodicGrid`
-(subclasses with other point positions) keep the definitions.  For the forces, relaxation and dynamics of
+(subclasses with other point positions) keep the definitions, except the local potential of a `GeneralPeriodicGrid`
+cell with a `Cubic_Spline` species, which takes the split of the orthorhombic grid over lattice balls
+(`PARSEC_PERIODIC_OBLIQUE_SPLIT`, since 2026-11-07: the direct sum ran into the spline error near the end of the
+tables as the cell grew).  For the forces, relaxation and dynamics of
 such a cell the accelerated command line installs, for that calculation only, device builders of the local
 potential and of the atomic densities (`acceleration/V_ion/periodic_device.py`, through the same provider hook
 and `V_ion.ionic_potential.set_atomic_density_provider`) and their derivatives as the local terms of
 `Forces.periodic.periodic_local_forces` (`Forces.periodic.set_local_force_provider`,
 `acceleration/Forces/periodic_device.py`); the host builders of `periodic_setup.py` are restored afterwards.
+The local forces of `Cubic_Spline` species on the orthorhombic grid of the Fortran-derived routines, whose
+potential stays the host one, are the derivatives of that potential (`acceleration/Forces/periodic_spline.py`,
+installed through the same `Forces.periodic.set_local_force_provider` by `periodic_setup.install`; the device
+provider hands those species to it).  The short-ranged sums of the local potential stop where the table of `r V` is
+`-2 Z`: to round-off (POTRE), or to the digits of the file (FHIPP, MARTINS_OLD, MARTINS_WANG:
+`V_ion.ionic_potential.coulomb_tail_radius`).
 
 The tetrahedron sums of `Create_DOS` follow the same rule: `Output/dos.py` keeps the definition
 (`spectrum_sums`, written with the operations NumPy and CuPy share) and a provider hook
@@ -121,14 +130,14 @@ import the SCF driver. Physics components must remain independently callable.
 | `Laplacian` | finite-difference coefficients and kinetic application | effective potentials |
 | `Pseudopotential` | POTRE, old-format POTR, Martins-Wang POTRW and FHIPP parsing, radial data, Fourier filters, interpolation-ready models | placement on a molecular grid |
 | `V_ion` | local potential, KB projectors, atomic density, ion-ion energy | SCF state |
-| `Hartree` | isolated boundary values and Poisson solution; the Kronecker-product Poisson solver of batches of pair densities for exact exchange (`kronecker`: 1/r, erfc and erf kernels, multipole boundary on the padded bounding box; reflection-parity classes on the octant of a symmetric box) | density mixing |
-| `V_xc` | LDA (CA/PZ, PW92, X-alpha, Wigner, Hedin-Lundqvist), GGA (PBE, PW91) and asymptotically corrected (LB94, Casida-Salahub) potentials and energy densities, unpolarized and spin-polarized; the Fock exchange operator of orbital blocks, its adaptively compressed form (ACE) and the exchange energy (`exchange_operator`); the hybrid functionals: label registry, exact-exchange fractions and kernels, semilocal parts (`hybrid`, `semilocal`, `semilocal_components`) | total-energy assembly |
+| `Hartree` | isolated boundary values and Poisson solution; the Kronecker-product Poisson solver of batches of pair densities for exact exchange (`kronecker`: 1/r, erfc and erf kernels, multipole boundary on the padded bounding box; reflection-parity classes on the octant of a symmetric box); the Coulomb kernels `K(q + G)` of the exact exchange of periodic cells (`exchange_kernel`: bulk with k-points, slabs padded or truncated, the Gygi-Baldereschi element) | density mixing |
+| `V_xc` | LDA (CA/PZ, PW92, X-alpha, Wigner, Hedin-Lundqvist), GGA (PBE, PW91) and asymptotically corrected (LB94, Casida-Salahub) potentials and energy densities, unpolarized and spin-polarized; the Fock exchange operator of orbital blocks, its adaptively compressed form (ACE) and the exchange energy (`exchange_operator`); the hybrid functionals: label registry, exact-exchange fractions and kernels, semilocal parts (`hybrid`, `semilocal`, `semilocal_components`); the exchange of periodic cells (`bloch_exchange`: pair potentials by FFT on the grid box, Bloch factors of a time-reversal-reduced mesh, ACE per k-point) | total-energy assembly |
 | `Hamiltonian` | composition and block matrix-vector products | choosing an eigensolver |
 | `Eigensolvers` | PARSEC-selected eigensolver control flow and reusable subspaces | occupations or SCF mixing |
 | `Occupations` | Fermi level, occupations (searched, or fixed by `occup.in`), and density from orbitals | eigensolution |
 | `Mixer` | explicit mixer history and PARSEC SRE metrics; the Anderson history carried through the inner loops of a Fock loop (`carried`, `Exx_Mixer_History: carry`) | convergence policy selection |
 | `Energy` | named Rydberg energy components and total energy | text formatting |
-| `SCF` | ordering the component calls and applying stopping policy; the Fock loop of the hybrid functionals around the SCF loop (`hybrid`), its controls (`fock_controls`: adaptive inner criterion, carried mixer; `fock_diis`: Anderson extrapolation of the density matrix with a saddle guard) | hidden algorithm substitution |
+| `SCF` | ordering the component calls and applying stopping policy; the Fock loop of the hybrid functionals around the SCF loop (`hybrid`), its controls (`fock_controls`: adaptive inner criterion, carried mixer; `fock_diis`: Anderson extrapolation of the density matrix with a saddle guard); the exchange engine of periodic cells with k-points (`hybrid_periodic`: Bloch orbital sets, ACE per k-point, inner loops on the k-point drivers) | hidden algorithm substitution |
 | `Forces` | ion-ion, local, nonlocal forces, their symmetrization and net-force removal | moving atoms |
 | `Relaxation` | L-BFGS-B, steepest-descent and manual ionic steps, the ionic loop, relaxation files | electronic structure of a structure |
 | `MolecularDynamics` | the integrator of `moldyn.f90`, its input, random numbers and files | energies or forces |

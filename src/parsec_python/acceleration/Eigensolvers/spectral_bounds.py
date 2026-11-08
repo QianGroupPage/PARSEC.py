@@ -14,7 +14,105 @@ from ..backends.cupy import require_cupy
 _BREAKDOWN_TOLERANCE = 2.5e-16
 
 
+def filter_bound_policy() -> str:
+    """``PARSEC_META_GGA_FILTER_BOUND``: ``gershgorin`` (default), ``targeted`` or ``lanczos`` (:func:`with_orbital_term`)."""
+
+    import os
+
+    value = os.environ.get("PARSEC_META_GGA_FILTER_BOUND", _DEFAULT_POLICY).strip().lower()
+    if value not in ("targeted", "gershgorin", "lanczos"):
+        raise ValueError("PARSEC_META_GGA_FILTER_BOUND must be targeted, gershgorin or lanczos")
+    return value
+
+
+_DEFAULT_POLICY = "gershgorin"
+
+
+def with_orbital_term(operator: Any, upper_bound: float, *, steps: int = 8, rng=None) -> float:
+    """The filter's upper bound of an operator that may hold a meta-GGA term.
+
+    The term ``sum_a B_a^T diag(vtau) B_a`` (and the first-order term of the
+    orbital form) reports a bound ``m`` of its eigenvalues
+    (``spectral_margin``, Gershgorin's row sums).  Where ``vtau`` has a
+    narrow spike (low density) the term has localized eigenvalues far above
+    the rest of the spectrum, which the short Lanczos run from a random
+    vector does not see; the Chebyshev filter would amplify them without
+    limit.  With the term, the bound is ``max(lanczos, bare + m)``, ``bare``
+    the last Lanczos bound of the same operator without the term (the first
+    iteration of a meta-GGA has none), or ``lanczos + m`` before one exists:
+    ``lambda_max(H_0 + M) <= lambda_max(H_0) + m``.  ``bare`` is raised by
+    the rise of the largest value of the effective potential since it was
+    taken.  Without the term the Lanczos bound is recorded as ``bare`` on
+    operators that keep one.  This is ``PARSEC_META_GGA_FILTER_BOUND=gershgorin``.
+
+    ``targeted`` runs a second short Lanczos recurrence on the operator from
+    a start vector concentrated on the rows where the term is large (its
+    Gershgorin row sums with random signs, ``spectral_start_vector``), which
+    overlaps the localized modes of the spikes, and takes the larger of the
+    two Lanczos bounds: the spectrum's top of ``H_0`` (the checkerboard mode
+    of the Laplacian, which the derivative stencil does not see) is not added
+    to that of the term.  ``lanczos`` keeps the Lanczos bound alone (a
+    comparison; it can end in the filter's failure described above).
+    """
+
+    margin = float(getattr(operator, "spectral_margin", 0.0) or 0.0)
+    if margin <= 0.0:
+        if hasattr(operator, "bare_upper_bound") and getattr(operator, "kinetic_term", None) is None:
+            operator.bare_upper_bound = (float(upper_bound), _potential_top(operator))
+        return float(upper_bound)
+    policy = filter_bound_policy()
+    if policy == "lanczos":
+        return float(upper_bound)
+    start = getattr(operator, "spectral_start_vector", None) if policy == "targeted" else None
+    if start is not None:
+        cp, _ = require_cupy()
+        generator = np.random.default_rng(20261108) if rng is None else rng
+        signs = cp.asarray(generator.standard_normal(int(start.shape[0])))
+        targeted = _lanczos_bound(operator, cp.asarray(start, dtype=cp.float64) * signs, steps)
+        return max(float(upper_bound), float(targeted.upper_bound))
+    bare = getattr(operator, "bare_upper_bound", None)
+    if bare is None:
+        base = float(upper_bound)
+    else:
+        base, top = bare
+        now = _potential_top(operator)
+        if top is not None and now is not None:
+            base += max(0.0, now - top)
+    return max(float(upper_bound), base + margin)
+
+
+def orbital_term_margin(operator: Any) -> float:
+    """The bound of the orbital term an operator holds (``spectral_margin``), 0 under ``PARSEC_META_GGA_FILTER_BOUND=lanczos``."""
+
+    from parsec_python.Eigensolvers.spectral_bounds import orbital_term_margin as host_margin
+
+    return host_margin(operator)
+
+
 def lanczos_upper_bound(
+    operator: Any,
+    initial_vector: Any | None = None,
+    steps: int = 5,
+    *,
+    rng: np.random.Generator | None = None,
+) -> LanczosBoundResult:
+    """PARSEC's short Lanczos bound (:func:`_lanczos_bound`), with a meta-GGA's orbital term taken in (:func:`with_orbital_term`)."""
+
+    from dataclasses import replace
+
+    bound = _lanczos_bound(operator, initial_vector, steps, rng=rng)
+    upper = with_orbital_term(operator, bound.upper_bound, steps=steps, rng=rng)
+    return bound if upper == bound.upper_bound else replace(bound, upper_bound=float(upper))
+
+
+def _potential_top(operator: Any) -> float | None:
+    potential = getattr(operator, "effective_potential", None)
+    if potential is None:
+        return None
+    return float(potential.max())
+
+
+def _lanczos_bound(
     operator: Any,
     initial_vector: Any | None = None,
     steps: int = 5,
@@ -174,4 +272,4 @@ def lanczos_upper_bound(
     )
 
 
-__all__ = ["LanczosBoundResult", "lanczos_upper_bound"]
+__all__ = ["LanczosBoundResult", "filter_bound_policy", "lanczos_upper_bound", "with_orbital_term"]

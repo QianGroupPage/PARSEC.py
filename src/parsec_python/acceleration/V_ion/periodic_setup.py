@@ -80,6 +80,43 @@ def _box_rows(n: np.ndarray, ranges) -> np.ndarray:
     return ((i[:, None, None] * n[1] + j[None, :, None]) * n[2] + k[None, None, :]).reshape(-1)
 
 
+def _ball_rows(n: np.ndarray, lattice: np.ndarray, shift, centre: np.ndarray, radius: float, ranges) -> np.ndarray:
+    """The rows of the index box ``ranges`` that can lie within ``radius`` of ``centre``, in the order of
+    :func:`_box_rows`.
+
+    Along each line ``(i, j)`` of the box the points ``P_ij + k a_2/n_2`` are within the radius on one interval of
+    ``k``, the roots of ``|P_ij - centre + k a_2/n_2|^2 = radius^2`` (with ``P_ij`` the position the lattice
+    gives the point ``(i, j, 0)``); the interval is widened by one index on each side and the radius by 1e-12, so
+    every point that :func:`lattice_ball` keeps (its distance from the grid's own coordinates) is among the rows.
+    The ball of an oblique cell fills about 40 % of its index box.
+    """
+    (i0, i1), (j0, j1), (k0, k1) = ranges
+    i = np.arange(i0, i1 + 1, dtype=np.int64)
+    j = np.arange(j0, j1 + 1, dtype=np.int64)
+    shift = np.asarray(shift, dtype=float)
+    steps = lattice / n[:, None].astype(float)
+    base = (
+        (i[:, None, None] + shift[0]) * steps[0]
+        + (j[None, :, None] + shift[1]) * steps[1]
+        + shift[2] * steps[2]
+        - np.asarray(centre, dtype=float)
+    )
+    along = steps[2]
+    quadratic = float(along @ along)
+    linear = 2.0 * (base @ along)
+    reach = radius * (1.0 + 1.0e-12) + 1.0e-12
+    constant = np.einsum("abk,abk->ab", base, base) - reach * reach
+    discriminant = linear * linear - 4.0 * quadratic * constant
+    root = np.sqrt(np.maximum(discriminant, 0.0))
+    low = np.maximum(np.ceil((-linear - root) / (2.0 * quadratic)) - 1.0, k0)
+    high = np.minimum(np.floor((-linear + root) / (2.0 * quadratic)) + 1.0, k1)
+    counts = np.where(discriminant >= 0.0, np.maximum(high - low + 1.0, 0.0), 0.0).astype(np.int64).reshape(-1)
+    starts = ((i[:, None] * n[1] + j[None, :]) * n[2] + low.astype(np.int64)).reshape(-1)
+    total = int(counts.sum())
+    offsets = np.repeat(np.cumsum(counts) - counts, counts)
+    return np.repeat(starts, counts) + (np.arange(total, dtype=np.int64) - offsets)
+
+
 def grid_ball(grid, centre: np.ndarray, radius: float):
     """``(rows, relative, distances)`` of the grid points within ``radius`` of ``centre``.
 
@@ -102,7 +139,7 @@ def lattice_ball(grid, centre: np.ndarray, radius: float):
     lies at ``sum_m (i_m + s_m) a_m / n_m`` (``s = grid.shift``): this module's grids and the general grid of the
     Fortran-derived routines (:class:`parsec_python.Grid.pbc.GeneralPeriodicGrid`), which takes it instead of the
     dense scan (the same rows in the same order)."""
-    n, _, inverse = _cell_geometry(grid)
+    n, lattice, inverse = _cell_geometry(grid)
     fractional = np.asarray(centre, dtype=float) @ inverse
     half_width = radius * np.linalg.norm(inverse, axis=0)
     ranges = []
@@ -112,7 +149,8 @@ def lattice_ball(grid, centre: np.ndarray, radius: float):
             empty = np.empty(0, dtype=np.int64)
             return empty, np.empty((0, 3)), np.empty(0)
         ranges.append(found)
-    rows = _box_rows(n, ranges)
+    # the rows of the box that can be in the ball (_ball_rows; the same kept rows as the whole box)
+    rows = _ball_rows(n, lattice, grid.shift, centre, radius, ranges)
     relative = grid.coordinates[rows] - centre
     distances = np.linalg.norm(relative, axis=1)
     keep = distances <= radius
@@ -282,6 +320,10 @@ def fft_local_ionic_potential(
             erfc_cutoff,
             _ionic.coulomb_onset_radius(potentials[atom.symbol], specifications[atom.symbol].local_angular_momentum),
         )
+        if _ewald.local_potential_uses_spline(specifications[atom.symbol]):
+            _ionic.warn_spline_without_coulomb_tail(
+                potentials[atom.symbol], specifications[atom.symbol].local_angular_momentum, reach
+            )
         for rows, distances in _atom_balls(grid, position, reach):
             pending_rows.append(rows)
             pending_distances.append(distances)
@@ -312,27 +354,34 @@ def install() -> None:
     :mod:`parsec_python.Forces.periodic_local`), the atomic densities of :mod:`.periodic_setup_fortran` for
     those grids and for the default routines' bulk grids of cells with diagonal lattice vectors (the same
     density, from index boxes: 4-6 times faster than the readable sum); the threads of the Ewald terms keep
-    every sum's order.
+    every sum's order.  The local forces of the Fortran-derived routines' cells with ``Cubic_Spline`` species are
+    the derivatives of their fast potential (:mod:`parsec_python.acceleration.Forces.periodic_spline`; the readable
+    sum differentiates every image within 43-86 bohr).
     """
+    from parsec_python.Forces import periodic as _fortran_force_sums
     from parsec_python.Forces import periodic_local as _force_sums
 
     from ..Forces.periodic_local import local_force_provider
+    from ..Forces.periodic_spline import spline_periodic_local_forces
     from . import periodic_setup_fortran as _fortran
 
     _ionic.set_support_finder(grid_ball)
     _ewald.set_local_potential_provider(fft_local_ionic_potential, converged_for=_fortran_converged)
     _force_sums.set_local_force_provider(local_force_provider)
+    _fortran_force_sums.set_local_force_provider(spline_periodic_local_forces)
     # the image sums of the atomic densities (None, the readable sum, for the other grids)
     _ionic.set_atomic_density_provider(_fortran._density_provider)
     _ewald.set_translation_map(_fortran._translation_map)
 
 
 def uninstall() -> None:
+    from parsec_python.Forces import periodic as _fortran_force_sums
     from parsec_python.Forces import periodic_local as _force_sums
 
     _ionic.set_support_finder(None)
     _ewald.set_local_potential_provider(None)
     _force_sums.set_local_force_provider(None)
+    _fortran_force_sums.set_local_force_provider(None)
     _ionic.set_atomic_density_provider(None)
     _ewald.set_translation_map(None)
 

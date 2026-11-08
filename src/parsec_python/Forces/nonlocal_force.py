@@ -615,8 +615,36 @@ def nonlocal_forces(
     )
 
 
+
+def bloch_projector_gradients(
+    grid,
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    specifications: Mapping[str, SpeciesPotential],
+    lattice_vectors: np.ndarray,
+    k_point: np.ndarray | None = None,
+) -> NonlocalProjectorGradients:
+    """The gradients of the Bloch projectors a k-point loop applies (its nonlocal force).
+
+    On the confined grid of a wire or slab of the Fortran-derived routines (``grid.is_confined_periodic``) the
+    projectors of :func:`parsec_python.V_ion.build_nonlocal_projectors` sum the images of an atom along the periodic
+    directions of the grid only, so their gradients are those of
+    :func:`parsec_python.Forces.wire_slab.wire_slab_projector_gradients` (``lattice_vectors`` is not used there):
+    :func:`build_periodic_projector_gradients` would add images along the placeholder vectors of the confined
+    directions.  Elsewhere they are those of :func:`build_periodic_projector_gradients`.  (The spinor force paths,
+    ``SCF/kpoints_soc.py`` and ``Forces/spin_orbit_fortran.py``, call the latter directly: the input reader refuses
+    spin-orbit coupling and non-collinear magnetism on a wire or slab, so they never see a confined grid.)
+    """
+
+    if getattr(grid, "is_confined_periodic", False):
+        from .wire_slab import wire_slab_projector_gradients
+
+        return wire_slab_projector_gradients(grid, atoms, potentials, specifications, k_point=k_point)
+    return build_periodic_projector_gradients(grid, atoms, potentials, specifications, lattice_vectors, k_point)
+
 __all__ = [
     "NonlocalProjectorGradients",
+    "bloch_projector_gradients",
     "build_nonlocal_projector_gradients",
     "build_periodic_projector_gradients",
     "contract_nonlocal_forces",

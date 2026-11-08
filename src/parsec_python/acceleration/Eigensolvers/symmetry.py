@@ -137,6 +137,10 @@ class CuPySymmetryOrbitals:
     sector_scales: tuple[np.ndarray | None, ...] | None = None
     wedge_size: int | None = None
     remote_sectors: bool = False
+    # The spin channel whose orbitals these are, where the solver serves the
+    # two channels of a spin-polarized loop (``None`` otherwise): an MPI
+    # density command names it to the ranks.
+    spin_channel: int | None = None
     # Per sector, the hand-over that the columns of ``sector_vectors`` hold
     # (:class:`handover.RitzHandover`), or None where they are Ritz vectors
     # (PARSEC_CUPY_RITZ_HANDOVER).  The density reads it; an export takes
@@ -458,6 +462,9 @@ class CuPySymmetrySCFEigensolver:
         self._memory_allocator_evaluated = False
         self.mpi_context = mpi_context
         self._mpi_latest_results = {}
+        # The results of the last solve of every sector of this rank, kept for
+        # a hybrid's exchange (experimental/mpi_scf.py, retain_orbitals).
+        self._mpi_retained_results = {}
         # Sector -> [later passes, later passes that filtered in FP32].
         self._later_filter_passes: dict[int, list[int]] = {}
         # PARSEC_CUPY_RITZ_HANDOVER and its knobs, read when the solver is
@@ -628,22 +635,40 @@ class CuPySymmetrySCFEigensolver:
         prepares_poisson = (
             mpi_context is None or mpi_context.rank == mpi_context.root
         )
-        static_operators = load_or_build_reduced_operators(
-            decomposition,
-            negative_laplacian,
-            nonlocal_operator,
-            cache_directory=operator_cache_directory,
-            kinetic_key_seed=kinetic_cache_key,
-            decomposition_key_seed=decomposition_cache_key,
-            representations=(
-                None
-                if mpi_context is None
-                else (*self._owned_representations,
-                      self.totally_symmetric_representation)
-                if prepares_poisson
-                else self._owned_representations
-            ),
-        )
+        if prepares_poisson or self._owned_representations:
+            static_operators = load_or_build_reduced_operators(
+                decomposition,
+                negative_laplacian,
+                nonlocal_operator,
+                cache_directory=operator_cache_directory,
+                kinetic_key_seed=kinetic_cache_key,
+                decomposition_key_seed=decomposition_cache_key,
+                representations=(
+                    None
+                    if mpi_context is None
+                    else (*self._owned_representations,
+                          self.totally_symmetric_representation)
+                    if prepares_poisson
+                    else self._owned_representations
+                ),
+            )
+        else:
+            # A rank of a hybrid's MPI run that owns no sector assembles no
+            # sector operator: it solves pair densities of the exchange only.
+            from types import SimpleNamespace
+
+            from ..Symmetry.operator_cache import ReducedOperatorCacheInfo
+
+            count = decomposition.representation_count
+            static_operators = SimpleNamespace(
+                stencil_metadata=[None] * count,
+                nonlocal_operators=[None] * count,
+                cache_info=ReducedOperatorCacheInfo(
+                    enabled=False, status="no sector on this rank", key=None, path=None,
+                    hash_seconds=0.0, load_seconds=0.0, build_seconds=0.0, write_seconds=0.0,
+                    stencil_builder="none",
+                ),
+            )
         self.operator_cache_info = static_operators.cache_info
         # The GPU Poisson solver reads this packed stencil as it is.  Its
         # CSR form is rebuilt only for a consumer that asks for one, and
@@ -661,8 +686,10 @@ class CuPySymmetrySCFEigensolver:
         ]
         # Sectors assembled by this process; sizes its stencil-packing pool.
         self.assembled_sector_count = len(built_metadata)
-        first_neighbors = built_metadata[0].neighbors
-        neighbors_are_shared = all(
+        # (A rank of a hybrid's MPI run may own no sector: it solves pair
+        # densities of the exchange only.)
+        first_neighbors = built_metadata[0].neighbors if built_metadata else None
+        neighbors_are_shared = bool(built_metadata) and all(
             np.array_equal(first_neighbors, item.neighbors)
             for item in built_metadata[1:]
         )
@@ -827,11 +854,6 @@ class CuPySymmetrySCFEigensolver:
 
         if index not in (0, 1):
             raise ValueError("a spin channel is 0 (up) or 1 (down)")
-        if getattr(self, "mpi_context", None) is not None:
-            raise NotImplementedError(
-                "the symmetry sectors of an MPI run serve one spin channel; a spin-polarized "
-                "calculation runs in one process"
-            )
         channels = getattr(self, "_spin_channels", None)
         if channels is None:
             cp, _ = require_cupy()
@@ -842,12 +864,28 @@ class CuPySymmetrySCFEigensolver:
                     continue
                 with cp.cuda.Device(self._sector_device_ids[representation]):
                     solvers.append(self._new_sector_solver(representation))
-            self._channel_store = [None, {"_solvers": solvers, "_state": None, "_sector_counts": None}]
+            self._channel_store = [
+                None,
+                {
+                    "_solvers": solvers,
+                    "_state": None,
+                    "_sector_counts": None,
+                    "_mpi_latest_results": {},
+                    "_mpi_retained_results": {},
+                },
+            ]
             self._active_spin_channel = 0
             channels = self._spin_channels = (SectorSpinChannel(self, 0), SectorSpinChannel(self, 1))
         return channels[index]
 
-    _SPIN_CHANNEL_ATTRIBUTES = ("_solvers", "_state", "_sector_counts")
+    # The results an MPI rank keeps of its last solves are per channel too.
+    _SPIN_CHANNEL_ATTRIBUTES = (
+        "_solvers",
+        "_state",
+        "_sector_counts",
+        "_mpi_latest_results",
+        "_mpi_retained_results",
+    )
 
     def _activate_spin_channel(self, index: int) -> None:
         """Put the sector solvers, state and counts of channel ``index`` in place."""
@@ -896,9 +934,16 @@ class CuPySymmetrySCFEigensolver:
         ``selections`` holds per channel what :meth:`projector_force_terms`
         takes (sectors and sector columns of the selected states, and their
         occupations with the weight of one channel, half the electrons of a
-        state).  The projector gradients are built once for both.
+        state).  The projector gradients are built once for both.  On several
+        MPI ranks every rank sums those of its sectors and the root adds them.
         """
 
+        context = getattr(self, "mpi_context", None)
+        if context is not None:
+            return context.execute(self, "spin_forces", tuple(selections))
+        return self._spin_projector_force_terms_local(selections)
+
+    def _spin_projector_force_terms_local(self, selections) -> np.ndarray:
         gradients = self._force_gradients_now()
         total = None
         for index, (representations, columns, occupations) in enumerate(selections):
@@ -1309,6 +1354,8 @@ class CuPySymmetrySCFEigensolver:
 
         from .distributed_filter import replace_operator_projectors
 
+        if not self._owned_representations:
+            return  # (a rank of a hybrid's MPI run without sectors)
         reduced = self.decomposition.reduce_nonlocal_operators(
             nonlocal_operator, self._owned_representations
         )
@@ -1471,6 +1518,9 @@ class CuPySymmetrySCFEigensolver:
         started = perf_counter()
         gradients = provider()
         built = perf_counter()
+        if not self._owned_representations:
+            # A rank of a hybrid's MPI run without sectors adds no terms.
+            return len(gradients.labels), {}, {"gradients": built - started, "reduction": 0.0}
         reduced = [
             self.decomposition.reduce_nonlocal_operators(
                 SimpleNamespace(
@@ -2656,6 +2706,11 @@ class CuPySymmetrySCFEigensolver:
             wedge_size=self.decomposition.wedge_size,
             remote_sectors=(getattr(self, "mpi_context", None) is not None
                             and self.mpi_context.size > 1),
+            spin_channel=(
+                int(self._active_spin_channel)
+                if getattr(self, "_spin_channels", None) is not None
+                else None
+            ),
         )
 
     def __call__(

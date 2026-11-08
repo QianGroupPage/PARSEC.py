@@ -17,6 +17,10 @@
 # nodes with --rank-per-gpu, which starts one rank per GPU; the ranks then
 # share the orbitals of that sector (src/parsec_python/acceleration/
 # Eigensolvers/mpi_shared_basis.py). See src/parsec_python/FORCES_AND_RELAXATION.md.
+# A hybrid functional (Correlation_Type pbe0, hse06, ...) runs on either
+# layout: every sector on one GPU of its rank and the pair densities of its
+# exchange on all GPUs of all ranks; a structure without symmetry then needs
+# no --rank-per-gpu (see "Hybrid functionals on several nodes" in MULTI_GPU.md).
 #
 # Call the script by its path in the checkout, from a batch script or from the
 # shell of an interactive allocation, after loading the MPI and CUDA modules
@@ -149,7 +153,8 @@ export PARSEC_CUPY_STAGE_TIMING="${PARSEC_CUPY_STAGE_TIMING:-1}"
 
 # Cray MPICH: the network interface nearest to the GPUs (other MPI libraries
 # ignore the variable). The runner itself switches MPICH_GPU_SUPPORT_ENABLED
-# off where its ranks exchange host arrays only, and on for --rank-per-gpu.
+# off where its ranks exchange host arrays only, and on for --rank-per-gpu and
+# for a hybrid functional (PARSEC_MPI_EXCHANGE_TRANSPORT=host keeps it off).
 export MPICH_OFI_NIC_POLICY="${MPICH_OFI_NIC_POLICY:-GPU}"
 
 devices=0

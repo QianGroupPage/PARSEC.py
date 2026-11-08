@@ -830,6 +830,26 @@ def accelerated_xc_evaluators(
     # shifts its potentials; the device evaluators get the same shift.
     shift = getattr(reference, "_zero_average", None)
     zero_average = callable(shift) and shift(None) is True
+    from parsec_python.V_xc.libxc import is_libxc_functional
+
+    if is_libxc_functional(functional):
+        # A libxc LDA/GGA on the device where libxc is a CUDA build (device_libxc.py);
+        # the host evaluates it otherwise, and PARSEC_CUPY_XC=off keeps it there.
+        if device_xc_mode() == "off" or getattr(scf, "is_hybrid", False):
+            return None, None
+        from .device_libxc import libxc_xc_evaluators
+
+        unpolarized, spin_evaluator = libxc_xc_evaluators(
+            reference,
+            spec=functional,
+            reducer=reducer,
+            device_id=device_id,
+            core_density=keywords["core_density"],
+        )
+        if zero_average:
+            unpolarized = None if unpolarized is None else ZeroAverageXC(unpolarized)
+            spin_evaluator = None if spin_evaluator is None else ZeroAverageXC(spin_evaluator)
+        return unpolarized, spin_evaluator
     if spin:
         # The loop of two channels evaluates the spin functional only; on the
         # orbits where the channels are solved in the symmetry sectors.

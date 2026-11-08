@@ -131,6 +131,8 @@ class _SolveWorker:
         self.converter = plan.converter(index) if plan is not None else None
         self.device_solver = self.converter is not None and _device_solver_requested()
         self._spill: bool | None = None
+        # export_states hands the device subspaces as they are (the SCF loops of a hybrid's Fock loop)
+        self.device_states = False
 
     def _tick(self, name: str, start: float) -> None:
         """Add the seconds since ``start`` to the worker's ``worker_<name>_seconds`` counter."""
@@ -174,6 +176,17 @@ class _SolveWorker:
         self.vectors.pop(task, None)  # release the previous basis before the next one is made
         if state is not None and isinstance(state.vectors, np.ndarray) and backend.xp is not np:
             state.vectors = backend.asarray(state.vectors)  # a spilled subspace comes back
+        elif (
+            state is not None
+            and backend.xp is not np
+            and isinstance(state.vectors, backend.xp.ndarray)
+            and int(state.vectors.device.id) != int(backend.device_id)
+        ):
+            # a subspace kept on another device (a pool of another layout): copied here
+            source = backend.xp.ascontiguousarray(state.vectors)
+            copy = backend.xp.empty(source.shape, dtype=source.dtype)
+            copy.data.copy_from_device(source.data, source.nbytes)
+            state.vectors = copy
         if state is None and settings.initial_method == "chebdav" and _first_solve_on_host():
             # CHEBDAV (the first solve of Eigensolver: chebdav) runs on the host with the device
             # filter; its subspace then continues on the device.
@@ -285,13 +298,32 @@ class _SolveWorker:
                     total[name] = np.array(value, copy=True)
         yield None, total
 
+    def keep_device_states(self):
+        """Hand the device subspaces as they are from now on (no host copy in :meth:`export_states`)."""
+        self.device_states = True
+        yield None, None
+
+    def device_vectors_of(self, task: int):
+        """The final eigenvectors of ``task`` where they are (a device array, or a spilled host one)."""
+        if task in self.vectors:
+            yield task, self.vectors[task]
+
+    def device_of(self):
+        """``(task, device id)`` of every task of a device worker (none on the CPU)."""
+        if self.converter is not None and self.converter.backend.name == "cupy":
+            for task in self.tasks:
+                yield task, int(self.converter.backend.device_id)
+
     def export_states(self):
-        """``(task, state)`` of every task with a state, its subspace on the host."""
+        """``(task, state)`` of every task with a state, its subspace on the host (or kept on the device)."""
         for task in self.tasks:
             state = self.states.get(task)
             if state is None:
                 continue
             vectors = getattr(state, "vectors", None)
+            if self.device_states:
+                yield task, replace(state)
+                continue
             if vectors is not None and not isinstance(vectors, np.ndarray):  # the subspace of a device
                 self.converter.backend.use()
                 state = replace(state, vectors=self._to_host(vectors))
@@ -394,6 +426,24 @@ class PooledKPointSolver:
         for _, vectors in self.pool.results("vectors_of", task):
             return vectors
         raise KeyError(task)
+
+    def device_vectors(self, task: int):
+        """The final eigenvectors of one task where its worker keeps them: a device array (a view of
+        the task's Ritz subspace, which its next solve overwrites), or a host array where spilled."""
+        for _, vectors in self.pool.results("device_vectors_of", task):
+            return vectors
+        raise KeyError(task)
+
+    def keep_states_on_devices(self) -> None:
+        """Let :meth:`export_states` hand the device subspaces as they are, without host copies (the SCF
+        loops of a hybrid's Fock loop, whose next loop runs on the same devices)."""
+        if not getattr(self, "_device_states", False):
+            self.pool.results("keep_device_states")
+            self._device_states = True
+
+    def task_devices(self) -> dict[int, int]:
+        """The CUDA device of every task (empty on the CPU)."""
+        return dict(self.pool.results("device_of"))
 
     def stats(self) -> dict[str, float]:
         """Eigensolver counters and seconds summed over the workers (device route)."""

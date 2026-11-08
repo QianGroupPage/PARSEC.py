@@ -75,6 +75,12 @@ from .SCF.kpoint_parallel import install as _install_kpoint_parallelism  # noqa:
 
 _install_kpoint_parallelism()
 
+# The Fock loop of a periodic hybrid with k-points runs its exchange on the
+# devices of the k-point pool (SCF/hybrid_periodic.py) when that pool does.
+from .SCF.hybrid_periodic import install as _install_device_bloch_exchange  # noqa: E402
+
+_install_device_bloch_exchange()
+
 # Preparing a periodic cell scans the whole grid for every atom image unless the fast
 # replacements are installed.
 from .V_ion.periodic_setup import install as _install_periodic_setup  # noqa: E402

@@ -187,7 +187,8 @@ DEFAULT_GLOBAL_KEYS = frozenset(
 #: Labels of PARSEC 1.5 that the merged parser reads and whose effect is the same under both sets of routines, so
 #: that they decide nothing (the parity round of 2026-11-04, input layer): keywords that only tune 1.5's MPI
 #: layout, ScaLAPACK, ELPA, HDF5, space-filling curves, spectrum slicing, threads or its internal tests (no effect
-#: here); ``Use_LibXC``/``Func_Id_*`` (refused when libxc is asked for, ignored otherwise, as 1.5 does);
+#: here); ``Use_LibXC``/``Func_Id_*``/``LibXC_Functional``/``LibXC_Enforce_FHC`` (libxc's functionals: the XC
+#: evaluation both sets share, ``V_xc.selection``);
 #: ``Pseudopot_File`` (the parser resolves the file for both); the Poisson CG controls (``HartreeSettings``, read by
 #: the solvers both sets share); the output switches ``Generate_Complete_Parsec_In``, ``Output_Ascii_Data`` and
 #: ``Print_Unconverged_Density``.  The renamed ``Mol_RNG_Seed`` is read as ``RNG_Seed`` before the choice.
@@ -226,6 +227,10 @@ NEUTRAL_KEYS = frozenset(
         "use_libxc",
         "func_id_x",
         "func_id_c",
+        "libxc_functional",
+        "libxc_enforce_fhc",
+        "libxc_density_threshold",
+        "libxc_tau_threshold",
         "pseudopot_file",
         "hartree_cg_tolerance",
         "hartree_cg_criterion",
@@ -258,6 +263,21 @@ NEUTRAL_KEYS = frozenset(
         "afm_scan_heights",
         "afm_scan_height_step",
         "afm_scan_line_range",
+        # The keywords of a self-consistent hybrid functional (parsec_input._HYBRID_KEYS): the Fock loop of
+        # SCF/hybrid.py and SCF/hybrid_periodic.py reads them the same way under both sets (since 2026-11-07,
+        # when periodic cells took hybrids).
+        "exact_exchange_fraction",
+        "screening_parameter",
+        "exx_max_iter",
+        "exx_tolerance",
+        "exx_batch_size",
+        "exx_pair_solver",
+        "exx_inner_criterion",
+        "exx_mixer_history",
+        "exx_outer_mixing",
+        "exx_divergence",
+        "exx_slab_coulomb",
+        "exx_auxiliary_exponent",
     }
     # The eigensolver, SCF-control and start-vector labels of PARSEC 1.5 and the
     # extensions of its round (parsec_python.Input.solver_options): options of

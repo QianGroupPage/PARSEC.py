@@ -281,6 +281,13 @@ def embedding_force_fields(system, result) -> tuple[np.ndarray, np.ndarray, bool
 
     field = getattr(system, "embedding", None)
     if field is None:
+        # A meta-GGA in the orbital form of the density gradient: its local
+        # potential is de/dn alone; the core term reads dE/dn_core, which
+        # holds the divergence of W through the core density's gradient.
+        record = getattr(result, "meta_gga", None)
+        core = None if record is None else getattr(record, "core_potential", None)
+        if core is not None:
+            return result.density, np.asarray(core, dtype=np.float64), False
         return result.density, result.xc_potential, False
     nonadditive = getattr(result, "embedding", None)
     if nonadditive is None:

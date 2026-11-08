@@ -253,6 +253,9 @@ def energy_correction_lines(energies, *, dispersion: bool = False) -> list[str]:
     hubbard = float(getattr(energies, "hubbard", 0.0))
     if hubbard != 0.0:
         lines.append(f"   LDA+U Energy                  = {hubbard:20.8f} [Ry]")
+    if hasattr(energies, "integral_vtau_tau"):
+        # A meta-GGA: the band-energy part of -div(vtau grad), which the total removes.
+        lines.append(f"   Integral_{{2 vtau*tau}}         = {energies.integral_vtau_tau:20.8f} [Ry]")
     return lines
 
 

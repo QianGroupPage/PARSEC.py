@@ -1510,7 +1510,7 @@ def _round_rule_general(cell, settings, tolerance: float = 1.0e-6) -> bool:
     return not np.allclose(steps, steps[0], rtol=tolerance)
 
 
-def _correlation_lines(scf) -> list[str]:
+def _correlation_lines(scf, periodic: bool = False) -> list[str]:
     """The functional lines under "Correlation data" (usrinputfile.F90:2330-2361).
 
     CA and PBE keep the lines this report has always had (PBE is named
@@ -1524,7 +1524,21 @@ def _correlation_lines(scf) -> list[str]:
     if getattr(scf, "is_hybrid", False):
         from .hybrid_output import hybrid_correlation_lines
 
-        return hybrid_correlation_lines(scf)
+        return hybrid_correlation_lines(scf, periodic=periodic) if periodic else hybrid_correlation_lines(scf)
+    if getattr(scf, "is_libxc", False):
+        from ..V_xc.libxc import libxc_citation_lines
+
+        lines = [f" Exchange-Correlation functional is {functional}", *libxc_citation_lines(functional)]
+        if getattr(scf, "is_meta_gga", False):
+            from ..V_xc.meta_gga import meta_gga_lines
+
+            # tau and the form of the density gradient (the lines of the native SCAN after its name).
+            lines += meta_gga_lines(scf)[2:]
+        return lines
+    if getattr(scf, "is_meta_gga", False):
+        from ..V_xc.meta_gga import meta_gga_lines
+
+        return meta_gga_lines(scf)
     if functional == "ca":
         return [
             " Exchange-Correlation functional is ca",
@@ -1920,7 +1934,7 @@ class ParsecTextReporter:
             "",
             " Correlation data:",
             " -----------------",
-            *_correlation_lines(scf),
+            *_correlation_lines(scf, periodic=self.problem.periodic_cell is not None),
             # Only where Energy_Refinement asks for it.
             *(
                 ()

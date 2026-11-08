@@ -542,6 +542,21 @@ class SpinSectorReducer:
         half = self._pair.size // 2
         return [self.reducer.field(values[:half].copy()), self.reducer.field(values[half:].copy())]
 
+    @property
+    def weights(self) -> np.ndarray:
+        return self.reducer.weights
+
+    def join_blocks(self, fields) -> np.ndarray:
+        """Several orbit fields end to end (a meta-GGA's ``V_up, V_down, vtau_up, vtau_down``)."""
+
+        return self.reducer.join_blocks(fields)
+
+    def split_blocks(self, values, count: int) -> list:
+        return self.reducer.split_blocks(values, count)
+
+    def block_mixer(self, settings, count: int):
+        return self.reducer.block_mixer(settings, count)
+
     def spin_mixer(self, settings):
         """The mixer of ``settings.method`` for joined channel vectors (:meth:`join_channels`)."""
 

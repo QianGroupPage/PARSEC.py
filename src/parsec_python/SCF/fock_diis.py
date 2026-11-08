@@ -133,10 +133,44 @@ def to_host(array) -> np.ndarray:
 
 @dataclass
 class OccupiedBlock:
-    """Copies of the occupied orbitals of one channel in one sector (``rows x n``) and their occupations."""
+    """Copies of the occupied orbitals of one channel in one sector (``rows x n``) and their occupations.
+
+    The window reaches the orbitals only through :meth:`overlap` and
+    :meth:`combine`.  A block whose orbitals lie elsewhere (another MPI rank,
+    complex Bloch orbitals) is a subclass that overrides both.
+    """
 
     vectors: object
     occupations: np.ndarray
+
+    def overlap(self, other: "OccupiedBlock") -> np.ndarray:
+        """``Y_self^T Y_other`` on the host (``n_self x n_other``), formed where ``self`` lies."""
+
+        with _Place(self.vectors):
+            xp = array_module(self.vectors)
+            second = other.vectors
+            if array_module(second) is not xp or (
+                xp is not np and int(second.device.id) != int(self.vectors.device.id)
+            ):
+                second = xp.asarray(to_host(second)) if xp is not np else to_host(second)
+            return to_host(self.vectors.T @ second)
+
+    @classmethod
+    def combine(cls, terms) -> object:
+        """``Phi = sum_k Y_k C_k`` of ``terms = [(block_k, C_k), ...]`` (``C_k`` host, ``n_k x m``).
+
+        Formed where each block lies and added where the first one lies.
+        Called on the class of the first block.
+        """
+
+        phi = None
+        for block, part in terms:
+            stored = block.vectors
+            with _Place(stored):
+                xp = array_module(stored)
+                term = stored @ xp.asarray(part)
+                phi = term if phi is None else phi + _same_place(term, phi)
+        return phi
 
 
 @dataclass
@@ -161,14 +195,7 @@ def _overlaps(left: OutputSet, right: OutputSet) -> list:
             other = right_channel.get(key)
             if other is None:
                 continue
-            with _Place(block.vectors):
-                xp = array_module(block.vectors)
-                second = other.vectors
-                if array_module(second) is not xp or (
-                    xp is not np and int(second.device.id) != int(block.vectors.device.id)
-                ):
-                    second = xp.asarray(to_host(second)) if xp is not np else to_host(second)
-                blocks[key] = to_host(block.vectors.T @ second)
+            blocks[key] = block.overlap(other)
         products.append(blocks)
     return products
 
@@ -177,8 +204,13 @@ def _trace(left: OutputSet, right: OutputSet, products) -> float:
     total = 0.0
     for left_channel, right_channel, blocks in zip(left.channels, right.channels, products):
         for key, product in blocks.items():
-            weighted = left_channel[key].occupations[:, None] * (product * product) * right_channel[key].occupations[None, :]
-            total += float(weighted.sum())
+            # |(Psi_a^G)^H Psi_b^G|^2 (complex Bloch blocks: the squared modulus)
+            square = product * product if not np.iscomplexobj(product) else (product * product.conj()).real
+            weighted = left_channel[key].occupations[:, None] * square * right_channel[key].occupations[None, :]
+            # a block that stands for several points of a k-point mesh (Bloch blocks: 2 for a time-reversal pair,
+            # 1 for a self-partner point) counts that many times; sector blocks have no weight (1)
+            share = getattr(left_channel[key], "weight", None)
+            total += float(weighted.sum()) if share is None else float(share) * float(weighted.sum())
     return total
 
 
@@ -408,24 +440,26 @@ class OuterDIIS:
                 sizes = [entry.channels[channel][key].occupations.size for entry, _ in members]
                 offsets = np.concatenate([[0], np.cumsum(sizes)])
                 count = int(offsets[-1])
-                overlap = np.zeros((count, count))
+                # Bloch blocks (complex) have Hermitian overlaps; real blocks keep the real algebra.
+                hermitian = any(np.iscomplexobj(entry.channels[channel][key].vectors) for entry, _ in members)
+                overlap = np.zeros((count, count), dtype=np.complex128 if hermitian else np.float64)
                 for i, (left, _) in enumerate(members):
                     for j, (right, _) in enumerate(members):
                         pair = self.products.get((left.step, right.step))
                         if pair is not None:
                             block = pair[channel][key]
                         else:
-                            block = self.products[(right.step, left.step)][channel][key].T
+                            block = self.products[(right.step, left.step)][channel][key].conj().T
                         overlap[offsets[i] : offsets[i + 1], offsets[j] : offsets[j + 1]] = block
-                overlap = 0.5 * (overlap + overlap.T)
+                overlap = 0.5 * (overlap + overlap.conj().T)
                 weights = np.concatenate(
                     [value * entry.channels[channel][key].occupations for entry, value in members]
                 )
                 values, vectors = np.linalg.eigh(overlap)
                 keep = values > OVERLAP_CUTOFF * max(float(values.max(initial=0.0)), 0.0)
                 basis = vectors[:, keep] / np.sqrt(values[keep])
-                projected = basis.T @ overlap @ (weights[:, None] * (overlap @ basis))
-                projected = 0.5 * (projected + projected.T)
+                projected = basis.conj().T @ overlap @ (weights[:, None] * (overlap @ basis))
+                projected = 0.5 * (projected + projected.conj().T)
                 occupations, rotation = np.linalg.eigh(projected)
                 order = np.argsort(occupations)[::-1]
                 wanted = int(occupied_counts[channel].get(key, 0))
@@ -438,14 +472,11 @@ class OuterDIIS:
                 natural = np.clip(natural, 0.0, 1.0)
                 kept_sum += float(natural.sum())
                 combination = basis @ rotation[:, chosen]
-                phi = None
-                for i, (entry, _) in enumerate(members):
-                    part = combination[offsets[i] : offsets[i + 1]]
-                    stored = entry.channels[channel][key].vectors
-                    with _Place(stored):
-                        xp = array_module(stored)
-                        term = stored @ xp.asarray(part)
-                        phi = term if phi is None else phi + _same_place(term, phi)
+                terms = [
+                    (entry.channels[channel][key], combination[offsets[i] : offsets[i + 1]])
+                    for i, (entry, _) in enumerate(members)
+                ]
+                phi = type(terms[0][0]).combine(terms)
                 blocks[key] = [phi, natural]
             if dropped > DROPPED_LIMIT:
                 self.last_note = f"natural occupations beyond the occupied states ({dropped:.1E}): plain step"

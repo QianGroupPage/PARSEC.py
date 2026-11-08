@@ -179,6 +179,119 @@ forces and 0.26 s of rebuilding on 16 GPUs. The comparisons with Fortran
 PARSEC and the other measurements are in
 [FORCES_AND_RELAXATION.md](../FORCES_AND_RELAXATION.md).
 
+### Hybrid functionals on several nodes
+
+The same runner and launch script run a self-consistent hybrid functional
+(`../README.md`, "Self-consistent hybrid functionals"), unpolarized or
+spin-polarized in the symmetry sectors, single points, forces, relaxations
+and molecular dynamics (`SCF/hybrid_mpi.py`). The root runs the Fock loop of
+one process; every piece of it that touches orbitals is a command `exx_*`
+that all ranks execute together, and the root alone decides (stop rule,
+adaptive inner criterion, outer DIIS) from scalars the ranks hand it, so a
+run on several nodes takes the decisions of one node.
+
+- Every sector basis lies on one device of its rank (the exchange term is not
+  held by a basis that several devices share), and every GPU of every rank
+  solves pair densities. A rank may own no sector: with more ranks than
+  sectors, and in a run without point group (molecular dynamics, `manual`
+  relaxations), where the sector of the identity lies on the first GPU of
+  the root and the other ranks, one per node or one per GPU
+  (`--rank-per-gpu`), solve the pair densities of its exchange.
+- Every rank keeps the sector orbitals of its last solve. For a build of
+  `W = V_x Psi` each owner broadcasts the occupied columns of its sectors
+  (and the empty ones for a build of all columns), and every rank holds them
+  as a replica on its least loaded device. The tiles of the build are those
+  of one process (blocks of `Exx_Batch_Size` columns, each pair once),
+  assigned to the GPUs of all ranks, the most expensive first, each to the
+  least loaded GPU; a rank solves its tiles with the kernels of one process
+  (reflection-parity classes) and sends the parts of `W` of the other ranks'
+  sectors to their owners, which add them in rank order. `M = -Psi^T W`,
+  its Cholesky factor and `xi_G` are formed on the owner of each sector,
+  where `xi_G` stays in the sector operator; `E_x` and the band energies of
+  the operator are sums over the owners' sectors that the root adds in the
+  order of one process. The window of the outer DIIS keeps its copies on the
+  owners; only its small matrices come to the root.
+- Orbitals travel as device arrays where Cray MPICH takes them: the runner
+  sets `MPICH_GPU_SUPPORT_ENABLED=1` before `MPI_Init` for an input with a
+  hybrid `Correlation_Type`; `PARSEC_MPI_EXCHANGE_TRANSPORT=host` stages
+  them through the host instead (`auto`, the default, follows the variable).
+  Messages are columns of at most `PARSEC_MPI_EXCHANGE_CHUNK_BYTES` (256
+  MiB). Measured between two A100 nodes: broadcasts 10.6-11.7 GB/s and owner
+  sums 7.3-14.7 GB/s received per rank with device arrays, 5.7 and 1.0 GB/s
+  staged (`benchmarks/exchange_transport.py`).
+- A spin-polarized run, hybrid or semilocal, divides the sectors of both
+  channels: every command names its channel, and a rank keeps a subspace of
+  each channel in each of its sectors. A run that the symmetry guard sends to
+  the full grid is prepared again and finished in the process of the root, on
+  the GPUs of its node, while the other ranks wait (every rank first lets the
+  exchange of the sectors go); spin channels on the full grid are otherwise
+  refused on several ranks. Single points only: the forces, relaxations and
+  molecular dynamics of a spin-polarized run are refused on several ranks
+  (the force terms of both channels summed over the ranks are not validated
+  yet). Measured on 2 nodes against one rank: O2 PBE dE -2.8e-14 Ry, O2 PBE0
+  -3.3e-13, O2 Hartree-Fock 1.4e-14, each with the iterations of one node.
+- Each rank counts what a build holds on its devices (its sectors' `W`, the
+  new replicas of the other ranks' orbitals with the columns they had, its
+  parts of their `W`, two chunks of a message of its sectors (columns it
+  broadcasts, sums of `W` it receives), the tile work; `xi`, the expansions
+  and the plans in the memory rules of its sectors) and makes these arrays
+  before any tile or broadcast runs: a build that does not fit is refused
+  with the numbers of the rank, on every rank, and the outer DIIS takes such
+  a refusal as on one node. A failure on one rank inside an exchange command
+  is raised on every rank before the next collective call; after a refusal
+  for memory no rank keeps what the command made.
+- `timing.json` holds under `per_rank[].exchange` the seconds of every
+  command and phase of the exchange (replicas, tiles, sums to the owners),
+  the bytes moved and the pair solves of each rank.
+
+Measured on A100 nodes of four GPUs (2026-11-07, first runs, one rank per
+node), PBE0 of the inputs of `examples/0d_nanodiamonds/fortran_comparison`
+with the PBE potentials of `examples/0d_hybrid_functionals` (D2, four
+sectors), against the runner with one rank on one node, which takes the path
+of `main.py` (1.9e-10 Ry from it for C185H124). Exchange tiles are the wall
+seconds of the pair solves of all ACE builds, the broadcasts included; the
+broadcasts and the sums to the owners are their own wall seconds; peak is the
+largest device of any rank.
+
+| system | GPUs | program [s] | SCF [s] | exchange tiles [s] | broadcasts, sums [s] | peak [GiB] | E - E(4 GPUs) [Ry] |
+|---|---|---|---|---|---|---|---|
+| C185H124 | 4 | 33.9 | 29.8 | 15.3 | - | 5.7 | |
+| | 8 | 27.8 | 23.3 | 8.4 | 0.43, 0.33 | 6.9 | -3.0e-11 |
+| | 16 | 20.1 | 16.8 | 6.3 | 0.99, 0.44 | 8.9 | -1.3e-10 |
+| C459H204 | 4 | 242.8 | 233.0 | 186.0 | - | 11.4 | |
+| | 8 | 146.6 | 137.4 | 97.0 | 2.3, 1.3 | 17.5 | -1.3e-9 |
+| | 16 | 97.1 | 88.5 | 52.7 | 3.7, 2.5 | 17.0 | -1.2e-9 |
+| C795H300 | 4 | 715.4 | 699.8 | 597.0 | - | 21.5 | |
+| | 8 | 413.9 | 399.3 | 313.6 | 4.2, 2.6 | 31.4 | -1.5e-10 |
+| | 16 | 251.1 | 236.4 | 157.1 | 7.4, 4.9 | 32.2 | -4.6e-10 |
+
+The rows of 8 GPUs of C459H204 are those of the code as it stands; the other
+rows of 8 and 16 GPUs ran the version before, which solved a rank's tiles of
+its own sectors and those of the others in two passes (the C459H204 tiles on
+8 GPUs took 108.5 s that way). Every run took the SCF and outer iterations of
+one node (24, 46, 54 SCF iterations); `E_x` agrees within 3e-11 Ry, the total
+energies within the noise of an inner SCF that stops at 2e-4 Ry (2e-9 Ry
+between 1 and 4 GPUs of one node for C459H204). The exchange scales nearly
+with the GPUs (3.5x and 3.8x on 4x the GPUs for C459H204 and C795H300); the
+inner SCF does not, since every sector stays on one GPU, and is a third of
+the program on 16 GPUs. The broadcasts and sums are 2-12 % of the tiles
+of C459H204 and C795H300 (23 % for C185H124 on 16 GPUs);
+the overlap of the broadcasts with the tiles (`PARSEC_MPI_EXCHANGE_OVERLAP`)
+gains about 1 % (C459H204 on 8 GPUs: 146.6 s, 147.3 s without). Each rank
+holds replicas of the other ranks' occupied orbitals during a build, so the
+peak grows with the node count (C795H300: 21.5, 31.4, 32.2 GiB).
+
+The same comparison for the other routes, 2 nodes against one rank:
+C185H124 HSE06 dE -2.9e-11 Ry (SCF 37.9 -> 27.9 s); O2 PBE0 spin-polarized
+(D2h, 8 sectors) dE -3.3e-13, 72 iterations; O2 Hartree-Fock spin-polarized
+and CO Hartree-Fock with two DIIS extrapolations each, dE 1.4e-14 and
+1.8e-13 with the same extrapolations; two BFGS moves of C185H124 PBE0 with
+the forces of every structure, energies within 6.7e-10 Ry, forces within
+1.2e-11 Ry/bohr; three steps of molecular dynamics of H2O PBE0 (one sector,
+the second rank owning none), the trajectory of one node to the last bit;
+an oxygen atom PBE0 whose start sends it to the full grid, `main.py`'s
+result to the last bit.
+
 ## Correctness and memory
 
 Filtering is FP64 unless `PARSEC_CUPY_MIXED_FILTER` asks for the FP32 later
@@ -1161,7 +1274,8 @@ balance of those sectors; the nanodiamond examples have four. The MPI runner
 rank among the sectors it owns, and the devices of a sector share its basis,
 so that four sectors use 8 or 16 GPUs on two or four nodes of four. No sector
 is spread over ranks, and through
-`main.py` an asymmetric system uses one GPU.
+`main.py` an asymmetric system uses one GPU. A hybrid functional puts every
+sector basis on one GPU and its exchange on all GPUs of all ranks (above).
 
 A self-consistent hybrid functional (`../README.md`, "Self-consistent hybrid
 functionals") runs on the GPUs of one process: the compressed exchange
@@ -1171,7 +1285,23 @@ process, so an asymmetric system uses all of them for its exchange while
 its eigensolver stays on one. The exchange's device bytes enter the memory
 rules of the sectors above (states are spilled to the host where they and
 the exchange do not fit), and a build that cannot hold `W = V_x Psi` is
-refused with the numbers. The MPI runner and `--mpi` refuse hybrids.
+refused with the numbers. On several nodes the MPI runner divides the
+sectors among its ranks and the pair densities among all their GPUs
+("Hybrid functionals on several nodes", above); `main.py --mpi` (the
+k-point solver) refuses hybrids. A libxc functional (hybrid or not) and a
+meta-GGA are refused on several ranks; they run in one process on the GPUs
+of one node (`--serial-control` of the runner).
+
+A hybrid of a periodic cell (`README.md`, "Hybrid functionals of periodic
+cells on the device") uses the GPUs of one process in two ways. At the Gamma
+point without spin it is the loop above on the full grid (one eigensolver
+GPU, the pair tiles on all of them). With k-points or spin the k-point pool
+deals the k-points (and spin channels) to one worker per GPU, each keeping its
+k-points' orbitals, `W` and `xi` on its device; the pair tiles of a build go
+to every GPU, each of which holds a copy of the occupied columns of the whole
+mesh (and, for the pairs solved once for both states, their partial `W`), so
+the memory of a GPU grows with the occupied columns of all k-points. Builds
+below 1e9 pair-density points stay on one GPU.
 
 A spin-polarized run in the sectors (`Spin_Symmetry_Sectors: auto`, the
 default; `../README.md`, "Spin channels in the symmetry sectors")

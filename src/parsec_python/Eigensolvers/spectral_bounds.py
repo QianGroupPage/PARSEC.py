@@ -66,6 +66,32 @@ class LanczosBoundResult:
     breakdown: bool
 
 
+def orbital_term_margin(operator: Any) -> float:
+    """A bound of the eigenvalues of a meta-GGA's orbital term held by ``operator`` (Ry; 0 without).
+
+    The term ``-div(vtau grad)`` (and the first-order term of the orbital
+    form) has localized eigenvalues where ``vtau`` has a narrow spike (low
+    density), far above the rest of the spectrum; a short Lanczos run from a
+    random vector does not see them and the Chebyshev filter would amplify
+    them.  The bounds add Gershgorin's bound of the term
+    (``spectral_margin``): ``lambda_max(H_0 + M) <= lambda_max(H_0) + m``.
+    ``PARSEC_META_GGA_FILTER_BOUND``: ``gershgorin`` (default) or ``lanczos``
+    (no margin: the Lanczos bound alone, for a comparison of its cost); the
+    host bounds take ``targeted`` (a device policy,
+    :func:`parsec_python.acceleration.Eigensolvers.spectral_bounds.with_orbital_term`)
+    as ``gershgorin``.
+    """
+
+    import os
+
+    choice = os.environ.get("PARSEC_META_GGA_FILTER_BOUND", "gershgorin").strip().lower()
+    if choice not in ("targeted", "gershgorin", "lanczos"):
+        raise ValueError("PARSEC_META_GGA_FILTER_BOUND must be targeted, gershgorin or lanczos")
+    if choice == "lanczos":
+        return 0.0
+    return float(getattr(operator, "spectral_margin", 0.0) or 0.0)
+
+
 def _square_operator_size(operator: Any) -> int:
     shape = getattr(operator, "shape", None)
     if shape is None or len(shape) != 2 or shape[0] != shape[1]:
@@ -96,7 +122,7 @@ def _random_start(size: int, rng: np.random.Generator) -> np.ndarray:
     return rng.random(size)
 
 
-def lanczos_upper_bound(
+def _lanczos_upper_bound_core(
     operator: Any,
     initial_vector: np.ndarray | None = None,
     steps: int = 5,
@@ -266,7 +292,7 @@ def _start_vector(size: int, initial_vector, rng) -> np.ndarray:
     return vector / norm
 
 
-def lanczos_bound_parsec15(
+def _lanczos_bound_parsec15_core(
     operator: Any,
     initial_vector: np.ndarray | None = None,
     steps: int = 10,
@@ -332,7 +358,7 @@ def lanczos_bound_parsec15(
     )
 
 
-def lanczos_bound_full_orthogonalization(
+def _lanczos_bound_full_orthogonalization_core(
     operator: Any,
     initial_vector: np.ndarray | None = None,
     steps: int = 10,
@@ -404,6 +430,67 @@ def lanczos_bound_full_orthogonalization(
         requested_steps=requested_steps,
         breakdown=final_steps < target_steps,
     )
+
+
+def _with_orbital_term(core, operator, initial_vector, steps, rng) -> LanczosBoundResult:
+    """The bound of ``core`` on ``operator``, with a meta-GGA's orbital term taken in.
+
+    ``max(lanczos, bare + m)``: ``bare`` the same Lanczos bound of the
+    operator without the term (``without_orbital_term``), ``m`` the term's
+    Gershgorin bound (:func:`orbital_term_margin`), as the device bounds
+    (:func:`parsec_python.acceleration.Eigensolvers.spectral_bounds.with_orbital_term`);
+    ``lanczos + m`` for an operator that cannot drop its term.
+    """
+
+    from dataclasses import replace
+
+    bound = core(operator, initial_vector, steps, rng=rng)
+    margin = orbital_term_margin(operator)
+    if margin <= 0.0:
+        return bound
+    strip = getattr(operator, "without_orbital_term", None)
+    if callable(strip):
+        bare = core(strip(), initial_vector, steps, rng=rng).upper_bound
+        upper = max(float(bound.upper_bound), float(bare) + margin)
+    else:
+        upper = float(bound.upper_bound) + margin
+    return replace(bound, upper_bound=float(upper))
+
+
+def lanczos_upper_bound(
+    operator: Any,
+    initial_vector: np.ndarray | None = None,
+    steps: int = 5,
+    *,
+    rng: np.random.Generator | None = None,
+) -> LanczosBoundResult:
+    """PARSEC's short Lanczos bound (:func:`_lanczos_upper_bound_core`) with a meta-GGA's orbital term taken in."""
+
+    return _with_orbital_term(_lanczos_upper_bound_core, operator, initial_vector, steps, rng)
+
+
+def lanczos_bound_parsec15(
+    operator: Any,
+    initial_vector: np.ndarray | None = None,
+    steps: int = 10,
+    *,
+    rng: np.random.Generator | None = None,
+) -> LanczosBoundResult:
+    """PARSEC 1.5's ``lanczos`` bound (:func:`_lanczos_bound_parsec15_core`) with a meta-GGA's orbital term taken in."""
+
+    return _with_orbital_term(_lanczos_bound_parsec15_core, operator, initial_vector, steps, rng)
+
+
+def lanczos_bound_full_orthogonalization(
+    operator: Any,
+    initial_vector: np.ndarray | None = None,
+    steps: int = 10,
+    *,
+    rng: np.random.Generator | None = None,
+) -> LanczosBoundResult:
+    """PARSEC 1.5's ``lanczos_full`` bound (:func:`_lanczos_bound_full_orthogonalization_core`) with the orbital term."""
+
+    return _with_orbital_term(_lanczos_bound_full_orthogonalization_core, operator, initial_vector, steps, rng)
 
 
 def spectral_bound(

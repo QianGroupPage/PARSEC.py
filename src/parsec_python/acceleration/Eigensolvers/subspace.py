@@ -193,6 +193,21 @@ def run_subspace_filter(
             else spectral_bound
         )
     upper_bound = float(bound.upper_bound)
+    if not lower_bound < upper_bound and getattr(operator, "kinetic_term", None) is not None:
+        # Last guard (operators with a meta-GGA's orbital term only; every
+        # other operator keeps the filter's refusal of a crossed interval):
+        # the saved Ritz values reach the new upper bound (an
+        # operator whose spectrum top fell, or a bound that missed part of
+        # it, which the filter then amplified).  The lower end becomes the
+        # largest saved Ritz value below the upper end, and the upper end
+        # rises above the lower one where none is below it.
+        saved = state.eigenvalues
+        saved = np.sort(np.asarray(saved.get() if hasattr(saved, "get") else saved, dtype=np.float64))
+        below = saved[saved < upper_bound]
+        if below.size:
+            lower_bound = float(below[-1])
+        else:
+            upper_bound = float(lower_bound + max(abs(lower_bound), 1.0))
     degree = filter_degree(settings, state, lower_bound, upper_bound)
     blocks = subspace_filter_blocks(
         state.working_states,

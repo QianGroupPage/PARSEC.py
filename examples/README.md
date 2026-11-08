@@ -65,6 +65,8 @@ python src\parsec_python\main.py examples\0d_Si28H36\parsec.in --dry-run
 | `0d_hybrid_functionals` | Self-consistent hybrids (PBE0, HSE06, HSE03, B3LYP, B3LYP5, B3PW91, HF) of H2, H2O, CH4, CO, N2, benzene and triplet O2 on the GPU, compared with Quantum ESPRESSO using the same FHI98PP potentials. | `python src\parsec_python\main.py examples\0d_hybrid_functionals\H2O\pbe0\parsec.in --pp-dir examples\0d_hybrid_functionals --no-archive`; see [`0d_hybrid_functionals/README.md`](0d_hybrid_functionals/README.md). |
 | `ml_initial_density` | Fourteen-molecule SAD/SCDP/ChargE3Net suite with portable predicted densities and CHEBFF/CHEBDAV reference outputs. | See [`ml_initial_density/README.md`](ml_initial_density/README.md). |
 | `3d_Si` | Periodic boundary conditions for bulk silicon with an 8 atom conventional unit cell | `python src\parsec_python\main.py examples\3d_Si\parsec.in --no-archive` |
+| `0d_meta_gga` | PBE pseudopotentials (FHI98PP H, C, N, O; PARSEC-format H, Li) of the meta-GGA checks of molecules (SCAN, r2SCAN, TPSS and the meta-GGA hybrids against Quantum ESPRESSO) and of the meta-GGA unit tests. | `python -m parsec_python.acceleration.benchmarks.meta_gga_check --help`; see [`0d_meta_gga/README.md`](0d_meta_gga/README.md). |
+| `3d_meta_gga` | Meta-GGAs (PBE, SCAN, r2SCAN, TPSS) of bulk Si (fcc, two atoms) on Gamma-centred k-meshes, against Quantum ESPRESSO with the same FHI98PP potential. | `python -m parsec_python.acceleration.benchmarks.meta_gga_periodic_check --functional scan --kmesh 2 --spacing 0.20`; see [`3d_meta_gga/README.md`](3d_meta_gga/README.md). |
 
 `0d_naphthalene/gpu_cpp` is a retained self-contained historical run folder.
 For new calculations, prefer `0d_naphthalene/parsec.in`; the canonical

@@ -83,7 +83,7 @@ python src\parsec_python\reference_main.py calculation\parsec.in --no-archive
 | `Pseudopotential/` | Read Martins-new `POTRE.DAT`, old-format `POTR.DAT`, Martins-Wang `POTRW.DAT` and FHI98PP `FHIPP.DAT`, integrate radial data, reproduce PARSEC splines and Fourier filters. |
 | `V_ion/` | Assemble local ionic fields, KB nonlocal factors, initial atomic density, and ion-ion energy. |
 | `Hartree/` | Construct open-boundary data and solve the finite-difference Poisson equation. |
-| `V_xc/` | Evaluate the functional of `Correlation_Type` (CA/PZ, PW92, X-alpha, Wigner, Hedin-Lundqvist, PBE, PW91, LB94, Casida-Salahub), without or with spin polarization, and their energy terms. |
+| `V_xc/` | Evaluate the functional of `Correlation_Type` (CA/PZ, PW92, X-alpha, Wigner, Hedin-Lundqvist, PBE, PW91, LB94, Casida-Salahub, the meta-GGA SCAN), without or with spin polarization, and their energy terms; the grid layer of the meta-GGAs (`tau`, the orbital term, `meta_gga.py`). |
 | `Hamiltonian/` | Apply the matrix-free Kohn--Sham operator. |
 | `Eigensolvers/` | Readable CHEBFF, CHEBDAV, subspace, filtering, orthogonalization, and Ritz primitives. |
 | `Occupations/` | Determine Fermi occupations and rebuild the density. |
@@ -154,6 +154,14 @@ Currently supported:
   Hedin-Lundqvist (`hl`) LDA, PBE and PW91 (`pw`) GGA, and the LB94 (`lb`)
   and Casida-Salahub (`cs`, with `Ion_Energy_Diff`) potential corrections of
   CA ([V_xc/selection.py](V_xc/selection.py));
+- the functionals of libxc (optional library; LDA, GGA and meta-GGA, their
+  hybrids through the Fock loop; on the GPU with a CUDA build), see
+  [Functionals of libxc](#functionals-of-libxc);
+- meta-GGA functionals of isolated systems and periodic cells (the native
+  SCAN, libxc's meta-GGAs such as r2SCAN and TPSS), unpolarized and
+  spin-polarized, with forces, on the CPU and on the GPUs of one node, and
+  meta-GGA hybrids of isolated systems (libxc's TPSSh, r2SCAN0, SCAN0, ...),
+  see [Meta-GGA functionals](#meta-gga-functionals);
 - collinear spin polarization of isolated systems (`Spin_Polarization: true`)
   with every functional but `xa`, `wi` and `hl`, which have no spin form, see
   [Spin polarization](#spin-polarization);
@@ -248,9 +256,12 @@ Not currently supported as production physics:
   spin-polarized periodic cells with k-points, of spin-polarized periodic cells and spin-orbit or non-collinear inputs on
   the accelerated path (`main.py` hands them to the readable solver), and of periodic cells and non-collinear inputs on
   several nodes (`--mpi`);
-- hybrid functionals of periodic cells and on several nodes (`--mpi`),
-  meta-GGA functionals, and DFT+U beyond PARSEC's LDA+U of the d channel
-  (other channels or forms);
+- hybrid functionals of wires and of periodic cells on several nodes (`--mpi`), Energy_Refinement
+  on several nodes, meta-GGA functionals on several nodes (`--mpi`), meta-GGA hybrids of periodic cells,
+  meta-GGAs with spin-orbit coupling, non-collinear magnetism or `Restart_Run`, libxc functionals with
+  `--mpi` (hybrids included), the TS dispersion correction or an empirical dispersion term of their own
+  (-D, -D3), and DFT+U beyond PARSEC's LDA+U of the d channel (other channels or forms);
+- stress (no stress tensor is computed for any functional);
 - PARSEC restart files other than `relax_restart.dat` and `mdinit.dat`;
 - Ono--Hirose double-grid order greater than one.
 - With `Use_Fortran_Routines: .true.` (and for the inputs that run on those routines by default - slabs, shifted bulk grids, forces of a bulk cell at the
@@ -259,7 +270,6 @@ Not currently supported as production physics:
   `Input/routines.py`), the Fortran-derived routines:
   - forces with the perturbative spin-orbit correction (`SO_PSP` without
     `SO_from_scratch`);
-  - hybrid functionals of periodic cells and meta-GGA functionals;
   - PARSEC restart files other than `relax_restart.dat` and `mdinit.dat`.
 
 Unsupported requested input is rejected rather than silently approximated.
@@ -606,10 +616,11 @@ Correlation_Type: pbe0
 ```
 
 runs a generalized Kohn-Sham SCF with a nonlocal exact-exchange operator for
-an isolated system (`Boundary_Conditions: cluster`, sphere or box domain),
-spin-unpolarized or with collinear spin (`Spin_Polarization: true`, also with
-the occupations of `occup.in`), with forces, structural relaxation and
-molecular dynamics. The functional is
+an isolated system (`Boundary_Conditions: cluster`, sphere or box domain) or a
+periodic cell (`bulk` at the Gamma point or with k-points, `slab`; see
+[Periodic cells](#periodic-cells)), spin-unpolarized or with collinear spin
+(`Spin_Polarization: true`, also with the occupations of `occup.in`), with
+forces, structural relaxation and molecular dynamics. The functional is
 
 ```text
 E_xc = a_x E_x^HF[K] + E_xc^semilocal[n],
@@ -660,8 +671,11 @@ ESPRESSO differ (`HybridFunctional.variants`).
 | `Exx_Inner_Criterion` | `adaptive` | `adaptive`: while the Fock loop is far from converged an inner SCF stops at a share of its first residual (a tenth of the next loop's expected first residual), the two last loops at `Convergence_Criterion` and with every one of the `States_Num` levels converged at their last Hamiltonian, a spin-unpolarized PBE start with integer occupations at `max(Convergence_Criterion, 1e-4 Ry)`; `fixed`: every inner SCF and the start at `Convergence_Criterion` |
 | `Exx_Mixer_History` | `restart` | `restart`: a new mixer per inner loop, as PARSEC starts every SCF loop; `carry`: the inner loops continue one Anderson history (the first secant pairs of each loop carried into the next, the first loop seeded by the PBE start), measured slower with the adaptive criterion (opt-in). The Broyden and multisecant `Mixing_Method`s always restart |
 | `Exx_Outer_Mixing` | `diis` | `diis`: Anderson (Pulay) extrapolation of the density matrix of the outer loop, through natural orbitals, where the loop is slow; `none`: the plain fixed point |
+| `Exx_Divergence` | `auto` | periodic cells: the treatment of the Coulomb singularity at `q + G = 0`, `auto`, `gygi-baldereschi`, `gygi-baldereschi-x` or `none` ([Periodic cells](#periodic-cells)) |
+| `Exx_Auxiliary_Exponent` | the limit `a -> 0` (`10/E_w` for a truncated slab) | periodic cells: the exponent (bohr^2) of the Gygi-Baldereschi auxiliary function, zero or positive |
+| `Exx_Slab_Coulomb` | `padded` | slabs: `padded` (the bulk kernel on the slab box padded to twice its height), `truncated` (the Coulomb kernel cut along z) or `periodic` (the bulk kernel on the slab box itself, as Quantum ESPRESSO's exact exchange) |
 
-The nine keywords without a hybrid `Correlation_Type` are refused.
+The twelve keywords without a hybrid `Correlation_Type` are refused.
 `Convergence_Criterion`, `Max_Iter`, the mixer and the eigensolver settings
 apply to every SCF loop of the Fock loop. `Generate_Complete_Parsec_In`
 writes the Fock-loop keywords with their values (the fraction and omega where
@@ -829,19 +843,130 @@ formed once.
   where the states and the exchange do not fit together. A build whose
   `W = V_x Psi` cannot be held where its sectors are is refused with the
   numbers (use more GPUs, fewer `States_Num` or a smaller `Exx_Batch_Size`).
+- On several nodes the MPI runner (`scripts/run_multi_gpu_scf.sh`, one rank
+  per node) runs the same loop: its ranks divide the symmetry sectors (of
+  both channels of a spin-polarized run), every sector basis on one GPU,
+  and the pair densities of all sectors are solved on every GPU of every
+  rank; the orbitals of the other ranks' sectors reach a rank by broadcasts
+  and the parts of `W` go back to the owner of their sector, as device
+  arrays of Cray MPICH. The decisions of the loop are taken on the root, so
+  the runs of one and of several nodes take the same SCF and outer
+  iterations and agree within the summation round-off of the exchange
+  (`E_x` to 3e-11 Ry; total energies 1e-13 to 1.3e-9 Ry, the larger ones
+  where the inner SCF stops at 2e-4 Ry). Single points, forces, relaxations and molecular dynamics (the
+  sector of the identity on one GPU of the root, its exchange on all GPUs
+  of all ranks) run there, those of a spin-polarized run single points
+  only; see
+  [acceleration/MULTI_GPU.md](acceleration/MULTI_GPU.md#hybrid-functionals-on-several-nodes).
 - `main.py` hands any other hybrid input to the reference solver with a
   NOTE: a CPU backend, or `Exx_Pair_Solver: cg`. `--backend cupy` or
-  `native` and `--device gpu` refuse such an input. Hybrids on several nodes
-  (`--mpi`) are refused: the exchange operator needs every orbital in one
-  process.
+  `native` and `--device gpu` refuse such an input, and so does `main.py
+  --mpi` (the k-point solver, which divides the rows of every orbital).
+
+### Periodic cells
+
+A bulk cell (`Boundary_Conditions: bulk`) at the Gamma point or with a
+Monkhorst-Pack mesh (`Monkhorst_Pack_Grid`, with or without
+`Monkhorst_Pack_Shift`, or a `Kpoint_List` that writes out every point of a
+uniform mesh with equal weights) and a slab (`Boundary_Conditions: slab`, the
+mesh in its plane) run the same Fock loop, on either set of routines
+(`Use_Fortran_Routines`) and on both command lines, with
+[SCF/hybrid_periodic.py](SCF/hybrid_periodic.py) and
+[V_xc/bloch_exchange.py](V_xc/bloch_exchange.py). On the GPUs of one node
+(`main.py` with CuPy) the Gamma point without spin runs on the accelerated
+driver's device loop with a cuFFT pair solver, and k-points (and spin) run
+the loop of the readable solver with its k-point eigenproblems, the pair
+solves, ACE and the exchange term on the GPUs; both give the numbers of the
+host loop to round-off ([acceleration/README.md](acceleration/README.md),
+"Hybrid functionals of periodic cells on the device"):
+
+- **k-points.** The exchange operator sums over the full mesh, so the space
+  group does not reduce it: a hybrid takes the mesh reduced by time reversal
+  only (`qpoints.dat` and the report list those points). The SCF solves the
+  representatives `k` (weight `2/N`, or `1/N` where `-k = k` modulo a
+  reciprocal lattice vector); the factor at `-k` is `conj(u_k)`, exact for the
+  finite-difference Bloch operator (`H_{-k} = conj(H_k)`).
+- **Pair potentials.** For a Bloch factor `u_nk` and an occupied `u_mk'` the
+  pair density `conj(u_mk') u_nk / dV` is the periodic part of a Bloch
+  function of `q = k - k'`; its potential is `w = ifftn(K(q + G) fftn(rho))`
+  on the box of the grid (`Hartree/exchange_kernel.py`: `K` of
+  `alpha/r + beta erfc(omega r)/r`, the CAM coefficients of the functional), and
+  `V_x u_nk = -(1/N) sum_k' sum_m f_mk' u_mk' w`. `E_x = (s/2) sum_k w_k sum_n f_nk <u_nk|V_x u_nk>`.
+  A pair of two occupied states is solved once for both (its mirror has
+  the conjugate potential, or the same one for a time-reversal partner).
+  The batched FFTs use half the CPUs of the process (`PARSEC_FFT_WORKERS` sets
+  the number).
+- **The Coulomb singularity** at `q + G = 0` (`Exx_Divergence`, default
+  `auto`): Gygi-Baldereschi with the extrapolation of Nguyen and de Gironcoli
+  on the `1/r` part of a bulk cell; `gygi-baldereschi` and
+  `gygi-baldereschi-x` are Quantum ESPRESSO's treatments with
+  `x_gamma_extrapolation` false and true (its default), `none` leaves the
+  Coulomb element out. `Exx_Auxiliary_Exponent` (bohr^2) is the exponent of
+  the auxiliary function, by default the limit `a -> 0` (closed-form lattice
+  sums); Quantum ESPRESSO uses `10/ecutwfc` (Ry), which a like-for-like
+  comparison passes. It matters only on coarse meshes. A long-range
+  corrected functional (`lc-wpbe`, CAM-B3LYP) takes the extrapolation on
+  every part of its kernel where the mesh does not resolve omega.
+- **Slabs.** By default (`Exx_Slab_Coulomb: padded`) the pair densities are
+  zero-padded to twice the height of the slab box and solved with the bulk
+  kernel of that box (the Gygi-Baldereschi element with the extrapolation on
+  its `1/r` part): the images along z sit beyond the density and the
+  in-plane mesh converges as fast as in a bulk cell. `truncated` cuts the
+  Coulomb kernel along z on the same padded box (exactly isolated, but its
+  error falls only as `N_k^-1.5` with the in-plane mesh, a cusp at
+  `Q_par = 0` that no element at `q + G = 0` removes); `periodic` keeps the
+  bulk kernel on the unpadded slab box, as Quantum ESPRESSO's exact exchange
+  (its `assume_isolated='2D'` cuts the Hartree, local and Ewald terms only),
+  for comparisons.
+- **The loop.** At the Gamma point without k-point input and without spin the
+  orbitals are real and the cluster loop runs with the FFT pair solver;
+  otherwise (k-points, or spin at the Gamma point as the 1x1x1 mesh) the
+  orbitals are complex Bloch factors and the inner loops are the k-point SCF
+  with `a_x V_ACE` of every k-point (`M = -U^H W = L L^H`, `xi = W L^-H`) in
+  its Bloch Hamiltonian. The stop rule, the adaptive inner criterion and the
+  outer DIIS (one block per k-point) are those of the clusters, with
+  k-averaged energies.
+- **Output.** After the loop `parsec.out` gives the valence band maximum,
+  the conduction band minimum (an occupation above one half counts as
+  occupied) and the gap, direct or indirect with the smallest direct one.
+- **Forces.** Hellmann-Feynman forces of the hybrid orbitals and density; the
+  exchange operator of norm-conserving pseudopotentials adds no explicit term
+  (see [FORCES_AND_RELAXATION.md](FORCES_AND_RELAXATION.md)). Forces,
+  relaxation and dynamics run at the Gamma point (also with spin) and with
+  k-points (spin-unpolarized; with spin on the Fortran-derived routines, as
+  for semilocal functionals). No stress.
+- `Restart_Run` starts the semilocal start loop from the stored potential, as
+  for clusters. `occup.in` (a negative `Fermi_Temp`) is taken at the Gamma
+  point without k-point input and refused with k-points.
+- **Against Quantum ESPRESSO 7.5** with the same FHI98PP pseudopotentials:
+  bulk Si, C, MgO and an 8-atom Si cube with Gamma-centred meshes 1x1x1 to
+  4x4x4, the h-BN monolayer at 3x3x1 and 6x6x1, triplet O2 in a 12-bohr
+  cube at the Gamma point; PBE0, HSE06, HF and B3LYP with each of QE's
+  treatments of the singularity, `Exx_Auxiliary_Exponent = 10/ecutwfc`, the
+  slab with `Exx_Slab_Coulomb: periodic`. `E_hyb - E_PBE` agrees within
+  `4e-5 Ry` for Si, C and Si8 (PBE0 within `8e-6`) and `2.6e-5` for MgO,
+  `a_x E_x` within `6e-5 Ry` (HF), the gaps within 0.7 meV (1.9 meV MgO).
+  HSE06 agrees as well once QE's own artefact is removed: QE skips its
+  short-range PBE exchange at grid points where the density gradient
+  vanishes (atom sites, bond centres), which lowers its HSE energies by up
+  to `3.2e-4 Ry` (O2) unless the atoms are moved off its grid points.
+  h-BN: within `1.3e-4 Ry` (PBE0, HSE06) against QE at 100 Ry, whose own
+  cutoff error is `9.7e-5`; against QE at 160 Ry PBE0 `+2.9e-5` (3x3x1) and
+  `+7e-6` (6x6x1), HSE06 `+6e-6` (6x6x1); HF `2.8e-4`; the bands at K within
+  1 meV. The
+  hybrid-minus-PBE force agrees within `4e-6 Ry/bohr` (Si with a displaced
+  atom, 2x2x2 and 3x3x3), and finite differences of the energy give the
+  analytic PBE0 force to `1.3e-6 Ry/bohr`.
 
 ### What is refused
 
 Each of these is refused by name when the input is read:
 
-- periodic cells (bulk, wire and slab): exact exchange of a periodic system
-  needs a treatment of the Coulomb singularity at `G = 0` that is not
-  implemented;
+- wires (`Boundary_Conditions: wire`); on a periodic cell `Exx_Pair_Solver: cg`
+  (its pair potentials are solved by FFT), a `Kpoint_List` that is not a full
+  uniform mesh written out with equal weights, and `--mpi`; `Exx_Divergence`
+  and `Exx_Auxiliary_Exponent` on an isolated system, `Exx_Slab_Coulomb`
+  outside a slab;
 - spin-orbit coupling (`SO_PSP`, `SO_from_scratch`) and non-collinear
   magnetism: the operator acts on real scalar orbitals;
 - FDET (`Potential_Field`, and so AFM scans) and LDA+U (`ldaplusu_u`,
@@ -899,6 +1024,551 @@ cutoff error for LYP: `1.1e-5 Ry` against QE at 250 Ry), the Fock energies
 `a_x E_x` within `5.9e-5 Ry` and the HOMOs within 1.94 meV (HSE03 against
 a reference derived from QE's HSE and libxc's HSE03, since QE has no HSE03
 of this form). Inputs, references and tables: [`examples/0d_hybrid_functionals`](../../examples/0d_hybrid_functionals/).
+
+## Functionals of libxc
+
+```text
+LibXC_Functional: gga_x_pbe gga_c_pbe
+```
+
+runs the SCF with functionals of [libxc](https://libxc.gitlab.io) (S. Lehtola,
+C. Steigemann, M. J. T. Oliveira, M. A. L. Marques, SoftwareX 7, 1 (2018);
+MPL-2.0), an optional library that the code loads when such a functional is
+asked for ([V_xc/libxc_library.py](V_xc/libxc_library.py), ctypes;
+[V_xc/libxc.py](V_xc/libxc.py)). Every functional of libxc of the LDA and GGA
+families runs where the functionals of this code run (clusters and
+periodic cells, unpolarized and collinear spin, forces, relaxation and
+dynamics, both CLIs), except spin-orbit coupling, non-collinear magnetism,
+FDET, the TS van der Waals correction (PBE of this code only, as 1.5) and
+`--mpi` and the MPI runner of several nodes (`scripts/run_multi_gpu_scf.sh`, hybrids too: not tested
+there), which are refused with a libxc functional; a libxc hybrid runs through the Fock loop of
+[Self-consistent hybrid functionals](#self-consistent-hybrid-functionals) with
+its exact exchange; the meta-GGAs run through the meta-GGA Hamiltonian
+(`V_xc/meta_gga.py`, `SCF/meta_gga.py`: `tau` of the orbitals, `-div(vtau grad)`
+in every Hamiltonian; clusters and periodic cells, see
+[Meta-GGA functionals](#meta-gga-functionals)), the meta-GGA hybrids (TPSSh,
+r2SCAN0, SCAN0, M06-2X, ...) of clusters through the Fock loop with
+meta-GGA inner loops. In GPU runs (`main.py`, CuPy)
+libxc evaluates on the GPU when the library is a CUDA build (libxc >= 7.1).
+
+### Keywords
+
+| keyword | default | meaning |
+|---|---|---|
+| `LibXC_Functional` | - | one or more libxc functionals, by name (`GGA_X_PBE`, `gga_x_pbe`, `XC_GGA_X_PBE`) or number (`101`), separated by blanks, commas or `+`; their energies are added (an exchange and a correlation functional, or one exchange-correlation functional such as `hyb_gga_xc_b3lyp`) |
+| `Use_LibXC`, `Func_Id_X`, `Func_Id_C` | `.false.`, -1, -1 | PARSEC 1.5's keywords: `Use_LibXC: .true.` with the libxc numbers of the exchange and the correlation functional; -1 takes 1.5's defaults (1 = LDA_X; 9 = LDA_C_PZ, 12 = LDA_C_PW with spin), 0 leaves the slot empty. With `.false.` the ids are ignored, as in 1.5. `LibXC_Functional` and `Func_Id_*` together are refused |
+| `LibXC_Enforce_FHC` | by functional | the Fermi-hole-curvature condition of meta-GGAs, `tau_s >= tau_W,s = sigma_ss/(8 n_s)`: `.true.` floors `tau` of each channel at `tau_W` with the exact derivatives (the meta-GGA grid layer); `.false.` evaluates the functional at the `tau` of the orbitals, as Quantum ESPRESSO (which switches off libxc 7's default clamp) and the native SCAN do. Without the keyword: the floor for a functional whose derivatives jump at `tau = tau_W` (libxc clamps `z = tau_W/tau` at 1 inside TPSS-type correlation: TPSS, revTPSS, TPSSh, rSCAN; a probe of the functional finds them), so that all its components see `z <= 1`; none for SCAN, r2SCAN, M06-L, MN15-L, M06-2X and the other smooth ones. libxc's own clamp (`sigma -> 8 n tau`, not carried into the derivatives; NaN in the polarized SCAN and r2SCAN correlation where it leaves a zero total gradient) is not used. No effect on LDA and GGA |
+| `LibXC_Tau_Threshold` | 1e-12 | the absolute floor of the `tau` of each channel of a meta-GGA (Hartree/bohr^3; `tau_minimum` of the meta-GGA grid layer): a point below it keeps the energy of `tau = t`, with `vtau = 0` there, the exact derivative of that energy; below it the binding floors `tau` at 1e-20 (libxc's default threshold) on the host and the device alike. Where every occupied orbital has a zero gradient at a density maximum (the bond centre of Si at Gamma) `tau` and `sigma` are round-off; at libxc's floor `z = tau_W/tau` of TPSS is a ratio of round-off, `vtau` and `vsigma` reach 1e9 to 1e13 and the SCF does not converge, while at `t` `z` goes to 0 with `sigma`. Quantum ESPRESSO drops a point whose `tau` is at most 1e-12: a plane-wave grid point weighs nothing there, a real-space one `h^3` (0.03 Ry of Si at Gamma at h 0.4), so it keeps its energy here |
+| `LibXC_Density_Threshold` | libxc's, per functional | libxc's density threshold of every component (`xc_func_set_dens_threshold`), e/bohr^3: below it a point contributes nothing, and libxc floors each spin density at it |
+
+`Correlation_Type` beside a libxc functional does not select the functional
+(a warning says so), as in 1.5. With `Use_LibXC` and an exchange-correlation
+functional in `Func_Id_X` (`402`, `457`), 1.5's default `Func_Id_C` (LDA_C_PZ,
+LDA_C_PW with spin) is added to it, as 1.5 does, with a warning: give
+`Func_Id_C: 0` (or `LibXC_Functional`) for the functional alone. In the settings of a run the functional is
+`SCFSettings.xc_functional = "libxc:gga_x_pbe+gga_c_pbe"`, with
+`;fhc=on|off`, `;threshold=<t>` and `;tau=<t>` where those keywords are given;
+`Generate_Complete_Parsec_In` writes `LibXC_Functional` back.
+`python -m parsec_python.V_xc.libxc [--list] [names]` prints the library the
+code finds, whether it evaluates on the device, and the functionals with
+their families, CAM coefficients and references; each run prints the
+components, their references and libxc's citation under "Correlation data".
+
+### What the code does with them
+
+- **Variables and units.** libxc returns the energy per particle `zk` and the
+  derivatives of the energy per volume in Hartree, in its spin layout
+  (`rho` and `tau` interleaved per point, `sigma = (uu, ud, dd)`); the
+  evaluator (`LibxcSemilocal`, the `SemilocalXC` interface of
+  [V_xc/semilocal.py](V_xc/semilocal.py)) returns `e = zk (n_u + n_d)` and the
+  derivatives per channel, and the grid functions of every semilocal
+  functional of this code take them over: `sigma = |D n|^2` with the
+  centered stencil of `Expansion_Order`, the potential
+  `v = vrho + D^T (2 vsigma D n)` (spin: `v_a = vrho_a + D^T (2 v_aa D n_a + v_ab D n_b)`),
+  the exact derivative of the discrete energy, in Rydberg, the frozen core
+  density added (half per channel).
+- **First iteration.** LDA and GGA functionals are used from the first
+  iteration. PARSEC 1.5 evaluates the first XC of every libxc run with PBE
+  (101 + 130, `potential/hartree.F90`), which a density functional does not
+  need; a meta-GGA, whose `tau` needs orbitals, starts with PBE as there.
+- **Hybrids.** A libxc hybrid (`hyb_` names) is a
+  [`HybridFunctional`](V_xc/hybrid.py) with libxc's CAM coefficients
+  (`xc_hyb_cam_coef`: `alpha` at long range, `alpha + beta` at short range,
+  `omega` in bohr^-1) and libxc's functional as its semilocal part (libxc's
+  energy of a hybrid is its semilocal part). The Fock loop, its keywords
+  (`Exx_*`), its refusals and its GPU path are those of the hybrids of this
+  code; it starts from a PBE SCF. Periodic cells (bulk and slabs, at the Gamma point and with k-points) run the
+  hybrid GGAs of libxc through the periodic Fock loop: `hyb_gga_xc_pbeh` equals the code's PBE0 to round-off with
+  libxc's PBE digits in the code's PBE (H2 in a 6-bohr box, Gamma and a 2x1x1 mesh,
+  `tests/unit/test_libxc.py`) and lies 5e-8 Ry below it without them (Si, two atoms, Gamma and 2x2x2, one A100), the
+  offset of the two PBEs. PARSEC 1.5 evaluates libxc's hybrid GGAs as
+  plain GGAs without their exact exchange. A meta-GGA hybrid (`hyb_mgga_`)
+  runs the same Fock loop with the meta-GGA loops as inner loops: every
+  Hamiltonian holds `a_x V_ACE` and `-div(vtau grad)`, the energies remove the
+  band energy of both, the mixed `vtau` goes from one inner loop to the next,
+  and the first inner loop starts as every meta-GGA loop starts (the PBE
+  potential of the start density, no orbital term yet); its inner loops
+  restart their mixer (`Exx_Mixer_History: carry` is refused for them). The
+  density gradient follows the meta-GGA's form (`auto`: the orbital form for
+  r2SCAN0, SCAN0, M06-2X, the density form for TPSSh); in the orbital form the
+  inner loops converge as those of a GGA hybrid (NH3 r2SCAN0, h 0.16, one
+  A100: 4 outer iterations of 12-20 inner ones, 88 s, against 3062 s in the
+  density form). An exchange-only hybrid
+  (`hyb_gga_x_s12h`, `hyb_mgga_x_scan0`) beside a correlation functional
+  takes the exact exchange of that one component once: libxc's value of the
+  component already holds its reduced semilocal exchange.
+  `Exact_Exchange_Fraction` and `Screening_Parameter` are refused with a
+  libxc hybrid (libxc's own variants, such as `hyb_gga_xc_pbeh` or
+  `hyb_gga_xc_hse12`, carry other coefficients).
+- **GPU.** `acceleration/V_xc/device_libxc.py` evaluates libxc's CUDA build
+  on the device pointers of the CuPy arrays, on the full grid or once per
+  symmetry orbit in the sectors, with the stencils of the code's device
+  functionals; a library without device support makes the host evaluate
+  libxc (the output names the implementation), and `PARSEC_CUPY_XC=off` keeps
+  every functional on the host.
+- **Pseudopotentials.** A libxc LDA reads CA/LDA files, every other libxc
+  functional PBE files; a file of another label is used with a warning, as
+  `pseudo.f90` warns.
+
+### What is refused
+
+Of the 712 functionals of libxc 7.1.2, 589 run: 61 LDA, 205 GGA and 162
+meta-GGA functionals, and 161 hybrids (4 LDA, 105 GGA, 52 meta-GGA; exact
+exchange with the kernels `1/r`, `erf`, `erfc`, `1/r + erf` or `1/r + erfc`);
+123 are refused: 70 kinetic-energy functionals, 19 of one or two dimensions,
+13 with VV10, 9 fitted with an empirical dispersion term, 6 Yukawa-screened
+hybrids and 6 without an energy or a potential.
+
+When the input is read: a name or number libxc does not have; kinetic-energy
+functionals; functionals with the nonlocal VV10 correlation (wB97M-V,
+B97M-V, ...); functionals fitted together with an empirical dispersion term
+that libxc does not hold (wB97X-D, wB97X-D3, B97-D, SSB-D, oTPSS-D, ...: the
+names ending in `_d`, `_d3`); hybrids with a Yukawa-screened kernel
+(CAMY/LCY); functionals of one or two dimensions; functionals without an
+energy or a potential in libxc (`gga_x_lb`); two hybrid components in one
+functional; meta-GGA hybrids of periodic cells; the TS van der Waals
+correction (`Van_Der_Waals`, PBE of this code only, PARSEC 1.5's error 158);
+spin-orbit coupling, non-collinear magnetism, FDET and `--mpi` together with
+a libxc functional (not tested); without the library, every libxc keyword,
+with how to install it.
+
+### Meta-GGAs and meta-GGA hybrids against Quantum ESPRESSO
+
+The molecules of the meta-GGA references (FHI98PP `NCPPs/PBE` H, C, N, O;
+`Grid_Spacing` 0.16 bohr, `Expansion_Order` 12, sphere 11.14-11.53 bohr;
+Quantum ESPRESSO 7.5 + libxc at 150 Ry, ecutfock 300 Ry, 20 bohr box, its
+hybrids TPSSh and r2SCAN0 stock, SCAN0 from a pw.x that takes libxc's
+exchange-only hybrid once); `E - E_PBE` in mRy, each code against its own
+PBE; the default form of the density gradient (`auto`: density form for TPSS
+and TPSSh, orbital form for the others); one A100, `Exx_Tolerance` 1e-8 Ry,
+`Convergence_Criterion` 1e-6 Ry, `Max_Iter` 200. M06-2X and the O2 TPSSh and
+r2SCAN0 have no Quantum ESPRESSO reference (Quantum ESPRESSO 7.5 aborts on
+M06-2X, and its O2 TPSSh and r2SCAN0 diverge before the exact exchange starts):
+
+| molecule | functional | dE this code (mRy) | dE QE (mRy) | ours - QE (mRy) | a_x E_x - QE (mRy) | inner iterations | s |
+|---|---|---|---|---|---|---|---|
+| H2O | tpssh | -8.113 | -8.186 | +0.073 | +0.005 | [6, 9, 14] | 39.1 |
+| H2O | r2scan0 | +11.265 | +11.303 | -0.038 | +0.014 | [11, 12, 17, 8] | 53.7 |
+| H2O | scan0 | +14.166 | +14.242 | -0.076 | +0.174 | [6, 13, 12, 6] | 52.2 |
+| H2O | m062x | -14.492 | - | - | - | [14, 10, 12, 11, 9, 8] | 58.5 |
+| H2O | r2scan | -2.132 | -2.038 | -0.094 |  |  | 32.1 |
+| H2O | scan | +1.397 | +1.543 | -0.147 |  |  | 37.0 |
+| H2O | tpss | -11.075 | -11.145 | +0.070 |  |  | 30.5 |
+| CH4 | tpssh | -41.476 | -41.426 | -0.050 | -0.003 | [12, 10, 15, 9] | 41.5 |
+| CH4 | r2scan0 | -3.799 | -3.745 | -0.054 | +0.001 | [7, 14, 9, 7] | 53.4 |
+| CH4 | scan0 | -5.614 | -5.488 | -0.126 | +0.019 | [7, 21, 14, 8] | 58.1 |
+| CH4 | m062x | +3.441 | - | - | - | [42, 53, 39, 29, 24, 9] | 124.0 |
+| CH4 | r2scan | -1.511 | -1.422 | -0.088 |  |  | 34.5 |
+| CH4 | scan (not converged) | -4.046 | -3.821 | -0.225 |  |  | 112.7 |
+| CH4 | tpss | -39.429 | -39.357 | -0.072 |  |  | 29.9 |
+| N2 | tpssh | +18.447 | +18.419 | +0.028 | +0.003 | [6, 6, 9] | 26.5 |
+| N2 | r2scan0 | +61.904 | +61.921 | -0.018 | -0.010 | [8, 6, 17, 5] | 34.4 |
+| N2 | scan0 | +64.839 | +65.073 | -0.234 | -0.162 | [5, 10, 16, 11] | 32.0 |
+| N2 | m062x | +19.136 | - | - | - | [5, 8, 11, 11, 10, 4] | 36.8 |
+| N2 | r2scan | +35.224 | +35.240 | -0.016 |  |  | 27.6 |
+| N2 | scan | +38.779 | +39.273 | -0.493 |  |  | 34.9 |
+| N2 | tpss | +8.420 | +8.392 | +0.028 |  |  | 25.0 |
+| CO | tpssh | +9.782 | +9.795 | -0.013 | +0.005 | [6, 9, 9] | 34.0 |
+| CO | r2scan0 | +43.956 | +44.056 | -0.100 | -0.005 | [6, 15, 13, 10, 9] | 46.4 |
+| CO | scan0 | +46.601 | +46.508 | +0.093 | -0.107 | [7, 17, 120, 168, 13] | 137.2 |
+| CO | m062x | +3.032 | - | - | - | [6, 13, 13, 13, 11, 9] | 51.6 |
+| CO | r2scan | +19.591 | +19.736 | -0.145 |  |  | 32.4 |
+| CO | scan (not converged) | +22.765 | +22.822 | -0.057 |  |  | 94.8 |
+| CO | tpss | +1.575 | +1.589 | -0.014 |  |  | 28.3 |
+| NH3 | tpssh | -16.874 | -16.873 | -0.001 | +0.003 | [7, 15, 11] | 50.0 |
+| NH3 | r2scan0 | +11.177 | +11.158 | +0.019 | +0.007 | [12, 20, 16, 16] | 82.8 |
+| NH3 | scan0 | +12.380 | +12.512 | -0.132 | -0.057 | [10, 15, 26, 12] | 85.7 |
+| NH3 | m062x | +3.175 | - | - | - | [7, 11, 13, 14, 11, 6] | 76.7 |
+| NH3 | r2scan | +4.850 | +4.828 | +0.022 |  |  | 64.9 |
+| NH3 | scan (not converged) | +6.216 | +6.491 | -0.275 |  |  | 148.1 |
+| NH3 | tpss | -17.648 | -17.640 | -0.008 |  |  | 39.7 |
+| O2 | tpssh | +17.023 | - | - | - | [7, 12, 10] | 41.9 |
+| O2 | r2scan0 | +55.269 | - | - | - | [7, 9, 11, 9, 7] | 52.6 |
+| O2 | scan0 | +59.848 | +58.758 | +1.090 | +0.066 | [6, 16, 13, 11, 9] | 63.3 |
+| O2 | m062x | +31.271 | - | - | - | [6, 12, 11, 8, 10, 5] | 58.6 |
+| O2 | r2scan | +13.137 | +13.351 | -0.214 |  |  | 36.5 |
+| O2 | scan | +19.193 | +18.074 | +1.119 |  |  | 43.4 |
+| O2 | tpss | +1.759 | +1.681 | +0.079 |  |  | 33.1 |
+
+r2SCAN, TPSS and their hybrids agree within 0.1 mRy (r2SCAN O2 0.2 mRy) and
+the exact exchange within 0.02 mRy; SCAN and SCAN0 within 0.1-0.5 mRy and O2
+1.1 mRy, the grid sensitivity of SCAN (Quantum ESPRESSO's own SCAN
+`E - E_PBE` of O2 moves by 0.7 mRy between 150 and 300 Ry; see
+[Accuracy and grid spacing](#accuracy-and-grid-spacing)). The SCAN runs of
+CH4, CO and NH3 stop at `Max_Iter` 200 with the energy settled (SCAN's
+residual floor, see [Method](#method)).
+
+### libxc's versions of this code's functionals
+
+| this code | libxc | difference |
+|---|---|---|
+| `ca` | `lda_x lda_c_pz` | none: round-off |
+| `pw92` (`pl`) | `lda_x lda_c_pw_mod` | Fortran PARSEC's digits of a few PW92 constants (6th to 9th digit) |
+| `pbe` | `gga_x_pbe gga_c_pbe` | the PW92 `A` of the correlation, `(1 - ln 2)/pi^2 = 0.0310906908` here, `0.0310907` in libxc: 3e-7 of the local correlation (H2 at h = 0.5 bohr: 1e-7 Ry) |
+| `pw91` | `gga_x_pw91 gga_c_pw91` | Fortran PARSEC's digits of a few constants |
+| `b3lyp`, `b3lyp5`, `cam-b3lyp` | `hyb_gga_xc_b3lyp`, `hyb_gga_xc_b3lyp5`, `hyb_gga_xc_cam_b3lyp` | none: round-off |
+| `pbe0` | `hyb_gga_xc_pbeh` | as PBE |
+| `hse06` | `hyb_gga_xc_hse06` | libxc's wPBEh hole and rescaling of s, see `HybridFunctional.variants` |
+
+With libxc's digits put into the code's functionals the two agree to
+round-off: pointwise to 2e-12 relative, as grid fields to 1e-12, and the SCF
+of H2 (PBE, the B3LYP Fock loop) and of an H atom in a periodic box to 1e-9 Ry
+([tests/unit/test_libxc.py](tests/unit/test_libxc.py)). A fully polarized
+density differs by libxc's floor of the empty channel at its density
+threshold: the spin PBE H atom by 2.6e-9 Ry at libxc's threshold and 5e-13 Ry
+at fixed density with `LibXC_Density_Threshold: 1e-30`. On the molecules of
+[`examples/0d_hybrid_functionals`](../../examples/0d_hybrid_functionals/)
+(GPU, h = 0.16 bohr) libxc's B3LYP gives the code's B3LYP to the printed
+digits (O2 triplet included), libxc's PBE and PBEh the code's PBE and PBE0
+within 1e-8 to 1.3e-7 Ry (the `A` above), and libxc's HSE06 and HSE03 through
+this code's exact exchange reproduce Quantum ESPRESSO with libxc within
+2.1e-5 Ry in `E_hyb - E_PBE` and 1.3e-5 Ry in `a_x E_x`.
+
+libxc 7.1 (7.1.2 checked) evaluates its polarized LYP inaccurately where one
+spin channel is almost empty (`n_u = 4.2e-11` beside `n_d = 9.1e-5`: on the
+host `vrho_u` 3e-4 and `vsigma_uu` 33 % off a 60-digit evaluation, on the
+device `vsigma_uu` 33 % off as well; the host error falls as `n_u^(-11/3)`,
+2.5e-11 at `n_u/n = 5e-5`); libxc 6.2.2 and the code's own LYP give the exact
+values. Host and device therefore differ there (the B3LYP spin potential of
+a test field by 8.5e-6 of its largest value). The points carry no density to
+speak of: the spin B3LYP H atom differs by less than 1e-10 Ry between host
+and device, O2 (triplet) libxc B3LYP equals the code's B3LYP to the printed
+digits, and the GPU tests compare spin fields whose channels both hold a
+share of the density.
+
+### Installation
+
+libxc >= 7.0 for the host, a CUDA build of libxc >= 7.1 for the GPU:
+
+```bash
+bash scripts/build_libxc.sh --prefix $HOME/libxc-7.1.2-cpu             # host build (CMake)
+bash scripts/build_libxc.sh --cuda --cuda-arch 80 --prefix $HOME/libxc-7.1.2-cuda-sm80   # GPU (A100)
+export PARSEC_LIBXC_LIBRARY=$HOME/libxc-7.1.2-cuda-sm80/lib/libxc.so
+python -m parsec_python.V_xc.libxc
+```
+
+The script downloads the source from libxc's GitLab and builds energy and
+potential only (`MAXORDER 1`); one CUDA build evaluates host and device
+arrays. The CUDA build is compiled without fused multiply-adds
+(`--fmad off`, as the device kernels of this code; `--fmad on` for nvcc's
+default), so that host and device round alike. Without `PARSEC_LIBXC_LIBRARY` the code looks for `libxc.so`
+(`xc.dll`, `libxc.dylib`) on the loader's path. conda-forge's `libxc-c`
+(7.1.2 for Linux with cpu and cuda variants, and for Windows, cpu) works as
+well: `conda install -c conda-forge libxc-c` and point the variable at its
+`lib/libxc.so` (Windows: `Library\bin\xc.dll`). On Perlmutter the builds of
+the script are `<prefix>/libxc/7.1.2-cuda-sm80/lib/libxc.so`
+(CUDA 12.9, sm_80; it links `libcudart.so.12`, the runtime CuPy 14 loads on the
+A100 nodes, so one runtime serves both) and `.../7.1.2-cpu/lib/libxc.so` (host
+only: `libm` and `libc`, it loads on CPU nodes). The script compiles with the
+plain `gcc` (and `g++` as the host compiler of `nvcc`): Cray's `cc` wrapper
+links the CUDA runtime of the loaded `craype-accel` module into any library,
+and checks with `ldd` that a host build needs no CUDA runtime.
+
+## Meta-GGA functionals
+
+```text
+Correlation_Type: scan
+```
+
+or a meta-GGA of libxc (`LibXC_Functional: mgga_x_r2scan mgga_c_r2scan`, see
+[Functionals of libxc](#functionals-of-libxc)) runs the SCF with a functional
+of the kinetic-energy density of the occupied orbitals,
+`tau = (1/2) sum_n f_n |grad psi_n|^2` (Hartree, libxc's convention), and of
+the Laplacian of the density where the functional asks for it. Isolated
+systems and periodic cells (see [Periodic cells](#periodic-cells)),
+unpolarized and collinear spin, forces (with a nonlinear core
+correction), relaxation and dynamics, on the CPU and on the GPUs of one node,
+on the full grid and in the symmetry sectors; meta-GGA hybrids of clusters
+with the functionals of libxc ([Functionals of libxc](#functionals-of-libxc))
+([V_xc/meta_gga.py](V_xc/meta_gga.py), [SCF/meta_gga.py](SCF/meta_gga.py),
+[acceleration/Hamiltonian/meta_gga_device.py](acceleration/Hamiltonian/meta_gga_device.py)).
+
+### Functionals
+
+| `Correlation_Type` | functional | evaluation |
+|---|---|---|
+| `scan` | SCAN of Sun, Ruzsinszky and Perdew (PRL 115, 036402 (2015)) | native ([V_xc/scan.py](V_xc/scan.py)): libxc's formulas (`mgga_x_scan`, `mgga_c_scan`) to 5e-10 relative wherever `n > 1e-8`, derivatives by complex steps; on the host and the GPU |
+| a libxc `mgga_` functional | e.g. r2SCAN, TPSS, M06-L | libxc, on the GPU with a CUDA build |
+
+The Fermi-hole-curvature condition `tau >= tau_W` is not enforced for the
+native SCAN and the libxc functionals smooth across `tau = tau_W` (as Quantum
+ESPRESSO); a libxc functional with a kink there (TPSS-type correlation, which
+clamps `z = tau_W/tau` at 1) has `tau` of each channel floored at `tau_W`
+with the exact derivatives, so that all its components see `z <= 1`
+(`LibXC_Enforce_FHC` sets it either way). `tau` of each channel of a libxc
+meta-GGA is also floored at `LibXC_Tau_Threshold` (1e-12 Hartree/bohr^3): where
+every occupied orbital has a zero gradient (the bond centre of Si at the
+Gamma point) `tau` and `sigma` are round-off, and `z` of TPSS would be a
+ratio of round-off; the point keeps the energy of the floored input, with
+`vtau = 0` there.
+Pseudopotentials: PBE files (a meta-GGA reads the PBE label, as for the
+hybrids).
+
+### Method
+
+- **Discretization.** `tau` from the centered first-derivative stencil `G`
+  of `Expansion_Order` applied to the orbitals; the energy
+  `E = h^3 sum_i e(n_i, sigma_i, tau_i)`; the orbital term of the Hamiltonian
+  `-div(vtau grad)` as `sum_c G_c^T diag(vtau) G_c` (Rydberg), Hermitian and
+  the exact derivative of the discrete energy with respect to the orbitals.
+  The frozen core density enters `n` and the density gradient, never `tau`.
+- **The density gradient.** Two forms (`PARSEC_META_GGA_GRADIENT`):
+  `orbital` takes `g = (d/h^3) sum_n f_n 2 q_n (G q_n)` from the orbitals,
+  `density` takes the stencil gradient of the density, `G n`, as the GGAs do;
+  `auto` (the default) takes the orbital form for a functional whose
+  derivatives are continuous across `tau = tau_W` and the density form for
+  one with a kink there (TPSS-type correlation clamps `z = tau_W/tau <= 1`;
+  `LibXC_Enforce_FHC: .true.` floors `tau` at `tau_W`), decided by a probe of
+  the functional's derivatives at `tau_W (1 -+ 1e-6)` on a few densities and
+  gradients; `parsec.out` names the form and why. In the orbital form every
+  point of a one-orbital region sits at `tau = tau_W` up to round-off, and a
+  kink there makes those points change sides from one iteration to the next
+  (libxc TPSS on H2: the residual stays at 1e-2).
+  On the grid only the orbital form keeps `tau >= |g|^2/(8n)` (Cauchy-Schwarz;
+  equality where one orbital carries the density); with `G n`, `tau - tau_W`
+  of the grid is noise of either sign in the tails and near the nuclei, which
+  `alpha = (tau - tau_W)/tau_unif` of SCAN amplifies where the density is
+  small, and the SCF gets worse as the grid gets finer (H2O on an A100, SCAN:
+  SRE 1.7e-5 after 80 iterations at h = 0.20 bohr, 1.7e-4 after 80 at 0.16
+  with a passing excursion to +2782 Ry, 1e-3 after 120 at 0.13; libxc r2SCAN
+  diverges at 0.11), while the orbital form converges as a GGA does (H2O
+  h = 0.30: 1e-7 in 24 iterations; O2 h = 0.40, spin: 1e-7 in 25; CH4
+  h = 0.40: 1e-7 in 28; r2SCAN H2O h = 0.30: 1e-7 in 19). The orbital form's
+  potential is `vrho` alone, and the Hamiltonian holds the first-order term
+  `2 sum_c [W_c G_c + G_c^T W_c]` of `W = de/dg`. The two forms differ by the
+  grid error (first-order energy differences of at most 0.04 mRy at
+  h = 0.20, 0.006 at 0.16 and 0.001 at 0.13 on the molecules of the
+  references). The functionals with a kink at `tau_W` keep the density form
+  and its convergence (libxc TPSS, H2O h = 0.30: 1e-7 in 19 iterations).
+  SCAN itself is sensitive to `alpha` near 1 (its switching function): on CH4
+  the energy converges to 1e-10 Ry within 16-30 iterations, while the SRE
+  stays at 5e-6 to 2e-5 (h = 0.16-0.25), set by points of density 1e-5 to
+  1e-3; r2SCAN, built to remove that sensitivity, converges to 1e-8 in 23
+  iterations with the same SCF.
+- **First iteration.** PBE of the start density without orbital terms (as
+  PARSEC 1.5 starts its libxc meta-GGAs); after an ionic move the mixed
+  `vtau` (and `W`) of the structure before.
+- **Mixing.** `Mixing_Method`'s mixer sees `(V, vtau[, W])` of all channels
+  joined, one history; Anderson's least squares weigh every value by the
+  density (`PARSEC_META_GGA_ANDERSON=weighted`, the default; `plain` for
+  PARSEC's metric). The stop test is PARSEC's on `V`; the residual of `vtau`
+  is recorded. The weights let the low-density values of `vtau` and `W`
+  drift in the Anderson combination; on fine grids that can produce states
+  localized on a few points (SCAN H2O at h = 0.13 bohr, orbital form: two
+  passing excursions and SRE 4.6e-5 after 80 iterations, where `plain`
+  converges in 54). With the orbital form neither choice wins everywhere on
+  an A100 (iterations to 1e-6 with `weighted` / `plain`: SCAN H2O h = 0.20
+  37 / 27, h = 0.16 45 / 61, O2 h = 0.16 41 / 45), so `weighted` stays the
+  default; on fine grids use `plain` or r2SCAN (r2SCAN H2O h = 0.13 with
+  `plain`: 53 iterations).
+- **Energy.** The band energy holds `<psi|H_tau|psi>`; the total removes
+  `2 h^3 sum (vtau_in tau + W_in . g)` (printed as `Integral_{2 vtau*tau}`
+  under the energy corrections of `parsec.out`).
+- **Eigensolver.** The filter's upper bound takes in Gershgorin's bound of
+  the orbital term ([acceleration/README.md](acceleration/README.md#meta-gga-functionals-on-the-device)).
+
+### Accuracy and grid spacing
+
+A meta-GGA needs a finer grid than a GGA for the same accuracy of energy
+differences. Its energy is the sum `h^3 sum_i e(n_i, sigma_i, tau_i)` over
+the grid points; `tau` and the iso-orbital indicator
+`alpha = (tau - tau_W)/tau_unif` vary on shorter length scales than the
+density, and the sum carries a quadrature (aliasing) error that changes sign
+from one grid spacing to the next (a plane-wave code has the same error on its
+dense FFT grid). Against Quantum ESPRESSO 7.5 with libxc and the same
+FHI98PP potentials (`NCPPs/PBE` H, C, N, O; 300 Ry, 20 bohr box; H2O, CH4,
+NH3 and the O2 triplet), the difference of `E_mGGA - E_PBE` (mRy) and of the
+HOMO (meV):
+
+| functional | h = 0.20 bohr | 0.16 | 0.13 |
+|---|---|---|---|
+| r2SCAN | 0.08-0.18, O2 1.0 / HOMO 0.3-2, O2 14 | 0.03-0.11, O2 0.34 / 0.1-1.4 | 0.01-0.05, O2 0.11 / 0.1-2.7 |
+| TPSS (H2O; O2 at 0.16) | 0.18 / 0.3 | 0.01, O2 0.03 / 0.3-0.9 | 0.02 / 0.9 |
+| SCAN | 0.2-0.8 / 5-50 | 0.1-0.9 / 1-40 | 0.03-0.2, O2 0.2 / 0.3-25 |
+
+The derivative stencil of `sigma` and `tau` (against exact derivatives of the
+same orbitals: <= 0.07 mRy, < 0.3 meV), the boundary of the domain (3 bohr
+more radius: < 1e-6 Ry, 0.05 meV) and the form of the density gradient (<=
+0.04 mRy at 0.20, 0.006 at 0.16) are not what is left: with the energy
+density summed on a twice finer grid (the orbitals interpolated spectrally),
+r2SCAN and TPSS agree with Quantum ESPRESSO to 0.04 mRy and 2.5 meV at every
+spacing above (O2 at h = 0.20: 1.045 -> -0.027 mRy). SCAN's steep switching
+function in `alpha` makes it grid-sensitive in every code (Quantum ESPRESSO's
+own SCAN `E - E_PBE` moves by 0.1-0.5 mRy between 200 and 300 Ry). Hence:
+
+- r2SCAN, TPSS and other smooth meta-GGAs: `Grid_Spacing` <= 0.16 bohr
+  (0.1 mRy, O2 0.35 mRy, levels to 2 meV); 0.13 bohr for energy differences
+  to 0.05-0.1 mRy with first-row atoms;
+- SCAN: 0.13 bohr or finer, and still up to 0.2 mRy and 25 meV; prefer
+  r2SCAN (built to remove this sensitivity) unless SCAN is required;
+- forces: the force formulas of the GGAs are the derivatives of the
+  meta-GGA's grid energy too (the orbital term does not depend on the atoms;
+  a core charge adds its term, see
+  [FORCES_AND_RELAXATION.md](FORCES_AND_RELAXATION.md)): finite differences of
+  the energy match them as for PBE; against Quantum ESPRESSO (distorted H2O,
+  200 Ry) the largest component of r2SCAN differs by 1.5e-3 Ry/bohr at
+  h = 0.16 and 5e-4 at 0.13 (PBE: 1.0e-3 and 2.6e-4);
+- the LUMOs of small molecules near 0 eV are diffuse and confined by
+  `Boundary_Sphere_Radius` (as by a plane-wave box): compare them with a larger
+  sphere.
+
+`python -m parsec_python.acceleration.benchmarks.meta_gga_accuracy --input
+parsec.in --refine 2` runs an input and estimates the quadrature error of its
+meta-GGA energy and levels (the `fft2x` rows minus the `code` rows; the
+orbitals interpolated to h/2 on the bounding box, NumPy: about 30 s for H2O at
+h = 0.16 bohr).
+
+### Periodic cells
+
+```text
+Boundary_Conditions: bulk                          # or slab, wire
+Correlation_Type: scan                             # or LibXC_Functional: mgga_x_r2scan mgga_c_r2scan
+Kpoint_Method: mp                                  # or a Kpoint_List, or the Gamma point alone
+```
+
+Bulk cells with a Monkhorst-Pack mesh, an explicit `Kpoint_List` or the
+irreducible wedge of `Symmetrize_Charge_Density`, bulk cells at the Gamma
+point, slabs and wires, on both sets of routines (`Use_Fortran_Routines`),
+unpolarized and with collinear spin, with forces, relaxation and molecular
+dynamics where the semilocal functionals of the cell have them, from both
+CLIs ([SCF/meta_gga_periodic.py](SCF/meta_gga_periodic.py),
+[Hamiltonian/kpoint_operator.py](Hamiltonian/kpoint_operator.py)). The
+k-point workers apply the orbital terms on their GPUs and form `tau` (and `g`)
+where the orbitals are; the accelerated Gamma-point path of an orthorhombic
+cell holds them in its device Hamiltonian as for a cluster.
+
+- **Bloch factors.** With `psi_nk = e^{ik.r} u_nk` the derivative is
+  `(G + ik) u` (`G` wrapped on the periodic axes, zero beyond a slab or wire,
+  Cartesian on oblique cells): `tau = sum_k w_k (d/2h^3) sum_n f_nk |(G + ik) u_nk|^2`
+  and the Hamiltonian of k-point `k` holds `sum_c (G_c + ik_c)^H diag(vtau) (G_c + ik_c)`,
+  Hermitian and with `dE/dn` the exact derivative of the discrete energy with
+  respect to `u` (at `k = 0` the term of the Gamma point). In the orbital form
+  `g = sum_k w_k (d/h^3) sum_n f_nk 2 Re[conj(u_nk) (G + ik) u_nk]`, in which the
+  `ik` part drops, and `2 sum_c [W_c G_c + G_c^T W_c]` is the same at every
+  k-point. Time reversal (`u_-k = conj(u_k)`) leaves `tau` and `g` unchanged,
+  so a k and -k merged with twice the weight are exact; an irreducible wedge
+  is completed by the space-group average of `tau` (a scalar) and of `g` (a
+  vector field, `g(r) = C g(r')` with the Cartesian rotation `C` of each
+  operation), as of the density.
+- **Spin at the Gamma point** runs the k-point spin loop at `k = 0` (the
+  Gamma-point driver of periodic spin has no meta-GGA term).
+- **Forces.** No term beyond those of a cluster: the periodic and slab forces
+  read `dE/dn_core` (`Forces.periodic.meta_gga_core_potential`), and the ionic
+  loops carry `vtau` and `W` to the next structure. Against central
+  differences of the total energy (Si, one atom displaced, Andrew Grieder's
+  routines): the smooth test meta-GGA as PBE (3.4e-4 and 3.5e-4 Ry/bohr at
+  h = 0.4); SCAN 1.8e-3 at h = 0.4, 3.8e-4 at 0.3 (PBE 1.7e-4), SCAN's grid
+  sensitivity ([FORCES_AND_RELAXATION.md](FORCES_AND_RELAXATION.md)).
+- **GPUs.** The device Bloch operator applies the derivatives along the grid
+  directions (`G_c = sum_i M_ci L_i`, recovered from `G`; on an oblique cell a
+  third of the entries of a Cartesian `G_c`) with the CSR kernel of the
+  cluster term on the real view of the complex block, the pointwise part in
+  one kernel ([acceleration/Hamiltonian/device_bloch.py](acceleration/Hamiltonian/device_bloch.py),
+  [acceleration/Hamiltonian/bloch_meta_gga_device.py](acceleration/Hamiltonian/bloch_meta_gga_device.py)).
+  Bulk Si on one A100 (Fortran's grid of 36^3 points at h = 0.20, 16
+  columns): one application of the Bloch Hamiltonian takes 1.29 ms, with the
+  orbital terms 1.67 ms; the 4x4x4 mesh (8 irreducible k-points) converges in
+  11.6 s and 12 iterations with PBE, 17.0 s and 14 with SCAN (`main.py`:
+  26.5 and 32.6 s).
+- **Filter bounds.** The Bloch operators carry Gershgorin's bound of their
+  orbital terms (`spectral_margin`, with `|G_c + ik_c| <= |G_c| + |k_c|`), so
+  a `vtau` spike in the vacuum of a slab or wire cannot escape the Chebyshev
+  filter: the host eigensolvers add it to the Lanczos bound, the device
+  k-point solver takes `max(lanczos, bare + margin)` as the cluster path.
+- **Refused** as for clusters, and: the MPI-distributed k-point solver
+  (`--mpi`: `tau` needs the orbitals on every grid point), meta-GGA hybrids
+  of periodic cells, `Restart_Run` of a periodic cell (`parsec.dat` holds no
+  `vtau` or `W`), the atomic `Potential_Extrapolation` of the
+  Fortran-derived k-point ionic loop.
+
+Validation ([tests/unit/test_meta_gga_periodic.py](tests/unit/test_meta_gga_periodic.py),
+[acceleration/tests/test_meta_gga_periodic_device.py](acceleration/tests/test_meta_gga_periodic_device.py)):
+the Bloch terms against their dense matrices and as the derivative of the
+energy (3e-13, orthorhombic and Fortran's general fcc grid); Gamma-point loop
+= 1x1x1 Bloch loop (bulk 2e-15 Ry; slabs of both routine families and a wire
+1e-8); two equal spin channels = the unpolarized loop (1e-10 Ry); device
+loops (CuPy and the NumPy double of the device code) = host loop (1e-9 Ry);
+accelerated Gamma-point path = reference path (Si8, 7e-15 Ry density form,
+9e-13 orbital form); the energy of a converged k-point loop is the functional
+of its orbitals. A 16-atom Si supercell at Gamma against the 8-atom cell with
+the 2x1x1 mesh differs by -2.4e-4 Ry with SCAN, as with PBE (-3.2e-4): the
+finite-difference Bloch kinetic term of the k-point Hamiltonian. The orbital
+form also converges what the density form does not (SCAN, an H2 slab with a
+2x2 mesh: SRE 3e-4 after 80 iterations against 21 iterations; an H2 wire 80
+and 45 iterations against 16 and 20); in bulk Si the two forms agree to
+1e-5 Ry.
+
+Against Quantum ESPRESSO 7.5 + libxc 7.0 with the same FHI98PP potential
+(bulk Si, a = 10.26 bohr, Gamma-centred meshes, QE at 200 Ry and dual 8,
+the references of `examples/3d_meta_gga`; `Expansion_Order` 12),
+`E_mGGA - E_PBE` (mRy) and the gap on the mesh (meV), parsec_python minus QE,
+at h = 0.20 / 0.16 bohr:
+
+| functional | 1x1x1 | 2x2x2 | 4x4x4 |
+|---|---|---|---|
+| r2SCAN (libxc) | -0.14 / +0.5, -0.15 / +0.4 | -0.11 / +0.3, -0.10 / +0.3 | -0.09 / +0.3, -0.09 / +0.2 |
+| SCAN (native) | -0.51 / -0.3, -0.59 / -0.9 | -0.09 / +2.2, -0.16 / +2.5 | -0.14 / +4.8, -0.11 / +1.3 |
+| TPSS (libxc) | see below | -0.10 / +0.4 (h 0.20) | -0.09 / +0.3 (h 0.20) |
+
+QE's own meta-GGA totals move by up to 1.5e-4 Ry and its SCAN gap by a few
+meV between 120 and 250 Ry.
+
+**Limitation: TPSS-type functionals at the Gamma point.** In a periodic cell
+sampled at the Gamma point alone, every occupied orbital can have a zero
+gradient at the same grid points (in Si the bond centres, at the density
+maximum), where `tau` and `sigma` vanish together. The TPSS-type
+functionals (`z = tau_W/tau`; the density form of the gradient under `auto`)
+may then stall or diverge: Si at Gamma stalls at an SRE of 7e-3 at
+h = 0.25 bohr and diverges at h = 0.4, whatever `LibXC_Tau_Threshold` and
+`LibXC_Enforce_FHC` say. Remedies: a k-mesh (TPSS converges with 2x2x2 and
+4x4x4 and matches QE, table above), or `PARSEC_META_GGA_GRADIENT=orbital`
+(converges in 125 and 173 iterations at h = 0.25 and 0.16, `E - E_PBE`
+within 0.05 and 0.25 mRy of QE, the gap within 26 and 7 meV). SCAN and
+r2SCAN (written with `alpha`) are not affected.
+
+### What is refused
+
+When the input is read: meta-GGA hybrids of periodic cells, spin-orbit
+coupling, non-collinear magnetism,
+FDET, LDA+U, `Energy_Refinement`, `Polarizability`, non-self-consistent runs
+(`nscf`), `Output_GW`, band structures and `Restart_Run` (the restart file
+holds the potential, not `vtau` and `W`). In GPU runs: `--mpi` (the
+MPI SCF, and with it a sector basis shared by several devices), the FP32
+filter (`PARSEC_CUPY_MIXED_FILTER=on`) and
+`PARSEC_CUPY_RITZ_HANDOVER=triangular`. One process puts each sector on a
+device of its node, several sectors on one device where there are fewer
+devices than sectors.
+
+### Switches
+
+| variable | default | meaning |
+|---|---|---|
+| `PARSEC_META_GGA_GRADIENT` | `auto` | `auto`, `orbital` or `density`: the density gradient (see Method) |
+| `PARSEC_META_GGA_ANDERSON` | `weighted` | `weighted` or `plain`: the inner products of Anderson's least squares |
+| `PARSEC_META_GGA_MIXING` | `joint` | `joint` mixes `(V, vtau[, W])`; `output` takes `vtau_out` unmixed and `linear` mixes `vtau` linearly (density form only) |
+| `PARSEC_META_GGA_FILTER_BOUND` | `gershgorin` | the filter's upper bound with the orbital term: `gershgorin` adds the term's Gershgorin bound to the last bound without it (safe; H2O at h = 0.16-0.20 bohr takes 36-42 % more SCF time than without it, k04 none); `targeted` runs a second short Lanczos recurrence from the term's largest rows; `lanczos` leaves the term out (comparisons only; the filter can fail) |
+| `PARSEC_META_GGA_DENSITY_CUT` | `off` | `low,high` (bohr^-3): below `low` the energy is the functional's own `alpha = 1` GGA limit `e(n, sigma, tau_W + tau_unif)`, between `low` and `high` a quintic switch in `log n`, with exact derivatives |
+| `PARSEC_SCAN_TAU_FLOOR` | - | `weizsaecker` floors `tau` at `tau_W` for the native SCAN |
 
 ## Spin polarization
 
@@ -1196,6 +1866,21 @@ occurrence of such a label goes to the n-th Atom_Type that reads it;
 1.5 reads it (the PARSEC before 1.5 read one for every species: such an input
 is refused with a message).
 
+The local potential of an FHIPP, MARTINS_OLD or MARTINS_WANG table reaches the
+Coulomb tail `-2Z/r` only to the digits of its file (`r V + 2Z` of 1e-13 to
+1e-11 relative for FHIPP, out to the end of the table). In a periodic cell its
+images are summed out to the radius where the table is `-2Z/r` to that
+precision (6 bohr for silicon), as for a POTRE table. Before 2026-11-07 they
+were summed to the end of the table (75 bohr). With `Cubic_Spline` the error of
+the spline there then lowered the local potential of orthorhombic cells by
+0.05 Ry (an 8-atom silicon cube 1.62 Ry low in total energy), and preparing
+a 64-atom cell took 11 minutes (now under 3 s). Oblique cells (Fortran's
+general grid) with `Cubic_Spline` species take the same sums since then; their
+earlier direct sum met the same spline error as the cell grew (a 54-atom fcc
+silicon cell 0.049 Ry low in the potential), and primitive fcc cells move by
+less than 5e-5 Ry (`PARSEC_PERIODIC_OBLIQUE_SPLIT=readable` restores the
+earlier sum; acceleration/README.md has the numbers).
+
 `Pseudopot_File` (PARSEC 1.5, one per Atom_Type, the n-th to the n-th) names
 the file of a species instead of `<Atom_Type>_<suffix>.DAT`: a relative path
 is looked for beside the input, then in `--pp-dir` and the current directory.
@@ -1223,8 +1908,10 @@ layer, with 1.5's validation (`Input/parsec_input.py`, block `_INPUT15_*`):
   converges to the same states), `Use_Sfc`, `Thread_Random_Init`, `Rritz_Logic`, `Test_Logic` (`none` only),
   `Max_Taskgroups`, `Vxc_Matrix_Elements`.  `Use_HDF5: .true.` writes no HDF5 file: `parsec.dat` is written as with
   `.false.` (a 1.5 binary without HDF5 writes neither).
-- `Use_LibXC: .true.` is refused (no libxc here yet); with `.false.` (1.5's default) `Func_Id_X`/`Func_Id_C` are
-  ignored, as 1.5 ignores them there.
+- `Use_LibXC: .true.` with `Func_Id_X`/`Func_Id_C` runs libxc's functionals (the optional library; see
+  [Functionals of libxc](#functionals-of-libxc)): 1.5's defaults and its 0 for an empty slot, from the first iteration
+  (1.5 starts every libxc run with PBE) and with the exact exchange of a libxc hybrid (which 1.5 leaves out); with
+  `.false.` (1.5's default) `Func_Id_X`/`Func_Id_C` are ignored, as 1.5 ignores them there.
 - `Correlation_Type: wb` (1.5's PBE with the White-Bird variational potential) runs this port's PBE, whose potential
   is the exact derivative of the discrete energy, as 1.5's `wb` of an unpolarized cluster without symmetry (H2O:
   -34.56585964 Ry here, -34.56585973 Ry with 1.5 `wb`); 1.5's spin `wb` is not the derivative of its energy.

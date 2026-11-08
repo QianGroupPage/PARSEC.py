@@ -51,6 +51,7 @@ XCFunctional = Literal[
     "b3pw91",
     "lc-wpbe",
     "cam-b3lyp",
+    "scan",
 ]
 # Self-consistent hybrid functionals (generalized Kohn-Sham with a nonlocal
 # exchange operator, parsec_python.SCF.hybrid): the labels of the registry
@@ -58,6 +59,9 @@ XCFunctional = Literal[
 HYBRID_XC_FUNCTIONALS = frozenset(
     ("hf", "pbe0", "pbeh", "hse06", "hse03", "b3lyp", "b3lyp5", "b3pw91", "lc-wpbe", "cam-b3lyp")
 )
+# Meta-GGAs of this package (orbital kinetic-energy density in the functional,
+# parsec_python.V_xc.meta_gga): SCAN (V_xc.scan); no Fortran PARSEC label.
+META_GGA_XC_FUNCTIONALS = frozenset(("scan",))
 XC_FUNCTIONAL_NAMES = frozenset(
     (
         "ca",
@@ -70,9 +74,22 @@ XC_FUNCTIONAL_NAMES = frozenset(
         "lb94",
         "casida_salahub",
     )
-) | HYBRID_XC_FUNCTIONALS
+) | HYBRID_XC_FUNCTIONALS | META_GGA_XC_FUNCTIONALS
 # Functionals without a spin-polarized form (none in Fortran's exc_spn.f90).
 UNPOLARIZED_ONLY_XC_FUNCTIONALS = frozenset(("xalpha", "wigner", "hedin_lundqvist"))
+# libxc's functionals (optional library, parsec_python.V_xc.libxc): ``xc_functional``
+# "libxc:<name>[+<name>...][;fhc=on|off][;threshold=<t>][;tau=<t>]" with libxc's lowercase names.
+LIBXC_XC_PREFIX = "libxc:"
+
+
+def _libxc_spec(xc_functional):
+    """The parsed ``libxc:`` spec of ``xc_functional``, ``None`` for the code's own functionals."""
+
+    if not (isinstance(xc_functional, str) and xc_functional.startswith(LIBXC_XC_PREFIX)):
+        return None
+    from .V_xc.libxc import parse_libxc_spec
+
+    return parse_libxc_spec(xc_functional)
 # ``sad``, ``file``, or a density model of ``MLDensity.registry`` (built in:
 # ``charge3net``, ``scdp``, ``custom``).
 InitialDensityMethod = str
@@ -1280,6 +1297,19 @@ DEFAULT_EXX_MIXER_HISTORY = "restart"
 #: of the Fock loop, with a saddle guard) or ``none`` (the plain fixed point).
 EXX_OUTER_MIXINGS = ("diis", "none")
 DEFAULT_EXX_OUTER_MIXING = "diis"
+#: ``Exx_Divergence`` (periodic cells): the treatment of the Coulomb singularity of
+#: the exchange at ``q + G = 0`` (``parsec_python.Hartree.exchange_kernel``):
+#: Gygi-Baldereschi, Gygi-Baldereschi with Quantum ESPRESSO's ``x_gamma_extrapolation``,
+#: or none (the Coulomb ``q + G = 0`` element zero).  ``None`` (the input's ``auto``):
+#: the kernel's default (Gygi-Baldereschi, the extrapolation on the ``1/r`` component of a bulk cell).
+EXX_DIVERGENCES = ("gygi-baldereschi", "gygi-baldereschi-x", "none")
+#: ``Exx_Slab_Coulomb`` (slabs): ``padded`` (the bulk kernel on the slab box padded to
+#: twice its height: the images along z beyond the density, the Gygi-Baldereschi
+#: element of a bulk cell), ``truncated`` (the kernel cut along z, exactly isolated, but
+#: converging slowly with the in-plane mesh) or ``periodic`` (3-D periodic on the slab
+#: box itself, as Quantum ESPRESSO's exact exchange even with ``assume_isolated='2D'``).
+EXX_SLAB_COULOMBS = ("padded", "truncated", "periodic")
+DEFAULT_EXX_SLAB_COULOMB = "padded"
 
 
 @dataclass(frozen=True)
@@ -1298,8 +1328,14 @@ class ExactExchangeSettings:
     ``inner_criterion`` (``Exx_Inner_Criterion``), ``mixer_history``
     (``Exx_Mixer_History``) and ``outer_mixing`` (``Exx_Outer_Mixing``)
     choose how the Fock loop gets there (:mod:`parsec_python.SCF.fock_controls`),
-    not where it stops.  The text of the settings names only what differs
-    from the defaults.
+    not where it stops.  ``divergence`` (``Exx_Divergence``) and
+    ``slab_coulomb`` (``Exx_Slab_Coulomb``) belong to periodic cells
+    (:mod:`parsec_python.SCF.hybrid_periodic`): the treatment of the Coulomb
+    singularity (``None``: the kernel's default) and the kernel of a slab;
+    so does ``auxiliary_exponent`` (``Exx_Auxiliary_Exponent``, bohr^2, the
+    exponent of the Gygi-Baldereschi auxiliary function, zero or positive;
+    ``None``: the kernel's, the limit ``a -> 0``).
+    The text of the settings names only what differs from the defaults.
     """
 
     fraction: float | None = None
@@ -1311,8 +1347,22 @@ class ExactExchangeSettings:
     inner_criterion: str = DEFAULT_EXX_INNER_CRITERION
     mixer_history: str = DEFAULT_EXX_MIXER_HISTORY
     outer_mixing: str = DEFAULT_EXX_OUTER_MIXING
+    divergence: str | None = None
+    slab_coulomb: str = DEFAULT_EXX_SLAB_COULOMB
+    auxiliary_exponent: float | None = None
 
     def __post_init__(self) -> None:
+        if self.auxiliary_exponent is not None:
+            exponent = float(self.auxiliary_exponent)
+            if not np.isfinite(exponent) or exponent < 0.0:
+                raise ValueError("Exx_Auxiliary_Exponent must be zero or positive (bohr^2)")
+            object.__setattr__(self, "auxiliary_exponent", exponent)
+        if self.divergence is not None and self.divergence not in EXX_DIVERGENCES:
+            raise ValueError(f"Exx_Divergence must be one of {', '.join(EXX_DIVERGENCES)}, got {self.divergence!r}")
+        if self.slab_coulomb not in EXX_SLAB_COULOMBS:
+            raise ValueError(
+                f"Exx_Slab_Coulomb must be one of {', '.join(EXX_SLAB_COULOMBS)}, got {self.slab_coulomb!r}"
+            )
         if self.pair_solver not in ("kronecker", "cg"):
             raise ValueError("the pair solver must be 'kronecker' or 'cg'")
         for name, choices, label in (
@@ -1356,6 +1406,9 @@ class ExactExchangeSettings:
             "inner_criterion": DEFAULT_EXX_INNER_CRITERION,
             "mixer_history": DEFAULT_EXX_MIXER_HISTORY,
             "outer_mixing": DEFAULT_EXX_OUTER_MIXING,
+            "divergence": None,
+            "slab_coulomb": DEFAULT_EXX_SLAB_COULOMB,
+            "auxiliary_exponent": None,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -1470,9 +1523,32 @@ class SCFSettings:
 
     @property
     def is_hybrid(self) -> bool:
-        """Whether ``xc_functional`` has a nonlocal exact-exchange term."""
+        """Whether ``xc_functional`` has a nonlocal exact-exchange term (a libxc ``hyb_`` functional too)."""
 
-        return self.xc_functional in HYBRID_XC_FUNCTIONALS
+        if self.xc_functional in HYBRID_XC_FUNCTIONALS:
+            return True
+        spec = _libxc_spec(self.xc_functional)
+        return spec is not None and spec.is_hybrid
+
+    @property
+    def is_libxc(self) -> bool:
+        """Whether ``xc_functional`` names libxc functionals (``libxc:...``)."""
+
+        return _libxc_spec(self.xc_functional) is not None
+
+    @property
+    def is_meta_gga(self) -> bool:
+        """Whether ``xc_functional`` depends on the kinetic-energy density of the orbitals.
+
+        The meta-GGAs of :mod:`parsec_python.V_xc.meta_gga` (``scan``) and
+        those a registered provider (libxc) returns.
+        """
+
+        if self.xc_functional in META_GGA_XC_FUNCTIONALS:
+            return True
+        from .V_xc.meta_gga import is_meta_gga
+
+        return is_meta_gga(self)
 
     @property
     def spin_symmetry_sector_mode(self) -> str:
@@ -1565,10 +1641,11 @@ class SCFSettings:
             if not np.isfinite(approach):
                 raise ValueError("convergence_criterion_approach must be finite")
             object.__setattr__(self, "convergence_criterion_approach", approach)
-        if self.xc_functional not in XC_FUNCTIONAL_NAMES:
+        if self.xc_functional not in XC_FUNCTIONAL_NAMES and _libxc_spec(self.xc_functional) is None:
             raise ValueError(
                 "xc_functional must be one of "
                 + ", ".join(repr(name) for name in sorted(XC_FUNCTIONAL_NAMES))
+                + " or a libxc functional 'libxc:<name>[+<name>...]'"
             )
         if self.xc_functional in UNPOLARIZED_ONLY_XC_FUNCTIONALS and (
             self.spin_polarized or self.noncollinear
@@ -1578,7 +1655,7 @@ class SCFSettings:
                 "form; it cannot be used with spin polarization or "
                 "non-collinear magnetism"
             )
-        if self.xc_functional in HYBRID_XC_FUNCTIONALS:
+        if self.is_hybrid:
             if self.exact_exchange is None:
                 object.__setattr__(self, "exact_exchange", ExactExchangeSettings())
             elif not isinstance(self.exact_exchange, ExactExchangeSettings):
@@ -2372,6 +2449,20 @@ class CorrectedEnergyBreakdown(EnergyBreakdown):
 
 
 @dataclass(frozen=True)
+class MetaGGAEnergyBreakdown(EnergyBreakdown):
+    """:class:`EnergyBreakdown` of a meta-GGA (:mod:`parsec_python.V_xc.meta_gga`), in Ry.
+
+    ``eigenvalue`` is the band energy of the Hamiltonian with the orbital term
+    ``-div(vtau_in grad)``; ``integral_vtau_tau`` is the part of it that term
+    gives, ``2 h^3 sum vtau_in tau``, which ``electronic`` removes (double
+    counting).  ``exchange_correlation`` is ``E_xc[n + n_core, tau]`` and
+    ``integral_vxc_rho`` that of ``dE_xc/dn``.
+    """
+
+    integral_vtau_tau: float = 0.0
+
+
+@dataclass(frozen=True)
 class HybridEnergyBreakdown(EnergyBreakdown):
     """:class:`EnergyBreakdown` of a hybrid functional (generalized Kohn-Sham), in Ry.
 
@@ -2680,6 +2771,10 @@ class SpinPolarizedSCFIteration:
     diagonalization_seconds: float = 0.0
     total_seconds: float = 0.0
     eigen_residual_max: float = float("nan")
+    # SCFWarmStart.level_tolerance only (the inner loops of a hybrid's Fock
+    # loop): the iteration after the converged one, on the same V_in, as in
+    # SCFIteration.
+    level_refinement: bool = field(default=False, repr=False)
 
 
 @dataclass
@@ -2766,6 +2861,10 @@ class SinglePointResult:
     """A hybrid functional: the :class:`parsec_python.SCF.hybrid.FockLoopSummary` of the Fock
     loop (its outer iterations and what an ionic step needs to start the next structure);
     ``None`` otherwise.  ``xc_potential`` is then the semilocal part only."""
+    meta_gga: object | None = None
+    """A meta-GGA: the :class:`parsec_python.SCF.meta_gga.MetaGGARecord` of the loop (``vtau`` of the
+    last eigenproblem, the mixed ``vtau`` a next structure starts from, ``tau``); ``None`` otherwise.
+    ``xc_potential`` is ``dE_xc/dn`` at fixed ``tau``."""
 
     @property
     def all_electron_total(self) -> float:
@@ -2853,6 +2952,15 @@ class SpinPolarizedSinglePointResult:
     otherwise (as :class:`SinglePointResult`)."""
     timings: RunTimings | None = None
     """Stage timings, recorded by the k-point driver (``None`` where not measured)."""
+    history: list = field(default_factory=list, repr=False)
+    """The iteration records of the k-point driver (empty where not kept)."""
+    eigensolver_state: object | None = field(default=None, repr=False)
+    """With ``keep_states`` of the k-point driver: the Ritz states by task (``spin * n_k + k``)."""
+    exact_exchange: object | None = field(default=None, repr=False)
+    """A hybrid functional: the :class:`parsec_python.SCF.hybrid.FockLoopSummary` of its Fock loop."""
+    meta_gga: object | None = field(default=None, repr=False)
+    """A meta-GGA with k-points: the :class:`parsec_python.SCF.meta_gga.MetaGGARecord` of the loop (as
+    :class:`SinglePointResult`); ``None`` otherwise."""
 
     @property
     def magnetic_moment(self) -> float:

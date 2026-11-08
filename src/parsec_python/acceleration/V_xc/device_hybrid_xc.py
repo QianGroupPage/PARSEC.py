@@ -15,8 +15,9 @@ variables ``s_ab = D n_a . D n_b`` (:func:`parsec_python.V_xc.pbe.discrete_spin_
 Results agree with the host to round-off: the elementary functions are
 CUDA's (``cbrt``, ``pow``, ``exp``, ``log``, ``log1p``, ``expm1``, ``erf``,
 ``erfcx``, ``asinh``, ``atan``) and the grid sums run in another order.
-A semilocal evaluator that is not a ``ComponentSemilocal`` (a libxc-backed
-one, later) has no device form here; :func:`device_hybrid_supported` tells.
+A semilocal evaluator that is not a ``ComponentSemilocal`` has no device
+form here (:func:`device_hybrid_supported` tells); the semilocal part of a
+libxc hybrid runs on the device in :mod:`.device_libxc`.
 """
 
 from __future__ import annotations

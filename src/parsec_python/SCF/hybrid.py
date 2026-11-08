@@ -142,10 +142,13 @@ class HybridDefinition:
 
 
 def hybrid_display_name(label: str) -> str:
-    """Report name of a hybrid ``xc_functional`` label."""
+    """Report name of a hybrid ``xc_functional`` label (a libxc hybrid spec too)."""
 
     from ..V_xc.hybrid import HYBRID_FUNCTIONALS
+    from ..V_xc.libxc import is_libxc_functional, libxc_hybrid_functional
 
+    if is_libxc_functional(label):
+        return libxc_hybrid_functional(label).name
     functional = HYBRID_FUNCTIONALS.get(label)
     return label.upper() if functional is None else functional.name
 
@@ -153,7 +156,17 @@ def hybrid_display_name(label: str) -> str:
 @lru_cache(maxsize=64)
 def _functional(label: str, fraction: float | None, screening: float | None):
     from ..V_xc.hybrid import hybrid_functional
+    from ..V_xc.libxc import is_libxc_functional, libxc_hybrid_functional
 
+    if is_libxc_functional(label):
+        # libxc's hybrids are defined by libxc's coefficients; its own variants
+        # (hyb_gga_xc_pbeh, hse06/hse12, ...) take the place of the overrides.
+        if fraction is not None or screening is not None:
+            raise ValueError(
+                "Exact_Exchange_Fraction and Screening_Parameter set the hybrids of this code; a libxc "
+                "hybrid keeps libxc's coefficients"
+            )
+        return libxc_hybrid_functional(label)
     return hybrid_functional(
         label, exact_exchange_fraction=fraction, screening_parameter=screening
     )
@@ -315,25 +328,39 @@ class FockOperator:
         added.
         """
 
-        cross = self.cross_energy(orbitals, occupations)
-        band = 2.0 * self.fraction * cross
-        exact = self.fraction * (2.0 * cross - self.reference_energy)
-        semilocal = float(energies.exchange_correlation)
-        return HybridEnergyBreakdown(
-            eigenvalue=float(energies.eigenvalue),
-            hartree=float(energies.hartree),
-            integral_vxc_rho=float(energies.integral_vxc_rho),
-            exchange_correlation=semilocal + exact,
-            electron_ion=float(energies.electron_ion),
-            ion_ion=float(energies.ion_ion),
-            electronic=float(energies.electronic) - band + exact,
-            total=float(energies.total) - band + exact,
-            semilocal_exchange_correlation=semilocal,
-            exact_exchange=exact,
-            exact_exchange_band=band,
-            exact_exchange_fraction=self.fraction,
-            linearized=True,
+        return linearized_energies(
+            energies, self.cross_energy(orbitals, occupations), self.fraction, self.reference_energy
         )
+
+
+def linearized_energies(energies, cross: float, fraction: float, reference_energy: float) -> HybridEnergyBreakdown:
+    """The energies of an inner iteration from ``E_x(P, P0)`` (``cross``, Ry, unscaled).
+
+    ``energies`` hold the semilocal exchange-correlation energy and the band
+    energy of the Hamiltonian with ``a_x V_ACE``; the operator's part of the
+    band energy, ``2 a_x E_x(P, P0)``, is removed and the linearized exact
+    exchange ``a_x [2 E_x(P, P0) - E_x(P0)]`` added (``reference_energy`` is
+    ``E_x(P0)``).
+    """
+
+    band = 2.0 * fraction * cross
+    exact = fraction * (2.0 * cross - reference_energy)
+    semilocal = float(energies.exchange_correlation)
+    return HybridEnergyBreakdown(
+        eigenvalue=float(energies.eigenvalue),
+        hartree=float(energies.hartree),
+        integral_vxc_rho=float(energies.integral_vxc_rho),
+        exchange_correlation=semilocal + exact,
+        electron_ion=float(energies.electron_ion),
+        ion_ion=float(energies.ion_ion),
+        electronic=float(energies.electronic) - band + exact,
+        total=float(energies.total) - band + exact,
+        semilocal_exchange_correlation=semilocal,
+        exact_exchange=exact,
+        exact_exchange_band=band,
+        exact_exchange_fraction=fraction,
+        linearized=True,
+    )
 
 
 def energies_with_exchange(energies: HybridEnergyBreakdown, exchange_energy: float) -> HybridEnergyBreakdown:
@@ -442,6 +469,9 @@ def fock_loop_diagnostics(records: Sequence[ExchangeLoopIteration], occupations)
 
 def _final_occupations(result):
     channels = getattr(result, "spin", None)
+    if channels is None and hasattr(result, "occupations_up"):
+        # The spin-polarized k-point loop (parsec_python.SCF.hybrid_periodic).
+        return [np.asarray(result.occupations_up, dtype=np.float64), np.asarray(result.occupations_down, dtype=np.float64)]
     if channels is None:
         return [np.asarray(result.occupations, dtype=np.float64)]
     return [np.asarray(channel.occupations, dtype=np.float64) for channel in channels]
@@ -576,10 +606,19 @@ def default_pair_solver(system, definition: HybridDefinition):
     multipole boundary values at the order of the run.  ``cg``: the conjugate
     gradients of the Hartree solver on the domain itself
     (:func:`~parsec_python.V_xc.exchange_operator.cached_pair_solver`), the
-    Coulomb kernel only.  A two-kernel functional gets the weighted sum.
+    Coulomb kernel only.  A two-kernel functional gets the weighted sum.  A
+    periodic cell (at the Gamma point) gets the FFT pair potentials of its
+    exchange kernel (:func:`parsec_python.SCF.hybrid_periodic.periodic_pair_potentials`).
     """
 
     require_supported(definition)
+    if getattr(system.input, "periodic_cell", None) is not None:
+        # A periodic cell at the Gamma point: the FFT pair potentials of the cell's
+        # exchange kernel (parsec_python.V_xc.bloch_exchange), every kernel in one.
+        from ..V_xc.bloch_exchange import PeriodicPairPoisson
+        from .hybrid_periodic import periodic_pair_potentials
+
+        return PeriodicPairPoisson(periodic_pair_potentials(system, definition))
     if len(definition.terms) == 1:
         kernel, _, omega = definition.terms[0]
         return _kernel_solver(system, kernel, omega, definition.pair_solver)
@@ -599,13 +638,17 @@ def semilocal_start_system(system, definition: HybridDefinition):
     return replace(system, input=replace(system.input, scf=scf))
 
 
-def _transition_warm_start(system, start: SinglePointResult):
+def _transition_warm_start(system, start: SinglePointResult, start_system=None):
     """The first inner loop after the semilocal start.
 
     As Quantum ESPRESSO after its first SCF: the potential is rebuilt from the
     converged density with the semilocal part of the hybrid
     (``V_ion + V_H[rho] + V_xc^semilocal[rho]``) and the eigensolver keeps
-    its subspace; the exchange operator joins the Hamiltonian.
+    its subspace; the exchange operator joins the Hamiltonian.  A meta-GGA
+    hybrid starts its first inner loop as every meta-GGA loop starts: the
+    start functional's potential of the density (``start_system``, PBE) and
+    no orbital term yet (``vtau = 0``); the loop forms ``tau`` from its first
+    orbitals.
     """
 
     from .single_point import SCFWarmStart, state_for_new_potential
@@ -613,6 +656,10 @@ def _transition_warm_start(system, start: SinglePointResult):
     ionic = np.asarray(system.ionic_potential, dtype=np.float64)
     hartree = np.asarray(start.hartree_potential, dtype=np.float64)
     channels = getattr(start, "spin", None)
+    if getattr(system.input.scf, "is_meta_gga", False):
+        if start_system is None:
+            raise ValueError("the first inner loop of a meta-GGA hybrid needs the start system")
+        system = start_system
     if channels is None:
         xc = system.evaluate_xc(np.asarray(start.density, dtype=np.float64))
         return SCFWarmStart(
@@ -642,7 +689,11 @@ def _start_total_energy(system, start: SinglePointResult, exchange_energy: float
     """
 
     channels = getattr(start, "spin", None)
-    if channels is None:
+    if getattr(system.input.scf, "is_meta_gga", False):
+        semilocal = meta_gga_start_semilocal(system, start)
+        if semilocal is None:
+            return None
+    elif channels is None:
         semilocal = system.evaluate_xc(np.asarray(start.density, dtype=np.float64)).total_energy
     else:
         semilocal = system.evaluate_spin_xc(
@@ -652,6 +703,64 @@ def _start_total_energy(system, start: SinglePointResult, exchange_energy: float
     energies = start.energies
     return float(
         energies.total - energies.exchange_correlation + semilocal + fraction * exchange_energy
+    )
+
+
+def meta_gga_start_semilocal(reference, start: SinglePointResult) -> float | None:
+    """``E_xc^semilocal[rho, tau]`` (Ry) of a meta-GGA hybrid at the start orbitals, on the host full grid.
+
+    ``tau`` of the start's orbitals (``reference.kinetic_energy_density``),
+    and in the orbital form of the gradient (the form of the run,
+    :func:`parsec_python.V_xc.meta_gga.meta_gga_gradient_form`, as the inner
+    loops take it) ``g`` of the orbitals too; ``None`` where the result holds
+    no host orbitals.
+    """
+
+    from ..V_xc.meta_gga import grid_gradient, meta_gga_gradient_form, orbital_density_gradient
+
+    orbital = meta_gga_gradient_form(reference.input.scf)[0] == "orbital"
+
+    def gradient_of(orbitals, occupations, degeneracy):
+        if not orbital:
+            return None
+        return orbital_density_gradient(
+            orbitals,
+            occupations,
+            grid_gradient(reference.grid),
+            reference.grid.volume_element,
+            degeneracy=degeneracy,
+        )
+
+    channels = getattr(start, "spin", None)
+    if channels is None:
+        orbitals = getattr(start, "wavefunctions", None)
+        if not isinstance(orbitals, np.ndarray):
+            return None
+        occupations = np.asarray(start.occupations)
+        tau = reference.kinetic_energy_density(orbitals, occupations, 2.0)
+        return float(
+            reference.evaluate_xc(
+                np.asarray(start.density, dtype=np.float64),
+                tau=tau,
+                density_gradient=gradient_of(orbitals, occupations, 2.0),
+            ).total_energy
+        )
+    taus, gradients = [], []
+    for channel in channels:
+        orbitals = getattr(channel, "wavefunctions", None)
+        if not isinstance(orbitals, np.ndarray):
+            return None
+        occupations = np.asarray(channel.occupations)
+        taus.append(reference.kinetic_energy_density(orbitals, occupations, 1.0))
+        gradients.append(gradient_of(orbitals, occupations, 1.0))
+    return float(
+        reference.evaluate_spin_xc(
+            np.asarray(channels[0].density, dtype=np.float64),
+            np.asarray(channels[1].density, dtype=np.float64),
+            tau_up=taus[0],
+            tau_down=taus[1],
+            density_gradients=None if not orbital else tuple(gradients),
+        ).total_energy
     )
 
 
@@ -742,6 +851,7 @@ class HostExchange:
     """
 
     def __init__(self, system, definition: HybridDefinition, pair_solver=None) -> None:
+        self.definition = definition
         self.solver = default_pair_solver(system, definition) if pair_solver is None else pair_solver
         self.description = str(getattr(self.solver, "description", type(self.solver).__name__))
         self.volume_element = system.grid.volume_element
@@ -754,12 +864,13 @@ class HostExchange:
         return orbital_sets_of(result)
 
     def transition_warm_start(self, system, start):
-        return _transition_warm_start(system, start)
+        return _transition_warm_start(system, start, self.start_system(system, self.definition))
 
     def next_warm_start(self, system, result):
-        from .single_point import _parsec_warm_start
+        from .single_point import _parsec_warm_start, meta_gga_warm_start
 
-        return _parsec_warm_start(system, result, system)
+        # A meta-GGA hybrid: the next inner loop takes over the mixed vtau too.
+        return meta_gga_warm_start(_parsec_warm_start(system, result, system), result)
 
     def start_total_energy(self, system, start, exchange_energy: float, fraction: float) -> float:
         return _start_total_energy(system, start, exchange_energy, fraction)
@@ -916,6 +1027,7 @@ def run_hybrid_scf(
     convergence_criterion: float | None = None,
     iteration_state_callback: Callable[[object], None] | None = None,
     pair_solver=None,
+    engine=None,
     **hooks,
 ) -> SinglePointResult:
     """The Fock loop of a hybrid ``system.input.scf.xc_functional`` (see the module).
@@ -929,7 +1041,10 @@ def run_hybrid_scf(
     unless the system holds the exchange operator in its own Hamiltonians
     (``system.exchange_device``, whose ``fock_engine`` supplies the pieces
     of :class:`HostExchange` on its devices); they then go to every SCF loop
-    of the Fock loop.
+    of the Fock loop.  ``engine`` replaces both: an object with the methods of
+    :class:`HostExchange` (the Bloch orbitals of a periodic cell with
+    k-points, :class:`parsec_python.SCF.hybrid_periodic.BlochExchange`); one
+    with a ``run_scf`` method runs the SCF loops of the Fock loop with it.
 
     The result is the one of the last inner loop with the energies of the
     hybrid functional, the history of every loop, ``converged`` only when
@@ -945,7 +1060,13 @@ def run_hybrid_scf(
     settings = scf.exact_exchange
     fraction = definition.fraction
     device = getattr(system, "exchange_device", None)
-    if device is None:
+    if engine is not None:
+        if pair_solver is not None:
+            raise ValueError("an exchange engine brings its own pair solver")
+        keywords = {name: hook for name, hook in hooks.items() if hook is not None}
+        if keywords and not getattr(engine, "takes_hooks", False):
+            refuse_exchange_hooks(**hooks)
+    elif device is None:
         refuse_exchange_hooks(**hooks)
         engine = HostExchange(system, definition, pair_solver)
         keywords = {}
@@ -958,6 +1079,8 @@ def run_hybrid_scf(
         keywords["convergence_criterion"] = convergence_criterion
     if iteration_state_callback is not None:
         keywords["iteration_state_callback"] = iteration_state_callback
+    # The SCF loops of the Fock loop: the engine's (k-point loops) or run_scf.
+    run_loop = getattr(engine, "run_scf", None) or run_scf
     # How the loop gets to its fixed point (parsec_python.SCF.fock_controls).
     criteria = InnerCriterion(
         adaptive=settings.inner_criterion == "adaptive",
@@ -994,7 +1117,7 @@ def run_hybrid_scf(
         # START_CRITERION; one with a partly filled level then goes on to the
         # criterion of the loop (parsec_python.SCF.fock_controls).
         start_criterion = criteria.start_criterion(bool(scf.spin_polarized))
-        start = run_scf(
+        start = run_loop(
             start_system,
             callback=callback,
             warm_start=warm_start,
@@ -1014,7 +1137,7 @@ def run_hybrid_scf(
                 f"a residual of {criteria.final:.2E} Ry"
             )
             start_criterion = None
-            start = run_scf(
+            start = run_loop(
                 start_system,
                 callback=callback,
                 warm_start=engine.next_warm_start(start_system, start),
@@ -1111,7 +1234,7 @@ def run_hybrid_scf(
         # plain loop, and its orbitals may build the final operator or be the
         # result.  On the plain path nothing is added.
         levels = float(settings.tolerance) if share is None and refine_levels and off_plain_path else None
-        inner = run_scf(
+        inner = run_loop(
             system,
             callback=callback,
             warm_start=replace(inner_start, mixer=mixer, relative_criterion=share, level_tolerance=levels),
@@ -1305,6 +1428,11 @@ def exchange_start_orbitals(result) -> tuple[OrbitalSet, ...] | None:
 
     if getattr(result, "exact_exchange", None) is None:
         return None
+    if getattr(result, "k_points", None) is not None:
+        # Bloch factors of a periodic cell with k-points (parsec_python.SCF.hybrid_periodic).
+        from .hybrid_periodic import bloch_orbital_sets_of
+
+        return bloch_orbital_sets_of(result)
     return orbital_sets_of(result)
 
 
@@ -1320,6 +1448,7 @@ __all__ = [
     "hybrid_definition",
     "hybrid_display_name",
     "hybrid_functional_of",
+    "linearized_energies",
     "orbital_sets_of",
     "PAIR_SOLVER_KERNELS",
     "WeightedPairPoisson",

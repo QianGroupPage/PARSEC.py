@@ -1500,7 +1500,7 @@ def _tile_pairs(kind: str, first_count: int, second_count: int):
 
 
 def _run_parity_tiles(cp, context: ParityContext, orbitals: ChannelOrbitals, solvers, blocks, work,
-                      device: int, deliver, timing: dict) -> None:
+                      device: int, deliver, timing: dict, ready=None) -> None:
     """The tiles ``work`` of ``device`` in parity classes (the module text; no full-grid array).
 
     The two blocks of a tile are gathered into coset form, the pair
@@ -1535,6 +1535,8 @@ def _run_parity_tiles(cp, context: ParityContext, orbitals: ChannelOrbitals, sol
         first_index = None
         first = first_acc = first_weights = None
         for tile in work:
+            if ready is not None:
+                ready(tile)
             if tile.first != first_index:
                 if first_acc is not None:
                     deliver(blocks[first_index], parity_fold(cp, context, blocks[first_index], first_acc))
@@ -1638,26 +1640,42 @@ def _blocks(orbitals: ChannelOrbitals, wanted: set[int], size: int):
     return occupied_blocks, empty_blocks
 
 
-def apply_device_exchange(
-    orbitals: ChannelOrbitals,
-    solvers: DevicePairSolvers,
-    devices: Sequence[int],
-    *,
-    columns: str = "all",
-    known: DeviceExchangeApplication | None = None,
-) -> DeviceExchangeApplication:
-    """``W = V_x Psi`` of a channel on ``devices`` (see the module text).
+@dataclass
+class ExchangePlan:
+    """The blocks and tiles of one build of ``W = V_x Psi`` (see the module text).
 
-    ``columns="occupied"`` forms the occupied columns only (enough for the
-    energy); ``"all"`` every column.  ``known``, an application of the
-    occupied columns of the same orbitals, is completed with the empty ones
-    and consumed.
+    ``blocks`` are the occupied blocks of every sector (``occupied_blocks``
+    of them) followed by the blocks of the wanted empty states; ``tiles``
+    pair them.  The plan depends on the occupations and the sector columns
+    only, so every MPI rank makes the same one.
     """
 
-    from ..backends.cupy import require_cupy
+    blocks: list
+    tiles: list
+    occupied_blocks: int
+    occupied: tuple[int, ...]
+    wanted_empty: frozenset
+    columns: str
 
-    cp, _ = require_cupy()
-    started = perf_counter()
+    @property
+    def pair_solves(self) -> int:
+        return int(sum(tile.pairs for tile in self.tiles))
+
+    def done(self) -> tuple[int, ...]:
+        """The channel states whose ``W`` the build forms (occupied, and the wanted empty ones)."""
+
+        return tuple(sorted(set(self.occupied) | (set(self.wanted_empty) if self.columns == "all" else set())))
+
+
+def plan_exchange(
+    orbitals: ChannelOrbitals,
+    batch_size: int,
+    *,
+    columns: str = "all",
+    known: "DeviceExchangeApplication | None" = None,
+) -> ExchangePlan:
+    """The :class:`ExchangePlan` of a build (``columns`` and ``known`` as in :func:`apply_device_exchange`)."""
+
     occupied_states = [int(state) for state in orbitals.occupied_states()]
     all_states = set(range(orbitals.state_count))
     if columns not in ("all", "occupied"):
@@ -1667,7 +1685,7 @@ def apply_device_exchange(
             raise ValueError("the known application belongs to other orbitals")
         if set(known.columns) != set(occupied_states):
             raise ValueError("a known application must hold the occupied columns")
-    size = int(solvers.batch_size)
+    size = int(batch_size)
     wanted_empty = (all_states - set(occupied_states)) if columns == "all" else set()
     occupied_blocks, empty_blocks = _blocks(orbitals, wanted_empty, size)
     blocks = occupied_blocks + empty_blocks
@@ -1690,34 +1708,75 @@ def apply_device_exchange(
                     "empty",
                 )
             )
-    # Sector orbitals of a symmetric box: the pair densities in parity classes.
-    parity = parity_context(orbitals, solvers)
-    record = getattr(solvers, "record_path", None)
-    if callable(record):
-        record("full" if parity is None else "parity")
-    # W of every sector on its device.
-    if known is not None:
-        applied = known.applied
-    else:
-        require_exchange_memory(orbitals, solvers, devices, parity=parity)
-        applied = []
-        for sector in orbitals.sectors:
-            with cp.cuda.Device(sector.device):
-                applied.append(
-                    cp.zeros((sector.rows, sector.local.size), dtype=cp.float64, order="F")
-                )
-    locks = [Lock() for _ in orbitals.sectors]
-    # Most expensive tiles first, each to the least loaded device; a device
-    # then runs its tiles grouped by their first block.
-    devices = tuple(int(device) for device in devices) or (orbitals.sectors[0].device,)
+    return ExchangePlan(
+        blocks=blocks,
+        tiles=tiles,
+        occupied_blocks=len(occupied_blocks),
+        occupied=tuple(occupied_states),
+        wanted_empty=frozenset(wanted_empty),
+        columns=columns,
+    )
+
+
+def assign_tiles(tiles, devices) -> dict:
+    """Tiles of every device: the most expensive first, each to the least loaded device.
+
+    ``devices`` are hashable names (device indices in one process, ``(rank,
+    device)`` across MPI ranks); ties go to the first in ``devices``.  A
+    device then runs its tiles grouped by their first block.
+    """
+
+    devices = tuple(devices)
+    order = {device: index for index, device in enumerate(devices)}
     loads = {device: 0 for device in devices}
-    assigned: dict[int, list[_Tile]] = {device: [] for device in devices}
+    assigned: dict = {device: [] for device in devices}
     for tile in sorted(tiles, key=lambda item: -item.pairs):
-        device = min(devices, key=lambda name: (loads[name], devices.index(name)))
+        device = min(devices, key=lambda name: (loads[name], order[name]))
         loads[device] += tile.pairs
         assigned[device].append(tile)
     for device in devices:
         assigned[device].sort(key=lambda item: (item.first, item.second))
+    return assigned
+
+
+def touched_blocks(work) -> set[int]:
+    """Indices of the blocks whose ``W`` the tiles ``work`` form (both blocks of a pair, the first of the others)."""
+
+    touched: set[int] = set()
+    for tile in work:
+        touched.add(int(tile.first))
+        if tile.kind == "pair":
+            touched.add(int(tile.second))
+    return touched
+
+
+def run_exchange_tiles(
+    orbitals: ChannelOrbitals,
+    solvers: DevicePairSolvers,
+    plan: ExchangePlan,
+    assigned: dict,
+    applied: list,
+    *,
+    parity: "ParityContext | None",
+    ready=None,
+) -> dict[int, float]:
+    """Run the tiles ``assigned[device]`` on the devices of this process; ``W`` goes into ``applied``.
+
+    ``applied[s]`` receives the folded parts of ``W`` of ``orbitals.sectors[s]``
+    on that sector's device (a block of every touched sector must be there).
+    ``ready(tile)``, where given, is called on a device's thread before the
+    tile reads its blocks and returns once their orbitals are in place (the
+    replicas an MPI rank receives meanwhile, ``SCF/hybrid_mpi.py``).
+    Returns the seconds of the pair solves per device (CUDA events).
+    """
+
+    from ..backends.cupy import require_cupy
+
+    cp, _ = require_cupy()
+    blocks = plan.blocks
+    size = int(solvers.batch_size)
+    devices = tuple(assigned)
+    locks = [Lock() for _ in orbitals.sectors]
     inverse_volume = 1.0 / float(orbitals.volume_element)
     timing = {device: 0.0 for device in devices}
     # The bases were written on the eigensolvers' streams and W was zeroed on
@@ -1791,6 +1850,8 @@ def apply_device_exchange(
             first_full = first_acc = None
             first_weights = None
             for tile in work:
+                if ready is not None:
+                    ready(tile)
                 if tile.first != first_index:
                     if first_acc is not None:
                         deliver(blocks[first_index], folded(blocks[first_index], first_acc))
@@ -1877,37 +1938,103 @@ def apply_device_exchange(
 
         def run(device: int) -> None:  # noqa: F811 -- the parity path replaces the full-grid loop
             if assigned[device]:
-                _run_parity_tiles(cp, parity, orbitals, solvers, blocks, assigned[device], device, deliver, timing)
+                _run_parity_tiles(
+                    cp, parity, orbitals, solvers, blocks, assigned[device], device, deliver, timing, ready
+                )
 
     try:
+        persistent = getattr(solvers, "run_on_devices", None)
         if len(devices) == 1:
             run(devices[0])
-        else:
+        elif devices and callable(persistent):
+            # threads kept for the run by the solvers (the cuFFT pair solver of a periodic cell: its plans)
+            persistent(run, devices)
+        elif devices:
             with ThreadPoolExecutor(max_workers=len(devices), thread_name_prefix="parsec-exx") as pool:
                 for future in [pool.submit(run, device) for device in devices]:
                     future.result()
     finally:
         solvers.release_blocks()
         release_gather_blocks(cp)
-    energy = 0.0
+    return timing
+
+
+def sector_exchange_energies(orbitals: ChannelOrbitals, applied: list, sectors=None) -> dict[int, float]:
+    """``sum_i f_i <q_i|W_i>`` of every sector (index into ``orbitals.sectors``; unscaled).
+
+    ``sectors`` limits the sum to those indices (the sectors an MPI rank
+    owns); a sector without occupied states gives nothing.
+    """
+
+    from ..backends.cupy import require_cupy
+
+    cp, _ = require_cupy()
+    values: dict[int, float] = {}
     for index, sector in enumerate(orbitals.sectors):
+        if sectors is not None and index not in sectors:
+            continue
         weights = orbitals.occupations[sector.states]
         occupied = np.flatnonzero(weights > OCCUPATION_THRESHOLD)
         if not occupied.size:
             continue
         with cp.cuda.Device(sector.device):
-            values = sector.products(cp, occupied, applied[index][:, occupied], diagonal=True)
-            energy += float(cp.asnumpy(values) @ weights[occupied])
+            products = sector.products(cp, occupied, applied[index][:, occupied], diagonal=True)
+            values[index] = float(cp.asnumpy(products) @ weights[occupied])
+    return values
+
+
+def apply_device_exchange(
+    orbitals: ChannelOrbitals,
+    solvers: DevicePairSolvers,
+    devices: Sequence[int],
+    *,
+    columns: str = "all",
+    known: DeviceExchangeApplication | None = None,
+) -> DeviceExchangeApplication:
+    """``W = V_x Psi`` of a channel on ``devices`` (see the module text).
+
+    ``columns="occupied"`` forms the occupied columns only (enough for the
+    energy); ``"all"`` every column.  ``known``, an application of the
+    occupied columns of the same orbitals, is completed with the empty ones
+    and consumed.
+    """
+
+    from ..backends.cupy import require_cupy
+
+    cp, _ = require_cupy()
+    started = perf_counter()
+    plan = plan_exchange(orbitals, solvers.batch_size, columns=columns, known=known)
+    # Sector orbitals of a symmetric box: the pair densities in parity classes.
+    parity = parity_context(orbitals, solvers)
+    record = getattr(solvers, "record_path", None)
+    if callable(record):
+        record("full" if parity is None else "parity")
+    # W of every sector on its device.
+    if known is not None:
+        applied = known.applied
+    else:
+        require_exchange_memory(orbitals, solvers, devices, parity=parity)
+        applied = []
+        for sector in orbitals.sectors:
+            with cp.cuda.Device(sector.device):
+                applied.append(
+                    cp.zeros((sector.rows, sector.local.size), dtype=cp.float64, order="F")
+                )
+    devices = tuple(int(device) for device in devices) or (orbitals.sectors[0].device,)
+    timing = run_exchange_tiles(
+        orbitals, solvers, plan, assign_tiles(plan.tiles, devices), applied, parity=parity
+    )
+    energy = 0.0
+    for value in sector_exchange_energies(orbitals, applied).values():
+        energy += value
     energy *= 0.5 * orbitals.spin_weight
-    pair_solves = sum(tile.pairs for tile in tiles)
-    done = set(occupied_states) | (wanted_empty if columns == "all" else set())
     return DeviceExchangeApplication(
         orbitals=orbitals,
         applied=applied,
-        columns=tuple(sorted(done)),
-        occupied=tuple(occupied_states),
+        columns=plan.done(),
+        occupied=plan.occupied,
         energy=float(energy) if known is None else float(known.energy),
-        pair_solves=int(pair_solves + (0 if known is None else known.pair_solves)),
+        pair_solves=int(plan.pair_solves + (0 if known is None else known.pair_solves)),
         poisson_seconds=float(max(timing.values(), default=0.0) + (0.0 if known is None else known.poisson_seconds)),
         seconds=float(perf_counter() - started + (0.0 if known is None else known.seconds)),
     )
@@ -2008,13 +2135,15 @@ def _right_solve_lower_transpose(cp, lower, block) -> None:
 
 
 def compress_device_exchange(
-    application: DeviceExchangeApplication, *, fraction: float = 1.0
+    application: DeviceExchangeApplication, *, fraction: float = 1.0, sectors=None
 ) -> DeviceCompressedExchange:
     """``xi_G = W_G L_G^-T`` with ``M_G = -Psi_G^T W_G = L_G L_G^T`` per sector.
 
     ``W`` is overwritten by ``xi`` (the application is consumed).  ``M_G``
     is symmetrized; its asymmetry ``max|M - M^T| / max|M|`` over the sectors
-    is reported.
+    is reported.  ``sectors`` limits the compression to those indices of
+    ``application.orbitals.sectors`` (the sectors an MPI rank owns); the
+    rank counts their columns only.
     """
 
     from ..backends.cupy import require_cupy
@@ -2028,6 +2157,8 @@ def compress_device_exchange(
     asymmetry = 0.0
     rank = 0
     for index, sector in enumerate(orbitals.sectors):
+        if sectors is not None and index not in sectors:
+            continue
         applied = application.applied[index]
         with cp.cuda.Device(sector.device):
             overlap = -sector.products(cp, np.arange(sector.local.size), applied)

@@ -7,6 +7,7 @@ PBE0, HSE06, HSE03, B3LYP, B3LYP5, B3PW91 and Hartree-Fock, self-consistent (gen
 - `<molecule>/<functional>/parsec.in` for `pbe`, `pbe0`, `hse06`, `hse03`, `b3lyp`, `b3lyp5`, `b3pw91`, `hf` (O2: with `occup.in`, 7 up and 5 down electrons), and `parsec_python.out`, the reference log of that input (one NVIDIA A100; paths shortened to repository paths).
 - `H_FHIPP.DAT`, `C_FHIPP.DAT`, `N_FHIPP.DAT`, `O_FHIPP.DAT`: copies of `src/pp_generation/NCPPs/PBE/<E>/FHI/` (Troullier-Martins, FHI98PP, PBE, no core correction). The inputs find them with `--pp-dir` (one folder for all elements; the library keeps one folder per element).
 - `qe/`: the Quantum ESPRESSO inputs, their settings, the UPF note and the QE numbers (`qe/README.md`).
+- `libxc/run_libxc.py`: the same molecules with libxc's functionals (section "libxc's functionals").
 
 ## Run one case
 
@@ -121,6 +122,53 @@ With both corrections (higher cutoff and this code's KB coefficients in QE) the 
 **B3PW91 constants.** The PW91 and PW92 pieces of this code keep Fortran PARSEC's constants, which differ from libxc's in the last digits (PW92 A, PW91 nu and C_x, the Rasolt-Geldart rs^3 term). On the converged densities libxc's constants change the B3PW91 energy by -0.3e-6 (H2) to -2.6e-6 Ry (O2).
 
 **B3LYP definitions.** `b3lyp` is B3LYP with VWN-RPA (libxc HYB_GGA_XC_B3LYP, Gaussian's), `b3lyp5` with VWN5. QE's internal `B3LYP` uses VWN5 and its own B88/LYP, which differ from libxc's by about 1e-4 Ry for H2O; QE's `B3LYP-V1R` interpolates VWN-RPA in spin differently (8e-4 Ry for O2). The references are therefore QE with libxc 402 and 475.
+
+## libxc's functionals
+
+The same inputs with the functionals of libxc (the optional library, `LibXC_Functional`; see "Functionals of
+libxc" in `src/parsec_python/README.md`): `libxc/run_libxc.py` copies a case, replaces its `Correlation_Type` by
+the libxc keyword and runs `main.py` (one A100, libxc 7.1.2 CUDA build, the libxc functional evaluated on the
+GPU, 2026-11-07):
+
+```bash
+PARSEC_LIBXC_LIBRARY=.../libxc.so python examples/0d_hybrid_functionals/libxc/run_libxc.py --out OUT
+```
+
+**The code's functionals and libxc's** (total energies, Ry; libxc - this code):
+
+| molecule | `pbe` | `gga_x_pbe gga_c_pbe` | `b3lyp` | `hyb_gga_xc_b3lyp` | `pbe0` | `hyb_gga_xc_pbeh` |
+|---|---|---|---|---|---|---|
+| H2 | -2.32971479 | -1e-8 | -2.35652351 | 0 | -2.33584725 | -1e-8 |
+| H2O | -34.34610983 | -8e-8 | -34.39690228 | 0 | -34.34067824 | -8e-8 |
+| CH4 | -16.15718582 | -6e-8 | -16.20042071 | 0 | -16.17296711 | -6e-8 |
+| CO | -43.31671520 | -9e-8 | -43.35272511 | 0 | -43.29458083 | -9e-8 |
+| N2 | -39.83042717 | -9e-8 | -39.85039763 | 0 | -39.80213906 | -9e-8 |
+| O2 (triplet) | -63.71093108 | -1.3e-7 | -63.75356897 | 0 | | |
+
+B3LYP is the same functional in both (also with spin: O2), to the printed digits, and so are the exchange
+energies `a_x E_x`. The PBE of this code differs from libxc's by the PW92 `A` of its correlation
+(`(1 - ln 2)/pi^2` against libxc's 0.0310907): 1e-8 to 1.3e-7 Ry here, and by the same in PBE0.
+
+**libxc's HSE06 (428) and HSE03 (427) against Quantum ESPRESSO with libxc** (QE's `hse06_libxc` and
+`hse03_libxc` rows, `qe/README.md`): dE = E_hyb - E_PBE (this code: the `pbe` input), Fock = `a_x E_x` (Ry).
+
+| functional | molecule | dE this code | dE QE | ddE | Fock this code | Fock QE | dFock |
+|---|---|---|---|---|---|---|---|
+| hse06 (libxc 428) | H2 | -0.00631429 | -0.00631791 | +3.6e-06 | -0.26801282 | -0.26801734 | +4.5e-06 |
+| hse06 (libxc 428) | H2O | +0.00751581 | +0.00749483 | +2.1e-05 | -1.72360290 | -1.72361325 | +1.0e-05 |
+| hse06 (libxc 428) | CH4 | -0.01277033 | -0.01278614 | +1.6e-05 | -1.23611075 | -1.23611379 | +3.0e-06 |
+| hse06 (libxc 428) | CO | +0.02581786 | +0.02581579 | +2.1e-06 | -2.03362500 | -2.03362469 | -3.1e-07 |
+| hse06 (libxc 428) | N2 | +0.03241038 | +0.03241806 | -7.7e-06 | -1.93709788 | -1.93708486 | -1.3e-05 |
+| hse03 (libxc 427) | H2 | -0.04684184 | -0.04684600 | +4.2e-06 | -0.27061363 | -0.27061929 | +5.7e-06 |
+| hse03 (libxc 427) | H2O | -0.16338835 | -0.16340967 | +2.1e-05 | -1.73325097 | -1.73326301 | +1.2e-05 |
+| hse03 (libxc 427) | CH4 | -0.17707994 | -0.17709741 | +1.7e-05 | -1.24576303 | -1.24576806 | +5.0e-06 |
+| hse03 (libxc 427) | CO | -0.18600764 | -0.18601185 | +4.2e-06 | -2.04554638 | -2.04554848 | +2.1e-06 |
+| hse03 (libxc 427) | N2 | -0.17912561 | -0.17911944 | -6.2e-06 | -1.94884254 | -1.94883094 | -1.2e-05 |
+
+The semilocal part from libxc and the screened exact exchange of this code reproduce QE's libxc hybrids within
+2.1e-5 Ry, the level of the code's own HSE06 against QE's (table above). libxc's HSE06 differs from the code's
+(QE's form, `hse06` above) by -1.1e-4 (H2O) to +1.3e-3 Ry (N2): libxc's full-range wPBEh(w = 0) exchange and
+its rescaling of s.
 
 ## Why `Cubic_Spline` is set
 

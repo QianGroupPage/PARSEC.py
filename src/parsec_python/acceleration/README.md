@@ -328,8 +328,14 @@ channel.
   `PARSEC_CUPY_XC=off` keeps the host; Exchange-correlation on the device,
   below).
 - The MPI SCF (`mpi_context`, the multi-node runner without
-  `--serial-control`) refuses a spin-polarized input: its ranks divide the
-  symmetry sectors.
+  `--serial-control`) divides the symmetry sectors of both channels among
+  its ranks (every command names the channel it is for, a rank keeps a
+  subspace of each channel in each sector it owns), for single points;
+  channels that stay on the full grid (`Spin_Symmetry_Sectors: off`, no point
+  group, LDA+U) and the forces, relaxations and molecular dynamics of
+  spin-polarized runs are refused there, and a run that the symmetry guard
+  sends to the full grid is finished in the process of the root
+  (`MULTI_GPU.md`, "Hybrid functionals on several nodes").
 - An eigensolver hook that keeps a subspace of its own and has no
   `for_spin_channel` is refused by the SCF loop, as are symmetry-reduced
   scalar-field hooks without the two-channel interface of
@@ -337,6 +343,21 @@ channel.
 
 Forces, relaxation, molecular dynamics and the B3LYP refinement take a
 spin-polarized result on every backend.
+
+### Hybrid functionals
+
+The Fock loop of a hybrid functional (`../README.md`, "Self-consistent
+hybrid functionals") runs on the GPUs of one process through `SCF/hybrid.py`
+(`DeviceExchange`, `Hamiltonian/exchange_device.py`), and on several nodes in
+the MPI runner through `SCF/hybrid_mpi.py`: the ranks divide the symmetry
+sectors, every sector basis on one GPU, and the pair densities of the
+exchange are solved on every GPU of every rank (`MULTI_GPU.md`, "Hybrid
+functionals on several nodes"). `PARSEC_MPI_EXCHANGE_TRANSPORT` (`auto`,
+`cuda`, `host`) says how its orbitals travel between the ranks,
+`PARSEC_MPI_EXCHANGE_CHUNK_BYTES` (256 MiB) bounds one message, and
+`PARSEC_MPI_EXCHANGE_OVERLAP` (`1`, the default; `0` broadcasts first) lets
+the devices start on their tiles while the orbitals of the other ranks are
+broadcast.
 
 ### LDA+U and the TS correction
 
@@ -1582,6 +1603,7 @@ them; both have run there since (`result.hartree_boundary` in the
 | `PARSEC_HARTREE_LINEAR_BACKEND` | unset or `auto` (since 2026-11-07): the conjugate gradients of the cluster Hartree solve, and the pair solves of `Energy_Refinement`, on the GPU of the orbitals wherever CuPy orbitals have the native Hartree components; the CG of the selected backend elsewhere (CPU runs, `--backend scipy` or `cupy`, periodic cells). The host CG, on the same wedge, also where the GPU CG cannot be made (out-of-memory, CUDA runtime or driver errors) and, beside a full-grid eigensolver, where the GPU Hartree arrays would take more than 1/20 of the free device memory; with symmetry sectors the arrays are counted by the memory rules of the sectors instead (`Hartree/GPU_HARTREE.md`). `cupy`: the GPU CG by name (refused where it does not apply) | `native`: the C++/OpenMP CG on the host | within the CG tolerance: totals of 109 example inputs within 1.3e-11 Ry, forces within 1.5e-11 Ry/bohr (1e-9 for CA CF4), C459H204 within 1e-9 Ry; the boundary of a full grid follows the CG onto the GPU (`PARSEC_HARTREE_BOUNDARY_BACKEND`) | `hartree_linear_backend`, `hartree_backend`, `hartree_cg_device`, `hartree_cg_device_bytes` | `Hartree/GPU_HARTREE.md` |
 | `PARSEC_HARTREE_BOUNDARY_BACKEND` | unset: the native builders; where they have no orbit table (no reduction, or the table of the raised order above 512 MiB) the GPU kernels if the orbital backend is CuPy and the plan is engaged or, since 2026-11-07, the Hartree CG runs on the GPU (`PARSEC_HARTREE_LINEAR_BACKEND`); the wedge kernels on the GPU for the wedge of the resident chain (`PARSEC_CUPY_RESIDENT_HARTREE`). `cupy`: the GPU boundary. `auto`: see `GPU_SFC_OPTIMIZATION.md` | `native`: the native builders whatever they cost | round-off where the GPU kernels take the boundary | `hartree_boundary_kernel`, `hartree_backend` | `Hartree/GPU_HARTREE.md` |
 | `PARSEC_CUPY_RESIDENT_HARTREE` | unset or `auto` (since 2026-11-07): where the GPU CG solves the symmetry wedge of the SCF fields of a sector run, the boundary of that wedge on the same GPU (the wedge kernels on an axis-reflection group, whether the plan is engaged or not) and every solve in the device-resident chain (`Hartree/cupy_resident.py`); the route before where the GPU boundary or the chain cannot be built or the GPU CG gives way, and from a solve whose device allocation fails on; also in MPI runs (the root rank). `1`: the chain by name (refused where it does not apply) | `0`: the host interface and the orbit table of the wedge on the host, bit for bit the code before (also `PARSEC_HARTREE_BOUNDARY_BACKEND=native`) | round-off: against `0`, on A100, the totals of the 85 example inputs that take the chain within 2.6e-11 Ry, exact exchange within 1.4e-10 Ry, occupied levels within 2.3e-10 Ry, forces within 1.4e-11 Ry/bohr, relaxation paths within 1.1e-12, the same SCF steps; the 30 that do not take it unchanged; 4 to 35 % less program time on one GPU, peaks within 0.1 GiB | `hartree_resident_chain`, `hartree_full_grid_transfer_policy`, `hartree_boundary_kernel`, `hartree_resident_device_bytes` | `Hartree/GPU_HARTREE.md` |
+| `PARSEC_CUPY_BLOCH_PAIR_SYMMETRY` | `on` (since 2026-11-07, new with the device exchange of periodic hybrids with k-points): each pair of two occupied states solved once for both (`Hamiltonian/bloch_exchange_device.py`) | `off`: every pair one way, the host loop's order | round-off: device and host engines within 1.3e-15 Ry (H2 box and slab, PBE0, HSE06, B3LYP spin) with either value; 20 to 46 % fewer pair solves | `pair_solves` of the Fock-loop lines of `parsec.out` | `Hybrid functionals of periodic cells on the device` below |
 | `PARSEC_HARTREE_ATOMIC_TAIL_VALUES` | `auto`: the values of the atomic tail at the exterior points come from an FP64 device kernel where the orbital backend is CuPy and from host threads elsewhere | `host`: host threads on every backend (the serial control of the MPI runner takes them); there is no former route, the tail is new | round-off | `hartree_atomic_tail_values` | `Hartree/GPU_HARTREE.md` |
 | `PARSEC_HARTREE_BOUNDARY_CHECK` | `0`: off. `n` compares, after the SCF, the boundary values of the final density at a sample of `n` unique exterior points (the innermost, those of the largest atomic tail, those nearest to an atom, random ones) with its direct Coulomb sum on the Hartree device and reports `hartree_boundary_check_*`; the maximum is that of the sample, and `n` at or above the number of points checks all (GPU boundary only; no effect on the results; its seconds are kept out of the SCF wall time) |  | none | `hartree_boundary_check_*` | `Hartree/GPU_HARTREE.md` |
 
@@ -2940,6 +2962,120 @@ water spends 0.01 s instead of 0.04 s (on a first run of a node the PBE
 kernels compile once, about 1 s on the laptop, 0.5 s on an A100 node). The
 reference CLI, CA and the other functionals are unchanged bit for bit.
 
+#### libxc on the device
+
+The functionals of libxc (`LibXC_Functional`, PARSEC 1.5's `Use_LibXC`; see
+"Functionals of libxc" in the package README) are evaluated on the GPU when
+the library that `PARSEC_LIBXC_LIBRARY` names is a CUDA build of libxc 7.1 or
+later (`bash scripts/build_libxc.sh --cuda --cuda-arch 80`; on Perlmutter
+`<prefix>/libxc/7.1.2-cuda-sm80/lib/libxc.so`).
+`V_xc/device_libxc.py`:
+
+- libxc's own kernels evaluate the functional on the device pointers of
+  CuPy arrays: each functional is initialized once per process and device
+  with `xc_func_init_flags(..., XC_FLAGS_ON_DEVICE)` (libxc 7.1; the same
+  library initializes the host functionals of the reference path with
+  `XC_FLAGS_ON_HOST`), called through ctypes with the raw pointers. libxc
+  launches on the legacy default stream: the current CuPy stream is
+  synchronized before the call and the device after it.
+- Around it the stencils of the device functionals above: the density
+  gradient and the transpose of the discrete potential (`xc_gradient`,
+  `xc_adjoint` of `device_xc_kernels.cu`), on the full grid or once per
+  symmetry orbit with the reflection signs of the flux, and packing kernels
+  (`device_libxc_kernels.cu`: `sigma`, libxc's interleaved spin layout, the
+  fluxes `2 v_aa D n_a + v_ab D n_b`) compiled with `--fmad=false` in the
+  order of the NumPy code. Host and device agree to round-off (libxc's
+  elementary functions on two processors).
+- Unpolarized, spin (also the spin channels in the symmetry sectors) and
+  the semilocal part of a libxc hybrid in the device Fock loop.
+  `planned_device_bytes`: 18 fields of the values unpolarized, 36 with spin
+  (37 with a core density), counted by the memory rules of the sectors.
+- A meta-GGA is evaluated pointwise by the same evaluator on CuPy arrays
+  (`LibxcSemilocal`, `supports_device`); its grid terms belong to the
+  meta-GGA Hamiltonian.
+- A host-only libxc in a GPU run: the host evaluates libxc (expanded to the
+  full grid in the sectors, as for any host functional); `xc_implementation`
+  names the path (`libxc CUDA float64 ... on the symmetry orbits` on the
+  device). `PARSEC_CUPY_XC=off` keeps libxc on the host as every functional.
+- `python -m parsec_python.acceleration.benchmarks.libxc_timing parsec.in`
+  times one evaluation of libxc's and of the code's device PBE on the grid
+  and orbits of an input.
+
+#### Meta-GGA functionals on the device
+
+A meta-GGA (native `scan`, or a libxc `mgga_` functional; see "Meta-GGA
+functionals" in the package README) adds an orbital term to the device
+Hamiltonians and forms `tau` (and, in the orbital form of the density
+gradient, `g`) where the orbitals are. `Hamiltonian/meta_gga_device.py`:
+
+- **The term.** `H_tau = sum_c G_c^T diag(vtau) G_c` of the centered
+  first-derivative stencil `G_c` of `Expansion_Order` (Rydberg, the exact
+  derivative of the discrete energy), and in the orbital form
+  `2 sum_c [W_c G_c + G_c^T W_c]` of `W = de/dg`. The CuPy operator adds it
+  in `apply`, `apply_into` and the Chebyshev recurrence
+  (`bind_kinetic_term`). The derivatives are CSR matrices on the device,
+  products in one CUDA kernel of a CSR matrix with a strided block
+  (`--fmad=false`), transposes stored as CSR (deterministic sums).
+- **Symmetry sectors.** The groups of the sectors are commuting involutions;
+  their 3x3 operations have common eigenvectors `q_a` (the Cartesian axes for
+  reflections), and the derivative along `q_a` maps sector `Gamma` into
+  sector `Gamma chi_a`. The term of a sector is
+  `sum_a B_a^T diag(vtau) B_a` with `B_a = U_{Gamma chi_a}^T D'_a U_Gamma`,
+  assembled once from representative rows and checked on a random vector;
+  `tau` of the sector orbitals needs no full-grid field. `W` turns with the
+  operations; its component along `q_a` has the character `chi_a` and acts
+  on the orbits shared by a sector and its target. The fields of the
+  orbital form leave and enter the SCF as Cartesian components at the orbit
+  representatives (`OrbitVectorFields`; any commuting signed-permutation
+  group).
+- **Functional.** `V_xc/meta_gga_xc.py` evaluates the functional pointwise on
+  the device (`supports_device`: the native SCAN, libxc's CUDA build) on the
+  full grid or once per orbit with the stencils of the device GGAs; groups
+  with operations that exchange axes, functionals of the Laplacian and
+  host-only libxc builds take the host functional on expanded fields.
+- **Filter bound.** Every bound term reports Gershgorin's bound of its
+  eigenvalues (`spectral_margin`). Where `vtau` has narrow spikes (low
+  density, `vtau ~ n^(-1/3)` for SCAN) the term has localized eigenvalues
+  above the rest of the spectrum that the short Lanczos run from a random
+  vector does not see, and the filter amplified them (H2O and O2 SCAN on
+  A100 stopped at "upper_bound must be greater than lower_bound").
+  `Eigensolvers/spectral_bounds.with_orbital_term` makes the filter's upper
+  bound `max(lanczos, bare + m)`, `bare` the last Lanczos bound of the same
+  operator without the term (`PARSEC_META_GGA_FILTER_BOUND=gershgorin`, the
+  default). It is safe but wide: the top of `H_0` (the Laplacian's
+  checkerboard mode, which the derivative stencil does not see) and that of
+  the term add up, and the wider interval filters less per pass (H2O SCAN,
+  orbital form, A100: 37 and 45 SCF iterations at h = 0.20 and 0.16 bohr
+  against 25 and 34 with the Lanczos bound alone; k04: 20 either way).
+  `targeted` runs a second short Lanczos recurrence from the term's
+  Gershgorin row sums with random signs, which overlap the localized modes,
+  and takes the larger of the two Lanczos bounds; `lanczos` keeps the
+  Lanczos bound alone (comparisons only). A last guard in the subspace pass
+  lowers the filter's lower end to the largest saved Ritz value below the
+  upper end where they would cross.
+- **Memory.** The matrices hold `2 x 3 x Expansion_Order` nonzeros per grid
+  point (12 bytes each), about 0.86 KiB per point at order 12, counted by
+  the memory rules of the sectors; the orbital form adds `2 W` per
+  derivative on the rows of a sector and its target and the int32 maps
+  between them (at most 120 bytes per point). Its first-order part runs in
+  the same two CSR passes per derivative (one kernel each way); on a laptop
+  GPU (H2O, h = 0.2 bohr, a sector of 95,584 rows, 16 vectors) the term takes
+  2.2 ms with it and 1.96 ms without it.
+- **Routes.** The term runs in one process on the GPUs of one node (one
+  device per sector basis) and on the CPU backends (the host term).
+  Refused: `--mpi` (with it a sector basis shared by several devices),
+  `PARSEC_CUPY_MIXED_FILTER=on` (the FP32 filter) and
+  `PARSEC_CUPY_RITZ_HANDOVER=triangular`. Captured filter graphs and a filter
+  spread over devices give way to the ordinary filter by themselves.
+- **Cost.** k04 (C185H124, h = 0.16 bohr, 4 A100, 4 sectors of 274,784 rows,
+  density form): one application of the operator to 16 vectors 1.69 ms with
+  the term against 0.90 ms without (the term alone 0.68 ms), `tau` 0.074 s
+  per SCF iteration, 173 MB per device.
+- `python -m parsec_python.acceleration.benchmarks.meta_gga_check` runs a
+  molecule of the meta-GGA references or an input (`--term-timing`,
+  `--trace`, `--bound-trace`) and prints the timings, the filter intervals and
+  the meta-GGA statistics.
+
 ### Hartree acceleration
 
 All accelerated backends use an associated-Legendre recurrence for the same
@@ -3122,6 +3258,63 @@ in 0.20 instead of 5.2 s, the Si8 cube at h 0.35 in 0.30 instead of 10.3 s;
 total energies move by 1e-12 to 1.2e-11 Ry. Wires, slabs and oblique cells
 keep the readable sums.
 
+The short-ranged terms of the local potential stop at the radius where the
+table of `r V` is the Coulomb tail `-2 Z`: to round-off for a POTRE table, to
+the digits of the file for the FHIPP, MARTINS_OLD and MARTINS_WANG tables
+(`V_ion.ionic_potential.coulomb_tail_radius`, since 2026-11-07; before, those
+tables never settled to round-off and the sums ran to the end of the table,
+75 bohr). On the orthorhombic grid of the Fortran-derived routines, which every
+`fhipp` input takes, that was both slow and, with `Cubic_Spline`, wrong: the
+error of the spline of `V` near the end of the table entered every image
+(V_ion 0.05 Ry low, an 8-atom silicon cube 1.62 Ry low in total energy).
+Setup on one A100 node (PBE silicon `fhipp` with `Cubic_Spline`, first runs),
+local potential / whole preparation, before -> after: Si8 h 0.25 (64,000
+points) 132.3 / 132.8 s -> 0.09 / 0.52 s; Si64 h 0.30 (314,432 points)
+645.3 / 647.4 s -> 0.62 / 2.79 s; Si216 h 0.30 (1,061,208 points) 2.16 / 10.0
+s now. Without `Cubic_Spline` the potential moves by 9e-10 Ry (Si64: 8.0 ->
+0.11 s). POTRE tables keep their radius, bit for bit.
+The local forces of `Cubic_Spline` species on that grid
+(`Forces/periodic_spline.py`, installed with the preparation) are the
+derivatives of this potential: the short-ranged terms over the same balls on
+the host, the long-ranged one from one FFT of the density, and the
+self-consistency and core-correction terms in the CUDA kernel of
+`Forces/periodic_device.py` (host balls without a device). Before, the
+readable routine summed every grid point of every image within
+`erfcinv(1e-26)/eta`, 43 to 86 bohr; it differs from these forces by the
+spline error between the two reaches (2.6e-7 Ry/bohr in
+`tests/test_periodic_coulomb_tail.py`). Local forces on one A100 node, readable
+-> now: Si8 h 0.25 (displaced atom) 34.1 -> 3.5 s; Si64 h 0.30 891.9 -> 5.2 s.
+The general (oblique) grid of the Fortran-derived routines takes the same
+split since 2026-11-07 where a species uses `Cubic_Spline`
+(`V_ion/periodic_setup_fortran.py`, `_oblique_local_ionic_potential`;
+`PARSEC_PERIODIC_OBLIQUE_SPLIT`: `auto`, the default; `fast` for every
+species; `readable` for the readable direct sum, the route before). The
+readable sum reaches the erfc cutoff of `eta = sqrt(pi)/V^(1/3)` plus the
+diameter of the cell, which runs into the spline error near the end of the
+table as the cell grows: an fcc silicon cell of 54 atoms at h 0.30 had its
+local potential 0.049 Ry low (about -10 Ry in the total energy), 16 atoms
+1.5e-5 Ry. Primitive cells move by less than 1e-4 Ry: A100, PBE `fhipp`,
+E(split) - E(readable) = -2.7e-5 Ry (Si, h 0.25, Gamma and 2x2x2 and 3x3x3
+meshes), -4.2e-5 (C, h 0.14), -3.6e-5 (MgO, h 0.14). Against Quantum
+ESPRESSO with the same tables (the converged cutoff and the KB-energy shift of
+`refs/pbc`), five of the six cases come closer: Si +1.9e-5, +2.6e-5, +4.5e-6
+-> -8.7e-6, -1.5e-6, -2.3e-5; C +2.0e-4, +1.3e-4 -> +1.6e-4, +8.9e-5; MgO
++5.3e-4 -> +5.0e-4. The POTRE files of the same potentials move by 2e-6 (their
+denser radial grid). Setup of the local potential: 2.6-7 s -> 0.04-0.15 s for
+these cells, 89.9 -> 0.28 s for Si16 and 817 -> 1.0 s for Si54. Their local
+forces are the derivatives of this potential (`Forces/periodic_spline.py`
+over the lattice balls of `V_ion/periodic_setup.py`). The atomic densities
+of the general grid and the density terms of these forces (30-bohr balls for
+silicon: 13 s for Si16 and 44 s for Si54 on an A100 node) run in two lattice
+kernels on the device where one is usable
+(`V_ion/periodic_device.py::device_lattice_atomic_density`,
+`Forces/periodic_device.py::device_lattice_density_forces`), equal to the host
+sums to round-off (3e-15 relative); laptop RTX 5070, fcc Si16 h 0.30:
+density 48 -> 0.11 s, local forces 95 -> 1.7 s. A `Cubic_Spline` core
+density keeps the host sum.
+Cells whose species all interpolate linearly keep the readable sum (bit for
+bit; the split gives the same potential to 1e-11 Ry).
+
 SCF seconds on one A100 (runs that shared the CPUs of a node; code
 defaults, warm CuPy cache), before -> after:
 
@@ -3139,6 +3332,98 @@ A first run with an empty CuPy kernel cache compiles the kernels of the
 accelerated eigensolver, the device workers and these solves (20-45 s on a
 shared A100 node); the device Hartree's own share is 6 kernels (one module for
 the CG).
+
+### Hybrid functionals of periodic cells on the device
+
+The Fock loop of a periodic cell (`../README.md`, the periodic part of
+"Self-consistent hybrid functionals"; host definitions in
+`V_xc/bloch_exchange.py` and `SCF/hybrid_periodic.py`) takes two device
+routes, both with the exchange kernel and FFT box of the host loop, so that
+their numbers are the host's to round-off:
+
+- **Gamma point, without spin** (bulk or slab, real orbitals): the
+  accelerated driver runs the device Fock loop of isolated systems
+  (`SCF/hybrid.py`, `Hamiltonian/exchange_device.py`: tiles of orbital blocks
+  on every GPU of the process, each pair of two occupied states solved once,
+  `-a_x xi xi^T` in the CuPy operator) with
+  `Hamiltonian/bloch_exchange_device.py::DevicePeriodicPairSolvers` in place
+  of the Kronecker solver: a batch of real pair densities goes through a
+  real-to-complex cuFFT of the FFT box (a slab's box zero-padded along z and
+  the potentials cropped), is multiplied by the half spectrum of `K(G)` and
+  transformed back.
+- **k-points, and spin** (also spin at the Gamma point, the 1x1x1 Bloch loop
+  of the reference solver): the reference CLI runs the Fock loop with the
+  k-point drivers on the device k-point pool (`SCF/kpoint_parallel.py`, one
+  worker per GPU, each k-point's Ritz subspace resident on its device), and
+  `SCF/hybrid_periodic.py::DeviceBlochExchange` (installed into
+  `parsec_python.SCF.hybrid_periodic` with the package) is the engine of the
+  loop where that pool runs on CUDA devices. The orbitals stay where the
+  workers keep them (`PooledKPointSolver.device_vectors`; the Ritz states
+  stay on their devices between the loops). `W_t = V_x U_t`
+  (`apply_device_bloch_exchange`): every device takes one copy of the occupied
+  columns of every k-point of the mesh, tiles of up to 32 target columns of a
+  k-point go to the GPUs (most expensive first, the GPU of the k-point on a
+  tie), and for every source `k'` of the mesh (`-k` as `conj(u_k)`) a CUDA
+  kernel writes a chunk of pair densities `conj(u_mk') u_nt / dV` straight
+  into the FFT box (1 GiB of them, at most 5 % of the device's memory and at
+  least `Exx_Batch_Size`: fewer, larger transforms leave less Python per
+  transform to the threads of the devices, which run it in turn), cuFFT
+  transforms them in place, they are multiplied by `K(k_t - k' + G)` (built
+  on the device per `q` in one launch, `Hartree/exchange_kernel_device.py`,
+  kept per device up to 5 % of its memory) and transformed back, and a second
+  kernel adds `-(f_m/N) u_mk' w` to `W`. Each device works on a thread of its
+  own kept for the run (cuFFT plans are cached per thread).
+  The pairs of two occupied states are solved once: the potential of the
+  partner pair is `conj(w)` for a source of the mesh point itself and the
+  same `w` for the partner `-k` of a representative (when the target has a
+  partner too), and a third kernel adds it to the other state's `W`
+  (`PARSEC_CUPY_BLOCH_PAIR_SYMMETRY=off`: every pair one way, the order of
+  the host loop). A build of fewer than 1e9 pair-density points runs on the
+  GPU that holds the most k-points (several GPUs only add launch and thread
+  overhead there). ACE per k-point on the GPU of its orbitals
+  (`compress_device_bloch_exchange`: `M = -U^H W` by one ZGEMM, cuSOLVER
+  Cholesky, ZTRSM into `xi`), and `KPointExchangeHamiltonian` becomes
+  `-a_x xi (xi^H X)` in the device Bloch operator (`Hamiltonian/device_bloch.py`),
+  so the CHEBFF and SUBSPACE filters, the Lanczos bounds, Rayleigh-Ritz and
+  the residuals of the device eigensolver hold it. `E_x`, `E_x(P, P0)` and the
+  overlaps of the outer DIIS are formed where the orbitals are; the result of
+  the loop holds host copies of the orbitals (forces, output). A build whose
+  copies, tile work and `W` do not fit a device is refused with the numbers.
+
+The device k.grad of a Bloch Hamiltonian is cached by its gradient operators
+and k-point (since 2026-11-07): the k-point drivers build a new host
+Hamiltonian for every task and SCF step, and the former cache by that object
+kept one host and one device copy of k.grad per task and step (17.6 GB of
+host memory for Si at h 0.20 with 36 k-points on master).
+
+Measured on A100 nodes (2026-11-07, first runs of `main.py`, PBE0 with
+`Exx_Tolerance` 1e-8 Ry, the inputs of the periodic references of the round:
+Si fcc a = 10.26 bohr at h 0.25 (28^3 points, 8 states), the cubic Si8 cell
+(41^3, 20 states), h-BN at h 0.18 (26x26x168, the FFT box padded to 336
+planes, 8 states) and a 64-atom Si cell at h 0.30 (68^3, 140 states); seconds
+of the program, of its SCF, of the k-point or Gamma eigensolver and of the
+exchange builds (pair solves on the GPUs, ACE), peak device memory by
+`benchmarks/periodic_hybrid_run.py`):
+
+| input | k-points solved | GPUs | program s | SCF s | eigensolver s | exchange s | pair solves | peak GiB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Si 2x2x2 | 8 | 1 | 22.6 | 12.8 | 11.4 | 0.67 | 6,736 | 0.8 |
+| Si 3x3x3 | 14 | 1 / 4 | 31.1 / 32.9 | 22.6 / 22.1 | 19.5 / 18.7 | 2.2 / 2.4 | 40,102 | 1.0 / 0.8 |
+| Si 4x4x4 | 36 | 1 / 4 | 79.4 / 76.4 | 62.7 / 63.3 | 54.5 / 53.1 | 6.8 / 8.5 | 306,432 | 2.3 / 1.5 |
+| Si8 2x2x2 | 8 | 1 / 4 | 75.0 / 40.7 | 67.0 / 29.8 | 57.4 / 23.8 | 3.0 / 2.8 | 82,368 / 90,624 | 3.1 / 2.4 |
+| h-BN 6x6x1 | 20 | 1 / 4 | 221.5 / 142.8 | 182.6 / 105.2 | 169.3 / 92.8 | 6.3 / 5.6 | 95,664 | 4.0 / 2.5 |
+| Si64 Gamma | 1 (real) | 1 / 4 | 162.7 / 156.4 | 158.1 / 151.5 | 133.9 / 134.8 | 13.3 / 5.9 | 111,360 | 9.0 / 9.2 |
+| Si64 2x2x2 | 8 | 4 | 423.8 | 415.4 | 351.4 | 43.2 | 2,707,968 | 15.3 |
+
+The exchange is 4 to 13 % of these SCF loops. The eigensolver of the k-point
+pool takes most of the rest, and on cells of a few ten thousand points (Si
+at 28^3) four GPUs do not shorten it: each k-point's solve is a series of
+small launches from Python, and the threads of the GPUs take turns at them.
+The eigensolver of the Gamma point uses one GPU (its four-GPU exchange builds
+are faster: 13.3 against 5.9 s). The FFT box is the grid of the cell, so its
+edges set the cost of the transforms: one batch of 32 complex transforms
+takes 1.28 ms at 64^3, 2.46 ms at 68^3 (4 x 17), 1.89 ms at 72^3, and 0.60 ms
+at 41^3 against 0.34 ms at 40^3 (A100, `benchmarks/exchange_fft_sizes.py`).
 
 ## Selection, fallback, and provenance
 

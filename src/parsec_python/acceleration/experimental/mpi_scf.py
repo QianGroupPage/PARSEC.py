@@ -19,17 +19,25 @@ class MPISCFError(RuntimeError):
     """A worker failed; the outer launcher must abort the MPI job."""
 
 
-def sector_device_groups(representations, size, rank, devices, shared=False):
+def sector_device_groups(representations, size, rank, devices, shared=False, exchange=False):
     """Assign sectors cyclically to ranks and disjoint GPU groups when possible.
 
     With ``shared`` the one sector of a run without symmetry belongs to every
     rank, each of which holds a share of its basis on its first device
-    (:mod:`..Eigensolvers.mpi_shared_basis`).
+    (:mod:`..Eigensolvers.mpi_shared_basis`).  With ``exchange`` (a hybrid
+    functional, ``SCF/hybrid_mpi.py``) every sector basis lies on one device
+    of its rank, which the exchange operator needs, and a rank may own no
+    sector: every device of every rank solves pair densities of the exchange.
     """
     representations, size, rank = int(representations), int(size), int(rank)
     devices = tuple(int(device) for device in devices)
     if not devices or len(set(devices)) != len(devices) or min(devices) < 0:
         raise ValueError('devices must be a nonempty list of distinct nonnegative indices')
+    if exchange:
+        if representations < 1 or size < 1 or not 0 <= rank < size:
+            raise ValueError('MPI ranks and representations must be positive')
+        owned = tuple(range(rank, representations, size))
+        return {sector: (devices[index % len(devices)],) for index, sector in enumerate(owned)}
     if shared:
         if representations != 1 or not 0 <= rank < size:
             raise ValueError('only the single sector of a run without symmetry is shared by the ranks')
@@ -56,8 +64,17 @@ class MPISectorContext:
     One failure is not collective: a pool release that a rank waits for behind
     the collective calls of its density command (_release_joined) is raised by
     that rank alone, and the others learn of it by the launcher's Abort.
+
+    ``exchange`` (a hybrid functional): every sector basis on one device, a
+    rank may own no sector, every rank keeps the sector orbitals of its last
+    solve (``_mpi_retained_results`` of the solver) for the exchange, and the
+    commands ``exx_*`` go to the rank's ``exchange_service``
+    (``SCF/hybrid_mpi.py``).  Every command carries the spin channel it is
+    for (the active one of the root's solver, or the channel of the orbitals
+    of a density); a rank serves both channels of a spin-polarized loop in
+    the sectors it owns.
     """
-    def __init__(self, comm):
+    def __init__(self, comm, *, exchange=False):
         self.comm = comm
         self.rank, self.size = int(comm.rank), int(comm.size)
         self.root = 0
@@ -70,13 +87,25 @@ class MPISectorContext:
         self.command_counts = {}
         # Wall seconds of each command on this rank, collective calls included.
         self.command_seconds = {}
+        self.exchange = bool(exchange)
+        self.retain_orbitals = bool(exchange)
+        self.exchange_service = None
+
+    def planned_groups(self, representations, devices):
+        """The device groups of the sectors this rank will own (what ``configure`` assigns)."""
+        return sector_device_groups(representations, self.size, self.rank, devices,
+                                    shared=self._shared(representations), exchange=self.exchange)
+
+    def _shared(self, representations):
+        # More ranks than the one sector of a run without symmetry: they share its basis (not with a hybrid).
+        return int(representations) == 1 and self.size > 1 and not self.exchange
 
     def configure(self, representations, devices):
-        # More ranks than the one sector of a run without symmetry: they share its basis.
-        shared = int(representations) == 1 and self.size > 1
+        shared = self._shared(representations)
         error = None
         try:
-            groups = sector_device_groups(representations, self.size, self.rank, devices, shared=shared)
+            groups = sector_device_groups(representations, self.size, self.rank, devices, shared=shared,
+                                          exchange=self.exchange)
         except Exception as exc:
             groups = {}
             error = f'{type(exc).__name__}: {exc}'
@@ -92,24 +121,29 @@ class MPISectorContext:
         self.topology = tuple(record[1] for record in records)
         return groups
 
-    def execute(self, solver, command, payload=None, *, density_builder=None):
+    def execute(self, solver, command, payload=None, *, density_builder=None, channel=None):
         if self.rank != self.root:
             raise MPISCFError('only root may dispatch SCF commands')
         if self.failed or self.stopped:
             raise MPISCFError('MPI sector context is no longer active')
-        self.comm.bcast((command, payload), root=self.root)
-        return self._execute_local(solver, command, payload, density_builder)
+        if channel is None:
+            channel = self._active_channel(solver)
+        self.comm.bcast((command, payload, channel), root=self.root)
+        return self._execute_local(solver, command, payload, density_builder, channel)
 
     def worker_loop(self, solver, density_builder):
         if self.rank == self.root:
             raise MPISCFError('root must run SCF, not the worker loop')
         try:
             while True:
-                command, payload = self.comm.bcast(None, root=self.root)
+                message = self.comm.bcast(None, root=self.root)
+                # (command, payload, spin channel); a command without a channel names none.
+                command, payload = message[0], message[1]
+                channel = message[2] if len(message) > 2 else None
                 if command == 'stop':
                     self.stopped = True
                     return
-                self._execute_local(solver, command, payload, density_builder)
+                self._execute_local(solver, command, payload, density_builder, channel)
         finally:
             solver.restore_memory_allocator()
 
@@ -117,8 +151,26 @@ class MPISectorContext:
         if self.rank != self.root:
             raise MPISCFError('only root may stop workers')
         if not self.failed and not self.stopped:
-            self.comm.bcast(('stop', None), root=self.root)
+            self.comm.bcast(('stop', None, None), root=self.root)
             self.stopped = True
+
+    @staticmethod
+    def _active_channel(solver):
+        """The spin channel the root's solver serves now, ``None`` without spin channels."""
+        if getattr(solver, '_spin_channels', None) is None:
+            return None
+        return int(solver._active_spin_channel)
+
+    @staticmethod
+    def _select_channel(solver, channel):
+        """Put spin channel ``channel`` in place in ``solver``; return the channel to put back (or None)."""
+        if channel is None or solver is None:
+            return None
+        if getattr(solver, '_spin_channels', None) is None:
+            solver.for_spin_channel(int(channel))
+        previous = int(solver._active_spin_channel)
+        solver._activate_spin_channel(int(channel))
+        return previous
 
     def update_potential(self, solver, potential):
         from ..SCF.symmetry_fields import SymmetryScalarField
@@ -130,11 +182,14 @@ class MPISectorContext:
             values = solver.decomposition.invariant_wedge_values(potential)
         self.execute(solver, 'potential', np.ascontiguousarray(values, dtype=np.float64))
 
-    def _execute_local(self, solver, command, payload, density_builder):
+    def _execute_local(self, solver, command, payload, density_builder, channel=None):
         started = perf_counter()
+        previous = self._select_channel(solver, channel)
         try:
             return self._execute_counted(solver, command, payload, density_builder)
         finally:
+            if previous is not None:
+                solver._activate_spin_channel(previous)
             self.command_seconds[command] = self.command_seconds.get(command, 0.0) + perf_counter() - started
 
     def _execute_counted(self, solver, command, payload, density_builder):
@@ -151,7 +206,7 @@ class MPISectorContext:
                 value = np.ascontiguousarray(value, dtype=np.float64)
                 if value.shape != (solver.decomposition.wedge_size,) or not np.all(np.isfinite(value)):
                     raise ValueError('local density must be a finite physical wedge field')
-            elif command == 'forces':
+            elif command in ('forces', 'spin_forces'):
                 value = np.ascontiguousarray(value, dtype=np.float64)
                 if value.ndim != 2 or value.shape[1] != 3 or not np.all(np.isfinite(value)):
                     raise ValueError('local force terms must be finite, three per projector')
@@ -191,7 +246,7 @@ class MPISectorContext:
             # rank goes on: the root to its Hartree solve, a worker to the next command.
             self._release_joined(density_builder)
             return total
-        if command == 'forces':
+        if command in ('forces', 'spin_forces'):
             # One row per projector on every rank: the ranks hold the same atoms.
             total = np.empty_like(value)
             self.comm.Allreduce(value, total)
@@ -218,9 +273,15 @@ class MPISectorContext:
             raise MPISCFError(f'density pool release failed: rank {self.rank}: {type(exc).__name__}: {exc}') from exc
 
     def _apply(self, solver, command, payload, density_builder):
+        if command.startswith('exx_'):
+            # A piece of the Fock loop of a hybrid functional (SCF/hybrid_mpi.py).
+            if self.exchange_service is None:
+                raise RuntimeError(f'rank {self.rank} has no exchange service for {command}')
+            return self.exchange_service.handle(command, payload)
         if command == 'reset':
             solver._reset_local()
             solver._mpi_latest_results = {}
+            solver._mpi_retained_results = {}
         elif command == 'configure_memory':
             solver._configure_large_problem_allocator(payload)
         elif command == 'potential':
@@ -229,13 +290,18 @@ class MPISectorContext:
         elif command == 'solve':
             requested = tuple(index for index in payload['representations'] if index in self.device_groups)
             latest = solver._mpi_latest_results
+            # The orbitals that a hybrid's exchange reads: those of the last solve of every sector,
+            # kept past the density and a new SCF loop (as the views of one process are).
+            retained = solver._mpi_retained_results if self.retain_orbitals else {}
             for index in requested:
                 latest.pop(index, None)
+                retained.pop(index, None)
             if self.rank != self.root:
                 solver._sector_counts = list(payload['counts'])
             result = solver._run_local_sector_jobs(requested, payload['counts'], payload['settings'],
                                                    reset=payload['reset'])
             latest.update(result)
+            retained.update(result)
             if self.rank != self.root:
                 # The root counts every sector from the records it gathers; a worker its own.
                 record = getattr(solver, '_record_handover', None)
@@ -281,6 +347,9 @@ class MPISectorContext:
             # Nonlocal force terms of the sectors of this rank, from the states its solvers hold.
             representations, columns, occupations = payload
             return solver._projector_force_terms_local(representations, columns, occupations)
+        elif command == 'spin_forces':
+            # The same for both spin channels of a spin-polarized loop, summed.
+            return solver._spin_projector_force_terms_local(payload)
         else:
             raise ValueError(f'unknown MPI SCF command: {command}')
 
@@ -299,7 +368,10 @@ class MPISymmetryDensityBuilder:
             raise ValueError('occupation count differs from the global selected states')
         payload = (wavefunctions.representations, wavefunctions.representation_columns,
                    weights, float(volume_element))
-        values = self.context.execute(self.solver, 'density', payload, density_builder=self.local_builder)
+        # The orbitals of a spin channel are that channel's on every rank, whichever channel the
+        # root's solver serves now.
+        values = self.context.execute(self.solver, 'density', payload, density_builder=self.local_builder,
+                                      channel=getattr(wavefunctions, 'spin_channel', None))
         reducer = getattr(self.local_builder, 'reducer', None)
         return reducer.field(values) if reducer is not None else values[self.solver.decomposition.reduction.full_to_wedge]
 

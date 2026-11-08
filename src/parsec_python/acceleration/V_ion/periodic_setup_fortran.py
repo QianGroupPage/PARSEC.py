@@ -77,11 +77,18 @@ above round-off: the reaches of the device builder :mod:`.periodic_device` (``lo
 tail or the end of the non-Coulomb part of ``r V``; ``density_reach``: 1e-16 of the density peak).
 That drops the round-off terms that ``table`` keeps (about 6000 images per atom for an 8-atom silicon
 cube; 90-99 % of the preparation time of an orthorhombic cell) and changes the last bits of the fields
-(1e-13 Ry, 1e-16 electrons/bohr^3) and of the energies (1e-11 Ry).  ``table`` (the default up to
-2026-10-30) sums to the end of the radial tables, bit for bit the readable definitions; the accelerated
-driver's cache of preparations keys the two apart.  The local potential of a ``Cubic_Spline`` species
-takes the physical reach under both rules (``_local_reach``: the spline's own tail near the end of a
-table is no part of the potential).
+(1e-13 Ry, 1e-16 electrons/bohr^3) and of the energies (1e-11 Ry) for the POTRE tables, whose ``r V`` is
+``-2 Z`` to round-off.  The tables written with fewer digits (FHIPP, MARTINS_OLD, MARTINS_WANG) end their
+physical reach where ``r V`` is ``-2 Z`` to those digits
+(:func:`parsec_python.V_ion.ionic_potential.coulomb_tail_radius`, since 2026-11-07): ``table`` adds their noise
+out to the end of the table, 1e-9 Ry in the potential of FHIPP silicon, 1.5e-6 Ry in the mean potential of the
+MARTINS_WANG Na table of the tests.  ``table`` (the default up to 2026-10-30) sums to the end of the radial
+tables, bit for bit the readable definitions; the accelerated driver's cache of preparations keys the two
+apart.  The device fields and their forces (:mod:`.periodic_device`, a calculation with forces or moving atoms)
+take the physical reach under both rules.  The local potential of a ``Cubic_Spline`` species takes the
+physical reach under both rules (``_local_reach``: the spline's own tail near the end of a table is no part of
+the potential; a table with no Coulomb tail is summed to its end with a warning,
+:func:`parsec_python.V_ion.ionic_potential.warn_spline_without_coulomb_tail`).
 """
 
 from __future__ import annotations
@@ -113,6 +120,15 @@ _ERF_CHECKED_UP_TO = 1000.0
 REACH_RULES = ("table", "physical")
 #: The rule where ``PARSEC_PERIODIC_SETUP_REACH`` is unset or empty (``table`` up to 2026-10-30).
 DEFAULT_REACH_RULE = "physical"
+
+#: ``PARSEC_PERIODIC_OBLIQUE_SPLIT``: the local potential of the general (oblique) grid of these routines from the
+#: split of the orthorhombic grid (:func:`_oblique_local_ionic_potential`) or from the readable direct sum.
+#: ``auto`` (the default since 2026-11-07): the split where a species uses ``Cubic_Spline`` (the readable sum reaches
+#: the spline error near the end of the table as the cell grows: 0.049 Ry in the potential of a 54-atom fcc silicon
+#: cell), the readable sum otherwise (its potential, to round-off); ``fast``: the split for every species;
+#: ``readable``: the readable sum (the route before 2026-11-07, for comparison).
+OBLIQUE_SPLITS = ("auto", "fast", "readable")
+DEFAULT_OBLIQUE_SPLIT = "auto"
 
 
 def _axis_spacing(grid: PeriodicRealSpaceGrid) -> tuple[np.ndarray, np.ndarray, float]:
@@ -215,11 +231,13 @@ def grid_ball(grid, centre: np.ndarray, radius: float):
     return rows[keep], relative[keep], distances[keep]
 
 
-def _atom_balls(grid, position: np.ndarray, radius: float):
+def _atom_balls(grid, position: np.ndarray, radius: float, *, vectors: bool = False):
     """Yield ``(rows, distances)`` of the grid points within ``radius`` of each periodic image of an atom.
 
     One item per image box, so a cell much smaller than ``radius`` (thousands of overlapping images) is
-    never held in memory at once; rows repeat across images and the caller sums over them.
+    never held in memory at once; rows repeat across images and the caller sums over them.  With
+    ``vectors=True`` each item is ``(rows, distances, relative)``, ``relative`` the displacements of the
+    points from the image (what a force needs).
     """
     n, sides, spacing = _axis_spacing(grid)
     shift = _plain_shift(grid)
@@ -241,7 +259,10 @@ def _atom_balls(grid, position: np.ndarray, radius: float):
                 distance = np.linalg.norm(relative, axis=1)
                 keep = distance <= radius
                 if np.any(keep):
-                    yield box[keep], distance[keep]
+                    if vectors:
+                        yield box[keep], distance[keep], relative[keep]
+                    else:
+                        yield box[keep], distance[keep]
 
 
 # ---------------------------------------------------------------------------
@@ -621,9 +642,11 @@ def _short_range_species(potential, specification, padding, eta, reach) -> _Shor
 
 
 def _short_range_by_balls(
-    total, grid, atoms, positions, potentials, specifications, eta, reach_of
+    total, grid, atoms, positions, potentials, specifications, eta, reach_of, balls=None
 ) -> None:
-    """``total += sum_a sum_images V_a + 2 Z erf(eta r)/r`` over the balls of :func:`_atom_balls`."""
+    """``total += sum_a sum_images V_a + 2 Z erf(eta r)/r`` over the balls of :func:`_atom_balls` (or of ``balls``,
+    the same generator for another grid)."""
+    balls = _atom_balls if balls is None else balls
     pending_rows: list[np.ndarray] = []
     pending_distances: list[np.ndarray] = []
     pending_points = 0
@@ -651,7 +674,7 @@ def _short_range_by_balls(
         if atom.symbol != batch_symbol:
             flush()
             batch_symbol = atom.symbol
-        for rows, distances in _atom_balls(grid, position, reach_of(atom.symbol)):
+        for rows, distances in balls(grid, position, reach_of(atom.symbol)):
             pending_rows.append(rows)
             pending_distances.append(distances)
             pending_points += rows.size
@@ -765,7 +788,10 @@ def _local_reach(potential, specification, eta: float, erfc_cutoff: float, rule:
     if rule == "physical" or specification.use_spline:
         from .periodic_device import coulomb_radius
 
-        return max(erfc_cutoff, coulomb_radius(potential, specification.local_angular_momentum))
+        reach = max(erfc_cutoff, coulomb_radius(potential, specification.local_angular_momentum))
+        if specification.use_spline:
+            _ionic.warn_spline_without_coulomb_tail(potential, specification.local_angular_momentum, reach)
+        return reach
     # beyond the table of the pseudopotential V_a is exactly -2 Z/r, but inside it V_a differs from
     # the Coulomb tail, so the ball reaches the larger of the two radii
     return max(erfc_cutoff, float(potential.interpolation_cutoff))
@@ -843,6 +869,10 @@ def fft_local_ionic_potential(
             grid, atoms, potentials, specifications, lattice_vectors, eta, tolerance
         )
     if not _fft_handles(grid, lattice_vectors):
+        if oblique_fast(grid, specifications, atoms):
+            return _oblique_local_ionic_potential(
+                grid, atoms, potentials, specifications, lattice_vectors, eta, tolerance
+            )
         return None
     n, sides, spacing = _axis_spacing(grid)
     volume = float(np.prod(sides))
@@ -877,6 +907,70 @@ def fft_local_ionic_potential(
     total += -(2.0 * np.pi * float(np.sum(charges)) / volume) * (
         1.0 / reference_eta**2 - 1.0 / fast_eta**2
     )
+    return total
+
+
+def oblique_split() -> str:
+    """``PARSEC_PERIODIC_OBLIQUE_SPLIT``: ``auto`` (default), ``fast`` or ``readable`` (see :data:`OBLIQUE_SPLITS`)."""
+    value = (
+        os.environ.get("PARSEC_PERIODIC_OBLIQUE_SPLIT", DEFAULT_OBLIQUE_SPLIT).strip().lower()
+        or DEFAULT_OBLIQUE_SPLIT
+    )
+    if value not in OBLIQUE_SPLITS:
+        raise ValueError(
+            f"PARSEC_PERIODIC_OBLIQUE_SPLIT must be one of {', '.join(OBLIQUE_SPLITS)}, got {value!r}"
+        )
+    return value
+
+
+def oblique_fast(grid, specifications, atoms) -> bool:
+    """Whether :func:`fft_local_ionic_potential` builds the potential of this general (oblique) grid of the
+    Fortran-derived routines: ``PARSEC_PERIODIC_OBLIQUE_SPLIT`` ``fast``, or ``auto`` with a ``Cubic_Spline`` species
+    among ``atoms``."""
+    if not (
+        getattr(grid, "is_general_periodic", False)
+        and not getattr(grid, "is_confined_periodic", False)
+        and uses_fortran_routines(grid)
+    ):
+        return False
+    split = oblique_split()
+    if split == "auto":
+        return any(
+            getattr(specifications[symbol], "use_spline", False)
+            for symbol in dict.fromkeys(atom.symbol for atom in atoms)
+        )
+    return split == "fast"
+
+
+def _oblique_local_ionic_potential(grid, atoms, potentials, specifications, lattice_vectors, eta, tolerance):
+    """The split of the orthorhombic grid on the general grid of these routines (:func:`oblique_fast`).
+
+    The Fourier series of :func:`.periodic_setup._structure_factor_series` (any lattice) at the ``eta`` of
+    :func:`.periodic_setup.fast_splitting`, the short-ranged terms ``V_a + 2 Z erf(eta r)/r`` (``Cubic_Spline`` as the
+    species asks) over the balls of :func:`.periodic_setup._atom_balls` with the reach of :func:`_local_reach`, and the
+    ``G = 0`` constant of the reference ``eta``.  The points of the general grid lie at ``sum_m (i_m + s_m) a_m/n_m``,
+    the grid of those helpers.  Linearly interpolated species get the readable potential to round-off; ``Cubic_Spline``
+    species lose the spline error of ``-2 Z/r`` that the readable sum adds out to its erfc reach.
+    """
+    from . import periodic_setup as _default
+
+    lattice = np.asarray(lattice_vectors, dtype=float)
+    volume = abs(float(np.linalg.det(lattice)))
+    reference_eta, _, _ = _ewald._ewald_cutoffs(volume, eta, tolerance)
+    fast_eta, erfc_cutoff, _ = _default.fast_splitting(grid, lattice, tolerance)
+    positions = np.array([np.asarray(atom.position, dtype=np.float64) for atom in atoms])
+    charges = np.array([potentials[atom.symbol].ionic_charge for atom in atoms], dtype=np.float64)
+    total = _default._structure_factor_series(grid, positions, charges, fast_eta, tolerance, lattice)
+    rule = reach_rule()
+    reaches = {
+        symbol: _local_reach(potentials[symbol], specifications[symbol], fast_eta, erfc_cutoff, rule)
+        for symbol in dict.fromkeys(atom.symbol for atom in atoms)
+    }
+    _short_range_by_balls(
+        total, grid, atoms, positions, potentials, specifications, fast_eta, reaches.__getitem__,
+        balls=_default._atom_balls,
+    )
+    total += -(2.0 * np.pi * float(np.sum(charges)) / volume) * (1.0 / reference_eta**2 - 1.0 / fast_eta**2)
     return total
 
 
@@ -1006,7 +1100,14 @@ def _density_provider(grid, atoms, potentials, specifications, lattice_vectors, 
         return periodic_atomic_density(
             grid, atoms, potentials, specifications, lattice_vectors, core, reaches=reaches
         )
-    return periodic_atomic_density(grid, atoms, potentials, specifications, lattice_vectors, core)
+    found = periodic_atomic_density(grid, atoms, potentials, specifications, lattice_vectors, core)
+    if found is None:
+        # Fortran's general (oblique) grid: the same sum on the device where one is usable (round-off equal; the
+        # readable lattice-ball sum spends 13-44 s on the 30-bohr valence balls of a 16- to 54-atom fcc cell)
+        from .periodic_device import device_lattice_atomic_density
+
+        found = device_lattice_atomic_density(grid, atoms, potentials, specifications, lattice_vectors, core=core)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -1040,11 +1141,15 @@ def uninstall() -> None:
 
 
 __all__ = [
+    "DEFAULT_OBLIQUE_SPLIT",
     "DEFAULT_REACH_RULE",
+    "OBLIQUE_SPLITS",
     "REACH_RULES",
     "fft_local_ionic_potential",
     "grid_ball",
     "install",
+    "oblique_fast",
+    "oblique_split",
     "periodic_atomic_density",
     "reach_rule",
     "setup_threads",

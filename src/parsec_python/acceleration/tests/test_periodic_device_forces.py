@@ -167,11 +167,21 @@ class DeviceFieldTests(unittest.TestCase):
                 general, _ATOMS, self.si_potentials, self.si, _FCC.lattice_vectors, None, 1.0e-14
             )
         )
-        self.assertIsNone(
-            device_fields.device_atomic_density(
-                general, _ATOMS, self.si_potentials, self.si, _FCC.lattice_vectors
-            )
+        # The atomic density of an oblique cell (the general grid of the Fortran-derived routines) is no longer
+        # declined: the lattice kernel of device_lattice_atomic_density sums it (round 2026-11-08), equal to the
+        # host sum to round-off (one thread per point adds the images in another order).
+        density = device_fields.device_atomic_density(
+            general, _ATOMS, self.si_potentials, self.si, _FCC.lattice_vectors
         )
+        self.assertIsNotNone(density)
+        with mock.patch.dict(os.environ, {"PARSEC_DEVICE": "cpu"}):
+            self.assertIsNone(
+                device_fields.device_atomic_density(general, _ATOMS, self.si_potentials, self.si, _FCC.lattice_vectors)
+            )
+            host = superpose_atomic_density(general, _ATOMS, self.si_potentials, self.si, _FCC.lattice_vectors)
+        scale = float(np.max(np.abs(host)))
+        self.assertGreater(scale, 0.0)
+        np.testing.assert_allclose(density, host, rtol=0.0, atol=1.0e-14 * scale)
         splined = {"Si": SpeciesPotential(DATA / "Si_POTRE.DAT", 2, use_spline=True)}
         self.assertIsNone(
             device_fields.device_local_ionic_potential(
@@ -201,9 +211,12 @@ class DeviceFieldTests(unittest.TestCase):
             periodic_forces._local_force_provider,
         )
         self.assertEqual(before, after)
-        # outside the scope: the host builder of the fast periodic preparation (the readable sum, same bits)
+        # outside the scope: the host builder of the fast periodic preparation (the readable sum, same bits) and
+        # the host forces of its Cubic_Spline potential (the readable sums for every other cell)
+        from parsec_python.acceleration.Forces.periodic_spline import spline_periodic_local_forces
+
         self.assertIs(ionic_module._atomic_density_provider, periodic_setup._density_provider)
-        self.assertIsNone(periodic_forces._local_force_provider)
+        self.assertIs(periodic_forces._local_force_provider, spline_periodic_local_forces)
         with mock.patch.dict(os.environ, {"PARSEC_DEVICE": "cpu"}):
             with device_forces.device_periodic_forces() as active:
                 self.assertFalse(active)

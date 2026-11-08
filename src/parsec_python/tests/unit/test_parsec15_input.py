@@ -157,9 +157,23 @@ class RenamedKeywordTests(_InputDirectory):
 
 
 class LibxcTests(_InputDirectory):
-    def test_libxc_is_refused_and_its_ids_ignored_without_it(self) -> None:
-        with self.assertRaisesRegex(UnsupportedParsecOptionError, "Use_LibXC"):
-            self.cluster("Use_LibXC: .true.\nFunc_Id_X: 1\nFunc_Id_C: 9")
+    def test_libxc_runs_with_the_library_and_its_ids_are_ignored_without_use_libxc(self) -> None:
+        from unittest import mock
+
+        from parsec_python.V_xc import libxc_library
+
+        # Without the library (an empty path): refused with the reason; with it: libxc's functional
+        # (tests/unit/test_libxc.py).
+        with mock.patch.dict("os.environ", {libxc_library.LIBRARY_VARIABLE: "/nonexistent/libxc.so"}):
+            libxc_library._reset_for_tests()
+            try:
+                with self.assertRaisesRegex(UnsupportedParsecOptionError, "Use_LibXC.*no usable libxc"):
+                    self.cluster("Use_LibXC: .true.\nFunc_Id_X: 1\nFunc_Id_C: 9")
+            finally:
+                libxc_library._reset_for_tests()
+        if libxc_library.libxc_available():
+            translation = self.cluster("Use_LibXC: .true.\nFunc_Id_X: 1\nFunc_Id_C: 9")
+            self.assertEqual(translation.problem.scf.xc_functional, "libxc:lda_x+lda_c_pz")
         translation = self.cluster("Use_LibXC: .false.\nFunc_Id_X: 101\nFunc_Id_C: 130")
         self.assertEqual(translation.problem.scf.xc_functional, "ca")
         self.assertTrue(any(note.startswith("Func_Id_X and Func_Id_C") for note in translation.warnings))

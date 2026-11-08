@@ -92,6 +92,15 @@ _RECONSTRUCTED = frozenset(
         "spin_polarization",
         "correlation_type",
         "ion_energy_diff",
+        # libxc's functionals: written as LibXC_Functional (Use_LibXC/Func_Id_* of 1.5 included; without
+        # Use_LibXC the ids change nothing and are left out)
+        "libxc_functional",
+        "libxc_enforce_fhc",
+        "libxc_density_threshold",
+        "libxc_tau_threshold",
+        "use_libxc",
+        "func_id_x",
+        "func_id_c",
         # the Fock loop of a hybrid Correlation_Type (parsec_input._HYBRID_KEYS)
         "exact_exchange_fraction",
         "screening_parameter",
@@ -102,6 +111,9 @@ _RECONSTRUCTED = frozenset(
         "exx_inner_criterion",
         "exx_mixer_history",
         "exx_outer_mixing",
+        "exx_divergence",
+        "exx_slab_coulomb",
+        "exx_auxiliary_exponent",
         "spin_symmetry_sectors",
         "atom_types_num",
         "total_atom_num",
@@ -432,8 +444,23 @@ def complete_input_text(
         f"Net_Charges  {_number(scf.net_charge)}",
         f"Fermi_Temp  {_number(scf.fermi_temperature_kelvin)}",
         f"Spin_Polarization  {_logical(bool(scf.spin_polarized))}",
-        f"Correlation_Type  {FORTRAN_CORRELATION_CODES.get(scf.xc_functional, scf.xc_functional)}",
     ]
+    if getattr(scf, "is_libxc", False):
+        # libxc's functionals (PARSEC.py): the names of the spec, and the FHC choice when made.
+        from ..V_xc.libxc import parse_libxc_spec
+
+        spec = parse_libxc_spec(scf.xc_functional)
+        lines.append("LibXC_Functional  " + " ".join(name.upper() for name in spec.names))
+        if spec.enforce_fhc is not None:
+            lines.append(f"LibXC_Enforce_FHC  {_logical(spec.enforce_fhc)}")
+        if spec.density_threshold is not None:
+            lines.append(f"LibXC_Density_Threshold  {_number(spec.density_threshold)}")
+        if spec.tau_threshold is not None:
+            lines.append(f"LibXC_Tau_Threshold  {_number(spec.tau_threshold)}")
+    else:
+        lines.append(
+            f"Correlation_Type  {FORTRAN_CORRELATION_CODES.get(scf.xc_functional, scf.xc_functional)}"
+        )
     if scf.spin_polarized and (scf.is_hybrid or getattr(scf, "spin_symmetry_sectors", None) is not None):
         # The spin channels of the accelerated driver (PARSEC.py): the value of
         # every spin-polarized hybrid, and of another run where the input sets
@@ -458,6 +485,13 @@ def complete_input_text(
             f"Exx_Mixer_History  {exact_exchange.mixer_history}",
             f"Exx_Outer_Mixing  {exact_exchange.outer_mixing}",
         ]
+        # periodic cells: only where the input sets them (a cluster's completed input stays what it was)
+        if getattr(exact_exchange, "divergence", None) is not None:
+            lines.append(f"Exx_Divergence  {exact_exchange.divergence}")
+        if getattr(exact_exchange, "slab_coulomb", "padded") != "padded":
+            lines.append(f"Exx_Slab_Coulomb  {exact_exchange.slab_coulomb}")
+        if getattr(exact_exchange, "auxiliary_exponent", None) is not None:
+            lines.append(f"Exx_Auxiliary_Exponent  {_number(exact_exchange.auxiliary_exponent)}")
     if problem.point_charges:
         counts = tuple(getattr(translation, "point_charge_type_counts", ())) or (len(problem.point_charges),)
         lines += ["Add_Point_Charges  .true.", f"Point_Typ_Num  {len(counts)}"]

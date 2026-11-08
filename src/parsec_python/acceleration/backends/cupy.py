@@ -315,6 +315,9 @@ class CuPyHamiltonian:
         # ``factor * xi xi^T`` (Hamiltonian.exchange_device); ``None`` without.
         self.exchange_projectors = None
         self.exchange_factor = 0.0
+        # The orbital term -div(vtau grad) of a meta-GGA
+        # (Hamiltonian.meta_gga_device.DeviceKineticTerm); ``None`` without.
+        self.kinetic_term = None
 
         def initialize() -> None:
             cp, cpsparse = require_cupy()
@@ -734,6 +737,47 @@ class CuPyHamiltonian:
         self.exchange_projectors = projectors
         self.exchange_factor = float(factor)
 
+    def bind_kinetic_term(self, term: Any | None) -> None:
+        """Hold the meta-GGA's ``sum_a B_a^T diag(vtau) B_a`` in every application (``None`` removes it).
+
+        ``term`` is a bound :class:`~parsec_python.acceleration.Hamiltonian.meta_gga_device.DeviceKineticTerm`
+        on this operator's device.  :meth:`apply`, :meth:`apply_into` and
+        :meth:`chebyshev_recurrence` add it after the fused kernels; the FP32
+        recurrence refuses it, and the filters that reach the kernels without
+        these methods (captured graphs, a filter spread over devices) are not
+        taken while it is held (:func:`parsec_python.acceleration.Eigensolvers.chebyshev.holds_exchange`).
+        """
+
+        if term is not None:
+            device = getattr(self.effective_potential, "device", None)
+            if device is not None and int(term.device_id) != int(device.id):
+                raise ValueError("the meta-GGA term must be on the device of the operator")
+            if int(term.rows) != int(self.shape[0]):
+                raise ValueError("the meta-GGA term does not match the operator")
+        self.kinetic_term = term
+
+    @property
+    def spectral_margin(self) -> float:
+        """A bound of the eigenvalues of the meta-GGA term (Ry; 0 without), for the filter's upper bound."""
+
+        term = self.kinetic_term
+        return 0.0 if term is None else float(getattr(term, "spectral_margin", 0.0))
+
+    @property
+    def spectral_start_vector(self):
+        """The Gershgorin row sums of the meta-GGA term (a start vector of the targeted Lanczos bound), or ``None``."""
+
+        term = self.kinetic_term
+        return None if term is None else getattr(term, "row_sums", None)
+
+    def _kinetic_action(self, block: Any):
+        """``H_tau X`` of a block, or ``None`` without a meta-GGA term."""
+
+        term = self.kinetic_term
+        if term is None:
+            return None
+        return term.apply(block)
+
     def _exchange_coefficients(self, block: Any):
         """``xi^T X`` of a block, or ``None`` without an exchange term."""
 
@@ -865,9 +909,13 @@ class CuPyHamiltonian:
         self.timing_stats.orbital_vectors_applied += (
             1 if block.ndim == 1 else int(block.shape[1])
         )
-        if self.exchange_projectors is not None:
+        if self.exchange_projectors is not None or self.kinetic_term is not None:
             exchange = self._exchange_coefficients(block)
-            return self._add_exchange(self._apply_without_exchange(block), exchange)
+            kinetic = self._kinetic_action(block)
+            result = self._add_exchange(self._apply_without_exchange(block), exchange)
+            if kinetic is not None:
+                result += kinetic
+            return result
         return self._apply_without_exchange(block)
 
     def _apply_without_exchange(self, block: Any):
@@ -932,8 +980,10 @@ class CuPyHamiltonian:
             1 if was_vector else int(block.shape[1])
         )
         # A hybrid's exchange term reads the input, which may share no
-        # memory with the output: its coefficients come first.
+        # memory with the output: its coefficients come first (and the
+        # meta-GGA's orbital term).
         exchange = self._exchange_coefficients(kernel_block)
+        kinetic = self._kinetic_action(kernel_block)
         if (
             self.compact_finite_difference is not None
             and self.fused_projector_scatter
@@ -949,6 +999,8 @@ class CuPyHamiltonian:
                 output=kernel_target,
             )
             self._add_exchange(kernel_target, exchange)
+            if kinetic is not None:
+                kernel_target += kinetic
             return target
 
         # Exact compatibility fallback for optional compact/generic paths
@@ -970,6 +1022,8 @@ class CuPyHamiltonian:
             result += nonlocal_values
         kernel_target[...] = result
         self._add_exchange(kernel_target, exchange)
+        if kinetic is not None:
+            kernel_target += kinetic
         return target
 
     def chebyshev_recurrence(
@@ -1011,10 +1065,12 @@ class CuPyHamiltonian:
         else:
             previous_block = None
 
-        if self.exchange_projectors is not None:
-            # The exchange term of a hybrid: H X - c X with the term, then
+        if self.exchange_projectors is not None or self.kinetic_term is not None:
+            # The exchange term of a hybrid and the orbital term of a
+            # meta-GGA: H X - c X with the terms, then
             # ``sigma_next * (scale * (...) - sigma * previous)``.
             exchange = self._exchange_coefficients(block)
+            kinetic = self._kinetic_action(block)
             result = self.chebyshev_recurrence_without_exchange(
                 block,
                 center=center,
@@ -1023,9 +1079,13 @@ class CuPyHamiltonian:
                 previous=previous_block,
                 sigma=sigma,
             )
-            return self._add_exchange(
+            result = self._add_exchange(
                 result, exchange, float(sigma_next) * float(scale)
             )
+            if kinetic is not None:
+                kinetic *= float(sigma_next) * float(scale)
+                result += kinetic
+            return result
         return self.chebyshev_recurrence_without_exchange(
             block,
             center=center,
@@ -1053,7 +1113,7 @@ class CuPyHamiltonian:
         if fused is None or (
             self.projector_count and not self.fused_projector_scatter
         ):
-            if self.exchange_projectors is None:
+            if self.exchange_projectors is None and self.kinetic_term is None:
                 applied = self.apply(block)
             else:
                 self.timing_stats.hamiltonian_applications += 1
@@ -1107,6 +1167,10 @@ class CuPyHamiltonian:
         if self.exchange_projectors is not None:
             raise RuntimeError(
                 "the FP32 filter does not hold the exchange operator of a hybrid functional"
+            )
+        if self.kinetic_term is not None:
+            raise RuntimeError(
+                "the FP32 filter does not hold the orbital term of a meta-GGA"
             )
         cp, _ = require_cupy()
         block = cp.asarray(current, dtype=cp.float32)

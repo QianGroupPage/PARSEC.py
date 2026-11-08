@@ -1414,6 +1414,10 @@ def _gamma_spin_on_kpoint_driver(translation, is_periodic: bool, has_soc_species
     if not is_periodic or has_soc_species:
         return False
     problem = translation.problem
+    if getattr(getattr(problem, "scf", None), "is_meta_gga", False):
+        # A meta-GGA: the k-point spin loop forms tau of the Bloch factors (SCF/meta_gga_periodic.py); the
+        # Gamma driver run_scf_spin_polarized has no meta-GGA term.
+        return True
     periodicity = getattr(problem.grid, "periodicity", 3)
     if periodicity in (1, 2) and (
         os.environ.get("PARSEC_WIRE_SLAB_GAMMA_SPIN", "kpoint").strip().lower() == "gamma"
@@ -1422,6 +1426,83 @@ def _gamma_spin_on_kpoint_driver(translation, is_periodic: bool, has_soc_species
     ):
         return False
     return parallel_backend_uses_device()
+
+
+def _run_periodic_hybrid(
+    system,
+    translation,
+    reporter,
+    log,
+    arguments,
+    *,
+    start: float,
+    archive_path: Path,
+    log_path: Path,
+    input_directory: Path,
+    k_sampling,
+    write_files,
+    restart=None,
+    state: dict | None = None,
+) -> int:
+    """The SCF of a hybrid functional of a periodic cell with k-points, on Bloch factors.
+
+    :func:`parsec_python.SCF.hybrid_periodic.run_periodic_hybrid_scf` on the
+    time-reversal-reduced mesh of the input (a run without k-point input, which
+    main's ``run_scf`` takes, as the 1x1x1 mesh); ``restart`` (``Restart_Run``)
+    starts its semilocal start loop.  A wire or
+    slab of the Fortran-derived routines with ``Skip_Force: .false.`` gets its
+    single-point forces from :func:`parsec_python.Forces.wire_slab.compute_wire_slab_forces`,
+    whose nonlocal part reads the Bloch factors the loop keeps (``k_wavefunctions``, the
+    orbitals of the last inner loop with its exchange operator; with spin those of both
+    channels).  A bulk cell has no single-point forces on this path.
+    """
+
+    from .SCF.hybrid_periodic import run_periodic_hybrid_scf
+
+    if k_sampling is None:
+        k_points, k_weights = np.zeros((1, 3)), np.ones(1)
+    else:
+        k_points, k_weights = k_sampling
+    scf_start = time.perf_counter()
+    result = run_periodic_hybrid_scf(
+        system,
+        k_points,
+        k_weights,
+        callback=reporter.iteration,
+        warm_start=restart,
+        **(state or {}),
+    )
+    scf_elapsed = time.perf_counter() - scf_start
+    spin_polarized = translation.problem.scf.spin_polarized
+    forces = None
+    if translation.compute_forces and getattr(system.grid, "is_confined_periodic", False):
+        forces = reference_backend().compute_forces(system, result)
+    if spin_polarized:
+        reporter.finish_spin_polarized(result, scf_elapsed, forces=forces)
+    else:
+        reporter.finish(result, scf_elapsed, forces=forces)
+    if not arguments.no_archive:
+        include = arguments.save_wavefunctions or translation.output_all_states
+        extra = {} if forces is None else {"forces": forces}
+        saved = (
+            save_spin_polarized_result_archive(
+                archive_path,
+                result,
+                None,
+                include_wavefunctions=include,
+                dipole=getattr(reporter, "last_dipole", None),
+                **extra,
+            )
+            if spin_polarized
+            else save_result_archive(archive_path, result, include_wavefunctions=include, **extra)
+        )
+        log.write(f"Result archive: {saved}")
+    write_files(result)
+    _run_dos(system, translation, result, reporter, input_directory)
+    total_elapsed = time.perf_counter() - start
+    log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
+    log.write(f"Text log: {log_path}")
+    return 0 if result.converged else 3
 
 
 def _run_extended_drivers(
@@ -1609,6 +1690,25 @@ def _run_extended_drivers(
         log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
         log.write(f"Text log: {log_path}")
         return 0 if result.converged else 3
+
+    if getattr(translation.problem.scf, "is_hybrid", False):
+        # A hybrid functional of a periodic cell with k-points, or spin-polarized at the Gamma point (the
+        # 1x1x1 mesh): the Fock loop on Bloch factors (parsec_python.SCF.hybrid_periodic).
+        return _run_periodic_hybrid(
+            system,
+            translation,
+            reporter,
+            log,
+            arguments,
+            start=start,
+            archive_path=archive_path,
+            log_path=log_path,
+            input_directory=input_directory,
+            k_sampling=k_sampling,
+            write_files=write_files,
+            restart=restart,
+            state=state,
+        )
 
     if spin_polarized:  # periodic or with spin-orbit (isolated and plain: main's run_spin_scf)
         if k_sampling is None and _gamma_spin_on_kpoint_driver(
@@ -2308,6 +2408,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         kpoint_wire_slab_forces = False
         wire_slab_polarizability = False
         spinor_polarizability_forces = False
+    # A hybrid functional of a periodic cell at the Gamma point (spin-polarized too, with the occupations of occup.in)
+    # runs main's run_scf: the Fock loop on real orbitals (SCF/hybrid.py); with k-points the extended drivers run it
+    # on Bloch factors (SCF/hybrid_periodic.py).
+    periodic_hybrid_gamma = bool(is_periodic and translation.problem.scf.is_hybrid and k_sampling is None)
+    if (
+        periodic_hybrid_gamma
+        and spin_polarized
+        and getattr(translation.problem.scf, "fixed_occupations", None) is None
+        and not (
+            translation.relaxation is not None
+            or translation.molecular_dynamics is not None
+            or translation.compute_forces
+        )
+        and _gamma_spin_on_kpoint_driver(translation, is_periodic, has_soc_species)
+    ):
+        # A spin-polarized single point where the k-point workers run on the GPUs: the 1x1x1 Bloch loop of the
+        # extended drivers, whose orbitals, exchange and eigenproblems stay on the devices
+        # (acceleration/SCF/hybrid_periodic.py); the Gamma loop of run_scf has no device path for two channels of a
+        # periodic cell.  Its energy equals the real loop's to the SCF convergence.
+        periodic_hybrid_gamma = False
+    if periodic_hybrid_gamma:
+        uses_extended_drivers = False
     if uses_extended_drivers and not (periodic_ionic or spinor_ionic) and (
         translation.relaxation is not None
         or translation.molecular_dynamics is not None
@@ -2424,6 +2546,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.write("\n".join(relaxation_header_lines(translation)))
             if is_periodic:
                 system = prepare_periodic_single_point(translation.problem)
+                if periodic_hybrid_gamma:
+                    # run_spin_scf starts from the periodic spin densities (nothing for an unpolarized run)
+                    from .SCF.pbc import with_initial_spin_densities
+
+                    system = with_initial_spin_densities(system)
             else:
                 system = prepare_single_point(translation.problem)
             reporter.setup(system)

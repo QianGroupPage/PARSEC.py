@@ -42,6 +42,7 @@ from .SCF.symmetry_fields import scf_buffers_requested
 # Imported here and not where it is read: the module binds ``require_cupy``
 # when it is first imported, and a preparation may run under a double of it.
 from .V_ion.cupy_ionic import ionic_gpu_count_setting, ionic_sum_grid_setting
+from .V_ion.periodic_setup_fortran import oblique_split as periodic_oblique_split
 from .V_ion.periodic_setup_fortran import reach_rule as periodic_reach_rule
 from .backends.implicit_stencil import (
     FilterPlan,
@@ -120,6 +121,10 @@ def _reference_cache_key(
     # before 2026-10-30, when the table reach was the default).
     if getattr(problem, "periodic_cell", None) is not None and periodic_reach_rule() != "table":
         digest.update(f"periodic-reach-{periodic_reach_rule()}".encode("ascii"))
+    # PARSEC_PERIODIC_OBLIQUE_SPLIT other than its default (auto: the split of the orthorhombic grid on the
+    # oblique grid where a species uses Cubic_Spline).
+    if getattr(problem, "periodic_cell", None) is not None and periodic_oblique_split() != "auto":
+        digest.update(f"periodic-oblique-{periodic_oblique_split()}".encode("ascii"))
     digest.update(bytes((int(bool(defer_native_laplacian)),)))
     cache_path = (
         "disabled"
@@ -471,6 +476,9 @@ def _readable_xc_label(xc_functional: str, *, spin_polarized: bool) -> str:
     name = XC_DISPLAY_NAMES.get(xc_functional, xc_functional)
     if xc_functional == "pw91":
         name = f"discrete-variational {name}"
+    if str(xc_functional).startswith("libxc:"):
+        # libxc's C code on the host (a host build, or PARSEC_CUPY_XC=off).
+        return f"host libxc (C) {'spin-polarized ' if spin_polarized else ''}{name}"
     return (
         f"vectorized NumPy {'spin-polarized ' if spin_polarized else ''}{name}"
     )
@@ -1739,6 +1747,9 @@ def _planned_sector_device_groups(
     """
 
     if mpi_context is not None:
+        planned = getattr(mpi_context, "planned_groups", None)
+        if callable(planned):
+            return planned(representation_count, device_ids)
         from .experimental.mpi_scf import sector_device_groups
 
         return sector_device_groups(
@@ -2739,8 +2750,12 @@ def prepare_single_point(
     every thread began and ended.
     """
 
+    if getattr(getattr(problem, "scf", None), "is_libxc", False):
+        _refuse_libxc_routes(problem, mpi_context=mpi_context)
     if getattr(getattr(problem, "scf", None), "is_hybrid", False):
         _refuse_hybrid_routes(problem, backend=backend, mpi_context=mpi_context)
+    if getattr(getattr(problem, "scf", None), "is_meta_gga", False):
+        _refuse_meta_gga_routes(problem, mpi_context=mpi_context)
     preparation = _Preparation()
     try:
         return _prepare_single_point(
@@ -2758,20 +2773,42 @@ def prepare_single_point(
 
 
 
+def _refuse_libxc_routes(problem, *, mpi_context) -> None:
+    """Refuse a libxc functional on the MPI routes (``V_xc/libxc.py``).
+
+    No libxc functional has been run on several ranks: neither an LDA or GGA
+    on the distributed solvers (``main.py --mpi`` refuses those by name) nor a
+    hybrid in the MPI runner of several nodes (``scripts/run_multi_gpu_scf.sh``,
+    :mod:`.SCF.hybrid_mpi`), whose root evaluates the semilocal part.  One
+    process on the GPUs of one node runs them (``--serial-control``).
+    """
+
+    if mpi_context is not None:
+        raise NotImplementedError(
+            f"the libxc functional {problem.scf.xc_functional!r} is not implemented for the MPI SCF of several "
+            "ranks or nodes (not tested there); run it in one process on one node (--serial-control), which "
+            "uses all GPUs of that node"
+        )
+
+
 def _refuse_hybrid_routes(problem, *, backend, mpi_context) -> None:
     """Refuse the routes of a hybrid functional that the device exchange does not cover.
 
     The device Fock loop (SCF/hybrid.py) runs isolated systems in one
     process on the GPUs of one node, unpolarized and spin-polarized, on the
-    full grid or in the symmetry sectors with one device per sector basis.
+    full grid or in the symmetry sectors with one device per sector basis;
+    on several MPI ranks (SCF/hybrid_mpi.py) in the symmetry sectors, with
+    a sector context made for the exchange (one device per sector basis,
+    the pair tiles on every device of every rank); and periodic cells (bulk
+    and slab) at the Gamma point on the full grid of one process, their pair
+    densities by FFT (Hamiltonian/bloch_exchange_device.py).
     """
 
     label = problem.scf.xc_functional
-    if mpi_context is not None:
+    if mpi_context is not None and not getattr(mpi_context, "exchange", False):
         raise NotImplementedError(
-            f"the self-consistent hybrid functional {label!r} is not implemented for the "
-            "MPI SCF of several ranks or nodes; run it in one process on one node "
-            "(--serial-control), which uses all GPUs of that node"
+            f"the self-consistent hybrid functional {label!r} needs an MPI sector context made "
+            "for the exchange (MPISectorContext(comm, exchange=True), as the MPI runner makes it)"
         )
     if str(backend).lower() not in ("auto", "cupy"):
         raise NotImplementedError(
@@ -2780,7 +2817,13 @@ def _refuse_hybrid_routes(problem, *, backend, mpi_context) -> None:
             "(reference_main.py)"
         )
     settings = getattr(problem.scf, "exact_exchange", None)
-    if getattr(settings, "pair_solver", "kronecker") != "kronecker":
+    periodic = getattr(problem, "periodic_cell", None) is not None
+    if periodic and getattr(problem.grid, "periodicity", 3) == 1:
+        raise NotImplementedError(
+            f"the self-consistent hybrid functional {label!r} is not implemented for a wire "
+            "(Boundary_Conditions: wire); bulk cells and slabs are"
+        )
+    if not periodic and getattr(settings, "pair_solver", "kronecker") != "kronecker":
         raise NotImplementedError(
             "the device exchange operator solves the pair densities with the Kronecker "
             "solver only (Exx_Pair_Solver: kronecker); Exx_Pair_Solver: cg runs on the "
@@ -2807,6 +2850,31 @@ def _refuse_hybrid_routes(problem, *, backend, mpi_context) -> None:
             raise NotImplementedError(
                 f"{name}={os.environ[name]} is not implemented with the self-consistent hybrid "
                 f"functional {label!r}: {reason}"
+            )
+
+
+def _refuse_meta_gga_routes(problem, *, mpi_context) -> None:
+    """Refuse the routes of a meta-GGA that its device term does not cover (Hamiltonian/meta_gga_device.py).
+
+    The term runs in one process on the GPUs of one node (full grid or the
+    symmetry sectors with one device per sector basis) and on the CPU
+    backends.  Filters that bypass the term (captured graphs, a filter
+    spread over devices) give way to the ordinary filter by themselves.
+    """
+
+    label = problem.scf.xc_functional
+    if mpi_context is not None:
+        raise NotImplementedError(
+            f"the meta-GGA {label!r} is not implemented for the MPI SCF of several ranks or nodes; "
+            "run it in one process on one node (--serial-control), which uses all GPUs of that node"
+        )
+    for name, refused, reason in (
+        ("PARSEC_CUPY_MIXED_FILTER", {"on"}, "the FP32 filter does not hold the orbital term -div(vtau grad)"),
+        ("PARSEC_CUPY_RITZ_HANDOVER", {"triangular"}, "tau is formed from Ritz vectors"),
+    ):
+        if os.environ.get(name, "").strip().lower() in refused:
+            raise NotImplementedError(
+                f"{name}={os.environ[name]} is not implemented with the meta-GGA {label!r}: {reason}"
             )
 
 
@@ -2837,7 +2905,20 @@ def _hybrid_xc_evaluators(reference, *, backend, reducer, device_id, core_densit
         )
 
         functional = hybrid_functional_of(scf)
-        if device_hybrid_supported(functional, reference.grid):
+        from .V_xc.device_libxc import device_libxc_supported
+
+        if device_libxc_supported(functional.semilocal, reference.grid):
+            # A libxc hybrid: its semilocal part by libxc's CUDA build (V_xc/device_libxc.py).
+            from .V_xc.device_libxc import DeviceLibxcXCEvaluator, DeviceSpinLibxcXCEvaluator
+
+            keywords = dict(
+                name=functional.name, core_density=core_density, reducer=reducer, device_id=device_id
+            )
+            if spin:
+                spin_evaluator = DeviceSpinLibxcXCEvaluator(functional.semilocal, reference.grid, **keywords)
+            else:
+                unpolarized = DeviceLibxcXCEvaluator(functional.semilocal, reference.grid, **keywords)
+        elif device_hybrid_supported(functional, reference.grid):
             if spin:
                 # On the orbits where the channels are solved in the sectors
                 # (``reducer``; None on the full grid).
@@ -2969,12 +3050,13 @@ def _prepare_single_point(
         getattr(getattr(problem, "scf", None), "spin_polarized", False)
     )
     spin_sector_refusal = _spin_sector_refusal(problem) if spin_polarized else None
-    if spin_polarized and mpi_context is not None:
+    if spin_polarized and mpi_context is not None and spin_sector_refusal is not None:
+        # The ranks divide the symmetry sectors; two channels on the full grid
+        # run in one process.
         raise NotImplementedError(
-            "a spin-polarized calculation (Spin_Polarization: true) cannot run "
-            "as an MPI SCF: the ranks divide the symmetry sectors, which are "
-            "not implemented for two spin channels. Run it in one process "
-            "(--serial-control)"
+            "a spin-polarized calculation whose channels stay on the full grid "
+            f"({spin_sector_refusal}) cannot run as an MPI SCF: the ranks divide the "
+            "symmetry sectors. Run it in one process (--serial-control or main.py)"
         )
     _refuse_corrections(problem, is_periodic=is_periodic, mpi_context=mpi_context)
     point_charges = bool(getattr(problem, "point_charges", ()))
@@ -3255,6 +3337,12 @@ def _prepare_single_point(
     # Spin_Symmetry_Sectors: both channels in the sectors of this
     # decomposition, with the symmetry guard of SCF/spin_sectors.py.
     spin_sectors = spin_polarized and orbital_decomposition is not None
+    if spin_polarized and mpi_context is not None and not spin_sectors:
+        raise NotImplementedError(
+            f"a spin-polarized calculation on the {orbital_symmetry} cannot run as an MPI SCF: "
+            "the ranks divide the symmetry sectors of both channels. Run it in one process "
+            "(--serial-control or main.py)"
+        )
 
     # Decide the Hartree reduction before constructing the execution backend.
     # This lets the independent boundary-geometry setup overlap the much more
@@ -3609,6 +3697,66 @@ def _prepare_single_point(
     # functional of its Fock loop (V_xc/device_hybrid_xc.py, device_xc.py).
     hybrid_start_xc = (None, None)
     if native_xc_evaluator is None and getattr(
+        getattr(getattr(reference, "input", None), "scf", None), "is_meta_gga", False
+    ):
+        # A meta-GGA: the functional of the reference on the host, the fields
+        # of the sectors expanded for it (V_xc/meta_gga_xc.py).
+        # On the device where the evaluator runs on CuPy arrays (PARSEC_CUPY_XC
+        # not off, a cluster or orthorhombic grid, no Laplacian dependence).
+        from parsec_python.V_xc.meta_gga import meta_gga_evaluator
+
+        from .V_xc import device_xc_mode
+        from .V_xc.meta_gga_xc import (
+            DeviceMetaGGAOnOrbits,
+            HostMetaGGAOnOrbits,
+            HostMetaGGASpinOnOrbits,
+        )
+
+        native_xc_evaluator = HostMetaGGAOnOrbits(lambda: reference, scf_reducer)
+        spin_xc_evaluator = HostMetaGGASpinOnOrbits(
+            lambda: reference, scf_reducer if spin_sectors else None
+        )
+        if selection.selected == "cupy" and device_xc_mode() != "off" and not sector_worker:
+            functional = meta_gga_evaluator(reference.input.scf)
+            try:
+                if spin_polarized:
+                    spin_xc_evaluator = DeviceMetaGGAOnOrbits(
+                        functional,
+                        reference.grid,
+                        reducer=scf_reducer if spin_sectors else None,
+                        device_id=hartree_device if isinstance(hartree_device, int) else 0,
+                        core_density=lambda: reference.core_density,
+                        spin=True,
+                    )
+                else:
+                    native_xc_evaluator = DeviceMetaGGAOnOrbits(
+                        functional,
+                        reference.grid,
+                        reducer=scf_reducer,
+                        device_id=hartree_device if isinstance(hartree_device, int) else 0,
+                        core_density=lambda: reference.core_density,
+                    )
+            except ValueError:
+                # No device evaluation of this functional or grid: the host one.
+                pass
+            planned = getattr(native_xc_evaluator, "planned_device_bytes", None)
+            if symmetry_eigensolver is not None and planned is not None and not spin_polarized:
+                # The memory rules of the sectors count what the device
+                # evaluator keeps and takes on its device (the spin one below).
+                symmetry_eigensolver.resident_device_bytes = {
+                    int(native_xc_evaluator.device_id): int(planned)
+                }
+        if getattr(reference.input.scf, "is_hybrid", False) and not sector_worker:
+            # A meta-GGA hybrid: the start functional (PBE) of its Fock loop where
+            # PARSEC_CUPY_XC puts it on the device; the semilocal part is the meta-GGA's.
+            hybrid_start_xc = _hybrid_xc_evaluators(
+                reference,
+                backend=selection.selected,
+                reducer=scf_reducer,
+                device_id=hartree_device,
+                core_density=lambda: reference.core_density,
+            )[2]
+    elif native_xc_evaluator is None and getattr(
         getattr(getattr(reference, "input", None), "scf", None), "is_hybrid", False
     ):
         native_xc_evaluator, spin_xc_evaluator, hybrid_start_xc = _hybrid_xc_evaluators(
@@ -4885,6 +5033,9 @@ def _prepare_single_point(
                     operator_build_workers(
                         symmetry_eigensolver.assembled_sector_count
                     )
+                    # (A rank of a hybrid's MPI run may assemble no sector.)
+                    if symmetry_eigensolver.assembled_sector_count
+                    else 0
                 ),
             ),
             (
@@ -5250,6 +5401,14 @@ def _prepare_single_point(
             hybrid_start_xc, lambda: reference, scf_reducer, spin_sectors=spin_sectors
         ),
     )
+    if exchange_device is not None and mpi_context is not None:
+        # Several ranks: every piece of the Fock loop is a command to all of
+        # them, and this rank's service answers it (SCF/hybrid_mpi.py).
+        from .SCF.hybrid_mpi import mpi_device_exchange_for
+
+        exchange_device = mpi_device_exchange_for(
+            exchange_device, mpi_context, symmetry_eigensolver, reference
+        )
     if exchange_device is not None and symmetry_eigensolver is not None:
         # The memory rules of the sectors count what the hybrid keeps on the
         # devices: its device XC evaluators and the exchange (xi, the
@@ -5262,6 +5421,50 @@ def _prepare_single_point(
             spin_xc_evaluator if spin_sectors else native_xc_evaluator,
             hybrid_start_xc,
         )
+    # A meta-GGA: its orbital term in the device Hamiltonians, tau where the
+    # orbitals are; the CPU backends add the host term (SCF/single_point.py).
+    meta_gga_device = None
+    if selection.selected == "cupy" and getattr(
+        getattr(getattr(reference, "input", None), "scf", None), "is_meta_gga", False
+    ):
+        from .Hamiltonian.meta_gga_device import DeviceMetaGGA
+
+        stage_started = perf_counter()
+        meta_gga_device = DeviceMetaGGA(
+            backend=implementation,
+            sectors=symmetry_eigensolver,
+            reducer=scf_reducer,
+            grid=reference.grid,
+        )
+        meta_gga_device.prepare()
+        from parsec_python.V_xc.meta_gga import meta_gga_gradient_form
+
+        orbital_gradient = meta_gga_gradient_form(reference.input.scf)[0] == "orbital"
+        resident = dict(meta_gga_device.device_bytes)
+        if orbital_gradient:
+            for device_id, count in meta_gga_device.flux_device_bytes.items():
+                resident[device_id] = resident.get(device_id, 0) + count
+        if symmetry_eigensolver is not None:
+            # The memory rules of the sectors count the derivative matrices
+            # (and W with the shared-row maps of the orbital form).
+            counts = dict(symmetry_eigensolver.resident_device_bytes)
+            for device_id, count in resident.items():
+                counts[device_id] = counts.get(device_id, 0) + count
+            symmetry_eigensolver.resident_device_bytes = counts
+        implementation.info = replace(
+            implementation.info,
+            details=implementation.info.details
+            + (
+                (
+                    "meta_gga_term",
+                    "-div(vtau grad) as sum_a B_a^T diag(vtau) B_a of the first-derivative stencil"
+                    + (" with 2 sum_a [W_a B_a + B_a^T W_a] of the orbital density gradient" if orbital_gradient else "")
+                    + f" ({'sector-reduced' if symmetry_eigensolver is not None else 'full grid'}, CSR on the devices, "
+                    f"{sum(resident.values())} B)",
+                ),
+            ),
+        )
+        stages.add("meta_gga_term", stage_started)
     # Spin_Symmetry_Sectors: the adapter of the two channels' orbit fields,
     # with the symmetry guard, and how the run goes back to the full grid.
     spin_adapter = None
@@ -5349,6 +5552,7 @@ def _prepare_single_point(
         dispersion_device=dispersion_device,
         exchange_device=exchange_device,
         spin_sector_fallback=spin_sector_fallback,
+        meta_gga_device=meta_gga_device,
         **_fdet_kinetic_operators(reference, selection.selected, hartree_device),
     )
 
@@ -5522,8 +5726,9 @@ class _SpinSectorFallback:
         ``None`` (a run from the atomic densities) stays ``None``.  After an
         ionic move the potentials of both channels and the Hartree potential
         of the previous structure are full-grid fields already (the public
-        fields of a sector result) and are kept, as an ``off`` relaxation
-        keeps them; what lives in the sectors is dropped: the eigensolver
+        fields of a sector result, a meta-GGA's ``vtau`` and ``W`` included)
+        and are kept, as an ``off`` relaxation keeps them; what lives in the
+        sectors is dropped: the eigensolver
         subspaces (the full grid starts with its first filter), a hybrid's
         exchange orbitals and a carried mixer.
         """
@@ -5580,6 +5785,12 @@ class _SpinSectorFallback:
         exchange = getattr(system, "exchange_device", None)
         if exchange is not None:
             exchange.bind(None)
+            # On several MPI ranks: what every rank's exchange service holds
+            # (replicas, W, the window of the outer DIIS, the device plans of
+            # its pair solvers) goes before the root prepares the full grid.
+            release = getattr(exchange, "release_build_memory", None)
+            if callable(release):
+                release(final=True)
             exchange._solvers.clear()
             exchange.expansions.clear()
         gc.collect()
@@ -5665,6 +5876,12 @@ def run_scf(
         result = fallback.run(
             system, run_accelerated_scf, callback=callback, warm_start=warm_start, **keywords
         )
+    # A hybrid on several MPI ranks: what the builds of its exchange left on
+    # the devices of the ranks (replicas of other ranks' orbitals, the last
+    # parts of W) goes before the forces and the next structure.
+    release = getattr(getattr(system, "exchange_device", None), "release_build_memory", None)
+    if callable(release):
+        release()
     boundary_check = _hartree_boundary_check(system, result)
     if boundary_check:
         result.backend = replace(
@@ -5727,9 +5944,11 @@ def warm_start_for_moved_atoms(
     SCF loop itself.
     """
 
-    from parsec_python.SCF.single_point import extrapolated_warm_start
+    from parsec_python.SCF.single_point import extrapolated_warm_start, meta_gga_warm_start
 
-    warm_start = _parsec_warm_start(previous_system, previous_result, system)
+    warm_start = meta_gga_warm_start(
+        _parsec_warm_start(previous_system, previous_result, system), previous_result
+    )
     exchange_device = getattr(system, "exchange_device", None)
     if exchange_device is not None and getattr(previous_result, "exact_exchange", None) is not None:
         # A hybrid functional: the orbitals before the move, where the

@@ -233,6 +233,9 @@ class DeviceExchange:
         return planned_parity(grid, kernels, self.multipole_order, decomposition.reduction)
 
     def pair_solvers(self, system, definition: HybridDefinition) -> DevicePairSolvers:
+        reference = _periodic_reference(system)
+        if reference is not None:
+            return self._periodic_pair_solvers(reference, definition)
         terms = tuple(definition.terms)
         if len(terms) == 1:
             kernel, _fraction, omega = terms[0]
@@ -255,7 +258,39 @@ class DeviceExchange:
             self._solvers[key] = solvers
         return solvers
 
+    def _periodic_pair_solvers(self, reference, definition: HybridDefinition):
+        """The cuFFT pair solver of a periodic cell at the Gamma point (real orbitals).
+
+        The kernel and the box of the host solver
+        (:func:`parsec_python.SCF.hybrid_periodic.periodic_pair_potentials`,
+        what :func:`parsec_python.SCF.hybrid.default_pair_solver` gives the
+        reference loop), so the device pair potentials are the host's to
+        round-off.
+        """
+
+        from parsec_python.SCF.hybrid_periodic import periodic_pair_potentials
+
+        from ..Hamiltonian.bloch_exchange_device import DevicePeriodicBox, DevicePeriodicPairSolvers
+
+        key = ("periodic", tuple(definition.terms), float(definition.fraction), self.batch_size)
+        solvers = self._solvers.get(key)
+        if solvers is None:
+            potentials = periodic_pair_potentials(reference, definition)
+            kernel = potentials.kernel
+            describe = getattr(kernel, "describe", None)
+            solvers = DevicePeriodicPairSolvers(
+                kernel,
+                DevicePeriodicBox(potentials.box.shape, potentials.fft_shape, getattr(potentials.box, "flat", None)),
+                self.batch_size,
+                description=str(describe() if callable(describe) else getattr(kernel, "description", "")),
+            )
+            self._solvers[key] = solvers
+        return solvers
+
     def fock_engine(self, system, definition: HybridDefinition) -> "DeviceFockEngine":
+        if _periodic_reference(system) is not None:
+            # A periodic cell: its pair densities by FFT whatever Exx_Pair_Solver says (the reference loop's too).
+            return DeviceFockEngine(self, system, definition)
         if definition.pair_solver != "kronecker":
             raise NotImplementedError(
                 "the device exchange operator solves the pair densities with the Kronecker "
@@ -280,6 +315,20 @@ class DeviceExchange:
         )
 
 
+def _periodic_reference(system):
+    """The prepared reference system of a periodic cell, or ``None`` (an isolated system).
+
+    ``system`` is an accelerated system (its ``reference``), a reference
+    system, or what only names a grid (the exchange service of an MPI rank,
+    ``SCF/hybrid_mpi.py``, which has no input: always a cluster, since a
+    periodic cell with an MPI context is refused by the driver).
+    """
+
+    reference = getattr(system, "reference", system)
+    problem = getattr(reference, "input", None)
+    return reference if getattr(problem, "periodic_cell", None) is not None else None
+
+
 def _new_loop_state(solver, state, index: int | None = None):
     """The saved subspace of an eigensolver, marked for a new SCF loop on its device."""
 
@@ -299,6 +348,7 @@ class DeviceFockEngine:
 
     def __init__(self, exchange: DeviceExchange, system, definition: HybridDefinition) -> None:
         self.device = exchange
+        self.definition = definition
         self.solvers = exchange.pair_solvers(system, definition)
 
     @property
@@ -336,15 +386,22 @@ class DeviceFockEngine:
         hartree = np.asarray(start.hartree_potential, dtype=np.float64)
         solver = getattr(system, "eigenproblem_solver", None)
         channels = getattr(start, "spin", None)
+        # A meta-GGA hybrid starts its first inner loop as every meta-GGA loop:
+        # the start functional's potential (PBE) and no orbital term yet.
+        evaluator = (
+            self.start_system(system, self.definition)
+            if getattr(system.input.scf, "is_meta_gga", False)
+            else system
+        )
         if channels is None:
-            xc = system.evaluate_xc(self._internal(system, start.density))
+            xc = evaluator.evaluate_xc(self._internal(system, start.density))
             return SCFWarmStart(
                 input_potential=ionic + hartree + self._public(system, xc.potential),
                 hartree_potential=hartree,
                 eigensolver_state=_new_loop_state(solver, start.eigensolver_state),
             )
         # (Orbit fields where the channels are in the symmetry sectors.)
-        xc = system.evaluate_spin_xc(
+        xc = evaluator.evaluate_spin_xc(
             self._internal(system, channels[0].density),
             self._internal(system, channels[1].density),
         )
@@ -360,12 +417,27 @@ class DeviceFockEngine:
         )
 
     def next_warm_start(self, system, result):
+        from parsec_python.SCF.single_point import meta_gga_warm_start
+
         from ..driver import _parsec_warm_start
 
-        return _parsec_warm_start(system, result, system)
+        # A meta-GGA hybrid: the next inner loop takes over the mixed vtau too.
+        return meta_gga_warm_start(_parsec_warm_start(system, result, system), result)
 
-    def start_total_energy(self, system, start, exchange_energy: float, fraction: float) -> float:
+    def start_total_energy(self, system, start, exchange_energy: float, fraction: float) -> float | None:
         channels = getattr(start, "spin", None)
+        if getattr(system.input.scf, "is_meta_gga", False):
+            # tau of the start orbitals on the host full grid (the reference system), where the
+            # result holds them; the energy of the start is not reported otherwise.
+            from parsec_python.SCF.hybrid import meta_gga_start_semilocal
+
+            semilocal = meta_gga_start_semilocal(system.reference, start)
+            if semilocal is None:
+                return None
+            energies = start.energies
+            return float(
+                energies.total - energies.exchange_correlation + semilocal + fraction * exchange_energy
+            )
         if channels is None:
             semilocal = system.evaluate_xc(self._internal(system, start.density)).total_energy
         else:
@@ -378,12 +450,20 @@ class DeviceFockEngine:
             energies.total - energies.exchange_correlation + semilocal + fraction * exchange_energy
         )
 
+    def _devices(self, orbitals, columns: str, known) -> tuple:
+        """The devices of a build: every device of the process, or one for a small build of a periodic cell."""
+
+        small = getattr(self.solvers, "small_build", None)
+        if callable(small) and small(orbitals, columns=columns, known=known):
+            return (int(orbitals.sectors[0].device),)
+        return self.device.devices
+
     def exchange(self, sets, *, columns: str = "occupied", known=None):
         return [
             apply_device_exchange(
                 orbitals,
                 self.solvers,
-                self.device.devices,
+                self._devices(orbitals, columns, None if known is None else known[index]),
                 columns=columns,
                 known=None if known is None else known[index],
             )

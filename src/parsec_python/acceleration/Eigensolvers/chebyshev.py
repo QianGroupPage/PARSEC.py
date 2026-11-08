@@ -353,9 +353,18 @@ def _batched_block_filter(
 
 
 def holds_exchange(operator: Any) -> bool:
-    """Whether ``operator`` holds the exchange term of a hybrid functional."""
+    """Whether ``operator`` holds a term outside its fused kernels.
 
-    return getattr(operator, "exchange_projectors", None) is not None
+    The exchange term of a hybrid functional or the orbital term of a
+    meta-GGA (``kinetic_term``): the filter then groups its blocks
+    (:func:`_exchange_block_filter`), takes no FP32 recurrence, no captured
+    graph and no filter spread over devices, whose kernels hold neither.
+    """
+
+    return (
+        getattr(operator, "exchange_projectors", None) is not None
+        or getattr(operator, "kinetic_term", None) is not None
+    )
 
 
 def _carried_sigmas(
@@ -429,7 +438,12 @@ def _exchange_block_filter(
     free_bytes, _total = cp.cuda.runtime.memGetInfo()
     pool = cp.get_default_memory_pool()
     available = int(free_bytes) + int(pool.free_bytes())
-    width = max(1, int(0.60 * available) // max(1, 4 * 8 * rows))
+    # Four row-sized arrays per column (previous, current, following and the
+    # operator's output); a meta-GGA's orbital term adds its own per
+    # application (DeviceKineticTerm.apply: the scaled block, the result and,
+    # in the orbital form, the derivative block, on the larger target rows).
+    arrays = 4 + int(getattr(getattr(operator, "kinetic_term", None), "block_arrays", 0))
+    width = max(1, int(0.60 * available) // max(1, arrays * 8 * rows))
     groups: list[list[int]] = [[]]
     count = 0
     for index, block in enumerate(blocks):
@@ -620,7 +634,7 @@ def subspace_filter(
         )
         if grouped is not None:
             return grouped[:, 0] if was_vector else grouped
-    if os.environ.get("PARSEC_CUPY_DISTRIBUTED_FILTER", "0") == "1":
+    if os.environ.get("PARSEC_CUPY_DISTRIBUTED_FILTER", "0") == "1" and not holds_exchange(operator):
         if use_mixed_precision:
             raise ValueError("distributed filter experiment requires FP64")
         from .distributed_filter import distributed_filter

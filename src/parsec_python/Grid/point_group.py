@@ -112,6 +112,25 @@ def symmetrize_scalar(values: np.ndarray, group: GridPointGroup) -> np.ndarray:
     return total / float(group.order)
 
 
+def symmetrize_vector(values: np.ndarray, group: GridPointGroup) -> np.ndarray:
+    """Return ``(1/|G|) sum_g R_g^T v(g r)`` of a vector field ``values`` ``(3, points)``.
+
+    The average of a field that turns with the operations (``v(R r) = R v(r)``,
+    the orbital density gradient of a meta-GGA), as :func:`symmetrize_scalar`
+    averages a scalar field.
+    """
+
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] != 3:
+        raise ValueError("a vector field has shape (3, points)")
+    if group.order <= 1:
+        return values.copy()
+    total = np.zeros_like(values)
+    for matrix, images in zip(group.matrices, group.images):
+        total += np.asarray(matrix, dtype=np.float64).T @ values[:, images]
+    return total / float(group.order)
+
+
 def symmetrize_density(
     density: np.ndarray, group: GridPointGroup, volume_element: float
 ) -> tuple[np.ndarray, ScalarSymmetrization]:
@@ -135,4 +154,5 @@ __all__ = [
     "grid_point_group",
     "symmetrize_density",
     "symmetrize_scalar",
+    "symmetrize_vector",
 ]

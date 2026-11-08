@@ -1,0 +1,43 @@
+# CH4: PBE (this code's own)
+# Quantum ESPRESSO reference: input_dft = 'pbe' (qe/README.md)
+
+Boundary_Sphere_Radius: 12.05
+Grid_Spacing: 0.160
+Coordinate_Unit: Cartesian_Bohr
+Expansion_Order: 12
+Correlation_Type: pbe
+States_Num: 8
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+
+Atom_Types_Num: 2
+
+Atom_Type: H
+Pseudopotential_Format: fhipp
+Potential_Num: 1
+Local_Component: s
+Core_Cutoff_Radius: 1.3
+begin Electron_Per_Orbital
+1
+end Electron_Per_Orbital
+Cubic_Spline: .true.
+begin Atom_Coord
+     1.1859538349    1.1859538349    1.1859538349
+    -1.1859538349   -1.1859538349    1.1859538349
+    -1.1859538349    1.1859538349   -1.1859538349
+     1.1859538349   -1.1859538349   -1.1859538349
+end Atom_Coord
+
+Atom_Type: C
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 1.6
+begin Electron_Per_Orbital
+2 2 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.
+begin Atom_Coord
+     0.0000000000    0.0000000000    0.0000000000
+end Atom_Coord

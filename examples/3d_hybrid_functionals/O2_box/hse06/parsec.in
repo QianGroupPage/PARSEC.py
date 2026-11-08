@@ -1,0 +1,42 @@
+# O2 triplet (bond 1.2075 A) in a periodic cubic cell of 12 bohr, Gamma point, spin-polarized (occup.in: 7 up, 5 down)
+# HSE06: 1/4 short-range exact exchange (erfc(0.11 r)/r) + PBE exchange - 1/4 short-range PBE exchange + PBE correlation
+# Quantum ESPRESSO reference: qe/o2_hse06_k111_e150_gb.in (ecutwfc 150 Ry)
+# like-for-like with the QE row: its q+G = 0 treatment and auxiliary exponent (Exx_Divergence, Exx_Auxiliary_Exponent)
+
+Periodic_System: .true.
+Boundary_Conditions: bulk
+begin Cell_Shape
+  12.0000000000 0.0000000000 0.0000000000
+  0.0000000000 12.0000000000 0.0000000000
+  0.0000000000 0.0000000000 12.0000000000
+end Cell_Shape
+Lattice_Vector_Scale: 1.0 bohr
+Coordinate_Unit: Cartesian_Bohr
+Grid_Spacing: 0.160
+Expansion_Order: 12
+Correlation_Type: hse06
+Exx_Tolerance: 1e-8 Ry   # Fock-loop stop (default 1e-6 Ry), tight for the comparison
+Exx_Divergence: gygi-baldereschi   # q+G = 0 as the QE row (x_gamma_extrapolation = .false.)
+Exx_Auxiliary_Exponent: 0.0666667   # QE's 10/ecutwfc in bohr^2 (default: the limit a -> 0)
+States_Num: 11
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+Spin_Polarization: true
+Fermi_Temp: -1 K   # occupations of occup.in (triplet: 7 up, 5 down)
+Atom_Types_Num: 1
+
+Atom_Type: O
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 1.6
+begin Electron_Per_Orbital
+2 4 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.   # spline of the radial table, as in examples/0d_hybrid_functionals
+Initial_Spin_Polarization: 0.3
+begin Atom_Coord
+     6.0000000000    6.0000000000    4.8590778523
+     6.0000000000    6.0000000000    7.1409221477
+end Atom_Coord

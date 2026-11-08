@@ -1,0 +1,43 @@
+# bulk Si (fcc, a = 10.26 bohr, two atoms), 2x2x2 Gamma-centred mesh: PBE (this code's own)
+# Quantum ESPRESSO reference: input_dft = 'pbe', K_POINTS automatic 2 2 2 0 0 0 (qe/README.md)
+
+Periodic_System: .true.
+Boundary_Conditions: bulk
+begin Cell_Shape
+  0.0000000000 5.1300000000 5.1300000000
+  5.1300000000 0.0000000000 5.1300000000
+  5.1300000000 5.1300000000 0.0000000000
+end Cell_Shape
+Lattice_Vector_Scale: 1.0 bohr
+Coordinate_Unit: Cartesian_Bohr
+Grid_Spacing: 0.200
+Expansion_Order: 12
+Correlation_Type: pbe
+States_Num: 8
+Fermi_Temp: 10 K   # insulator: occupations 1/0 to exp(-300)
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+Kpoint_Method: mp   # the irreducible wedge of the mesh, density symmetrized
+begin Monkhorst_Pack_Grid
+  2 2 2
+end Monkhorst_Pack_Grid
+begin Monkhorst_Pack_Shift
+  0.0 0.0 0.0
+end Monkhorst_Pack_Shift
+
+Atom_Types_Num: 1
+
+Atom_Type: Si
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 2.2
+begin Electron_Per_Orbital
+2 2 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.
+begin Atom_Coord
+     0.0000000000    0.0000000000    0.0000000000
+     2.5650000000    2.5650000000    2.5650000000
+end Atom_Coord

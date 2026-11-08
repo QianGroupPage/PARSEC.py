@@ -1,0 +1,2407 @@
+
+ =================================================================
+
+  PARSEC-PYTHON - Modular real-space DFT program
+  PARSEC-like report; Python real-space implementation
+
+ starting run on 08-Nov-2026 04:13:23 -0800
+ input file: examples/3d_hybrid_functionals/O2_box/pbe/parsec.in
+ Routines: Fortran-derived, chosen automatically: Pseudopotential_Format: fhipp
+
+ =================================================================
+
+ Initial Run - starting from atomic potentials
+ Initial density method = sad
+ ignoresym= F
+
+ Grid data:
+ ~~------~~
+
+ Periodic boundary conditions!
+ System is fully periodic 
+ Unit lattice vectors [bohr] : 
+  12.0000000000    0.0000000000    0.0000000000
+   0.0000000000   12.0000000000    0.0000000000
+   0.0000000000    0.0000000000   12.0000000000
+ Grid spacing is  0.160000 bohrs
+ Order of double grid is    1
+ Grid points are shifted from origin!
+ shift vector =   0.5000   0.5000   0.5000   [units of grid spacing]
+ WAVEFUNCTIONS ARE REAL!
+ The Finite-difference expansion is of order 12
+ Python constructs the full active grid; the selected execution backend reports any exact symmetry reduction.
+
+ Eigenvalue data:
+ ----------------
+ Number of states:           11
+ Net cluster charge =    0.000      [e]
+ WARNING: reading occupations from occup.in file
+
+ Self-consistency data:
+ ----------------------
+ Maximum number of iterations is          200
+ Performing Chebyshev-Davidson diagonalization
+ Polynomial degree for Chebyshev-Davidson is     20
+ The matvec operations use block size      5
+ Polynomial degree for Chebyshev filtering is     15
+ Change in polynomial degree (dpm) for Chebyshev filtering is      3
+ Self-consistency convergence criterion is    9.9999999999999995E-07  Ry
+ Diagonalization tolerance is    9.9999999999999995E-07
+ Buffer size in subspace is      6
+
+ Mixer data:
+ -----------
+ solver lpole is :            9
+ Anderson mixer
+ Initial Jacobian:  0.300  Mixing memory is  4
+ Mixing restarted after           20 iterations
+ Anderson safeguard disabled (strict PARSEC path)
+
+ Correlation data:
+ -----------------
+ Exchange-Correlation functional is pbe
+ GGA, Perdew-Burke-Ernzerhof parametrization
+
+ Other input data:
+ -----------------
+ output level [1 - 6] =  1
+ Spin-polarized computation!
+
+ Initial spin polarization: 
+  O           0.3000
+ No minimization!
+
+WARNING: This input runs on the Fortran-derived routines (as with Use_Fortran_Routines: .true.) because Andrew Grieder's routines do not compute it: Pseudopotential_Format: fhipp
+
+ Execution resources (k-point eigensolver):
+ -------------------------------------------
+ Device            = GPU (NVIDIA A100-SXM4-80GB)
+ GPUs              = 1 active, index 0
+ Eigensolver       = device-resident Ritz subspaces (filter, QR and Rayleigh-Ritz on the device)
+ Workers           = one thread per GPU; the k-points and spin channels are dealt out to them
+
+ Atom data:
+ --~--~---
+
+ Tot. # of atom types is     1
+
+ Chemical element : O
+ Physical element : O
+ fhipp
+  pseudopotential format : new Martins
+  pseudopotential file   : examples/3d_hybrid_functionals/O_FHIPP.DAT
+  radial points/channels : 473 / 3
+  selected local channel : l=2
+ There are      2 O  atoms
+ and their initial coordinates are:
+
+    x [bohr]          y [bohr]          z [bohr]
+      6.000000000      6.000000000      4.859077852
+      6.000000000      6.000000000      7.140922148
+
+ Tot. number of atoms =       2
+
+ Real-space setup:
+ -----------------
+ Full active grid points =       405224
+ Hamiltonian dimension   =       405224
+ Sparse Laplacian nonzeros =    14993288
+ Nonlocal projector columns =        8
+ Number of electrons =    12.00000000
+ Initial density integral =    12.00000000
+
+
+ Symmetry Properties:
+ --------------------
+
+ The crystallographic system is cubic with operations: 
+       1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16
+      17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
+      33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48
+
+
+ The space group of the crystal is symmorphic
+ (this usually means that symmetry operations do not
+ involve rotations and translations simultaneously)
+
+ Operation number: 
+       1  2  3  4 13 14 15 16 25 26 27 28
+      37 38 39 40
+
+
+    Rotation matrices (r-lattice) and fractional translations (r-lattice)
+
+    1     1  0  0     0  1  0     0  0  1     -0.00000 -0.00000 -0.00000   E  
+    2     1  0  0     0 -1  0     0  0 -1     -0.00000 -0.00000 -0.00000   C2 
+    3    -1  0  0     0  1  0     0  0 -1     -0.00000 -0.00000 -0.00000   C2 
+    4    -1  0  0     0 -1  0     0  0  1     -0.00000 -0.00000 -0.00000   C2 
+    5     0 -1  0    -1  0  0     0  0 -1     -0.00000 -0.00000 -0.00000   C2 
+    6     0  1  0    -1  0  0     0  0  1     -0.00000 -0.00000 -0.00000   C4 
+    7     0 -1  0     1  0  0     0  0  1     -0.00000 -0.00000 -0.00000   C4 
+    8     0  1  0     1  0  0     0  0 -1     -0.00000 -0.00000 -0.00000   C2 
+    9    -1  0  0     0 -1  0     0  0 -1     -0.00000 -0.00000 -0.00000   IE 
+   10    -1  0  0     0  1  0     0  0  1     -0.00000 -0.00000 -0.00000   IC2
+   11     1  0  0     0 -1  0     0  0  1     -0.00000 -0.00000 -0.00000   IC2
+   12     1  0  0     0  1  0     0  0 -1     -0.00000 -0.00000 -0.00000   IC2
+   13     0  1  0     1  0  0     0  0  1     -0.00000 -0.00000 -0.00000   IC2
+   14     0 -1  0     1  0  0     0  0 -1     -0.00000 -0.00000 -0.00000   IC4
+   15     0  1  0    -1  0  0     0  0 -1     -0.00000 -0.00000 -0.00000   IC4
+   16     0 -1  0    -1  0  0     0  0  1     -0.00000 -0.00000 -0.00000   IC2
+
+  Found Abelian subgroup D_2h  with            8  symmetry operations
+
+  Character table : character = exp(i*Pi*x/3)
+----------------------------------------------------------
+ Representation |    E   C2   C2   C2   IE  IC2  IC2  IC2
+   Ag      1   |     0    0    0    0    0    0    0    0
+   B1g     2   |     0    0    3    3    0    0    3    3
+   B2g     3   |     0    3    0    3    0    3    0    3
+   B3g     4   |     0    3    3    0    0    3    3    0
+   Au      5   |     0    0    0    0    3    3    3    3
+   B1u     6   |     0    0    3    3    3    3    0    0
+   B2u     7   |     0    3    0    3    3    0    3    0
+   B3u     8   |     0    3    3    0    3    0    0    3
+----------------------------------------------------------
+ Operation number:   1    2    3    4    9   10   11   12
+
+
+
+ Forces from ion-ion interaction:
+ ================================
+-atom-  ----x----   ----y----   ----z-----   ----Fx----  ----Fy----   ----Fz---
+                       [bohr]                             [Ry/bohr]            
+
+   1     6.000000    6.000000    4.859078      0.000000    0.000000  -13.386490
+   2     6.000000    6.000000    7.140922     -0.000000   -0.000000   13.386490
+
+ Setup timings [sec]
+ --------------------------------------------------
+ Pseudopotential loading       :     0.010186
+ Grid-domain construction      :     0.011206
+ Finite-difference construction:     1.354168
+ Local ionic potential setup   :     0.047948
+ Nonlocal ionic projector setup:     0.011224
+ Initial valence-density setup :     0.043133
+ Core-density setup            :     0.001802
+ Ion-ion energy setup           :     0.010310
+ Preparation wall time          :     1.490329
+ --------------------------------------------------
+
+ Spin-polarized SCF iter #   1
+
+ Diagonalization time [sec] :       9.84,      iteration time =      11.36
+
+ Eigensolver residual max [Ry] :   5.0834e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.4436183741       -60.4589828750    1.0000
+    2        -3.5741833788       -48.6296242158    1.0000
+    3        -3.0886186850       -42.0231281044    1.0000
+    4        -3.0136395388       -41.0029768373    1.0000
+    5        -3.0136395388       -41.0029768373    1.0000
+    6        -2.5247965117       -34.3518763791    1.0000
+    7        -2.5247965117       -34.3518763791    1.0000
+    8        -2.0349656553       -27.6873357125    0.0000
+    9        -1.8283790368       -24.8765594985    0.0000
+   10        -1.7956222878       -24.4308777232    0.0000
+   11        -1.7831137575       -24.2606891622    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2037853852       -57.1958631934    1.0000
+    2        -3.3491910593       -45.5684237152    1.0000
+    3        -2.8651482603       -38.9826342002    1.0000
+    4        -2.8026310951       -38.1320381537    1.0000
+    5        -2.8026310951       -38.1320381537    1.0000
+    6        -2.3064050036       -31.3804851984    0.0000
+    7        -2.3064050035       -31.3804851962    0.0000
+    8        -2.0112024332       -27.3640180651    0.0000
+    9        -1.7736429832       -24.1318317010    0.0000
+   10        -1.7650045018       -24.0142982508    0.0000
+   11        -1.7627201685       -23.9832180680    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -14.20667943 [Ry]
+   Hartree Energy                =          52.63031820 [Ry]
+   Integral_{Vxc*rho}            =         -17.90946689 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.79950915 [Ry]
+   Electron-Ion energy           =        -165.96243070 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.69516253 [Ry]
+   Energy/atom  =          -433.31182119 [eV]
+
+  0-  1    SRE of pot. & charge weighted pot =   1.5836688388   0.1481843039
+
+ Spin-polarized SCF iter #   2
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.84
+
+ Eigensolver residual max [Ry] :   1.2581e-02
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.4170946145       -60.0981059056    1.0000
+    2        -3.5217039891       -47.9156001347    1.0000
+    3        -3.0298523665       -41.2235653277    1.0000
+    4        -2.9834893595       -40.5927595270    1.0000
+    5        -2.9834885090       -40.5927479557    1.0000
+    6        -2.4893189737       -33.8691760919    1.0000
+    7        -2.4893146841       -33.8691177286    1.0000
+    8        -2.0276649866       -27.5880042751    0.0000
+    9        -1.8103272245       -24.6309501516    0.0000
+   10        -1.7873651915       -24.3185333230    0.0000
+   11        -1.7770532526       -24.1782311445    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2197338165       -57.4128543611    1.0000
+    2        -3.3228551469       -45.2101025582    1.0000
+    3        -2.8522276978       -38.8068396102    1.0000
+    4        -2.7925834781       -37.9953322857    1.0000
+    5        -2.7925829403       -37.9953249688    1.0000
+    6        -2.2835731888       -31.0698400924    0.0000
+    7        -2.2835698509       -31.0697946778    0.0000
+    8        -2.0090975827       -27.3353798910    0.0000
+    9        -1.7726243833       -24.1179728340    0.0000
+   10        -1.7636000613       -23.9951897135    0.0000
+   11        -1.7604795233       -23.9527322981    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.89424558 [Ry]
+   Hartree Energy                =          52.48526724 [Ry]
+   Integral_{Vxc*rho}            =         -17.86263136 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.76328706 [Ry]
+   Electron-Ion energy           =        -165.66041400 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.70329653 [Ry]
+   Energy/atom  =          -433.36715599 [eV]
+
+  0-  2    SRE of pot. & charge weighted pot =   0.9797527159   0.0902767878
+
+ Spin-polarized SCF iter #   3
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.85
+
+ Eigensolver residual max [Ry] :   2.3832e-02
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3763197363       -59.5433310685    1.0000
+    2        -3.4486986267       -46.9223037758    1.0000
+    3        -2.9453549311       -40.0739101220    1.0000
+    4        -2.9407567171       -40.0113477411    1.0000
+    5        -2.9407519327       -40.0112826457    1.0000
+    6        -2.4407124603       -33.2078455922    1.0000
+    7        -2.4406894692       -33.2075327802    1.0000
+    8        -2.0176895331       -27.4522802490    0.0000
+    9        -1.7900701435       -24.3553363588    0.0000
+   10        -1.7760109788       -24.1640501748    0.0000
+   11        -1.7688952892       -24.0672355262    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2507311521       -57.8345979096    1.0000
+    2        -3.2921694495       -44.7925990963    1.0000
+    3        -2.8421734504       -38.6700435312    1.0000
+    4        -2.7823856773       -37.8565830476    1.0000
+    5        -2.7823672542       -37.8563323877    1.0000
+    6        -2.2543559562       -30.6723162688    0.0000
+    7        -2.2543248646       -30.6718932424    0.0000
+    8        -2.0071116474       -27.3083596518    0.0000
+    9        -1.7722074912       -24.1123006839    0.0000
+   10        -1.7624450500       -23.9794748618    0.0000
+   11        -1.7585344077       -23.9262674438    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.48311086 [Ry]
+   Hartree Energy                =          52.25217930 [Ry]
+   Integral_{Vxc*rho}            =         -17.78868866 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.70615862 [Ry]
+   Electron-Ion energy           =        -165.18535244 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.70944357 [Ry]
+   Energy/atom  =          -433.40897369 [eV]
+
+  0-  3    SRE of pot. & charge weighted pot =   0.7888709057   0.0187287032
+
+ Spin-polarized SCF iter #   4
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.87
+
+ Eigensolver residual max [Ry] :   1.3586e-02
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3754591281       -59.5316218051    1.0000
+    2        -3.4482385878       -46.9160445776    1.0000
+    3        -2.9443849976       -40.0607134007    1.0000
+    4        -2.9404111746       -40.0066463599    1.0000
+    5        -2.9404074381       -40.0065955215    1.0000
+    6        -2.4405902443       -33.2061827452    1.0000
+    7        -2.4405743398       -33.2059663530    1.0000
+    8        -2.0176788672       -27.4521351313    0.0000
+    9        -1.7899377109       -24.3535345075    0.0000
+   10        -1.7759590548       -24.1633437081    0.0000
+   11        -1.7688911960       -24.0671798344    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2522000635       -57.8545836246    1.0000
+    2        -3.2929917812       -44.8037875761    1.0000
+    3        -2.8436913827       -38.6906962154    1.0000
+    4        -2.7829962471       -37.8648903387    1.0000
+    5        -2.7829760387       -37.8646153871    1.0000
+    6        -2.2546388873       -30.6761657733    0.0000
+    7        -2.2546097188       -30.6757689121    0.0000
+    8        -2.0072176324       -27.3098016625    0.0000
+    9        -1.7723338723       -24.1140201995    0.0000
+   10        -1.7625091514       -23.9803470119    0.0000
+   11        -1.7587027610       -23.9285580250    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.48492142 [Ry]
+   Hartree Energy                =          52.17271844 [Ry]
+   Integral_{Vxc*rho}            =         -17.76492181 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68776366 [Ry]
+   Electron-Ion energy           =        -165.03887990 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71016138 [Ry]
+   Energy/atom  =          -433.41385683 [eV]
+
+  0-  4    SRE of pot. & charge weighted pot =   0.6700361102   0.0206187555
+
+ Spin-polarized SCF iter #   5
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.90
+
+ Eigensolver residual max [Ry] :   8.1865e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3749166170       -59.5242405071    1.0000
+    2        -3.4482573822       -46.9163002901    1.0000
+    3        -2.9438997394       -40.0541110743    1.0000
+    4        -2.9404311566       -40.0069182306    1.0000
+    5        -2.9404277511       -40.0068718958    1.0000
+    6        -2.4409309489       -33.2108183048    1.0000
+    7        -2.4409199266       -33.2106683376    1.0000
+    8        -2.0176343758       -27.4515297903    0.0000
+    9        -1.7898887247       -24.3528680100    0.0000
+   10        -1.7758744243       -24.1621922416    0.0000
+   11        -1.7688280119       -24.0663201643    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2540908676       -57.8803095261    1.0000
+    2        -3.2943780854       -44.8226493540    1.0000
+    3        -2.8458119745       -38.7195485625    1.0000
+    4        -2.7839514807       -37.8778870560    1.0000
+    5        -2.7839298031       -37.8775921153    1.0000
+    6        -2.2553738151       -30.6861650529    0.0000
+    7        -2.2553458806       -30.6857849827    0.0000
+    8        -2.0073007905       -27.3109330960    0.0000
+    9        -1.7724418574       -24.1154894236    0.0000
+   10        -1.7625183154       -23.9804716951    0.0000
+   11        -1.7588858376       -23.9310489289    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.49194573 [Ry]
+   Hartree Energy                =          52.12844292 [Ry]
+   Integral_{Vxc*rho}            =         -17.75204926 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.67784821 [Ry]
+   Electron-Ion energy           =        -164.95755207 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71039730 [Ry]
+   Energy/atom  =          -433.41546177 [eV]
+
+  0-  5    SRE of pot. & charge weighted pot =   0.4054841782   0.0219427305
+
+ Spin-polarized SCF iter #   6
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.88
+
+ Eigensolver residual max [Ry] :   6.4813e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3744151617       -59.5174178070    1.0000
+    2        -3.4490619394       -46.9272469349    1.0000
+    3        -2.9438513258       -40.0534523684    1.0000
+    4        -2.9409956825       -40.0145990574    1.0000
+    5        -2.9409924014       -40.0145544145    1.0000
+    6        -2.4421622916       -33.2275717073    1.0000
+    7        -2.4421548393       -33.2274703131    1.0000
+    8        -2.0175653501       -27.4505906409    0.0000
+    9        -1.7899409988       -24.3535792410    0.0000
+   10        -1.7757289156       -24.1602124804    0.0000
+   11        -1.7686901833       -24.0644448961    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2575870835       -57.9278783408    1.0000
+    2        -3.2974548886       -44.8645117236    1.0000
+    3        -2.8501194879       -38.7781557290    1.0000
+    4        -2.7859740159       -37.9054052654    1.0000
+    5        -2.7859503336       -37.9050830489    1.0000
+    6        -2.2571653843       -30.7105407859    0.0000
+    7        -2.2571374745       -30.7101610511    0.0000
+    8        -2.0074187009       -27.3125373606    0.0000
+    9        -1.7725906952       -24.1175144803    0.0000
+   10        -1.7624639764       -23.9797323697    0.0000
+   11        -1.7591978043       -23.9352934853    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.51071945 [Ry]
+   Hartree Energy                =          52.11105803 [Ry]
+   Integral_{Vxc*rho}            =         -17.74711460 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.67407430 [Ry]
+   Electron-Ion energy           =        -164.92932554 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71051378 [Ry]
+   Energy/atom  =          -433.41625422 [eV]
+
+  0-  6    SRE of pot. & charge weighted pot =   0.2768771427   0.0202199833
+
+ Spin-polarized SCF iter #   7
+
+ Diagonalization time [sec] :       0.29,      iteration time =       1.89
+
+ Eigensolver residual max [Ry] :   5.9075e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3744292886       -59.5176100153    1.0000
+    2        -3.4515784607       -46.9614862210    1.0000
+    3        -2.9452658139       -40.0726976102    1.0000
+    4        -2.9426515859       -40.0371289475    1.0000
+    5        -2.9426484824       -40.0370867214    1.0000
+    6        -2.4449254597       -33.2651668197    1.0000
+    7        -2.4449207780       -33.2651031219    1.0000
+    8        -2.0175963236       -27.4510120592    0.0000
+    9        -1.7903218050       -24.3587604147    0.0000
+   10        -1.7756582486       -24.1592509992    0.0000
+   11        -1.7685759273       -24.0628903511    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2624062404       -57.9934468253    1.0000
+    2        -3.3027090269       -44.9359984779    1.0000
+    3        -2.8569054671       -38.8704844037    1.0000
+    4        -2.7892599322       -37.9501127849    1.0000
+    5        -2.7892345122       -37.9497669255    1.0000
+    6        -2.2604246666       -30.7548859282    0.0000
+    7        -2.2603964837       -30.7545024784    0.0000
+    8        -2.0075573617       -27.3144239522    0.0000
+    9        -1.7727503500       -24.1196867118    0.0000
+   10        -1.7623056898       -23.9775787538    0.0000
+   11        -1.7596471294       -23.9414069134    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.54693505 [Ry]
+   Hartree Energy                =          52.11766292 [Ry]
+   Integral_{Vxc*rho}            =         -17.74903822 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.67561403 [Ry]
+   Electron-Ion energy           =        -164.94564879 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71064325 [Ry]
+   Energy/atom  =          -433.41713496 [eV]
+
+  0-  7    SRE of pot. & charge weighted pot =   0.2081445608   0.0153390384
+
+ Spin-polarized SCF iter #   8
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.87
+
+ Eigensolver residual max [Ry] :   5.4780e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3738473387       -59.5096921204    1.0000
+    2        -3.4524242971       -46.9729945013    1.0000
+    3        -2.9451405504       -40.0709933006    1.0000
+    4        -2.9432700849       -40.0455441216    1.0000
+    5        -2.9432673014       -40.0455062497    1.0000
+    6        -2.4462714034       -33.2834794609    1.0000
+    7        -2.4462682541       -33.2834366121    1.0000
+    8        -2.0174337187       -27.4487996895    0.0000
+    9        -1.7903607350       -24.3592900887    0.0000
+   10        -1.7754083469       -24.1558508864    0.0000
+   11        -1.7683206535       -24.0594171480    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2661845853       -58.0448542302    1.0000
+    2        -3.3060376556       -44.9812871339    1.0000
+    3        -2.8615913751       -38.9342399318    1.0000
+    4        -2.7914300167       -37.9796385210    1.0000
+    5        -2.7914053787       -37.9793033013    1.0000
+    6        -2.2623118070       -30.7805619835    0.0000
+    7        -2.2622850769       -30.7801982995    0.0000
+    8        -2.0074832177       -27.3134151639    0.0000
+    9        -1.7727198849       -24.1192722100    0.0000
+   10        -1.7619949349       -23.9733506846    0.0000
+   11        -1.7598181545       -23.9437338466    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.56713824 [Ry]
+   Hartree Energy                =          52.12512670 [Ry]
+   Integral_{Vxc*rho}            =         -17.75115786 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.67729510 [Ry]
+   Electron-Ion energy           =        -164.96176352 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71072319 [Ry]
+   Energy/atom  =          -433.41767882 [eV]
+
+  0-  8    SRE of pot. & charge weighted pot =   0.1741421881   0.0118239923
+
+ Spin-polarized SCF iter #   9
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.86
+
+ Eigensolver residual max [Ry] :   5.7370e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3719053272       -59.4832695012    1.0000
+    2        -3.4542464295       -46.9977860706    1.0000
+    3        -2.9445664074       -40.0631816255    1.0000
+    4        -2.9445640546       -40.0631496147    1.0000
+    5        -2.9443738073       -40.0605611475    1.0000
+    6        -2.4494346774       -33.3265183337    1.0000
+    7        -2.4494329307       -33.3264945679    1.0000
+    8        -2.0169762158       -27.4425749972    0.0000
+    9        -1.7904087776       -24.3599437462    0.0000
+   10        -1.7746991920       -24.1462022668    0.0000
+   11        -1.7677057382       -24.0510507329    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2753238214       -58.1692008486    1.0000
+    2        -3.3141929001       -45.0922457607    1.0000
+    3        -2.8732357863       -39.0926714613    1.0000
+    4        -2.7965928578       -38.0498831044    1.0000
+    5        -2.7965751881       -38.0496426943    1.0000
+    6        -2.2666984602       -30.8402459095    0.0000
+    7        -2.2666792996       -30.8399852142    0.0000
+    8        -2.0069919677       -27.3067313136    0.0000
+    9        -1.7723292211       -24.1139569165    0.0000
+   10        -1.7608298440       -23.9574986909    0.0000
+   11        -1.7599541555       -23.9455842487    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61444419 [Ry]
+   Hartree Energy                =          52.15535427 [Ry]
+   Integral_{Vxc*rho}            =         -17.75969355 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68397047 [Ry]
+   Electron-Ion energy           =        -165.02075886 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71083280 [Ry]
+   Energy/atom  =          -433.41842448 [eV]
+
+  0-  9    SRE of pot. & charge weighted pot =   0.0835712459   0.0030213767
+
+ Spin-polarized SCF iter #  10
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.84
+
+ Eigensolver residual max [Ry] :   5.3659e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3705539417       -59.4648828199    1.0000
+    2        -3.4540776121       -46.9954891742    1.0000
+    3        -2.9443986843       -40.0608996191    1.0000
+    4        -2.9443961512       -40.0608651537    1.0000
+    5        -2.9432623659       -40.0454390984    1.0000
+    6        -2.4498325825       -33.3319321515    1.0000
+    7        -2.4498305006       -33.3319038246    1.0000
+    8        -2.0167956359       -27.4401180623    0.0000
+    9        -1.7902880504       -24.3583011560    0.0000
+   10        -1.7744565554       -24.1429010013    0.0000
+   11        -1.7675932068       -24.0495196531    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2774791641       -58.1985260103    1.0000
+    2        -3.3160473777       -45.1174774113    1.0000
+    3        -2.8762719460       -39.1339808426    1.0000
+    4        -2.7975543898       -38.0629655170    1.0000
+    5        -2.7975409633       -38.0627828386    1.0000
+    6        -2.2673197131       -30.8486985524    0.0000
+    7        -2.2673049389       -30.8484975371    0.0000
+    8        -2.0065682302       -27.3009660265    0.0000
+    9        -1.7719381769       -24.1086364469    0.0000
+   10        -1.7601584679       -23.9483640828    0.0000
+   11        -1.7597032703       -23.9421707546    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.62124568 [Ry]
+   Hartree Energy                =          52.16486035 [Ry]
+   Integral_{Vxc*rho}            =         -17.76253662 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68620395 [Ry]
+   Electron-Ion energy           =        -165.03883410 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71085835 [Ry]
+   Energy/atom  =          -433.41859830 [eV]
+
+  0- 10    SRE of pot. & charge weighted pot =   0.0465109277   0.0016940052
+
+ Spin-polarized SCF iter #  11
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.82
+
+ Eigensolver residual max [Ry] :   5.0360e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3692280793       -59.4468434010    1.0000
+    2        -3.4530150478       -46.9810321375    1.0000
+    3        -2.9435941968       -40.0499539233    1.0000
+    4        -2.9435919007       -40.0499226830    1.0000
+    5        -2.9417543236       -40.0249209762    1.0000
+    6        -2.4491554682       -33.3227194690    1.0000
+    7        -2.4491535118       -33.3226928506    1.0000
+    8        -2.0167555387       -27.4395725086    0.0000
+    9        -1.7901257297       -24.3560926532    0.0000
+   10        -1.7744098595       -24.1422656670    0.0000
+   11        -1.7675959235       -24.0495566162    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2772023684       -58.1947599839    1.0000
+    2        -3.3156231684       -45.1117057040    1.0000
+    3        -2.8762883160       -39.1342035698    1.0000
+    4        -2.7969877867       -38.0552564290    1.0000
+    5        -2.7969783025       -38.0551273881    1.0000
+    6        -2.2665054701       -30.8376201245    0.0000
+    7        -2.2664948103       -30.8374750906    0.0000
+    8        -2.0061708960       -27.2955599772    0.0000
+    9        -1.7715494378       -24.1033473408    0.0000
+   10        -1.7596808634       -23.9418658915    0.0000
+   11        -1.7592737181       -23.9363263540    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61257247 [Ry]
+   Hartree Energy                =          52.16223607 [Ry]
+   Integral_{Vxc*rho}            =         -17.76216131 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68593580 [Ry]
+   Electron-Ion energy           =        -165.03466963 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71086855 [Ry]
+   Energy/atom  =          -433.41866764 [eV]
+
+  0- 11    SRE of pot. & charge weighted pot =   0.0196989987   0.0005066126
+
+ Spin-polarized SCF iter #  12
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.83
+
+ Eigensolver residual max [Ry] :   4.5743e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3691250013       -59.4454409426    1.0000
+    2        -3.4528677036       -46.9790274013    1.0000
+    3        -2.9435636226       -40.0495379369    1.0000
+    4        -2.9435616585       -40.0495112137    1.0000
+    5        -2.9414725332       -40.0210869922    1.0000
+    6        -2.4491540107       -33.3226996388    1.0000
+    7        -2.4491522988       -33.3226763467    1.0000
+    8        -2.0168089846       -27.4402996829    0.0000
+    9        -1.7901858594       -24.3569107656    0.0000
+   10        -1.7744571611       -24.1429092422    0.0000
+   11        -1.7676702229       -24.0505675186    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2773770929       -58.1971372506    1.0000
+    2        -3.3156634371       -45.1122535929    1.0000
+    3        -2.8764594788       -39.1365323771    1.0000
+    4        -2.7970093782       -38.0555501974    1.0000
+    5        -2.7970009051       -38.0554349150    1.0000
+    6        -2.2664404866       -30.8367359731    0.0000
+    7        -2.2664309614       -30.8366063743    0.0000
+    8        -2.0061410633       -27.2951540785    0.0000
+    9        -1.7715236755       -24.1029968247    0.0000
+   10        -1.7596583845       -23.9415600484    0.0000
+   11        -1.7592343865       -23.9357912156    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61240712 [Ry]
+   Hartree Energy                =          52.16198064 [Ry]
+   Integral_{Vxc*rho}            =         -17.76214215 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68592923 [Ry]
+   Electron-Ion energy           =        -165.03441837 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087262 [Ry]
+   Energy/atom  =          -433.41869536 [eV]
+
+  0- 12    SRE of pot. & charge weighted pot =   0.0160919398   0.0003530117
+
+ Spin-polarized SCF iter #  13
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.81
+
+ Eigensolver residual max [Ry] :   4.1541e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3692146721       -59.4466609856    1.0000
+    2        -3.4527561228       -46.9775092551    1.0000
+    3        -2.9436359284       -40.0505217146    1.0000
+    4        -2.9436346958       -40.0505049439    1.0000
+    5        -2.9412316721       -40.0178098845    1.0000
+    6        -2.4492280554       -33.3237070767    1.0000
+    7        -2.4492269887       -33.3236925632    1.0000
+    8        -2.0169476189       -27.4421859133    0.0000
+    9        -1.7903500050       -24.3591440982    0.0000
+   10        -1.7745717947       -24.1444689246    0.0000
+   11        -1.7678342321       -24.0527989947    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775944971       -58.2000952086    1.0000
+    2        -3.3156920028       -45.1126422520    1.0000
+    3        -2.8765874757       -39.1382738771    1.0000
+    4        -2.7970753315       -38.0564475453    1.0000
+    5        -2.7970686701       -38.0563569120    1.0000
+    6        -2.2664025246       -30.8362194696    0.0000
+    7        -2.2663950783       -30.8361181562    0.0000
+    8        -2.0061836495       -27.2957334980    0.0000
+    9        -1.7715645482       -24.1035529304    0.0000
+   10        -1.7597623354       -23.9429743828    0.0000
+   11        -1.7592323957       -23.9357641298    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61294611 [Ry]
+   Hartree Energy                =          52.16174950 [Ry]
+   Integral_{Vxc*rho}            =         -17.76205561 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68586872 [Ry]
+   Electron-Ion energy           =        -165.03392222 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087469 [Ry]
+   Energy/atom  =          -433.41870942 [eV]
+
+  0- 13    SRE of pot. & charge weighted pot =   0.0062602088   0.0002799432
+
+ Spin-polarized SCF iter #  14
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.82
+
+ Eigensolver residual max [Ry] :   3.7847e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3690902447       -59.4449680509    1.0000
+    2        -3.4526189677       -46.9756431511    1.0000
+    3        -2.9435025442       -40.0487069158    1.0000
+    4        -2.9435013631       -40.0486908465    1.0000
+    5        -2.9411249525       -40.0163578794    1.0000
+    6        -2.4490708783       -33.3215685559    1.0000
+    7        -2.4490698395       -33.3215544223    1.0000
+    8        -2.0169500500       -27.4422189901    0.0000
+    9        -1.7903334539       -24.3589189066    0.0000
+   10        -1.7745800899       -24.1445817873    0.0000
+   11        -1.7678320110       -24.0527687750    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2772899927       -58.1959521828    1.0000
+    2        -3.3154657283       -45.1095636062    1.0000
+    3        -2.8763110733       -39.1345132016    1.0000
+    4        -2.7968778479       -38.0537606230    1.0000
+    5        -2.7968716602       -38.0536764343    1.0000
+    6        -2.2662185665       -30.8337165725    0.0000
+    7        -2.2662116479       -30.8336224392    0.0000
+    8        -2.0061561590       -27.2953594680    0.0000
+    9        -1.7715392213       -24.1032083373    0.0000
+   10        -1.7597472854       -23.9427696151    0.0000
+   11        -1.7591866418       -23.9351416116    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61079509 [Ry]
+   Hartree Energy                =          52.15978213 [Ry]
+   Integral_{Vxc*rho}            =         -17.76157937 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68550317 [Ry]
+   Electron-Ion energy           =        -165.03051852 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087568 [Ry]
+   Energy/atom  =          -433.41871619 [eV]
+
+  0- 14    SRE of pot. & charge weighted pot =   0.0079027852   0.0001226691
+
+ Spin-polarized SCF iter #  15
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.94
+
+ Eigensolver residual max [Ry] :   3.4480e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3690849900       -59.4448965569    1.0000
+    2        -3.4526266566       -46.9757477645    1.0000
+    3        -2.9435046590       -40.0487356891    1.0000
+    4        -2.9435035205       -40.0487201990    1.0000
+    5        -2.9411293147       -40.0164172306    1.0000
+    6        -2.4490782717       -33.3216691495    1.0000
+    7        -2.4490772473       -33.3216552107    1.0000
+    8        -2.0169566986       -27.4423094504    0.0000
+    9        -1.7903492121       -24.3591333106    0.0000
+   10        -1.7745853055       -24.1446527491    0.0000
+   11        -1.7678402208       -24.0528804760    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2772947046       -58.1960162915    1.0000
+    2        -3.3154882490       -45.1098700185    1.0000
+    3        -2.8763366085       -39.1348606284    1.0000
+    4        -2.7968870231       -38.0538854594    1.0000
+    5        -2.7968811407       -38.0538054248    1.0000
+    6        -2.2662303115       -30.8338763721    0.0000
+    7        -2.2662237410       -30.8337869751    0.0000
+    8        -2.0061586160       -27.2953928977    0.0000
+    9        -1.7715449642       -24.1032864744    0.0000
+   10        -1.7597563943       -23.9428935489    0.0000
+   11        -1.7591897747       -23.9351842368    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61089239 [Ry]
+   Hartree Energy                =          52.15903021 [Ry]
+   Integral_{Vxc*rho}            =         -17.76140574 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68537158 [Ry]
+   Electron-Ion energy           =        -165.02936626 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087620 [Ry]
+   Energy/atom  =          -433.41871973 [eV]
+
+  0- 15    SRE of pot. & charge weighted pot =   0.0100143100   0.0001773097
+
+ Spin-polarized SCF iter #  16
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.89
+
+ Eigensolver residual max [Ry] :   3.1448e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3690757942       -59.4447714401    1.0000
+    2        -3.4525905041       -46.9752558803    1.0000
+    3        -2.9434647253       -40.0481923597    1.0000
+    4        -2.9434633966       -40.0481742810    1.0000
+    5        -2.9411292848       -40.0164168228    1.0000
+    6        -2.4490160060       -33.3208219748    1.0000
+    7        -2.4490147985       -33.3208055456    1.0000
+    8        -2.0169263046       -27.4418959152    0.0000
+    9        -1.7903050252       -24.3585321119    0.0000
+   10        -1.7745806719       -24.1445897054    0.0000
+   11        -1.7678063176       -24.0524191967    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2771819162       -58.1944817150    1.0000
+    2        -3.3153627491       -45.1081624923    1.0000
+    3        -2.8761741382       -39.1326500898    1.0000
+    4        -2.7968073181       -38.0528010091    1.0000
+    5        -2.7968001067       -38.0527028923    1.0000
+    6        -2.2661591394       -30.8329080188    0.0000
+    7        -2.2661511075       -30.8327987380    0.0000
+    8        -2.0061582549       -27.2953879851    0.0000
+    9        -1.7715512202       -24.1033715920    0.0000
+   10        -1.7597447337       -23.9427348983    0.0000
+   11        -1.7591973776       -23.9352876796    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61008074 [Ry]
+   Hartree Energy                =          52.15796203 [Ry]
+   Integral_{Vxc*rho}            =         -17.76113668 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68516432 [Ry]
+   Electron-Ion energy           =        -165.02754263 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087644 [Ry]
+   Energy/atom  =          -433.41872136 [eV]
+
+  0- 16    SRE of pot. & charge weighted pot =   0.0167908494   0.0003572718
+
+ Spin-polarized SCF iter #  17
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.89
+
+ Eigensolver residual max [Ry] :   2.8755e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3690980261       -59.4450739230    1.0000
+    2        -3.4526323479       -46.9758251988    1.0000
+    3        -2.9435292518       -40.0490702938    1.0000
+    4        -2.9435282874       -40.0490571726    1.0000
+    5        -2.9411068590       -40.0161117028    1.0000
+    6        -2.4491135429       -33.3221490422    1.0000
+    7        -2.4491126539       -33.3221369461    1.0000
+    8        -2.0169813192       -27.4426444323    0.0000
+    9        -1.7903937560       -24.3597393656    0.0000
+   10        -1.7746031053       -24.1448949304    0.0000
+   11        -1.7678715116       -24.0533062129    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2773733691       -58.1970865847    1.0000
+    2        -3.3155524977       -45.1107441738    1.0000
+    3        -2.8764281076       -39.1361055467    1.0000
+    4        -2.7969335620       -38.0545186575    1.0000
+    5        -2.7969284279       -38.0544488039    1.0000
+    6        -2.2662630857       -30.8343222908    0.0000
+    7        -2.2662573621       -30.8342444178    0.0000
+    8        -2.0061637180       -27.2954623147    0.0000
+    9        -1.7715545496       -24.1034168910    0.0000
+   10        -1.7597765816       -23.9431682137    0.0000
+   11        -1.7591927812       -23.9352251428    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61133693 [Ry]
+   Hartree Energy                =          52.15809759 [Ry]
+   Integral_{Vxc*rho}            =         -17.76118146 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68520173 [Ry]
+   Electron-Ion energy           =        -165.02792928 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087666 [Ry]
+   Energy/atom  =          -433.41872286 [eV]
+
+  0- 17    SRE of pot. & charge weighted pot =   0.0106532832   0.0002089427
+
+ Spin-polarized SCF iter #  18
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.88
+
+ Eigensolver residual max [Ry] :   2.6288e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3690982407       -59.4450768436    1.0000
+    2        -3.4526304951       -46.9757999898    1.0000
+    3        -2.9435287692       -40.0490637282    1.0000
+    4        -2.9435278076       -40.0490506446    1.0000
+    5        -2.9411049818       -40.0160861611    1.0000
+    6        -2.4491123745       -33.3221331452    1.0000
+    7        -2.4491114816       -33.3221209962    1.0000
+    8        -2.0169812927       -27.4426440718    0.0000
+    9        -1.7903968852       -24.3597819404    0.0000
+   10        -1.7746054694       -24.1449270950    0.0000
+   11        -1.7678720799       -24.0533139444    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2773751520       -58.1971108432    1.0000
+    2        -3.3155505935       -45.1107182649    1.0000
+    3        -2.8764263096       -39.1360810826    1.0000
+    4        -2.7969335266       -38.0545181765    1.0000
+    5        -2.7969284123       -38.0544485922    1.0000
+    6        -2.2662623636       -30.8343124672    0.0000
+    7        -2.2662566635       -30.8342349127    0.0000
+    8        -2.0061613714       -27.2954303871    0.0000
+    9        -1.7715545498       -24.1034168935    0.0000
+   10        -1.7597747291       -23.9431430096    0.0000
+   11        -1.7591928133       -23.9352255785    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61132814 [Ry]
+   Hartree Energy                =          52.15779503 [Ry]
+   Integral_{Vxc*rho}            =         -17.76110744 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68514542 [Ry]
+   Electron-Ion energy           =        -165.02745353 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087677 [Ry]
+   Energy/atom  =          -433.41872358 [eV]
+
+  0- 18    SRE of pot. & charge weighted pot =   0.0122018792   0.0002358312
+
+ Spin-polarized SCF iter #  19
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.90
+
+ Eigensolver residual max [Ry] :   2.4058e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3691126819       -59.4452733272    1.0000
+    2        -3.4526461211       -46.9760125950    1.0000
+    3        -2.9435420300       -40.0492441516    1.0000
+    4        -2.9435411296       -40.0492319012    1.0000
+    5        -2.9411189835       -40.0162766651    1.0000
+    6        -2.4491290637       -33.3223602155    1.0000
+    7        -2.4491282324       -33.3223489041    1.0000
+    8        -2.0169837414       -27.4426773890    0.0000
+    9        -1.7904085629       -24.3599408245    0.0000
+   10        -1.7746086072       -24.1449697884    0.0000
+   11        -1.7678764151       -24.0533729290    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2773793617       -58.1971681196    1.0000
+    2        -3.3155711268       -45.1109976376    1.0000
+    3        -2.8764484736       -39.1363826421    1.0000
+    4        -2.7969433077       -38.0546512557    1.0000
+    5        -2.7969382287       -38.0545821514    1.0000
+    6        -2.2662743631       -30.8344757289    0.0000
+    7        -2.2662687224       -30.8343989837    0.0000
+    8        -2.0061738954       -27.2956007865    0.0000
+    9        -1.7715695391       -24.1036208350    0.0000
+   10        -1.7597962846       -23.9434362893    0.0000
+   11        -1.7592007604       -23.9353337060    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61149874 [Ry]
+   Hartree Energy                =          52.15764445 [Ry]
+   Integral_{Vxc*rho}            =         -17.76107710 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68512299 [Ry]
+   Electron-Ion energy           =        -165.02728072 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087684 [Ry]
+   Energy/atom  =          -433.41872404 [eV]
+
+  0- 19    SRE of pot. & charge weighted pot =   0.0121178138   0.0002333106
+
+ Spin-polarized SCF iter #  20
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.89
+
+ Eigensolver residual max [Ry] :   2.2034e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3691196697       -59.4453684020    1.0000
+    2        -3.4526592195       -46.9761908083    1.0000
+    3        -2.9435475060       -40.0493186569    1.0000
+    4        -2.9435466301       -40.0493067393    1.0000
+    5        -2.9411362857       -40.0165120753    1.0000
+    6        -2.4491362923       -33.3224585662    1.0000
+    7        -2.4491354869       -33.3224476075    1.0000
+    8        -2.0169824851       -27.4426602956    0.0000
+    9        -1.7904137051       -24.3600107893    0.0000
+   10        -1.7746085611       -24.1449691607    0.0000
+   11        -1.7678756505       -24.0533625259    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2773667751       -58.1969968687    1.0000
+    2        -3.3155803779       -45.1111235056    1.0000
+    3        -2.8764536310       -39.1364528132    1.0000
+    4        -2.7969439228       -38.0546596253    1.0000
+    5        -2.7969388468       -38.0545905618    1.0000
+    6        -2.2662806615       -30.8345614241    0.0000
+    7        -2.2662750384       -30.8344849173    0.0000
+    8        -2.0061835259       -27.2957318167    0.0000
+    9        -1.7715814059       -24.1037822921    0.0000
+   10        -1.7598124570       -23.9436563279    0.0000
+   11        -1.7592071880       -23.9354211582    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61156464 [Ry]
+   Hartree Energy                =          52.15748715 [Ry]
+   Integral_{Vxc*rho}            =         -17.76104473 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68509858 [Ry]
+   Electron-Ion energy           =        -165.02707243 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087688 [Ry]
+   Energy/atom  =          -433.41872430 [eV]
+
+  0- 20    SRE of pot. & charge weighted pot =   0.0124758993   0.0002430238
+
+ Spin-polarized SCF iter #  21
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.94
+
+ Eigensolver residual max [Ry] :   2.0195e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3691270322       -59.4454685753    1.0000
+    2        -3.4526625954       -46.9762367399    1.0000
+    3        -2.9435551893       -40.0494231948    1.0000
+    4        -2.9435543459       -40.0494117197    1.0000
+    5        -2.9411349180       -40.0164934671    1.0000
+    6        -2.4491453191       -33.3225813824    1.0000
+    7        -2.4491445411       -33.3225707975    1.0000
+    8        -2.0169884368       -27.4427412729    0.0000
+    9        -1.7904241910       -24.3601534578    0.0000
+   10        -1.7746133099       -24.1450337723    0.0000
+   11        -1.7678828516       -24.0534605025    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2773847373       -58.1972412586    1.0000
+    2        -3.3155935254       -45.1113023874    1.0000
+    3        -2.8764709938       -39.1366890471    1.0000
+    4        -2.7969551946       -38.0548129863    1.0000
+    5        -2.7969502825       -38.0547461530    1.0000
+    6        -2.2662892500       -30.8346782773    0.0000
+    7        -2.2662838098       -30.8346042589    0.0000
+    8        -2.0061846547       -27.2957471751    0.0000
+    9        -1.7715836325       -24.1038125872    0.0000
+   10        -1.7598169939       -23.9437180553    0.0000
+   11        -1.7592080019       -23.9354322327    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61167867 [Ry]
+   Hartree Energy                =          52.15740187 [Ry]
+   Integral_{Vxc*rho}            =         -17.76102538 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68508419 [Ry]
+   Electron-Ion energy           =        -165.02696479 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087690 [Ry]
+   Energy/atom  =          -433.41872448 [eV]
+
+  0- 21    SRE of pot. & charge weighted pot =   0.0124551987   0.0002394433
+
+ Spin-polarized SCF iter #  22
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.81
+
+ Eigensolver residual max [Ry] :   1.8396e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3692133778       -59.4466433751    1.0000
+    2        -3.4527129560       -46.9769219366    1.0000
+    3        -2.9436180290       -40.0502781795    1.0000
+    4        -2.9436172997       -40.0502682564    1.0000
+    5        -2.9411857819       -40.0171855111    1.0000
+    6        -2.4492041932       -33.3233824115    1.0000
+    7        -2.4492035001       -33.3233729811    1.0000
+    8        -2.0170273314       -27.4432704654    0.0000
+    9        -1.7904800820       -24.3609138998    0.0000
+   10        -1.7746341745       -24.1453176516    0.0000
+   11        -1.7679230025       -24.0540067875    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2774667222       -58.1983567288    1.0000
+    2        -3.3156542462       -45.1121285432    1.0000
+    3        -2.8765236492       -39.1374054663    1.0000
+    4        -2.7970240241       -38.0557494666    1.0000
+    5        -2.7970202024       -38.0556974695    1.0000
+    6        -2.2663559263       -30.8355854623    0.0000
+    7        -2.2663516806       -30.8355276960    0.0000
+    8        -2.0061962125       -27.2959044278    0.0000
+    9        -1.7715923452       -24.1039311298    0.0000
+   10        -1.7598448248       -23.9440967176    0.0000
+   11        -1.7592180221       -23.9355685647    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61244398 [Ry]
+   Hartree Energy                =          52.15772802 [Ry]
+   Integral_{Vxc*rho}            =         -17.76109090 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68513489 [Ry]
+   Electron-Ion energy           =        -165.02754577 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087693 [Ry]
+   Energy/atom  =          -433.41872467 [eV]
+
+  0- 22    SRE of pot. & charge weighted pot =   0.0090777017   0.0001389264
+
+ Spin-polarized SCF iter #  23
+
+ Diagonalization time [sec] :       0.26,      iteration time =       1.89
+
+ Eigensolver residual max [Ry] :   1.6603e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693910903       -59.4490612959    1.0000
+    2        -3.4528153773       -46.9783154608    1.0000
+    3        -2.9437469858       -40.0520327388    1.0000
+    4        -2.9437466239       -40.0520278159    1.0000
+    5        -2.9412898877       -40.0186019544    1.0000
+    6        -2.4493245087       -33.3250194005    1.0000
+    7        -2.4493241300       -33.3250142486    1.0000
+    8        -2.0171305683       -27.4446750868    0.0000
+    9        -1.7906173709       -24.3627818255    0.0000
+   10        -1.7746863627       -24.1460277134    0.0000
+   11        -1.7680296431       -24.0554577183    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2776337982       -58.2006299318    1.0000
+    2        -3.3157883699       -45.1139534038    1.0000
+    3        -2.8766362379       -39.1389373253    1.0000
+    4        -2.7971720485       -38.0577634574    1.0000
+    5        -2.7971712674       -38.0577528300    1.0000
+    6        -2.2665011889       -30.8375618760    0.0000
+    7        -2.2665002848       -30.8375495752    0.0000
+    8        -2.0062196203       -27.2962229103    0.0000
+    9        -1.7716059280       -24.1041159355    0.0000
+   10        -1.7599098606       -23.9449815815    0.0000
+   11        -1.7592335029       -23.9357791934    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61404033 [Ry]
+   Hartree Energy                =          52.15859534 [Ry]
+   Integral_{Vxc*rho}            =         -17.76127001 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68527305 [Ry]
+   Electron-Ion energy           =        -165.02903172 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087695 [Ry]
+   Energy/atom  =          -433.41872480 [eV]
+
+  0- 23    SRE of pot. & charge weighted pot =   0.0011494419   0.0000908905
+
+ Spin-polarized SCF iter #  24
+
+ Diagonalization time [sec] :       0.25,      iteration time =       1.92
+
+ Eigensolver residual max [Ry] :   1.5511e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693094191       -59.4479500948    1.0000
+    2        -3.4527650727       -46.9776310260    1.0000
+    3        -2.9436862978       -40.0512070312    1.0000
+    4        -2.9436860196       -40.0512032459    1.0000
+    5        -2.9412399934       -40.0179231021    1.0000
+    6        -2.4492667976       -33.3242341943    1.0000
+    7        -2.4492665195       -33.3242304107    1.0000
+    8        -2.0171149180       -27.4444621511    0.0000
+    9        -1.7905895725       -24.3624036056    0.0000
+   10        -1.7746791864       -24.1459300745    0.0000
+   11        -1.7680124913       -24.0552243536    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775535854       -58.1995385720    1.0000
+    2        -3.3157383314       -45.1132725887    1.0000
+    3        -2.8765889727       -39.1382942444    1.0000
+    4        -2.7971119963       -38.0569463997    1.0000
+    5        -2.7971109033       -38.0569315283    1.0000
+    6        -2.2664447716       -30.8367942731    0.0000
+    7        -2.2664435433       -30.8367775611    0.0000
+    8        -2.0062083224       -27.2960691923    0.0000
+    9        -1.7715974377       -24.1040004175    0.0000
+   10        -1.7598933461       -23.9447568887    0.0000
+   11        -1.7592203473       -23.9356002018    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61332391 [Ry]
+   Hartree Energy                =          52.15828775 [Ry]
+   Integral_{Vxc*rho}            =         -17.76120539 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68522357 [Ry]
+   Electron-Ion energy           =        -165.02850944 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087696 [Ry]
+   Energy/atom  =          -433.41872486 [eV]
+
+  0- 24    SRE of pot. & charge weighted pot =   0.0014017163   0.0000100123
+
+ Spin-polarized SCF iter #  25
+
+ Diagonalization time [sec] :       0.24,      iteration time =       1.91
+
+ Eigensolver residual max [Ry] :   1.4558e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693108514       -59.4479695820    1.0000
+    2        -3.4527649811       -46.9776297804    1.0000
+    3        -2.9436870022       -40.0512166149    1.0000
+    4        -2.9436867770       -40.0512135501    1.0000
+    5        -2.9412400532       -40.0179239161    1.0000
+    6        -2.4492671764       -33.3242393482    1.0000
+    7        -2.4492669495       -33.3242362620    1.0000
+    8        -2.0171221595       -27.4445606782    0.0000
+    9        -1.7905979165       -24.3625171329    0.0000
+   10        -1.7746837774       -24.1459925385    0.0000
+   11        -1.7680199474       -24.0553258001    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775546195       -58.1995526420    1.0000
+    2        -3.3157414704       -45.1133152985    1.0000
+    3        -2.8765906775       -39.1383174400    1.0000
+    4        -2.7971147096       -38.0569833154    1.0000
+    5        -2.7971138328       -38.0569713864    1.0000
+    6        -2.2664478520       -30.8368361848    0.0000
+    7        -2.2664468653       -30.8368227598    0.0000
+    8        -2.0062089424       -27.2960776279    0.0000
+    9        -1.7715980871       -24.1040092529    0.0000
+   10        -1.7598970433       -23.9448071912    0.0000
+   11        -1.7592199736       -23.9355951172    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61333910 [Ry]
+   Hartree Energy                =          52.15826011 [Ry]
+   Integral_{Vxc*rho}            =         -17.76119720 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68521731 [Ry]
+   Electron-Ion energy           =        -165.02847224 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087696 [Ry]
+   Energy/atom  =          -433.41872489 [eV]
+
+  0- 25    SRE of pot. & charge weighted pot =   0.0010176938   0.0000086618
+
+ Spin-polarized SCF iter #  26
+
+ Diagonalization time [sec] :       0.23,      iteration time =       1.92
+
+ Eigensolver residual max [Ry] :   1.3816e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693107701       -59.4479684762    1.0000
+    2        -3.4527649374       -46.9776291858    1.0000
+    3        -2.9436869439       -40.0512158218    1.0000
+    4        -2.9436867179       -40.0512127463    1.0000
+    5        -2.9412400085       -40.0179233078    1.0000
+    6        -2.4492671239       -33.3242386346    1.0000
+    7        -2.4492668961       -33.3242355344    1.0000
+    8        -2.0171220813       -27.4445596144    0.0000
+    9        -1.7905984205       -24.3625239896    0.0000
+   10        -1.7746843032       -24.1459996931    0.0000
+   11        -1.7680199687       -24.0553260906    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775545309       -58.1995514359    1.0000
+    2        -3.3157413898       -45.1133142010    1.0000
+    3        -2.8765906081       -39.1383164951    1.0000
+    4        -2.7971146285       -38.0569822130    1.0000
+    5        -2.7971137496       -38.0569702546    1.0000
+    6        -2.2664477703       -30.8368350726    0.0000
+    7        -2.2664467811       -30.8368216144    0.0000
+    8        -2.0062089239       -27.2960773762    0.0000
+    9        -1.7715986114       -24.1040163874    0.0000
+   10        -1.7598973772       -23.9448117348    0.0000
+   11        -1.7592201376       -23.9355973486    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61333830 [Ry]
+   Hartree Energy                =          52.15823454 [Ry]
+   Integral_{Vxc*rho}            =         -17.76119086 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68521250 [Ry]
+   Electron-Ion energy           =        -165.02843168 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872491 [eV]
+
+  0- 26    SRE of pot. & charge weighted pot =   0.0012023869   0.0000107759
+
+ Spin-polarized SCF iter #  27
+
+ Diagonalization time [sec] :       0.22,      iteration time =       1.89
+
+ Eigensolver residual max [Ry] :   1.3240e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693095835       -59.4479523305    1.0000
+    2        -3.4527633978       -46.9776082375    1.0000
+    3        -2.9436856646       -40.0511984148    1.0000
+    4        -2.9436854981       -40.0511961501    1.0000
+    5        -2.9412386519       -40.0179048494    1.0000
+    6        -2.4492656614       -33.3242187362    1.0000
+    7        -2.4492654986       -33.3242165206    1.0000
+    8        -2.0171250373       -27.4445998331    0.0000
+    9        -1.7906013404       -24.3625637174    0.0000
+   10        -1.7746868944       -24.1460349479    0.0000
+   11        -1.7680230685       -24.0553682649    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775530896       -58.1995318266    1.0000
+    2        -3.3157416087       -45.1133171802    1.0000
+    3        -2.8765903285       -39.1383126919    1.0000
+    4        -2.7971144157       -38.0569793177    1.0000
+    5        -2.7971136014       -38.0569682380    1.0000
+    6        -2.2664477794       -30.8368351972    0.0000
+    7        -2.2664468708       -30.8368228349    0.0000
+    8        -2.0062092726       -27.2960821211    0.0000
+    9        -1.7715991721       -24.1040240156    0.0000
+   10        -1.7598987951       -23.9448310260    0.0000
+   11        -1.7592199507       -23.9355948046    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61332700 [Ry]
+   Hartree Energy                =          52.15820684 [Ry]
+   Integral_{Vxc*rho}            =         -17.76118383 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68520713 [Ry]
+   Electron-Ion energy           =        -165.02838787 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872492 [eV]
+
+  0- 27    SRE of pot. & charge weighted pot =   0.0011388816   0.0000131273
+
+ Spin-polarized SCF iter #  28
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.85
+
+ Eigensolver residual max [Ry] :   1.2850e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693100106       -59.4479581417    1.0000
+    2        -3.4527628918       -46.9776013532    1.0000
+    3        -2.9436855682       -40.0511971037    1.0000
+    4        -2.9436854667       -40.0511957223    1.0000
+    5        -2.9412383461       -40.0179006897    1.0000
+    6        -2.4492653313       -33.3242142449    1.0000
+    7        -2.4492652416       -33.3242130245    1.0000
+    8        -2.0171280170       -27.4446403740    0.0000
+    9        -1.7906043028       -24.3626040225    0.0000
+   10        -1.7746895993       -24.1460717496    0.0000
+   11        -1.7680262145       -24.0554110696    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775532191       -58.1995335878    1.0000
+    2        -3.3157427910       -45.1133332652    1.0000
+    3        -2.8765910532       -39.1383225519    1.0000
+    4        -2.7971153231       -38.0569916628    1.0000
+    5        -2.7971145631       -38.0569813222    1.0000
+    6        -2.2664488352       -30.8368495617    0.0000
+    7        -2.2664479979       -30.8368381704    0.0000
+    8        -2.0062098255       -27.2960896431    0.0000
+    9        -1.7715998365       -24.1040330549    0.0000
+   10        -1.7599001879       -23.9448499759    0.0000
+   11        -1.7592200545       -23.9355962169    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61332981 [Ry]
+   Hartree Energy                =          52.15818904 [Ry]
+   Integral_{Vxc*rho}            =         -17.76117916 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68520357 [Ry]
+   Electron-Ion energy           =        -165.02835923 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872492 [eV]
+
+  0- 28    SRE of pot. & charge weighted pot =   0.0010596536   0.0000140289
+
+ Spin-polarized SCF iter #  29
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.85
+
+ Eigensolver residual max [Ry] :   1.2501e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693107623       -59.4479683697    1.0000
+    2        -3.4527632696       -46.9776064932    1.0000
+    3        -2.9436860874       -40.0512041685    1.0000
+    4        -2.9436859942       -40.0512029000    1.0000
+    5        -2.9412387421       -40.0179060767    1.0000
+    6        -2.4492658005       -33.3242206290    1.0000
+    7        -2.4492657199       -33.3242195318    1.0000
+    8        -2.0171288943       -27.4446523095    0.0000
+    9        -1.7906055233       -24.3626206289    0.0000
+   10        -1.7746904962       -24.1460839529    0.0000
+   11        -1.7680271632       -24.0554239767    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775539696       -58.1995438000    1.0000
+    2        -3.3157435461       -45.1133435396    1.0000
+    3        -2.8765916796       -39.1383310746    1.0000
+    4        -2.7971160660       -38.0570017711    1.0000
+    5        -2.7971153256       -38.0569916968    1.0000
+    6        -2.2664495999       -30.8368599657    0.0000
+    7        -2.2664487854       -30.8368488850    0.0000
+    8        -2.0062099775       -27.2960917113    0.0000
+    9        -1.7716001933       -24.1040379106    0.0000
+   10        -1.7599007128       -23.9448571181    0.0000
+   11        -1.7592202157       -23.9355984110    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61333696 [Ry]
+   Hartree Energy                =          52.15817601 [Ry]
+   Integral_{Vxc*rho}            =         -17.76117570 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68520093 [Ry]
+   Electron-Ion energy           =        -165.02833921 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872493 [eV]
+
+  0- 29    SRE of pot. & charge weighted pot =   0.0010821419   0.0000144510
+
+ Spin-polarized SCF iter #  30
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.84
+
+ Eigensolver residual max [Ry] :   1.2162e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693110674       -59.4479725213    1.0000
+    2        -3.4527634860       -46.9776094382    1.0000
+    3        -2.9436863272       -40.0512074310    1.0000
+    4        -2.9436862343       -40.0512061670    1.0000
+    5        -2.9412389576       -40.0179090088    1.0000
+    6        -2.4492660366       -33.3242238405    1.0000
+    7        -2.4492659562       -33.3242227474    1.0000
+    8        -2.0171290723       -27.4446547322    0.0000
+    9        -1.7906060153       -24.3626273227    0.0000
+   10        -1.7746908928       -24.1460893487    0.0000
+   11        -1.7680273871       -24.0554270239    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775542979       -58.1995482662    1.0000
+    2        -3.3157438174       -45.1133472302    1.0000
+    3        -2.8765919316       -39.1383345026    1.0000
+    4        -2.7971163390       -38.0570054848    1.0000
+    5        -2.7971156032       -38.0569954735    1.0000
+    6        -2.2664498751       -30.8368637110    0.0000
+    7        -2.2664490659       -30.8368527005    0.0000
+    8        -2.0062100105       -27.2960921615    0.0000
+    9        -1.7716004731       -24.1040417170    0.0000
+   10        -1.7599009480       -23.9448603186    0.0000
+   11        -1.7592203310       -23.9355999791    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61334005 [Ry]
+   Hartree Energy                =          52.15816337 [Ry]
+   Integral_{Vxc*rho}            =         -17.76117248 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68519847 [Ry]
+   Electron-Ion energy           =        -165.02832010 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872493 [eV]
+
+  0- 30    SRE of pot. & charge weighted pot =   0.0011444019   0.0000152550
+
+ Spin-polarized SCF iter #  31
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.85
+
+ Eigensolver residual max [Ry] :   1.1832e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693117249       -59.4479814663    1.0000
+    2        -3.4527630415       -46.9776033903    1.0000
+    3        -2.9436865175       -40.0512100191    1.0000
+    4        -2.9436864162       -40.0512086413    1.0000
+    5        -2.9412384007       -40.0179014322    1.0000
+    6        -2.4492660436       -33.3242239364    1.0000
+    7        -2.4492659498       -33.3242226598    1.0000
+    8        -2.0171295996       -27.4446619062    0.0000
+    9        -1.7906069041       -24.3626394165    0.0000
+   10        -1.7746915747       -24.1460986274    0.0000
+   11        -1.7680280726       -24.0554363508    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775549418       -58.1995570265    1.0000
+    2        -3.3157436664       -45.1133451764    1.0000
+    3        -2.8765916574       -39.1383307726    1.0000
+    4        -2.7971166146       -38.0570092346    1.0000
+    5        -2.7971158701       -38.0569991054    1.0000
+    6        -2.2664500221       -30.8368657103    0.0000
+    7        -2.2664491995       -30.8368545181    0.0000
+    8        -2.0062103955       -27.2960973990    0.0000
+    9        -1.7716010693       -24.1040498287    0.0000
+   10        -1.7599020280       -23.9448750131    0.0000
+   11        -1.7592205515       -23.9356029791    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61334084 [Ry]
+   Hartree Energy                =          52.15815247 [Ry]
+   Integral_{Vxc*rho}            =         -17.76116944 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68519616 [Ry]
+   Electron-Ion energy           =        -165.02830355 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872494 [eV]
+
+  0- 31    SRE of pot. & charge weighted pot =   0.0011470809   0.0000158604
+
+ Spin-polarized SCF iter #  32
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.84
+
+ Eigensolver residual max [Ry] :   1.1506e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693060430       -59.4479041595    1.0000
+    2        -3.4527585502       -46.9775422827    1.0000
+    3        -2.9436819074       -40.0511472950    1.0000
+    4        -2.9436817846       -40.0511456247    1.0000
+    5        -2.9412338098       -40.0178389692    1.0000
+    6        -2.4492614420       -33.3241613279    1.0000
+    7        -2.4492613212       -33.3241596846    1.0000
+    8        -2.0171259562       -27.4446123350    0.0000
+    9        -1.7906028715       -24.3625845486    0.0000
+   10        -1.7746897609       -24.1460739485    0.0000
+   11        -1.7680245586       -24.0553885398    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775488862       -58.1994746362    1.0000
+    2        -3.3157380222       -45.1132683828    1.0000
+    3        -2.8765864498       -39.1382599185    1.0000
+    4        -2.7971112201       -38.0569358383    1.0000
+    5        -2.7971103566       -38.0569240893    1.0000
+    6        -2.2664444849       -30.8367903720    0.0000
+    7        -2.2664435260       -30.8367773263    0.0000
+    8        -2.0062100429       -27.2960926016    0.0000
+    9        -1.7716013588       -24.1040537675    0.0000
+   10        -1.7599017225       -23.9448708559    0.0000
+   11        -1.7592200169       -23.9355957056    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61327979 [Ry]
+   Hartree Energy                =          52.15811493 [Ry]
+   Integral_{Vxc*rho}            =         -17.76116080 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68518953 [Ry]
+   Electron-Ion energy           =        -165.02824204 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872494 [eV]
+
+  0- 32    SRE of pot. & charge weighted pot =   0.0014519422   0.0000245785
+
+ Spin-polarized SCF iter #  33
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.93
+
+ Eigensolver residual max [Ry] :   1.1196e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693082435       -59.4479340992    1.0000
+    2        -3.4527601737       -46.9775643708    1.0000
+    3        -2.9436836754       -40.0511713503    1.0000
+    4        -2.9436835542       -40.0511697022    1.0000
+    5        -2.9412354254       -40.0178609504    1.0000
+    6        -2.4492631903       -33.3241851145    1.0000
+    7        -2.4492630712       -33.3241834942    1.0000
+    8        -2.0171274738       -27.4446329831    0.0000
+    9        -1.7906048856       -24.3626119530    0.0000
+   10        -1.7746908068       -24.1460881790    0.0000
+   11        -1.7680260712       -24.0554091202    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775513274       -58.1995078507    1.0000
+    2        -3.3157401144       -45.1132968486    1.0000
+    3        -2.8765883623       -39.1382859396    1.0000
+    4        -2.7971132990       -38.0569641237    1.0000
+    5        -2.7971124835       -38.0569530281    1.0000
+    6        -2.2664465942       -30.8368190711    0.0000
+    7        -2.2664456883       -30.8368067462    0.0000
+    8        -2.0062102433       -27.2960953280    0.0000
+    9        -1.7716016098       -24.1040571822    0.0000
+   10        -1.7599022319       -23.9448777870    0.0000
+   11        -1.7592203249       -23.9355998960    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61330292 [Ry]
+   Hartree Energy                =          52.15810827 [Ry]
+   Integral_{Vxc*rho}            =         -17.76115882 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68518801 [Ry]
+   Electron-Ion energy           =        -165.02823160 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872494 [eV]
+
+  0- 33    SRE of pot. & charge weighted pot =   0.0013937307   0.0000230198
+
+ Spin-polarized SCF iter #  34
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.88
+
+ Eigensolver residual max [Ry] :   1.0894e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693094595       -59.4479506445    1.0000
+    2        -3.4527610919       -46.9775768648    1.0000
+    3        -2.9436846505       -40.0511846180    1.0000
+    4        -2.9436845382       -40.0511830900    1.0000
+    5        -2.9412363677       -40.0178737718    1.0000
+    6        -2.4492641538       -33.3241982240    1.0000
+    7        -2.4492640446       -33.3241967382    1.0000
+    8        -2.0171287459       -27.4446502904    0.0000
+    9        -1.7906064764       -24.3626335971    0.0000
+   10        -1.7746917733       -24.1461013291    0.0000
+   11        -1.7680273441       -24.0554264389    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775526793       -58.1995262440    1.0000
+    2        -3.3157415003       -45.1133157052    1.0000
+    3        -2.8765895944       -39.1383027038    1.0000
+    4        -2.7971145840       -38.0569816071    1.0000
+    5        -2.7971138064       -38.0569710270    1.0000
+    6        -2.2664479365       -30.8368373341    0.0000
+    7        -2.2664470738       -30.8368255960    0.0000
+    8        -2.0062103970       -27.2960974200    0.0000
+    9        -1.7716018476       -24.1040604186    0.0000
+   10        -1.7599026832       -23.9448839268    0.0000
+   11        -1.7592204977       -23.9356022470    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61331647 [Ry]
+   Hartree Energy                =          52.15810123 [Ry]
+   Integral_{Vxc*rho}            =         -17.76115690 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68518656 [Ry]
+   Electron-Ion energy           =        -165.02822122 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872495 [eV]
+
+  0- 34    SRE of pot. & charge weighted pot =   0.0013560621   0.0000223641
+
+ Spin-polarized SCF iter #  35
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.88
+
+ Eigensolver residual max [Ry] :   1.0675e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693657564       -59.4487166089    1.0000
+    2        -3.4528056730       -46.9781834256    1.0000
+    3        -2.9437311796       -40.0518176832    1.0000
+    4        -2.9437310941       -40.0518165207    1.0000
+    5        -2.9412812423       -40.0184843261    1.0000
+    6        -2.4493107757       -33.3248325520    1.0000
+    7        -2.4493106699       -33.3248311127    1.0000
+    8        -2.0171794970       -27.4453408001    0.0000
+    9        -1.7906630857       -24.3634038120    0.0000
+   10        -1.7747193455       -24.1464764709    0.0000
+   11        -1.7680801368       -24.0561447254    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2776170826       -58.2004025028    1.0000
+    2        -3.3158024996       -45.1141456485    1.0000
+    3        -2.8766449802       -39.1390562718    1.0000
+    4        -2.7971731656       -38.0577786566    1.0000
+    5        -2.7971723548       -38.0577676245    1.0000
+    6        -2.2665085702       -30.8376623050    0.0000
+    7        -2.2665076603       -30.8376499241    0.0000
+    8        -2.0062161729       -27.2961760051    0.0000
+    9        -1.7716024289       -24.1040683277    0.0000
+   10        -1.7599131289       -23.9450260497    0.0000
+   11        -1.7592272739       -23.9356944436    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61394647 [Ry]
+   Hartree Energy                =          52.15835342 [Ry]
+   Integral_{Vxc*rho}            =         -17.76121153 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68522859 [Ry]
+   Electron-Ion energy           =        -165.02864954 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872495 [eV]
+
+  0- 35    SRE of pot. & charge weighted pot =   0.0022385888   0.0000569803
+
+ Spin-polarized SCF iter #  36
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.84
+
+ Eigensolver residual max [Ry] :   1.0348e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693340344       -59.4482850056    1.0000
+    2        -3.4527800205       -46.9778344032    1.0000
+    3        -2.9437048895       -40.0514599857    1.0000
+    4        -2.9437048712       -40.0514597371    1.0000
+    5        -2.9412552711       -40.0181309680    1.0000
+    6        -2.4492843131       -33.3244725078    1.0000
+    7        -2.4492843005       -33.3244723358    1.0000
+    8        -2.0171549361       -27.4450066290    0.0000
+    9        -1.7906352031       -24.3630244465    0.0000
+   10        -1.7747063810       -24.1463000787    0.0000
+   11        -1.7680528684       -24.0557737166    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775817890       -58.1999223041    1.0000
+    2        -3.3157691966       -45.1136925355    1.0000
+    3        -2.8766144572       -39.1386409814    1.0000
+    4        -2.7971408288       -38.0573386890    1.0000
+    5        -2.7971408191       -38.0573385568    1.0000
+    6        -2.2664751193       -30.8372071784    0.0000
+    7        -2.2664751087       -30.8372070341    0.0000
+    8        -2.0062139229       -27.2961453921    0.0000
+    9        -1.7716030665       -24.1040770027    0.0000
+   10        -1.7599094259       -23.9449756675    0.0000
+   11        -1.7592239864       -23.9356497147    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61359479 [Ry]
+   Hartree Energy                =          52.15825335 [Ry]
+   Integral_{Vxc*rho}            =         -17.76119067 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68521268 [Ry]
+   Electron-Ion energy           =        -165.02849206 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872495 [eV]
+
+  0- 36    SRE of pot. & charge weighted pot =   0.0004550408   0.0000164593
+
+ Spin-polarized SCF iter #  37
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.85
+
+ Eigensolver residual max [Ry] :   1.0063e-03
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693293494       -59.4482212616    1.0000
+    2        -3.4527759597       -46.9777791525    1.0000
+    3        -2.9437009490       -40.0514063723    1.0000
+    4        -2.9437009313       -40.0514061305    1.0000
+    5        -2.9412511740       -40.0180752230    1.0000
+    6        -2.4492802444       -33.3244171491    1.0000
+    7        -2.4492802303       -33.3244169579    1.0000
+    8        -2.0171523911       -27.4449720026    0.0000
+    9        -1.7906321415       -24.3629827909    0.0000
+   10        -1.7747053875       -24.1462865613    0.0000
+   11        -1.7680504127       -24.0557403053    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775766986       -58.1998530461    1.0000
+    2        -3.3157645437       -45.1136292293    1.0000
+    3        -2.8766100733       -39.1385813355    1.0000
+    4        -2.7971364303       -38.0572788435    1.0000
+    5        -2.7971363454       -38.0572776885    1.0000
+    6        -2.2664705798       -30.8371454145    0.0000
+    7        -2.2664704865       -30.8371441449    0.0000
+    8        -2.0062139540       -27.2961458151    0.0000
+    9        -1.7716035937       -24.1040841757    0.0000
+   10        -1.7599094667       -23.9449762224    0.0000
+   11        -1.7592237408       -23.9356463720    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61354293 [Ry]
+   Hartree Energy                =          52.15823124 [Ry]
+   Integral_{Vxc*rho}            =         -17.76118554 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68520874 [Ry]
+   Electron-Ion energy           =        -165.02845534 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872495 [eV]
+
+  0- 37    SRE of pot. & charge weighted pot =   0.0002306700   0.0000098135
+
+ Spin-polarized SCF iter #  38
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.81
+
+ Eigensolver residual max [Ry] :   9.7891e-04
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693252283       -59.4481651909    1.0000
+    2        -3.4527721577       -46.9777274229    1.0000
+    3        -2.9436974353       -40.0513585649    1.0000
+    4        -2.9436974261       -40.0513584399    1.0000
+    5        -2.9412473639       -40.0180233840    1.0000
+    6        -2.4492765086       -33.3243663203    1.0000
+    7        -2.4492764923       -33.3243660993    1.0000
+    8        -2.0171514951       -27.4449598125    0.0000
+    9        -1.7906305485       -24.3629611171    0.0000
+   10        -1.7747054681       -24.1462876577    0.0000
+   11        -1.7680495800       -24.0557289758    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775724213       -58.1997948497    1.0000
+    2        -3.3157608374       -45.1135788015    1.0000
+    3        -2.8766064506       -39.1385320454    1.0000
+    4        -2.7971329437       -38.0572314051    1.0000
+    5        -2.7971328204       -38.0572297276    1.0000
+    6        -2.2664670012       -30.8370967253    0.0000
+    7        -2.2664668721       -30.8370949687    0.0000
+    8        -2.0062145892       -27.2961544582    0.0000
+    9        -1.7716045775       -24.1040975603    0.0000
+   10        -1.7599101666       -23.9449857441    0.0000
+   11        -1.7592239664       -23.9356494421    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61349809 [Ry]
+   Hartree Energy                =          52.15820380 [Ry]
+   Integral_{Vxc*rho}            =         -17.76117906 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68520377 [Ry]
+   Electron-Ion energy           =        -165.02840767 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872495 [eV]
+
+  0- 38    SRE of pot. & charge weighted pot =   0.0000936248   0.0000033617
+
+ Spin-polarized SCF iter #  39
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.83
+
+ Eigensolver residual max [Ry] :   9.5240e-04
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693221740       -59.4481236349    1.0000
+    2        -3.4527694176       -46.9776901413    1.0000
+    3        -2.9436949233       -40.0513243872    1.0000
+    4        -2.9436949098       -40.0513242041    1.0000
+    5        -2.9412445310       -40.0179848394    1.0000
+    6        -2.4492738717       -33.3243304431    1.0000
+    7        -2.4492738536       -33.3243301980    1.0000
+    8        -2.0171512314       -27.4449562248    0.0000
+    9        -1.7906298127       -24.3629511053    0.0000
+   10        -1.7747056716       -24.1462904261    0.0000
+   11        -1.7680493410       -24.0557257238    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775695413       -58.1997556650    1.0000
+    2        -3.3157582190       -45.1135431767    1.0000
+    3        -2.8766039036       -39.1384973919    1.0000
+    4        -2.7971304789       -38.0571978704    1.0000
+    5        -2.7971303282       -38.0571958193    1.0000
+    6        -2.2664644777       -30.8370623907    0.0000
+    7        -2.2664643181       -30.8370602185    0.0000
+    8        -2.0062151943       -27.2961626910    0.0000
+    9        -1.7716054369       -24.1041092539    0.0000
+   10        -1.7599110150       -23.9449972872    0.0000
+   11        -1.7592242403       -23.9356531681    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61346615 [Ry]
+   Hartree Energy                =          52.15817841 [Ry]
+   Integral_{Vxc*rho}            =         -17.76117291 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68519903 [Ry]
+   Electron-Ion energy           =        -165.02836365 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872495 [eV]
+
+  0- 39    SRE of pot. & charge weighted pot =   0.0000391287   0.0000020773
+
+ Spin-polarized SCF iter #  40
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.82
+
+ Eigensolver residual max [Ry] :   9.2649e-04
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693225373       -59.4481285782    1.0000
+    2        -3.4527700369       -46.9776985678    1.0000
+    3        -2.9436953414       -40.0513300763    1.0000
+    4        -2.9436953305       -40.0513299271    1.0000
+    5        -2.9412450928       -40.0179924838    1.0000
+    6        -2.4492744141       -33.3243378233    1.0000
+    7        -2.4492744043       -33.3243376899    1.0000
+    8        -2.0171503456       -27.4449441716    0.0000
+    9        -1.7906292889       -24.3629439795    0.0000
+   10        -1.7747051486       -24.1462833105    0.0000
+   11        -1.7680484560       -24.0557136820    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775699665       -58.1997614505    1.0000
+    2        -3.3157583059       -45.1135443590    1.0000
+    3        -2.8766041507       -39.1385007530    1.0000
+    4        -2.7971305627       -38.0571990096    1.0000
+    5        -2.7971303855       -38.0571965994    1.0000
+    6        -2.2664645502       -30.8370633774    0.0000
+    7        -2.2664643561       -30.8370607359    0.0000
+    8        -2.0062149769       -27.2961597328    0.0000
+    9        -1.7716054300       -24.1041091596    0.0000
+   10        -1.7599108164       -23.9449945854    0.0000
+   11        -1.7592242167       -23.9356528478    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61347053 [Ry]
+   Hartree Energy                =          52.15817002 [Ry]
+   Integral_{Vxc*rho}            =         -17.76117080 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68519740 [Ry]
+   Electron-Ion energy           =        -165.02834936 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872496 [eV]
+
+  0- 40    SRE of pot. & charge weighted pot =   0.0000566474   0.0000021634
+
+ Spin-polarized SCF iter #  41
+
+ Diagonalization time [sec] :       0.20,      iteration time =       1.82
+
+ Eigensolver residual max [Ry] :   9.0155e-04
+
+ Fermi level at        nan [Ry]
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693245453       -59.4481558985    1.0000
+    2        -3.4527719400       -46.9777244610    1.0000
+    3        -2.9436971382       -40.0513545226    1.0000
+    4        -2.9436971127       -40.0513541763    1.0000
+    5        -2.9412469459       -40.0180176959    1.0000
+    6        -2.4492763223       -33.3243637861    1.0000
+    7        -2.4492762949       -33.3243634134    1.0000
+    8        -2.0171511384       -27.4449549583    0.0000
+    9        -1.7906305339       -24.3629609188    0.0000
+   10        -1.7747055651       -24.1462889781    0.0000
+   11        -1.7680491915       -24.0557236893    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775723616       -58.1997940381    1.0000
+    2        -3.3157602535       -45.1135708576    1.0000
+    3        -2.8766060870       -39.1385270991    1.0000
+    4        -2.7971324056       -38.0572240838    1.0000
+    5        -2.7971322532       -38.0572220109    1.0000
+    6        -2.2664664474       -30.8370891901    0.0000
+    7        -2.2664662768       -30.8370868685    0.0000
+    8        -2.0062151078       -27.2961615135    0.0000
+    9        -1.7716055943       -24.1041113951    0.0000
+   10        -1.7599110446       -23.9449976903    0.0000
+   11        -1.7592245545       -23.9356574437    0.0000
+
+   Magnetic moment N_up - N_down =       2.0000
+
+   Eigenvalue Energy             =         -13.61349366 [Ry]
+   Hartree Energy                =          52.15817244 [Ry]
+   Integral_{Vxc*rho}            =         -17.76117117 [Ry]
+   Exc = Integral{eps_xc*rho}    =         -13.68519769 [Ry]
+   Electron-Ion energy           =        -165.02835441 [Ry]
+   Ion-Ion Energy                =          -2.01518658 [Ry]
+
+   Total Energy =           -63.71087697 [Ry]
+   Energy/atom  =          -433.41872496 [eV]
+
+  0- 41    SRE of pot. & charge weighted pot =   0.0000183576   0.0000002663
+
+Self-consistency convergence achieved.
+
+Time for self-consistent field [sec] :      88.58
+
+ SCF timing analysis [sec]
+ --------------------------------------------------
+ Initial Hartree potential      :     0.831715
+ Initial exchange-correlation   :     1.440473
+ Diagonalization subtotal       :    19.402644
+ Occupation/density subtotal    :     0.103098
+ Hartree potential subtotal     :     3.679536
+ Exchange-correlation subtotal  :    61.769474
+ Mixing/energy subtotal         :     1.079735
+ SCF wall time                   :    88.584000
+ --------------------------------------------------
+
+ K-point solver detail
+ --------------------------------------------------
+ Workers                        :            1
+ Solver and worker start-up     :     0.001247
+ Summed over the workers [worker-sec]
+   Bloch Hamiltonian (projectors) :     0.037150
+   Operator upload              :     0.147052
+   Eigensolver                  :    19.214058
+   Density of the k-points      :     0.070673
+ Device eigensolver [worker-sec]
+   Lanczos bounds               :     1.916786
+   Chebyshev filter             :    11.865307
+   Orthonormalization           :     3.254456
+   Rayleigh-Ritz                :     0.968087
+   Residuals                    :     0.883248
+ Eigensolver counters
+   First solves                 :            2
+   Subspace steps               :           80
+   Extra CHEBFF cycles          :           48
+   Operator applications        :         3798
+   Application columns          :        38730
+ --------------------------------------------------
+
+Converged magnetic moment N_up - N_down =       2.0000
+Total Energy =           -63.71087697 [Ry]
+Energy/atom  =          -433.41872496 [eV]
+
+Converged eigenvalues by k-point
+
+ k-point   1 of   1   k = (  0.000000   0.000000   0.000000) [1/bohr]   frac = ( 0.00000  0.00000  0.00000)   weight =  1.000000
+
+   Spin up
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.3693245453       -59.4481558985    1.0000
+    2        -3.4527719400       -46.9777244610    1.0000
+    3        -2.9436971382       -40.0513545226    1.0000
+    4        -2.9436971127       -40.0513541763    1.0000
+    5        -2.9412469459       -40.0180176959    1.0000
+    6        -2.4492763223       -33.3243637861    1.0000
+    7        -2.4492762949       -33.3243634134    1.0000
+    8        -2.0171511384       -27.4449549583    0.0000
+    9        -1.7906305339       -24.3629609188    0.0000
+   10        -1.7747055651       -24.1462889781    0.0000
+   11        -1.7680491915       -24.0557236893    0.0000
+
+   Spin down
+   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.
+
+    1        -4.2775723616       -58.1997940381    1.0000
+    2        -3.3157602535       -45.1135708576    1.0000
+    3        -2.8766060870       -39.1385270991    1.0000
+    4        -2.7971324056       -38.0572240838    1.0000
+    5        -2.7971322532       -38.0572220109    1.0000
+    6        -2.2664664474       -30.8370891901    0.0000
+    7        -2.2664662768       -30.8370868685    0.0000
+    8        -2.0062151078       -27.2961615135    0.0000
+    9        -1.7716055943       -24.1041113951    0.0000
+   10        -1.7599110446       -23.9449976903    0.0000
+   11        -1.7592245545       -23.9356574437    0.0000
+
+Forces, dipoles, and MPI statistics are not calculated by this Python single-point implementation.
+
+ =================================================================
+ NOTE: the potentials of parsec.dat are the output potentials of the last SCF iteration (this driver keeps no mixed potential)
+ NOTE: the wavefunctions of 7 state(s) are not in parsec.dat: this calculation does not keep them (k-point drivers keep no orbitals)
+ NOTE: the wavefunctions of 5 state(s) are not in parsec.dat: this calculation does not keep them (k-point drivers keep no orbitals)
+ parsec.dat: examples/3d_hybrid_functionals/O2_box/pbe/parsec.dat (potential and density of 2 spin channel(s) on 405224 points, 0 wavefunction(s))
+ Total Python wall time [sec] :       96.12
+Text log: examples/3d_hybrid_functionals/O2_box/pbe/parsec.out

@@ -1,0 +1,33 @@
+ &control
+    calculation = 'scf'
+    prefix = 'CO_scan_L20_e150'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+    tprnfor = .true.
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 20.000000
+    assume_isolated = 'mt'
+    nat = 2
+    ntyp = 2
+    ecutwfc = 150.0
+    ecutrho = 600.0
+    nbnd = 9
+    occupations = 'fixed'
+    input_dft = 'XC-000I-000I-000I-000I-263L-267L'
+ /
+ &electrons
+    conv_thr = 1.0d-09
+    mixing_beta = 0.4
+    electron_maxstep = 300
+ /
+ATOMIC_SPECIES
+ C 12.011 c_pbe_tm.UPF
+ O 15.999 o_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ C 10.0000000000 10.0000000000 8.9339110068
+ O 10.0000000000 10.0000000000 11.0660889932
+K_POINTS gamma

@@ -1,0 +1,42 @@
+ &control
+    calculation = 'scf'
+    prefix = 'o2_hse06_k111_e150_gb_moved'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 0
+    nat = 2
+    ntyp = 1
+    ecutwfc = 150.0
+    nbnd = 11
+    occupations = 'fixed'
+    input_dft = 'hse'
+    nspin = 2
+    tot_magnetization = 2
+    nqx1 = 1
+    nqx2 = 1
+    nqx3 = 1
+    x_gamma_extrapolation = .false.
+    exxdiv_treatment = 'gygi-baldereschi'
+    ecutfock = 300.0
+    screening_parameter = 0.11
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ O 15.999 o_pbe_tm.UPF
+CELL_PARAMETERS bohr
+ 12.0000000000 0.0000000000 0.0000000000
+ 0.0000000000 12.0000000000 0.0000000000
+ 0.0000000000 0.0000000000 12.0000000000
+ATOMIC_POSITIONS bohr
+ O 6.0625000000 6.0625000000 4.9215778523
+ O 6.0625000000 6.0625000000 7.2034221477
+K_POINTS automatic
+ 1 1 1 0 0 0

@@ -1216,7 +1216,9 @@ the exact exchange within 0.02 mRy; SCAN and SCAN0 within 0.1-0.5 mRy and O2
 `E - E_PBE` of O2 moves by 0.7 mRy between 150 and 300 Ry; see
 [Accuracy and grid spacing](#accuracy-and-grid-spacing)). The SCAN runs of
 CH4, CO and NH3 stop at `Max_Iter` 200 with the energy settled (SCAN's
-residual floor, see [Method](#method)).
+residual floor, see [Method](#method)). The inputs and logs of the
+semilocal rows, TPSSh and r2SCAN0 (with the h = 0.13 bohr rows, forces and
+timings) are [`examples/0d_meta_gga`](../../examples/0d_meta_gga/README.md).
 
 ### libxc's versions of this code's functionals
 

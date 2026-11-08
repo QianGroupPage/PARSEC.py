@@ -1,0 +1,35 @@
+ &control
+    calculation = 'scf'
+    prefix = 'Si_tpss_k4_e200_d8'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+    tprnfor = .true.
+ /
+ &system
+    ibrav = 0
+    nat = 2
+    ntyp = 1
+    ecutwfc = 200.0
+    ecutrho = 1600.0
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'XC-000I-000I-000I-000I-202L-231L'
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 300
+ /
+ATOMIC_SPECIES
+ Si 28.085 si_pbe_tm.UPF
+CELL_PARAMETERS bohr
+ 0.0000000000 5.1300000000 5.1300000000
+ 5.1300000000 0.0000000000 5.1300000000
+ 5.1300000000 5.1300000000 0.0000000000
+ATOMIC_POSITIONS bohr
+ Si 0.0000000000 0.0000000000 0.0000000000
+ Si 2.5650000000 2.5650000000 2.5650000000
+K_POINTS automatic
+ 4 4 4 0 0 0

@@ -1,0 +1,34 @@
+ &control
+    calculation = 'scf'
+    prefix = 'mgo_pbe_k333_e150'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 0
+    nat = 2
+    ntyp = 2
+    ecutwfc = 150.0
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'pbe'
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ Mg 24.305 mg_pbe_tm.UPF
+ O 15.999 o_pbe_tm.UPF
+CELL_PARAMETERS bohr
+ 0.0000000000 3.9800000000 3.9800000000
+ 3.9800000000 0.0000000000 3.9800000000
+ 3.9800000000 3.9800000000 0.0000000000
+ATOMIC_POSITIONS bohr
+ Mg 0.0000000000 0.0000000000 0.0000000000
+ O 3.9800000000 0.0000000000 0.0000000000
+K_POINTS automatic
+ 3 3 3 0 0 0

@@ -1,0 +1,43 @@
+# H2O: TPSS (Tao, Perdew, Staroverov and Scuseria 2003) of libxc, in PARSEC 1.5's keywords
+# Quantum ESPRESSO reference: input_dft = 'XC-000I-000I-000I-000I-202L-231L' (qe/README.md)
+
+Boundary_Sphere_Radius: 11.53
+Grid_Spacing: 0.160
+Coordinate_Unit: Cartesian_Bohr
+Expansion_Order: 12
+Use_LibXC: .true.   # PARSEC 1.5's form; the same as LibXC_Functional: mgga_x_tpss mgga_c_tpss
+Func_Id_X: 202      # MGGA_X_TPSS
+Func_Id_C: 231      # MGGA_C_TPSS
+States_Num: 8
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+
+Atom_Types_Num: 2
+
+Atom_Type: H
+Pseudopotential_Format: fhipp
+Potential_Num: 1
+Local_Component: s
+Core_Cutoff_Radius: 1.3
+begin Electron_Per_Orbital
+1
+end Electron_Per_Orbital
+Cubic_Spline: .true.
+begin Atom_Coord
+     1.4304288085    0.0000000000    0.5535785220
+    -1.4304288085    0.0000000000    0.5535785220
+end Atom_Coord
+
+Atom_Type: O
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 1.6
+begin Electron_Per_Orbital
+2 4 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.
+begin Atom_Coord
+     0.0000000000    0.0000000000   -0.5535785220
+end Atom_Coord

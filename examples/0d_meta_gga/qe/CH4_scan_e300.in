@@ -1,0 +1,36 @@
+ &control
+    calculation = 'scf'
+    prefix = 'CH4_scan_L20_e300'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+    tprnfor = .true.
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 20.000000
+    assume_isolated = 'mt'
+    nat = 5
+    ntyp = 2
+    ecutwfc = 300.0
+    ecutrho = 1200.0
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'XC-000I-000I-000I-000I-263L-267L'
+ /
+ &electrons
+    conv_thr = 1.0d-09
+    mixing_beta = 0.4
+    electron_maxstep = 300
+ /
+ATOMIC_SPECIES
+ H 1.008 h_pbe_tm.UPF
+ C 12.011 c_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ C 10.0000000000 10.0000000000 10.0000000000
+ H 11.1859538349 11.1859538349 11.1859538349
+ H 8.8140461651 8.8140461651 11.1859538349
+ H 8.8140461651 11.1859538349 8.8140461651
+ H 11.1859538349 8.8140461651 8.8140461651
+K_POINTS gamma

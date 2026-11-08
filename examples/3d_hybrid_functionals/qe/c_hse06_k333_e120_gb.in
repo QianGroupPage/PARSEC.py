@@ -1,0 +1,40 @@
+ &control
+    calculation = 'scf'
+    prefix = 'c_hse06_k333_e120_gb'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 0
+    nat = 2
+    ntyp = 1
+    ecutwfc = 120.0
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'hse'
+    nqx1 = 3
+    nqx2 = 3
+    nqx3 = 3
+    x_gamma_extrapolation = .false.
+    exxdiv_treatment = 'gygi-baldereschi'
+    ecutfock = 240.0
+    screening_parameter = 0.11
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ C 12.011 c_pbe_tm.UPF
+CELL_PARAMETERS bohr
+ 0.0000000000 3.3700000000 3.3700000000
+ 3.3700000000 0.0000000000 3.3700000000
+ 3.3700000000 3.3700000000 0.0000000000
+ATOMIC_POSITIONS bohr
+ C 0.0000000000 0.0000000000 0.0000000000
+ C 1.6850000000 1.6850000000 1.6850000000
+K_POINTS automatic
+ 3 3 3 0 0 0

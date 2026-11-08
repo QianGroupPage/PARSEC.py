@@ -1,0 +1,40 @@
+ &control
+    calculation = 'scf'
+    prefix = 'si_hse06_k222_e60_gb'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 0
+    nat = 2
+    ntyp = 1
+    ecutwfc = 60.0
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'hse'
+    nqx1 = 2
+    nqx2 = 2
+    nqx3 = 2
+    x_gamma_extrapolation = .false.
+    exxdiv_treatment = 'gygi-baldereschi'
+    ecutfock = 120.0
+    screening_parameter = 0.11
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ Si 28.085 si_pbe_tm.UPF
+CELL_PARAMETERS bohr
+ 0.0000000000 5.1300000000 5.1300000000
+ 5.1300000000 0.0000000000 5.1300000000
+ 5.1300000000 5.1300000000 0.0000000000
+ATOMIC_POSITIONS bohr
+ Si 0.0000000000 0.0000000000 0.0000000000
+ Si 2.5650000000 2.5650000000 2.5650000000
+K_POINTS automatic
+ 2 2 2 0 0 0

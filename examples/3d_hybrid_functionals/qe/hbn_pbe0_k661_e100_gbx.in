@@ -1,0 +1,41 @@
+ &control
+    calculation = 'scf'
+    prefix = 'hbn_pbe0_k661_e100_gbx'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 0
+    nat = 2
+    ntyp = 2
+    ecutwfc = 100.0
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'pbe0'
+    assume_isolated = '2D'
+    nqx1 = 6
+    nqx2 = 6
+    nqx3 = 1
+    x_gamma_extrapolation = .true.
+    exxdiv_treatment = 'gygi-baldereschi'
+    ecutfock = 200.0
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ B 10.81 b_pbe_tm.UPF
+ N 14.007 n_pbe_tm.UPF
+CELL_PARAMETERS bohr
+ 4.7300000000 0.0000000000 0.0000000000
+ -2.3650000000 4.0963001599 0.0000000000
+ 0.0000000000 0.0000000000 30.0000000000
+ATOMIC_POSITIONS bohr
+ B 0.0000000000 0.0000000000 0.0000000000
+ N 0.0000000000 2.7308667733 0.0000000000
+K_POINTS automatic
+ 6 6 1 0 0 0

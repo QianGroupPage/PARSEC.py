@@ -89,8 +89,9 @@ def moving_cell_options_reference_only(translation) -> list[str]:
         names.append("a wire or slab (Boundary_Conditions: wire or slab)")
     if getattr(problem.hartree, "periodic_g_space", False):
         names.append("Calc_Hartree_G")
-    if getattr(problem.grid, "local_potential", "real_space") != "real_space":
-        names.append("Periodic_Local_Potential: g_space")
+    # (Periodic_Local_Potential: g_space is not named: the accelerated forces take its ionic term from
+    # Forces.periodic.periodic_local_forces, whose G-space branch is gspace_local_forces; see
+    # Forces/periodic_local.py::fortran_spline_local_forces)
     if getattr(problem.scf, "zero_average_xc_potential", False):
         names.append("Zero_Average_Vxc")
     # LDA+U (J = 0) and TS of a bulk cell at Gamma move on the accelerated

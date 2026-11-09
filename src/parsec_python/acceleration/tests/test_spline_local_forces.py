@@ -96,6 +96,24 @@ class SplineLocalForceTests(unittest.TestCase):
         # the readable term differentiates the exactly converged sum: the same function to the splitting accuracy
         np.testing.assert_allclose(quick.ionic, self._readable().ionic, atol=1.0e-3, rtol=0.0)
 
+    def test_the_g_space_local_potential(self) -> None:
+        # Fortran's reciprocal-space local potential (Periodic_Local_Potential: g_space): the ionic term is the readable
+        # one, the other two are the ball sums
+        settings = PeriodicGridSettings(fortran_routines=True, spacing=0.7, expansion_order=4, local_potential="g_space")
+        grid = build_periodic_grid(_CUBE, settings)
+        density, residual, xc = _fields(grid, self.lattice)
+        self.assertTrue(fast.spline_species_takes(grid, self.lattice, self.species, self.atoms))
+        readable = periodic_forces.periodic_local_forces(
+            grid, self.atoms, self.potentials, self.species, self.lattice, density, residual, xc
+        )
+        quick = fast.fortran_spline_local_forces(
+            grid, self.atoms, self.potentials, self.species, self.lattice, density, residual, xc
+        )
+        np.testing.assert_allclose(quick.ionic, readable.ionic, atol=1.0e-12, rtol=0.0)
+        np.testing.assert_allclose(quick.self_consistency, readable.self_consistency, atol=1.0e-7, rtol=0.0)
+        np.testing.assert_allclose(quick.core_correction, readable.core_correction, atol=1.0e-7, rtol=0.0)
+        self.assertGreater(np.abs(readable.core_correction).max(), 1.0e-3)
+
     def test_the_inputs_it_takes(self) -> None:
         self.assertTrue(fast.spline_species_takes(self.grid, self.lattice, self.species, self.atoms))
         linear = {"Si": SpeciesPotential(DATA / "Si_POTRE.DAT", 2), "Ge": self.species["Ge"]}

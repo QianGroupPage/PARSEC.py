@@ -1457,6 +1457,16 @@ def _routines_lines(translation) -> tuple[str, ...]:
     return () if line is None else (line,)
 
 
+
+def _force_phase_lines(forces) -> list[str]:
+    """The seconds of each phase of the force evaluation, where the path that computed the forces measured them."""
+
+    phases = getattr(forces, "phase_seconds", None)
+    if not phases:
+        return []
+    shown = ", ".join(f"{name} {float(seconds):.2f}" for name, seconds in phases.items() if isinstance(seconds, (int, float)))
+    return [f"  (phases [sec]: {shown})"] if shown else []
+
 class ParsecTextReporter:
     """Stateful writer for the subset of ``parsec.out`` Python can support.
 
@@ -2725,6 +2735,7 @@ class ParsecTextReporter:
                         forces, self.translation.output_level, periodic=self._crystal_report
                     ),
                     f"Time for forces [sec] : {forces.seconds:11.2f}",
+                    *_force_phase_lines(forces),
                     "",
                     (
                         "Dipoles and MPI statistics"
@@ -3045,6 +3056,7 @@ class ParsecTextReporter:
                 forces, self.translation.output_level, periodic=self._crystal_report
             ),
             f"Time for forces [sec] : {forces.seconds:11.2f}",
+            *_force_phase_lines(forces),
             "",
             "Dipoles and MPI statistics" if self._bulk else "MPI statistics",
             "are not calculated by this Python implementation.",

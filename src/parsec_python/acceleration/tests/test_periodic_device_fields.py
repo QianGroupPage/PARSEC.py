@@ -380,7 +380,7 @@ class RoutingTests(unittest.TestCase):
             (_SLAB.format(extra="Restart_Run: .true."), "Restart_Run of a wire or slab"),
             (_CELL.format(xc="ca", extra="Calc_Hartree_G: .true.\n" + kpoints), "k-point"),
             (_CELL.format(xc="ca", extra="Zero_Average_Vxc: .true.\nSpin_Polarization: .true."), "spin polarization"),
-            (_CELL.format(xc="ca", extra="Periodic_Local_Potential: g_space\nSkip_Force: .false."), "forces"),
+            (_CELL.format(xc="ca", extra="Zero_Average_Vxc: .true.\nSkip_Force: .false."), "forces"),
         ):
             with self.subTest(name=name):
                 features = self.features(text)

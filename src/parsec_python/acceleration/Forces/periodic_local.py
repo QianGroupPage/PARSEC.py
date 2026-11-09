@@ -38,6 +38,8 @@ from parsec_python.V_ion import ionic_potential as _ionic
 
 from ..V_ion.periodic_setup import _atom_balls, _cell_geometry, fast_splitting
 
+#: Fraction of its peak out to which the atomic valence density counts in the self-consistency force (see there).
+_SELF_CONSISTENCY_TAIL = 1.0e-10
 #: Grid points whose radial slopes are evaluated together.
 _POINTS_PER_CALL = 1_000_000
 #: Complex numbers of one block of the reciprocal contraction.
@@ -314,6 +316,16 @@ def local_force_provider(
         return fast_periodic_local_forces(*arguments, xp=xp, erf=erf, tolerance=tolerance)
 
 
+def _images_reaching_the_grid(grid, centre: np.ndarray, translations: np.ndarray, radius: float) -> np.ndarray:
+    """The translations whose image ball of ``radius`` around ``centre + T`` can hold a grid point (the bounding box of the grid)."""
+
+    coordinates = grid.coordinates
+    low, high = coordinates.min(axis=0), coordinates.max(axis=0)
+    points = centre + translations
+    gap = np.maximum(np.maximum(low - points, points - high), 0.0)
+    return translations[np.sqrt(np.einsum("ij,ij->i", gap, gap)) <= radius]
+
+
 def fast_self_consistency_forces(grid, atoms, potentials, specifications, lattice_vectors, residual) -> np.ndarray:
     """The self-consistency term of :func:`parsec_python.Forces.periodic.periodic_local_forces`, ``(atoms, 3)`` without ``dv``.
 
@@ -337,10 +349,17 @@ def fast_self_consistency_forces(grid, atoms, potentials, specifications, lattic
         potential = potentials[atom.symbol]
         if atom.symbol not in tables:
             table = _valence_density_table(potential, specifications[atom.symbol])
-            tables[atom.symbol] = (table, _density_reach(potential, table))
+            # The readable term sums the images out to where the density is 1e-16 of its peak (30 to 40 bohr for La, Zr:
+            # every ball then covers most of the cell).  The term is the SCF residual (about 1e-5 Ry) times the slope
+            # of the density there, so out to 1e-10 of the peak (12 to 25 bohr) it differs by less than 1e-12 Ry/bohr.
+            magnitude = np.abs(table)
+            significant = np.flatnonzero(magnitude > _SELF_CONSISTENCY_TAIL * float(magnitude.max(initial=0.0)))
+            reach = float(potential.radii[min(int(significant[-1]) + 1, magnitude.size - 1)]) if significant.size else 0.0
+            tables[atom.symbol] = (table, min(reach, _density_reach(potential, table)))
         table, cutoff = tables[atom.symbol]
         position = np.asarray(atom.position, dtype=np.float64)
-        for translation in _ionic._periodic_image_translations(lattice, cutoff):
+        images = _images_reaching_the_grid(grid, position, _ionic._periodic_image_translations(lattice, cutoff), cutoff)
+        for translation in images:
             rows, relative, radius = _ionic._support_finder(grid, position + translation, cutoff)
             inside = (radius < cutoff) & (radius > 0.0)
             if not np.any(inside):
@@ -354,20 +373,71 @@ def fast_self_consistency_forces(grid, atoms, potentials, specifications, lattic
 def spline_species_takes(grid, lattice_vectors, specifications, atoms) -> bool:
     """Whether :func:`fortran_spline_local_forces` differentiates the local potential the Fortran-derived SCF used.
 
-    Every species interpolates its tables with the cubic spline (``Cubic_Spline``; the fast sums are those of a
-    potential that always splines them, :data:`parsec_python.V_ion.ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE`), the
-    local potential is the real-space one and the grid is the plain orthorhombic one of the FFT potential.
+    Every species interpolates its tables with the cubic spline (``Cubic_Spline``) and the grid is the plain orthorhombic
+    one of the FFT potential.  With the real-space local potential the fast sums are those of a potential that always
+    splines the tables (:data:`parsec_python.V_ion.ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE`); with Fortran's G-space
+    potential (``Periodic_Local_Potential: g_space``) the ionic term is :func:`parsec_python.V_ion.gspace_local.gspace_local_forces`.
     """
 
     from ..V_ion import periodic_setup_fortran as _fortran
 
     symbols = dict.fromkeys(atom.symbol for atom in atoms)
+    local = getattr(grid.settings, "local_potential", "real_space")
     return bool(
-        _ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE
-        and getattr(grid.settings, "local_potential", "real_space") == "real_space"
+        (local == "g_space" or (local == "real_space" and _ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE))
         and _fortran._fft_handles(grid, lattice_vectors)
         and all(getattr(specifications[symbol], "use_spline", False) for symbol in symbols)
     )
+
+
+def fast_core_correction_forces(
+    grid, atoms, potentials, specifications, lattice_vectors, xc_potential, *, xp=np
+) -> np.ndarray:
+    """The core-correction term of :func:`fast_periodic_local_forces` alone, ``(atoms, 3)`` without ``dv``.
+
+    The same ball sums over the images within the support of the core density (the loop of that function), for the
+    local potential of a G-space construction, whose ionic term is not a ball sum.
+    """
+
+    xc = xp.asarray(np.asarray(xc_potential, dtype=np.float64))
+    forces = np.zeros((len(atoms), 3))
+    half_width = grid.settings.stencil_half_width
+    lattice = np.asarray(lattice_vectors, dtype=np.float64)
+    slopes: dict = {}
+    for index, atom in enumerate(atoms):
+        potential = potentials[atom.symbol]
+        specification = specifications[atom.symbol]
+        if atom.symbol not in slopes:
+            tables = species_force_tables(potential, specification)
+            slopes[atom.symbol] = (
+                None
+                if tables.core_density_derivative is None
+                else _Slope(
+                    xp, potential, potential.core_density,
+                    spline_padding=half_width if specification.use_spline else None,
+                    table=tables.core_density_derivative,
+                )
+            )
+        slope = slopes[atom.symbol]
+        if slope is None:
+            continue
+        position = np.asarray(atom.position, dtype=np.float64)
+        support = _ionic.atomic_density_support_radius(potential, specification, core=True)
+        rows_all, relative_all, radius_all = [], [], []
+        images = _images_reaching_the_grid(grid, position, _ionic._periodic_image_translations(lattice, support), support)
+        for translation in images:
+            rows, relative, radius = _ionic._support_finder(grid, position + translation, support)
+            inside = radius < support
+            if np.any(inside):
+                rows_all.append(rows[inside]), relative_all.append(relative[inside]), radius_all.append(radius[inside])
+        if not rows_all:
+            continue
+        rows = xp.asarray(np.concatenate(rows_all))
+        relative = xp.asarray(np.concatenate(relative_all))
+        distances = xp.asarray(np.concatenate(radius_all))
+        coefficient = slope(distances) * xc[rows] * _inverse(xp, distances)
+        forces[index] = _to_host(xp, xp.sum(coefficient[:, None] * relative, axis=0))
+    return forces
 
 
 def fortran_spline_local_forces(
@@ -394,6 +464,20 @@ def fortran_spline_local_forces(
     :func:`fast_self_consistency_forces`.  See :func:`spline_species_takes` for the inputs it covers.
     """
 
+    if getattr(grid.settings, "local_potential", "real_space") == "g_space":
+        from parsec_python.V_ion.gspace_local import gspace_local_forces
+
+        return LocalForceTerms(
+            ionic=gspace_local_forces(grid, atoms, potentials, specifications, lattice_vectors, density),
+            self_consistency=fast_self_consistency_forces(
+                grid, atoms, potentials, specifications, lattice_vectors, potential_residual
+            )
+            * grid.volume_element,
+            core_correction=fast_core_correction_forces(
+                grid, atoms, potentials, specifications, lattice_vectors, xc_potential, xp=xp
+            )
+            * grid.volume_element,
+        )
     terms = fast_periodic_local_forces(
         grid, atoms, potentials, specifications, lattice_vectors, density, xc_potential,
         xp=xp, erf=erf, tolerance=tolerance,
@@ -409,6 +493,7 @@ def fortran_spline_local_forces(
 
 
 __all__ = [
+    "fast_core_correction_forces",
     "fast_periodic_local_forces",
     "fast_self_consistency_forces",
     "fortran_spline_local_forces",

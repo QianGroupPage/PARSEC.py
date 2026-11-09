@@ -258,8 +258,9 @@ Currently supported:
 
 Not currently supported as production physics:
 
-- forces, relaxation and molecular dynamics of the perturbative spin-orbit correction (`SO_PSP` without `SO_from_scratch`), of
-  spin-polarized periodic cells with k-points, of spin-polarized periodic cells and spin-orbit or non-collinear inputs on
+- forces, relaxation and molecular dynamics of the perturbative spin-orbit correction (`SO_PSP` without `SO_from_scratch`),
+  of spin-polarized periodic cells with k-points on Andrew Grieder's routines (such an input runs on the Fortran-derived
+  routines by itself, with a warning), of spin-polarized periodic cells and spin-orbit or non-collinear inputs on
   the accelerated path (`main.py` hands them to the readable solver), and of periodic cells and non-collinear inputs on
   several nodes (`--mpi`);
 - hybrid functionals of wires and of periodic cells on several nodes (`--mpi`), Energy_Refinement
@@ -268,15 +269,20 @@ Not currently supported as production physics:
   `--mpi` (hybrids included), the TS dispersion correction or an empirical dispersion term of their own
   (-D, -D3), and DFT+U beyond PARSEC's LDA+U of the d channel (other channels or forms);
 - stress (no stress tensor is computed for any functional);
-- PARSEC restart files other than `relax_restart.dat` and `mdinit.dat`;
-- Ono--Hirose double-grid order greater than one.
+- Ono--Hirose double grid (`Double_Grid_Order > 1`) of wires, slabs and Fortran's general periodic grid
+  (non-orthogonal lattice vectors, or steps that differ between the lattice directions); clusters and the other bulk
+  cells have it, forces included, and on the accelerated path too except with spin-orbit species (`SO_PSP`), which
+  go to the readable solver.
 - With `Use_Fortran_Routines: .true.` (and for the inputs that run on those routines by default - slabs, shifted bulk grids, forces of a bulk cell at the
   Gamma point on a grid both sets share with Cubic_Spline species, bulk cells whose space group sets Fortran's grid -
   or by themselves, see
   `Input/routines.py`), the Fortran-derived routines:
   - forces with the perturbative spin-orbit correction (`SO_PSP` without
-    `SO_from_scratch`);
-  - PARSEC restart files other than `relax_restart.dat` and `mdinit.dat`.
+    `SO_from_scratch`).
+
+PARSEC's restart files are read: `parsec.dat` (`Restart_Run`, `nscf_kpoints`),
+`wfn.dat` (`Restart_From_Wfndat`, orbitals included), `relax_restart.dat` and
+`mdinit.dat`.
 
 Unsupported requested input is rejected rather than silently approximated.
 Sphere Hartree boundaries use a multipole expansion; box boundaries use the
@@ -1699,10 +1705,14 @@ occupation of one is one electron. Forces, relaxation, molecular dynamics and
 `Energy_Refinement: b3lyp` work as without spin.
 
 Every execution path runs it: `reference_main.py`, and `main.py` with the
-SciPy, native and CuPy backends. The multi-node runner refuses a
-spin-polarized input unless it runs in one process (`--serial-control`). A
-spin-polarized periodic cell runs the periodic spin drivers of the readable
-solver (see "Physical scope").
+SciPy, native and CuPy backends. The multi-node runner
+(`scripts/run_multi_gpu_scf.sh`) runs the single point of a spin-polarized
+cluster on several ranks, both channels in the symmetry sectors (checked
+against one process for O2 with PBE, PBE0 and Hartree-Fock); it refuses the
+forces, relaxation and molecular dynamics of a spin-polarized input on
+several ranks, which run in one process (`--serial-control`) or with
+`main.py`. A spin-polarized periodic cell runs the periodic spin drivers of
+the readable solver (see "Physical scope").
 
 ### Spin channels in the symmetry sectors
 

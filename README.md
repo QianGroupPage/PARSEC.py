@@ -392,8 +392,8 @@ not a guarantee of a completely cold GPU runtime.
 
 ### 5. Several GPUs and several nodes
 
-`scripts/run_multi_gpu_scf.sh` runs one SCF calculation of an isolated system
-(the runner refuses periodic cells) on the GPUs of one node or of several
+`scripts/run_multi_gpu_scf.sh` runs one SCF calculation of an isolated system,
+or of a bulk cell at the Gamma point, on the GPUs of one node or of several
 nodes, one MPI rank per node, with the launch settings the multi-GPU solver
 was measured with (1 to 16 A100 80 GB GPUs). Most of these settings are not
 defaults of the code: started without them, a calculation takes slower
@@ -411,8 +411,21 @@ without point-group symmetry, such as molecular dynamics, has a single
 symmetry sector; on several nodes add `--rank-per-gpu`, which starts one rank
 per GPU that share its orbitals (C1653H508 MD: 40.5 s per step on one node,
 23.0 s on four).
-`src/parsec_python/acceleration/MULTI_GPU.md` ("Several nodes") lists the
-settings and says which ones the solver chooses for itself.
+
+A bulk cell (`Boundary_Conditions: bulk`) runs at the Gamma point with real
+orbitals, an orthorhombic cell, no spin and a native LDA or GGA, as one
+sector whose orbitals all ranks share; on several nodes launch it with
+`--rank-per-gpu` (bulk diamond with 5,832 atoms: 308 s on 16 A100,
+`examples/3d_diamond_benchmark`). K-points of a cell run under
+`python -m parsec_python.main parsec.in --mpi` (k-point pools, "Several GPUs
+and nodes for one large eigenproblem (MPI)" below); spin, hybrids,
+meta-GGAs, oblique cells, wires, slabs and the forces of a cell go to
+`main.py`, and the runner refuses them by name. A spin-polarized cluster
+runs its single point on several ranks; its forces, relaxation and
+molecular dynamics need one rank (`--serial-control`) or `main.py`.
+`src/parsec_python/acceleration/MULTI_GPU.md` ("Several nodes", "Periodic
+cells at the Gamma point on several nodes") lists the settings and says
+which ones the solver chooses for itself.
 
 ### Troubleshooting
 

@@ -16,10 +16,11 @@ existing real Gamma-point :class:`~parsec_python.Hamiltonian.operator.KohnShamHa
 (verified directly: identical projector values, and the ``-2i*k.grad+|k|^2``
 terms vanish).
 
-This module intentionally does not include spin-orbit coupling; combining
-periodic k-point sampling with SOC needs the k-point-phase-weighted spin-
-orbit projectors (:mod:`~parsec_python.Eigensolvers.perturbative_soc`
-currently only builds isolated, single-copy ones) and is not implemented.
+This module holds scalar orbitals only.  Spin-orbit coupling with k-points
+uses two-component spinors: :mod:`~parsec_python.Hamiltonian.kpoint_spinor_operator`
+(the operator, with the Bloch-phase-weighted spin-orbit projectors of
+:mod:`~parsec_python.Eigensolvers.perturbative_soc`) and
+:mod:`~parsec_python.SCF.kpoints_soc` (the SCF).
 """
 
 from __future__ import annotations

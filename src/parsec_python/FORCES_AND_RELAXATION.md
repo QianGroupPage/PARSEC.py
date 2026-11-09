@@ -25,7 +25,7 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
   k-point sampling (collinear spin polarization at the Gamma point only): forces, `Minimization: bfgs | simple | manual`
   and molecular dynamics. See "Periodic cells" below; the spin-unpolarized Gamma-point cell also runs on the accelerated
   path, and a cell with k-points on the GPUs of the k-point solver (see "On GPUs"). A spin-polarized one with k-points
-  does not have them yet.
+  does not have them on these routines; such an input runs on the Fortran-derived routines by itself, with a warning.
 - Self-consistent spin-orbit coupling (`SO_from_scratch`, alone or with `Spin_Polarization`) and non-collinear magnetism
   (`Non_Collinear_magnetism`, with or without spin-orbit), isolated or periodic at the Gamma point or with k-points:
   forces, relaxation and molecular dynamics. See "Spin-orbit coupling and non-collinear magnetism" below. The

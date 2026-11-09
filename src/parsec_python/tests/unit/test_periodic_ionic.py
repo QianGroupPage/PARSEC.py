@@ -325,6 +325,18 @@ class CommandLineTests(unittest.TestCase):
         _, _, plain = self._run("Skip_Force: .false.", accelerated_main)
         np.testing.assert_allclose(self._final_forces(folder), self._final_forces(plain), atol=2.0e-6)
 
+    def test_a_gamma_only_kpoint_block_is_reported_and_solved_as_the_gamma_point(self) -> None:
+        # Under the Fortran-derived routines as under his: real orbitals, no k-point loop, the energy of the input
+        # without a sampling (the reference k-point solver would say complex wavefunctions and keep no orbitals).
+        extra = "Kpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n1 1 1\nend Monkhorst_Pack_Grid"
+        _, _, one_point = self._run(extra, accelerated_main)
+        _, _, plain = self._run("", accelerated_main)
+        text = (one_point / "parsec.out").read_text()
+        self.assertIn("WAVEFUNCTIONS ARE REAL!", text)
+        self.assertNotIn("eigenvalues of the first k-point only", text)
+        energies = [re.findall(r"Total Energy =\s+(-?\d+\.\d+)", (f / "parsec.out").read_text())[-1] for f in (one_point, plain)]
+        self.assertAlmostEqual(float(energies[0]), float(energies[1]), places=7)
+
     def test_the_accelerated_driver_hands_kpoints_with_forces_to_the_reference_solver(self) -> None:
         extra = "Skip_Force: .false.\nKpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 1 1\nend Monkhorst_Pack_Grid"
         code, error, folder = self._run(extra, accelerated_main)

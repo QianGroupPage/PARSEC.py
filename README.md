@@ -879,6 +879,9 @@ parameter `Use_Fortran_Routines` chooses:
 - `.false.`: Andrew Grieder's routines wherever his code accepts the input, his slab and his full shifted mesh
   (equal weights, no reduction to the irreducible wedge) included;
 - `.true.`: the Fortran-derived routines.
+  The Gamma point given as a one-point k-point grid (`Kpoint_Method: mp`, `1 1 1`, or a list of one k = 0) is the
+  Gamma-point calculation of the accelerated path under both sets of routines (real orbitals, no k-point loop,
+  reported as such in parsec.out); with `.true.` it used to go to the reference k-point solver.
 
 An input that Andrew Grieder's routines do not compute (wires, charged sheets, forces of a slab, unequal k-point
 weights, LDA+U, NSCF, other pseudopotential formats or functionals, ...) runs on the Fortran-derived routines by

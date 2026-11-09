@@ -546,7 +546,9 @@ def _reference_only_features(
         )
     if (
         problem.has_kpoint_sampling
-        and (fortran or not _gamma_point_only(problem))
+        # The Gamma point named as a one-point grid is the Gamma-point calculation of this path under both sets of
+        # routines (the reference k-point solver gives its energy to 1e-8 Ry, and keeps no orbitals).
+        and not _gamma_point_only(problem)
         and not (
             (problem.scf.self_consistent_spin_orbit or problem.scf.noncollinear)
             and problem.periodic_cell is not None
@@ -1104,6 +1106,20 @@ def _run(
             file=sys.stderr,
         )
         return reference_main(_reference_argv(arguments))
+    if translation.problem.has_kpoint_sampling:
+        # Only the Gamma point named as a one-point sampling gets here (_reference_only_features): this path solves
+        # it with real orbitals and no k-point loop, as the input without a sampling, and reports it so (the
+        # complex-orbital header, the k-point notes and eigen.dat belong to the reference k-point solver).
+        translation = replace(
+            translation,
+            problem=replace(
+                translation.problem,
+                monkhorst_pack_dimensions=None,
+                monkhorst_pack_shift=None,
+                kpoints=None,
+                kpoint_weights=None,
+            ),
+        )
     if translation.problem.periodic_cell is not None:
         from .Parallel import mpi
 

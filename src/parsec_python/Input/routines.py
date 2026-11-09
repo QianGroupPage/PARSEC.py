@@ -12,8 +12,11 @@ The input parameter ``Use_Fortran_Routines`` chooses:
   the Fortran-derived routines (:data:`FORTRAN_DEFAULT_FEATURES`): slabs, a shifted Monkhorst-Pack grid of a bulk
   cell (``Monkhorst_Pack_Shift``), the forces, relaxation and molecular dynamics of a bulk cell at the Gamma point
   on a grid both sets of routines share with Cubic_Spline species, and a symmetric bulk cell whose space group sets Fortran's grid (:func:`bulk_default_features`; the user's
-  decisions of 2 and 4 November 2026);
-* ``.false.``: Andrew Grieder's routines wherever his code accepts the input (his slab, his shifted mesh too);
+  decisions of 2 and 4 November 2026), and a weighted ``Kpoint_List`` of a bulk cell (which his routines refused
+  before 8 November 2026);
+* ``.false.``: Andrew Grieder's routines wherever his code accepts the input (his slab, his shifted mesh and a
+  weighted list of a bulk single point too, reduced and averaged as ``Input.parsec_input._default_routines_wedge``
+  and ``_default_routines_list_symmetry`` say);
 * ``.true.``: the Fortran-derived routines.
 
 An input that Andrew Grieder's routines do not compute (a keyword or a value they do not read, a geometry they
@@ -278,6 +281,11 @@ NEUTRAL_KEYS = frozenset(
         "exx_divergence",
         "exx_slab_coulomb",
         "exx_auxiliary_exponent",
+        # The Kerker preconditioner of the mixing of bulk cells (PARSEC.py, Mixer/preconditioner.py, 2026-11-08):
+        # the shared SCF loops wrap their mixer the same way under both sets.
+        "mixing_preconditioner",
+        "kerker_wavevector",
+        "kerker_dielectric_constant",
     }
     # The eigensolver, SCF-control and start-vector labels of PARSEC 1.5 and the
     # extensions of its round (parsec_python.Input.solver_options): options of
@@ -294,7 +302,12 @@ SLAB_FEATURE = "slabs"
 SHIFTED_MESH_FEATURE = "shifted Monkhorst-Pack grids of bulk cells"
 GAMMA_FORCES_FEATURE = "forces, relaxation and molecular dynamics of bulk cells at the Gamma point"
 SYMMETRIC_GRID_FEATURE = "bulk cells whose space group sets the grid"
-FORTRAN_DEFAULT_FEATURES = (SLAB_FEATURE, SHIFTED_MESH_FEATURE, GAMMA_FORCES_FEATURE, SYMMETRIC_GRID_FEATURE)
+#: A weighted Kpoint_List of a bulk cell: Andrew Grieder's routines refused it before 2026-11-08 (it ran on the
+#: Fortran-derived routines); they run it now with Use_Fortran_Routines: .false., the default keeps those routines.
+WEIGHTED_LIST_FEATURE = "Kpoint_Lists of unequal weights of bulk cells"
+FORTRAN_DEFAULT_FEATURES = (
+    SLAB_FEATURE, SHIFTED_MESH_FEATURE, GAMMA_FORCES_FEATURE, SYMMETRIC_GRID_FEATURE, WEIGHTED_LIST_FEATURE
+)
 
 #: Labels of PARSEC 1.5 for the forces, ionic loops and band structure (the parity round of 2026-11-04)
 #: whose effect is the same under both sets of routines, so that they decide nothing: ``Calculate_Force``
@@ -800,6 +813,27 @@ NO_EFFECT: dict[str, NoEffect] = {
 }
 
 
+def _bulk_kpoint_reduction(scalar, blocks) -> bool:
+    """A bulk cell with a ``Monkhorst_Pack_Shift`` mesh or a ``Kpoint_List``/``Kpoint_File``: the inputs whose density
+    the default routines average (``Input.parsec_input._default_routines_wedge`` and ``_default_routines_list_symmetry``,
+    2026-11-08).  The parser sends one it does not average (forces, a slab, ...) to the Fortran-derived routines."""
+
+    conditions = [text.strip().lower() for text in _texts(scalar, "boundary_conditions")]
+    if conditions != ["bulk"]:
+        return False
+    methods = [text.strip().lower() for text in _texts(scalar, "kpoint_method")]
+    if methods == ["mp"]:
+        return "monkhorst_pack_shift" in blocks
+    if methods == ["manual"]:
+        return "kpoint_list" in blocks or bool(_texts(scalar, "kpoint_file"))
+    return False
+
+
+#: Labels the default routines read for some inputs only (label -> the predicate of those inputs): elsewhere they
+#: choose the Fortran-derived routines as every label of neither set does.
+DEFAULT_CONDITIONAL_KEYS = {"symmetrize_charge_density": _bulk_kpoint_reduction}
+
+
 def has_no_effect(key: str, scalar: Mapping[str, Sequence[object]], blocks: Mapping[str, Sequence[object]]) -> bool:
     """Whether ``key`` is written at a value that does nothing (:data:`NO_EFFECT`); ``False`` for other labels."""
 
@@ -836,6 +870,8 @@ def decide_routines(
         and key not in DEFAULT_SPECIES_KEYS | DEFAULT_GLOBAL_KEYS | NEUTRAL_KEYS | SMALL15_SHARED_KEYS
         # a label written at a value that has no effect chooses nothing (NO_EFFECT)
         and not has_no_effect(key, scalar, blocks)
+        # nor one the default routines read for this input (DEFAULT_CONDITIONAL_KEYS)
+        and not (key in DEFAULT_CONDITIONAL_KEYS and DEFAULT_CONDITIONAL_KEYS[key](scalar, blocks))
     )
     # the values of the labels of NO_EFFECT that act, so that the warning names them
     unknown = [
@@ -859,9 +895,11 @@ __all__ = [
     "SLAB_FEATURE",
     "SMALL15_SHARED_KEYS",
     "SYMMETRIC_GRID_FEATURE",
+    "WEIGHTED_LIST_FEATURE",
     "bulk_default_features",
     "routines_report_line",
     "DEFAULT_BLOCK_KEYS",
+    "DEFAULT_CONDITIONAL_KEYS",
     "DEFAULT_GLOBAL_KEYS",
     "DEFAULT_SPECIES_KEYS",
     "KEYWORD",

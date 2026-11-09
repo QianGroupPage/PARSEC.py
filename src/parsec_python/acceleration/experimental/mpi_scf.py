@@ -84,6 +84,9 @@ class MPISectorContext:
         self.device_groups = {}
         # Whether the ranks share the basis of the single sector (configure).
         self.shared = False
+        # The Ritz step of a shared basis where PARSEC_MPI_SHARED_RITZ names none
+        # (mpi_shared_basis.shared_ritz_route): the runner asks for rounds for a periodic cell.
+        self.shared_ritz_route = "rows"
         self.command_counts = {}
         # Wall seconds of each command on this rank, collective calls included.
         self.command_seconds = {}

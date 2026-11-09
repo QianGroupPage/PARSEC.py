@@ -103,9 +103,14 @@ class FoldingConventionTests(unittest.TestCase):
 
 class ParsedKPointTests(_Case):
     def test_both_routine_sets_fold_and_explicit_lists_stay(self) -> None:
+        from parsec_python.Grid.kpoints import kpoint_sampling
+
         reciprocal = 2.0 * np.pi / 5.0
         his = parse_parsec_input(self.write("his", _SI_SC.format(routines=".false.", extra=_PLAIN))).problem
-        fractions = np.asarray(his.kpoints) / reciprocal
+        # since 2026-11-08 Andrew Grieder's routines keep the mesh (reduced by time reversal alone here, with
+        # Ignore_Symmetry): its points folded as well
+        k_points, _ = kpoint_sampling(his)
+        fractions = np.asarray(k_points) / reciprocal
         self.assertEqual(sorted(set(np.round(fractions.ravel(), 12))), [-0.25, 0.25])
         listed = _SI_SC.format(routines=".false.", extra=_PLAIN).replace(
             "Kpoint_Method: mp", "Kpoint_Method: manual\nKpoint_Unit: reciprocal_lattice_vectors\n"

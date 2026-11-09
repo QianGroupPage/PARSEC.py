@@ -260,6 +260,20 @@ class InputTests(unittest.TestCase):
         self.assertEqual(problem.eigensolver.lanczos_bounds, "lanczos")
         self.assertEqual(problem.eigensolver.lanczos_bound_steps, 12)
         self.assertEqual(self.add("Smart_Subspace: .false.").problem.eigensolver.subspace_lower_bound, "adaptive")
+        # Subspace_Lower_Bound (PARSEC.py) names every rule, the earlier PARSEC's monotone one too.
+        for rule in ("monotone", "smart", "adaptive"):
+            with self.subTest(rule=rule):
+                self.assertEqual(
+                    self.add(f"Subspace_Lower_Bound: {rule}").problem.eigensolver.subspace_lower_bound, rule
+                )
+        self.assertEqual(
+            self.add("Subspace_Lower_Bound: smart\nSmart_Subspace: .true.").problem.eigensolver.subspace_lower_bound,
+            "smart",
+        )
+        with self.assertRaisesRegex(ParsecInputError, "give one of them"):
+            self.add("Subspace_Lower_Bound: monotone\nSmart_Subspace: .false.")
+        with self.assertRaises(ParsecInputError):
+            self.add("Subspace_Lower_Bound: zero")
         self.assertEqual(self.add("Bounds_Method: lanczos_full").problem.eigensolver.lanczos_bounds, "lanczos_full")
         with self.assertRaisesRegex(UnsupportedParsecOptionError, "uninitialized"):
             self.add("Bounds_Method: static")
@@ -343,7 +357,12 @@ class InputTests(unittest.TestCase):
         self.assertEqual(
             _reference_only_solver_options(self.add("Chebyshev_Degree_Decrease_After: 4").problem), []
         )
-        for line in ("FF_Residual_Test: stop", "Reorthogonalization_Threshold: 0.68", "Smart_Subspace: .true."):
+        # The lower-bound rules of SUBSPACE run on the device filters (subspace_filter_bounds).
+        for line in ("Smart_Subspace: .true.", "Smart_Subspace: .false.", "Bounds_Method: lanczos", "Bounds_Iter: 12"):
+            with self.subTest(line=line):
+                self.assertEqual(_reference_only_solver_options(self.add(line).problem), [])
+        for line in ("FF_Residual_Test: stop", "Reorthogonalization_Threshold: 0.68", "Chebyshev_Scaled: .true.",
+                     "Bounds_Method: lanczos_full"):
             with self.subTest(line=line):
                 self.assertEqual(len(_reference_only_solver_options(self.add(line).problem)), 1)
 

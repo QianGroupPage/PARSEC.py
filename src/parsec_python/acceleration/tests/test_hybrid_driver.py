@@ -17,6 +17,12 @@ from unittest.mock import ANY, DEFAULT, MagicMock, patch
 import numpy as np
 
 import parsec_python.acceleration.driver as driver_module
+# prepare_single_point imports the GPU direct boundary lazily, and that module binds
+# backends.cupy.require_cupy by name at import.  Imported first inside the patch of
+# require_cupy of MPIRolePreparationTests.prepare (test_fast_grid, test_hartree_boundary and
+# test_scf_host_work borrow it), it kept the stand-in CuPy for the rest of the process: the
+# known test_gpu_fields failures of the [f-h] shard (2026-11-08).  Import it before any patch.
+import parsec_python.acceleration.Hartree.cupy_direct_boundary  # noqa: F401
 from parsec_python.acceleration.backends.cupy import cupy_available
 from parsec_python.acceleration.backends.cupy import CuPyTimingStats
 from parsec_python.acceleration.backends.native import native_available

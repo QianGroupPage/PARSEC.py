@@ -1318,6 +1318,19 @@ def _mixer_lines(mixing) -> list[str]:
     ]
 
 
+def _preconditioner_lines(mixing) -> list[str]:
+    """The line of ``Mixing_Preconditioner`` (PARSEC.py), none at its default."""
+
+    if getattr(mixing, "preconditioner", "none") == "none":
+        return []
+    dielectric = mixing.kerker_dielectric_constant
+    return [
+        " Kerker preconditioner of the residual: P(G) = (G^2 + q0^2/eps)/(G^2 + q0^2),"
+        f" q0 = {mixing.kerker_wavevector:.4g} bohr^-1, eps = "
+        + ("inf" if dielectric == float("inf") else f"{dielectric:.4g}")
+    ]
+
+
 def parsec15_solver_header_lines(eigensolver, scf) -> tuple[str, ...]:
     """The lines of the PARSEC 1.5 solver options an input sets (none at the defaults).
 
@@ -1931,6 +1944,7 @@ class ParsecTextReporter:
                 )
             ),
             *_mixer_lines(mixing),
+            *_preconditioner_lines(mixing),
             "",
             " Correlation data:",
             " -----------------",
@@ -3084,9 +3098,11 @@ class ParsecTextReporter:
             ("worker_upload_seconds", "Operator upload"),
             ("worker_solve_seconds", "Eigensolver"),
             ("worker_spill_seconds", "Subspace to the host"),
+            ("worker_restore_seconds", "Subspace back to the device"),
             ("worker_download_seconds", "Eigenvectors to the host"),
             ("worker_density_seconds", "Density of the k-points"),
             ("worker_gather_seconds", "Density joined over the MPI ranks"),
+            ("worker_pool_wait_seconds", "Waiting for the other pools"),
             ("worker_halo_begin_seconds", "Halo rows packed and sent (rank 0)"),
             ("worker_halo_wait_seconds", "Waiting for the halo rows (rank 0)"),
             ("worker_allsum_seconds", "Projector overlaps summed over ranks (rank 0)"),
@@ -3108,6 +3124,43 @@ class ParsecTextReporter:
             lines.append(" Device eigensolver [worker-sec]")
             for key, label in present:
                 lines.append(f"   {label:28s} : {detail[key]:12.6f}")
+        # the MPI k-point pools (acceleration/SCF/kpoint_pools.py): this rank's share of the exchanges
+        # inside the orthonormalization and Rayleigh-Ritz steps above, and the plan of the pools
+        exchanges = (
+            ("pool_to_rows_seconds", "Columns to rows (Alltoallv)"),
+            ("pool_to_columns_seconds", "Rows to columns (Alltoallv)"),
+            ("pool_reduce_seconds", "Sums over the pool"),
+            ("pool_broadcast_seconds", "Root's factors broadcast"),
+        )
+        present = [(key, label) for key, label in exchanges if key in detail]
+        if present:
+            lines.append(" Of which exchanges in the pool (rank 0) [sec]")
+            for key, label in present:
+                lines.append(f"   {label:28s} : {detail[key]:12.6f}")
+        if "pools" in detail:
+            lines.append(
+                f" {'MPI k-point pools':30s} : {int(detail['pools']):12d}"
+                f"   ({int(detail.get('pool_ranks', 0))} rank(s), {int(detail.get('pool_tasks', 0))} task(s) on rank 0)"
+            )
+            lines.append(
+                f" {'Estimate per GPU [GB]':30s} : {detail.get('pool_estimate_bytes', 0.0) / 1e9:12.3f}"
+                f"   (operator data {detail.get('pool_static_bytes', 0.0) / 1e9:.3f} GB per task,"
+                f" sent {detail.get('pool_sent_bytes', 0.0) / 1e9:.3f} GB)"
+            )
+            if detail.get("pool_reserved_bytes"):
+                lines.append(
+                    f" {'Device memory pool (rank 0) [GB]':30s} : {detail['pool_reserved_bytes'] / 1e9:12.3f}"
+                    + (
+                        f"   ({int(detail.get('pool_resident', 0))} subspace(s) on the device, the others on the host)"
+                        if detail.get("pool_host_storage")
+                        else ""
+                    )
+                )
+            if detail.get("pool_host_peak_bytes"):
+                lines.append(
+                    f" {'Host memory (rank 0) [GB]':30s} : {detail['pool_host_peak_bytes'] / 1e9:12.3f}"
+                    f"   (peak; {detail.get('pool_host_setup_bytes', 0.0) / 1e9:.3f} GB after the preparation)"
+                )
         counters = (
             ("first_solves", "First solves"),
             ("subspace_steps", "Subspace steps"),

@@ -65,6 +65,12 @@ class KPointKohnShamHamiltonian:
     (:func:`parsec_python.V_xc.meta_gga.meta_gga_gradient`): the term
     ``2 sum_c [W_c (G_c + i k_c) + (G_c + i k_c)^H W_c] = 2 sum_c [W_c G_c + G_c^T W_c]``
     (the ``k`` parts cancel for a real ``W``); ``None`` in the density form.
+    ``sum_c k_c G_c`` (``_k_gradient``, one real sparse matrix, ``None`` at
+    Gamma) is built on first use; ``k_gradient_cache`` is a dict that keeps it
+    for the next Hamiltonians of the same ``k_point`` and ``gradient`` (the SCF
+    drivers hold one per k-point, so that no iteration sums the three sparse
+    matrices again, and a device kernel that never reads the matrix never
+    builds it).
     """
 
     negative_laplacian: sp.csr_matrix
@@ -74,8 +80,8 @@ class KPointKohnShamHamiltonian:
     k_point: np.ndarray
     kinetic_potential: np.ndarray | None = None
     gradient_flux: tuple | None = None
-    # k.grad as one real sparse matrix and V_eff + |k|^2, both built once.
-    _k_gradient: sp.csr_matrix | None = field(init=False, repr=False, compare=False)
+    k_gradient_cache: dict | None = field(default=None, repr=False, compare=False)
+    # V_eff + |k|^2, built once.
     _diagonal: np.ndarray = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -95,14 +101,6 @@ class KPointKohnShamHamiltonian:
         object.__setattr__(self, "effective_potential", potential)
         object.__setattr__(self, "gradient", tuple(self.gradient))
         object.__setattr__(self, "k_point", k_point)
-        k_gradient = None
-        for axis, gradient_axis in enumerate(self.gradient):
-            if k_point[axis] != 0.0:
-                term = k_point[axis] * gradient_axis
-                k_gradient = term if k_gradient is None else k_gradient + term
-        object.__setattr__(
-            self, "_k_gradient", None if k_gradient is None else k_gradient.tocsr()
-        )
         object.__setattr__(
             self, "_diagonal", potential + float(np.dot(k_point, k_point))
         )
@@ -118,6 +116,21 @@ class KPointKohnShamHamiltonian:
             if len(fluxes) != 3 or any(flux.shape != (size,) for flux in fluxes):
                 raise ValueError("the meta-GGA gradient flux must be three fields of the grid")
             object.__setattr__(self, "gradient_flux", fluxes)
+
+    @property
+    def _k_gradient(self) -> sp.csr_matrix | None:
+        """``sum_c k_c G_c`` as one real sparse matrix (``None`` at Gamma), built on first use."""
+        cache = self.k_gradient_cache
+        if cache is None:
+            cache = self.__dict__.setdefault("_own_k_gradient", {})
+        if "matrix" not in cache:
+            k_gradient = None
+            for axis, gradient_axis in enumerate(self.gradient):
+                if self.k_point[axis] != 0.0:
+                    term = self.k_point[axis] * gradient_axis
+                    k_gradient = term if k_gradient is None else k_gradient + term
+            cache["matrix"] = None if k_gradient is None else k_gradient.tocsr()
+        return cache["matrix"]
 
     def apply_kinetic_potential(self, block: np.ndarray) -> np.ndarray:
         """The meta-GGA terms of a complex block: ``sum_c (G_c + i k_c)^H diag(vtau) (G_c + i k_c) u``

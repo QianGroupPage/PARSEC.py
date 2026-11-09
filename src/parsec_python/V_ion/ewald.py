@@ -1,5 +1,5 @@
 """
-Ewald summation for the periodic ion-ion
+Ewald summation for the periodic ion-ion energy and forces and the periodic local ionic potential.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from typing import Mapping, Sequence
 import numpy as np
 from scipy.special import erf, erfc, erfcinv
 
+from ..Grid.cell import lattice_plane_spacings
 from ..Grid.pbc import uses_fortran_routines
 from ..models import Atom, SpeciesPotential
 from ..Pseudopotential import ParsecPseudopotential
@@ -76,46 +77,289 @@ def _ewald_cutoffs(
     return eta, real_cutoff, reciprocal_cutoff
 
 
-def _serial_map(function, translations, pairs):
-    return map(function, translations)
+#: Truncation of both sums of the ion-ion energy and forces: the real-space terms end where ``erfc(eta r)`` and the
+#: reciprocal ones where ``exp(-G^2/4 eta^2)`` fall below it.  The real-space terms left out add up to about
+#: ``2 pi rho Z^2 tolerance / eta^2`` per atom (Hartree; ``rho`` atoms per bohr^3), 1e-14 Ry for 4,096 carbon atoms of
+#: diamond at the ``eta`` of :func:`ion_ion_splitting`, far below the 1e-12 Ry asked of the energy (1e-14 left
+#: 1e-10 Ry there); the reciprocal terms left out are smaller still.
+ION_ION_TOLERANCE = 1.0e-18
+
+# Costs of the parts of the two sums (seconds; one laptop core, numpy/scipy, 2026-11-08), which choose ``eta``: a
+# real-space pair (tree query, erfc and sum), an image atom of the tree, an element of the phase product of one
+# atom, a complex multiply-add of the structure-factor matrix product.
+_PAIR_SECONDS = 3.0e-7
+_IMAGE_SECONDS = 2.0e-7
+_PHASE_SECONDS = 1.7e-8
+_PRODUCT_SECONDS = 1.5e-10
+_PAIR_BLOCK = 1 << 21  # atom pairs of one block of the real-space sum (24 bytes each from the tree)
+_PHASE_ELEMENTS = 1 << 22  # complex numbers of the phase product of one block of atoms (64 MiB)
 
 
-_translation_map = _serial_map
+def _ion_ion_inputs(atoms, potentials, lattice_vectors) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
+    """``(lattice, volume, fractional, positions, charges)`` with every atom translated into the cell.
 
-
-def set_translation_map(mapper=None) -> None:
-    """Install (or, with ``None``, remove) the map of the real-space terms of :func:`ewald_ion_ion_energy`.
-
-    ``mapper(function, translations, pairs)`` yields ``function(T)`` for every translation ``T`` in
-    order (``pairs`` is the number of atom pairs of one term, for a memory budget); the energy adds
-    the terms in that order, so a parallel map that keeps the order gives the same energy bit for
-    bit.  The default is the builtin ``map``; the performance counterpart lives in
-    ``parsec_python.acceleration.V_ion.periodic_setup``.
-    """
-    global _translation_map
-    _translation_map = _serial_map if mapper is None else mapper
-
-
-def ewald_image_sets(
-    positions: np.ndarray, lattice_vectors: np.ndarray, eta: float | None, tolerance: float
-) -> tuple[float, float, np.ndarray, np.ndarray]:
-    """Return ``(eta, real_cutoff, translations, reciprocal_points)`` of the Ewald sums of one cell.
-
-    The real-space translations ``T`` with some pair separation ``r_a - r_b + T`` possibly within the cutoff
-    (``|T| <= cutoff + |r_a - r_b|``, the pair separations being bounded by the diameter of the atoms), and the
-    reciprocal-lattice vectors ``G != 0`` with ``|G|`` within the reciprocal cutoff.  The energy and its forces
-    (:func:`parsec_python.Forces.ion_ion.ewald_ion_ion_forces`) both enumerate them here, so the force is the
-    derivative of exactly the sum that the energy evaluates.
+    The energy does not depend on which image of an atom the coordinates name; the sums below need the
+    fractional coordinates in ``[0, 1]``.  An atom already inside keeps its position bit for bit.
     """
 
-    volume = float(abs(np.linalg.det(lattice_vectors)))
-    eta, real_cutoff, reciprocal_cutoff = _ewald_cutoffs(volume, eta, tolerance)
-    reciprocal_vectors = _reciprocal_lattice(lattice_vectors)
-    pair_reach = 2.0 * float(np.max(np.linalg.norm(positions - positions.mean(axis=0), axis=1)))
-    translations = _lattice_points(lattice_vectors, reciprocal_vectors, real_cutoff + pair_reach)
-    reciprocal_points = _lattice_points(reciprocal_vectors, lattice_vectors, reciprocal_cutoff)
-    reciprocal_points = reciprocal_points[np.any(reciprocal_points != 0.0, axis=1)]
-    return eta, real_cutoff, translations, reciprocal_points
+    lattice = np.asarray(lattice_vectors, dtype=np.float64)
+    if lattice.shape != (3, 3):
+        raise ValueError("lattice_vectors must have shape (3, 3)")
+    volume = float(abs(np.linalg.det(lattice)))
+    if volume <= 0.0:
+        raise ValueError("lattice_vectors must span a nondegenerate cell")
+    positions = np.stack([np.asarray(atom.position, dtype=np.float64) for atom in atoms]).reshape(-1, 3)
+    charges = np.array([potentials[atom.symbol].ionic_charge for atom in atoms], dtype=np.float64)
+    fractional = positions @ np.linalg.inv(lattice)
+    shift = np.floor(fractional)
+    moved = np.any(shift != 0.0, axis=1)
+    if np.any(moved):
+        positions = positions.copy()
+        positions[moved] -= shift[moved] @ lattice
+        fractional = fractional - shift
+    return lattice, volume, np.clip(fractional, 0.0, 1.0), positions, charges
+
+
+def _reciprocal_half_widths(lattice: np.ndarray, cutoff: float) -> np.ndarray:
+    """Largest ``|m_i|`` of a reciprocal vector ``G = sum_i m_i b_i`` with ``|G| <= cutoff``: ``m_i = G.a_i/2 pi``."""
+
+    return np.floor(cutoff * np.linalg.norm(lattice, axis=1) / (2.0 * np.pi)).astype(np.int64)
+
+
+def ion_ion_splitting(lattice_vectors: np.ndarray, atom_count: int, tolerance: float = ION_ION_TOLERANCE) -> float:
+    """The Ewald parameter ``eta`` (1/bohr) of the ion-ion sums of a cell of ``atom_count`` atoms.
+
+    Any ``eta`` gives the same energy; it moves work between the real-space pairs (``~ N^2 r_c^3/V`` with
+    ``r_c = erfcinv(tolerance)/eta``) and the reciprocal sum (``~ N`` times the box of ``|m_i| <= G_c |a_i|/2 pi``,
+    ``G_c = 2 eta sqrt(-ln tolerance)``).  This is the one of least estimated cost on the grid
+    ``sqrt(pi)/V^(1/3) 2^(k/4)`` (the first factor the parameter of the direct sums before 2026-11-08): about
+    0.4/bohr for 4,096 atoms of diamond (``r_c`` 15 bohr, 400 neighbours per atom, a box of 90^3 vectors).
+    """
+
+    lattice = np.asarray(lattice_vectors, dtype=np.float64)
+    volume = float(abs(np.linalg.det(lattice)))
+    count = max(int(atom_count), 1)
+    real_scale = float(erfcinv(tolerance))
+    reciprocal_scale = 2.0 * np.sqrt(-np.log(tolerance))
+    spacings = lattice_plane_spacings(lattice)
+    reference = float(np.sqrt(np.pi) / volume ** (1.0 / 3.0))
+    best_cost, best_eta = np.inf, reference
+    for step in range(-8, 61):
+        eta = reference * 2.0 ** (step / 4.0)
+        cutoff = real_scale / eta
+        pairs = count * count / volume * (4.0 / 3.0) * np.pi * cutoff**3
+        images = count * float(np.prod(1.0 + 2.0 * cutoff / spacings))
+        half = np.sort(_reciprocal_half_widths(lattice, reciprocal_scale * eta))
+        plane = float((2 * half[0] + 1) * (2 * half[1] + 1))
+        cost = (
+            _PAIR_SECONDS * pairs
+            + _IMAGE_SECONDS * images
+            + count * plane * (_PHASE_SECONDS + _PRODUCT_SECONDS * (half[2] + 1))
+        )
+        if cost < best_cost:
+            best_cost, best_eta = cost, eta
+    return best_eta
+
+
+def _real_space_pairs(positions: np.ndarray, fractional: np.ndarray, lattice: np.ndarray, cutoff: float):
+    """Yield ``(a, b, displacement, distance)`` of every pair term of the real-space sum, in blocks of atoms ``a``.
+
+    The terms are the atoms ``a`` of the cell and the images ``r_b + n.A`` (``n`` integer) within ``cutoff`` of
+    them, without ``a`` itself (``b = a``, ``n = 0``); ``displacement = r_a - r_b - n.A``.  The candidate images
+    are those with every fractional coordinate in ``[-c_i, 1 + c_i]``, ``c_i = cutoff/d_i`` (``d_i``: the spacing
+    of the lattice planes ``i``), which holds every image within ``cutoff`` of the cell; a k-d tree of them gives
+    the pairs (any cell, oblique or small).  Each pair ``(a, b, n)`` comes once, its mirror ``(b, a, -n)`` once.
+    """
+
+    from scipy.spatial import cKDTree
+
+    count = len(positions)
+    reach = cutoff / lattice_plane_spacings(lattice)
+    span = np.ceil(reach).astype(np.int64) + 1
+    axes = [np.arange(-s, s + 1, dtype=np.int64) for s in span]
+    translations = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+    origin = np.flatnonzero(np.all(translations == 0, axis=1))
+    translations = np.concatenate((translations[origin], np.delete(translations, origin, axis=0)))
+    shifted = fractional[None, :, :] + translations[:, None, :]
+    inside = np.all((shifted >= -reach) & (shifted <= 1.0 + reach), axis=2)
+    which, atom = np.nonzero(inside)  # translation-major: the translation n = 0 first, its rows the atoms
+    image_atoms = atom
+    image_positions = positions[atom] + translations[which].astype(np.float64) @ lattice
+    tree = cKDTree(image_positions)
+    neighbours = len(image_positions) / max(float(np.prod(1.0 + 2.0 * reach)), 1.0) * (4.0 / 3.0) * np.pi * (
+        reach.max() ** 3
+    )
+    block = max(1, int(_PAIR_BLOCK // max(neighbours, 1.0)))
+    for start in range(0, count, block):
+        stop = min(start + block, count)
+        found = cKDTree(positions[start:stop]).sparse_distance_matrix(tree, cutoff, output_type="ndarray")
+        rows = found["i"].astype(np.int64) + start
+        columns = found["j"].astype(np.int64)
+        keep = columns != rows  # the image rows 0..N-1 are the atoms themselves (n = 0)
+        rows, columns = rows[keep], columns[keep]
+        distance = found["v"][keep]
+        if np.any(distance <= 0.0):
+            raise ValueError("two nuclei occupy the same position")
+        yield rows, image_atoms[columns], positions[rows] - image_positions[columns], distance
+
+
+def _reciprocal_box(lattice: np.ndarray, eta: float, tolerance: float):
+    """The half box of reciprocal vectors of the sums: ``(axes, frequencies, weight, vectors)``.
+
+    ``G = sum_i m_i b_i`` with ``|m_i| <= G_c |a_i|/2 pi``, ``G_c = 2 eta sqrt(-ln tolerance)``.  ``axes`` orders the
+    lattice directions with the longest frequency range first; that range is halved, ``m >= 0`` (``S(-G)`` is the
+    conjugate of ``S(G)``).  ``weight[m]`` is ``exp(-G^2/4 eta^2)/G^2`` for ``0 < |G| <= G_c`` and 0 elsewhere,
+    doubled for ``m_0 > 0`` (``G`` stands for ``-G`` too); ``vectors`` returns the Cartesian components of ``G``.
+    """
+
+    cutoff = 2.0 * eta * np.sqrt(-np.log(tolerance))
+    half = _reciprocal_half_widths(lattice, cutoff)
+    axes = tuple(int(axis) for axis in np.argsort(-half, kind="stable"))
+    half = half[list(axes)]
+    frequencies = (
+        np.arange(0, half[0] + 1, dtype=np.int64),
+        np.arange(-half[1], half[1] + 1, dtype=np.int64),
+        np.arange(-half[2], half[2] + 1, dtype=np.int64),
+    )
+    reciprocal = _reciprocal_lattice(lattice)[list(axes)]  # rows b_i in the order of ``axes``
+    m0, m1, m2 = frequencies[0][:, None, None], frequencies[1][None, :, None], frequencies[2][None, None, :]
+
+    def vectors(component: int) -> np.ndarray:
+        return m0 * reciprocal[0, component] + m1 * reciprocal[1, component] + m2 * reciprocal[2, component]
+
+    g_squared = sum(vectors(component) ** 2 for component in range(3))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        weight = np.exp(-g_squared / (4.0 * eta**2)) / g_squared
+    weight[(g_squared == 0.0) | (g_squared > cutoff**2)] = 0.0
+    weight[1:] *= 2.0
+    return axes, frequencies, weight, vectors
+
+
+def _axis_phases(fractional: np.ndarray, frequencies: np.ndarray) -> np.ndarray:
+    """``exp(2 pi i f m)`` of the atoms (rows) and the frequencies ``m`` (columns) of one axis."""
+
+    return np.exp(2.0j * np.pi * np.multiply.outer(fractional, frequencies.astype(np.float64)))
+
+
+def _structure_factors(fractional: np.ndarray, charges: np.ndarray, frequencies) -> np.ndarray:
+    """``S(G) = sum_a Z_a exp(i G.r_a)`` over the box, ``G.r_a = 2 pi sum_i m_i f_ai``.
+
+    The phase is a product of one factor per axis, so ``S`` of a block of atoms is one matrix product of the
+    first axis's phases with the products of the other two: ``N x M_0 x M_1 x M_2`` multiply-adds in all.
+    """
+
+    m0, m1, m2 = (len(values) for values in frequencies)
+    structure = np.zeros((m0, m1 * m2), dtype=np.complex128)
+    block = max(1, _PHASE_ELEMENTS // (m1 * m2))
+    buffer = np.empty((min(block, len(charges)), m1, m2), dtype=np.complex128)
+    for start in range(0, len(charges), block):
+        stop = min(start + block, len(charges))
+        first = charges[start:stop, None] * _axis_phases(fractional[start:stop, 0], frequencies[0])
+        product = np.multiply(
+            _axis_phases(fractional[start:stop, 1], frequencies[1])[:, :, None],
+            _axis_phases(fractional[start:stop, 2], frequencies[2])[:, None, :],
+            out=buffer[: stop - start],
+        )
+        structure += first.T @ product.reshape(stop - start, m1 * m2)
+    return structure.reshape(m0, m1, m2)
+
+
+def ewald_ion_ion_terms(
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    lattice_vectors: np.ndarray,
+    *,
+    eta: float | None = None,
+    tolerance: float = ION_ION_TOLERANCE,
+    forces: bool = False,
+) -> tuple[float, np.ndarray | None]:
+    """The Ewald ion-ion energy (Ry) of one cell and, with ``forces``, its ``(atoms, 3)`` forces (Ry/bohr).
+
+    In Hartree units, with ``d = |r_a - r_b + T|``, ``w(G) = exp(-G^2/4 eta^2)/G^2`` and
+    ``S(G) = sum_a Z_a exp(i G.r_a)``,
+
+    ``E = 1/2 sum'_(a,b,T) Z_a Z_b erfc(eta d)/d + (2 pi/V) sum_(G != 0) w(G) |S(G)|^2
+          - eta/sqrt(pi) sum_a Z_a^2 - pi/(2 eta^2 V) (sum_a Z_a)^2``,
+
+    the prime leaving out ``a = b`` at ``T = 0``, and
+
+    ``F_a = sum'_(b,T) Z_a Z_b [erfc(eta d)/d^2 + 2 eta exp(-eta^2 d^2)/(sqrt(pi) d)] (r_a - r_b + T)/d
+            + (4 pi/V) Z_a sum_(G != 0) w(G) G Im[exp(i G.r_a) S(G)^*]``;
+
+    both are doubled for Rydberg units.  The real-space terms run over the pairs within
+    ``r_c = erfcinv(tolerance)/eta`` (:func:`_real_space_pairs`), the reciprocal ones over ``|G| <= 2 eta
+    sqrt(-ln tolerance)`` (:func:`_reciprocal_box`, :func:`_structure_factors`), so the forces are the derivative of
+    exactly the sum the energy evaluates.  ``eta`` defaults to :func:`ion_ion_splitting`.  The cost is
+    ``O(N^2 r_c^3/V + N M^3)``: 1-2 s for 4,096 atoms, where the direct sum over every translation and atom pair
+    of the code before 2026-11-08 took 200 s.
+    """
+
+    if not 0.0 < tolerance < 1.0:
+        raise ValueError("tolerance must be between 0 and 1")
+    count = len(atoms)
+    if count == 0:
+        lattice = np.asarray(lattice_vectors, dtype=np.float64)
+        if lattice.shape != (3, 3):
+            raise ValueError("lattice_vectors must have shape (3, 3)")
+        if float(abs(np.linalg.det(lattice))) <= 0.0:
+            raise ValueError("lattice_vectors must span a nondegenerate cell")
+        return 0.0, (np.zeros((0, 3)) if forces else None)
+    lattice, volume, fractional, positions, charges = _ion_ion_inputs(atoms, potentials, lattice_vectors)
+    if eta is None:
+        eta = ion_ion_splitting(lattice, count, tolerance)
+    eta = float(eta)
+    if eta <= 0.0:
+        raise ValueError("eta must be positive")
+    cutoff = float(erfcinv(tolerance) / eta)
+    force = np.zeros((count, 3)) if forces else None
+
+    real_space_energy = 0.0
+    for rows, others, displacement, distance in _real_space_pairs(positions, fractional, lattice, cutoff):
+        products = charges[rows] * charges[others]
+        screened = erfc(eta * distance)
+        real_space_energy += 0.5 * float(np.sum(products * screened / distance))
+        if forces:
+            # -d/dd [erfc(eta d)/d], over d for the unit vector
+            radial = products * (
+                screened / distance**2 + 2.0 * eta * np.exp(-((eta * distance) ** 2)) / (np.sqrt(np.pi) * distance)
+            ) / distance
+            for component in range(3):
+                force[:, component] += np.bincount(rows, weights=radial * displacement[:, component], minlength=count)
+
+    axes, frequencies, weight, vectors = _reciprocal_box(lattice, eta, tolerance)
+    ordered = fractional[:, list(axes)]
+    structure = _structure_factors(ordered, charges, frequencies)
+    reciprocal_energy = (2.0 * np.pi / volume) * float(np.sum(weight * (structure.real**2 + structure.imag**2)))
+    if forces:
+        _reciprocal_forces(force, ordered, charges, frequencies, weight, vectors, structure, volume)
+
+    self_energy = -(eta / np.sqrt(np.pi)) * float(np.sum(charges**2))
+    neutralizing_energy = -(np.pi / (2.0 * eta**2 * volume)) * float(np.sum(charges)) ** 2
+    hartree_energy = real_space_energy + reciprocal_energy + self_energy + neutralizing_energy
+    # PARSEC's Rydberg convention, matching ion_ion_energy's factor of two.
+    return 2.0 * hartree_energy, (None if force is None else 2.0 * force)
+
+
+def _reciprocal_forces(force, fractional, charges, frequencies, weight, vectors, structure, volume) -> None:
+    """``force += (4 pi/V) Z_a sum_G w(G) G Im[exp(i G.r_a) S(G)^*]`` (Hartree) over the half box of ``weight``.
+
+    ``C_k(G) = w(G) G_k S(G)^*`` contracted with the phases of every atom one axis after the other: a matrix product
+    over the last axis, then two sums per atom.
+    """
+
+    m0, m1, m2 = (len(values) for values in frequencies)
+    coefficients = np.stack([weight * vectors(component) for component in range(3)]) * np.conj(structure)[None]
+    coefficients = coefficients.reshape(3 * m0 * m1, m2)
+    block = max(1, _PHASE_ELEMENTS // (3 * m0 * m1))
+    for start in range(0, len(charges), block):
+        stop = min(start + block, len(charges))
+        last = coefficients @ _axis_phases(fractional[start:stop, 2], frequencies[2]).T
+        middle = np.einsum(
+            "kxyb,by->kxb", last.reshape(3, m0, m1, stop - start),
+            _axis_phases(fractional[start:stop, 1], frequencies[1]),
+        )
+        total = np.einsum("kxb,bx->bk", middle, _axis_phases(fractional[start:stop, 0], frequencies[0]))
+        force[start:stop] += (4.0 * np.pi / volume) * charges[start:stop, None] * total.imag
 
 
 def ewald_ion_ion_energy(
@@ -124,79 +368,16 @@ def ewald_ion_ion_energy(
     lattice_vectors: np.ndarray,
     *,
     eta: float | None = None,
-    tolerance: float = 1.0e-14,
+    tolerance: float = ION_ION_TOLERANCE,
 ) -> float:
     """Return the periodic pairwise ion-ion repulsion in Rydberg.
 
-    Returns
-    -------
-    The Ewald ion-ion energy in Rydberg, for one unit cell (i.e. counting each
-    ion once, not once per image).
+    The Ewald sum of :func:`ewald_ion_ion_terms` for one unit cell (each ion counted once, not once per image), the
+    neutralizing background included.  Atoms may be given outside the cell.
     """
 
-    lattice_vectors = np.asarray(lattice_vectors, dtype=np.float64)
-    if lattice_vectors.shape != (3, 3):
-        raise ValueError("lattice_vectors must have shape (3, 3)")
-    volume = float(abs(np.linalg.det(lattice_vectors)))
-    if volume <= 0.0:
-        raise ValueError("lattice_vectors must span a nondegenerate cell")
-    if not atoms:
-        return 0.0
-
-    positions = np.stack([np.asarray(atom.position, dtype=np.float64) for atom in atoms])
-    charges = np.array(
-        [potentials[atom.symbol].ionic_charge for atom in atoms], dtype=np.float64
-    )
-
-    eta, real_cutoff, translations, reciprocal_points = ewald_image_sets(
-        positions, lattice_vectors, eta, tolerance
-    )
-
-    # Real-space sum: (1/2) * sum_{a,b} sum'_R Z_a*Z_b*erfc(eta*d)/d, the
-    # prime excluding the singular (a=b, R=0) term.  Each translation R
-    # contributes an (n_atoms, n_atoms) block of pair separations.
-    real_space_energy = 0.0
-    charge_products = charges[:, None] * charges[None, :]
-    extent = positions.max(axis=0) - positions.min(axis=0)  # every |r_a - r_b| component is within it
-
-    def real_space_term(translation):
-        if np.linalg.norm(np.maximum(np.abs(translation) - extent, 0.0)) > real_cutoff:
-            return None  # no pair of atoms comes within the cutoff of this image
-        is_origin = bool(np.all(translation == 0.0))
-        displacement = (
-            positions[:, None, :] - positions[None, :, :] + translation[None, None, :]
-        )
-        distance = np.linalg.norm(displacement, axis=2)
-        if is_origin:
-            np.fill_diagonal(distance, np.inf)
-        if float(np.min(distance)) > real_cutoff:
-            return None
-        return 0.5 * np.sum(charge_products * erfc(eta * distance) / distance)
-
-    # the terms in the order of the translations (see set_translation_map)
-    for term in _translation_map(real_space_term, translations, len(positions) ** 2):
-        if term is not None:
-            real_space_energy += term
-
-    # Reciprocal-space sum: (2*pi/V) * sum_{G!=0} exp(-G^2/(4*eta^2))/G^2 * |S(G)|^2.
-    reciprocal_energy = 0.0
-    if reciprocal_points.size:
-        g_squared = np.sum(reciprocal_points**2, axis=1)
-        phases = positions @ reciprocal_points.T
-        structure_factor = np.sum(
-            charges[:, None] * np.exp(1j * phases), axis=0
-        )
-        weight = np.exp(-g_squared / (4.0 * eta**2)) / g_squared
-        reciprocal_energy = (2.0 * np.pi / volume) * float(
-            np.sum(weight * np.abs(structure_factor) ** 2)
-        )
-
-    self_energy = -(eta / np.sqrt(np.pi)) * float(np.sum(charges**2))
-    neutralizing_energy = -(np.pi / (2.0 * eta**2 * volume)) * float(np.sum(charges)) ** 2
-
-    hartree_energy = real_space_energy + reciprocal_energy + self_energy + neutralizing_energy
-    # PARSEC's Rydberg convention, matching ion_ion_energy's factor of two.
-    return 2.0 * hartree_energy
+    energy, _ = ewald_ion_ion_terms(atoms, potentials, lattice_vectors, eta=eta, tolerance=tolerance)
+    return energy
 
 
 def _erf_over_r(charge: float, radius: np.ndarray, eta: float) -> np.ndarray:
@@ -441,12 +622,14 @@ def ewald_alpha_z_energy(
 
 
 __all__ = [
+    "ION_ION_TOLERANCE",
     "LOCAL_POTENTIAL_USES_CUBIC_SPLINE",
     "ewald_alpha_z_energy",
     "ewald_ion_ion_energy",
+    "ewald_ion_ion_terms",
     "ewald_local_ionic_potential",
+    "ion_ion_splitting",
     "local_potential_tolerance",
     "local_potential_uses_spline",
     "set_local_potential_provider",
-    "set_translation_map",
 ]

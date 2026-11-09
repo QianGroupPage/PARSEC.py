@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
-# Complete SCF calculation of an isolated system (molecule or cluster) on the
-# GPUs of one node or of several nodes.
+# Complete SCF calculation of an isolated system (molecule or cluster), or of
+# a bulk periodic cell at the Gamma point, on the GPUs of one node or of
+# several nodes.
 #
 # One MPI rank per node drives all GPUs of its node. This is the layout and
 # these are the settings the multi-GPU solver was measured with (1 to 16
 # A100 80 GB GPUs, four per node, double precision); see "Several nodes" in
-# src/parsec_python/acceleration/MULTI_GPU.md. The runner refuses periodic
-# cells.
+# src/parsec_python/acceleration/MULTI_GPU.md.
+#
+# A periodic cell (Boundary_Conditions: bulk) runs at the Gamma point, with
+# real orbitals, an orthorhombic cell, no spin and a native LDA or GGA, as one
+# sector whose orbitals the ranks share: on several nodes launch it with
+# --rank-per-gpu (one rank per GPU), on one node either layout. K-points go to
+# parsec_python/main.py --mpi; spin, hybrids, meta-GGAs, oblique cells, wires,
+# slabs, forces, relaxation and molecular dynamics of a cell to main.py (the
+# runner refuses them by name). See "Periodic cells at the Gamma point on
+# several nodes" in MULTI_GPU.md.
 #
 # An input with Minimization (bfgs, simple) runs the structural relaxation on
 # the same layout, and Skip_Force: false adds the forces to a single point;
@@ -44,7 +53,7 @@
 #   --cpus-per-rank   CPUs of each rank as srun -c counts them (default 32,
 #                which is 16 cores with two hardware threads each)
 #   --rank-per-gpu    G ranks per node, one GPU each, for a run without
-#                symmetry (molecular dynamics) on several nodes. Their
+#                symmetry (molecular dynamics, a periodic cell) on several nodes. Their
 #                exchanges pass GPU arrays to MPI: Cray MPICH needs mpi4py
 #                built with craype-accel-nvidia80 loaded (it links
 #                libmpi_gtl_cuda); PARSEC_MPI_SHARED_TRANSPORT=host stages
@@ -56,6 +65,7 @@
 #   scripts/run_multi_gpu_scf.sh parsec.in out                    # every node, 4 GPUs each
 #   scripts/run_multi_gpu_scf.sh --nodes 1 --gpus-per-node 2 parsec.in out
 #   scripts/run_multi_gpu_scf.sh --nodes 4 --rank-per-gpu md/parsec.in md_out   # MD on 16 GPUs
+#   scripts/run_multi_gpu_scf.sh --nodes 4 --rank-per-gpu bulk/parsec.in bulk_out   # a cell at Gamma on 16 GPUs
 #
 # Environment: a setting below that is already in the environment is left as
 # it is, except the OpenMP binding, which is switched off (OMP_PROC_BIND=false,

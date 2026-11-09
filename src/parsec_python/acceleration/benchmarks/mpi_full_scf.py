@@ -11,6 +11,10 @@ interpreter lock; PARSEC_CUDA_CONTEXT_CREATION=runtime leaves them to CuPy's
 first calls on each device, which hold the lock, as before.
 No symmetry cache is read or written unless --symmetry-cache names a directory:
 a run with default flags is the first calculation of its structure.
+A bulk periodic cell at the Gamma point (orthorhombic, unpolarized, a native
+LDA or GGA) is one sector of the identity, whose orbitals several ranks per
+node share, one GPU each (scripts/run_multi_gpu_scf.sh --rank-per-gpu); the
+other periodic calculations are refused by name (_refuse_unsupported_periodic).
 """
 from __future__ import annotations
 
@@ -193,6 +197,25 @@ _SERIAL_CONTROL_SETTINGS = {
     # same bits, and a defect of it would otherwise be in both sides.
     'PARSEC_CUPY_STENCIL_KERNEL': 'former',
 }
+
+
+# Notes of the record of a periodic cell (none for a cluster, whose record is as it was).
+_PERIODIC_NOTES = [
+    'A periodic cell (Boundary_Conditions: bulk) at the Gamma point: one sector of the identity, every grid point an '
+    'orbit, whose basis the ranks share (one GPU each, --rank-per-gpu) or the GPUs of one rank. Its grid is the '
+    'periodic grid of the input on every rank (checked: lattice vectors, spacing, order, shift, point counts); the '
+    'root solves the periodic Hartree potential (Hartree/periodic_device.py, on its GPU) and the XC functional of '
+    'the full grid, with the SCF fields in the order of the grid. result.domain and result.hartree_boundary are '
+    'null: a cell has no sphere and no boundary values.',
+]
+
+
+# The note of the diagnostic PARSEC_DEVICE_LIVE_PEAK (none without it).
+_LIVE_PEAK_NOTE = (
+    'per_rank[].device_live_peak (PARSEC_DEVICE_LIVE_PEAK=1) is, per device, the most bytes that the arrays of the '
+    'main thread of the rank held at once from the end of the preparation to the end of the run (a CuPy memory hook: '
+    'live_peak_bytes = in_use_at_entry_bytes + peak_bytes_since_entry, as the pool rounds the arrays), without the '
+    'CUDA context, library workspaces and the blocks that the pool keeps after a release, which gpu_memory includes.')
 
 
 def _keep_former_routes(environment):
@@ -518,6 +541,47 @@ class _GpuMemorySampler:
                     peak_used_mib=max(peaks.values(), default=None))
 
 
+def _live_peak_requested() -> bool:
+    """PARSEC_DEVICE_LIVE_PEAK: a diagnostic, off unless 1, true, yes or on."""
+    return os.environ.get('PARSEC_DEVICE_LIVE_PEAK', '0').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+class _LivePeak:
+    """The most bytes that the arrays of the calling thread held at once on each device (a CuPy memory hook).
+
+    nvidia-smi sees what CuPy's pool has reserved, which keeps the blocks of freed arrays and so can lie well
+    above what the arrays ever needed at once; the pool gives those blocks back to the driver before an
+    allocation that would otherwise fail. This counts the bytes of the arrays themselves (as the pool rounds
+    them), from their allocation to their release, in the thread that enters it (CuPy keeps hooks per thread).
+    """
+
+    def __init__(self):
+        from cupy.cuda import memory_hook
+
+        class Hook(memory_hook.MemoryHook):
+            name = 'parsec_live_peak'
+
+            def __init__(hook):
+                hook.live, hook.peak = {}, {}
+
+            def malloc_postprocess(hook, **values):
+                device = int(values['device_id'])
+                hook.live[device] = hook.live.get(device, 0) + int(values['mem_size'])
+                hook.peak[device] = max(hook.peak.get(device, 0), hook.live[device])
+
+            def free_postprocess(hook, **values):
+                device = int(values['device_id'])
+                hook.live[device] = hook.live.get(device, 0) - int(values['mem_size'])
+
+        self.hook = Hook()
+
+    def record(self, baseline):
+        """Per device: the peak of the arrays counted here and ``baseline``, the pool bytes in use at the entry."""
+        return {str(device): dict(peak_bytes_since_entry=int(peak), in_use_at_entry_bytes=int(baseline.get(device, 0)),
+                                  live_peak_bytes=int(peak + baseline.get(device, 0)))
+                for device, peak in sorted(self.hook.peak.items())}
+
+
 def _synchronize(cp, devices):
     for device in devices:
         with cp.cuda.Device(device):
@@ -586,9 +650,20 @@ def _parsed_domain(translation):
 
     Their bit patterns, and the texts of the default rule where it chose
     them: every rank runs the rule on its own, from the input and the
-    pseudopotential bytes that the ranks have just compared.
+    pseudopotential bytes that the ranks have just compared. A periodic cell
+    has neither: its lattice vectors and the settings its grid follows from
+    (spacing, order, shift, the rule of the counts and the routines), as bit
+    patterns, take their place.
     """
     problem, choice = translation.problem, getattr(translation, 'domain', None)
+    if problem.periodic_cell is not None:
+        import numpy as np
+
+        grid = problem.grid
+        lattice = np.asarray(problem.periodic_cell.lattice_vectors, dtype=float).ravel()
+        return ('periodic', tuple(float(value).hex() for value in lattice), float(grid.spacing).hex(),
+                int(grid.expansion_order), tuple(float(value).hex() for value in grid.shift), str(grid.points_rule),
+                bool(grid.fortran_routines), int(grid.periodicity))
     tolerance = problem.hartree.boundary_tolerance
     return (float(problem.grid.radius).hex(), None if tolerance is None else float(tolerance).hex(),
             None if choice is None else (choice.radius_text, choice.tolerance_text))
@@ -597,10 +672,58 @@ def _parsed_domain(translation):
 def _require_same_domain(parsed):
     """Stop unless every rank resolved the domain of the first, before any of them prepares a grid."""
     different = [rank for rank, item in enumerate(parsed) if item != parsed[0]]
+    if different and parsed[0][0] == 'periodic':
+        raise ValueError('the periodic cell or the settings of its grid differ across ranks: rank 0 has '
+                         f'{parsed[0]}, rank {different[0]} has {parsed[different[0]]}')
     if different:
         raise ValueError('the sphere radius or the Hartree boundary tolerance differs across ranks: rank 0 has '
                          f'{parsed[0]}, rank {different[0]} has {parsed[different[0]]}; give Boundary_Sphere_Radius '
                          'and Hartree_Boundary_Tolerance in the input')
+
+
+def _prepared_cell_grid(system):
+    """The grid that this rank prepared of a periodic cell: point counts, step and shift as bit patterns."""
+    grid = system.grid
+    return (tuple(int(value) for value in grid.points_per_axis), int(grid.size), float(grid.spacing).hex(),
+            float(grid.volume_element).hex(), tuple(float(value).hex() for value in grid.shift))
+
+
+def _require_same_cell_grid(prepared):
+    """Stop unless every rank prepared the grid of the first (the rows of the shared basis are its points)."""
+    different = [rank for rank, item in enumerate(prepared) if item != prepared[0]]
+    if different:
+        raise ValueError('the grid of the periodic cell differs across ranks: rank 0 has '
+                         f'{prepared[0]}, rank {different[0]} has {prepared[different[0]]}')
+
+
+def _refuse_unsupported_periodic(translation) -> None:
+    """Refuse by name what this runner does not run of a periodic cell.
+
+    It solves a bulk cell at the Gamma point (orthorhombic, unpolarized, a
+    native LDA or GGA) as one sector of the identity whose basis the ranks
+    share (driver.periodic_sector_refusal). Forces, relaxation, molecular
+    dynamics and the band calculations after an SCF of a cell stay with
+    main.py, as do k-points (main.py --mpi pools them on several ranks).
+    """
+    problem = translation.problem
+    if problem.periodic_cell is None:
+        return
+    from parsec_python.acceleration.driver import periodic_sector_refusal
+
+    reason = periodic_sector_refusal(problem)
+    if reason is not None:
+        where = 'parsec_python/main.py --mpi' if 'k-point' in reason else 'parsec_python/main.py'
+        raise ValueError(f'{reason} of a periodic cell is not available in the full-SCF runner, which solves a bulk '
+                         'cell at the Gamma point (orthorhombic, unpolarized, native LDA or GGA) as one sector whose '
+                         f'basis the ranks share: run it with {where}')
+    if (getattr(translation, 'compute_forces', False) or getattr(translation, 'relaxation', None) is not None
+            or getattr(translation, 'molecular_dynamics', None) is not None):
+        raise ValueError('forces, relaxation and molecular dynamics of a periodic cell are not available in the '
+                         'full-SCF runner (the periodic force terms of the shared sector are not validated): run them '
+                         'with parsec_python/main.py')
+    if problem.bands is not None or getattr(translation, 'nscf', None) is not None:
+        raise ValueError('the band structure (bandstruc) and the non-self-consistent runs (nscf) of a periodic cell '
+                         'are not available in the full-SCF runner: run them with parsec_python/main.py')
 
 
 def _hartree_boundary_record(system, result):
@@ -716,10 +839,10 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
     if args.mlff is not None:
         from parsec_python.MLFF import apply_mlff_option
         translation = apply_mlff_option(translation, args.mlff)
-    if translation.problem.periodic_cell is not None:
-        # Refused here by name: the sphere and the symmetry sectors read below are those of a cluster.
-        raise ValueError('the full-SCF runner divides the symmetry sectors of an isolated cluster; a periodic input '
-                         '(Boundary_Conditions: bulk) is not supported: run it with parsec_python/main.py')
+    # A bulk cell at the Gamma point runs as one sector of the identity shared by the ranks; every other periodic
+    # calculation is refused here by name, on every rank alike, before anything is prepared.
+    periodic = translation.problem.periodic_cell is not None
+    _refuse_unsupported_periodic(translation)
     if getattr(translation, 'polarizability_field', None) is not None:
         # Refused rather than ignored: the seven field loops run in one process (main.py).
         raise ValueError('Polarizability is not available in the full-SCF runner: run it with '
@@ -764,6 +887,12 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                          + (group_note or 'manual movements and molecular dynamics use no symmetry'))
     symmetry = (args.symmetry if args.symmetry is not None and (keeps_group or args.symmetry == 'off')
                 else ('auto' if use_symmetry else 'off'))
+    if periodic:
+        # The accelerated path detects no space group: a cell is the one sector of the identity.
+        if args.symmetry == 'on':
+            raise ValueError('--symmetry on cannot be used for a periodic cell: the accelerated path detects no space '
+                             'group, and the ranks share the basis of one sector of the identity')
+        symmetry = 'off'
     # Forces are symmetrized where the calculation itself uses the group.
     symmetrize_forces = keeps_group and symmetry != 'off'
     if symmetry == 'off' and not args.serial_control and not one_sector:
@@ -813,6 +942,23 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         translation = with_positions(translation, outcome[1])
         restart_notes = [*restart_notes, *outcome[2]]
     context = None if args.serial_control else MPISectorContext(comm, exchange=hybrid)
+    if context is not None and periodic:
+        # A bulk cell shares a basis of a size that only the Ritz step with one row block holds
+        # (mpi_shared_basis.shared_ritz_route); clusters keep the two row blocks and their bits.
+        context.shared_ritz_route = 'rounds'
+    if context is not None and comm.size > 1:
+        # An error of some ranks inside a step of a shared basis leaves the others in a collective that no
+        # command of the context reaches: report it here and end the job (mpi_shared_basis.set_failure_handler).
+        from parsec_python.acceleration.Eigensolvers.mpi_shared_basis import set_failure_handler
+
+        def end_the_job(group, error):
+            print(f'FULL_SCF_FAILED rank={comm.rank}: in a step of the shared basis: {type(error).__name__}: {error}',
+                  file=sys.stderr, flush=True)
+            traceback.print_exc()
+            sys.stderr.flush()
+            comm.Abort(1)
+
+        set_failure_handler(end_the_job)
     memory = []
     # As in acceleration.cli, this clock begins after imports, input parsing
     # and output-path resolution. All rank readiness/preparation waits follow.
@@ -841,6 +987,9 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
             mode = ('serial production control' if args.serial_control
                     else 'MPI symmetry sectors and the exchange of a hybrid on every GPU' if hybrid
                     else 'one sector shared by the ranks' if shared_ranks else 'MPI symmetry sectors')
+            if periodic and not args.serial_control:
+                mode = ('one sector of the identity of a periodic cell at the Gamma point'
+                        + (', shared by the ranks' if shared_ranks else ''))
             if hybrid and not args.serial_control:
                 from parsec_python.acceleration.SCF.hybrid_mpi import exchange_transport
                 transport = ('host-fields and ' + ('device' if exchange_transport() == 'cuda' else 'host-staged')
@@ -877,6 +1026,9 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
             raise RuntimeError('MPI full SCF requires the configured symmetry-sector eigensolver')
         memory.append(_observe_memory(cp, args.devices, 'after_preparation'))
         ready_started = time.perf_counter()
+        if periodic:
+            # The rows of the shared basis are the points of this grid on every rank.
+            _require_same_cell_grid(comm.allgather(_prepared_cell_grid(system)))
         placement = comm.allgather(dict(hostname=socket.gethostname(), devices=device_records))
         physical_devices = [(row['hostname'], item['pci_bus_id']) for row in placement for item in row['devices']]
         if len(set(physical_devices)) != len(physical_devices):
@@ -889,6 +1041,13 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
             log.write('NOTE: OpenMP binding had pinned the calling thread; its launcher CPU mask '
                       f'({len(initial_affinity)} CPUs) was restored for Python worker threads.')
         prepared_at = time.perf_counter()
+        # PARSEC_DEVICE_LIVE_PEAK=1: the peak of the arrays of this thread from here to the end of the run.
+        live_peak, live_baseline = (_LivePeak() if _live_peak_requested() else None), {}
+        if live_peak is not None:
+            for device in args.devices:
+                with cp.cuda.Device(device):
+                    live_baseline[device] = int(cp.get_default_memory_pool().used_bytes())
+            leaving.enter_context(live_peak.hook)
         result = None
         # The rank's own density builder: the root wraps it for the MPI protocol below.
         density_builder = getattr(system, 'orbital_density_builder', None)
@@ -1071,12 +1230,15 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                                         handover_slab_columns=getattr(group, 'handover_slab_columns', None),
                                         handover_product=getattr(group, 'handover_product', None))
     # A sector whose basis the ranks share (Eigensolvers/mpi_shared_basis.py): this rank's Ritz passes, the
-    # seconds of its stages, the orbital bytes it sent in the exchanges and how they travelled.
+    # seconds of its stages, the orbital bytes it sent in the exchanges and how they travelled, and the route of
+    # its Ritz step (shared_ritz_route).
     for sector, operator in enumerate(getattr(solver, '_operators', None) or ()):
         group = getattr(operator, '_mpi_shared_group', None)
         if group is not None:
+            from parsec_python.acceleration.Eigensolvers.mpi_shared_basis import shared_ritz_route
             shared_state.append(dict(sector=sector, ranks=group.size, device=group.device,
                                      transport=group.transport, ritz_passes=group.passes,
+                                     ritz_route=shared_ritz_route(group.ritz_route),
                                      seconds=dict(group.seconds), exchanged_bytes=group.exchanged_bytes))
     # What became of the host thread that made the estimates of the radius search beside the SCF of the root
     # (PARSEC_DOMAIN_REPORT_THREAD): a dict, and none for a rank or a run without that thread.
@@ -1110,6 +1272,7 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         # Per device: releases of a finished sector's pool blocks and the bytes returned; empty where none ran.
         sector_pool_release=dict(getattr(solver, 'sector_pool_releases', None) or {}),
         gpu_memory=gpu_memory, distributed_state=shared_state,
+        **({} if live_peak is None else {'device_live_peak': live_peak.record(live_baseline)}),
         single_array_ritz_sectors=list(getattr(solver, 'low_memory_ritz_sectors', ()) or ()),
         # Where the solver of the rank keeps the states of its sectors, which allocator serves them, and the
         # bytes per device that ``auto`` of either held against its share of the memory of the device
@@ -1144,7 +1307,9 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
             manual=translation.relaxation is not None and translation.relaxation.method == 'manual')
         payload = dict(kind='complete_scf_mpi_symmetry_sectors', schema_version=1,
             status='converged' if result.converged else 'not_converged', complete=True,
-            serial_control=args.serial_control, ranks=size, nodes=len(placement), gpu_count=len(physical_devices),
+            # Nodes are hosts: several ranks per node (--rank-per-gpu) counted once each.
+            serial_control=args.serial_control, ranks=size, nodes=len({row['hostname'] for row in placement}),
+            gpu_count=len(physical_devices),
             mpi_transport='host-fields', symmetry_cache_directory=cache,
             parameters=vars(args), input_sha256=inputs, source_provenance=source,
             rank_topology=placement, per_rank=ranks, result=root_report,
@@ -1184,7 +1349,8 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                 'Process RSS high water uses OS ru_maxrss; default CuPy pool observations exclude alternate/async allocators. Device-used observations include CUDA/library allocations.',
                 'Memory callback overhead is inside SCF wall time. CPU/thread resources per rank are recorded; total host CPU allocation can increase with node count.',
                 'Preparation max-rank is descriptive, not added to independently maximized stages or root total.',
-            ])
+            ] + (_PERIODIC_NOTES if periodic else [])
+              + ([] if live_peak is None else [_LIVE_PEAK_NOTE]))
         _atomic_json(timing_path, payload)
         print('FULL_SCF_CONVERGED' if result.converged else 'FULL_SCF_NOT_CONVERGED', timing_path, flush=True)
     return comm.bcast(exit_code, root=0)

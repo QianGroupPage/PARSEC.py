@@ -228,7 +228,13 @@ Currently supported:
     symmetric one; Andrew Grieder's routines fold their shifted grid alike), and the density is
     symmetrized over the space group (`Symmetrize_Charge_Density`, then true by
     default); weighted `Kpoint_List` rows; reference solver only.  Without the
-    shift block the unreduced grid of earlier versions is kept.
+    shift block the unreduced grid of earlier versions is kept.  On Andrew
+    Grieder's routines (`Use_Fortran_Routines: .false.`) the shifted grid of a
+    bulk single point is reduced by the operations that map their grid (that of
+    `Grid_Spacing`) and the mesh onto themselves, with time reversal, and the
+    density averaged with them (`Grid.space_group.find_grid_space_group`,
+    `Grid.kpoints.mesh_preserving_operations`; README "Irreducible k-points on
+    the default routines").
   - in every SCF driver (cluster, Gamma, k-points, periodic spin, spin-orbit,
     non-collinear): `Dynamic_Diag_Tol` (off with `Restart_Run`, as PARSEC),
     `Save_Intermediate_Charge_Density` / `Save_Intermediate_Eigenvalues`
@@ -554,6 +560,94 @@ with `Mixing_Param`, `Memory_Param` and `Restart_Mixing`) and
 hybrid multisecant mixers of `msecant1-3.f90`, with `Mixing_Group_Size`,
 `Mixing_EN_Like`, `Mixing_Restart_Factor`, `Mixing_Memory_Expand_Factor` and
 `Mixing_Preferred_Type`).  The safeguard belongs to the Anderson mixer only.
+
+### Bulk cells: the SUBSPACE lower bound
+
+The later-SCF Chebyshev filter (SUBSPACE) damps the unwanted interval `[l, u]`.  PARSEC's rule, this code's
+default, is `l = max(r_max, 0)` on the first call after the first solve and `l = max(l_previous, r_max)` later
+(`r_max` the largest saved Ritz value).  The clip at 0 suits clusters, whose unwanted spectrum starts near the
+vacuum level.  A 3-D periodic cell has none: with this code's periodic local potential the eigenvalues of bulk
+diamond lie near -37 Ry (64 atoms) and -84 Ry (216 atoms), the offset growing with the cell, so `l` stays 0 for
+the whole SCF and the conduction band between the subspace and 0 Ry is amplified with the occupied states.  The
+orbitals then converge by a few per cent per SCF iteration, the potential residual (the SCF test) becomes small
+because the orbitals change little, and the run stops with the energy far above its converged value.  PARSEC 1.5's
+`Smart_Subspace: .true.` takes `l = r_max` wherever the spectrum lies (`subspace_filter_bounds` in
+`Eigensolvers/subspace.py`, the one rule of the reference filter and of the device filters of one GPU, of a
+distributed basis and of the k-point solver).  Bulk diamond at the Gamma point (the inputs of
+`examples/3d_diamond_benchmark`: 18 points per cubic edge, order 8, chebff, the nanodiamond blocks, 2e-4 Ry; one
+A100):
+
+| atoms | default: iterations / SCF s / E - E_converged | `Smart_Subspace: .true.` |
+|---|---|---|
+| 64 | 24 / 1.6 / +0.062 mRy/atom | 8 / 1.2 / +0.00001 mRy/atom |
+| 216 | 43 / 12.6 / +0.37 mRy/atom | 10 / 3.7 / +0.00002 mRy/atom |
+| 512 | 65 / 118 / +4.9 mRy/atom | 16 / 19.2 / +0.00001 mRy/atom |
+| 1,000 | 104 / 954 / +13.9 mRy/atom | 17 / 85.5 / +0.0015 mRy/atom (`Chebyshev_Degree: 20`: 17 / 89.1 / +0.000004) |
+
+(`E_converged`: `Smart_Subspace`, `Chebyshev_Degree: 40` without the degree decrease, a buffer of 10 % of the
+states, `Convergence_Criterion: 1e-6 Ry`.)  With the smart bound the other blocks matter little: degree 20 or 30,
+no degree decrease, buffers of 5 or 10 % and `FF_MaxIter` 4 or 6 change the 512-atom SCF by -6 to +3 iterations
+and its time by less than 15 %, all within 0.001 mRy/atom; at 1,000 atoms degree 20 instead of 15 brings the
+stopping energy from 0.0015 to 0.000004 mRy/atom above the converged one for 4 % more time.  With the smart bound
+`Mixing_Param: 0.6` stops at +0.0001 mRy/atom (512 atoms); with PARSEC's rule it stopped 0.7 Ry high (216 atoms).  The same holds for k-points (64 atoms, 2x2x2 mesh:
+17 iterations and 0.048 mRy/atom high with PARSEC's rule, 8 with the smart one) and for bulk Si (64 atoms, PBE,
+1e-6 Ry: 51 iterations against 23).  A slab keeps a level near 0 (h-BN, 6x6x1: 25 iterations with PARSEC's rule, 30
+with the smart one, the same energy), and so do clusters (Si28H36: 12 and 13).  Since 8 November 2026 a bulk cell
+(`Boundary_Conditions: bulk`) without a `Smart_Subspace` line takes the smart rule; slabs and wires keep PARSEC's
+rule (slabs measured slower, wires not measured), and clusters take the input's rule as before
+(`DEFAULT_PERIODIC_SUBSPACE_LOWER_BOUND` of `Input/parsec_input.py` holds the rule of each periodic boundary
+condition for inputs without the line).  `Subspace_Lower_Bound: monotone | smart | adaptive` (PARSEC.py) names
+each rule; `Smart_Subspace: .true.` is `smart` and `.false.` PARSEC 1.5's `adaptive` (not the earlier PARSEC's
+`monotone`), as in 1.5.
+
+### The upper bound of the filters, and the other PARSEC 1.5 defaults
+
+Every Chebyshev filter (CHEBFF, CHEBDAV, SUBSPACE) takes its upper end `u` from a short Lanczos run
+(`lanczos_bound_from_ritz` in `Eigensolvers/spectral_bounds.py`, the one formula of the reference and device
+filters).  This code's default is the earlier PARSEC's radius `u = max(theta_max, |theta_min|) + margin` (4 to 8
+steps); PARSEC 1.5's default, `Bounds_Method: lanczos`, is `u = theta_max + margin` with `max(degree/2,
+Bounds_Iter = 10)` steps, and moves with the spectrum.  Both run on the reference and the device filters since 8
+November 2026 (`Bounds_Method: lanczos_full` stays with the reference CHEBFF).  With a periodic potential whose mean
+lies tens of Ry below 0 the radius takes `|theta_min|` and widens the filter interval several times (bulk diamond,
+Fermi level -341 Ry at 1,728 atoms: 25 SCF iterations with the radius, 11 with 1.5's bound, 16 ranks); with the
+zero-mean convention (`Periodic_Local_Potential: g_space`, `Zero_Average_Vxc: .true.`) the two bounds agree (512 and
+1,000 atoms: 10 iterations with the radius, 11 with 1.5's bound), and the radius stays the default.  In the same
+convention the other defaults where PARSEC 1.5 differs were measured on bulk diamond of 512 and 1,000 atoms and stay
+as they are: 1.5's degree decrease below `2 x Convergence_Criterion` instead of `100 x` (the same iterations and
+time), 1.5's working space without buffer (`Exact_State_Count: .true.`, the same or one iteration more), more cycles
+of the first filter (`FF_MaxIter` 6 or 10: 7 iterations instead of 10 but 25-90 % more time), the three lower-bound
+rules (`Subspace_Lower_Bound`: 10 iterations each at 216 and 512 atoms, smart 10 and the others 11 at 1,000; a
+spin-polarized SCAN Si2 cell with two k-points: 25 each, where the smart rule needed 54 against 28 with the offset).
+Bulk cells keep the smart rule.
+
+### Kerker preconditioner of the mixing (periodic cells)
+
+`Mixing_Preconditioner: kerker` (PARSEC.py; Fortran PARSEC has no preconditioner of its mixers) filters the
+potential residual `R = V_out - V_in` of a 3-D periodic cell in G-space before the mixer of `Mixing_Method` sees it
+(`Mixer/preconditioner.py`):
+
+```text
+R -> P R,   P(G) = (G^2 + q0^2/eps)/(G^2 + q0^2) for G != 0,   P(0) = 1
+Mixing_Preconditioner: kerker        # auto (default) = none here; none
+Kerker_Wavevector: 1.0               # q0, bohr^-1 (or ang^-1), default 1.0
+Kerker_Dielectric_Constant: 5.7      # eps, default infinite (Kerker's G^2/(G^2 + q0^2))
+```
+
+The linear response of the output potential gives `R = -eps e` for an input error `e` (`eps = 1 - (v_H + f_xc)
+chi0` acting on potentials), so the ideal step is `eps^-1 R`; Kerker's `P` is `eps^-1` of Thomas-Fermi screening
+(a metal), the finite `eps` the model of an insulator whose `eps(G -> 0)` is its dielectric constant.  The mean of
+`V_in` is a gauge of the periodic cell (it shifts every eigenvalue and changes neither the density nor the energy),
+so the mean of the residual passes unchanged.  The mixer works on the preconditioned fixed-point problem `P R = 0`
+(left preconditioning; `P` is invertible, so the converged potential is that of the run without it), and the SCF
+test still reads `R` itself.  Two spin channels have the charge part of their residual filtered.  Oblique cells go
+through the reciprocal metric.  Clusters, wires and slabs are refused, as are meta-GGAs, hybrids, spin-orbit
+coupling, non-collinear magnetism and FDET (untested there).  The FFT runs with NumPy on the host fields of the
+mixer (CuPy for device arrays).  Measured on bulk diamond (one A100): with PARSEC's SUBSPACE bound the energy at
+iteration k is the same for every mixer and the iteration count follows the eigensolver; with `Smart_Subspace` the
+plain Anderson mixer takes 8, 10 and 16 iterations for 64, 216 and 512 atoms, Kerker's form (q0 = 1 bohr^-1) 10, 14
+and 27 (it damps the long wavelengths of an insulator too much), the dielectric form (q0 = 1, eps = 5.7) 9, 9 and 11
+(512 atoms: 16.6 s instead of 19.2 s, but it stops 0.0014 mRy/atom above the converged energy, the plain mixer
+0.00001).  The preconditioner therefore stays opt-in.
 
 ### Energy refinement by a hybrid functional
 
@@ -1948,8 +2042,10 @@ Eigensolver and SCF controls (`Input/solver_options.py`, measured in the 1.5 rou
 - The default eigensolver stays CHEBDAV (1.5's is CHEBFF): CHEBFF is faster on the large clusters, whose inputs
   write it, and slower or less accurate at the same criterion on Si28H36 and on periodic cells.
 - Opt-in labels of 1.5: `Vector_Rng_Seed` (start vectors of the first solve; -1 a seed from the clock, named in a
-  warning), `Smart_Subspace`, `Chebyshev_Scaled`, `Bounds_Method`, `Bounds_Iter` (1.5's SUBSPACE lower bound, scaled
-  filter and Lanczos bounds, on the reference eigensolvers), `Filter_Restart_After` with its two companions
+  warning), `Smart_Subspace` (1.5's SUBSPACE lower bound, on the reference and the device filters since 8 November
+  2026, see [Bulk cells: the SUBSPACE lower bound](#bulk-cells-the-subspace-lower-bound)), `Chebyshev_Scaled`,
+  `Bounds_Method`, `Bounds_Iter` (1.5's scaled filter and Lanczos bounds, on the reference eigensolvers),
+  `Filter_Restart_After` with its two companions
   (relaxation and molecular dynamics). Under MPI every rank takes rank 0's clock seed, so that the seed printed
   repeats the run.
   Extensions: `FF_Residual_Test: stop` (1.5's residual-driven CHEBFF at `Diag_Tolerance`, which stops the run as 1.5

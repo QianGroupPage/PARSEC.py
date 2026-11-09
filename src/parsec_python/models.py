@@ -1142,6 +1142,12 @@ class EigensolverSettings:
 
 # PARSEC's Mixing_Method values (const.f90: ANDERSON, BROYDEN, MSECANT1-3).
 MIXING_METHODS = ("anderson", "broyden", "msecant1", "msecant2", "msecant3")
+#: ``Mixing_Preconditioner`` (PARSEC.py; PARSEC has none): ``none`` mixes the
+#: residual as it is, ``kerker`` filters it in G-space first
+#: (:mod:`parsec_python.Mixer.preconditioner`, 3-D periodic cells only).
+MIXING_PRECONDITIONERS = ("none", "kerker")
+#: ``Kerker_Wavevector`` q0 (bohr^-1) of ``Mixing_Preconditioner: kerker``.
+DEFAULT_KERKER_WAVEVECTOR = 1.0
 
 
 @dataclass(frozen=True)
@@ -1171,6 +1177,14 @@ class MixingSettings:
     the Broyden mixer) and, for the Broyden mixer, a positive ``restart``.
     ``regularization`` and the safeguard are options of the Anderson mixer
     of this port and are refused for the others.
+
+    ``preconditioner`` (``Mixing_Preconditioner``, PARSEC.py only) is
+    ``none`` or ``kerker``: the residual ``V_out - V_in`` of a 3-D periodic
+    cell filtered by ``P(G) = (G^2 + q0^2/eps)/(G^2 + q0^2)`` before the
+    mixer sees it, with ``q0 = kerker_wavevector`` (bohr^-1,
+    ``Kerker_Wavevector``) and ``eps = kerker_dielectric_constant``
+    (``Kerker_Dielectric_Constant``, infinite for Kerker's form
+    ``G^2/(G^2 + q0^2)``); see :mod:`parsec_python.Mixer.preconditioner`.
     """
 
     parameter: float = 0.30
@@ -1187,13 +1201,16 @@ class MixingSettings:
     restart_factor: float = 0.3
     expand_factor: float = 2.0
     preferred_type: int = 1
+    preconditioner: str = "none"
+    kerker_wavevector: float = DEFAULT_KERKER_WAVEVECTOR
+    kerker_dielectric_constant: float = float("inf")
 
     def __repr__(self) -> str:
         # The text of these settings is hashed by the cache keys of the
-        # accelerated driver and stored in test records.  The method and the
-        # multisecant fields at their defaults print nothing, so that the
-        # text of every Anderson calculation stays what it was before the
-        # fields existed.
+        # accelerated driver and stored in test records.  The method, the
+        # multisecant fields and the preconditioner fields at their defaults
+        # print nothing, so that the text of every Anderson calculation stays
+        # what it was before the fields existed.
         defaults = {
             "method": "anderson",
             "group_size": 1,
@@ -1201,6 +1218,9 @@ class MixingSettings:
             "restart_factor": 0.3,
             "expand_factor": 2.0,
             "preferred_type": 1,
+            "preconditioner": "none",
+            "kerker_wavevector": DEFAULT_KERKER_WAVEVECTOR,
+            "kerker_dielectric_constant": float("inf"),
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -1272,6 +1292,21 @@ class MixingSettings:
                 raise ValueError(f"mixing {name} must be finite")
         for name, value in integers.items():
             object.__setattr__(self, name, value)
+        preconditioner = str(self.preconditioner).strip().lower()
+        if preconditioner not in MIXING_PRECONDITIONERS:
+            raise ValueError(
+                f"unknown mixing preconditioner {self.preconditioner!r}; the "
+                "preconditioners are " + ", ".join(MIXING_PRECONDITIONERS)
+            )
+        object.__setattr__(self, "preconditioner", preconditioner)
+        wavevector = float(self.kerker_wavevector)
+        if not np.isfinite(wavevector) or wavevector <= 0.0:
+            raise ValueError("the Kerker wavevector must be positive and finite (bohr^-1)")
+        dielectric = float(self.kerker_dielectric_constant)
+        if np.isnan(dielectric) or dielectric < 1.0:
+            raise ValueError("the Kerker dielectric constant must be at least 1 (inf for Kerker's form)")
+        object.__setattr__(self, "kerker_wavevector", wavevector)
+        object.__setattr__(self, "kerker_dielectric_constant", dielectric)
 
 
 #: ``Exx_Max_Iter``: outer (Fock) iterations of a hybrid SCF.  100 is the cap of

@@ -48,9 +48,12 @@ def wire_slab_reference_only(translation) -> list[str]:
 
 
 def cell_options_reference_only(translation) -> list[str]:
-    """``Calc_Hartree_G``, ``g_space`` and ``Zero_Average_Vxc`` of a 3-D cell that stay routed.
+    """``Calc_Hartree_G`` and ``g_space`` of a 3-D cell that stay routed.
 
-    Only an MPI run (``--mpi``), which keeps the reference route it had before.
+    Only an MPI run (``--mpi``), which keeps the reference route it had before.  ``Zero_Average_Vxc`` (PARSEC 1.5's
+    potshift) is the default of a 3-D cell since 2026-11-08 and takes the route of the cell: every XC evaluation
+    of both routes shifts its potential (the readable ``evaluate_xc`` and
+    :class:`parsec_python.acceleration.V_xc.device_xc.ZeroAverageXC`).
     """
 
     problem = translation.problem
@@ -61,8 +64,6 @@ def cell_options_reference_only(translation) -> list[str]:
         names.append("the reciprocal-space Hartree potential (Calc_Hartree_G)")
     if getattr(problem.grid, "local_potential", "real_space") != "real_space":
         names.append("Fortran's G-space local potential (Periodic_Local_Potential: g_space)")
-    if getattr(problem.scf, "zero_average_xc_potential", False):
-        names.append("the zero-average exchange-correlation potential (Zero_Average_Vxc)")
     return [f"{name} in an MPI run (--mpi)" for name in names]
 
 
@@ -73,8 +74,12 @@ def moving_cell_options_reference_only(translation) -> list[str]:
     are those of a bulk cell at the Gamma point on the readable or device
     fields of the real-space local potential, validated without these
     options (and with LDA+U and TS); the reference solver keeps the wire and
-    slab forces and the forces of a cell with ``Calc_Hartree_G``, ``g_space``
-    or ``Zero_Average_Vxc``.
+    slab forces and the forces of a cell with ``Calc_Hartree_G`` or ``g_space``.
+    ``Zero_Average_Vxc`` (the default of a 3-D cell since 2026-11-08) moves on the
+    accelerated path: its forces read the shifted potentials of the result through
+    the reference formula (:func:`parsec_python.Forces.periodic.periodic_force_fields`),
+    and a constant in V_xc adds nothing to them but the grid's egg-box term of
+    the core density.
     """
 
     problem = translation.problem
@@ -91,8 +96,6 @@ def moving_cell_options_reference_only(translation) -> list[str]:
         names.append("Calc_Hartree_G")
     if getattr(problem.grid, "local_potential", "real_space") != "real_space":
         names.append("Periodic_Local_Potential: g_space")
-    if getattr(problem.scf, "zero_average_xc_potential", False):
-        names.append("Zero_Average_Vxc")
     # LDA+U (J = 0) and TS of a bulk cell at Gamma move on the accelerated
     # path: the LDA+U term from the orbitals on the device with the gradients
     # of the cell images (Hamiltonian/hubbard_device.py), the TS forces of the

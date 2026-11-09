@@ -56,20 +56,31 @@ are the performance counterpart; importing `parsec_python.acceleration` installs
 it with `set_parallel_backend`. `acceleration/tests/test_kpoint_parallel.py`
 checks it against the serial definition.
 
-A basis too large for one GPU is split over MPI ranks by blocks of grid rows:
-`acceleration/Parallel/mpi.py` (the communicator and its collectives), `acceleration/Hamiltonian/distributed_bloch.py`
-(row-sliced operators with halo exchange and projector sums) and `acceleration/SCF/kpoint_mpi.py` (the solver that the
-drivers get from `make_kpoint_solver` when `PARSEC_MPI=1`). The eigensolver in `chebff_spinor.py` is the same code
-with its reductions routed through the operator; the drivers stay replicated and unaware of MPI.
+Under MPI (`PARSEC_MPI=1`, `main.py --mpi`) the drivers stay replicated on every rank and unaware of MPI;
+`make_kpoint_solver` returns one of two solvers. The scalar and collinear-spin k-point drivers get
+`acceleration/SCF/kpoint_pools.py`: the ranks form pools (`--kpoint-pools`, else by balance and a memory
+estimate), the tasks are dealt to the pools, and a pool shares the basis of each task by columns
+(`acceleration/Eigensolvers/chebff_columns.py`: every rank holds all grid rows of its columns and a replica of the
+operator, filters without communication, and moves the basis to blocks of rows and back with `Alltoallv` for the
+Cholesky QR and the Rayleigh-Ritz step; the dense steps on the pool root); on an orthorhombic grid the local
+Bloch term and the recurrence step of the filter run in one kernel (`acceleration/Hamiltonian/bloch_stencil.py`,
+read from and checked against the stencil matrices). The jobs with per-task extras (spin-orbit, non-collinear,
+forces) get the basis split by blocks of grid rows: `acceleration/Parallel/mpi.py` (the communicator and its
+collectives), `acceleration/Hamiltonian/distributed_bloch.py` (row-sliced operators with halo exchange and
+projector sums) and `acceleration/SCF/kpoint_mpi.py`; the eigensolver in `chebff_spinor.py` is the same code with
+its reductions routed through the operator. Every rank solves the periodic Hartree potential and evaluates the
+unpolarized semilocal functionals on its own device (`acceleration/V_xc/periodic_xc.py`; fixed-order sums: the same
+fields on all ranks); only rank 0 writes files.
 
 Preparing a periodic cell follows the same rule. `V_ion` keeps the direct definitions: the Ewald local
 potential and the projector and atomic-density builders measure the distance of every grid point to every atom
 image. `acceleration/V_ion/periodic_setup.py` supplies a grid-ball query (integer index boxes, identical
 rows and distances) through `V_ion.ionic_potential.set_support_finder`, the local potential as one FFT
 through `V_ion.ewald.set_local_potential_provider`, the superposed atomic densities through
-`V_ion.ionic_potential.set_atomic_density_provider`, and a threaded map of the real-space terms of the Ewald
-ion-ion energy that keeps their order (`V_ion.ewald.set_translation_map`); importing `parsec_python.acceleration`
-installs all four.
+`V_ion.ionic_potential.set_atomic_density_provider` (on the GPU where one is usable, the host sum bit for bit);
+importing `parsec_python.acceleration` installs all three.  The Ewald ion-ion energy needs no counterpart since
+2026-11-08: `V_ion.ewald.ewald_ion_ion_terms` sums the atom pairs within its cutoff and the structure factors of a
+box of reciprocal vectors (0.5 s for 4,096 atoms).
 The radial sums reach the end of the radial tables (about 118 bohr), so they visit thousands of images of every
 atom in a small cell: the module sums them in blocks of images (broadcast distances per axis, worker threads,
 `PARSEC_PERIODIC_SETUP_THREADS`) in the order of the definitions.  By default (since 2026-10-30,

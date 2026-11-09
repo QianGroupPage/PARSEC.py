@@ -36,6 +36,13 @@ the k-point runs do not build), the Abelian subgroup itself (``abelian``: this
 port keeps every field on the full grid) and the multiplication table that
 ``atftmt`` prints at ``Output_Level >= 2``.
 
+The search of :func:`find_space_group` is :func:`fast_crystal_operations` (a
+neighbour tree; the operations and vectors of the port :func:`_crystal_operations`),
+once per structure.  :func:`find_grid_space_group` keeps the operations that
+also map a given grid onto itself (the irreducible k-points of the default
+routines), and :func:`periodic_grid_symmetry` builds the density table from the
+integer affine maps of the operations.
+
 Units: bohr.  This module does not print; :mod:`parsec_python.Output.kpoint_output`
 formats the report.
 """
@@ -43,7 +50,7 @@ formats the report.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -375,6 +382,39 @@ def _nint_array(values: np.ndarray) -> np.ndarray:
     return whole + (fraction >= 0.5) - (fraction <= -0.5)
 
 
+TRANSLATION_DENOMINATORS = 48
+"""Largest denominator ``q`` of the fractions ``p/q`` a translation is snapped to."""
+
+TRANSLATION_SNAP_TOLERANCE = 1.0e-8
+"""A translation within this of ``p/q`` is that fraction (``eps`` of ``atftmt``)."""
+
+TRANSLATION_ROUND_OFF = 1.0e-14
+"""Deviations up to this are round-off of an exact input: the value is kept bit for bit."""
+
+
+def snapped_translation(value: float) -> float:
+    """``value`` as the simplest fraction ``p/q`` (``q <= 48``) within ``1e-8``.
+
+    A crystal read from rounded coordinates has its fractional translations
+    off a simple fraction by the rounding (``0.25 - 3.7e-12`` with ten
+    decimals), which ``adjust_step`` cannot meet: its trial ``x = tau/nn``
+    and the fitted step ``L/n`` never agree within ``1e-15``.  The smallest
+    ``q`` with ``|value - p/q| <= 1e-8`` decides; where the deviation is
+    round-off (at most ``1e-14``, an exact input) ``value`` itself is
+    returned, so such inputs keep PARSEC's bits.  A value near no such
+    fraction is returned unchanged.
+    """
+
+    value = float(value)
+    for denominator in range(1, TRANSLATION_DENOMINATORS + 1):
+        numerator = math.floor(value * denominator + 0.5)
+        fraction = numerator / denominator
+        deviation = abs(value - fraction)
+        if deviation <= TRANSLATION_SNAP_TOLERANCE:
+            return value if deviation <= TRANSLATION_ROUND_OFF else fraction
+    return value
+
+
 def _labels(rotations) -> tuple[str, ...]:
     """``symm_ident``: E, C2, C3, C4, C6 and their products with the inversion."""
 
@@ -456,7 +496,10 @@ class SpaceGroup:
 
         ``inipbc.f90:381-391``: for every operation the components of
         ``|M t|`` larger than ``tolerance``, per lattice direction, in the
-        order of the operations.
+        order of the operations, each snapped to a simple fraction
+        (:func:`snapped_translation`): coordinates written with ten decimals
+        give ``0.2499999999963`` for diamond's quarter, for which no step
+        settles (``adjust_step`` alternates between ``x L`` and ``L/n``).
         """
 
         lists: list[list[float]] = [[] for _ in range(directions)]
@@ -467,7 +510,7 @@ class SpaceGroup:
                 if value < 0.0:
                     value = -value
                 if value > tolerance:
-                    lists[direction].append(float(value))
+                    lists[direction].append(snapped_translation(float(value)))
         return tuple(tuple(values) for values in lists)
 
 
@@ -495,15 +538,25 @@ def skipped_space_group() -> SpaceGroup:
     return replace(identity_space_group(ignored=False), crystal_system="")
 
 
-def find_space_group(lattice_vectors, atoms) -> SpaceGroup:
-    """Space group of the atoms in a three-dimensional periodic cell.
+@dataclass(frozen=True)
+class _CellSearch:
+    """What ``symgen`` searches with: ``alatt``, its inverse, the atoms (``(3, atoms)`` Cartesian, Fortran ``x``,
+    and their integer types) and the lattice operations among the candidate rotations (:func:`lattice_point_group`)."""
 
-    ``lattice_vectors`` are the rows ``a1, a2, a3`` in bohr and ``atoms`` the
-    :class:`~parsec_python.models.Atom` objects at their input coordinates.
-    Atom types are the species symbols in order of first appearance (PARSEC's
-    ``Atom_Type`` blocks), atoms of one type in input order (``coorat``).
-    Translation of ``symmetries.f90:120-170`` with ``nops = -1`` (fractional
-    translations included) followed by ``symgen.f90:111-221``.
+    alatt: list
+    inverse: list
+    positions: np.ndarray
+    types: list
+    rotations: list
+    lattice_indices: list
+    holohedral: int
+
+
+def _cell_search(lattice_vectors, atoms) -> _CellSearch:
+    """``symmetries.f90:120-170``: the atoms in lattice coordinates and back, the lattice operations.
+
+    Atom types are the species symbols in order of first appearance (PARSEC's ``Atom_Type`` blocks), atoms of one
+    type in input order (``coorat``).
     """
 
     alatt = lattice_columns(lattice_vectors)
@@ -533,7 +586,34 @@ def find_space_group(lattice_vectors, atoms) -> SpaceGroup:
     positions = np.array(columns, dtype=np.float64).T
     inverse = _mtrxin(alatt)
     rotations, lattice_indices, holohedral, _hexagonal_flag = lattice_point_group(alatt, inverse)
-    numbers, vectors = _crystal_operations(inverse, positions, types, rotations, lattice_indices)
+    return _CellSearch(alatt, inverse, positions, types, rotations, lattice_indices, holohedral)
+
+
+def _lattice_matrix(rotation, alatt, inverse) -> tuple[tuple[int, int, int], ...]:
+    """``rmtrx`` of a Cartesian rotation: ``r1 = transpose(R) a``, ``rlat = b r1``, ``nint(rlat)`` (``symgen``)."""
+
+    r1 = [
+        [
+            ((0.0 + rotation[0][j] * alatt[0][k]) + rotation[1][j] * alatt[1][k])
+            + rotation[2][j] * alatt[2][k]
+            for k in range(3)
+        ]
+        for j in range(3)
+    ]
+    rlat = [
+        [
+            ((0.0 + inverse[j][0] * r1[0][k]) + inverse[j][1] * r1[1][k])
+            + inverse[j][2] * r1[2][k]
+            for k in range(3)
+        ]
+        for j in range(3)
+    ]
+    return tuple(tuple(fortran_nint(value) for value in row) for row in rlat)
+
+
+def _assembled_space_group(search: _CellSearch, numbers, vectors) -> SpaceGroup:
+    """``symgen.f90:111-221``: the :class:`SpaceGroup` of the crystal operations ``numbers`` and their vectors."""
+
     if not numbers or numbers[0] != 1:
         raise ValueError(
             "the symmetry search did not find the identity (overlapping atoms?); "
@@ -543,28 +623,12 @@ def find_space_group(lattice_vectors, atoms) -> SpaceGroup:
     cartesian = []
     translations = []
     for number, vector in zip(numbers, vectors):
-        rotation = rotations[number - 1]
-        # r1 = transpose(R) a ; rlat = b r1 ; rmtrx = nint(rlat).
-        r1 = [
-            [
-                ((0.0 + rotation[0][j] * alatt[0][k]) + rotation[1][j] * alatt[1][k])
-                + rotation[2][j] * alatt[2][k]
-                for k in range(3)
-            ]
-            for j in range(3)
-        ]
-        rlat = [
-            [
-                ((0.0 + inverse[j][0] * r1[0][k]) + inverse[j][1] * r1[1][k])
-                + inverse[j][2] * r1[2][k]
-                for k in range(3)
-            ]
-            for j in range(3)
-        ]
-        matrices.append(tuple(tuple(fortran_nint(value) for value in row) for row in rlat))
+        rotation = search.rotations[number - 1]
+        matrices.append(_lattice_matrix(rotation, search.alatt, search.inverse))
         # symm%trans = transpose(trans), trans = R.
         cartesian.append(tuple(tuple(float(rotation[j][i]) for j in range(3)) for i in range(3)))
         translations.append(tuple(-value for value in vector))
+    holohedral = search.holohedral
     full = (holohedral == 7 and len(numbers) == 24) or (holohedral == 5 and len(numbers) == 48)
     last = vectors[-1]
     symmorphic = not (abs(last[0]) + abs(last[1]) + abs(last[2]) > SYMMETRY_TOLERANCE)
@@ -575,10 +639,283 @@ def find_space_group(lattice_vectors, atoms) -> SpaceGroup:
         labels=_labels(matrices),
         crystal_system=CRYSTAL_SYSTEMS[holohedral - 1],
         full_holohedry=full,
-        lattice_operations=tuple(lattice_indices),
+        lattice_operations=tuple(search.lattice_indices),
         candidate_numbers=tuple(numbers),
         symmorphic=symmorphic,
     )
+
+
+def space_group_with_search(lattice_vectors, atoms, search=None) -> SpaceGroup:
+    """:func:`find_space_group` with the search ``search`` (default :func:`fast_crystal_operations`), not cached.
+
+    ``search=_crystal_operations`` runs the statement-by-statement port of ``atftmt``, the reference the fast
+    search is tested against.
+    """
+
+    cell = _cell_search(lattice_vectors, atoms)
+    numbers, vectors = (search or fast_crystal_operations)(
+        cell.inverse, cell.positions, cell.types, cell.rotations, cell.lattice_indices
+    )
+    return _assembled_space_group(cell, numbers, vectors)
+
+
+_SPACE_GROUP_CACHE: dict = {}
+_SPACE_GROUP_CACHE_SIZE = 8
+
+
+def _structure_key(lattice_vectors, atoms) -> tuple:
+    """The lattice and the atoms (symbols, positions) bit for bit, a key of the caches of this module."""
+
+    lattice = np.ascontiguousarray(np.asarray(lattice_vectors, dtype=np.float64))
+    positions = np.ascontiguousarray(
+        np.array([np.asarray(atom.position, dtype=np.float64) for atom in atoms]).reshape(-1, 3)
+    )
+    return (lattice.tobytes(), tuple(atom.symbol for atom in atoms), positions.tobytes())
+
+
+def _cached(key, compute):
+    """``compute()`` once per ``key`` (the last :data:`_SPACE_GROUP_CACHE_SIZE` keys; a group is immutable)."""
+
+    if key in _SPACE_GROUP_CACHE:
+        return _SPACE_GROUP_CACHE[key]
+    value = compute()
+    if len(_SPACE_GROUP_CACHE) >= _SPACE_GROUP_CACHE_SIZE:
+        _SPACE_GROUP_CACHE.pop(next(iter(_SPACE_GROUP_CACHE)))
+    _SPACE_GROUP_CACHE[key] = value
+    return value
+
+
+def find_space_group(lattice_vectors, atoms) -> SpaceGroup:
+    """Space group of the atoms in a three-dimensional periodic cell.
+
+    ``lattice_vectors`` are the rows ``a1, a2, a3`` in bohr and ``atoms`` the
+    :class:`~parsec_python.models.Atom` objects at their input coordinates.
+    Atom types are the species symbols in order of first appearance (PARSEC's
+    ``Atom_Type`` blocks), atoms of one type in input order (``coorat``).
+    Translation of ``symmetries.f90:120-170`` with ``nops = -1`` (fractional
+    translations included) followed by ``symgen.f90:111-221``.
+
+    The crystal operations come from :func:`fast_crystal_operations`, the
+    search of ``atftmt`` with a neighbour tree (the same operations and
+    vectors as the port :func:`_crystal_operations`, in ``O(N log N)`` per
+    trial instead of ``(N, N)`` arrays: 1 s and a few MB for 4,096 atoms).
+    The group of a structure is computed once (the parser, the choice of the
+    routines and the report ask for it): the result is cached by the lattice
+    and the atoms, bit for bit.
+    """
+
+    return _cached(
+        ("space group",) + _structure_key(lattice_vectors, atoms),
+        lambda: space_group_with_search(lattice_vectors, atoms),
+    )
+
+
+# ----------------------------------------------------------------------------
+# The crystal operations, fast (atftmt with a neighbour tree)
+# ----------------------------------------------------------------------------
+
+# Atoms of the sample test of _maps_all_atoms.
+_SAMPLE_ATOMS = 64
+
+
+def fast_crystal_operations(inverse, positions, types, rotations, lattice_indices, *, admissible=None):
+    """``atftmt``'s search with a neighbour tree: same operations, same vectors.
+
+    Arguments and result as :func:`_crystal_operations`.  For an
+    operation ``R`` the Fortran loop takes the first atom pair ``(k1, k2)``
+    whose vector ``v = rlv(R x_k1 - x_k2)`` maps every atom onto an atom of
+    its type (within ``sum_i mod(|dv_i| + eps, 1) <= 10 eps``).  With
+    ``k1 = 1`` some ``k2`` succeeds whenever the operation is a symmetry
+    (``k2`` the image of the first atom), and a pair with ``k1 > 1`` maps the
+    first atom as well, so the operation and its vector are those of the
+    first successful ``k2`` of the first atom.  The test of a vector looks
+    up every image in a periodic k-d tree of the fractional coordinates
+    (L1 metric) and then applies Fortran's criterion to the hits.
+
+    ``admissible(number, vectors)`` (optional) returns a boolean mask of the
+    candidate vectors ``vectors`` ``(k2, 3)`` of candidate ``number`` that
+    may be taken (:func:`find_grid_space_group`: those that map a grid onto
+    itself); the first admissible vector that maps the atoms is kept.
+    """
+
+    from scipy.spatial import cKDTree
+
+    eps = SYMMETRY_TOLERANCE
+    x = np.asarray(positions, dtype=np.float64)
+    types = np.asarray(types)
+    ai = [[float(value) for value in row] for row in inverse]
+
+    def fractional(vectors):
+        return np.stack(
+            [((0.0 + ai[i][0] * vectors[0]) + ai[i][1] * vectors[1]) + ai[i][2] * vectors[2] for i in range(3)],
+            axis=-1,
+        )
+
+    fx = fractional(x)
+    folded = fx - np.floor(fx)
+    folded[folded >= 1.0] = 0.0
+    trees = {}
+    members = {}
+    for kind in np.unique(types):
+        index = np.flatnonzero(types == kind)
+        members[kind] = index
+        trees[kind] = cKDTree(folded[index], boxsize=1.0)
+    first_type = types[0]
+    candidates_k2 = np.flatnonzero(types == first_type)
+    # Look-up radius in L1: Fortran accepts sum |dv| <= 7 eps (plus wrap).
+    radius = 1.0e-6
+
+    found: list[int] = []
+    translations: list[list[float]] = []
+    for number in lattice_indices:
+        rotation = rotations[number - 1]
+        rx = np.empty_like(x)
+        for i in range(3):
+            rx[i] = ((0.0 + rotation[i][0] * x[0]) + rotation[i][1] * x[1]) + rotation[i][2] * x[2]
+        frx = fractional(rx)
+        match_vector = None
+        # rdiff(:, k2, 1) = rlv(ai, R x_1 - x_k2) of every candidate k2, with
+        # Fortran's operations in its order (elementwise, so the same bits).
+        xb = rx[:, :1] - x[:, candidates_k2]
+        y = [((0.0 + ai[i][0] * xb[0]) + ai[i][1] * xb[1]) + ai[i][2] * xb[2] for i in range(3)]
+        vectors = np.stack([value - 1.0 * _nint_array(value) for value in y], axis=-1)
+        # The first test of _maps_all_atoms (the image of the last atom) for
+        # all candidates in one tree query: a large cluster has thousands of
+        # candidates per operation that is not a symmetry, and one query per
+        # candidate dominated the search.  The survivors are tested in full,
+        # in Fortran's order, so the first match is the same.
+        last = x.shape[1] - 1
+        targets = frx[last][None, :] - vectors
+        targets = targets - np.floor(targets)
+        targets[targets >= 1.0] = 0.0
+        probe, _ = trees[types[last]].query(targets, k=1, p=1, distance_upper_bound=radius)
+        survivors = np.isfinite(probe)
+        if admissible is not None:
+            survivors &= np.asarray(admissible(number, vectors), dtype=bool)
+        for candidate in np.flatnonzero(survivors):
+            vr = vectors[candidate]
+            if _maps_all_atoms(vr, frx, fx, types, trees, members, radius, eps, rx, x, ai):
+                match_vector = [float(value) for value in vr]
+                break
+        if match_vector is None:
+            continue
+        found.append(number)
+        translations.append(match_vector)
+    return found, translations
+
+
+def _maps_all_atoms(vr, frx, fx, types, trees, members, radius, eps, rx, x, ai) -> bool:
+    """Whether every atom ``k3`` has a partner ``k4`` with ``rdiff(k3, k4) ~ vr``.
+
+    The nearest stored atom (periodic L1 distance of the fractional
+    coordinates) of every image is the only candidate that can pass
+    Fortran's criterion, which is then applied to it.  The last atom is
+    tested first: a wrong vector almost always fails there.
+    """
+
+    targets = frx - vr[None, :]
+    folded = targets - np.floor(targets)
+    folded[folded >= 1.0] = 0.0
+    last = folded.shape[0] - 1
+    probe_kind = types[last]
+    distance, _ = trees[probe_kind].query(folded[last], k=1, p=1, distance_upper_bound=radius)
+    if not np.isfinite(distance):
+        return False
+    count = folded.shape[0]
+    if count > _SAMPLE_ATOMS:
+        # A spread sample first: a lattice translation of a large crystallite
+        # maps the last atom and most inner atoms onto atoms, and the full
+        # test of each such candidate would cost a query of every atom.  The
+        # sample's test is part of the full one, so the answer is the same.
+        sample = np.unique(np.linspace(0, count - 1, _SAMPLE_ATOMS).astype(np.int64))
+        if not _atoms_map(sample, vr, folded, types, trees, members, radius, eps, rx, x, ai):
+            return False
+    return _atoms_map(np.arange(count), vr, folded, types, trees, members, radius, eps, rx, x, ai)
+
+
+def _atoms_map(selection, vr, folded, types, trees, members, radius, eps, rx, x, ai) -> bool:
+    """Whether the atoms ``selection`` have partners ``k4`` with ``rdiff(k3, k4) ~ vr``.
+
+    ``folded`` holds the folded fractional images of every atom.
+    """
+
+    for kind, tree in trees.items():
+        own = selection[types[selection] == kind]
+        if own.size == 0:
+            continue
+        distances, local = tree.query(folded[own], k=1, p=1, distance_upper_bound=radius)
+        if not np.all(np.isfinite(distances)):
+            return False
+        partners = members[kind][local]
+        # rdiff(:, k4, k3) and Fortran's comparison with vr, elementwise.
+        xb = rx[:, own] - x[:, partners]
+        y = [((0.0 + ai[i][0] * xb[0]) + ai[i][1] * xb[1]) + ai[i][2] * xb[2] for i in range(3)]
+        dif = np.zeros(own.size)
+        for i in range(3):
+            vt = y[i] - 1.0 * _nint_array(y[i])
+            da = np.abs(vr[i] - vt) + eps
+            dif = dif + np.fmod(da, 1.0)
+        if not np.all(dif <= 10.0 * eps):
+            return False
+    return True
+
+
+GRID_MAP_TOLERANCE = 1.0e-6
+"""An operation maps a grid point onto a point when its image is a whole number of steps within this."""
+
+
+def find_grid_space_group(lattice_vectors, atoms, counts, shift) -> SpaceGroup:
+    """The operations of the crystal that map the atoms AND a periodic grid onto themselves.
+
+    ``counts`` are the points along the three lattice vectors and ``shift`` the offset of the first point (grid
+    steps): point ``i`` has the fractional coordinates ``f = (i + s)/n``.  An operation ``T(f) = M (f - t)`` maps the
+    grid onto itself when ``M (f - t) n - s`` is a whole vector for every ``f``
+    (:func:`grid_commensurability_problem`).  A rotation of the crystal comes with several translations (``t`` plus
+    any lattice translation of the crystal smaller than the cell, as the centring vectors of a conventional cell or
+    the cells of a supercell), so the search of :func:`fast_crystal_operations` keeps for every lattice rotation the
+    first image of the first atom whose translation maps the grid onto itself and every atom onto an atom of its
+    type.  Every operation of the crystal that maps the grid onto itself maps the first atom onto some atom, so a
+    rotation is missed only when it has no such translation; and products of operations that map the grid onto
+    itself do so again: the rotations found form a group, which with time reversal reduces a k-point mesh and
+    symmetrizes the density on that grid (the default routines, which keep the grid of ``Grid_Spacing``; the
+    Fortran-derived routines change the grid instead, ``adjust_step``).
+
+    Example: diamond in the conventional cube with 18 points per edge, an atom at the origin and the points half a
+    step off it (Andrew Grieder's grid).  The 24 operations with the translation ``a/4 (1, 1, 1)`` (4.5 steps) map the
+    grid onto the unshifted one; the 24 of ``Td`` about the atom do not move the grid.  ``Td`` with time reversal
+    reduces a Monkhorst-Pack mesh as ``Oh`` does.  The result is cached as :func:`find_space_group`'s.
+    """
+
+    counts = tuple(int(value) for value in np.asarray(counts).reshape(-1))
+    shift = tuple(float(value) for value in np.asarray(shift, dtype=np.float64).reshape(-1))
+    if len(counts) != 3 or len(shift) != 3 or min(counts) < 1:
+        raise ValueError("a grid of three lattice directions: three counts and three shifts")
+    return _cached(
+        ("grid space group", counts, shift) + _structure_key(lattice_vectors, atoms),
+        lambda: _grid_space_group(lattice_vectors, atoms, counts, shift),
+    )
+
+
+def _grid_space_group(lattice_vectors, atoms, counts, shift) -> SpaceGroup:
+    cell = _cell_search(lattice_vectors, atoms)
+    n = np.asarray(counts, dtype=np.float64)
+    s = np.asarray(shift, dtype=np.float64)
+    corners = np.array([[a, b, c] for a in (0, 1) for b in (0, 1) for c in (0, 1)], dtype=np.float64)
+    fractional_corners = (corners + s) / n
+
+    def admissible(number, vectors):
+        matrix = np.asarray(
+            _lattice_matrix(cell.rotations[number - 1], cell.alatt, cell.inverse), dtype=np.float64
+        )
+        # The operation is x -> R x - A vr, so t = -vr: M (f - t) = M (f + vr).
+        mapped = (fractional_corners[None, :, :] + vectors[:, None, :]) @ matrix.T
+        target = mapped * n - s
+        return np.max(np.abs(target - np.rint(target)), axis=(1, 2)) <= GRID_MAP_TOLERANCE
+
+    numbers, vectors = fast_crystal_operations(
+        cell.inverse, cell.positions, cell.types, cell.rotations, cell.lattice_indices, admissible=admissible
+    )
+    return _assembled_space_group(cell, numbers, vectors)
 
 
 ATOM_IMAGE_TOLERANCE = 1.0e-6
@@ -653,6 +990,15 @@ class PeriodicGridSymmetry(GridPointGroup):
     printed deviation is relative to the sum over the whole cell.
     """
 
+    affine_maps: tuple | None = field(default=None, kw_only=True, compare=False, repr=False)
+    """``((M, c), ...)`` of every operation where all are integer affine maps of the grid indices: the point
+    ``i`` goes to ``(M i + c) mod n`` (row-major order of the points), as ``images`` holds them.  A device
+    version can apply them without the table (:mod:`parsec_python.acceleration.SCF.periodic_symmetry`).
+    ``None`` where the table was built otherwise."""
+
+    counts: tuple | None = field(default=None, kw_only=True, compare=False, repr=False)
+    """The points per lattice direction of the grid of ``affine_maps``."""
+
     @property
     def reduced_order(self) -> int:
         return 1
@@ -725,25 +1071,111 @@ def periodic_grid_symmetry(grid, group: SpaceGroup) -> PeriodicGridSymmetry:
             "the grid spacing commensurate with the fractional translations, which "
             "this cell's grid is not"
         )
-    fractional = (points.astype(np.float64) + shift) / counts
     # One row of point indices per operation (int32: half the memory of the
     # table, operations x points, for any grid below 2**31 points).
     index_type = np.int32 if points.shape[0] < 2**31 - 1 else np.int64
     images = np.empty((group.order, points.shape[0]), dtype=index_type)
+    maps = [
+        grid_affine_map(matrix, translation, counts, shift)
+        for matrix, translation in zip(group.rotation_matrices, group.translation_vectors)
+    ]
+    row_major = all(entry is not None for entry in maps) and _row_major_points(grid, points, counts)
+    fractional = None
     for index, (matrix, translation) in enumerate(
         zip(group.rotation_matrices, group.translation_vectors)
     ):
+        if row_major:
+            # nint(M (f - t) n - s) = M i + c exactly (the operation maps the grid onto itself), and with
+            # det M = +-1 and M mixing only directions of equal n the map is a permutation of the points
+            images[index] = affine_grid_images(*maps[index], counts, index_type)
+            continue
+        if fractional is None:
+            fractional = (points.astype(np.float64) + shift) / counts
         mapped = (fractional - translation) @ matrix.T.astype(np.float64)
         target = _nint_array(mapped * counts - shift).astype(np.int64)
         rows = grid.rows_for_integer_coordinates(target % counts)
-        if np.unique(rows).size != rows.size:
+        if np.bincount(rows, minlength=rows.size).max(initial=0) > 1:
             raise ValueError(
                 f"Symmetrize_Charge_Density: operation {index + 1} does not permute "
                 "the grid points"
             )
         images[index] = rows
     return PeriodicGridSymmetry(
-        matrices=group.rotation_matrices.astype(np.float64), images=images
+        matrices=group.rotation_matrices.astype(np.float64),
+        images=images,
+        affine_maps=tuple(maps) if row_major else None,
+        counts=tuple(int(value) for value in counts) if row_major else None,
+    )
+
+
+def grid_affine_map(matrix, translation, counts, shift, *, tolerance: float = GRID_MAP_TOLERANCE):
+    """``(M, c)`` with ``nint(M ((i + s)/n - t) n - s) = M i + c`` for every grid index ``i``, or ``None``.
+
+    ``M`` (integer, lattice coordinates) may mix only lattice directions of equal ``n`` (then the factors
+    ``n_d/n_e`` are one), and ``c = M s - s - n (M t)`` must be whole within ``tolerance`` (the operation maps the
+    grid onto itself).  With ``det M = +-1`` the map ``i -> (M i + c) mod n`` is then a permutation of the points;
+    ``None`` where any of this fails (the caller falls back to rounding the images point by point).
+    """
+
+    matrix = np.asarray(matrix, dtype=np.int64).reshape(3, 3)
+    counts = np.asarray(counts, dtype=np.int64).reshape(3)
+    shift = np.asarray(shift, dtype=np.float64).reshape(3)
+    translation = np.asarray(translation, dtype=np.float64).reshape(3)
+    for row in range(3):
+        for column in range(3):
+            if matrix[row, column] != 0 and counts[row] != counts[column]:
+                return None
+    if abs(round(float(np.linalg.det(matrix.astype(np.float64))))) != 1:
+        return None
+    real = matrix.astype(np.float64)
+    constant = real @ shift - shift - counts.astype(np.float64) * (real @ translation)
+    whole = np.rint(constant)
+    if np.max(np.abs(constant - whole)) > tolerance:
+        return None
+    return matrix, whole.astype(np.int64)
+
+
+def affine_grid_images(matrix, constant, counts, index_type=np.int64, *, xp=np):
+    """Row of the image ``(M i + c) mod n`` of every point ``i`` of a row-major grid of ``counts`` points.
+
+    Built from one-dimensional index vectors broadcast along the axes: a signed permutation of the axes costs one
+    sum of three broadcast vectors per point, without the coordinates of the points.  ``xp`` is the array module
+    (NumPy, or CuPy for the indices on a device).
+    """
+
+    n = [int(value) for value in counts]
+    strides = (n[1] * n[2], n[2], 1)
+    axes = [
+        xp.arange(n[axis], dtype=xp.int64).reshape([n[axis] if other == axis else 1 for other in range(3)])
+        for axis in range(3)
+    ]
+    flat = xp.zeros((1, 1, 1), dtype=xp.int64)
+    for row in range(3):
+        component = xp.full((1, 1, 1), int(constant[row]), dtype=xp.int64)
+        for column in range(3):
+            if matrix[row][column]:
+                component = component + int(matrix[row][column]) * axes[column]
+        flat = flat + (component % n[row]) * strides[row]
+    return xp.broadcast_to(flat, tuple(n)).reshape(-1).astype(index_type)
+
+
+def _row_major_points(grid, points, counts) -> bool:
+    """Whether the points of ``grid`` are its integer points in row-major order with the identity lookup."""
+
+    size = int(np.prod(counts))
+    if points.shape != (size, 3):
+        return False
+    lookup = np.asarray(getattr(grid, "lookup", None))
+    if lookup.shape != tuple(int(value) for value in counts):
+        return False
+    order = np.arange(size, dtype=np.int64)
+    if not np.array_equal(lookup.reshape(-1), order):
+        return False
+    n1, n2 = int(counts[1]), int(counts[2])
+    return bool(
+        np.array_equal(points[:, 0], order // (n1 * n2))
+        and np.array_equal(points[:, 1], (order // n2) % n1)
+        and np.array_equal(points[:, 2], order % n2)
     )
 
 
@@ -875,13 +1307,20 @@ def confined_grid_symmetry(grid, group: SpaceGroup) -> PeriodicGridSymmetry:
 __all__ = [
     "ATOM_IMAGE_TOLERANCE",
     "CRYSTAL_SYSTEMS",
+    "GRID_MAP_TOLERANCE",
     "PeriodicGridSymmetry",
     "SpaceGroup",
+    "affine_grid_images",
     "candidate_rotations",
     "confined_grid_symmetry",
     "confined_symmetry_lattice",
+    "fast_crystal_operations",
+    "find_grid_space_group",
     "find_space_group",
     "find_wire_slab_space_group",
+    "grid_affine_map",
+    "snapped_translation",
+    "space_group_with_search",
     "skipped_space_group",
     "grid_preserving_operations",
     "fortran_anint",

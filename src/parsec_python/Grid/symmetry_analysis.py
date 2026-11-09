@@ -20,8 +20,9 @@ the report uses them):
   PARSEC runs for an input (``info``, ``norot``; :func:`symmetry_search_mode`).
 
 :func:`report_space_group` finds the group of a cluster (the cube of edge
-``4 rmax``, ``symmetries.f90`` l.114-126) or of a cell for the report, with
-:func:`fast_crystal_operations`, an exact equivalent of ``atftmt``'s search
+``4 rmax``, ``symmetries.f90`` l.114-126) or of a cell for the report: that of
+:func:`parsec_python.Grid.space_group.find_space_group`, whose search
+:func:`fast_crystal_operations` is an exact equivalent of ``atftmt``'s
 (:func:`parsec_python.Grid.space_group._crystal_operations`) that scales to
 large systems: the same operations and the same translation vectors, bit for
 bit.
@@ -39,16 +40,12 @@ from dataclasses import dataclass
 import numpy as np
 
 from .space_group import (
-    CRYSTAL_SYSTEMS,
     SYMMETRY_TOLERANCE,
     SpaceGroup,
-    _labels,
-    _matvec_transposed,
-    _mtrxin,
-    _nint_array,
+    fast_crystal_operations,
+    find_space_group,
     fortran_nint,
     lattice_columns,
-    lattice_point_group,
 )
 
 #: ``tol`` of ``abelian``: a translation longer than this excludes an operation.
@@ -146,222 +143,16 @@ def abelian_rotation_flag(lattice_vectors, info: int) -> int:
 # ----------------------------------------------------------------------------
 
 
-def fast_crystal_operations(inverse, positions, types, rotations, lattice_indices):
-    """``atftmt``'s search with a neighbour tree: same operations, same vectors.
-
-    Arguments and result as
-    :func:`parsec_python.Grid.space_group._crystal_operations`.  For an
-    operation ``R`` the Fortran loop takes the first atom pair ``(k1, k2)``
-    whose vector ``v = rlv(R x_k1 - x_k2)`` maps every atom onto an atom of
-    its type (within ``sum_i mod(|dv_i| + eps, 1) <= 10 eps``).  With
-    ``k1 = 1`` some ``k2`` succeeds whenever the operation is a symmetry
-    (``k2`` the image of the first atom), and a pair with ``k1 > 1`` maps the
-    first atom as well, so the operation and its vector are those of the
-    first successful ``k2`` of the first atom.  The test of a vector looks
-    up every image in a periodic k-d tree of the fractional coordinates
-    (L1 metric) and then applies Fortran's criterion to the hits.
-    """
-
-    from scipy.spatial import cKDTree
-
-    eps = SYMMETRY_TOLERANCE
-    x = np.asarray(positions, dtype=np.float64)
-    types = np.asarray(types)
-    atoms = x.shape[1]
-    ai = [[float(value) for value in row] for row in inverse]
-
-    def fractional(vectors):
-        return np.stack(
-            [((0.0 + ai[i][0] * vectors[0]) + ai[i][1] * vectors[1]) + ai[i][2] * vectors[2] for i in range(3)],
-            axis=-1,
-        )
-
-    fx = fractional(x)
-    folded = fx - np.floor(fx)
-    folded[folded >= 1.0] = 0.0
-    trees = {}
-    members = {}
-    for kind in np.unique(types):
-        index = np.flatnonzero(types == kind)
-        members[kind] = index
-        trees[kind] = cKDTree(folded[index], boxsize=1.0)
-    first_type = types[0]
-    candidates_k2 = np.flatnonzero(types == first_type)
-    # Look-up radius in L1: Fortran accepts sum |dv| <= 7 eps (plus wrap).
-    radius = 1.0e-6
-
-    found: list[int] = []
-    translations: list[list[float]] = []
-    for number in lattice_indices:
-        rotation = rotations[number - 1]
-        rx = np.empty_like(x)
-        for i in range(3):
-            rx[i] = ((0.0 + rotation[i][0] * x[0]) + rotation[i][1] * x[1]) + rotation[i][2] * x[2]
-        frx = fractional(rx)
-        match_vector = None
-        # rdiff(:, k2, 1) = rlv(ai, R x_1 - x_k2) of every candidate k2, with
-        # Fortran's operations in its order (elementwise, so the same bits).
-        xb = rx[:, :1] - x[:, candidates_k2]
-        y = [((0.0 + ai[i][0] * xb[0]) + ai[i][1] * xb[1]) + ai[i][2] * xb[2] for i in range(3)]
-        vectors = np.stack([value - 1.0 * _nint_array(value) for value in y], axis=-1)
-        # The first test of _maps_all_atoms (the image of the last atom) for
-        # all candidates in one tree query: a large cluster has thousands of
-        # candidates per operation that is not a symmetry, and one query per
-        # candidate dominated the search.  The survivors are tested in full,
-        # in Fortran's order, so the first match is the same.
-        last = x.shape[1] - 1
-        targets = frx[last][None, :] - vectors
-        targets = targets - np.floor(targets)
-        targets[targets >= 1.0] = 0.0
-        probe, _ = trees[types[last]].query(targets, k=1, p=1, distance_upper_bound=radius)
-        for candidate in np.flatnonzero(np.isfinite(probe)):
-            vr = vectors[candidate]
-            if _maps_all_atoms(vr, frx, fx, types, trees, members, radius, eps, rx, x, ai):
-                match_vector = [float(value) for value in vr]
-                break
-        if match_vector is None:
-            continue
-        found.append(number)
-        translations.append(match_vector)
-    return found, translations
-
-
-def _maps_all_atoms(vr, frx, fx, types, trees, members, radius, eps, rx, x, ai) -> bool:
-    """Whether every atom ``k3`` has a partner ``k4`` with ``rdiff(k3, k4) ~ vr``.
-
-    The nearest stored atom (periodic L1 distance of the fractional
-    coordinates) of every image is the only candidate that can pass
-    Fortran's criterion, which is then applied to it.  The last atom is
-    tested first: a wrong vector almost always fails there.
-    """
-
-    targets = frx - vr[None, :]
-    folded = targets - np.floor(targets)
-    folded[folded >= 1.0] = 0.0
-    last = folded.shape[0] - 1
-    probe_kind = types[last]
-    distance, _ = trees[probe_kind].query(folded[last], k=1, p=1, distance_upper_bound=radius)
-    if not np.isfinite(distance):
-        return False
-    count = folded.shape[0]
-    if count > _SAMPLE_ATOMS:
-        # A spread sample first: a lattice translation of a large crystallite
-        # maps the last atom and most inner atoms onto atoms, and the full
-        # test of each such candidate would cost a query of every atom.  The
-        # sample's test is part of the full one, so the answer is the same.
-        sample = np.unique(np.linspace(0, count - 1, _SAMPLE_ATOMS).astype(np.int64))
-        if not _atoms_map(sample, vr, folded, types, trees, members, radius, eps, rx, x, ai):
-            return False
-    return _atoms_map(np.arange(count), vr, folded, types, trees, members, radius, eps, rx, x, ai)
-
-
-# Atoms of the sample test of _maps_all_atoms.
-_SAMPLE_ATOMS = 64
-
-
-def _atoms_map(selection, vr, folded, types, trees, members, radius, eps, rx, x, ai) -> bool:
-    """Whether the atoms ``selection`` have partners ``k4`` with ``rdiff(k3, k4) ~ vr``.
-
-    ``folded`` holds the folded fractional images of every atom.
-    """
-
-    for kind, tree in trees.items():
-        own = selection[types[selection] == kind]
-        if own.size == 0:
-            continue
-        distances, local = tree.query(folded[own], k=1, p=1, distance_upper_bound=radius)
-        if not np.all(np.isfinite(distances)):
-            return False
-        partners = members[kind][local]
-        # rdiff(:, k4, k3) and Fortran's comparison with vr, elementwise.
-        xb = rx[:, own] - x[:, partners]
-        y = [((0.0 + ai[i][0] * xb[0]) + ai[i][1] * xb[1]) + ai[i][2] * xb[2] for i in range(3)]
-        dif = np.zeros(own.size)
-        for i in range(3):
-            vt = y[i] - 1.0 * _nint_array(y[i])
-            da = np.abs(vr[i] - vt) + eps
-            dif = dif + np.fmod(da, 1.0)
-        if not np.all(dif <= 10.0 * eps):
-            return False
-    return True
-
-
 def report_space_group(lattice_vectors, atoms) -> SpaceGroup:
     """The group ``symgen`` finds for ``atoms`` in the cell ``lattice_vectors``.
 
-    As :func:`parsec_python.Grid.space_group.find_space_group`, with
-    :func:`fast_crystal_operations` for the search; for a cluster pass the
-    cube of edge ``4 rmax`` (``symmetries.f90`` l.123-126).
+    :func:`parsec_python.Grid.space_group.find_space_group` (whose search is
+    :func:`fast_crystal_operations`, and which computes the group of a
+    structure once); for a cluster pass the cube of edge ``4 rmax``
+    (``symmetries.f90`` l.123-126).
     """
 
-    alatt = lattice_columns(lattice_vectors)
-    invlat = _mtrxin([[alatt[j][i] for j in range(3)] for i in range(3)])
-    order: list[str] = []
-    grouped: dict[str, list] = {}
-    for atom in atoms:
-        if atom.symbol not in grouped:
-            order.append(atom.symbol)
-            grouped[atom.symbol] = []
-        grouped[atom.symbol].append(atom)
-    columns = []
-    types = []
-    for type_index, symbol in enumerate(order):
-        for atom in grouped[symbol]:
-            position = [float(value) for value in np.asarray(atom.position, dtype=float)]
-            fractional = _matvec_transposed(invlat, position)
-            cartesian = [
-                ((0.0 + alatt[k][0] * fractional[0]) + alatt[k][1] * fractional[1])
-                + alatt[k][2] * fractional[2]
-                for k in range(3)
-            ]
-            columns.append(cartesian)
-            types.append(type_index)
-    positions = np.array(columns, dtype=np.float64).T
-    inverse = _mtrxin(alatt)
-    rotations, lattice_indices, holohedral, _ = lattice_point_group(alatt, inverse)
-    numbers, vectors = fast_crystal_operations(
-        inverse, positions, types, rotations, lattice_indices
-    )
-    if not numbers or numbers[0] != 1:
-        raise ValueError("the symmetry search did not find the identity (overlapping atoms?)")
-    matrices = []
-    cartesian = []
-    translations = []
-    for number, vector in zip(numbers, vectors):
-        rotation = rotations[number - 1]
-        r1 = [
-            [
-                ((0.0 + rotation[0][j] * alatt[0][k]) + rotation[1][j] * alatt[1][k])
-                + rotation[2][j] * alatt[2][k]
-                for k in range(3)
-            ]
-            for j in range(3)
-        ]
-        rlat = [
-            [
-                ((0.0 + inverse[j][0] * r1[0][k]) + inverse[j][1] * r1[1][k])
-                + inverse[j][2] * r1[2][k]
-                for k in range(3)
-            ]
-            for j in range(3)
-        ]
-        matrices.append(tuple(tuple(fortran_nint(value) for value in row) for row in rlat))
-        cartesian.append(tuple(tuple(float(rotation[j][i]) for j in range(3)) for i in range(3)))
-        translations.append(tuple(-value for value in vector))
-    full = (holohedral == 7 and len(numbers) == 24) or (holohedral == 5 and len(numbers) == 48)
-    last = vectors[-1]
-    symmorphic = not (abs(last[0]) + abs(last[1]) + abs(last[2]) > SYMMETRY_TOLERANCE)
-    return SpaceGroup(
-        rotations=tuple(matrices),
-        translations=tuple(translations),
-        cartesian_rotations=tuple(cartesian),
-        labels=_labels(matrices),
-        crystal_system=CRYSTAL_SYSTEMS[holohedral - 1],
-        full_holohedry=full,
-        lattice_operations=tuple(lattice_indices),
-        candidate_numbers=tuple(numbers),
-        symmorphic=symmorphic,
-    )
+    return find_space_group(lattice_vectors, atoms)
 
 
 # ----------------------------------------------------------------------------

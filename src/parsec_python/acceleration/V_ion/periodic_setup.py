@@ -43,7 +43,6 @@ from parsec_python.V_ion import ewald as _ewald
 from parsec_python.V_ion import ionic_potential as _ionic
 
 _NYQUIST_FRACTION = 0.85  # the reciprocal series ends at this fraction of the grid's Nyquist frequency
-_POINTS_PER_CALL = 1_000_000  # grid points evaluated together (the radial spline is built once per call)
 _STRUCTURE_FACTOR_ELEMENTS = 4_000_000  # complex numbers of one structure-factor block
 
 
@@ -286,51 +285,33 @@ def fft_local_ionic_potential(
 
     total = _structure_factor_series(grid, positions, charges, fast_eta, tolerance, lattice_vectors)
 
-    # Short-ranged part: V_a + 2 Z erf(eta r)/r over the ball of every image, one radial call per batch
-    pending_rows: list[np.ndarray] = []
-    pending_distances: list[np.ndarray] = []
-    pending_points = 0
-    batch_symbol = None
+    # Short-ranged part: V_a + 2 Z erf(eta r)/r over the ball of every image (threads, the batches of the ball loop)
+    from . import periodic_setup_fortran as _fortran
 
-    def flush() -> None:
-        nonlocal pending_rows, pending_distances, pending_points
-        if not pending_rows:
-            return
-        rows = np.concatenate(pending_rows)
-        distances = np.concatenate(pending_distances)
-        potential = potentials[batch_symbol]
-        specification = specifications[batch_symbol]
-        values = potential.local_potential(
-            distances,
-            specification.local_angular_momentum,
-            use_spline=_ewald.local_potential_uses_spline(specification),
-            spline_padding_width=grid.settings.stencil_half_width,
-        ) + _ewald._erf_over_r(potential.ionic_charge, distances, fast_eta)
-        total_view[:] += np.bincount(rows, weights=values, minlength=total_view.size)
-        pending_rows, pending_distances, pending_points = [], [], 0
-
-    total_view = total
-    for atom, position in zip(atoms, positions):
-        if atom.symbol != batch_symbol:
-            flush()
-            batch_symbol = atom.symbol
+    reaches = {}
+    for symbol in dict.fromkeys(atom.symbol for atom in atoms):
         # beyond its Coulomb onset (2 to 7 bohr; the table runs to 118) V_a is -2 Z/r to 1e-14 Ry, but inside it V_a
         # differs from the Coulomb tail, so the ball reaches the larger of the onset and the Gaussian tail
-        reach = max(
+        reaches[symbol] = max(
             erfc_cutoff,
-            _ionic.coulomb_onset_radius(potentials[atom.symbol], specifications[atom.symbol].local_angular_momentum),
+            _ionic.coulomb_onset_radius(potentials[symbol], specifications[symbol].local_angular_momentum),
         )
-        if _ewald.local_potential_uses_spline(specifications[atom.symbol]):
+        if _ewald.local_potential_uses_spline(specifications[symbol]):
             _ionic.warn_spline_without_coulomb_tail(
-                potentials[atom.symbol], specifications[atom.symbol].local_angular_momentum, reach
+                potentials[symbol], specifications[symbol].local_angular_momentum, reaches[symbol]
             )
-        for rows, distances in _atom_balls(grid, position, reach):
-            pending_rows.append(rows)
-            pending_distances.append(distances)
-            pending_points += rows.size
-            if pending_points >= _POINTS_PER_CALL:
-                flush()
-    flush()
+    _fortran._short_range_by_balls(
+        total,
+        grid,
+        atoms,
+        positions,
+        potentials,
+        specifications,
+        fast_eta,
+        reaches.__getitem__,
+        balls=_atom_balls,
+        use_spline_of=_ewald.local_potential_uses_spline,
+    )
 
     # The reference carries the G = 0 term of its own eta: -(2 pi/V) Z_total/eta^2 per unit of charge
     total += -(2.0 * np.pi * float(np.sum(charges)) / volume) * (
@@ -371,7 +352,6 @@ def install() -> None:
     _fortran_force_sums.set_local_force_provider(spline_periodic_local_forces)
     # the image sums of the atomic densities (None, the readable sum, for the other grids)
     _ionic.set_atomic_density_provider(_fortran._density_provider)
-    _ewald.set_translation_map(_fortran._translation_map)
 
 
 def uninstall() -> None:
@@ -383,7 +363,6 @@ def uninstall() -> None:
     _force_sums.set_local_force_provider(None)
     _fortran_force_sums.set_local_force_provider(None)
     _ionic.set_atomic_density_provider(None)
-    _ewald.set_translation_map(None)
 
 
 __all__ = ["fast_splitting", "fft_local_ionic_potential", "grid_ball", "install", "uninstall"]

@@ -618,7 +618,7 @@ class SymmetryPrintoutTests(unittest.TestCase):
         self.assertIn("  Found Abelian subgroup C_2v  with            4  symmetry operations", level1)
 
     def test_fast_search_equals_the_port_of_atftmt(self) -> None:
-        from parsec_python.Grid.space_group import find_space_group
+        from parsec_python.Grid.space_group import _crystal_operations, space_group_with_search
         from parsec_python.Grid.symmetry_analysis import report_space_group
 
         a = 0.6293 / 0.529177
@@ -638,7 +638,11 @@ class SymmetryPrintoutTests(unittest.TestCase):
             (hcp, magnesium),
             (np.diag([12.0, 6.0, 6.0]), doubled),
         ):
-            self.assertEqual(report_space_group(lattice, atoms), find_space_group(lattice, atoms))
+            # find_space_group (which the report takes) searches with the neighbour tree; the dense port of
+            # atftmt is the reference
+            self.assertEqual(
+                report_space_group(lattice, atoms), space_group_with_search(lattice, atoms, _crystal_operations)
+            )
 
     def test_symchk_and_abelian(self) -> None:
         from parsec_python.Grid.symmetry_analysis import (

@@ -380,8 +380,13 @@ py::dict RadialGridEvaluator::projector_channel(
                     radial, radial_projector.data(), radial_count, distance
                 );
             }
+            // A point on the atom up to round-off takes the zero-limit direction of the center: the cosines are
+            // x / max(|d|, min(r_0, 1e-6 bohr)), the rule of the Python projectors and of the forces
+            // (V_ion.ionic_potential.PROJECTOR_CENTER_ROUND_OFF, Forces.periodic.ROUND_OFF_DISTANCE).
+            const double center_radius = std::min(radial[0], kProjectorCenterRoundOff);
             const auto harmonics = real_harmonics(
-                angular_momentum, x, y, z, distance
+                angular_momentum, x, y, z,
+                distance > 0.0 ? std::max(distance, center_radius) : 0.0
             );
             for (int harmonic = 0; harmonic < harmonic_count; ++harmonic) {
                 output[local * static_cast<std::size_t>(harmonic_count) + harmonic] =

@@ -266,6 +266,152 @@ def _field_kernel(cp):
     return _COMPILED[device]
 
 
+# The superposed densities of periodic_setup_fortran.periodic_atomic_density bit for bit.  The host adds the image
+# blocks in the order atom, x image, y image, z image, every term into the points of its box (0.0 outside the
+# ball); here every point adds its own terms in that order.  Each term takes the host's operations: the axis offset
+# x - (position + m side), its square, (x^2 + y^2) + z^2, the correctly rounded square root, and np.interp's
+# value slope_j (r - x_j) + y_j with slope_j = (y_{j+1} - y_j)/(x_{j+1} - x_j) (y_j at r = x_j, the left value below
+# the first sample), all rounded to nearest without fused multiply-adds.  A square above reach^2 (1 + 1e-12) is
+# outside the ball whatever its rounding, so its term (0.0 on the host) is skipped.
+_BULK_DENSITY_KERNEL = r"""
+__device__ __forceinline__ double numpy_interp(
+    const double r, const double* xp, const double* fp, const double* slopes, const int n, const double left)
+{
+    if (r < xp[0]) return left;
+    if (r >= xp[n - 1]) return fp[n - 1];
+    int low = 0, high = n - 1;  // xp[low] <= r < xp[high]
+    while (high - low > 1) {
+        const int middle = (low + high) >> 1;
+        if (xp[middle] <= r) low = middle; else high = middle;
+    }
+    if (xp[low] == r) return fp[low];
+    return __dadd_rn(__dmul_rn(slopes[low], __dsub_rn(r, xp[low])), fp[low]);
+}
+
+extern "C" __global__
+void bulk_atomic_density(
+    const long long nx, const long long ny, const long long nz,
+    const double* xs, const double* ys, const double* zs,
+    const int atom_count, const double* positions, const int* kinds, const double* sides,
+    const double* radii, const double* tables, const double* slopes, const int* offsets, const int* counts,
+    const double* reaches, const double* bounds, const int* images,
+    double* density)
+{
+    const long long point = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (point >= nx * ny * nz) return;
+    const double px = xs[point / (ny * nz)];
+    const double py = ys[(point / nz) % ny];
+    const double pz = zs[point % nz];
+    double total = 0.0;
+    for (int atom = 0; atom < atom_count; ++atom) {
+        const int kind = kinds[atom];
+        const double reach = reaches[kind];
+        const double bound = bounds[kind];
+        const double* xp = radii + offsets[kind];
+        const double* fp = tables + offsets[kind];
+        const double* slope = slopes + offsets[kind];
+        const int samples = counts[kind];
+        const int* m = images + 3 * kind;
+        for (int ix = -m[0]; ix <= m[0]; ++ix) {
+            const double dx = __dsub_rn(px, __dadd_rn(positions[3 * atom + 0], __dmul_rn((double)ix, sides[0])));
+            const double sx = __dmul_rn(dx, dx);
+            if (sx > bound) continue;
+            for (int iy = -m[1]; iy <= m[1]; ++iy) {
+                const double dy = __dsub_rn(py, __dadd_rn(positions[3 * atom + 1], __dmul_rn((double)iy, sides[1])));
+                const double planar = __dadd_rn(sx, __dmul_rn(dy, dy));
+                if (planar > bound) continue;
+                for (int iz = -m[2]; iz <= m[2]; ++iz) {
+                    const double dz = __dsub_rn(pz, __dadd_rn(positions[3 * atom + 2], __dmul_rn((double)iz, sides[2])));
+                    const double square = __dadd_rn(planar, __dmul_rn(dz, dz));
+                    if (square > bound) continue;
+                    const double r = __dsqrt_rn(square);
+                    if (!(r < reach)) continue;
+                    total = __dadd_rn(total, numpy_interp(r, xp, fp, slope, samples, fp[0]));
+                }
+            }
+        }
+    }
+    density[point] = total;
+}
+"""
+
+_COMPILED_BULK: dict[int, object] = {}
+
+
+def _bulk_density_kernel(cp):
+    device = int(cp.cuda.Device().id)
+    if device not in _COMPILED_BULK:
+        kernel = cp.RawKernel(_BULK_DENSITY_KERNEL, "bulk_atomic_density", options=("--std=c++11",))
+        kernel.compile()
+        _COMPILED_BULK[device] = kernel
+    return _COMPILED_BULK[device]
+
+
+def device_bulk_atomic_density(axes, sides, atoms, potentials, tables) -> np.ndarray | None:
+    """The density of :func:`.periodic_setup_fortran.periodic_atomic_density` on the device, bit for bit, or ``None``.
+
+    ``axes``: the coordinates of the grid points along each axis (``(i n_1 + j) n_2 + k`` at ``(x_i, y_j, z_k)``);
+    ``sides``: the diagonal of the lattice; ``atoms``: those that contribute; ``tables[symbol] = (table, radius)``,
+    the radial table on the grid of ``potentials[symbol].radii`` and the radius of its sum (terms at ``r <
+    radius``).  The images of an atom along an axis are those of the host, ``|m| <= ceil(radius/side) + 1``.
+    ``None`` without a usable device (``PARSEC_DEVICE=cpu``, no CuPy): the host sums then run.
+    """
+
+    cp = _cupy()
+    if cp is None or not atoms:
+        return None
+    symbols = list(dict.fromkeys(atom.symbol for atom in atoms))
+    sides = np.asarray(sides, dtype=np.float64)
+    radii, values, slopes, offsets, counts = [], [], [], [], []
+    reaches, bounds, images = [], [], []
+    cursor = 0
+    for symbol in symbols:
+        samples = np.asarray(potentials[symbol].radii, dtype=np.float64)
+        table, radius = tables[symbol]
+        table = np.asarray(table, dtype=np.float64)
+        radii.append(samples)
+        values.append(table)
+        # np.interp's slopes (precomputed there for these sizes; the same expression inline otherwise)
+        slopes.append(np.append((table[1:] - table[:-1]) / (samples[1:] - samples[:-1]), 0.0))
+        offsets.append(cursor)
+        counts.append(samples.size)
+        cursor += samples.size
+        radius = float(radius)
+        reaches.append(radius)
+        bounds.append(radius * radius * (1.0 + 1.0e-12))
+        images.extend(int(np.ceil(radius / float(side))) + 1 for side in sides)
+    positions = np.array([np.asarray(atom.position, dtype=np.float64) for atom in atoms]).reshape(-1)
+    kinds = np.array([symbols.index(atom.symbol) for atom in atoms], dtype=np.int32)
+    n = [int(len(axis)) for axis in axes]
+    points = n[0] * n[1] * n[2]
+    with cp.cuda.Device(device_id(cp)):
+        field = cp.zeros(points, dtype=cp.float64)
+        _bulk_density_kernel(cp)(
+            ((points + _THREADS - 1) // _THREADS,),
+            (_THREADS,),
+            (
+                np.int64(n[0]), np.int64(n[1]), np.int64(n[2]),
+                cp.asarray(np.asarray(axes[0], dtype=np.float64)),
+                cp.asarray(np.asarray(axes[1], dtype=np.float64)),
+                cp.asarray(np.asarray(axes[2], dtype=np.float64)),
+                np.int32(len(atoms)),
+                cp.asarray(positions),
+                cp.asarray(kinds),
+                cp.asarray(sides),
+                cp.asarray(np.concatenate(radii)),
+                cp.asarray(np.concatenate(values)),
+                cp.asarray(np.concatenate(slopes)),
+                cp.asarray(np.asarray(offsets, dtype=np.int32)),
+                cp.asarray(np.asarray(counts, dtype=np.int32)),
+                cp.asarray(np.asarray(reaches, dtype=np.float64)),
+                cp.asarray(np.asarray(bounds, dtype=np.float64)),
+                cp.asarray(np.asarray(images, dtype=np.int32)),
+                field,
+            ),
+        )
+        return np.asarray(cp.asnumpy(field), dtype=np.float64)
+
+
 def _cupy():
     """CuPy where a device works and the run may use one (``PARSEC_DEVICE`` not ``cpu``), else ``None``."""
 
@@ -690,6 +836,7 @@ def device_preparation_active() -> bool:
 
 
 __all__ = [
+    "device_bulk_atomic_density",
     "COULOMB_TAIL_TOLERANCE",
     "DENSITY_TAIL_FRACTION",
     "SplitParameters",

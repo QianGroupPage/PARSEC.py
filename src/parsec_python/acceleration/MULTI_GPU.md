@@ -292,6 +292,138 @@ the second rank owning none), the trajectory of one node to the last bit;
 an oxygen atom PBE0 whose start sends it to the full grid, `main.py`'s
 result to the last bit.
 
+### Periodic cells at the Gamma point on several nodes
+
+The same runner and launch script run the SCF of a bulk periodic cell
+(`Boundary_Conditions: bulk`) at the Gamma point: real orbitals, an
+orthorhombic cell, no spin, a native LDA or GGA (`ca`, `pbe` and the other
+functionals of `V_xc/device_xc.py`). The accelerated path detects no space
+group, so the cell is one sector of the identity (every grid point an orbit,
+`AxisReflectionReduction.identity`), the sector of a molecular dynamics run:
+on several nodes one rank per GPU shares its orbitals
+(`Eigensolvers/mpi_shared_basis.py`), on one node one rank shares them among
+the GPUs of its node (`Eigensolvers/distributed_state.py`) or one rank per
+GPU does. Inside the allocation of `N` nodes with four GPUs each:
+
+```bash
+scripts/run_multi_gpu_scf.sh --nodes N --rank-per-gpu bulk/parsec.in NEW_DIRECTORY
+```
+
+which starts `4 N` ranks of `benchmarks/mpi_full_scf.py`, each seeing its GPU
+(`--devices 0`). Every rank filters its columns of the orbitals with the
+stencil and the projectors of the whole cell (wrap-around rows of the
+periodic Laplacian, projectors with their lattice images); the Ritz step
+moves them to row blocks and back (three `Alltoallv` per step, GPU-aware MPI)
+and the root solves the small eigenproblem on its GPU. The root alone holds
+the SCF loop: the periodic Hartree solve (`Hartree/periodic_device.py`, the
+finite-difference CG or `Calc_Hartree_G` on its GPU), the XC functional on
+its GPU, the local ionic potential, densities and Ewald terms of the
+reference preparation, and the mixer. The other ranks build the grid, the
+Laplacian and the projectors only (`driver._prepare_periodic_orbital_operators`,
+the same arrays element for element). The ranks compare the lattice vectors,
+the settings of the grid and the prepared grid (point counts, step, shift)
+before the SCF. `timing.json` has `result.domain` and `result.hartree_boundary`
+null for a cell and a note that says so.
+
+What does not run there is refused by name before any rank prepares
+(`driver.periodic_sector_refusal`, `_refuse_unsupported_periodic` of the
+runner): k-points beyond Gamma (`parsec_python/main.py --mpi`, whose ranks
+take the k-points), spin, spin-orbit and non-collinear runs, hybrids,
+meta-GGAs, libxc functionals, oblique cells, wires and slabs, LDA+U, the TS
+correction, forces, relaxation and molecular dynamics of a cell, the band
+structure and `nscf` runs (all `parsec_python/main.py`), Fortran's general
+grid (`Use_Fortran_Routines` with sides of different steps) and
+`--symmetry on`. A single process takes the same route with
+`PARSEC_CUPY_SINGLE_SECTOR=on` (the GPUs of the process share the sector);
+without it a cell keeps the full grid of one GPU, as before.
+
+Measured on A100 nodes (2026-11-08, bulk diamond `examples/3d_diamond_benchmark`,
+18 points per cubic edge, PBE, the eigensolver and mixing of the nanodiamond
+series, launch settings of the script; `run_mpi_case.py` makes the input on
+every rank and runs the runner, `summarize_timing.py` reads `timing.json`):
+
+- The ranks give the energies of one rank on one GPU, the same route: 2 x 2 x 2
+  cells (64 atoms) -729.4306335707903 Ry on one GPU, within 2.8e-12 Ry on 4 ranks of
+  one node and 2.9e-12 on 16 ranks of four nodes; 3 x 3 x 3 (216 atoms) within
+  3e-12 on 16 ranks and 9e-12 on one rank with four GPUs; the same 23 and 55 SCF
+  steps everywhere.
+- Against the full grid of one GPU (`main.py`): the first SCF step is the same,
+  the later ones differ by a few 1e-4 Ry at these eigensolver settings, which
+  leave the SCF of a bulk cell limited by the eigensolver (its energy still
+  falls by mRy per step where the SRE criterion stops it). Converged further
+  (`Convergence_Criterion: 1e-6 Ry`) the two agree within 7e-8 Ry at 64 atoms;
+  at 216 atoms (Chebyshev degree 40, a buffer of 44 states) within 6e-6 Ry at the
+  last step of the full grid, the gap shrinking as the energy converges.
+- With PARSEC's former lower bound of the later filters (`Smart_Subspace` off,
+  the measurements of this paragraph and the next two up to the memory rule of
+  three shares) the overlap of the filtered basis of a bulk cell exceeded the
+  condition limit of the generalized Ritz step (1e8) by the second SCF step: the
+  filter interval left the occupied states, tens of Ry below it, amplified by
+  factors that differ by orders of magnitude. The sector then took the shifted
+  Cholesky QR of `MPIShardGroup.orthonormal_ritz` from then on (one GPU does the
+  same on its own fallback), whose factorizations run on the root's GPU: a later
+  SCF step of 1,728 atoms (3,468 states) on 16 GPUs took 10.0 s with the former
+  host factorizations and 2.4 s with these. With the smart bound, the default of
+  bulk cells, no step of 1,728, 2,744 and 4,096 atoms fell back.
+- Later SCF steps on 16 GPUs: 0.5 s (512 atoms), 2.9 s (1,728 atoms, 1.26 M
+  points), 7.7 s (2,744 atoms, 2.0 M points, 5,494 states) and 21 s (4,096
+  atoms, 2.99 M points, 8,204 states; of a pass of the Ritz step 2.5 s to the
+  rows and 1.1 s back, 2.9 s of Gram products, 2.7 s for the small problem on
+  the root, 1.3 s of rotation, besides 1.5 s of filter and the Cholesky QR
+  passes; 0.6 s Hartree). The first eigensolve of 4,096 atoms took 35 s. The
+  preparation is that of the root's reference system on the host: 13.5 s, 50 s,
+  106 s and 304 s (at 4,096 atoms the Ewald ion-ion energy 202 s, the local
+  ionic potential 42 s, the projectors 30 s, the starting density 18 s); the
+  other ranks build their operators in a ninth of that and wait.
+- Memory per GPU: the arrays of a rank hold at most about three times its
+  share of the orbitals (`8 N m / ranks` bytes) and 2 GiB of exchange buffers
+  (the filtered columns, `H` times them and the rows of the Ritz step), the
+  root a few `m x m` matrices more (`PARSEC_DEVICE_LIVE_PEAK=1` of the runner
+  records it): 8.4 GiB (root 8.9) at 1,728 atoms, 37.5 GiB (root 42.5) at 4,096
+  atoms, of which CuPy's pool held up to 11.2 and 51.3 GiB (nvidia-smi). By that
+  rule bulk diamond fits 16 A100 of 80 GB up to 8 x 8 x 8 cubic cells; 9 x 9 x 9
+  (5,832 atoms, 11,670 states) would take about 76 GiB per rank and 86 on the
+  root, which needs a Ritz step that holds two shares (the rows of `H X` formed
+  and projected a round of columns at a time) or more ranks. Host memory: 6.7
+  GiB on the root and 4.7 on the other ranks at 4,096 atoms.
+- That Ritz step is the default of a cell (`PARSEC_MPI_SHARED_RITZ`, `auto`:
+  `rounds` for a cell, whose runner names it, `rows` for clusters, which keep
+  their bits; `MPIShardGroup._ritz_in_rounds`). It keeps the row block of the
+  filtered basis and the columns, forms `H X` a round of exchange columns at a
+  time, projects each round as it arrives and sends the rotated rows back in
+  the same rounds; the overlap and the projection are the lower triangles of
+  blocks of round order (fewer Gram products than the full overlap of the two
+  row blocks). The condition number of the small problem, a symmetric spectrum
+  that took as long as its eigensolve (cuSOLVER on an A100: 0.95 and 1.03 s at
+  8,204 states, 2.31 and 2.58 s at 11,670), is estimated on rank 1 while the
+  root factors and solves (`PARSEC_CUPY_RITZ_CONDITION_HELPER=off` keeps it on
+  the root): the same coefficients bit for bit, also for clusters (C459H204 on
+  4 ranks, 49 SCF steps, every energy the same bits). With the smart bound,
+  4,096 atoms on 16 A100 (Max_Iter 6): a later SCF step 11.0 s with the two row
+  blocks, 9.9 s in rounds, 8.9 s in rounds with the condition number on rank 1
+  (per pass 1.0 s filter, 1.7 s to the rows, 1.5 s Gram products, 1.4 s small
+  problem, 1.45 s rotation, 0.9 s back); arrays at most 27.1 GiB per rank and
+  30.6 on the root, where the two row blocks held 36.6 and 42.0 (nvidia-smi
+  29.8 and 36.2 GB, against 41.7 and 51.3). The first SCF steps agree with the
+  two row blocks within 8e-7 Ry (6e-8 at the first, an SCF of -46,710 Ry far
+  from converged); converged SCFs of 216 and 512 atoms on 4 ranks end within
+  2e-12 and 2e-11 Ry of them in the same steps, C459H204 within 1.2e-10 Ry.
+- 9 x 9 x 9 cubic cells (5,832 atoms, 4.25 M points, 11,670 states) fit 16 A100
+  in rounds: arrays at most 51.6 GiB per rank (54.7 on rank 1, which estimates
+  the condition number, 61.2 on the root), nvidia-smi 57 to 61 GB (root 71.5);
+  preparation 60 s, first eigensolve 68 s, later SCF steps 20.6 s (per pass
+  3.1 s filter, 3.5 s to the rows, 4.3 s Gram products, 3.8 s small problem,
+  3.9 s rotation, 1.7 s back; 1.0 s Hartree). The rule that decides whether the
+  sector states keep CuPy's pool (`PARSEC_CUPY_LARGE_PROBLEM_ALLOCATOR` and
+  `PARSEC_CUPY_SECTOR_STATE_STORAGE`, `auto`) counts a shared basis in rounds as
+  two shares, three exchange buffers and the summed `m x m` pair (55.0 GB a rank
+  here); counted as four shares it chose the direct allocator, under which the
+  first Ritz step ran out of memory on most ranks. An error that stops some
+  ranks inside a step of the shared basis, while the others wait in an
+  exchange, now ends the job with `FULL_SCF_FAILED` and its traceback
+  (`mpi_shared_basis.set_failure_handler`, installed by the runner); before, the
+  job waited until its time limit.
+
 ## Correctness and memory
 
 Filtering is FP64 unless `PARSEC_CUPY_MIXED_FILTER` asks for the FP32 later

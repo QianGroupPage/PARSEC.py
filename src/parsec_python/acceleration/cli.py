@@ -280,6 +280,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--kpoint-pools",
+        default=None,
+        metavar="P|auto",
+        help=(
+            "with --mpi: pools of ranks the k-points and spin channels are dealt to, each basis shared "
+            "by the ranks of its pool (default PARSEC_KPOINT_POOLS, else auto: the best balanced count "
+            "whose memory fits the GPUs)"
+        ),
+    )
+    parser.add_argument(
         "--bands-from",
         type=Path,
         default=None,
@@ -294,9 +304,10 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "run as one of several MPI ranks (start them with mpirun or srun, one per GPU): "
-            "the basis of the k-point and non-collinear eigenproblems is split by blocks of grid "
-            "rows over all the GPUs, so a basis larger than one GPU fits. Every rank runs the same "
-            "calculation; only rank 0 writes the log and the archive. Same as PARSEC_MPI=1"
+            "the k-points and spin channels are dealt to pools of ranks, the basis of each shared "
+            "by the GPUs of its pool (--kpoint-pools); spin-orbit and non-collinear bases are split "
+            "by blocks of grid rows over all the GPUs. Every rank runs the same calculation; only "
+            "rank 0 writes the log, the archive and the data files. Same as PARSEC_MPI=1"
         ),
     )
     parser.add_argument(
@@ -499,14 +510,16 @@ def _reference_only_solver_options(problem) -> list[str]:
     features = []
     if getattr(eigensolver, "first_filter_residual_test", "off") != "off":
         features.append("PARSEC 1.5's residual-driven CHEBFF (FF_Residual_Test)")
+    # Smart_Subspace (the lower-bound rule of SUBSPACE) and Bounds_Method: lanczos
+    # with Bounds_Iter (PARSEC 1.5's upper bound) run on the device filters too
+    # (Eigensolvers.subspace.subspace_filter_bounds and
+    # Eigensolvers.spectral_bounds.lanczos_bound_from_ritz, since 2026-11-08).
     if (
-        getattr(eigensolver, "subspace_lower_bound", "monotone") != "monotone"
-        or getattr(eigensolver, "scaled_subspace_filter", False)
-        or getattr(eigensolver, "lanczos_bounds", "parsec") != "parsec"
+        getattr(eigensolver, "scaled_subspace_filter", False)
+        or getattr(eigensolver, "lanczos_bounds", "parsec") == "lanczos_full"
     ):
         features.append(
-            "PARSEC 1.5's SUBSPACE rules (Smart_Subspace, Chebyshev_Scaled, "
-            "Bounds_Method, Bounds_Iter)"
+            "PARSEC 1.5's SUBSPACE rules (Chebyshev_Scaled, Bounds_Method: lanczos_full)"
         )
     if getattr(eigensolver, "reorthogonalization_threshold", 0.1) != 0.1:
         features.append(
@@ -966,6 +979,7 @@ def _reference_argv(arguments: argparse.Namespace) -> list[str]:
         ("--log", arguments.log),
         ("--bands-from", arguments.bands_from),
         ("--kpoint-workers", arguments.kpoint_workers),
+        ("--kpoint-pools", getattr(arguments, "kpoint_pools", None)),
         ("--restart-from", arguments.restart_from),
         ("--energy-refinement", arguments.energy_refinement),
     ):
@@ -980,6 +994,8 @@ def _reference_argv(arguments: argparse.Namespace) -> list[str]:
         ("--quiet", arguments.quiet),
         ("--debug", arguments.debug),
         ("--esdf-lenient", getattr(arguments, "esdf_lenient", False)),
+        # the ranks other than 0 of an MPI run (_join_mpi)
+        ("--no-data-files", getattr(arguments, "no_data_files", False)),
     ):
         if enabled:
             argv.append(flag)
@@ -1004,15 +1020,17 @@ def _join_mpi(arguments: argparse.Namespace) -> int | None:
         return 2
     if arguments.dry_run:
         return None
+    arguments.mpi_rank = context.rank
     if not context.is_root:
         arguments.quiet = True
         arguments.log = Path(os.devnull)
         arguments.no_archive = True
         arguments.output = None
+        arguments.no_data_files = True  # parsec.dat, eigen.dat, cube files, qpoints.dat: rank 0 writes them
     elif context.size > 1:
         print(
-            f"MPI: {context.size} ranks, {context.ranks_per_node} per node; the eigenproblem basis "
-            "is split by blocks of grid rows over the ranks",
+            f"MPI: {context.size} ranks, {context.ranks_per_node} per node; the k-points are solved by "
+            "pools of ranks (spin-orbit and non-collinear bases split by blocks of grid rows)",
             flush=True,
         )
     return None
@@ -1248,17 +1266,18 @@ def _run(
                 file=sys.stderr,
             )
             return 2
-        print(
-            f"NOTE: {features} is not implemented on the accelerated path; "
-            "running the reference parsec_python.cli solver instead"
-            + (
-                " (its k-point eigensolvers, the exchange of a periodic hybrid and the force sums of a periodic cell "
-                "use the GPUs when CuPy and a device are available; the output names the device)"
-                if reference_uses_gpu and resources.device != "cpu"
-                else ""
-            ),
-            file=sys.stderr,
-        )
+        if getattr(arguments, "mpi_rank", 0) == 0:  # the other ranks of an MPI run are quiet
+            print(
+                f"NOTE: {features} is not implemented on the accelerated path; "
+                "running the reference parsec_python.cli solver instead"
+                + (
+                    " (its k-point eigensolvers, the exchange of a periodic hybrid and the force sums of a periodic "
+                    "cell use the GPUs when CuPy and a device are available; the output names the device)"
+                    if reference_uses_gpu and resources.device != "cpu"
+                    else ""
+                ),
+                file=sys.stderr,
+            )
         return reference_main(_reference_argv(arguments))
     if translation.problem.periodic_cell is not None:
         from .Parallel import mpi

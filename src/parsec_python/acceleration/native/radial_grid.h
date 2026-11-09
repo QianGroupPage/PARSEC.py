@@ -7,6 +7,11 @@
 
 namespace parsec_accelerated_native {
 
+// Bohr: a projector point closer than this (and than the first radial knot) to its atom is the center, whose
+// harmonics take their zero-limit direction (V_ion.ionic_potential.PROJECTOR_CENTER_ROUND_OFF; build_info
+// reports it, so that a module built before the rule can be told apart).
+inline constexpr double kProjectorCenterRoundOff = 1.0e-6;
+
 class RadialGridEvaluator {
 public:
     explicit RadialGridEvaluator(const FloatArray& coordinates);

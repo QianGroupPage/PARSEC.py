@@ -6,7 +6,11 @@ from typing import Any
 
 import numpy as np
 
-from parsec_python.Eigensolvers.spectral_bounds import LanczosBoundResult
+from parsec_python.Eigensolvers.spectral_bounds import (
+    LanczosBoundResult,
+    lanczos_bound_from_ritz,
+    lanczos_bound_steps,
+)
 
 from ..backends.cupy import require_cupy
 
@@ -28,7 +32,7 @@ def filter_bound_policy() -> str:
 _DEFAULT_POLICY = "gershgorin"
 
 
-def with_orbital_term(operator: Any, upper_bound: float, *, steps: int = 8, rng=None) -> float:
+def with_orbital_term(operator: Any, upper_bound: float, *, steps: int = 8, rng=None, rule: str = "parsec") -> float:
     """The filter's upper bound of an operator that may hold a meta-GGA term.
 
     The term ``sum_a B_a^T diag(vtau) B_a`` (and the first-order term of the
@@ -68,7 +72,7 @@ def with_orbital_term(operator: Any, upper_bound: float, *, steps: int = 8, rng=
         cp, _ = require_cupy()
         generator = np.random.default_rng(20261108) if rng is None else rng
         signs = cp.asarray(generator.standard_normal(int(start.shape[0])))
-        targeted = _lanczos_bound(operator, cp.asarray(start, dtype=cp.float64) * signs, steps)
+        targeted = _lanczos_bound(operator, cp.asarray(start, dtype=cp.float64) * signs, steps, rule=rule)
         return max(float(upper_bound), float(targeted.upper_bound))
     bare = getattr(operator, "bare_upper_bound", None)
     if bare is None:
@@ -95,13 +99,19 @@ def lanczos_upper_bound(
     steps: int = 5,
     *,
     rng: np.random.Generator | None = None,
+    rule: str = "parsec",
 ) -> LanczosBoundResult:
-    """PARSEC's short Lanczos bound (:func:`_lanczos_bound`), with a meta-GGA's orbital term taken in (:func:`with_orbital_term`)."""
+    """PARSEC's short Lanczos bound (:func:`_lanczos_bound`), with a meta-GGA's orbital term taken in (:func:`with_orbital_term`).
+
+    ``rule`` is the bound of :func:`parsec_python.Eigensolvers.spectral_bounds.lanczos_bound_from_ritz`:
+    ``parsec`` (the default: the radius ``max(theta_max, |theta_min|)``, 4 to 8 steps) or ``lanczos``
+    (PARSEC 1.5's ``Bounds_Method: lanczos``: ``theta_max``, ``steps`` as given).
+    """
 
     from dataclasses import replace
 
-    bound = _lanczos_bound(operator, initial_vector, steps, rng=rng)
-    upper = with_orbital_term(operator, bound.upper_bound, steps=steps, rng=rng)
+    bound = _lanczos_bound(operator, initial_vector, steps, rng=rng, rule=rule)
+    upper = with_orbital_term(operator, bound.upper_bound, steps=steps, rng=rng, rule=rule)
     return bound if upper == bound.upper_bound else replace(bound, upper_bound=float(upper))
 
 
@@ -118,8 +128,9 @@ def _lanczos_bound(
     steps: int = 5,
     *,
     rng: np.random.Generator | None = None,
+    rule: str = "parsec",
 ) -> LanczosBoundResult:
-    """Run the non-reorthogonalized 4--8 step PARSEC recurrence on CuPy.
+    """Run the non-reorthogonalized 4--8 step PARSEC recurrence on CuPy (``rule`` ``lanczos``: ``steps`` steps).
 
     The ``N``-component current/previous/residual vectors stay on the device.
     Recurrence scalars stay as zero-dimensional device arrays while CUDA
@@ -143,7 +154,7 @@ def _lanczos_bound(
     requested_steps = int(steps)
     if requested_steps != steps:
         raise ValueError("steps must be an integer")
-    target_steps = min(max(requested_steps, 4), 8, size)
+    target_steps = lanczos_bound_steps(rule, requested_steps, size)
 
     if initial_vector is None:
         generator = np.random.default_rng() if rng is None else rng
@@ -250,22 +261,10 @@ def _lanczos_bound(
             projected[indices, indices + 1] = off_diagonal
 
     ritz_values = np.linalg.eigvalsh(projected[:actual_steps, :actual_steps])
-    lower_bound = float(ritz_values[0])
-    spectral_radius = max(float(ritz_values[-1]), abs(lower_bound))
-    middle = 0.5 * (spectral_radius + lower_bound)
-    residual_scale = raw_beta_value
-    if residual_scale < 1.0e-2:
-        residual_scale *= 10.0
-    elif residual_scale < 1.0e-1:
-        residual_scale *= 5.0
-    upper_bound = spectral_radius + residual_scale
-    return LanczosBoundResult(
-        upper_bound=float(upper_bound),
-        lower_bound=lower_bound,
-        middle=float(middle),
-        ritz_values=ritz_values,
-        raw_beta=raw_beta_value,
-        residual_scale=float(residual_scale),
+    return lanczos_bound_from_ritz(
+        rule,
+        ritz_values,
+        raw_beta_value,
         steps=actual_steps,
         requested_steps=requested_steps,
         breakdown=breakdown,

@@ -760,7 +760,11 @@ class CuPySymmetrySCFEigensolver:
                         # The ranks share this sector's basis, one device each.
                         from .mpi_shared_basis import attach_shared_group
 
-                        attach_shared_group(operator, mpi_context.comm)
+                        attach_shared_group(
+                            operator,
+                            mpi_context.comm,
+                            ritz_route=getattr(mpi_context, "shared_ritz_route", "rows"),
+                        )
                 if neighbors_are_shared and device_id not in shared_device_neighbors:
                     selected_stencil = operator.compact_finite_difference
                     shared_device_neighbors[device_id] = getattr(
@@ -1635,13 +1639,29 @@ class CuPySymmetrySCFEigensolver:
             owner = self._sector_device_ids[representation]
             group = getattr(self._operators[representation], "_mpi_shared_group", None)
             if group is not None:
-                # A basis that the ranks share (mpi_shared_basis): this rank's
-                # columns, H times them and the two row blocks of a Ritz step,
-                # and the two buffers of an exchange round.
-                from .mpi_shared_basis import exchange_bytes
+                from .mpi_shared_basis import exchange_bytes, shared_ritz_route
 
                 share = -(-int(count) // group.size)
-                states[owner] += 4 * rows * share * np.dtype(np.float64).itemsize + 2 * exchange_bytes()
+                if shared_ritz_route(group.ritz_route) == "rounds":
+                    # The Ritz step in rounds (a periodic cell): this rank's
+                    # columns and the row block of the basis, the three
+                    # buffers of a round (H X, send, receive) and the summed
+                    # m x m pair.  Counted as four shares, the 5,832 atoms of
+                    # 9 x 9 x 9 diamond cells on 16 A100 (101 GB a rank) were
+                    # sent to the direct allocator, under which the first
+                    # Ritz step ran out of memory on most of the ranks; with
+                    # the pool they held at most 51.6 GiB of arrays (root
+                    # 61.2), where this counts 55.0 GB.
+                    states[owner] += (
+                        2 * rows * share * np.dtype(np.float64).itemsize
+                        + 3 * exchange_bytes()
+                        + 2 * int(count) ** 2 * np.dtype(np.float64).itemsize
+                    )
+                else:
+                    # The two row blocks: this rank's columns, H times them
+                    # and the two row blocks of a Ritz step, and the two
+                    # buffers of an exchange round.
+                    states[owner] += 4 * rows * share * np.dtype(np.float64).itemsize + 2 * exchange_bytes()
                 continue
             with cp.cuda.Device(owner):
                 shared = shared_basis_devices(

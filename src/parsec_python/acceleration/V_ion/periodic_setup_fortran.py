@@ -35,10 +35,8 @@ is imported, give the same numbers:
     the image sum of :func:`~parsec_python.V_ion.ionic_potential.superpose_atomic_density`
     (installed with :func:`~parsec_python.V_ion.ionic_potential.set_atomic_density_provider`).
 
-``_translation_map``
-    the real-space terms of :func:`~parsec_python.V_ion.ewald.ewald_ion_ion_energy` (one array of
-    atom pairs per lattice translation) on worker threads, handed back in the order of the
-    translations, in which the energy adds them (:func:`~parsec_python.V_ion.ewald.set_translation_map`).
+(The real-space terms of the Ewald ion-ion energy ran on threads here up to 2026-11-08; the energy is now a sum
+over the atom pairs within its cutoff, :func:`parsec_python.V_ion.ewald.ewald_ion_ion_terms`.)
 
 Image blocks.  Both radial sums reach the end of the radial table (``rs(ns-1)``, near 118 bohr for
 the POTRE files), so a small cell has thousands of images of every atom inside the ball and nearly
@@ -642,41 +640,69 @@ def _short_range_species(potential, specification, padding, eta, reach) -> _Shor
 
 
 def _short_range_by_balls(
-    total, grid, atoms, positions, potentials, specifications, eta, reach_of, balls=None
+    total, grid, atoms, positions, potentials, specifications, eta, reach_of, balls=None, use_spline_of=None
 ) -> None:
     """``total += sum_a sum_images V_a + 2 Z erf(eta r)/r`` over the balls of :func:`_atom_balls` (or of ``balls``,
-    the same generator for another grid)."""
+    the same generator for another grid).
+
+    ``use_spline_of(specification)`` says whether a species' table is evaluated with its cubic spline (default:
+    ``Cubic_Spline``).  Worker threads (:func:`setup_threads`) evaluate the terms of the image balls of one atom after
+    another, with one spline per species (rebuilding it for every batch cost a Python loop over the table); the
+    calling thread adds them as the ball loop did: the terms of the images between two flushes summed point by point
+    in image order by ``np.bincount``, a flush when an atom of another species begins, after the image that brings
+    the pending points to ``_POINTS_PER_CALL`` and at the end.  The terms are elementwise functions of the
+    distances, so the potential is the one of the single-thread loop bit for bit, whatever the threads.
+    """
     balls = _atom_balls if balls is None else balls
+    if use_spline_of is None:
+        use_spline_of = lambda specification: bool(specification.use_spline)  # noqa: E731
+    padding = grid.settings.stencil_half_width
+    splines = {}
+    for symbol in dict.fromkeys(atom.symbol for atom in atoms):
+        specification = specifications[symbol]
+        splines[symbol] = (
+            potentials[symbol].local_potential_spline(specification.local_angular_momentum, padding)
+            if use_spline_of(specification)
+            else None
+        )
+
+    def work(index: int):
+        symbol = atoms[index].symbol
+        potential = potentials[symbol]
+        specification = specifications[symbol]
+        terms = []
+        for rows, distances in balls(grid, positions[index], reach_of(symbol)):
+            values = potential.local_potential(
+                distances,
+                specification.local_angular_momentum,
+                use_spline=use_spline_of(specification),
+                spline_padding_width=padding,
+                spline=splines[symbol],
+            ) + _ewald._erf_over_r(potential.ionic_charge, distances, eta)
+            terms.append((rows, values))
+        return terms
+
     pending_rows: list[np.ndarray] = []
-    pending_distances: list[np.ndarray] = []
+    pending_values: list[np.ndarray] = []
     pending_points = 0
     batch_symbol = None
 
     def flush() -> None:
-        nonlocal pending_rows, pending_distances, pending_points
+        nonlocal pending_rows, pending_values, pending_points
         if not pending_rows:
             return
-        rows = np.concatenate(pending_rows)
-        distances = np.concatenate(pending_distances)
-        potential = potentials[batch_symbol]
-        specification = specifications[batch_symbol]
-        values = potential.local_potential(
-            distances,
-            specification.local_angular_momentum,
-            use_spline=specification.use_spline,
-            spline_padding_width=grid.settings.stencil_half_width,
-        ) + _ewald._erf_over_r(potential.ionic_charge, distances, eta)
-        total_view[:] += np.bincount(rows, weights=values, minlength=total_view.size)
-        pending_rows, pending_distances, pending_points = [], [], 0
+        total[:] += np.bincount(
+            np.concatenate(pending_rows), weights=np.concatenate(pending_values), minlength=total.size
+        )
+        pending_rows, pending_values, pending_points = [], [], 0
 
-    total_view = total
-    for atom, position in zip(atoms, positions):
-        if atom.symbol != batch_symbol:
+    for index, terms in enumerate(_ordered_results(work, range(len(atoms)), setup_threads())):
+        if atoms[index].symbol != batch_symbol:
             flush()
-            batch_symbol = atom.symbol
-        for rows, distances in balls(grid, position, reach_of(atom.symbol)):
+            batch_symbol = atoms[index].symbol
+        for rows, values in terms:
             pending_rows.append(rows)
-            pending_distances.append(distances)
+            pending_values.append(values)
             pending_points += rows.size
             if pending_points >= _POINTS_PER_CALL:
                 flush()
@@ -1041,6 +1067,13 @@ def periodic_atomic_density(
         reach = _density_reach(potential, table, rule) if reaches is None else float(reaches[atom.symbol])
         tables[atom.symbol] = (table, reach)
 
+    # the same sum on the device where one is usable (periodic_device.device_bulk_atomic_density: bit for bit)
+    from .periodic_device import device_bulk_atomic_density
+
+    found = device_bulk_atomic_density(axes, side_lengths, contributing, potentials, tables)
+    if found is not None:
+        return found
+
     # the shift of this module's grid (Andrew Grieder's keeps the margin of one index for his)
     shift = _plain_shift(grid)
     atom_images = []
@@ -1108,19 +1141,6 @@ def _density_provider(grid, atoms, potentials, specifications, lattice_vectors, 
 
         found = device_lattice_atomic_density(grid, atoms, potentials, specifications, lattice_vectors, core=core)
     return found
-
-
-# ---------------------------------------------------------------------------
-# The real-space terms of the Ewald ion-ion energy.
-
-_ION_ION_MEMORY = 1 << 31  # bytes the terms in flight may hold (about 48 bytes per atom pair each)
-
-
-def _translation_map(function, translations, pairs: int):
-    """The real-space terms of :func:`parsec_python.V_ion.ewald.ewald_ion_ion_energy` on worker
-    threads, in the order of the translations (the energy adds them in that order: same bits)."""
-    threads = min(setup_threads(), max(1, _ION_ION_MEMORY // (48 * max(1, pairs))))
-    return _ordered_results(function, translations, threads)
 
 
 def install() -> None:

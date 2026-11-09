@@ -380,6 +380,18 @@ def _orbit_flips(grid, reduction) -> np.ndarray:
     return flips
 
 
+def _grid_order_identity(reduction, size: int) -> bool:
+    """Whether ``reduction`` is the identity alone with orbit ``w`` the grid row ``w`` (``size`` rows)."""
+
+    if int(reduction.group_order) != 1 or int(reduction.wedge_size) != int(size):
+        return False
+    rows = np.arange(int(size), dtype=np.int64)
+    return bool(
+        np.array_equal(np.asarray(reduction.representative_rows), rows)
+        and np.array_equal(np.asarray(reduction.full_to_wedge), rows)
+    )
+
+
 class _StencilGeometry:
     """The value map, representative positions and stencil weights on a device."""
 
@@ -397,8 +409,10 @@ class _StencilGeometry:
         self.negated_weights = cp.asarray(-weights)
         self.flips = None
         if self.periodic:
-            if reduction is not None:
+            if reduction is not None and not _grid_order_identity(reduction, box_size):
                 raise ValueError("a periodic grid has no symmetry reduction here")
+            # (The identity alone, one orbit per point in the order of the
+            # grid, as one sector of the identity has it: the box itself.)
             # pbe.py _to_box: the rows of a periodic cell are its box, row-major.
             positions = np.arange(box_size, dtype=np.int32)
             value_of_box = positions
@@ -883,6 +897,13 @@ class ZeroAverageXC:
 
     @staticmethod
     def _shifted(potential):
+        reduction = getattr(potential, "reduction", None)
+        if reduction is not None:
+            # One value per orbit (an evaluator with a reducer): the mean over
+            # the full grid weighs every orbit by its size.
+            weights = np.asarray(reduction.multiplicities, dtype=np.float64)
+            mean = float(np.dot(weights, potential.values) / np.sum(weights))
+            return type(potential)(reduction, potential.values - mean)
         values = np.asarray(potential, dtype=np.float64)
         return values - float(np.mean(values))
 

@@ -173,6 +173,20 @@ class GSpacePotentialTests(unittest.TestCase):
         ewald_average = real.mean() + ewald_alpha_z_energy(atoms, potentials, cell.lattice_vectors, electrons) / electrons
         alpha = G.gspace_alpha_energy(atoms, potentials, specifications, cell.lattice_vectors, electrons) / electrons
         self.assertAlmostEqual(ewald_average, alpha, delta=1e-5)
+        # the preparation's convention (SCF.pbc.zero_average_local_potential, PARSEC 1.5's): the split without the
+        # average of its split, Fortran's alpha term; the G-space potential has a zero average
+        from parsec_python.SCF.pbc import zero_average_local_potential
+
+        shifted, energy = zero_average_local_potential(
+            real, atoms, potentials, specifications, cell.lattice_vectors, electrons
+        )
+        self.assertAlmostEqual(float(shifted.mean()), 0.0, delta=1e-5)  # the sampling of the short-range sum
+        self.assertEqual(energy, alpha * electrons)
+        # the total is that of the earlier convention: the band energy loses N_e times the removed constant
+        removed = float(real.mean() - shifted.mean())
+        earlier = ewald_alpha_z_energy(atoms, potentials, cell.lattice_vectors, electrons)
+        self.assertAlmostEqual(energy - electrons * removed, earlier, delta=1e-9)
+        self.assertAlmostEqual(float(reciprocal.mean()), 0.0, delta=1e-12)
 
 
 class GSpaceForceTests(unittest.TestCase):
@@ -351,13 +365,33 @@ class InputTests(unittest.TestCase):
     def test_defaults_print_nothing_new(self) -> None:
         translation = self.parse(_CELL)
         self.assertEqual(translation.problem.grid.local_potential, "real_space")
-        self.assertFalse(translation.problem.scf.zero_average_xc_potential)
-        for text in (repr(translation.problem.grid), repr(translation.problem.scf), repr(translation.problem)):
+        # PARSEC 1.5's potshift is the default of an unpolarized 3-D cell since 2026-11-08; .false. restores the
+        # earlier potential and its settings
+        self.assertTrue(translation.problem.scf.zero_average_xc_potential)
+        self.assertIn("zero_average_xc_potential=True", repr(translation.problem.scf))
+        earlier = self.parse(_CELL, "Zero_Average_Vxc: .false.\n")
+        self.assertFalse(earlier.problem.scf.zero_average_xc_potential)
+        for text in (repr(earlier.problem.grid), repr(earlier.problem.scf), repr(earlier.problem)):
             self.assertNotIn("local_potential", text)
             self.assertNotIn("alpha_term", text)
             self.assertNotIn("zero_average", text)
         self.assertNotIn("local_potential", repr(PeriodicGridSettings(spacing=0.5)))
         self.assertNotIn("zero_average", repr(SCFSettings()))
+
+    def test_the_zero_average_default_is_that_of_an_unpolarized_bulk_cell(self) -> None:
+        # a spin-polarized cell keeps the potential of each channel (each channel losing its own average would move
+        # them against each other), a slab of either routines and a cluster never take the shift
+        for template, extra in (
+            (_CELL, "Spin_Polarization: .true.\n"),
+            (_SLAB, ""),
+            (_SLAB, "Periodic_System: .true.\nUse_Fortran_Routines: .false.\n"),
+            (_CLUSTER, ""),
+        ):
+            with self.subTest(extra=extra, template=template.splitlines()[0]):
+                self.assertFalse(self.parse(template, extra).problem.scf.zero_average_xc_potential)
+        self.assertTrue(
+            self.parse(_CELL, "Spin_Polarization: .true.\nZero_Average_Vxc: .true.\n").problem.scf.zero_average_xc_potential
+        )
 
     def test_keywords(self) -> None:
         translation = self.parse(

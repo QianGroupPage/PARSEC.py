@@ -217,11 +217,59 @@ def parsec15_lower_bound(
     Returns ``(lower, upper)``.
     """
 
-    largest = float(np.max(state.eigenvalues))
-    previous = (
-        _MACHINE_EPSILON if state.filter_lower_bound is None else float(state.filter_lower_bound)
+    return subspace_filter_bounds(
+        rule,
+        float(np.max(state.eigenvalues)),
+        state.filter_lower_bound,
+        state.first_filter,
+        bound,
     )
-    if state.first_filter:
+
+
+def subspace_filter_bounds(
+    rule: str,
+    largest: float,
+    previous: float | None,
+    first_filter: bool,
+    bound,
+) -> tuple[float, float]:
+    """The unwanted interval ``[lower, upper]`` (Ry) of one later-SCF SUBSPACE filter.
+
+    The one rule of every SUBSPACE implementation (the reference filter, the
+    device filters of one GPU, of a distributed basis and of the complex
+    k-point solver).  ``largest`` is the largest saved Ritz value ``r_max``,
+    ``previous`` the lower bound of the previous call (``None`` before the
+    first call after the first solver), ``first_filter`` whether this is that
+    first call, ``bound`` the short-Lanczos estimate of the call (attributes
+    ``upper_bound``, ``lower_bound`` = ``theta_min`` and ``middle``, as
+    :class:`~parsec_python.Eigensolvers.spectral_bounds.LanczosBoundResult`).
+
+    * ``"monotone"`` (the earlier PARSEC, the default): ``l = max(r_max, 0)``
+      on the first call, ``l = max(l_p, r_max)`` later, ``u`` the Lanczos
+      bound (:func:`_next_filter_lower_bound`).  The clamp at 0 assumes that
+      the unwanted spectrum starts near the vacuum level, as for a cluster;
+      a periodic cell whose eigenvalues lie far below 0 (bulk diamond:
+      ``r_max`` ~ -36 Ry at 64 atoms, ~ -84 Ry at 216, the offset of the
+      periodic local potential grows with the cell) keeps ``l = 0`` for the
+      whole SCF, and the filter then damps nothing between the subspace and
+      0 Ry.
+    * ``"smart"`` (``Smart_Subspace: .true.``) and ``"adaptive"``
+      (``.false.``): PARSEC 1.5's rules with its repair of a crossed
+      interval (:func:`parsec15_lower_bound`); ``smart`` places ``l`` at
+      ``r_max`` (on the first call at ``max(min(g, middle), 0)`` when
+      ``r_max > 0``), wherever the spectrum lies.
+    """
+
+    largest = float(largest)
+    if rule == "monotone":
+        if first_filter or previous is None:
+            # subspace.f90z firstfilt branch (non-BETA build).
+            return max(largest, 0.0), float(bound.upper_bound)
+        return max(float(previous), largest), float(bound.upper_bound)
+    if rule not in ("smart", "adaptive"):
+        raise ValueError("lower_bound_rule must be monotone, smart or adaptive")
+    previous = _MACHINE_EPSILON if previous is None else float(previous)
+    if first_filter:
         if previous < 2.0 * _MACHINE_EPSILON:
             suggestion = 0.99 * largest
         else:

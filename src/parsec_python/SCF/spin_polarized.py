@@ -49,6 +49,7 @@ from ..Grid import symmetrize_density
 from ..Mixer import (
     make_mixer,
     potential_residual_metrics,
+    preconditioned_mixer,
     spin_potential_residual_metrics,
 )
 from ..Occupations import (
@@ -364,9 +365,15 @@ def run_spin_scf(
         eigval_states = [None, None] if states is None else list(states)
 
     # The mixer a warm start carries (the Fock loop's Exx_Mixer_History), else a new one.
+    # Mixing_Preconditioner: kerker filters the charge part of the joined
+    # channels' residual (Mixer.preconditioner); "none" keeps this mixer.
     mixer = warm_start_mixer(
         warm_start,
-        (lambda: build_mixer(system.input.mixing))
+        (
+            lambda: preconditioned_mixer(
+                build_mixer(system.input.mixing), system, adapter=scalar_field_adapter, channels=2
+            )
+        )
         if meta is None
         else (lambda: meta.mixer(build_mixer, system.input.mixing)),
     )
@@ -1150,7 +1157,7 @@ def run_scf_spin_polarized(
     # One mixer history over the concatenated (V_up, V_down) vector, the
     # spin-polarized analog of mixing a single scalar field -- PARSEC treats
     # vnew(:,1:2) as one combined potential for mixing purposes.
-    mixer = make_mixer(system.input.mixing)
+    mixer = preconditioned_mixer(make_mixer(system.input.mixing), system, channels=2)
     filter_degree = system.input.eigensolver.filter_degree
     minimum_filter_degree = max(10, system.input.eigensolver.filter_degree_delta + 1)
     eigensolver_settings = system.input.eigensolver

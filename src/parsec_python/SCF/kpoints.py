@@ -56,7 +56,7 @@ from ..Energy import total_energy, total_energy_no_degeneracy_spin_polarized
 from ..Occupations import fixed_occupations, spin_fixed_occupations
 from ..Grid.point_group import symmetrize_density
 from ..Hamiltonian.kpoint_operator import KPointExchangeHamiltonian, KPointKohnShamHamiltonian
-from ..Mixer import make_mixer, potential_residual_metrics
+from ..Mixer import make_mixer, potential_residual_metrics, preconditioned_mixer
 from ..SCF.pbc import PeriodicPreparedSinglePointSystem
 from ..SCF.spin_polarized import (
     _number_of_states_per_channel,
@@ -317,10 +317,15 @@ def run_scf_kpoints(
     # ``projector_cache`` (by k-point index) keeps them for its next loops of the
     # same structure (the loops of a hybrid's Fock loop).
     projector_cache: dict[int, object] = {} if projector_cache is None else projector_cache
+    # sum_c k_c G_c of each k-point, built where the task is solved and only if read (not by a device kernel)
+    k_gradients: dict[int, dict] = {}
+    # the k-point solver, once made: the MPI k-point pools build a k-point's projectors with the atoms dealt
+    # over the ranks of the pool (solver.projector_builder, the same matrix)
+    owner: dict = {}
 
     def make_hamiltonian(task, potentials):
         if task not in projector_cache:
-            projector_cache[task] = build_nonlocal_projectors(
+            projector_cache[task] = getattr(owner.get("solver"), "projector_builder", build_nonlocal_projectors)(
                 system.grid,
                 cell_atoms,
                 system.pseudopotentials,
@@ -337,6 +342,7 @@ def run_scf_kpoints(
             k_points[task],
             kinetic_potential=potentials.get("vtau"),
             gradient_flux=potentials.get("gradient_flux"),
+            k_gradient_cache=k_gradients.setdefault(task, {}),
         )
         if exchange_term is not None:
             # A hybrid functional: a_x V_ACE of this k-point (built where the worker solves it).
@@ -424,15 +430,17 @@ def run_scf_kpoints(
             problem_size=system.grid.size,
             backend=kpoint_backend(system) if backend is None else backend,
         )
+    owner["solver"] = solver
     if compute_forces and type(solver).__name__ == "MPIKPointSolver":
         raise NotImplementedError(
             "the nonlocal force of the row-distributed MPI k-point solver is not implemented: its extras are "
             "sums over row blocks, which does not apply to a product of overlaps"
         )
     build_mixer = mixer_factory or make_mixer
+    # Mixing_Preconditioner: kerker wraps the mixer (Mixer.preconditioner).
     mixer = warm_start_mixer(
         warm_start,
-        (lambda: build_mixer(system.input.mixing))
+        (lambda: preconditioned_mixer(build_mixer(system.input.mixing), system))
         if meta is None
         else (lambda: meta.mixer(build_mixer, system.input.mixing)),
     )
@@ -538,8 +546,9 @@ def run_scf_kpoints(
                     hubbard_occupations = accumulated["hubbard"]
                 symmetrization = ()
                 if density_symmetry is not None:
-                    # Symmetrize_Charge_Density: symm_scalar after newrho.
-                    density, report = symmetrize_density(
+                    # Symmetrize_Charge_Density: symm_scalar after newrho (on the device of a solver that
+                    # offers it, the same average bit for bit: the MPI k-point pools).
+                    density, report = getattr(solver, "density_symmetrizer", symmetrize_density)(
                         density, density_symmetry, system.grid.volume_element
                     )
                     symmetrization = (report,)
@@ -910,11 +919,14 @@ def run_scf_kpoints_spin_polarized(
     # Bloch-phase projectors of the k-points it owns once (a caller's projector_cache, by
     # k-point index, keeps them for the next loops of the same structure).
     projector_cache: dict[int, object] = {} if projector_cache is None else projector_cache
+    # sum_c k_c G_c of each k-point, shared by its two channels (built only if read)
+    k_gradients: dict[int, dict] = {}
+    owner: dict = {}  # the k-point solver, once made (see run_scf_kpoints)
 
     def make_hamiltonian(task, potentials):
         spin_index, k_index = divmod(task, n_kpoints)
         if k_index not in projector_cache:
-            projector_cache[k_index] = build_nonlocal_projectors(
+            projector_cache[k_index] = getattr(owner.get("solver"), "projector_builder", build_nonlocal_projectors)(
                 system.grid,
                 system.atoms,
                 system.pseudopotentials,
@@ -931,6 +943,7 @@ def run_scf_kpoints_spin_polarized(
             k_points[k_index],
             kinetic_potential=potentials.get("vtau_up" if spin_index == 0 else "vtau_down"),
             gradient_flux=potentials.get("gradient_flux_up" if spin_index == 0 else "gradient_flux_down"),
+            k_gradient_cache=k_gradients.setdefault(k_index, {}),
         )
         if exchange_term is not None:
             # A hybrid functional: a_x V_ACE of this channel and k-point.
@@ -983,10 +996,13 @@ def run_scf_kpoints_spin_polarized(
             problem_size=system.grid.size,
             backend=kpoint_backend(system) if backend is None else backend,
         )
+    owner["solver"] = solver
     build_mixer = mixer_factory or make_mixer
+    # Mixing_Preconditioner: kerker filters the charge part of the joined
+    # channels' residual (Mixer.preconditioner).
     mixer = warm_start_mixer(
         warm_start,
-        (lambda: build_mixer(system.input.mixing))
+        (lambda: preconditioned_mixer(build_mixer(system.input.mixing), system, channels=2))
         if meta is None
         else (lambda: meta.mixer(build_mixer, system.input.mixing)),
     )
@@ -1123,13 +1139,14 @@ def run_scf_kpoints_spin_polarized(
                 if density_symmetry is not None:
                     # Symmetrize_Charge_Density: isp = 1 (total, reported), 2, 3.
                     volume_element = system.grid.volume_element
-                    _, total_report = symmetrize_density(
+                    symmetrize = getattr(solver, "density_symmetrizer", symmetrize_density)
+                    _, total_report = symmetrize(
                         density_up + density_down, density_symmetry, volume_element
                     )
-                    density_up, up_report = symmetrize_density(
+                    density_up, up_report = symmetrize(
                         density_up, density_symmetry, volume_element
                     )
-                    density_down, down_report = symmetrize_density(
+                    density_down, down_report = symmetrize(
                         density_down, density_symmetry, volume_element
                     )
                     symmetrization = (total_report, up_report, down_report)

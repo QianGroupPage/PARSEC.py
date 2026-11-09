@@ -541,6 +541,48 @@ def irreducible_monkhorst_pack(
     )
 
 
+def mesh_preserving_operations(group, dimensions, shift, *, tolerance: float = 1.0e-8):
+    """The operations of ``group`` whose rotation maps a Monkhorst-Pack mesh onto itself, as a ``SpaceGroup``.
+
+    The mesh point ``f = (i + s)/n`` (reciprocal-lattice coordinates) goes to ``G f`` with ``G = transpose(M)``
+    (:attr:`~parsec_python.Grid.space_group.SpaceGroup.reciprocal_rotations`), a mesh point again (modulo the
+    reciprocal lattice) when ``n (G f) - s`` is a whole vector for every ``i``: an affine function of ``i``, tested
+    on the corners of one mesh cell.  ``irrbz`` reduces any mesh by the whole group and the density average then
+    restores the star of each representative, also its members outside the mesh, the sampling of the symmetrized
+    mesh.  With the operations kept here every star lies in the mesh, so the wedge with the averaged density gives
+    the density of the full mesh (time reversal needs no such test: ``k`` and ``-k`` have the same density, and a
+    star ``-G k`` with one member in a mesh that ``G`` preserves lies in it entirely).  Returns ``group`` itself when
+    every operation is kept.
+    """
+
+    from .space_group import SYMMETRY_TOLERANCE, SpaceGroup
+
+    counts = np.asarray([int(value) for value in dimensions], dtype=np.float64)
+    offsets = np.asarray([float(value) for value in shift], dtype=np.float64)
+    corners = np.array([[a, b, c] for a in (0, 1) for b in (0, 1) for c in (0, 1)], dtype=np.float64)
+    points = (corners + offsets) / counts
+    kept = []
+    for index, rotation in enumerate(group.reciprocal_rotations):
+        target = (points @ rotation.T.astype(np.float64)) * counts - offsets
+        if np.max(np.abs(target - np.rint(target))) <= tolerance:
+            kept.append(index)
+    if len(kept) == group.order:
+        return group
+    last = group.translations[kept[-1]]
+    return SpaceGroup(
+        rotations=tuple(group.rotations[index] for index in kept),
+        translations=tuple(group.translations[index] for index in kept),
+        cartesian_rotations=tuple(group.cartesian_rotations[index] for index in kept),
+        labels=tuple(group.labels[index] for index in kept),
+        crystal_system=group.crystal_system,
+        full_holohedry=False,
+        lattice_operations=group.lattice_operations,
+        candidate_numbers=tuple(group.candidate_numbers[index] for index in kept),
+        symmorphic=not (abs(last[0]) + abs(last[1]) + abs(last[2]) > SYMMETRY_TOLERANCE),
+        ignored=group.ignored,
+    )
+
+
 def kpoint_sampling_details(problem) -> MonkhorstPackSampling | None:
     """The Fortran-path sampling of a ``SinglePointInput``, or ``None``.
 
@@ -675,6 +717,7 @@ __all__ = [
     "irreducible_monkhorst_pack",
     "kpoint_sampling",
     "kpoint_sampling_details",
+    "mesh_preserving_operations",
     "monkhorst_pack_grid",
     "read_kpoint_file",
     "time_reversal_reduced",

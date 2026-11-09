@@ -125,6 +125,7 @@ _HIS = "Use_Fortran_Routines: .false."
 _SHEETS = (
     "add_charged_sheets: .true.\nnum_charged_sheets: 1\nbegin sheet_coord\n 0.0 0.0 3.0\nend sheet_coord\nsheet_charge: 0.1"
 )
+_WEIGHTED = "Kpoint_Method: manual\nbegin Kpoint_List\n0.0 0.0 0.0 1.0\n0.25 0.0 0.0 3.0\nend Kpoint_List"
 _SHIFTED_BULK = (
     "Kpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 2 2\nend Monkhorst_Pack_Grid\n"
     "begin Monkhorst_Pack_Shift\n0.5 0.5 0.5\nend Monkhorst_Pack_Shift"
@@ -233,7 +234,9 @@ class FallBackTests(_ParserCase):
         ("slab relaxation", _slab("Minimization: bfgs\n" + _HIS), "of a slab"),
         ("slab k-points along z", _slab("Kpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 2 2\nend Monkhorst_Pack_Grid\n" + _HIS), "along z"),
         ("charged sheets", _slab(_SHEETS + "\n" + _HIS), "sheet"),
-        ("weighted k-points", _bulk("Kpoint_Method: manual\nbegin Kpoint_List\n0.0 0.0 0.0 1.0\n0.25 0.0 0.0 3.0\nend Kpoint_List"), "unequal weights"),
+        # a weighted list of a bulk single point runs on his routines with .false. since 2026-11-08 (without the
+        # parameter it is a default of the Fortran-derived ones, ThreeWayChoiceTests); its forces need theirs
+        ("weighted k-points with forces", _bulk(_WEIGHTED + "\nSkip_Force: .false.\n" + _HIS), "unequal weights"),
         ("spin with k-points and forces", _bulk("Spin_Polarization: .true.\nKpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 1 1\nend Monkhorst_Pack_Grid\nSkip_Force: .false."), "spin-polarized cell with k-points"),
         ("spin PBE forces", _bulk("Spin_Polarization: .true.\nSkip_Force: .false.").replace("Correlation_Type: ca", "Correlation_Type: pbe"), "spin-polarized PBE"),
         ("Double_Grid_Order 2", _bulk("Double_Grid_Order: 2"), "Double_Grid_Order"),
@@ -296,6 +299,7 @@ class ThreeWayChoiceTests(_ParserCase):
         for name, text, feature in (
             ("slab", _slab(), "slabs"),
             ("shifted grid of a bulk cell", _bulk(_SHIFTED_BULK), "shifted Monkhorst-Pack grids of bulk cells"),
+            ("weighted k-points of a bulk cell", _bulk(_WEIGHTED), "Kpoint_Lists of unequal weights of bulk cells"),
         ):
             with self.subTest(name):
                 translation = self.parse(text)
@@ -317,6 +321,7 @@ class ThreeWayChoiceTests(_ParserCase):
             ("bulk", _bulk(_HIS)),
             ("slab", _slab(_HIS)),
             ("shifted bulk grid", _bulk(_SHIFTED_BULK + "\n" + _HIS)),
+            ("weighted k-points of a bulk cell", _bulk(_WEIGHTED + "\n" + _HIS)),
         ):
             with self.subTest(name):
                 translation = self.parse(text)
@@ -340,12 +345,25 @@ class ThreeWayChoiceTests(_ParserCase):
                 self.assertIn("Use_Fortran_Routines: .true.", routines_report_line(translation))
 
     def test_a_shifted_bulk_grid_is_fortrans_wedge_by_default_and_his_mesh_with_false(self) -> None:
-        default = self.parse(_bulk(_SHIFTED_BULK)).problem
-        self.assertEqual(tuple(default.monkhorst_pack_dimensions), (2, 2, 2))
-        his = self.parse(_bulk(_SHIFTED_BULK + "\n" + _HIS)).problem
-        self.assertIsNone(his.monkhorst_pack_dimensions)
-        self.assertEqual(len(his.kpoints), 8)
-        np.testing.assert_allclose(his.kpoint_weights, 1.0 / 8.0)
+        from parsec_python.Grid.kpoints import kpoint_sampling
+
+        default = self.parse(_bulk(_SHIFTED_BULK))
+        self.assertTrue(default.routines.fortran)
+        self.assertEqual(tuple(default.problem.monkhorst_pack_dimensions), (2, 2, 2))
+        # his routines reduce the mesh of a bulk single point too (2026-11-08): with Ignore_Symmetry by time
+        # reversal alone, the 8 points (+-1/4)^3 in pairs; moving atoms keep the full mesh
+        his = self.parse(_bulk(_SHIFTED_BULK + "\n" + _HIS))
+        self.assertFalse(his.routines.fortran)
+        self.assertEqual(tuple(his.problem.monkhorst_pack_dimensions), (2, 2, 2))
+        self.assertEqual(his.problem.monkhorst_pack_shift, (0.5, 0.5, 0.5))
+        self.assertIsNone(his.problem.space_group)
+        k_points, weights = kpoint_sampling(his.problem)
+        self.assertEqual(len(k_points), 4)
+        np.testing.assert_allclose(weights, 0.25)
+        moving = self.parse(_bulk(_SHIFTED_BULK + "\nSkip_Force: .false.\n" + _HIS)).problem
+        self.assertIsNone(moving.monkhorst_pack_dimensions)
+        self.assertEqual(len(moving.kpoints), 8)
+        np.testing.assert_allclose(moving.kpoint_weights, 1.0 / 8.0)
 
     def test_a_slab_is_the_fortran_derived_slab_by_default_and_his_with_false(self) -> None:
         default = self.parse(_slab())

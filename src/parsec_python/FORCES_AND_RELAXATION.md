@@ -299,7 +299,8 @@ Forces (`Forces.compute_periodic_forces`; the Fortran routines are `forpbc.f90`,
 `forcnloc.f90`):
 
 1. **Ion-ion**: the exact derivative of the Ewald energy (`Forces/ion_ion.py: ewald_ion_ion_forces`): the real-space sum
-   over images and the reciprocal sum.
+   over the atom pairs within the cutoff and the reciprocal sum over the structure factors of a box of reciprocal
+   vectors (`V_ion.ewald.ewald_ion_ion_terms`, 4 s for 4,096 atoms on a laptop).
 2. **Local pseudopotential** (`Forces/periodic_local.py`): `integral rho(r) grad V_a(r - R_a)` over the images of the local
    potential as it is built (the short-ranged `V_a(d) + 2 Z erf(eta d)/d` and the reciprocal series), and
    `integral V_xc(r) rho_core'(d) d/|d|` over the images of the core density. There is no SCF-residual term, as in
@@ -602,9 +603,11 @@ real-space Ewald split instead of the G-space `v_first`/`pot_local`):
 - local: `dV sum_r rho(r) [sum_T f'(|d_T|) d_T/|d_T| + 2Z (4 pi/V) sum_G w_G G sin(G.(r - R))]`
   with `f = V_loc + 2Z erf(eta r)/r` and the translations and G vectors of
   `ewald_local_ionic_potential`; ion-ion: the derivative of
-  `ewald_ion_ion_energy` with its translations (both sums keep every image a
-  pair or a grid point reaches, for any cell shape, so an atom that crosses a
-  cell face and is translated back changes no energy);
+  `ewald_ion_ion_energy` over the same atom pairs within the real-space cutoff
+  and the same reciprocal vectors (`V_ion.ewald.ewald_ion_ion_terms` evaluates
+  both; both sums keep every image a pair or a grid point reaches, for any cell
+  shape, so an atom that crosses a cell face and is translated back changes no
+  energy);
 - radial functions are differentiated as the energy samples them (slope of the
   linear interpolant of `r V`, of the densities and of the projectors, or the
   spline derivative). `PARSEC_PERIODIC_FORCE_SLOPES=tabulated` takes for the

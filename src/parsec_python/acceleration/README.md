@@ -909,7 +909,8 @@ a setting that selects the former one:
 |---|---|---|
 | `PARSEC_CUPY_RITZ_SYRK` | `auto`: overlap from GEMMs on trailing columns | `on`: DSYRK |
 | `PARSEC_CUPY_RITZ_DENSE_BACKEND` | `device`: the small generalized problem is solved by cuSOLVER where the Gram matrices were formed | `host`: download, host LAPACK, upload |
-| `PARSEC_CUPY_RITZ_CONDITION_HELPER` | `auto`: beside that solve on the owner of a shared basis, another device of the sector estimates the condition number of the overlap, never the device that holds the Hartree objects. `any` asks that device too where the sector has no other and the sharing rule counts the room for the estimate; it was the default for a while (below) | `off`: the owner estimates it first |
+| `PARSEC_CUPY_RITZ_CONDITION_HELPER` | `auto`: beside that solve on the owner of a shared basis, another device of the sector estimates the condition number of the overlap, never the device that holds the Hartree objects. `any` asks that device too where the sector has no other and the sharing rule counts the room for the estimate; it was the default for a while (below); ranks that share a basis over MPI (`Eigensolvers/mpi_shared_basis.py`): rank 1 estimates it for the root (same bits) | `off`: the owner estimates it first |
+| `PARSEC_MPI_SHARED_RITZ` | `auto`: a basis that MPI ranks share takes the Ritz step in rounds for a periodic cell (one row block beside the columns, `H X` formed and projected a round at a time: two shares of the basis per rank), the two row blocks for a cluster | `rows`: the two row blocks for a cell too (three shares); `rounds` names the rounds for a cluster as well |
 | `PARSEC_CUPY_STREAMING_RITZ` | `auto`: a symmetry sector whose basis lies on one device keeps one `N x m` array; `H X` is projected a slab of columns at a time and the basis is rotated in place | `0`: two arrays |
 | `PARSEC_CUPY_ROTATE_COLUMN_COPY` | `1`: the tiles of that rotation are written back along columns | `0` |
 | `PARSEC_CUPY_DISTRIBUTED_STATE` | `auto`: a sector that was given several devices (MPI sector runs) shares its basis among them if its blocks fit | `0`: the whole basis on the sector owner |
@@ -3207,7 +3208,15 @@ device paths:
   with the readable periodic CG).
 - `V_xc/device_xc.py::ZeroAverageXC` removes the average of a device XC
   potential of a 3-D cell with `Zero_Average_Vxc`, as the readable
-  `evaluate_xc` does (`potshift`).
+  `evaluate_xc` does (`potshift`); on the orbit fields of the symmetry
+  sectors it weighs every orbit by its size.
+- A bulk orthorhombic cell at the Gamma point (unpolarized, native LDA or
+  GGA) runs on several GPUs and nodes as one sector of the identity whose
+  orbitals the MPI ranks share: `scripts/run_multi_gpu_scf.sh --rank-per-gpu`
+  (`MULTI_GPU.md`, "Periodic cells at the Gamma point on several nodes";
+  `driver.periodic_sector_refusal` names what it does not take). In one
+  process `PARSEC_CUPY_SINGLE_SECTOR=on` takes the same route; unset, a cell
+  keeps the full grid of one GPU.
 - `V_xc/periodic_xc.py` evaluates the spin functionals of a periodic cell in
   the reference spin drivers on the device, by `PARSEC_CUPY_XC`: the
   functionals added for Fortran parity by default, PBE only with `on`

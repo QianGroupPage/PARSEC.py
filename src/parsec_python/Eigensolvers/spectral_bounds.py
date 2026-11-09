@@ -238,20 +238,91 @@ def _lanczos_upper_bound_core(
     # behavior.  It deliberately avoids PARSEC's zero-padded (k-1)-block
     # diagonalization artifact described in the module docstring.
     ritz_values = np.linalg.eigvalsh(projected[:actual_steps, :actual_steps])
+    return lanczos_bound_from_ritz(
+        "parsec",
+        ritz_values,
+        raw_beta,
+        steps=actual_steps,
+        requested_steps=requested_steps,
+        breakdown=breakdown,
+    )
+
+
+#: The rules of the short-Lanczos bound that every filter (reference and device) computes
+#: (:func:`lanczos_bound_from_ritz`): ``parsec`` the earlier PARSEC's, ``lanczos`` PARSEC 1.5's
+#: (``Bounds_Method: lanczos``).
+LANCZOS_BOUND_RULES = ("parsec", "lanczos")
+
+
+def lanczos_bound_steps(rule: str, requested_steps: int, size: int) -> int:
+    """The Lanczos steps of a bound of ``rule``: ``parsec`` clamps ``requested_steps`` to ``[4, 8]``
+    (the non-``BETA`` ``lancz_bound.f90z``), ``lanczos`` takes them as given (PARSEC 1.5); never more
+    than the dimension ``size``."""
+
+    requested_steps = int(requested_steps)
+    if rule == "parsec":
+        return min(max(requested_steps, 4), 8, int(size))
+    if rule == "lanczos":
+        if requested_steps < 1:
+            raise ValueError("steps must be a positive integer")
+        return min(requested_steps, int(size))
+    raise ValueError(f"unknown Lanczos bound rule {rule!r}; the rules are " + ", ".join(LANCZOS_BOUND_RULES))
+
+
+def lanczos_bound_from_ritz(
+    rule: str,
+    ritz_values,
+    raw_beta: float,
+    *,
+    steps: int,
+    requested_steps: int,
+    breakdown: bool,
+) -> LanczosBoundResult:
+    """The filter bound of a short-Lanczos tridiagonal (its sorted Ritz values ``theta``) under ``rule``.
+
+    The one bound formula of the reference and device filters (CHEBFF, CHEBDAV, SUBSPACE).
+
+    * ``parsec`` (the earlier PARSEC, the default): the radius
+      ``rho = max(theta_max, |theta_min|)``, ``u = rho + margin`` with
+      ``margin`` = 10, 5 or 1 times the last ``beta`` (below 1e-2, below 0.1,
+      otherwise), ``middle = (rho + theta_min)/2``.  The radius assumes that
+      the top of the spectrum exceeds the magnitude of its bottom, as for a
+      cluster whose potential vanishes far away.  A bulk cell whose
+      eigenvalues lie far below 0 (with this code's periodic potential the
+      Fermi level of bulk diamond is -237 Ry at 1,000 atoms and -607 Ry at
+      4,096, the kinetic spectrum spans ~300 Ry) gets ``u ~ |theta_min|``, an
+      interval several times wider than the spectrum, and a filter of
+      correspondingly lower effective degree.
+    * ``lanczos`` (PARSEC 1.5, ``Bounds_Method: lanczos``): ``u = theta_max +
+      margin`` with 1.5's margin (:func:`_parsec15_beta_scale`),
+      ``middle = (theta_max + theta_min)/2``; invariant under a shift of the
+      spectrum.
+
+    ``lower_bound`` is ``theta_min`` under both rules.
+    """
+
+    ritz_values = np.asarray(ritz_values, dtype=float)
     lower_bound = float(ritz_values[0])
-    # PARSEC uses a radius, so a large-magnitude negative Ritz value can set
-    # the positive Chebyshev upper endpoint even when theta_max is smaller.
-    spectral_radius = max(float(ritz_values[-1]), abs(lower_bound))
-    middle = 0.5 * (spectral_radius + lower_bound)
-
-    # Empirical safety enlargement copied from the non-BETA Fortran branch.
-    residual_scale = raw_beta
-    if residual_scale < 1.0e-2:
-        residual_scale *= 10.0
-    elif residual_scale < 1.0e-1:
-        residual_scale *= 5.0
-    upper_bound = spectral_radius + residual_scale
-
+    largest = float(ritz_values[-1])
+    raw_beta = float(raw_beta)
+    if rule == "parsec":
+        # PARSEC uses a radius, so a large-magnitude negative Ritz value can set
+        # the positive Chebyshev upper endpoint even when theta_max is smaller.
+        spectral_radius = max(largest, abs(lower_bound))
+        middle = 0.5 * (spectral_radius + lower_bound)
+        # Empirical safety enlargement copied from the non-BETA Fortran branch.
+        residual_scale = raw_beta
+        if residual_scale < 1.0e-2:
+            residual_scale *= 10.0
+        elif residual_scale < 1.0e-1:
+            residual_scale *= 5.0
+        upper_bound = spectral_radius + residual_scale
+    elif rule == "lanczos":
+        residual_scale = _parsec15_beta_scale(raw_beta)
+        upper_bound = largest + residual_scale
+        middle = 0.5 * (largest + lower_bound)
+    else:
+        raise ValueError(f"unknown Lanczos bound rule {rule!r}; the rules are " + ", ".join(LANCZOS_BOUND_RULES))
     return LanczosBoundResult(
         upper_bound=float(upper_bound),
         lower_bound=lower_bound,
@@ -259,10 +330,30 @@ def _lanczos_upper_bound_core(
         ritz_values=ritz_values,
         raw_beta=raw_beta,
         residual_scale=float(residual_scale),
-        steps=actual_steps,
-        requested_steps=requested_steps,
-        breakdown=breakdown,
+        steps=int(steps),
+        requested_steps=int(requested_steps),
+        breakdown=bool(breakdown),
     )
+
+
+def bound_request(settings) -> tuple[str, int]:
+    """``(rule, steps)`` of the short-Lanczos bound that a filter's settings ask for.
+
+    ``settings`` is a :class:`~parsec_python.Eigensolvers.chebff.ChebFFSettings`,
+    :class:`~parsec_python.Eigensolvers.chebdav.ChebDavSettings` or
+    :class:`~parsec_python.Eigensolvers.subspace.SubspaceSettings`: ``bounds``
+    (``parsec`` or ``lanczos``; ``lanczos_full`` is the reference CHEBFF's
+    only) and ``lanczos_steps``, replaced by ``bound_steps`` (``max(degree/2,
+    Bounds_Iter)``) where the settings carry one and the rule is not ``parsec``
+    (1.5's CHEBDAV keeps its ``lanczos_steps``).
+    """
+
+    rule = str(getattr(settings, "bounds", "parsec"))
+    steps = int(settings.lanczos_steps)
+    bound_steps = getattr(settings, "bound_steps", None)
+    if rule != "parsec" and bound_steps is not None:
+        steps = int(bound_steps)
+    return rule, steps
 
 
 def _parsec15_beta_scale(beta: float) -> float:
@@ -342,16 +433,10 @@ def _lanczos_bound_parsec15_core(
         projected[column, column] = alpha
         actual_steps = column + 1
     ritz_values = np.linalg.eigvalsh(projected[:actual_steps, :actual_steps])
-    lower_bound = float(ritz_values[0])
-    largest = float(ritz_values[-1])
-    residual_scale = _parsec15_beta_scale(raw_beta)
-    return LanczosBoundResult(
-        upper_bound=float(largest + residual_scale),
-        lower_bound=lower_bound,
-        middle=float(0.5 * (largest + lower_bound)),
-        ritz_values=ritz_values,
-        raw_beta=raw_beta,
-        residual_scale=float(residual_scale),
+    return lanczos_bound_from_ritz(
+        "lanczos",
+        ritz_values,
+        raw_beta,
         steps=actual_steps,
         requested_steps=requested_steps,
         breakdown=breakdown,

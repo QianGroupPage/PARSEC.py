@@ -449,6 +449,48 @@ def single_sector_setting() -> str:
     return value
 
 
+def periodic_sector_refusal(problem) -> str | None:
+    """Why a periodic cell cannot be solved as one sector of the identity, or ``None``.
+
+    The route of the sectors (one sector of the identity, whose basis the
+    devices of a process or the MPI ranks of the full-SCF runner share) takes
+    a bulk cell at the Gamma point with real orbitals: an orthorhombic cell,
+    unpolarized, with a native LDA or GGA, its local potential, Hartree solve
+    and XC functional on the full grid as on one device.  It has not been
+    built or validated for the other periodic calculations named here; a
+    calculation that names one keeps the full grid of one device (``main.py``),
+    and the MPI runner refuses it.
+    """
+
+    from parsec_python.Grid import kpoint_sampling
+    from parsec_python.V_xc.libxc import is_libxc_functional
+
+    scf = problem.scf
+    lattice = np.asarray(problem.periodic_cell.lattice_vectors, dtype=np.float64)
+    species = getattr(problem, "pseudopotentials", {}).values()
+    if int(getattr(problem.grid, "periodicity", 3)) != 3:
+        return "a wire or slab (Boundary_Conditions: wire or slab)"
+    if problem.has_kpoint_sampling:
+        sampling = kpoint_sampling(problem)
+        if sampling is None or len(sampling[0]) != 1 or np.any(sampling[0]):
+            return "k-point sampling beyond the Gamma point"
+    if scf.spin_polarized or scf.noncollinear or scf.self_consistent_spin_orbit:
+        return "spin polarization, spin-orbit coupling or non-collinear magnetism"
+    if scf.is_hybrid:
+        return "a hybrid functional"
+    if scf.is_meta_gga:
+        return "a meta-GGA functional"
+    if is_libxc_functional(scf.xc_functional):
+        return "a libxc functional"
+    if not np.allclose(lattice, np.diag(np.diag(lattice)), atol=1.0e-10):
+        return "an oblique cell (lattice vectors not along the Cartesian axes)"
+    if any(getattr(item, "has_hubbard", False) for item in species):
+        return "LDA+U"
+    if getattr(scf, "van_der_waals", False):
+        return "the Tkatchenko-Scheffler dispersion correction"
+    return None
+
+
 def _orbital_reduction(symmetry_reduction, stabilizer_disabled: bool):
     """Return the reduction the orbitals take of a detected one, or ``None``.
 
@@ -1250,6 +1292,10 @@ def _prepare_reference_physics(
             )
 
     if getattr(problem, "periodic_cell", None) is not None:
+        if orbital_operators_only and _periodic_operators_only_available(problem):
+            # A rank that only shares the basis of the sector: grid, kinetic
+            # operator and projectors alone.
+            return _prepare_periodic_orbital_operators(problem)
         reference = prepare_reference_periodic_single_point(problem)
         if cache_key is not None:
             _remember_reference(cache_key, reference, cache_capacity)
@@ -1392,6 +1438,92 @@ def _prepare_reference_physics(
     if cache_key is not None:
         _remember_reference(cache_key, reference, cache_capacity)
     return reference
+
+
+def _periodic_operators_only_available(problem) -> bool:
+    """Whether :func:`_prepare_periodic_orbital_operators` builds what the full preparation would of ``problem``.
+
+    Andrew Grieder's routines of a bulk cell on the orthorhombic grid; the
+    Fortran-derived routines, wires and slabs keep the full preparation.
+    """
+
+    grid = problem.grid
+    lattice = np.asarray(problem.periodic_cell.lattice_vectors, dtype=np.float64)
+    return (
+        not getattr(grid, "fortran_routines", False)
+        and int(getattr(grid, "periodicity", 3)) == 3
+        and int(getattr(problem.periodic_cell, "dimensions", 3)) == 3
+        and np.allclose(lattice, np.diag(np.diag(lattice)), atol=1.0e-10)
+    )
+
+
+def _prepare_periodic_orbital_operators(problem):
+    """The orbital operators of a bulk cell for a rank that shares the basis of its sector.
+
+    The steps of :func:`parsec_python.SCF.pbc.prepare_periodic_single_point`
+    that make ``H = -nabla_FD^2 + diag(V) + V_NL`` apart from ``V``, through
+    the same functions of that module and with the same arguments: the
+    pseudopotentials and the electron count, the grid, the finite-difference
+    Laplacian and the projectors with their lattice images.  The kinetic
+    operator and the projectors are those of the full preparation element for
+    element.  What only the SCF loop of the root reads (the gradient matrices,
+    the local ionic potential, the starting and core densities, the Ewald
+    energies) is not built: ``None``, and NaN for the energies.
+    """
+
+    from parsec_python.SCF import pbc as periodic
+
+    started = perf_counter()
+    atoms = tuple(problem.atoms)
+    stage = perf_counter()
+    pseudopotentials = periodic.load_pseudopotentials(
+        problem.pseudopotentials, xc_functional=problem.scf.xc_functional
+    )
+    pseudopotential_seconds = perf_counter() - stage
+    electron_count = periodic.ionic_charge(atoms, pseudopotentials) - problem.scf.net_charge
+    if electron_count <= 0:
+        raise ValueError("the requested system has no valence electrons")
+    stage = perf_counter()
+    grid = periodic.build_periodic_grid(problem.periodic_cell, problem.grid)
+    grid_seconds = perf_counter() - stage
+    lattice_vectors = problem.periodic_cell.lattice_vectors
+    outside = periodic.atom_outside_cell(lattice_vectors, atoms)
+    if outside is not None:
+        raise ValueError(
+            f"atom {outside.symbol} at {np.asarray(outside.position)} lies outside the periodic cell "
+            f"[0, {np.diag(np.asarray(lattice_vectors)).tolist()}); this path does not recenter geometry"
+        )
+    stage = perf_counter()
+    negative_laplacian = periodic.build_negative_laplacian(grid)
+    finite_difference_seconds = perf_counter() - stage
+    stage = perf_counter()
+    nonlocal_operator = periodic.build_nonlocal_projectors(
+        grid, atoms, pseudopotentials, problem.pseudopotentials, lattice_vectors, periodic_dimensions=3
+    )
+    nonlocal_seconds = perf_counter() - stage
+    return periodic.PeriodicPreparedSinglePointSystem(
+        input=problem,
+        atoms=atoms,
+        electron_count=electron_count,
+        pseudopotentials=pseudopotentials,
+        grid=grid,
+        negative_laplacian=negative_laplacian,
+        gradient=None,
+        ionic_potential=None,
+        nonlocal_operator=nonlocal_operator,
+        initial_density=None,
+        core_density=None,
+        ion_ion_energy=float("nan"),
+        atomic_reference_correction=float("nan"),
+        alpha_z_energy=float("nan"),
+        timings=PreparationTimings(
+            pseudopotential_loading_seconds=pseudopotential_seconds,
+            grid_seconds=grid_seconds,
+            finite_difference_seconds=finite_difference_seconds,
+            nonlocal_ionic_seconds=nonlocal_seconds,
+            total_seconds=perf_counter() - started,
+        ),
+    )
 
 
 def _build_backend(
@@ -2937,6 +3069,14 @@ def _hybrid_xc_evaluators(reference, *, backend, reducer, device_id, core_densit
                     reducer=reducer,
                     device_id=device_id,
                 )
+    # Zero_Average_Vxc of a 3-D cell (potshift): the device evaluators of the hybrid and of its start functional
+    # shift their potentials as the reference system's evaluate_xc does (the default of an unpolarized cell).
+    shift = getattr(reference, "_zero_average", None)
+    if callable(shift) and shift(None) is True:
+        from .V_xc.device_xc import ZeroAverageXC
+
+        unpolarized = None if unpolarized is None else ZeroAverageXC(unpolarized)
+        spin_evaluator = None if spin_evaluator is None else ZeroAverageXC(spin_evaluator)
     start_scf = replace(
         scf, xc_functional=hybrid_definition(scf).start_functional, exact_exchange=None
     )
@@ -2944,6 +3084,7 @@ def _hybrid_xc_evaluators(reference, *, backend, reducer, device_id, core_densit
         input=replace(reference.input, scf=start_scf),
         grid=reference.grid,
         core_density=reference.core_density,
+        _zero_average=shift,
     )
     start = accelerated_xc_evaluators(
         start_reference,
@@ -3113,12 +3254,17 @@ def _prepare_single_point(
             "space-group symmetry detection is not implemented for the "
             "accelerated periodic path"
         )
-    if is_periodic and mpi_context is not None:
+    # A periodic cell in an MPI sector context: one sector of the identity
+    # whose basis the ranks share (a bulk cell at Gamma; see
+    # periodic_sector_refusal for what that route does not take).
+    periodic_refusal = periodic_sector_refusal(problem) if is_periodic else None
+    if periodic_refusal is not None and mpi_context is not None:
         raise ValueError(
-            "an MPI sector context is not supported for periodic problems: "
-            "the ranks of an MPI run divide the symmetry sectors of an "
-            "isolated cluster, and the accelerated periodic path uses the "
-            "full grid"
+            f"{periodic_refusal} of a periodic cell does not run as an MPI SCF, whose "
+            "ranks share the basis of one sector of the identity (a bulk "
+            "orthorhombic cell at the Gamma point, unpolarized, native LDA or GGA): "
+            "run it with parsec_python/main.py"
+            + (" --mpi" if "k-point" in periodic_refusal else "")
         )
     # Only the root rank of an MPI run enters the SCF loop.  The other ranks
     # answer eigensolver and density commands for the sectors they own.
@@ -3250,10 +3396,30 @@ def _prepare_single_point(
             or (single_sector_mode == "auto" and mpi_context is not None)
         )
         and symmetry_reduction is None
-        and not is_periodic
+        # A periodic cell where the route of the sectors takes it (a bulk
+        # orthorhombic cell at Gamma on the grid of one spacing).
+        and (
+            not is_periodic
+            or (
+                periodic_refusal is None
+                and not getattr(reference.grid, "is_general_periodic", False)
+            )
+        )
         and not spin_polarized
         and selection.selected == "cupy"
     )
+    if is_periodic and mpi_context is not None and not single_sector:
+        raise ValueError(
+            "the MPI SCF of a periodic cell solves it as one sector of the identity, which this run "
+            + (
+                "cannot take on Fortran's general periodic grid (Use_Fortran_Routines with sides "
+                "of different grid steps)"
+                if getattr(reference.grid, "is_general_periodic", False)
+                else f"does not take here (PARSEC_CUPY_SINGLE_SECTOR={single_sector_mode}, "
+                f"backend {selection.selected})"
+            )
+            + ": run it with parsec_python/main.py"
+        )
     if single_sector:
         from .Symmetry import AxisReflectionReduction
 
@@ -3846,8 +4012,24 @@ def _prepare_single_point(
         # reference.solve_hartree) -- _selection_for_problem forces
         # hartree_backend to "scipy" for periodic precisely so none of the
         # branches below this one can be reached instead.
+        # In one sector of the identity (periodic_sector_refusal) the SCF
+        # keeps its fields as orbit fields of the identity, one value per grid
+        # point in the order of the grid: the full-grid solve sees them
+        # expanded, and its potentials go back to orbit fields, both exact
+        # copies.
         def accelerated_hartree(density, initial_potential=None, **kwargs):
-            return reference.solve_hartree(density, initial_potential, **kwargs)
+            if scf_reducer is None:
+                return reference.solve_hartree(density, initial_potential, **kwargs)
+            result = reference.solve_hartree(
+                scf_reducer.to_full(density),
+                None if initial_potential is None else scf_reducer.to_full(initial_potential),
+                **kwargs,
+            )
+            return replace(
+                result,
+                potential=scf_reducer.from_full(result.potential),
+                right_hand_side=scf_reducer.from_full(result.right_hand_side),
+            )
 
     elif selection.hartree_backend == "cupy":
         from .Hartree.cupy_poisson import CuPyPoissonSolver

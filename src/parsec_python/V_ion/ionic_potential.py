@@ -860,9 +860,16 @@ def ion_ion_energy(
     return float(energy)
 
 
+PROJECTOR_CENTER_ROUND_OFF = 1.0e-6
+"""Bohr: a projector's grid point closer than this (and than the first radial knot) to its atom is the center,
+the clamp of the nonlocal forces (``Forces.periodic.ROUND_OFF_DISTANCE``)."""
+
+
 def real_spherical_harmonics(
     angular_momentum: int,
     relative_coordinates: np.ndarray,
+    *,
+    center_radius: float = 0.0,
 ) -> np.ndarray:
     """Evaluate a real orthonormal spherical-harmonic basis through ``l=3``.
 
@@ -877,6 +884,15 @@ def real_spherical_harmonics(
     the stable zero-limit convention for regular ``l>0`` channels, while
     ``Y_00`` is direction independent.
 
+    ``center_radius`` (bohr, default 0): the cosines are ``x/max(r, c)``, so a
+    point within ``c`` of the center goes continuously to that limit.  The
+    projectors pass the radius their radial table is clamped to, as the forces
+    do (:data:`parsec_python.Forces.periodic.ROUND_OFF_DISTANCE`): a grid point
+    on an atom up to round-off (``1e-16`` to ``1e-12`` bohr) otherwise takes the
+    random direction of its round-off, which breaks the symmetry of the
+    operator (diamond with atoms on the points of its grid: ``2e-4`` of
+    ``V_NL`` under a two-fold axis).
+
     Columns span the complete channel.  Orthogonal rotations, permutations,
     or sign changes within that channel leave
     ``sum_mu |beta_l,mu><beta_l,mu|`` unchanged, which is why the precise real
@@ -888,7 +904,7 @@ def real_spherical_harmonics(
     radius = np.linalg.norm(xyz, axis=1)
     unit = np.zeros_like(xyz)
     nonzero = radius > 0
-    unit[nonzero] = xyz[nonzero] / radius[nonzero, None]
+    unit[nonzero] = xyz[nonzero] / np.maximum(radius[nonzero], float(center_radius))[:, None]
     x, y, z = unit.T
 
     # l=0: s-like constant harmonic Y_00 = 1/sqrt(4*pi).
@@ -1124,6 +1140,34 @@ def _image_translations(
     return _periodic_image_translations(lattice_vectors, radius)
 
 
+def _fractional_extent(grid, lattice_vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """``(inverse, lowest, highest, widths)``: the inverse lattice, the range of the fractional coordinates of the
+    grid points along each lattice vector and ``|inverse[:, m]|``, the fractional width of one bohr along it."""
+
+    inverse = np.linalg.inv(np.asarray(lattice_vectors, dtype=float))
+    fractional = np.asarray(grid.coordinates) @ inverse
+    return inverse, fractional.min(axis=0), fractional.max(axis=0), np.linalg.norm(inverse, axis=0)
+
+
+def _reaching_translations(extent, position: np.ndarray, radius: float, translations: np.ndarray) -> np.ndarray:
+    """The translations whose ball of ``radius`` around ``position + T`` can hold a grid point (bohr).
+
+    A point ``p`` within ``radius`` of a centre ``c`` has ``|f_m(p) - f_m(c)| <= radius |inverse[:, m]|`` along every
+    lattice vector (``f = x @ inverse``), so a centre whose interval misses the fractional range of the grid holds
+    none: the support finder would return no rows for it.  The test keeps a margin of 1e-9 for round-off; the
+    images it keeps are searched as before, in their order.
+    """
+
+    inverse, lowest, highest, widths = extent
+    if len(translations) <= 1:
+        return translations
+    centres = (np.asarray(position, dtype=float) + translations) @ inverse
+    margin = 1.0e-9 * (1.0 + np.abs(centres))
+    half = radius * widths
+    keep = np.all((centres + half + margin >= lowest) & (centres - half - margin <= highest), axis=1)
+    return translations[keep]
+
+
 def build_nonlocal_projectors(
     grid: RealSpaceGrid,
     atoms: Sequence[Atom],
@@ -1202,6 +1246,14 @@ def build_nonlocal_projectors(
     # Convert a continuous projector beta(r_i) into the Euclidean grid vector
     # b_i=sqrt(dV_grid)*beta(r_i).
     sqrt_dv = np.sqrt(grid.volume_element)
+    # the images of a bulk cell whose support ball can hold a grid point (_reaching_translations)
+    extent = (
+        _fractional_extent(grid, lattice_vectors)
+        if lattice_vectors is not None and periodic_dimensions == 3 and not getattr(grid, "is_confined_periodic", False)
+        else None
+    )
+    # one radial table (and spline) per species and channel, shared by its atoms and their images
+    channels: dict[tuple[str, int], tuple[np.ndarray, float, ParsecRadialSpline | None]] = {}
 
     for atom_index, atom in enumerate(atoms):
         potential = potentials[atom.symbol]
@@ -1215,6 +1267,8 @@ def build_nonlocal_projectors(
             translations = _periodic_image_translations(lattice_vectors, support_radius, periodic_dimensions)
         else:
             translations = _image_translations(grid, lattice_vectors, position, support_radius)
+        if extent is not None:
+            translations = _reaching_translations(extent, position, support_radius, translations)
 
         # KB projectors are localized.  Restrict all following interpolation
         # and harmonic work to grid points within their radial support.
@@ -1249,9 +1303,23 @@ def build_nonlocal_projectors(
 
             # radial_projector returns DeltaV_l*u_l/r/sqrt(|D_l|) together
             # with sign(D_l), which is applied by NonlocalProjectorOperator.
-            radial_grid, denominator_sign = potential.radial_projector(
-                angular_momentum, local_l
-            )
+            key = (atom.symbol, angular_momentum)
+            if key not in channels:
+                radial_grid, denominator_sign = potential.radial_projector(
+                    angular_momentum, local_l
+                )
+                channels[key] = (
+                    radial_grid,
+                    denominator_sign,
+                    ParsecRadialSpline.from_positive_grid(
+                        potential.radii,
+                        radial_grid,
+                        grid.settings.stencil_half_width,
+                    )
+                    if specifications[atom.symbol].use_spline
+                    else None,
+                )
+            radial_grid, denominator_sign, radial_spline = channels[key]
             # One column per real harmonic (2*l+1 of them), shared by every
             # image below: a periodic projector is one function per (atom,
             # l, m), not one per image, so images accumulate into the same
@@ -1266,12 +1334,7 @@ def build_nonlocal_projectors(
                 labels.append((atom_index, angular_momentum, harmonic_index))
 
             for support_rows, relative_support, radius_support, phase in images:
-                if specifications[atom.symbol].use_spline:
-                    radial_spline = ParsecRadialSpline.from_positive_grid(
-                        potential.radii,
-                        radial_grid,
-                        grid.settings.stencil_half_width,
-                    )
+                if radial_spline is not None:
                     # ``nonloc.F90`` clamps the radial interpolation coordinate
                     # to the first positive POTRE radius.  Angular harmonics
                     # still use the actual atom-image-grid displacement below.
@@ -1290,8 +1353,12 @@ def build_nonlocal_projectors(
 
                 # The same normalized radial function is paired with every one
                 # of the 2*l+1 real harmonics in this angular-momentum channel.
+                # A grid point on the atom up to round-off takes the center's
+                # zero-limit direction (the radial value is clamped there too).
                 harmonics = real_spherical_harmonics(
-                    angular_momentum, relative_support
+                    angular_momentum,
+                    relative_support,
+                    center_radius=min(float(potential.radii[0]), PROJECTOR_CENTER_ROUND_OFF),
                 )
                 for harmonic_index, target_column in enumerate(channel_columns):
                     projector = phase * (sqrt_dv * radial * harmonics[:, harmonic_index])

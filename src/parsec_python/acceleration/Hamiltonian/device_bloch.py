@@ -160,6 +160,10 @@ class DeviceBlochOperator:
     # Gershgorin's bound of those terms (Ry), set with them: the filter's upper
     # bound takes it in (chebff_spinor._lanczos_upper_bound, orbital_term_margin).
     spectral_margin = 0.0
+    # The local term as one kernel on an orthorhombic periodic grid (.bloch_stencil.BlochStencil) with the
+    # diagonal it adds (c_0 + V + |k|^2), set by a converter with ``fused_stencil``; None: the sparse products.
+    stencil = None
+    stencil_diagonal = None
 
     def __init__(
         self,
@@ -282,19 +286,23 @@ class DeviceBlochOperator:
         # the stencils reach rows of the neighbouring ranks when the basis is distributed: start the
         # exchange, apply the stencils to the local rows meanwhile, then add the part on the halo rows
         pending = None if self.halo_begin is None else self.halo_begin(block)
-        real = block.view(xp.float64)
-        # cuSPARSE returns a column-major product; the complex view below needs
-        # row-major data, so make it so (a no-op for NumPy, which already is).
-        result = xp.ascontiguousarray(self.laplacian @ real).view(xp.complex128)
-        if self.k_gradient is not None:
-            result -= 2j * xp.ascontiguousarray(self.k_gradient @ real).view(xp.complex128)
-        if pending is not None:
-            halo_real = self.halo_finish(pending).view(xp.float64)
-            if self.laplacian_halo is not None:
-                result += xp.ascontiguousarray(self.laplacian_halo @ halo_real).view(xp.complex128)
-            if self.k_gradient_halo is not None:
-                result -= 2j * xp.ascontiguousarray(self.k_gradient_halo @ halo_real).view(xp.complex128)
-        result += self.diagonal[:, None] * block
+        if self.stencil is not None and pending is None:
+            # -nabla^2 - 2i k.grad + V + |k|^2 in one kernel (orthorhombic periodic grid)
+            result = self.stencil.apply(block, self.stencil_diagonal)
+        else:
+            real = block.view(xp.float64)
+            # cuSPARSE returns a column-major product; the complex view below needs
+            # row-major data, so make it so (a no-op for NumPy, which already is).
+            result = xp.ascontiguousarray(self.laplacian @ real).view(xp.complex128)
+            if self.k_gradient is not None:
+                result -= 2j * xp.ascontiguousarray(self.k_gradient @ real).view(xp.complex128)
+            if pending is not None:
+                halo_real = self.halo_finish(pending).view(xp.float64)
+                if self.laplacian_halo is not None:
+                    result += xp.ascontiguousarray(self.laplacian_halo @ halo_real).view(xp.complex128)
+                if self.k_gradient_halo is not None:
+                    result -= 2j * xp.ascontiguousarray(self.k_gradient_halo @ halo_real).view(xp.complex128)
+            result += self.diagonal[:, None] * block
         if self.kinetic is not None:
             result += self._kinetic_term(block)
         if self.projector_forward is not None:
@@ -332,6 +340,46 @@ class DeviceBlochOperator:
 
                 cublas.gemm("N", "N", projectors, coefficients, result, factor, 1.0)
         return result
+
+    @property
+    def fused_recurrence(self) -> bool:
+        """Whether :meth:`chebyshev_step` takes a step of the filter recurrence in the stencil kernel: the
+        kernel of the local term and no term besides the projectors (no meta-GGA, LDA+U or exchange)."""
+        return (
+            self.stencil is not None
+            and self.halo_begin is None
+            and not self.spinor
+            and self.kinetic is None
+            and self.hubbard is None
+            and self.exchange is None
+        )
+
+    def chebyshev_step(self, current, previous, center: float, scale: float, before=None, after=None):
+        """``((H current - center current) scale - before previous) after`` (``before``, ``after`` per
+        column; ``previous`` may be ``None``): the projector products, then one pass of the stencil kernel
+        (:meth:`.bloch_stencil.BlochStencil.apply`).  Only where :attr:`fused_recurrence`."""
+        xp = self.xp
+        nonlocal_part = None
+        if self.projector_forward is not None:
+            if self.projector_real:
+                coefficients = self._real_product(self.projector_adjoint, current)
+            else:
+                coefficients = self.projector_adjoint @ current
+            coefficients *= self.projector_signs[:, None]
+            if self.projector_real:
+                nonlocal_part = self._real_product(self.projector_forward, coefficients)
+            else:
+                nonlocal_part = xp.ascontiguousarray(self.projector_forward @ coefficients)
+        return self.stencil.apply(
+            current,
+            self.stencil_diagonal,
+            added=nonlocal_part,
+            previous=previous,
+            center=center,
+            scale=scale,
+            before=before,
+            after=after,
+        )
 
     def _kinetic_term(self, block):
         """The meta-GGA terms of a complex block: ``sum_c (G_c + i k_c)^H diag(vtau) (G_c + i k_c)`` and,
@@ -592,6 +640,11 @@ class DeviceBlochConverter:
         self._exchange_uploads: dict[int, tuple[Any, Any]] = {}
         # PARSEC_KPOINT_SOLVER=host keeps the host eigensolver (only the filter on the device)
         self.device_solver = os.environ.get("PARSEC_KPOINT_SOLVER", "device").strip().lower() != "host"
+        # The local term of a scalar Bloch operator on an orthorhombic periodic grid as one CUDA kernel
+        # (.bloch_stencil), where the matrices are that stencil; off: the sparse products (the one-node
+        # solver keeps them, so that its numbers stay those of before the kernel; the MPI k-point pools set it).
+        self.fused_stencil = False
+        self._stencils: dict[tuple, Any] = {}
 
     def eigensolve(self, hamiltonian, number_of_states: int, settings, attempt: int = 0):
         """Lowest ``number_of_states`` pairs of a host Hamiltonian with the device-resident solver.
@@ -707,9 +760,39 @@ class DeviceBlochConverter:
         forward, adjoint, signs = self._cached(nonlocal_operator, build)
         return forward, adjoint, signs, projector_real
 
-    def _scalar_parts(self, hamiltonian):
+    def _bloch_stencil(self, hamiltonian):
+        """The kernel of the local term of ``hamiltonian`` where :attr:`fused_stencil` asks for it and its
+        matrices are an orthorhombic periodic stencil (:mod:`.bloch_stencil`), else ``None``."""
+        if not self.fused_stencil or self.backend.name != "cupy" or self._operator_extras():
+            return None
+        gradient = getattr(hamiltonian, "gradient", None)
+        laplacian = getattr(hamiltonian, "negative_laplacian", None)
+        if gradient is None or laplacian is None or _host_kinetic_term(hamiltonian) is not None:
+            return None
+        from .bloch_stencil import AxialStencils, BlochStencil, grid_shape_of
+
+        anchors = (laplacian, *tuple(gradient))
+        key = ("stencils",) + tuple(id(item) for item in anchors)
+        entry = self._stencils.get(key)
+        if entry is None or any(first is not second for first, second in zip(entry[0], anchors)):
+            shape = grid_shape_of(tuple(gradient), laplacian.shape[0])
+            stencils = None if shape is None else AxialStencils.from_matrices(shape, laplacian, tuple(gradient))
+            entry = (anchors, stencils, {})
+            self._stencils[key] = entry
+        _, stencils, by_k = entry
+        if stencils is None:
+            return None
+        k_point = tuple(
+            float(value) for value in np.asarray(getattr(hamiltonian, "k_point", np.zeros(3)), dtype=float).reshape(3)
+        )
+        found = by_k.get(k_point)
+        if found is None:
+            found = by_k[k_point] = BlochStencil(self.backend.cp, stencils, k_point)
+        return found
+
+    def _scalar_parts(self, hamiltonian, *, derivatives: bool = True):
         backend = self.backend
-        laplacian, k_gradient = self._derivative_parts(hamiltonian)
+        laplacian, k_gradient = self._derivative_parts(hamiltonian) if derivatives else (None, None)
         # an isolated Hamiltonian keeps its potential as ``effective_potential``
         host_diagonal = getattr(hamiltonian, "_diagonal", None)
         if host_diagonal is None:
@@ -848,9 +931,14 @@ class DeviceBlochConverter:
         backend.use()
         scalar = getattr(hamiltonian, "scalar_hamiltonian", None)
         spinor = scalar is not None or hasattr(hamiltonian, "soc_projectors")
-        parts = self._scalar_parts(scalar if scalar is not None else hamiltonian)
-        laplacian, k_gradient, diagonal, forward, adjoint, signs, projector_real = parts
         host_scalar = scalar if scalar is not None else hamiltonian
+        stencil = None if spinor else self._bloch_stencil(host_scalar)
+        if stencil is not None:
+            # the kernel replaces the stencil matrices: they are not uploaded
+            parts = self._scalar_parts(host_scalar, derivatives=False)
+        else:
+            parts = self._scalar_parts(host_scalar)
+        laplacian, k_gradient, diagonal, forward, adjoint, signs, projector_real = parts
         global_size = int(host_scalar.negative_laplacian.shape[0])
         soc, delta, field = None, None, None
         if spinor:
@@ -876,6 +964,9 @@ class DeviceBlochConverter:
             global_grid_size=global_size,
             **self._operator_extras(),
         )
+        if stencil is not None:
+            operator.stencil = stencil
+            operator.stencil_diagonal = stencil.diagonal(diagonal)
         term = _host_kinetic_term(host_scalar)
         if term is not None:
             if spinor or operator.row_bounds is not None:

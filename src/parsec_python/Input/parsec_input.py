@@ -26,6 +26,7 @@ from ..models import (
     HartreeSettings,
     InitialDensitySettings,
     MIXING_METHODS,
+    MIXING_PRECONDITIONERS,
     MixingSettings,
     NSCFSettings,
     OutputFileSettings,
@@ -551,20 +552,20 @@ def _plain_float(text: str, label: str) -> float:
     return float(match.group(0).replace("d", "e").replace("D", "e"))
 
 
-def _inverse_length_bohr(text: str) -> float:
-    """``Screening_Parameter`` in bohr^-1: a number, optionally ``bohr^-1`` or ``ang^-1``."""
+def _inverse_length_bohr(text: str, label: str = "Screening_Parameter") -> float:
+    """``label`` (``Screening_Parameter``) in bohr^-1: a number, optionally ``bohr^-1`` or ``ang^-1``."""
 
     value = str(text).strip()
     match = _FLOAT_PATTERN.match(value)
     if match is None:
-        raise ValueError(f"Screening_Parameter must be a number, got {text!r}")
+        raise ValueError(f"{label} must be a number, got {text!r}")
     number = float(match.group(0).replace("d", "e").replace("D", "e"))
     unit = re.sub(r"\s+", "", value[match.end():].lower())
     if unit in ("", "bohr^-1", "1/bohr", "bohr-1"):
         return number
     if unit in ("ang^-1", "1/ang", "ang-1", "angstrom^-1", "1/angstrom"):
         return number / ANGSTROM_TO_BOHR
-    raise ValueError(f"Screening_Parameter: unknown unit {unit!r} (bohr^-1 or ang^-1)")
+    raise ValueError(f"{label}: unknown unit {unit!r} (bohr^-1 or ang^-1)")
 
 
 def _check_meta_gga_request(
@@ -722,6 +723,120 @@ def _check_libxc_request(scf, *, specifications, embedding: bool) -> None:
             f"the libxc functional {scf.xc_functional} runs unpolarized or with collinear spin; not "
             "together with " + ", ".join(refused)
         )
+
+
+#: The lower-bound rule of the later-SCF SUBSPACE filter of a periodic cell
+#: (periodicity 1 wire, 2 slab, 3 bulk) whose input has no ``Smart_Subspace``
+#: line: ``monotone`` is the earlier PARSEC's ``max(r_max, 0)``, which a bulk
+#: cell's spectrum far below 0 Ry keeps at 0 for the whole SCF; ``smart`` is
+#: PARSEC 1.5's ``Smart_Subspace: .true.`` (the bound at the largest saved Ritz
+#: value, :func:`parsec_python.Eigensolvers.subspace.subspace_filter_bounds`).
+#: Clusters always take the input's rule (``monotone`` without the line).  Bulk
+#: cells take ``smart`` since 2026-11-08 (bulk diamond of
+#: 512 atoms: 16 SCF iterations at the converged energy against 65 and 4.9
+#: mRy/atom high); a slab keeps a level near 0 and was slower with ``smart``
+#: (h-BN 30 iterations against 25, the same energy), wires were not measured.
+DEFAULT_PERIODIC_SUBSPACE_LOWER_BOUND = {1: "monotone", 2: "monotone", 3: "smart"}
+
+#: The short-Lanczos upper bound of the Chebyshev filters (CHEBFF, CHEBDAV,
+#: SUBSPACE) of a periodic cell whose input has no ``Bounds_Method`` or
+#: ``Bounds_Iter`` line: ``parsec`` is the earlier PARSEC's spectral radius
+#: ``max(theta_max, |theta_min|)``, which for a bulk cell whose eigenvalues lie
+#: far below 0 Ry (this code's periodic potential) takes ``|theta_min|`` and
+#: widens the filter interval several times; ``lanczos`` is PARSEC 1.5's
+#: ``Bounds_Method: lanczos`` (``theta_max``, ``max(degree/2, Bounds_Iter)``
+#: steps; :func:`parsec_python.Eigensolvers.spectral_bounds.lanczos_bound_from_ritz`).
+#: Clusters always take the input's bound (``parsec`` without the lines).
+DEFAULT_PERIODIC_LANCZOS_BOUNDS = {1: "parsec", 2: "parsec", 3: "parsec"}
+
+#: The preconditioner of ``Mixing_Preconditioner: auto`` (the default) for
+#: ``Boundary_Conditions: bulk``; every other cell mixes without one.  ``none``
+#: keeps the mixing of PARSEC; ``kerker`` here would make the Kerker filter the
+#: default of bulk cells (Mixer/preconditioner.py), the combinations of
+#: :func:`_check_mixing_preconditioner` excepted.
+DEFAULT_BULK_MIXING_PRECONDITIONER = "none"
+
+
+def _mixing_preconditioner_fields(scalar, one, *, periodicity: int, warnings: list) -> dict:
+    """``Mixing_Preconditioner``, ``Kerker_Wavevector`` and ``Kerker_Dielectric_Constant`` (PARSEC.py).
+
+    Fortran PARSEC has no preconditioner of its mixers.  ``auto`` (the default)
+    is :data:`DEFAULT_BULK_MIXING_PRECONDITIONER` for a 3-D periodic cell and
+    ``none`` for clusters, wires and slabs; ``kerker`` filters the residual of
+    a bulk cell by ``P(G) = (G^2 + q0^2/eps)/(G^2 + q0^2)``, ``P(0) = 1``, with
+    ``q0`` = ``Kerker_Wavevector`` (bohr^-1 by default, or ``ang^-1``) and
+    ``eps`` = ``Kerker_Dielectric_Constant`` (default infinite: Kerker's
+    ``G^2/(G^2 + q0^2)``).  Returns the :class:`MixingSettings` fields; at
+    ``none`` the two numbers keep their defaults (a warning names them if given).
+    """
+
+    name = _normalize_label(one("mixing_preconditioner", "auto"))
+    if name not in ("auto", *MIXING_PRECONDITIONERS):
+        raise ParsecInputError(
+            f"Mixing_Preconditioner: unknown preconditioner {name!r}; the choices are auto, "
+            + ", ".join(MIXING_PRECONDITIONERS)
+        )
+    if name == "auto":
+        name = DEFAULT_BULK_MIXING_PRECONDITIONER if periodicity == 3 else "none"
+    given = [key for key in ("kerker_wavevector", "kerker_dielectric_constant") if key in scalar]
+    if name != "kerker":
+        for key in given:
+            warnings.append(
+                f"{'Kerker_Wavevector' if key == 'kerker_wavevector' else 'Kerker_Dielectric_Constant'} "
+                "has no effect without Mixing_Preconditioner: kerker"
+            )
+        return {"preconditioner": name}
+    fields = {"preconditioner": name}
+    if "kerker_wavevector" in scalar:
+        fields["kerker_wavevector"] = _inverse_length_bohr(
+            one("kerker_wavevector"), label="Kerker_Wavevector"
+        )
+    if "kerker_dielectric_constant" in scalar:
+        text = str(one("kerker_dielectric_constant")).strip().lower()
+        fields["kerker_dielectric_constant"] = (
+            float("inf")
+            if text in ("inf", "infinity")
+            else _strict_float(text, label="Kerker_Dielectric_Constant")
+        )
+    return fields
+
+
+def _check_mixing_preconditioner(mixing, scf, *, periodicity: int, specifications, embedding: bool, requested: bool):
+    """The mixing settings with the preconditioner the run can take.
+
+    ``Mixing_Preconditioner: kerker`` is implemented for 3-D periodic cells,
+    unpolarized or with collinear spin, at the Gamma point and on k-point
+    meshes, with LDA/GGA functionals (native or libxc).  Where it is not (a
+    cluster, wire or slab, a meta-GGA, a hybrid, spin-orbit coupling,
+    non-collinear magnetism, FDET) a request is refused by name, and ``auto``
+    falls back to ``none``.
+    """
+
+    if mixing.preconditioner == "none":
+        return mixing
+    refused = [
+        label
+        for condition, label in (
+            (periodicity != 3, "a cluster, wire or slab (3-D periodic cells only)"),
+            (scf.is_meta_gga, "a meta-GGA (its joined (V, vtau) mixing)"),
+            (scf.is_hybrid, "a hybrid functional (the mixers of its Fock loop)"),
+            (
+                scf.self_consistent_spin_orbit
+                or any(specification.spin_orbit for specification in specifications.values()),
+                "spin-orbit coupling (SO_PSP, SO_from_scratch)",
+            ),
+            (scf.noncollinear, "non-collinear magnetism"),
+            (embedding, "FDET (Potential_Field)"),
+        )
+        if condition
+    ]
+    if not refused:
+        return mixing
+    if requested:
+        raise UnsupportedParsecOptionError(
+            "Mixing_Preconditioner: kerker is not implemented together with " + ", ".join(refused)
+        )
+    return replace(mixing, preconditioner="none")
 
 
 def _normalize_label(value: str) -> str:
@@ -2487,6 +2602,9 @@ def _parse_parsec_input(
         "mixing_step_limit",
         "mixing_growth_trigger",
         "mixing_backoff",
+        "mixing_preconditioner",
+        "kerker_wavevector",
+        "kerker_dielectric_constant",
         "solver_lpole",
         "full_hartree",
         "hartree_boundary_tolerance",
@@ -2880,6 +2998,9 @@ def _parse_parsec_input(
     general_periodic_grid = False
     monkhorst_pack_dimensions: tuple[int, int, int] | None = None
     monkhorst_pack_shift: tuple[float, float, float] | None = None
+    # The Monkhorst_Pack_Grid and Monkhorst_Pack_Shift of a bulk cell on the default routines (a mesh of more than
+    # one point), whose wedge _default_routines_wedge may take instead of the full list.
+    default_routines_mesh: tuple | None = None
     kpoint_notes: list[str] = []
     explicit_kpoint_array: np.ndarray | None = None
     explicit_kpoint_weights: np.ndarray | None = None
@@ -3087,7 +3208,8 @@ def _parse_parsec_input(
                     # .false. for both):
                     # Fortran (irrbz.f90): the points are k = (i + shift)/n, i = 0 ... n-1, in coordinates of the
                     # reciprocal lattice vectors, so a zero shift gives a Gamma-centred mesh.  The mesh is kept as an
-                    # explicit list of equally weighted points.
+                    # explicit list of equally weighted points, except where a bulk cell's mesh is reduced to its
+                    # irreducible wedge below (_default_routines_wedge).
                     shift_blocks = blocks["monkhorst_pack_shift"]
                     if len(shift_blocks) != 1 or len(shift_blocks[0].value) != 1:
                         raise ParsecInputError("Monkhorst_Pack_Shift needs one line of numbers")
@@ -3109,6 +3231,13 @@ def _parse_parsec_input(
                     reciprocal = 2.0 * np.pi * np.linalg.inv(periodic_cell.lattice_vectors).T
                     explicit_kpoint_array = fractions @ reciprocal
                     explicit_kpoint_weights = np.full(len(fractions), 1.0 / len(fractions))
+                    if periodicity == 3 and len(fractions) > 1:
+                        # A bulk cell's mesh may be reduced to the wedge of the operations that map this grid onto
+                        # itself, once the rest of the input is known (_default_routines_wedge).
+                        default_routines_mesh = (
+                            monkhorst_pack_dimensions,
+                            tuple(float(value) for value in shift_values),
+                        )
                     monkhorst_pack_dimensions = None
                 else:
                     # usrinputfile.F90:977-993: one line, the shift of each
@@ -3190,6 +3319,12 @@ def _parse_parsec_input(
                 )
             # Unequal weights are normalized to one (init_var.F90:365-367);
             # the SCF drivers weight every level by its k-point (flevel.f90).
+            if periodicity == 3 and not np.allclose(
+                explicit_kpoint_weights, explicit_kpoint_weights[0], rtol=1.0e-12, atol=0.0
+            ):
+                # a bulk cell's weighted list runs on the Fortran-derived routines (their grid and space group, as
+                # before 2026-11-08) unless the input says Use_Fortran_Routines: .false.
+                fortran_by_default(_routines_module.WEIGHTED_LIST_FEATURE)
         elif kpoint_method != "none":
             raise ParsecInputError(
                 f"Kpoint_Method must be 'none', 'mp', or 'manual', got {kpoint_method!r}"
@@ -4262,6 +4397,26 @@ def _parse_parsec_input(
         ),
         warnings=warnings,
     )
+    # The SUBSPACE lower-bound rule of a periodic cell whose input has no
+    # Smart_Subspace line (DEFAULT_PERIODIC_SUBSPACE_LOWER_BOUND, by periodicity).
+    periodic_rule = DEFAULT_PERIODIC_SUBSPACE_LOWER_BOUND.get(periodicity, "monotone")
+    if (
+        filtering
+        and "smart_subspace" not in scalar
+        and "subspace_lower_bound" not in scalar
+        and periodic_rule != "monotone"
+    ):
+        solver_options.eigensolver["subspace_lower_bound"] = periodic_rule
+    # The upper bound of a periodic cell whose input has no Bounds_Method or
+    # Bounds_Iter line (DEFAULT_PERIODIC_LANCZOS_BOUNDS, by periodicity).
+    periodic_bounds = DEFAULT_PERIODIC_LANCZOS_BOUNDS.get(periodicity, "parsec")
+    if (
+        filtering
+        and "bounds_method" not in scalar
+        and "bounds_iter" not in scalar
+        and periodic_bounds != "parsec"
+    ):
+        solver_options.eigensolver["lanczos_bounds"] = periodic_bounds
     if solver_options.filter_restart is not None:
         # parsec_python.SCF.filter_restart, applied by the ionic loops.
         solver_options.eigensolver["filter_restart"] = solver_options.filter_restart
@@ -4340,6 +4495,7 @@ def _parse_parsec_input(
         preferred_type=_integer(
             one("mixing_preferred_type", "1"), label="Mixing_Preferred_Type"
         ),
+        **_mixing_preconditioner_fields(scalar, one, periodicity=periodicity, warnings=warnings),
     )
     # Keywords PARSEC reads but the selected mixer never uses.
     multisecant_keys = (
@@ -4691,9 +4847,62 @@ def _parse_parsec_input(
         # below, once bandstruc and nscf_kpoints are read.
         pass
     elif is_periodic and not routines.fortran:
-        # Andrew Grieder's routines find no space group of a crystal (no IBZ, no
-        # symmetrization, no fractional translations in the grid).
-        pass
+        # Andrew Grieder's routines put no fractional translations in the grid.  The Monkhorst_Pack_Shift mesh of a
+        # bulk single point of scalar orbitals is reduced by the operations of the crystal that map his grid onto
+        # itself, with time reversal, and the density is symmetrized with them (_default_routines_wedge); a hybrid
+        # (its exchange sums over the full mesh), spinors and moving atoms keep the full list of equal weights.
+        keeps_full_mesh = bool(
+            scf.is_hybrid
+            or noncollinear
+            or self_consistent_spin_orbit
+            or any(specification.spin_orbit for specification in specifications.values())
+            or atoms_move
+            or single_point_forces
+        )
+        weighted_list = bool(
+            explicit_kpoint_weights is not None
+            and not np.allclose(explicit_kpoint_weights, explicit_kpoint_weights[0], rtol=1.0e-12, atol=0.0)
+        )
+        averages = periodicity == 3 and (
+            (default_routines_mesh is not None and not keeps_full_mesh)
+            or (weighted_list and not (atoms_move or single_point_forces or scf.is_hybrid
+                                       or noncollinear or self_consistent_spin_orbit
+                                       or any(s.spin_orbit for s in specifications.values())))
+        )
+        if "symmetrize_charge_density" in scalar and symmetrize_density and not averages:
+            # these routines average the density of a reduced k-point set only (a Monkhorst_Pack_Shift wedge, a
+            # weighted Kpoint_List of a bulk single point); any other request runs on the Fortran-derived ones, as
+            # every Symmetrize_Charge_Density: .true. did before 2026-11-08
+            fall_back(
+                "Symmetrize_Charge_Density: .true. (the default routines average the density of a Monkhorst_Pack_Shift "
+                "wedge or a weighted Kpoint_List of a bulk single point of scalar orbitals only)"
+            )
+        if default_routines_mesh is not None and not keeps_full_mesh:
+            symmetrize_density, space_group = _default_routines_wedge(
+                atoms,
+                periodic_cell,
+                grid,
+                default_routines_mesh,
+                ignore_symmetry=ignore_symmetry,
+                symmetrize_density=symmetrize_density,
+                symmetrize_given="symmetrize_charge_density" in scalar,
+                warnings=warnings,
+            )
+            monkhorst_pack_dimensions, monkhorst_pack_shift = default_routines_mesh
+            explicit_kpoint_array = None
+            explicit_kpoint_weights = None
+        if weighted_list and periodicity == 3 and not (atoms_move or single_point_forces):
+            # A Kpoint_List of unequal weights runs as given; Symmetrize_Charge_Density averages its density over
+            # the operations that map the grid onto itself (an irreducible wedge; scalar orbitals, no hybrid: any
+            # other request went to the Fortran-derived routines above).
+            symmetrize_density, space_group = _default_routines_list_symmetry(
+                atoms,
+                periodic_cell,
+                grid,
+                ignore_symmetry=ignore_symmetry,
+                symmetrize_density=symmetrize_density,
+                warnings=warnings,
+            )
     elif is_periodic:
         weighted_kpoints = bool(
             explicit_kpoint_weights is not None
@@ -5407,6 +5616,7 @@ def _parse_parsec_input(
         scf,
         is_periodic=is_periodic,
         wire_or_slab=wire_or_slab,
+        bulk=periodicity == 3,
         warnings=warnings,
     )
     if is_periodic and not wire_or_slab and not routines.fortran:
@@ -5481,6 +5691,14 @@ def _parse_parsec_input(
         molecular_dynamics=molecular_dynamics.enabled,
         extrapolation=potential_extrapolation,
         grid_shift=tuple(float(value) for value in getattr(grid, "shift", (0.0, 0.0, 0.0))),
+    )
+    mixing = _check_mixing_preconditioner(
+        mixing,
+        scf,
+        periodicity=periodicity,
+        specifications=specifications,
+        embedding=fdet.embedding is not None,
+        requested=_normalize_label(one("mixing_preconditioner", "auto")) != "auto",
     )
     if scf.is_libxc:
         _check_libxc_request(scf, specifications=specifications, embedding=fdet.embedding is not None)
@@ -5823,6 +6041,121 @@ def _periodic_symmetry(
         symmetrize_density or fortran_kpoints or forces_of_weighted_kpoints
     ) and not failed_check
     return symmetrize_density, (group if keep else None), grid
+
+
+def _default_routines_wedge(
+    atoms,
+    periodic_cell: PeriodicCell,
+    grid: PeriodicGridSettings,
+    mesh,
+    *,
+    ignore_symmetry: bool,
+    symmetrize_density: bool,
+    symmetrize_given: bool,
+    warnings: list[str],
+):
+    """The symmetry of a ``Monkhorst_Pack_Shift`` mesh of a bulk cell on the default routines.
+
+    ``mesh`` is ``(Monkhorst_Pack_Grid, Monkhorst_Pack_Shift)``.  Returns ``(symmetrize_density, space_group)``; the
+    caller keeps the mesh as Fortran's grid ``k = (i + s)/n`` (``monkhorst_pack_shift``), which
+    :func:`parsec_python.Grid.kpoints.kpoint_sampling_details` reduces by ``space_group`` (the identity for
+    ``None``) and time reversal, as ``irrbz`` does on the Fortran-derived routines.  Their grid follows the space
+    group (``adjust_step``); Andrew Grieder's keeps the points of ``Grid_Spacing``, so the group here is the subgroup
+    of the crystal's operations that map his grid onto itself
+    (:func:`parsec_python.Grid.space_group.find_grid_space_group`) and the k-point mesh onto itself
+    (:func:`parsec_python.Grid.kpoints.mesh_preserving_operations`: then the wedge with the averaged density is the
+    full mesh, which these routines took before), with which the density is averaged on that grid
+    (``Symmetrize_Charge_Density``, true by default as on Fortran's k-point path; ``usrinputfile.F90:2548-2552``).
+    Diamond in the cube with 18 points per edge keeps the 24 operations of ``Td`` about an atom: with time reversal
+    the wedge of ``Oh`` (Gamma-centred 2^3, 3^3, 4^3 meshes: 4, 4 and 10 points).
+
+    ``Ignore_Symmetry`` or ``Symmetrize_Charge_Density: .false.``: time reversal alone (``k`` and ``-k`` have the
+    same density, which needs no average).
+    """
+
+    from ..Grid.kpoints import mesh_preserving_operations
+    from ..Grid.pbc import default_periodic_grid_counts
+    from ..Grid.space_group import find_grid_space_group, find_space_group
+
+    if ignore_symmetry or (symmetrize_given and not symmetrize_density):
+        if ignore_symmetry and symmetrize_given and symmetrize_density:
+            warnings.append(
+                "Symmetrize_Charge_Density changes nothing with Ignore_Symmetry: the Monkhorst_Pack_Shift mesh is "
+                "reduced by time reversal alone"
+            )
+        return symmetrize_density, None
+    lattice_vectors = np.asarray(periodic_cell.lattice_vectors, dtype=float)
+    counts = default_periodic_grid_counts(periodic_cell, grid)
+    try:
+        on_grid = find_grid_space_group(lattice_vectors, atoms, counts, grid.shift)
+        crystal = find_space_group(lattice_vectors, atoms)
+    except ValueError as error:
+        raise ParsecInputError(f"symmetry operations: {error}") from error
+    group = mesh_preserving_operations(on_grid, *mesh)
+    if group.order <= 1:
+        return symmetrize_density, None
+    if crystal.order > group.order:
+        dropped = []
+        if on_grid.order < crystal.order:
+            dropped.append(
+                f"{crystal.order - on_grid.order} have fractional translations of no whole number of grid steps "
+                "(the grid of Grid_Spacing, " + "x".join(str(int(value)) for value in counts) + " points)"
+            )
+        if group.order < on_grid.order:
+            dropped.append(f"{on_grid.order - group.order} more do not map the k-point mesh onto itself")
+        warnings.append(
+            f"Monkhorst_Pack_Shift: the k-point mesh is reduced to the irreducible wedge of {group.order} of the "
+            f"{crystal.order} operations of the space group and time reversal, and the density is symmetrized "
+            "with them (" + "; ".join(dropped) + ")"
+        )
+    return True, group
+
+
+def _default_routines_list_symmetry(
+    atoms,
+    periodic_cell: PeriodicCell,
+    grid: PeriodicGridSettings,
+    *,
+    ignore_symmetry: bool,
+    symmetrize_density: bool,
+    warnings: list[str],
+):
+    """The density average of a ``Kpoint_List`` of unequal weights of a bulk single point on the default routines.
+
+    Returns ``(symmetrize_density, space_group)``.  The k-point drivers weight every level by its point (the Fermi
+    level, the density and the band energy, ``flevel.f90``/``newrho.F90``/``totnrg.f90``), so the list runs as
+    given, as in PARSEC, whose ``Symmetrize_Charge_Density`` is false by default for such a list: the density is that
+    of the listed points, which is the density of the cell where the list samples the whole zone.  A list that is an
+    irreducible wedge needs the average over the operations of its reduction: ``Symmetrize_Charge_Density: .true.``
+    takes those of the crystal that map the grid of ``Grid_Spacing`` onto itself
+    (:func:`parsec_python.Grid.space_group.find_grid_space_group`; the weights must then be those of that group's
+    stars, which the input vouches for).  Without it, or with ``Ignore_Symmetry``, nothing is averaged, and a warning
+    says so.
+    """
+
+    from ..Grid.pbc import default_periodic_grid_counts
+    from ..Grid.space_group import find_grid_space_group
+
+    if not symmetrize_density or ignore_symmetry:
+        warnings.append(
+            "Kpoint_List with unequal weights: the density is that of the listed points with their weights; for "
+            "an irreducible wedge give Symmetrize_Charge_Density: .true. (without Ignore_Symmetry), which averages "
+            "it over the operations of the space group that map the grid onto itself"
+        )
+        return symmetrize_density, None
+    lattice_vectors = np.asarray(periodic_cell.lattice_vectors, dtype=float)
+    counts = default_periodic_grid_counts(periodic_cell, grid)
+    try:
+        group = find_grid_space_group(lattice_vectors, atoms, counts, grid.shift)
+    except ValueError as error:
+        raise ParsecInputError(f"symmetry operations: {error}") from error
+    if group.order <= 1:
+        warnings.append(
+            "Symmetrize_Charge_Density changes nothing here: no operation of the space group but the identity maps "
+            "the grid of Grid_Spacing onto itself"
+        )
+        return symmetrize_density, None
+    return True, group
 
 
 def _bulk_symmetry_search_info(
@@ -7142,7 +7475,9 @@ def _default_routines_periodic_refusal(
 ) -> str | None:
     """What Andrew Grieder's routines refuse of a periodic input his parser takes, as a reason, or ``None``.
 
-    Unequal k-point weights; a slab with forces, relaxation or dynamics (his slab has energies only); collinear spin
+    Unequal k-point weights of a slab, or with forces, relaxation or dynamics (a bulk single point takes them as
+    given, :func:`_default_routines_list_symmetry`); a slab with forces, relaxation or dynamics (his slab has energies
+    only); collinear spin
     with k-points other than Gamma and forces (his CLI); a grid his rule refuses (an axis of ``n <= 2 M`` points, ``M``
     the stencil half width, with Fortran's ``adjust_step`` for a bulk cell; fewer than ``2 M`` in the plane of a slab
     with ``2 nint(L/2h)``; a side of 1000 steps or more).
@@ -7150,8 +7485,18 @@ def _default_routines_periodic_refusal(
 
     from ..Grid.pbc import fortran_points_per_axis
 
-    if kpoint_weights is not None and not np.allclose(kpoint_weights, kpoint_weights[0], rtol=1.0e-12, atol=0.0):
-        return "a Kpoint_List with unequal weights"
+    if (
+        (ionic or slab)
+        and kpoint_weights is not None
+        and not np.allclose(kpoint_weights, kpoint_weights[0], rtol=1.0e-12, atol=0.0)
+    ):
+        # A single point of a bulk cell takes the weights as given since 2026-11-08 (_default_routines_list_symmetry);
+        # the forces of a weighted list (a wedge) are completed over the space group by the Fortran-derived routines.
+        return (
+            "a Kpoint_List with unequal weights"
+            if slab
+            else "forces, relaxation or molecular dynamics with a Kpoint_List of unequal weights"
+        )
     if slab and ionic:
         return "forces, relaxation or molecular dynamics of a slab"
     gamma_only = (
@@ -7392,7 +7737,7 @@ def _mixing_summary(mixing: MixingSettings) -> str:
 
 
 def _periodic_potential_conventions(
-    scalar, one, optional_bool, grid, scf, *, is_periodic, wire_or_slab, warnings
+    scalar, one, optional_bool, grid, scf, *, is_periodic, wire_or_slab, warnings, bulk=None
 ):
     """``Periodic_Local_Potential``, ``Periodic_Alpha_Term``, ``Zero_Average_Vxc``.
 
@@ -7404,9 +7749,15 @@ def _periodic_potential_conventions(
     * ``Periodic_Alpha_Term: analytic`` (default, the ``q -> 0`` limit) or
       ``fortran`` (the finite difference of ``fourier_f.f90``), with
       ``g_space`` only;
-    * ``Zero_Average_Vxc: .true.``: Fortran's ``potshift``, the average of the
+    * ``Zero_Average_Vxc``: Fortran's ``potshift``, the average of the
       exchange-correlation potential of each spin channel removed at every
-      evaluation (default false).
+      evaluation.  The default since 2026-11-08 for an unpolarized collinear
+      3-D cell (PARSEC 1.5 always does it there; the total energy, the density
+      and the forces do not change, the eigenvalues and the Fermi level lose
+      the average of V_xc); ``.false.`` restores the earlier potential.  A
+      spin-polarized cell keeps it off unless asked for: each channel losing
+      its own average moves the channels against each other, which changes the
+      occupations and the energy of a magnetic cell.
 
     A cluster reads none of them (a warning says so); a wire or slab refuses
     the G-space potential (Fortran's ``ionpot_wire``/``ionpot_slab`` build
@@ -7420,6 +7771,16 @@ def _periodic_potential_conventions(
         for key in ("periodic_local_potential", "periodic_alpha_term", "zero_average_vxc")
         if key in scalar
     ]
+    if (
+        "zero_average_vxc" not in scalar
+        and is_periodic
+        and not wire_or_slab
+        and (bulk is None or bulk)
+        and not scf.spin_polarized
+        and not scf.noncollinear
+    ):
+        # PARSEC 1.5's potshift of a 3-D cell (not a slab of either routines), by default
+        scf = replace(scf, zero_average_xc_potential=True)
     if not given:
         return grid, scf
     if not is_periodic:
@@ -7572,7 +7933,19 @@ def summarize_translation(translation: ParsecInputTranslation) -> str:
             f"+/-{problem.eigensolver.filter_degree_delta}, "
             f"buffer={problem.eigensolver.subspace_buffer}"
         ),
-        _mixing_summary(problem.mixing),
+        _mixing_summary(problem.mixing)
+        + (
+            ""
+            if problem.mixing.preconditioner == "none"
+            else (
+                f", Kerker preconditioner q0={problem.mixing.kerker_wavevector:.4g} bohr^-1"
+                + (
+                    ""
+                    if problem.mixing.kerker_dielectric_constant == float("inf")
+                    else f" eps={problem.mixing.kerker_dielectric_constant:.4g}"
+                )
+            )
+        ),
         (
             "Initial density: "
             f"{problem.initial_density_settings.method}, "

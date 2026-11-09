@@ -139,7 +139,8 @@ SLOPES_ENV = "PARSEC_PERIODIC_FORCE_SLOPES"
 #: The distance below which ``1/|d|`` of a projector gradient is clamped (bohr), and at most the first radial knot:
 #: an atom within round-off of a grid point (ideal positions on the grid) gets the gradient of this distance instead
 #: of ``1/1e-15`` (found when both sets of routines were compared).  Far below any physical displacement, far above round-off.
-ROUND_OFF_DISTANCE = 1.0e-6
+#: The projectors take the same rule for their harmonics (``V_ion.ionic_potential.PROJECTOR_CENTER_ROUND_OFF``).
+ROUND_OFF_DISTANCE = _ionic_potential.PROJECTOR_CENTER_ROUND_OFF
 
 
 def radial_slope_setting() -> str:

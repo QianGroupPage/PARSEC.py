@@ -4,7 +4,9 @@ Periodic (Gamma-point) SCF preparation, reusing the isolated SCF loop.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+import threading
 import time
 from typing import Callable
 
@@ -69,6 +71,50 @@ from .single_point import _species_densities, initial_spin_densities
 from .single_point import run_scf as _run_scf
 
 
+class LazyGradient(Sequence):
+    """The three centred first-derivative matrices ``d/dx, d/dy, d/dz`` of a grid, built on first use.
+
+    The matrices of :func:`parsec_python.Laplacian.build_gradient`, element for element.  Only the k-point kinetic
+    term ``-2 i k.grad``, band structures, meta-GGAs and the forces of wires and slabs read them; a Gamma-point run
+    never builds them (2.0 M points of 2,744-atom diamond: 1.15 GB and 2 s of every preparation).  A sequence of
+    the three CSR matrices for the code that reads them, safe to build from several threads.
+    """
+
+    def __init__(self, grid) -> None:
+        self._grid = grid
+        self._matrices: tuple | None = None
+        self._lock = threading.Lock()
+
+    def _built(self) -> tuple:
+        if self._matrices is None:
+            with self._lock:
+                if self._matrices is None:
+                    self._matrices = tuple(build_gradient(self._grid))
+        return self._matrices
+
+    @property
+    def built(self) -> bool:
+        """Whether the matrices exist (for tests and reports; reading them builds them)."""
+        return self._matrices is not None
+
+    def __getitem__(self, index):
+        return self._built()[index]
+
+    def __len__(self) -> int:
+        return 3
+
+    def __iter__(self):
+        return iter(self._built())
+
+    def __getstate__(self) -> dict:
+        return {"grid": self._grid, "matrices": self._matrices}
+
+    def __setstate__(self, state: dict) -> None:
+        self._grid = state["grid"]
+        self._matrices = state["matrices"]
+        self._lock = threading.Lock()
+
+
 @dataclass(frozen=True)
 class PeriodicPreparedSinglePointSystem:
     """Made to mirror of PreparedSinglePointSystem in single_point.py, should eitheir be made from a base class or folded into single_point.py
@@ -80,7 +126,8 @@ class PeriodicPreparedSinglePointSystem:
     pseudopotentials: dict[str, ParsecPseudopotential]
     grid: PeriodicRealSpaceGrid
     negative_laplacian: sp.csr_matrix
-    gradient: tuple[sp.csr_matrix, sp.csr_matrix, sp.csr_matrix]
+    # d/dx, d/dy, d/dz (LazyGradient: built where a k-point, band or meta-GGA term reads them)
+    gradient: Sequence[sp.csr_matrix]
     ionic_potential: np.ndarray
     nonlocal_operator: NonlocalProjectorOperator
     initial_density: np.ndarray
@@ -259,18 +306,21 @@ class PeriodicPreparedSinglePointSystem:
             from .hybrid import scf_semilocal_xc
 
             result = scf_semilocal_xc(self.input.scf, density, self.grid, self.core_density)
-        elif self.input.scf.xc_functional == "ca":
-            result = ca_lda(density, self.grid.volume_element, self.core_density)
-        elif self.input.scf.xc_functional == "pbe":
-            result = pbe(density, self.grid, self.core_density)
         else:
-            result = evaluate_unpolarized_xc(
-                self.input.scf.xc_functional,
-                density,
-                self.grid,
-                self.core_density,
-                ionization_energy_difference=self.input.scf.ionization_energy_difference,
-            )
+            # a device evaluator where one is installed and takes this system (set_periodic_xc_provider)
+            result = _provided_xc(self, density)
+            if result is None and self.input.scf.xc_functional == "ca":
+                result = ca_lda(density, self.grid.volume_element, self.core_density)
+            elif result is None and self.input.scf.xc_functional == "pbe":
+                result = pbe(density, self.grid, self.core_density)
+            elif result is None:
+                result = evaluate_unpolarized_xc(
+                    self.input.scf.xc_functional,
+                    density,
+                    self.grid,
+                    self.core_density,
+                    ionization_energy_difference=self.input.scf.ionization_energy_difference,
+                )
         if not self._zero_average(zero_average):
             return result
         return replace(result, potential=_without_average(result.potential))
@@ -471,6 +521,29 @@ class PeriodicPreparedSinglePointSystem:
 # A faster evaluator of the spin functionals of a periodic cell (a CUDA
 # device), or None.
 _spin_xc_provider = None
+_xc_provider = None
+
+
+def set_periodic_xc_provider(provider=None) -> None:
+    """Install (or, with ``None``, remove) a faster unpolarized XC of periodic cells.
+
+    ``provider(system, density)`` returns what
+    :meth:`PeriodicPreparedSinglePointSystem.evaluate_xc` evaluates for a
+    semilocal functional (not a meta-GGA or a hybrid) before the zero-average
+    shift, or ``None`` for a system or functional it does not take (the
+    readable functional then runs).  The performance counterpart lives in
+    ``parsec_python.acceleration.V_xc.periodic_xc`` (the replicated drivers of
+    an MPI run); importing :mod:`parsec_python.acceleration` installs it.
+    """
+
+    global _xc_provider
+    _xc_provider = provider
+
+
+def _provided_xc(system, density):
+    if _xc_provider is None:
+        return None
+    return _xc_provider(system, density)
 
 
 def set_periodic_spin_xc_provider(provider=None) -> None:
@@ -612,10 +685,9 @@ def _prepare_fortran_periodic_single_point(
     stage_start = time.perf_counter()
     negative_laplacian = build_negative_laplacian(grid)
     # Only needed for k-point sampling's -2i*k.grad kinetic term
-    # (Hamiltonian.kpoint_operator); computed unconditionally here since it
-    # is cheap relative to the Laplacian and keeps this prepared system
-    # self-contained for either the Gamma-only or k-point SCF path.
-    gradient = build_gradient(grid)
+    # (Hamiltonian.kpoint_operator), bands and meta-GGAs: built when one
+    # reads it, so that a Gamma-point run does not hold it.
+    gradient = LazyGradient(grid)
     finite_difference_seconds = time.perf_counter() - stage_start
 
     # 3. Local and Kleinman--Bylander nonlocal ionic terms.
@@ -690,6 +762,17 @@ def _prepare_fortran_periodic_single_point(
         problem.periodic_cell.lattice_vectors,
         electron_count,
     )
+    if getattr(problem.grid, "local_potential", "real_space") == "real_space":
+        # PARSEC 1.5's zero-average potential and its alpha term (the G-space potential has no G = 0 term)
+        ionic_potential, alpha_z_energy = zero_average_local_potential(
+            ionic_potential,
+            atoms,
+            pseudopotentials,
+            problem.pseudopotentials,
+            problem.periodic_cell.lattice_vectors,
+            electron_count,
+            alpha_term=getattr(problem.grid, "alpha_term", "analytic"),
+        )
     atomic_reference_correction = float(
         sum(
             problem.pseudopotentials[atom.symbol].atomic_energy_correction
@@ -866,6 +949,17 @@ def fortran_update_periodic_geometry(
     alpha_z_energy = periodic_alpha_energy(
         problem.grid, placed, pseudopotentials, specifications, lattice, system.electron_count
     )
+    if getattr(problem.grid, "local_potential", "real_space") == "real_space":
+        # PARSEC 1.5's zero-average potential and its alpha term (zero_average_local_potential)
+        ionic_potential, alpha_z_energy = zero_average_local_potential(
+            ionic_potential,
+            placed,
+            pseudopotentials,
+            specifications,
+            lattice,
+            system.electron_count,
+            alpha_term=getattr(problem.grid, "alpha_term", "analytic"),
+        )
     ion_ion_seconds = time.perf_counter() - stage_start
     moved = replace(
         system,
@@ -921,6 +1015,55 @@ def fold_atoms_into_cell(atoms, lattice_vectors: np.ndarray, *, periodic_axes: i
         else:
             folded.append(replace(atom, position=position - np.floor(fraction) @ lattice[:axes]))
     return tuple(folded)
+
+
+def zero_average_local_potential(
+    potential: np.ndarray,
+    atoms,
+    pseudopotentials,
+    specifications,
+    lattice_vectors: np.ndarray,
+    electron_count: float,
+    *,
+    alpha_term: str = "analytic",
+) -> tuple[np.ndarray, float]:
+    """``(V - c, E_alpha)`` of the real-space Ewald split: PARSEC 1.5's convention for a 3-D cell (Ry).
+
+    Fortran builds the local potential of a bulk cell in G space without its ``G = 0`` term (``ionpbc.f90``:
+    ``vionz(1) = 0``), a zero average, and the energy carries ``E_alpha = (N_e/Omega) sum_a alpha_a``,
+    ``alpha_a = int (V_a + 2 Z/r) d^3r`` (``pbc%ealpha``;
+    :func:`parsec_python.V_ion.gspace_local.gspace_alpha_energy`).  The real-space split
+    (:func:`parsec_python.V_ion.ewald.ewald_local_ionic_potential`) keeps the cell average of its split,
+    ``c = sum_a (alpha_a - 2 pi Z_a/eta^2)/V`` at ``eta = sqrt(pi)/V^(1/3)`` (``-2 Z_tot/V^(1/3)`` grows with the
+    cell: -608 Ry for 4,096 carbon atoms of diamond), which its alpha term ``N_e 2 pi Z_tot/(eta^2 V)``
+    (:func:`parsec_python.V_ion.ewald.ewald_alpha_z_energy`) cancelled in the energy up to 2026-11-08.  The
+    preparations of a bulk cell now remove ``c`` and take Fortran's ``E_alpha``: the band energy loses ``N_e c``
+    (``2 sum f = N_e``) and ``E_alpha - N_e 2 pi Z_tot/(eta^2 V) = N_e c``, so the total energy, the density and the
+    forces are unchanged (``c`` does not depend on the positions), and the eigenvalues and the Fermi level lose
+    ``c``.  The potential keeps the difference between the grid sum of the short-ranged pieces and their integral
+    (4e-4 Ry for carbon at 18 points per 3.567 A).
+    """
+
+    from ..V_ion.ewald import _ewald_cutoffs
+    from ..V_ion.gspace_local import alpha_coefficient, gspace_alpha_energy
+
+    lattice = np.asarray(lattice_vectors, dtype=np.float64)
+    volume = float(abs(np.linalg.det(lattice)))
+    eta, _, _ = _ewald_cutoffs(volume, None, 1.0e-14)
+    coefficients: dict[str, float] = {}
+    average = 0.0
+    for atom in atoms:
+        if atom.symbol not in coefficients:
+            potential_of = pseudopotentials[atom.symbol]
+            coefficients[atom.symbol] = alpha_coefficient(
+                potential_of, specifications[atom.symbol].local_angular_momentum, alpha_term
+            ) - 2.0 * np.pi * float(potential_of.ionic_charge) / eta**2
+        average += coefficients[atom.symbol]
+    average /= volume
+    energy = gspace_alpha_energy(
+        atoms, pseudopotentials, specifications, lattice, electron_count, method=alpha_term
+    )
+    return np.asarray(potential, dtype=np.float64) - average, energy
 
 
 def _geometry_terms(
@@ -1006,7 +1149,10 @@ def _geometry_terms(
         alpha_z_energy = 0.0  # the slab's local potential is summed in real space: no G = 0 correction
     else:
         repulsion = ewald_ion_ion_energy(atoms, pseudopotentials, lattice_vectors)
-        alpha_z_energy = ewald_alpha_z_energy(atoms, pseudopotentials, lattice_vectors, electron_count)
+        # PARSEC 1.5's zero-average potential and its alpha term
+        ionic_potential, alpha_z_energy = zero_average_local_potential(
+            ionic_potential, atoms, pseudopotentials, problem.pseudopotentials, lattice_vectors, electron_count
+        )
     ion_ion_seconds = time.perf_counter() - stage_start
     return {
         "fields": dict(
@@ -1136,10 +1282,9 @@ def prepare_periodic_single_point(
     stage_start = time.perf_counter()
     negative_laplacian = build_negative_laplacian(grid)
     # Only needed for k-point sampling's -2i*k.grad kinetic term
-    # (Hamiltonian.kpoint_operator); computed unconditionally here since it
-    # is cheap relative to the Laplacian and keeps this prepared system
-    # self-contained for either the Gamma-only or k-point SCF path.
-    gradient = build_gradient(grid)
+    # (Hamiltonian.kpoint_operator), bands and meta-GGAs: built when one
+    # reads it, so that a Gamma-point run does not hold it.
+    gradient = LazyGradient(grid)
     finite_difference_seconds = time.perf_counter() - stage_start
 
     # 3. The terms that depend on the positions: local and Kleinman--Bylander nonlocal ionic terms, the starting and
@@ -1152,6 +1297,16 @@ def prepare_periodic_single_point(
             problem.pseudopotentials[atom.symbol].atomic_energy_correction
             for atom in atoms
         )
+    )
+
+    # Symmetrize_Charge_Density of the irreducible wedge of a Monkhorst_Pack_Shift mesh: the operations that map
+    # this grid onto itself (the parser's Input.parsec_input._default_routines_wedge); without a group these
+    # routines average nothing, as before.
+    group = getattr(problem, "space_group", None)
+    density_symmetry = (
+        periodic_grid_symmetry(grid, group)
+        if problem.scf.symmetrize_density and group is not None and group.order > 1
+        else None
     )
 
     preparation_timings = PreparationTimings(
@@ -1172,18 +1327,22 @@ def prepare_periodic_single_point(
         **terms["fields"],
         atomic_reference_correction=atomic_reference_correction,
         timings=preparation_timings,
+        density_symmetry=density_symmetry,
     )
 
 
 __all__ = [
+    "LazyGradient",
     "PeriodicPreparedSinglePointSystem",
     "atom_outside_cell",
     "fold_atoms_into_cell",
+    "zero_average_local_potential",
     "fortran_update_periodic_geometry",
     "periodic_spin_start",
     "prepare_periodic_single_point",
     "update_periodic_geometry",
     "set_periodic_spin_xc_provider",
+    "set_periodic_xc_provider",
     "with_initial_spin_densities",
     "wrapped_atoms",
 ]

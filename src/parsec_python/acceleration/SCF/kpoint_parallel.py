@@ -516,9 +516,15 @@ def map_tasks(solve_task, n_tasks: int, *, problem_size=None, workers=None, back
 
 
 def make_solver(job: KPointJob, **options):
-    """The solver of a k-point job: row-distributed over the MPI ranks if the run is an MPI run
-    (``PARSEC_MPI=1``), else the pool of threads and devices of this process."""
+    """The solver of a k-point job: in an MPI run (``PARSEC_MPI=1``) the pools of ranks
+    (:class:`.kpoint_pools.MPIPoolKPointSolver`), or for a job with per-task extras (the spin-orbit and
+    non-collinear drivers, forces) the basis split by rows over the ranks (:class:`.kpoint_mpi.MPIKPointSolver`);
+    else the pool of threads and devices of this process."""
     if mpi.context() is not None:
+        if job.extras is None and options.get("problem_size") is not None:
+            from .kpoint_pools import MPIPoolKPointSolver
+
+            return MPIPoolKPointSolver(job, **options)
         from .kpoint_mpi import MPIKPointSolver
 
         return MPIKPointSolver(job, **options)
@@ -574,18 +580,40 @@ def describe() -> list[str]:
         nodes: dict[str, list] = {}
         for host, gpu in placement:
             nodes.setdefault(host, []).append(gpu)
+        from .kpoint_pools import requested_pools
+
+        try:
+            pools = requested_pools()
+        except ValueError:
+            pools = None
         lines.append(
             f" MPI               = {context.size} ranks on {len(nodes)} node(s), {context.ranks_per_node} per node; "
-            "the basis of every eigenproblem is split by blocks of grid rows over the ranks"
+            "k-points and spin channels are solved by pools of ranks"
+            + (f" ({pools} pools, --kpoint-pools)" if pools is not None else " (pools by balance and memory)")
+            + ", each basis shared by columns within its pool; spin-orbit and non-collinear runs split the "
+            "basis by blocks of grid rows over all ranks"
         )
         if device is not None:
+            from ..Eigensolvers.mpi_shared_basis import shared_transport
+
+            try:
+                shared = shared_transport()
+            except ValueError:
+                shared = "host"
             lines.append(
                 " GPU-aware MPI     = "
                 + (
-                    "on: halo rows go between the GPUs and overlap the local product; the sums go "
+                    "on: the pools move their bases between columns and rows as device arrays"
+                    if shared == "cuda"
+                    else "off: the pools move their bases through the host (MPICH_GPU_SUPPORT_ENABLED=1 for "
+                    "device arrays)"
+                )
+                + "; rows of spinors: "
+                + (
+                    "halo rows between the GPUs, sums "
                     + ("between the GPUs" if context.cuda_aware_reduce else "through the host")
                     if context.cuda_aware
-                    else "off: halo rows and sums go through the host (PARSEC_MPI_CUDA_AWARE=1 for GPU buffers)"
+                    else "halo rows and sums through the host (PARSEC_MPI_CUDA_AWARE=1 for GPU buffers)"
                 )
             )
             lines.append(

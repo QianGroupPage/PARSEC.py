@@ -76,6 +76,9 @@ _RECONSTRUCTED = frozenset(
         "mixing_step_limit",
         "mixing_growth_trigger",
         "mixing_backoff",
+        "mixing_preconditioner",
+        "kerker_wavevector",
+        "kerker_dielectric_constant",
         "solver_lpole",
         "hartree_boundary_tolerance",
         "hartree_atomic_tail",
@@ -414,6 +417,16 @@ def complete_input_text(
     ):
         if read or key in scalar:
             lines.append(f"{label}  {value}")
+    # Mixing_Preconditioner (PARSEC.py): written where it is on or the input names it.
+    preconditioner = getattr(mixing, "preconditioner", "none")
+    if preconditioner != "none" or "mixing_preconditioner" in scalar:
+        lines.append(f"Mixing_Preconditioner  {preconditioner}")
+    if preconditioner == "kerker":
+        dielectric = float(mixing.kerker_dielectric_constant)
+        lines += [
+            f"Kerker_Wavevector  {_number(mixing.kerker_wavevector)} bohr^-1",
+            f"Kerker_Dielectric_Constant  {'inf' if dielectric == float('inf') else _number(dielectric)}",
+        ]
 
     # Hartree potential
     lines += [

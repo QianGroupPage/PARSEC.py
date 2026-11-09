@@ -548,19 +548,14 @@ def build_periodic_grid(
     if cell.dimensions == 2:
         # a slab (Andrew Grieder's slab_boundary): its own grid, whatever the points rule
         return build_slab_grid(cell, settings)
-    if settings.points_rule == "fortran":
-        lengths = np.linalg.norm(lattice_vectors, axis=1)
-        return _build_general_grid(cell, settings, fortran_points_per_axis(lengths, settings.spacing))
-    if not _is_diagonal(lattice_vectors):
-        lengths = np.linalg.norm(lattice_vectors, axis=1)
-        # an even number of points per axis, the nearest to |a_i|/h
-        return _build_general_grid(cell, settings, (2 * np.round(lengths / (2.0 * settings.spacing))).astype(np.int64))
+    if settings.points_rule == "fortran" or not _is_diagonal(lattice_vectors):
+        return _build_general_grid(cell, settings, default_periodic_grid_counts(cell, settings))
     side_lengths = np.diag(lattice_vectors)
     if np.any(side_lengths <= 0.0):
         raise ValueError("lattice_vectors must have positive diagonal side lengths")
     spacing = settings.spacing
 
-    points_per_axis = np.round(side_lengths / spacing).astype(np.int64)
+    points_per_axis = default_periodic_grid_counts(cell, settings)
     half_width = settings.stencil_half_width
     if np.any(points_per_axis <= 2 * half_width):
         raise ValueError(
@@ -593,6 +588,25 @@ def build_periodic_grid(
         coordinates=coordinates,
         lookup=lookup,
     )
+
+
+def default_periodic_grid_counts(cell: PeriodicCell, settings: PeriodicGridSettings) -> np.ndarray:
+    """The points along the three lattice vectors of :func:`build_periodic_grid` on the default routines (a bulk
+    cell, not ``settings.fortran_routines``), without building the grid.
+
+    ``points_rule="fortran"``: :func:`fortran_points_per_axis` of ``|a_i|`` (Andrew Grieder's grid of the parser);
+    ``"round"``: ``round(L_i/h)`` of an orthorhombic cell, ``2 round(|a_i|/(2h))`` of an oblique one.  The checks
+    (stencil width, one common spacing) are the builder's.
+    """
+
+    lattice_vectors = np.asarray(cell.lattice_vectors, dtype=float)
+    if settings.points_rule == "fortran":
+        return fortran_points_per_axis(np.linalg.norm(lattice_vectors, axis=1), settings.spacing)
+    if not _is_diagonal(lattice_vectors):
+        lengths = np.linalg.norm(lattice_vectors, axis=1)
+        # an even number of points per axis, the nearest to |a_i|/h
+        return (2 * np.round(lengths / (2.0 * settings.spacing))).astype(np.int64)
+    return np.round(np.diag(lattice_vectors) / settings.spacing).astype(np.int64)
 
 
 def _build_general_grid(
@@ -789,6 +803,7 @@ __all__ = [
     "build_general_periodic_grid",
     "build_periodic_grid",
     "build_slab_grid",
+    "default_periodic_grid_counts",
     "fortran_grid_counts",
     "fortran_grid_shift",
     "fortran_orthorhombic_counts",

@@ -841,6 +841,28 @@ def save_self_consistent_soc_result_archive(
     return output
 
 
+def without_data_files(translation):
+    """The translation of a process that writes no data files (the ranks other than 0 of an MPI run).
+
+    ``Output_Data`` off (no ``parsec.dat`` or ``eigen.dat``), no ``Output_Grid_Data`` cube files and
+    no ``bak_complete_parsec.in``; the calculation is the same (these settings describe files only).
+    """
+
+    from dataclasses import replace
+
+    files = replace(
+        translation.output_files,
+        output_data=False,
+        grid_data=(),
+        intermediate_density=False,
+        intermediate_eigenvalues=False,
+    )
+    changes = {"output_files": files}
+    if getattr(translation, "complete_input", None) is not None:
+        changes["complete_input"] = None
+    return replace(translation, **changes)
+
+
 def planned_state_count(problem, electron_count: float) -> int:
     """The states of each channel the SCF loop will return (``States_Num``)."""
 
@@ -968,7 +990,14 @@ def _band_progress(reporter):
     return report
 
 
+# False in a process of main's --no-data-files (the ranks other than 0 of an MPI run): the band path and
+# the DOS are computed with rank 0, whose files they are, and not written again.
+_WRITE_DATA_FILES = True
+
+
 def _write_band_outputs(band_result, reporter, directory: Path, start: float) -> None:
+    if not _WRITE_DATA_FILES:
+        return
     files = list(write_bands_files(directory, band_result))
     spin_file = write_spin_file(directory, band_result)  # spinor bands only
     if spin_file is not None:
@@ -1253,7 +1282,8 @@ def _run_dos(system, translation, result, reporter, directory: Path) -> None:
         )
     path = directory / "DOS"
     lines = dos_file_lines(dos, atom_labels=[atom.symbol for atom in system.atoms])
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if _WRITE_DATA_FILES:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     reporter.write("\n".join(dos_report_lines(dos, time.perf_counter() - started)))
     reporter.write(f" DOS: {path}")
 
@@ -2033,6 +2063,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--kpoint-pools",
+        default=None,
+        metavar="P|auto",
+        help=(
+            "in an MPI run: pools of ranks the k-points and spin channels are dealt to, each basis "
+            "shared by the ranks of its pool (default PARSEC_KPOINT_POOLS, else auto)"
+        ),
+    )
+    # The ranks other than 0 of an MPI run (the accelerated CLI's --mpi) compute without writing
+    # parsec.dat, eigen.dat, the cube files, qpoints.dat or bak_complete_parsec.in.
+    parser.add_argument("--no-data-files", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
         "--bands-from",
         type=Path,
         default=None,
@@ -2101,6 +2143,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.kpoint_workers is not None:
         os.environ["PARSEC_KPOINT_WORKERS"] = str(arguments.kpoint_workers)
+    if arguments.kpoint_pools is not None:
+        os.environ["PARSEC_KPOINT_POOLS"] = str(arguments.kpoint_pools)
     try:
         translation = parse_parsec_input(
             arguments.input,
@@ -2110,6 +2154,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ParsecInputError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
+    global _WRITE_DATA_FILES
+    _WRITE_DATA_FILES = not arguments.no_data_files
+    if arguments.no_data_files:
+        translation = without_data_files(translation)
     if arguments.mlff is not None:
         from .MLFF import apply_mlff_option
 
@@ -2559,7 +2607,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             for line in embedding_setup_lines(system):
                 log.write(line)
-            if arguments.bands_from is None:
+            if arguments.bands_from is None and not arguments.no_data_files:
                 write_qpoints_file(translation.problem, input_directory, log.write)
 
             if translation.problem.eigensolver.method == "none":

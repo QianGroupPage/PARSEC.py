@@ -577,7 +577,6 @@ class MovingCellOptionRouteTests(unittest.TestCase):
         for option in (
             "Calc_Hartree_G: .true.\n",
             "Periodic_Local_Potential: g_space\n",
-            "Zero_Average_Vxc: .true.\n",
         ):
             with self.subTest(option=option):
                 routed = features(option + "Minimization: bfgs\n")
@@ -585,6 +584,9 @@ class MovingCellOptionRouteTests(unittest.TestCase):
                     any("molecular dynamics of a periodic cell with" in item for item in routed),
                     routed,
                 )
+        # Zero_Average_Vxc, the default of a 3-D cell since 2026-11-08, moves on the accelerated path (its forces read
+        # the shifted potentials of the result through the reference formula)
+        self.assertEqual(features("Zero_Average_Vxc: .true.\nMinimization: bfgs\n"), [])
 
 
 class ScopeTests(unittest.TestCase):

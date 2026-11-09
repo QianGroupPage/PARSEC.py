@@ -433,8 +433,20 @@ class PeriodicLoopTests(unittest.TestCase):
                 )
 
     def test_two_equal_spin_channels_are_the_unpolarized_kpoint_loop(self) -> None:
-        system = self.system(extra=TWO_KPOINTS)
-        spin = self.system(extra=TWO_KPOINTS + "\nSpin_Polarization: .true.", name="spin.in")
+        # A bulk cell takes the smart SUBSPACE lower bound by default since 2026-11-08; with it the spin loop of
+        # this cell stalls at a residual of ~1.5e-7 Ry (54 iterations on a laptop, more than Max_Iter 60 on an
+        # A100; 28 with PARSEC 1.5's adaptive rule or the earlier monotone one, the same energy).  The test is
+        # about the two equal channels, so it names the adaptive rule for both runs.
+        rule = "\nSmart_Subspace: .false."
+        system = self.system(extra=TWO_KPOINTS + rule)
+        # The unpolarized cell removes the average of V_xc by default (PARSEC 1.5's potshift, since 2026-11-08), a
+        # spin-polarized one does not: the spin run asks for it, so that its two equal channels carry the potential of
+        # the unpolarized loop.  Without it the spin loop's spectrum sits ~1 Ry lower, its largest Ritz value near
+        # 0 Ry, where the adaptive bound's ratio of Ritz values to the previous bound jumps, and the loop stalls
+        # (150 iterations, the same energy to 1e-11 Ry; 52 with the default smart bound).
+        spin = self.system(
+            extra=TWO_KPOINTS + rule + "\nSpin_Polarization: .true.\nZero_Average_Vxc: .true.", name="spin.in"
+        )
         from parsec_python.Grid import kpoint_sampling
 
         k_points, weights = kpoint_sampling(system.input)

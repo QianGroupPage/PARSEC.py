@@ -8,7 +8,8 @@ from typing import Any
 
 import numpy as np
 
-from parsec_python.Eigensolvers.subspace import SubspaceSettings
+from parsec_python.Eigensolvers.spectral_bounds import bound_request
+from parsec_python.Eigensolvers.subspace import SubspaceSettings, subspace_filter_bounds
 
 from ..backends.cupy import device_stage
 from .chebyshev import FilterBlock, subspace_filter, subspace_filter_blocks
@@ -180,19 +181,27 @@ def run_subspace_filter(
     if handover != "rotation" and mode == "rotation":
         note = "deferred trim"
     _validate_state(operator, state)
-    lower_bound = _next_filter_lower_bound(state)
     generator = np.random.default_rng(
         settings.random_seed + state.filters_completed
     )
+    rule, steps = bound_request(settings)
     with device_stage(operator, "subspace_bound_seconds"):
         bound = (
             lanczos_upper_bound(
-                operator, steps=settings.lanczos_steps, rng=generator
+                operator, steps=steps, rng=generator, rule=rule
             )
             if spectral_bound is None
             else spectral_bound
         )
-    upper_bound = float(bound.upper_bound)
+    # The unwanted interval of the lower-bound rule (Smart_Subspace; the
+    # default "monotone" is _next_filter_lower_bound and the Lanczos bound).
+    lower_bound, upper_bound = subspace_filter_bounds(
+        settings.lower_bound_rule,
+        float(state.eigenvalues.max().item()),
+        state.filter_lower_bound,
+        state.first_filter,
+        bound,
+    )
     if not lower_bound < upper_bound and getattr(operator, "kinetic_term", None) is not None:
         # Last guard (operators with a meta-GGA's orbital term only; every
         # other operator keeps the filter's refusal of a crossed interval):

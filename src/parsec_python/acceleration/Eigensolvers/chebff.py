@@ -143,9 +143,12 @@ def run_chebff(
         del host_trial
 
     if spectral_bound is None:
+        from parsec_python.Eigensolvers.spectral_bounds import bound_request
+
         bound_generator = np.random.default_rng(settings.random_seed)
+        rule, steps = bound_request(settings)
         bound = lanczos_upper_bound(
-            operator, steps=settings.lanczos_steps, rng=bound_generator
+            operator, steps=steps, rng=bound_generator, rule=rule
         )
     else:
         bound = spectral_bound

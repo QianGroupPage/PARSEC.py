@@ -510,16 +510,18 @@ class CuPyEigvalSolver:
                 else self.settings.chebdav
             )
             seed = options.random_seed
-            steps = options.lanczos_steps
         else:
             assert self._state is not None
             options = self.settings.subspace
             seed = options.random_seed + self._state.subspace.filters_completed
-            steps = options.lanczos_steps
+        from parsec_python.Eigensolvers.spectral_bounds import bound_request
+
+        rule, steps = bound_request(options)
         return lanczos_upper_bound(
             self.operator,
             steps=steps,
             rng=np.random.default_rng(seed),
+            rule=rule,
         )
 
     def _incompatibility(

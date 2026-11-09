@@ -593,6 +593,70 @@ potential is used, the periodic local forces differentiate the converged Ewald s
 (`V_ion.ewald.local_potential_tolerance`), so that they stay the derivative of the energy the SCF computed (with
 the default truncation they missed about 1e-7 Ry/bohr in a Si2 cube and 5e-7 in the Si8 cube).
 
+Since 8 November 2026 the other parts of the preparation scale to thousands of atoms as well (bulk diamond,
+`examples/3d_diamond_benchmark/profile_setup.py`, one A100 node, the stages of `prepare_periodic_single_point`):
+
+- **Ewald ion-ion energy and forces** (`V_ion/ewald.py: ewald_ion_ion_terms`): the real-space terms over the atom
+  pairs within the cutoff (a k-d tree of the images of the atoms within the cutoff of the cell, any cell shape) and
+  the reciprocal terms from the structure factors on a box of reciprocal vectors (a product of one phase factor per
+  lattice direction, one matrix product per block of atoms), with the Ewald parameter of least estimated cost and
+  both truncations at 1e-18. 4,096 atoms: 0.5 s instead of 197 s for the sum over every translation and atom pair,
+  the same energy to 6e-14 relative (the old sum's own truncation).
+- **Projectors**: one radial spline per species and channel (it was rebuilt for every image) and only the images
+  whose support reaches the grid: the same operator, 10 times faster.
+- **Local ionic potential**: the image balls of the atoms on worker threads (`PARSEC_PERIODIC_SETUP_THREADS`, else
+  `OMP_NUM_THREADS`), added in the batches of the single-thread loop: the same potential bit for bit.
+- **Atomic densities** (the SAD start and the core density of an orthorhombic bulk cell): on the GPU where one is
+  usable (`acceleration/V_ion/periodic_device.py: device_bulk_atomic_density`), every grid point adding its terms in
+  the order and with the floating-point operations of the host's image blocks (no fused multiply-add): the same
+  density bit for bit (`--device cpu` keeps the host sum).
+- **Gradient matrices** (the `-2 i k.grad` term of k-points, band structures, meta-GGAs) are built where they are
+  read (`SCF.pbc.LazyGradient`): a Gamma-point run never holds them.
+
+Bulk diamond on one A100 node (CPUs shared with other runs): 2,744 atoms, 2.0 M points 102 s -> 26 s; 4,096 atoms,
+3.0 M points 297 s -> 37 s (before the device densities), of which the atomic density 18 s, the local potential 9 s,
+the finite-difference matrices 7 s, the projectors 3 s and the Ewald energy 0.5 s; a rank that shares the basis
+(projectors and Laplacian only) 34 s -> 7 s.
+
+## Averages of the potential of a periodic cell
+
+A 3-D periodic cell takes PARSEC 1.5's two conventions for the constant parts of its potential (since 8 November 2026):
+
+- **The local ionic potential has a zero average.** PARSEC builds it in G space without its `G = 0` term
+  (`ionpbc.f90`: `vionz(1) = 0`) and puts the average into the energy, `E_alpha = (N_e/Omega) sum_a alpha_a` with
+  `alpha_a = int (V_a + 2 Z/r) d^3r`. This code keeps its real-space Ewald split as the construction
+  (`Periodic_Local_Potential: g_space` is Fortran's) and removes the average of the split
+  (`SCF.pbc.zero_average_local_potential`), `sum_a alpha_a/V - 2 Z_tot/V^(1/3)`: its Ewald parameter
+  `sqrt(pi)/V^(1/3)` shrinks with the cell, and the average was -9.5 n^2 Ry for n^3 conventional cells of
+  diamond (-37 Ry for 64 atoms, -608 Ry for 4,096), with all the eigenvalues. The energy takes Fortran's
+  `E_alpha` (the `Alpha Energy` of the report) in place of the term that cancelled that constant. On the grid the
+  average is zero up to the sampling of the short-ranged pieces (4e-4 Ry for carbon at 18 points per 3.567 A).
+- **`Zero_Average_Vxc`** (PARSEC's `potshift`, the average of `V_xc` removed at every evaluation) is the default
+  of an unpolarized collinear 3-D cell; `Zero_Average_Vxc: .false.` restores the earlier potential. A
+  spin-polarized cell keeps it off unless the input asks for it (each channel losing its own average moves the
+  channels against each other: other occupations and another energy of a magnetic cell); wires and slabs never
+  take it (Fortran applies it for `pbc%per == 3` only).
+
+Neither changes the total energy, the density or the forces: the band energy loses `N_e` times each average and
+the double-counting terms give it back (bulk diamond, 8 atoms: the total energy within 2.4e-13 Ry and the same 17
+SCF iterations; the density within 2e-9, the SCF path). The eigenvalues and the Fermi level lose both averages
+(+10.30 Ry for those 8 atoms: 9.35 from the local potential, 0.95 from `V_xc`) and now compare with Fortran's.
+Outputs written before the change print the earlier eigenvalues, and a `parsec.dat` written before it holds a
+potential with the earlier constants.
+
+## SCF of large bulk cells
+
+A bulk cell takes `Smart_Subspace: .true.` by default (since 8 November 2026; `Subspace_Lower_Bound: monotone`
+restores the earlier PARSEC's rule, `Smart_Subspace: .false.` selects PARSEC 1.5's adaptive one).  PARSEC's later-SCF filter clips its lower bound at
+0 Ry, which suits clusters (their unwanted states start near the vacuum level) but not a bulk cell, whose
+eigenvalues lay tens of Ry below 0 with this code's periodic potential before its averages were removed (bulk
+diamond: -37 Ry at 64 atoms, -84 Ry at 216; [Averages of the potential of a periodic cell](#averages-of-the-potential-of-a-periodic-cell)): the filter then barely separates the occupied states from the conduction band, and the SCF test is met
+while the energy is still far off (512 atoms: 65 iterations, 4.9 mRy/atom high; 1,000 atoms: 104 iterations, 13.9
+mRy/atom high).  PARSEC 1.5's smart bound gives 8, 10, 16 and 17 iterations for 64, 216, 512 and 1,000 atoms, within
+0.002 mRy/atom of the converged energy.  A Kerker-type preconditioner of the
+mixing (`Mixing_Preconditioner: kerker`, opt-in) is available for periodic cells; see
+[the package README](src/parsec_python/README.md#bulk-cells-the-subspace-lower-bound) for both.
+
 ## Parallel k-points, band paths and GPUs (periodic systems)
 
 The eigenproblems of different k-points (and spin channels) are independent: only the Fermi
@@ -874,6 +938,8 @@ parameter `Use_Fortran_Routines` chooses:
   default is the Fortran-derived routines (parsec.out names that default in its routines line):
   - slabs (`Boundary_Conditions: slab`);
   - a shifted Monkhorst-Pack grid of a bulk cell (`Monkhorst_Pack_Shift`);
+  - a `Kpoint_List` of unequal weights of a bulk cell (Andrew Grieder's routines refused it before 8 November 2026;
+    with `.false.` they take it now, see "Irreducible k-points on the default routines");
   - forces, a relaxation or molecular dynamics of a bulk cell at the Gamma point (no k-point input), with or
     without spin polarization, where the orthorhombic grid of the Fortran-derived routines has the points of
     Andrew Grieder's grid (the same counts, steps and shift) and every species uses `Cubic_Spline` (his local
@@ -891,12 +957,52 @@ parameter `Use_Fortran_Routines` chooses:
   Andrew Grieder's routines stay the default where the grids differ, for linear radial tables, and where the Fortran-derived ones would be slower: an oblique
   cell at the Gamma point (his accelerated oblique path), the Gamma point given as a one-point k-point grid,
   forces on an oblique cell, forces with k-points, and the forces and ionic loops of spinor orbitals;
-- `.false.`: Andrew Grieder's routines wherever his code accepts the input, his slab and his full shifted mesh
-  (equal weights, no reduction to the irreducible wedge) included;
+- `.false.`: Andrew Grieder's routines wherever his code accepts the input, his slab and his shifted mesh
+  included (see "Irreducible k-points on the default routines" below);
 - `.true.`: the Fortran-derived routines.
 
+### Irreducible k-points on the default routines
+
+With `Use_Fortran_Routines: .false.` the `Monkhorst_Pack_Shift` mesh of a bulk single point (more than one point,
+scalar orbitals with or without spin polarization, no hybrid functional, no forces or moving atoms) is reduced to
+its irreducible wedge, as on the Fortran-derived routines, but on the grid of `Grid_Spacing`. The Fortran-derived
+routines make their grid commensurate with the fractional translations of the space group (`adjust_step`), which
+for diamond's quarter translations means 16 points per cubic edge where `Grid_Spacing` asks for 18. The default
+routines keep their grid and use the operations of the crystal that map that grid, and the k-point mesh, onto
+themselves (`Grid.space_group.find_grid_space_group`, `Grid.kpoints.mesh_preserving_operations`), with time
+reversal; the density is averaged over the same operations (`Symmetrize_Charge_Density`, true by default there as
+on Fortran's k-point path). For diamond at 18 points per edge, with an atom at the origin and the points half a
+step off it, these are the 24 operations of Td about the atom: with time reversal they give the wedge of Oh,
+4, 4 and 10 points for Gamma-centred 2x2x2, 3x3x3 and 4x4x4 meshes (8, 27 and 64 before). parsec.out names the
+operations that were dropped (`24 of the 48 operations ...`). Since the operations map the mesh onto itself, the
+wedge with the averaged density is the full mesh: the 8-atom cube at 18 points per edge (PBE, `Convergence_Criterion`
+1e-8 Ry) gives the energy of the full mesh within 1e-10 Ry for 2x2x2, 3x3x3 and 4x4x4 (-91.1711622940,
+-91.2224516198, -91.2250126608 Ry; 4x4x4 in 59 s against 263 s for the 64 points on a laptop CPU).
+`Ignore_Symmetry` or `Symmetrize_Charge_Density: .false.` reduce by time reversal alone (`k` and `-k` have the same
+density). Hybrids (their exchange sums over the full mesh), spinors and moving atoms keep the full mesh of equal
+weights, as before 8 November 2026, when every input with `.false.` did. Without `Use_Fortran_Routines` a shifted
+mesh still selects the Fortran-derived routines (above).
+
+A `Kpoint_List` of unequal weights of a bulk single point runs on the default routines with `.false.` (before 8
+November 2026 it went to the Fortran-derived routines by itself): every level is weighted by its point in the Fermi
+level, the density and the band energy, and the density is that of the listed points, as in PARSEC, whose
+`Symmetrize_Charge_Density` is false for a list (a warning says so). For a list that is an irreducible wedge,
+`Symmetrize_Charge_Density: .true.` averages the density over the operations that map the grid onto itself (the
+2x2x2 wedge of the 8-atom cube written as a list, weights 1, 3, 3, 1: -91.1711622940 Ry, the full mesh). Forces and
+moving atoms with such a list, and the average with spinors or a hybrid, keep the Fortran-derived routines (the forces
+of a wedge are completed over the space group there). `Symmetrize_Charge_Density: .true.` of any other input of these
+routines selects the Fortran-derived ones as before.
+
+The space group is found by a neighbour-tree search (`Grid.space_group.fast_crystal_operations`, the operations
+and translations of Fortran's `atftmt`; 0.8 s and a few MB for 4,096 atoms, where the statement-by-statement port
+`_crystal_operations` needs `(N, N)` arrays), once per structure. The fractional translations that `adjust_step`
+meets are snapped to fractions `p/q` (`q <= 48`) within `1e-8` (`Grid.space_group.snapped_translation`): coordinates
+written with ten decimals gave `0.2499999999963` for diamond's quarter, whose steps never settled. The density
+table is built from the integer affine maps of the operations (3 M points and 24 operations: 1.5 s, 0.29 GB of
+int32); `acceleration/SCF/periodic_symmetry.py` applies them on a GPU without the table.
+
 An input that Andrew Grieder's routines do not compute (wires, charged sheets, forces of a slab, unequal k-point
-weights, LDA+U, NSCF, other pseudopotential formats or functionals, ...) runs on the Fortran-derived routines by
+weights of a slab or with forces, LDA+U, NSCF, other pseudopotential formats or functionals, ...) runs on the Fortran-derived routines by
 itself, also with `.false.`, with a warning in the log and in parsec.out. Labels that the shared eigensolvers
 and SCF loops read the same way under both sets choose nothing: `FF_MaxIter`, `Chebyshev_Degree_Decrease_After`,
 `Convergence_Criterion_Approach`, `Chebyshev_Filtering`, `Maximum_Matvec`, `Fix_Number_Eigenvalues` and PARSEC 1.5's

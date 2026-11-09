@@ -66,7 +66,7 @@ from ..Hartree import (
     valence_point_charges,
 )
 from ..Laplacian import build_negative_laplacian
-from ..Mixer import make_mixer, potential_residual_metrics
+from ..Mixer import make_mixer, potential_residual_metrics, preconditioned_mixer
 from ..Occupations import (
     check_fixed_occupations,
     check_spin_fixed_occupations,
@@ -2389,9 +2389,11 @@ def run_scf(
                     np.array(warm_start.hxc_reference, dtype=np.float64)
                 )
             )
+    # Mixing_Preconditioner: kerker wraps the mixer (Mixer.preconditioner);
+    # at its default "none" the mixer is the one built here.
     mixer = warm_start_mixer(
         warm_start,
-        (lambda: build_mixer(system.input.mixing))
+        (lambda: preconditioned_mixer(build_mixer(system.input.mixing), system, adapter=scalar_field_adapter))
         if meta is None
         else (lambda: meta.mixer(build_mixer, system.input.mixing)),
     )

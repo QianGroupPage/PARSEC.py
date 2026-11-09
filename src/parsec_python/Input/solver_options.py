@@ -63,6 +63,8 @@ SOLVER_KEYS = frozenset(
         "vector_rng_type",
         "old_vector_random",
         "smart_subspace",
+        # PARSEC.py: every lower-bound rule of SUBSPACE by name (monotone, smart, adaptive).
+        "subspace_lower_bound",
         "chebyshev_scaled",
         "bounds_method",
         "bounds_iter",
@@ -150,17 +152,32 @@ def read_solver_options(
             "routines (init_vector.f90z, code under #if 0); no effect here"
         )
 
-    # SUBSPACE rules of PARSEC 1.5 (usrinputfile.F90:2536-2544, 2737-2766).
-    if given("smart_subspace"):
-        if filtering:
-            eigensolver["subspace_lower_bound"] = (
-                "smart" if optional_bool("smart_subspace") else "adaptive"
+    # SUBSPACE rules of PARSEC 1.5 (usrinputfile.F90:2536-2544, 2737-2766):
+    # Smart_Subspace true is 1.5's smart rule, false its adaptive rule; neither
+    # is the earlier PARSEC's monotone rule, which Subspace_Lower_Bound (PARSEC.py)
+    # names, as it names the other two.
+    rule_of_label = None
+    if given("subspace_lower_bound"):
+        rule_of_label = one("subspace_lower_bound").strip().lower()
+        if rule_of_label not in ("monotone", "smart", "adaptive"):
+            raise ParsecInputError(
+                f"Subspace_Lower_Bound must be monotone, smart or adaptive, got {rule_of_label!r}"
             )
+    if given("smart_subspace"):
+        smart_rule = "smart" if optional_bool("smart_subspace") else "adaptive"
+        if rule_of_label is not None and rule_of_label != smart_rule:
+            raise ParsecInputError(
+                f"Smart_Subspace selects the {smart_rule} rule and Subspace_Lower_Bound the "
+                f"{rule_of_label} one; give one of them"
+            )
+        rule_of_label = smart_rule
+    if rule_of_label is not None:
+        if filtering:
+            eigensolver["subspace_lower_bound"] = rule_of_label
         else:
-            optional_bool("smart_subspace")
             warnings.append(
-                "Smart_Subspace is read with the SUBSPACE filter only (PARSEC 1.5 reads it "
-                "when solver%do_subsp); no effect here"
+                "Smart_Subspace and Subspace_Lower_Bound are read with the SUBSPACE filter only "
+                "(PARSEC 1.5 reads Smart_Subspace when solver%do_subsp); no effect here"
             )
     if given("chebyshev_scaled"):
         scaled = optional_bool("chebyshev_scaled")

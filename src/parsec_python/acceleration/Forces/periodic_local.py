@@ -314,4 +314,104 @@ def local_force_provider(
         return fast_periodic_local_forces(*arguments, xp=xp, erf=erf, tolerance=tolerance)
 
 
-__all__ = ["fast_periodic_local_forces", "local_force_provider"]
+def fast_self_consistency_forces(grid, atoms, potentials, specifications, lattice_vectors, residual) -> np.ndarray:
+    """The self-consistency term of :func:`parsec_python.Forces.periodic.periodic_local_forces`, ``(atoms, 3)`` without ``dv``.
+
+    ``dv sum_r (V_out - V_in)(r) rho_atom'(|r - R_a - T|) (r - R_a - T)/|r - R_a - T|`` over the images ``T`` within the
+    reach of the atomic valence density (``forcloc.f90``), summed over the grid points of a ball around each image
+    instead of the whole grid, with the slopes of the readable term (the linear interpolant of the table).  Points
+    beyond the reach, where the density is below ``DENSITY_TAIL_FRACTION`` of its peak, are dropped: the readable
+    term keeps them and they add at most that fraction.  The balls are small (the density reach), so the sums run on the
+    host.
+    """
+
+    from parsec_python.Forces.periodic import _density_reach, _density_slope, _valence_density_table
+
+    residual = np.asarray(residual, dtype=np.float64)
+    lattice = np.asarray(lattice_vectors, dtype=np.float64)
+    forces = np.zeros((len(atoms), 3))
+    if not np.any(residual != 0.0):
+        return forces
+    tables: dict = {}
+    for index, atom in enumerate(atoms):
+        potential = potentials[atom.symbol]
+        if atom.symbol not in tables:
+            table = _valence_density_table(potential, specifications[atom.symbol])
+            tables[atom.symbol] = (table, _density_reach(potential, table))
+        table, cutoff = tables[atom.symbol]
+        position = np.asarray(atom.position, dtype=np.float64)
+        for translation in _ionic._periodic_image_translations(lattice, cutoff):
+            rows, relative, radius = _ionic._support_finder(grid, position + translation, cutoff)
+            inside = (radius < cutoff) & (radius > 0.0)
+            if not np.any(inside):
+                continue
+            slope = _density_slope(potential, radius[inside], table)
+            weight = residual[rows[inside]] * slope / radius[inside]
+            forces[index] += weight @ relative[inside]
+    return forces
+
+
+def spline_species_takes(grid, lattice_vectors, specifications, atoms) -> bool:
+    """Whether :func:`fortran_spline_local_forces` differentiates the local potential the Fortran-derived SCF used.
+
+    Every species interpolates its tables with the cubic spline (``Cubic_Spline``; the fast sums are those of a
+    potential that always splines them, :data:`parsec_python.V_ion.ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE`), the
+    local potential is the real-space one and the grid is the plain orthorhombic one of the FFT potential.
+    """
+
+    from ..V_ion import periodic_setup_fortran as _fortran
+
+    symbols = dict.fromkeys(atom.symbol for atom in atoms)
+    return bool(
+        _ewald.LOCAL_POTENTIAL_USES_CUBIC_SPLINE
+        and getattr(grid.settings, "local_potential", "real_space") == "real_space"
+        and _fortran._fft_handles(grid, lattice_vectors)
+        and all(getattr(specifications[symbol], "use_spline", False) for symbol in symbols)
+    )
+
+
+def fortran_spline_local_forces(
+    grid,
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    specifications: Mapping[str, SpeciesPotential],
+    lattice_vectors: np.ndarray,
+    density: np.ndarray,
+    potential_residual: np.ndarray,
+    xc_potential: np.ndarray,
+    *,
+    xp=np,
+    erf=None,
+    tolerance: float = 1.0e-14,
+) -> LocalForceTerms:
+    """The three local terms of :func:`parsec_python.Forces.periodic.periodic_local_forces` for spline species, fast.
+
+    The readable term measures the distance of every grid point to every image of every atom (about 580 images per
+    atom, whatever the cell), which takes about 20 s per atom on 470 000 grid points.  The ionic and core-correction terms
+    are the ball sums and the one FFT of :func:`fast_periodic_local_forces` (the derivative of the converged Ewald
+    sum, the same function the readable term differentiates, to the splitting accuracy of about 1e-7 Ry/bohr); the
+    self-consistency term, which the fast sums of the default routines do not have, is
+    :func:`fast_self_consistency_forces`.  See :func:`spline_species_takes` for the inputs it covers.
+    """
+
+    terms = fast_periodic_local_forces(
+        grid, atoms, potentials, specifications, lattice_vectors, density, xc_potential,
+        xp=xp, erf=erf, tolerance=tolerance,
+    )
+    return LocalForceTerms(
+        ionic=terms.ionic,
+        self_consistency=fast_self_consistency_forces(
+            grid, atoms, potentials, specifications, lattice_vectors, potential_residual
+        )
+        * grid.volume_element,
+        core_correction=terms.core_correction,
+    )
+
+
+__all__ = [
+    "fast_periodic_local_forces",
+    "fast_self_consistency_forces",
+    "fortran_spline_local_forces",
+    "local_force_provider",
+    "spline_species_takes",
+]

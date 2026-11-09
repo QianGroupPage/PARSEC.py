@@ -513,6 +513,28 @@ def update_periodic_reference(system, atoms):
     return update_periodic_geometry(system, atoms)
 
 
+def _spline_species_local_forces(system, atoms, specifications, lattice, density, residual, xc):
+    """The local terms by ball sums for ``Cubic_Spline`` species (``None`` for the others), on the device of the run.
+
+    The device kernel of :func:`device_periodic_local_forces` takes linearly interpolated species only; the readable
+    term for the others scans the whole grid for each of about 580 images of each atom (hours for a few hundred atoms
+    on a grid of 10^5 points).  :func:`.periodic_local.fortran_spline_local_forces` forms the same terms from the grid
+    points of a ball around each image.
+    """
+
+    from .compute import _array_module
+    from .periodic_local import fortran_spline_local_forces, spline_species_takes
+
+    if not spline_species_takes(system.grid, lattice, specifications, atoms):
+        return None
+    xp, erf, device = _array_module(system)
+    arguments = (system.grid, atoms, system.pseudopotentials, specifications, lattice, density, residual, xc)
+    if device is None:
+        return fortran_spline_local_forces(*arguments)
+    with xp.cuda.Device(device):
+        return fortran_spline_local_forces(*arguments, xp=xp, erf=erf)
+
+
 def compute_device_periodic_forces(system, result, *, symmetrize: bool = True, operations=None):
     """Forces of a finished accelerated SCF loop of a periodic cell at Gamma.
 
@@ -557,9 +579,11 @@ def compute_device_periodic_forces(system, result, *, symmetrize: bool = True, o
     density, residual, xc = periodic_force_fields(system, result)
     # The readable entry: inside device_periodic_forces it differentiates the
     # device fields on the device, outside the fields of the readable builders.
-    local = periodic_local_forces(
-        system.grid, atoms, system.pseudopotentials, specifications, lattice, density, residual, xc
-    )
+    local = _spline_species_local_forces(system, atoms, specifications, lattice, density, residual, xc)
+    if local is None:
+        local = periodic_local_forces(
+            system.grid, atoms, system.pseudopotentials, specifications, lattice, density, residual, xc
+        )
     clock["local"] = perf_counter() - mark
     mark = perf_counter()
     separable = _nonlocal_forces(system, result, clock)

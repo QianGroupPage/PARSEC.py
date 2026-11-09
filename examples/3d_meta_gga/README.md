@@ -44,7 +44,7 @@ QE at 200 Ry, dual 8. PBE:
 
 | mesh | E this code (Ry/cell) | E QE (Ry/cell) | difference (Ry) | gap this code (eV) | gap QE (eV) | dgap (meV) |
 |---|---|---|---|---|---|---|
-| 2x2x2 | -15.57525517 | -15.57491928 | -3.36e-04 | 0.6102 | 0.6102 | +0.0 |
+| 2x2x2 | -15.57525517 | -15.57491928 | -3.36e-04 | 0.6103 | 0.6102 | +0.1 |
 | 4x4x4 | -15.74905936 | -15.74871754 | -3.42e-04 | 0.7003 | 0.7002 | +0.1 |
 
 The PBE offset is PARSEC's Kleinman-Bylander quadrature (trapezoid on the logarithmic mesh against QE's Simpson
@@ -53,12 +53,12 @@ E - E_PBE. Meta-GGAs, E - E_PBE in mRy per cell:
 
 | functional | mesh | E - E_PBE this code (mRy) | E - E_PBE QE (mRy) | this code - QE (mRy) | gap this code (eV) | gap QE (eV) | dgap (meV) | SCF iterations | gradient form |
 |---|---|---|---|---|---|---|---|---|---|
-| SCAN | 2x2x2 | -7.777 | -7.687 | -0.089 | 0.7954 | 0.7932 | +2.2 | 16 | orbital |
+| SCAN | 2x2x2 | -7.777 | -7.687 | -0.089 | 0.7954 | 0.7932 | +2.2 | 18 | orbital |
 | SCAN | 4x4x4 | -9.588 | -9.443 | -0.145 | 0.9654 | 0.9605 | +4.9 | 17 | orbital |
-| r2SCAN | 2x2x2 | +0.407 | +0.516 | -0.109 | 0.7651 | 0.7648 | +0.3 | 13 | orbital |
+| r2SCAN | 2x2x2 | +0.407 | +0.516 | -0.109 | 0.7651 | 0.7648 | +0.3 | 15 | orbital |
 | r2SCAN | 4x4x4 | -5.981 | -5.888 | -0.093 | 0.8564 | 0.8560 | +0.4 | 16 | orbital |
-| TPSS | 2x2x2 | +14.551 | +14.650 | -0.099 | 0.9632 | 0.9628 | +0.4 | 23 | density |
-| TPSS | 4x4x4 | +20.199 | +20.288 | -0.089 | 0.8712 | 0.8709 | +0.3 | 18 | density |
+| TPSS | 2x2x2 | +14.551 | +14.650 | -0.099 | 0.9632 | 0.9628 | +0.4 | 18 | density |
+| TPSS | 4x4x4 | +20.199 | +20.288 | -0.089 | 0.8712 | 0.8709 | +0.3 | 17 | density |
 
 E - E_PBE agrees within 0.09 to 0.15 mRy per cell, which is QE's own scatter of the meta-GGA totals between 120 and
 250 Ry (+-0.15 mRy per cell, `qe/README.md`); the gaps of r2SCAN and TPSS within 0.4 meV, SCAN's within 2 to 5 meV
@@ -71,7 +71,7 @@ In a cell sampled at the Gamma point alone, every occupied orbital can have a ze
 (in Si the bond centres, at the density maximum), where `tau` and `sigma` vanish together. TPSS-type functionals
 (`z = tau_W/tau`; the density form of the gradient under `auto`) may then stall or diverge: Si at Gamma stalls at an
 SRE of 7e-3 at h = 0.25 bohr and diverges at h = 0.4, whatever `LibXC_Tau_Threshold` and `LibXC_Enforce_FHC` say.
-Use a k-mesh (the 2x2x2 and 4x4x4 rows above converge in 18-23 iterations), or the orbital form
+Use a k-mesh (the 2x2x2 and 4x4x4 rows above converge in 17 and 18 iterations), or the orbital form
 (`PARSEC_META_GGA_GRADIENT=orbital`: 125 and 173 iterations at h = 0.25 and 0.16 bohr, E - E_PBE within 0.05 and
 0.25 mRy of QE, the gap within 26 and 7 meV). SCAN and r2SCAN, written with `alpha`, are not affected.
 
@@ -81,17 +81,17 @@ Use a k-mesh (the 2x2x2 and 4x4x4 rows above converge in 18-23 iterations), or t
 
 | mesh | irreducible k-points | functional | SCF iterations | wall (s) | peak device memory (GiB) |
 |---|---|---|---|---|---|
-| 2x2x2 | 3 | PBE | 13 | 13.3 | 0.7 |
-| 2x2x2 | 3 | SCAN | 16 | 22.1 | 0.8 |
-| 2x2x2 | 3 | r2SCAN | 13 | 19.4 | 0.8 |
-| 2x2x2 | 3 | TPSS | 23 | 20.7 | 0.8 |
-| 4x4x4 | 8 | PBE | 12 | 16.2 | 0.8 |
-| 4x4x4 | 8 | SCAN | 17 | 29.6 | 1.0 |
-| 4x4x4 | 8 | r2SCAN | 16 | 27.5 | 1.0 |
-| 4x4x4 | 8 | TPSS | 18 | 28.3 | 1.0 |
+| 2x2x2 | 3 | PBE | 12 | 7.0 | 0.7 |
+| 2x2x2 | 3 | SCAN | 18 | 13.0 | 0.8 |
+| 2x2x2 | 3 | r2SCAN | 15 | 11.5 | 0.8 |
+| 2x2x2 | 3 | TPSS | 18 | 11.5 | 0.8 |
+| 4x4x4 | 8 | PBE | 11 | 9.5 | 0.8 |
+| 4x4x4 | 8 | SCAN | 17 | 20.7 | 1.0 |
+| 4x4x4 | 8 | r2SCAN | 16 | 18.7 | 1.0 |
+| 4x4x4 | 8 | TPSS | 17 | 18.6 | 1.0 |
 
 The orbital terms of a meta-GGA (`tau` of the orbitals of every k-point and `-div(vtau grad)` in every Bloch
-Hamiltonian) and the evaluation of libxc on the GPU make a meta-GGA run 1.5 to 1.8 times as long as PBE here.
+Hamiltonian) and the evaluation of libxc on the GPU make a meta-GGA run 1.6 to 2.2 times as long as PBE here.
 
 ## The check script
 

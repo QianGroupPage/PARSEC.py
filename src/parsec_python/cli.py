@@ -53,6 +53,8 @@ from .Output import ParsecTextReporter
 from .Output.bands import save_band_structure_archive, write_bands_files, write_spin_file
 from .Output.output_files import ReporterWithFiles, RunOutputFiles, output_header_lines
 from .Output.post_processing_output import post_processing_header_lines
+from .Output.correction_output import embedding_header_lines
+from .Output.pot_dat import write_potential_field_after_run
 from .SCF.bands import (
     band_mode,
     band_potentials,
@@ -440,6 +442,9 @@ def save_result_archive(
         ),
     }
     for name, value in energy.items():
+        if name in _NON_ENERGY_FIELDS:
+            # A hybrid's fraction and flag are no energies (exx_* members).
+            continue
         payload[f"energy_{name}_ry"] = np.asarray(value)
     # A spin-polarized result adds its two channels, up first.  The members
     # above then describe both together (SinglePointResult): the total
@@ -583,6 +588,7 @@ def save_result_archive(
             payload[f"refinement_{name}_ry"] = np.asarray(getattr(refinement, name))
         payload["refinement_pair_solves"] = np.asarray(refinement.exchange.pair_solves)
         payload["refinement_seconds"] = np.asarray(refinement.seconds)
+    payload.update(_fock_loop_payload(result))
     payload.update(_dipole_payload(_isolated_dipole(result), polarizability))
     payload.update(_k_point_payload(result))
     payload.update(_scf_potential_payload(result))
@@ -591,6 +597,71 @@ def save_result_archive(
     # members are written as they are.
     np.savez(output, **payload)
     return output
+
+
+#: Fields of an energy breakdown that are no energies: kept out of the ``energy_*_ry`` members.
+_NON_ENERGY_FIELDS = frozenset({"exact_exchange_fraction", "linearized"})
+
+
+def _fock_loop_payload(result) -> dict[str, np.ndarray]:
+    """The Fock loop of a hybrid functional (``exx_*`` members), nothing otherwise.
+
+    ``scf_history_loop`` gives the SCF loop of each row of ``scf_history``:
+    0 for the semilocal start (PBE energies), ``n`` for the inner loop of
+    outer iteration ``n`` (linearized hybrid energies); the iteration numbers
+    of ``scf_history`` start again in every loop.  ``exx_energies_linearized``
+    says whether the final ``energy_*`` members are linearized (they are not
+    after a Fock loop) and ``exx_fraction`` is the fraction of exact exchange.
+    """
+
+    summary = getattr(result, "exact_exchange", None)
+    if summary is None:
+        return {}
+    records = summary.iterations
+    loops = np.concatenate(
+        [np.full(int(record.inner_iterations), int(record.iteration), dtype=np.int64) for record in records]
+        or [np.empty(0, dtype=np.int64)]
+    )
+    extra = {}
+    if loops.size == len(getattr(result, "history", ())):
+        extra["scf_history_loop"] = loops
+    return {
+        **extra,
+        "exx_energies_linearized": np.asarray(bool(getattr(result.energies, "linearized", False))),
+        "exx_functional": np.asarray(summary.functional),
+        "exx_fraction": np.asarray(summary.fraction),
+        "exx_exchange_energy_ry": np.asarray(summary.exchange_energy),
+        "exx_estimated_error_ry": np.asarray(summary.estimated_error),
+        "exx_converged": np.asarray(summary.converged),
+        "exx_pair_solves": np.asarray(summary.pair_solves),
+        "exx_seconds": np.asarray(summary.seconds),
+        "exx_history": np.asarray(
+            [
+                [
+                    record.iteration,
+                    record.exchange_energy,
+                    np.nan if record.total_energy is None else record.total_energy,
+                    np.nan if record.estimated_error is None else record.estimated_error,
+                    record.inner_iterations,
+                    record.pair_solves,
+                    record.exchange_seconds,
+                ]
+                for record in records
+            ],
+            dtype=float,
+        ),
+        "exx_history_columns": np.asarray(
+            [
+                "iteration",
+                "exchange_energy_ry",
+                "total_energy_ry",
+                "estimated_error_ry",
+                "inner_iterations",
+                "pair_solves",
+                "exchange_seconds",
+            ]
+        ),
+    }
 
 
 def relaxation_exit_code(result, outcome, *, manual: bool = False) -> int:
@@ -770,6 +841,28 @@ def save_self_consistent_soc_result_archive(
     return output
 
 
+def without_data_files(translation):
+    """The translation of a process that writes no data files (the ranks other than 0 of an MPI run).
+
+    ``Output_Data`` off (no ``parsec.dat`` or ``eigen.dat``), no ``Output_Grid_Data`` cube files and
+    no ``bak_complete_parsec.in``; the calculation is the same (these settings describe files only).
+    """
+
+    from dataclasses import replace
+
+    files = replace(
+        translation.output_files,
+        output_data=False,
+        grid_data=(),
+        intermediate_density=False,
+        intermediate_eigenvalues=False,
+    )
+    changes = {"output_files": files}
+    if getattr(translation, "complete_input", None) is not None:
+        changes["complete_input"] = None
+    return replace(translation, **changes)
+
+
 def planned_state_count(problem, electron_count: float) -> int:
     """The states of each channel the SCF loop will return (``States_Num``)."""
 
@@ -897,7 +990,14 @@ def _band_progress(reporter):
     return report
 
 
+# False in a process of main's --no-data-files (the ranks other than 0 of an MPI run): the band path and
+# the DOS are computed with rank 0, whose files they are, and not written again.
+_WRITE_DATA_FILES = True
+
+
 def _write_band_outputs(band_result, reporter, directory: Path, start: float) -> None:
+    if not _WRITE_DATA_FILES:
+        return
     files = list(write_bands_files(directory, band_result))
     spin_file = write_spin_file(directory, band_result)  # spinor bands only
     if spin_file is not None:
@@ -1182,7 +1282,8 @@ def _run_dos(system, translation, result, reporter, directory: Path) -> None:
         )
     path = directory / "DOS"
     lines = dos_file_lines(dos, atom_labels=[atom.symbol for atom in system.atoms])
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if _WRITE_DATA_FILES:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     reporter.write("\n".join(dos_report_lines(dos, time.perf_counter() - started)))
     reporter.write(f" DOS: {path}")
 
@@ -1343,6 +1444,10 @@ def _gamma_spin_on_kpoint_driver(translation, is_periodic: bool, has_soc_species
     if not is_periodic or has_soc_species:
         return False
     problem = translation.problem
+    if getattr(getattr(problem, "scf", None), "is_meta_gga", False):
+        # A meta-GGA: the k-point spin loop forms tau of the Bloch factors (SCF/meta_gga_periodic.py); the
+        # Gamma driver run_scf_spin_polarized has no meta-GGA term.
+        return True
     periodicity = getattr(problem.grid, "periodicity", 3)
     if periodicity in (1, 2) and (
         os.environ.get("PARSEC_WIRE_SLAB_GAMMA_SPIN", "kpoint").strip().lower() == "gamma"
@@ -1351,6 +1456,83 @@ def _gamma_spin_on_kpoint_driver(translation, is_periodic: bool, has_soc_species
     ):
         return False
     return parallel_backend_uses_device()
+
+
+def _run_periodic_hybrid(
+    system,
+    translation,
+    reporter,
+    log,
+    arguments,
+    *,
+    start: float,
+    archive_path: Path,
+    log_path: Path,
+    input_directory: Path,
+    k_sampling,
+    write_files,
+    restart=None,
+    state: dict | None = None,
+) -> int:
+    """The SCF of a hybrid functional of a periodic cell with k-points, on Bloch factors.
+
+    :func:`parsec_python.SCF.hybrid_periodic.run_periodic_hybrid_scf` on the
+    time-reversal-reduced mesh of the input (a run without k-point input, which
+    main's ``run_scf`` takes, as the 1x1x1 mesh); ``restart`` (``Restart_Run``)
+    starts its semilocal start loop.  A wire or
+    slab of the Fortran-derived routines with ``Skip_Force: .false.`` gets its
+    single-point forces from :func:`parsec_python.Forces.wire_slab.compute_wire_slab_forces`,
+    whose nonlocal part reads the Bloch factors the loop keeps (``k_wavefunctions``, the
+    orbitals of the last inner loop with its exchange operator; with spin those of both
+    channels).  A bulk cell has no single-point forces on this path.
+    """
+
+    from .SCF.hybrid_periodic import run_periodic_hybrid_scf
+
+    if k_sampling is None:
+        k_points, k_weights = np.zeros((1, 3)), np.ones(1)
+    else:
+        k_points, k_weights = k_sampling
+    scf_start = time.perf_counter()
+    result = run_periodic_hybrid_scf(
+        system,
+        k_points,
+        k_weights,
+        callback=reporter.iteration,
+        warm_start=restart,
+        **(state or {}),
+    )
+    scf_elapsed = time.perf_counter() - scf_start
+    spin_polarized = translation.problem.scf.spin_polarized
+    forces = None
+    if translation.compute_forces and getattr(system.grid, "is_confined_periodic", False):
+        forces = reference_backend().compute_forces(system, result)
+    if spin_polarized:
+        reporter.finish_spin_polarized(result, scf_elapsed, forces=forces)
+    else:
+        reporter.finish(result, scf_elapsed, forces=forces)
+    if not arguments.no_archive:
+        include = arguments.save_wavefunctions or translation.output_all_states
+        extra = {} if forces is None else {"forces": forces}
+        saved = (
+            save_spin_polarized_result_archive(
+                archive_path,
+                result,
+                None,
+                include_wavefunctions=include,
+                dipole=getattr(reporter, "last_dipole", None),
+                **extra,
+            )
+            if spin_polarized
+            else save_result_archive(archive_path, result, include_wavefunctions=include, **extra)
+        )
+        log.write(f"Result archive: {saved}")
+    write_files(result)
+    _run_dos(system, translation, result, reporter, input_directory)
+    total_elapsed = time.perf_counter() - start
+    log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
+    log.write(f"Text log: {log_path}")
+    return 0 if result.converged else 3
 
 
 def _run_extended_drivers(
@@ -1538,6 +1720,25 @@ def _run_extended_drivers(
         log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
         log.write(f"Text log: {log_path}")
         return 0 if result.converged else 3
+
+    if getattr(translation.problem.scf, "is_hybrid", False):
+        # A hybrid functional of a periodic cell with k-points, or spin-polarized at the Gamma point (the
+        # 1x1x1 mesh): the Fock loop on Bloch factors (parsec_python.SCF.hybrid_periodic).
+        return _run_periodic_hybrid(
+            system,
+            translation,
+            reporter,
+            log,
+            arguments,
+            start=start,
+            archive_path=archive_path,
+            log_path=log_path,
+            input_directory=input_directory,
+            k_sampling=k_sampling,
+            write_files=write_files,
+            restart=restart,
+            state=state,
+        )
 
     if spin_polarized:  # periodic or with spin-orbit (isolated and plain: main's run_spin_scf)
         if k_sampling is None and _gamma_spin_on_kpoint_driver(
@@ -1819,6 +2020,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="additional pseudopotential directory (searched before the input directory)",
     )
     parser.add_argument(
+        "--esdf-lenient",
+        action="store_true",
+        help=(
+            "read the input as PARSEC's ESDF does: ignore labels this reader does not know and take the "
+            "first value of a label given twice, with a warning (default: refuse both)"
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -1853,6 +2062,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "problems)"
         ),
     )
+    parser.add_argument(
+        "--kpoint-pools",
+        default=None,
+        metavar="P|auto",
+        help=(
+            "in an MPI run: pools of ranks the k-points and spin channels are dealt to, each basis "
+            "shared by the ranks of its pool (default PARSEC_KPOINT_POOLS, else auto)"
+        ),
+    )
+    # The ranks other than 0 of an MPI run (the accelerated CLI's --mpi) compute without writing
+    # parsec.dat, eigen.dat, the cube files, qpoints.dat or bak_complete_parsec.in.
+    parser.add_argument("--no-data-files", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--bands-from",
         type=Path,
@@ -1922,14 +2143,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     if arguments.kpoint_workers is not None:
         os.environ["PARSEC_KPOINT_WORKERS"] = str(arguments.kpoint_workers)
+    if arguments.kpoint_pools is not None:
+        os.environ["PARSEC_KPOINT_POOLS"] = str(arguments.kpoint_pools)
     try:
         translation = parse_parsec_input(
             arguments.input,
             pseudopotential_directory=arguments.pp_dir,
+            esdf_lenient=arguments.esdf_lenient,
         )
     except (ParsecInputError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
+    global _WRITE_DATA_FILES
+    _WRITE_DATA_FILES = not arguments.no_data_files
+    if arguments.no_data_files:
+        translation = without_data_files(translation)
     if arguments.mlff is not None:
         from .MLFF import apply_mlff_option
 
@@ -2001,6 +2229,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         restart_notes = [*restart_notes, *mlff_notes]
         use_symmetry, symmetry_note = symmetry_decision(translation)
+        # AFM_Scan: one folder per scan or part of a scan.
+        scan_folder_note = None
+        if getattr(translation, "afm_scan", None) is not None:
+            from .Output.afm_scan import claim_scan_folder
+
+            scan_folder_note = claim_scan_folder(translation, input_directory)
     except MLFFError as error:
         print(f"MLFF error: {error}", file=sys.stderr)
         return 2
@@ -2222,6 +2456,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         kpoint_wire_slab_forces = False
         wire_slab_polarizability = False
         spinor_polarizability_forces = False
+    # A hybrid functional of a periodic cell at the Gamma point (spin-polarized too, with the occupations of occup.in)
+    # runs main's run_scf: the Fock loop on real orbitals (SCF/hybrid.py); with k-points the extended drivers run it
+    # on Bloch factors (SCF/hybrid_periodic.py).
+    periodic_hybrid_gamma = bool(is_periodic and translation.problem.scf.is_hybrid and k_sampling is None)
+    if (
+        periodic_hybrid_gamma
+        and spin_polarized
+        and getattr(translation.problem.scf, "fixed_occupations", None) is None
+        and not (
+            translation.relaxation is not None
+            or translation.molecular_dynamics is not None
+            or translation.compute_forces
+        )
+        and _gamma_spin_on_kpoint_driver(translation, is_periodic, has_soc_species)
+    ):
+        # A spin-polarized single point where the k-point workers run on the GPUs: the 1x1x1 Bloch loop of the
+        # extended drivers, whose orbitals, exchange and eigenproblems stay on the devices
+        # (acceleration/SCF/hybrid_periodic.py); the Gamma loop of run_scf has no device path for two channels of a
+        # periodic cell.  Its energy equals the real loop's to the SCF convergence.
+        periodic_hybrid_gamma = False
+    if periodic_hybrid_gamma:
+        uses_extended_drivers = False
     if uses_extended_drivers and not (periodic_ionic or spinor_ionic) and (
         translation.relaxation is not None
         or translation.molecular_dynamics is not None
@@ -2302,6 +2558,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             # usrinputfile.F90: Calc_Hartree_G, nscf_kpoints and Create_DOS.
             for line in post_processing_header_lines(translation):
                 log.write(line)
+            # PARSEC 1.5: FDET (Potential_Field) and pot.dat.
+            for line in embedding_header_lines(translation):
+                log.write(line)
+            if scan_folder_note is not None:
+                log.write(scan_folder_note)
             # A periodic cell has no Hartree boundary values for a switch of
             # the accelerated driver to change.
             switch_warnings = () if is_periodic else ignored_boundary_switch_warnings()
@@ -2311,6 +2572,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.write(f"WARNING: {symmetry_note}")
             for note in restart_notes:
                 log.write(note)
+            # Generate_Complete_Parsec_In (PARSEC 1.5): bak_complete_parsec.in beside the input
+            from .Output.complete_input import write_complete_input
+
+            for line in write_complete_input(translation):
+                log.write(line)
             log.write()
             if (
                 noncollinear
@@ -2328,10 +2594,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log.write("\n".join(relaxation_header_lines(translation)))
             if is_periodic:
                 system = prepare_periodic_single_point(translation.problem)
+                if periodic_hybrid_gamma:
+                    # run_spin_scf starts from the periodic spin densities (nothing for an unpolarized run)
+                    from .SCF.pbc import with_initial_spin_densities
+
+                    system = with_initial_spin_densities(system)
             else:
                 system = prepare_single_point(translation.problem)
             reporter.setup(system)
-            if arguments.bands_from is None:
+            # FDET (PARSEC 1.5): the frozen field and the tip sphere.
+            from .Output.correction_output import embedding_setup_lines
+
+            for line in embedding_setup_lines(system):
+                log.write(line)
+            if arguments.bands_from is None and not arguments.no_data_files:
                 write_qpoints_file(translation.problem, input_directory, log.write)
 
             if translation.problem.eigensolver.method == "none":
@@ -2546,6 +2822,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 log.write(f"Result archive: {saved}")
             files.finish(result, system.grid, translation.problem)
+            # Write_Potential_Field: pot.dat of PARSEC 1.5, of the last structure.
+            write_potential_field_after_run(translation, system, result, outcome, dynamics, log.write, input_directory)
+            # AFM_Scan: the table of the scan (afm_scan.dat).
+            from .Output.afm_scan import scan_lines_after_run
+
+            scan_lines_after_run(translation, outcome, log.write, input_directory)
             # The SCF archive is written first so a long band calculation cannot lose it.
             _run_band_structure(system, translation, result, reporter, input_directory)
             # Create_DOS (parsec.F90 l.2181-2189), of the last structure.

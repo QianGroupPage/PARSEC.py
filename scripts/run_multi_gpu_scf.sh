@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
-# Complete SCF calculation of an isolated system (molecule or cluster) on the
-# GPUs of one node or of several nodes.
+# Complete SCF calculation of an isolated system (molecule or cluster), or of
+# a bulk periodic cell at the Gamma point, on the GPUs of one node or of
+# several nodes.
 #
 # One MPI rank per node drives all GPUs of its node. This is the layout and
 # these are the settings the multi-GPU solver was measured with (1 to 16
 # A100 80 GB GPUs, four per node, double precision); see "Several nodes" in
-# src/parsec_python/acceleration/MULTI_GPU.md. The runner refuses periodic
-# cells.
+# src/parsec_python/acceleration/MULTI_GPU.md.
+#
+# A periodic cell (Boundary_Conditions: bulk) runs at the Gamma point, with
+# real orbitals, an orthorhombic cell, no spin and a native LDA or GGA, as one
+# sector whose orbitals the ranks share: on several nodes launch it with
+# --rank-per-gpu (one rank per GPU), on one node either layout. K-points go to
+# parsec_python/main.py --mpi; spin, hybrids, meta-GGAs, oblique cells, wires,
+# slabs, forces, relaxation and molecular dynamics of a cell to main.py (the
+# runner refuses them by name). See "Periodic cells at the Gamma point on
+# several nodes" in MULTI_GPU.md.
 #
 # An input with Minimization (bfgs, simple) runs the structural relaxation on
 # the same layout, and Skip_Force: false adds the forces to a single point;
@@ -17,6 +26,10 @@
 # nodes with --rank-per-gpu, which starts one rank per GPU; the ranks then
 # share the orbitals of that sector (src/parsec_python/acceleration/
 # Eigensolvers/mpi_shared_basis.py). See src/parsec_python/FORCES_AND_RELAXATION.md.
+# A hybrid functional (Correlation_Type pbe0, hse06, ...) runs on either
+# layout: every sector on one GPU of its rank and the pair densities of its
+# exchange on all GPUs of all ranks; a structure without symmetry then needs
+# no --rank-per-gpu (see "Hybrid functionals on several nodes" in MULTI_GPU.md).
 #
 # Call the script by its path in the checkout, from a batch script or from the
 # shell of an interactive allocation, after loading the MPI and CUDA modules
@@ -40,7 +53,7 @@
 #   --cpus-per-rank   CPUs of each rank as srun -c counts them (default 32,
 #                which is 16 cores with two hardware threads each)
 #   --rank-per-gpu    G ranks per node, one GPU each, for a run without
-#                symmetry (molecular dynamics) on several nodes. Their
+#                symmetry (molecular dynamics, a periodic cell) on several nodes. Their
 #                exchanges pass GPU arrays to MPI: Cray MPICH needs mpi4py
 #                built with craype-accel-nvidia80 loaded (it links
 #                libmpi_gtl_cuda); PARSEC_MPI_SHARED_TRANSPORT=host stages
@@ -52,6 +65,7 @@
 #   scripts/run_multi_gpu_scf.sh parsec.in out                    # every node, 4 GPUs each
 #   scripts/run_multi_gpu_scf.sh --nodes 1 --gpus-per-node 2 parsec.in out
 #   scripts/run_multi_gpu_scf.sh --nodes 4 --rank-per-gpu md/parsec.in md_out   # MD on 16 GPUs
+#   scripts/run_multi_gpu_scf.sh --nodes 4 --rank-per-gpu bulk/parsec.in bulk_out   # a cell at Gamma on 16 GPUs
 #
 # Environment: a setting below that is already in the environment is left as
 # it is, except the OpenMP binding, which is switched off (OMP_PROC_BIND=false,
@@ -66,7 +80,8 @@
 # basis (PARSEC_CUPY_DISTRIBUTED_STATE), and the mixed-precision filter
 # (PARSEC_CUPY_MIXED_FILTER, off by default).
 #
-# The measured inputs use Eigensolver chebff with FF_MaxIter 4,
+# The benchmark inputs use Eigensolver chebff with FF_MaxIter 3 (4 in the
+# published series of 2026-10-23; 3 since 2026-11-04, 7-13 % shorter SCF on A100),
 # Chebdav_Degree 30 and Chebyshev_Degree 15; these are input keywords, not
 # settings of this script.
 set -euo pipefail
@@ -148,7 +163,8 @@ export PARSEC_CUPY_STAGE_TIMING="${PARSEC_CUPY_STAGE_TIMING:-1}"
 
 # Cray MPICH: the network interface nearest to the GPUs (other MPI libraries
 # ignore the variable). The runner itself switches MPICH_GPU_SUPPORT_ENABLED
-# off where its ranks exchange host arrays only, and on for --rank-per-gpu.
+# off where its ranks exchange host arrays only, and on for --rank-per-gpu and
+# for a hybrid functional (PARSEC_MPI_EXCHANGE_TRANSPORT=host keeps it off).
 export MPICH_OFI_NIC_POLICY="${MPICH_OFI_NIC_POLICY:-GPU}"
 
 devices=0

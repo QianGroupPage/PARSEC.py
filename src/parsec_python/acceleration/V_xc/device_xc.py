@@ -380,6 +380,18 @@ def _orbit_flips(grid, reduction) -> np.ndarray:
     return flips
 
 
+def _grid_order_identity(reduction, size: int) -> bool:
+    """Whether ``reduction`` is the identity alone with orbit ``w`` the grid row ``w`` (``size`` rows)."""
+
+    if int(reduction.group_order) != 1 or int(reduction.wedge_size) != int(size):
+        return False
+    rows = np.arange(int(size), dtype=np.int64)
+    return bool(
+        np.array_equal(np.asarray(reduction.representative_rows), rows)
+        and np.array_equal(np.asarray(reduction.full_to_wedge), rows)
+    )
+
+
 class _StencilGeometry:
     """The value map, representative positions and stencil weights on a device."""
 
@@ -397,8 +409,10 @@ class _StencilGeometry:
         self.negated_weights = cp.asarray(-weights)
         self.flips = None
         if self.periodic:
-            if reduction is not None:
+            if reduction is not None and not _grid_order_identity(reduction, box_size):
                 raise ValueError("a periodic grid has no symmetry reduction here")
+            # (The identity alone, one orbit per point in the order of the
+            # grid, as one sector of the identity has it: the box itself.)
             # pbe.py _to_box: the rows of a periodic cell are its box, row-major.
             positions = np.arange(box_size, dtype=np.int32)
             value_of_box = positions
@@ -701,15 +715,16 @@ class DeviceSpinXCEvaluator(_DeviceEvaluatorBase):
     """A spin-polarized functional on a device: ``evaluator(up, down) -> SpinXCResult``.
 
     The counterpart of :meth:`PreparedSinglePointSystem.evaluate_spin_xc`
-    (full-grid channels; each sees half of the frozen core density).
+    (each channel sees half of the frozen core density): full-grid channels,
+    or with ``reducer`` the orbit fields of a spin loop in the symmetry
+    sectors (``Spin_Symmetry_Sectors``), whose results are orbit fields.  Both
+    channel densities of the sectors are invariant, so the orbit geometry of
+    the unpolarized functional applies to each: the gradient of a channel
+    from its orbit values, ``D n_a . D n_b`` invariant, and each channel's
+    flux a vector field carried by the reflection signs.
     """
 
     spin_polarized = True
-
-    def __init__(self, functional: str, grid, **keywords) -> None:
-        if keywords.get("reducer") is not None:
-            raise ValueError("the spin channels are evaluated on the full grid")
-        super().__init__(functional, grid, **keywords)
 
     def __call__(self, valence_up, valence_down) -> SpinXCResult:
         cp = self._cp
@@ -785,9 +800,9 @@ class DeviceSpinXCEvaluator(_DeviceEvaluatorBase):
                 )
             total_energy = self._integral(energy_density)
             return SpinXCResult(
-                potential_up=cp.asnumpy(potential_up),
-                potential_down=cp.asnumpy(potential_down),
-                energy_density=cp.asnumpy(energy_density),
+                potential_up=self._field(potential_up),
+                potential_down=self._field(potential_down),
+                energy_density=self._field(energy_density),
                 total_energy=total_energy,
             )
 
@@ -829,11 +844,32 @@ def accelerated_xc_evaluators(
     # shifts its potentials; the device evaluators get the same shift.
     shift = getattr(reference, "_zero_average", None)
     zero_average = callable(shift) and shift(None) is True
+    from parsec_python.V_xc.libxc import is_libxc_functional
+
+    if is_libxc_functional(functional):
+        # A libxc LDA/GGA on the device where libxc is a CUDA build (device_libxc.py);
+        # the host evaluates it otherwise, and PARSEC_CUPY_XC=off keeps it there.
+        if device_xc_mode() == "off" or getattr(scf, "is_hybrid", False):
+            return None, None
+        from .device_libxc import libxc_xc_evaluators
+
+        unpolarized, spin_evaluator = libxc_xc_evaluators(
+            reference,
+            spec=functional,
+            reducer=reducer,
+            device_id=device_id,
+            core_density=keywords["core_density"],
+        )
+        if zero_average:
+            unpolarized = None if unpolarized is None else ZeroAverageXC(unpolarized)
+            spin_evaluator = None if spin_evaluator is None else ZeroAverageXC(spin_evaluator)
+        return unpolarized, spin_evaluator
     if spin:
-        # The loop of two channels evaluates the spin functional only.
+        # The loop of two channels evaluates the spin functional only; on the
+        # orbits where the channels are solved in the symmetry sectors.
         if not device_xc_selected(functional, spin_polarized=True):
             return None, None
-        evaluator = DeviceSpinXCEvaluator(functional, grid, **keywords)
+        evaluator = DeviceSpinXCEvaluator(functional, grid, reducer=reducer, **keywords)
         return None, (ZeroAverageXC(evaluator) if zero_average else evaluator)
     if not device_xc_selected(functional):
         return None, None
@@ -861,6 +897,13 @@ class ZeroAverageXC:
 
     @staticmethod
     def _shifted(potential):
+        reduction = getattr(potential, "reduction", None)
+        if reduction is not None:
+            # One value per orbit (an evaluator with a reducer): the mean over
+            # the full grid weighs every orbit by its size.
+            weights = np.asarray(reduction.multiplicities, dtype=np.float64)
+            mean = float(np.dot(weights, potential.values) / np.sum(weights))
+            return type(potential)(reduction, potential.values - mean)
         values = np.asarray(potential, dtype=np.float64)
         return values - float(np.mean(values))
 

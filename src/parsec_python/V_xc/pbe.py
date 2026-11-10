@@ -182,12 +182,30 @@ def pbe_energy_partials(
 
     n = density[positive]
     sig = np.maximum(sigma[positive], 0.0)
-    n13 = np.cbrt(n)
-    kf = _KF_COEFFICIENT * n13
 
     # Exchange: f_x = -C_x*n^(4/3)*F_x(s), with
     # s^2 = sigma/[4*k_F^2*n^2].
     exchange_energy, exchange_dn, exchange_dsigma = _exchange_partials(n, sig)
+    correlation_energy, correlation_dn, correlation_dsigma = _correlation_partials(n, sig)
+
+    energy_density[positive] = exchange_energy + correlation_energy
+    derivative_density[positive] = exchange_dn + correlation_dn
+    derivative_sigma[positive] = exchange_dsigma + correlation_dsigma
+    return energy_density, derivative_density, derivative_sigma
+
+
+def _correlation_partials(
+    n: np.ndarray, sig: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """PBE correlation energy per volume of an unpolarized density, in Hartree.
+
+    ``f_c = n [e_c^PW92(r_s) + H(r_s, t)]`` (the correlation half of
+    :func:`pbe_energy_partials`) and its derivatives with respect to ``n`` and
+    ``sigma``.  ``n`` must be positive and ``sig`` nonnegative.
+    """
+
+    n13 = np.cbrt(n)
+    kf = _KF_COEFFICIENT * n13
 
     # Correlation: PW92 LDA plus the PBE gradient correction H.
     rs = np.cbrt(3.0 / (4.0 * np.pi * n))
@@ -232,11 +250,7 @@ def pbe_energy_partials(
     correlation_energy = n * (epsilon_lda + h)
     correlation_dn = epsilon_lda + h + n * (epsilon_lda_n + h_n)
     correlation_dsigma = n * h_sigma
-
-    energy_density[positive] = exchange_energy + correlation_energy
-    derivative_density[positive] = exchange_dn + correlation_dn
-    derivative_sigma[positive] = exchange_dsigma + correlation_dsigma
-    return energy_density, derivative_density, derivative_sigma
+    return correlation_energy, correlation_dn, correlation_dsigma
 
 
 def _is_periodic(grid) -> bool:
@@ -628,6 +642,28 @@ def pbe_spin_polarized_partials(n_up, n_down, s_uu, s_ud, s_dd):
         outputs[index + 1][active] = (
             _pbe_spin_energy_density(*perturbed).imag / _COMPLEX_STEP
         )
+    # An empty channel (a decision of this port, 2026-11-05): with the floor, zeta lies 2e-16/n from +-1, where
+    # d phi/d zeta ~ (1 -+ zeta)**(-1/3) of the exact phi diverges, and the empty channel got potentials of
+    # 1e7 Ry.  Those points take the fully polarized limit of the PBE form with PBE's regularized phi
+    # (V_xc.pbe_spin, as the PBE reference code), its sigma derivatives written for s_ab:
+    # sigma_total = s_uu + 2 s_ud + s_dd.  Points with both channels positive keep their bits.
+    empty = active & ((arrays[0] <= 0.0) | (arrays[1] <= 0.0))
+    if np.any(empty):
+        from .pbe_spin import pbe_spin_energy_partials
+
+        suu, sud, sdd = np.maximum(arrays[2][empty], 0.0), arrays[3][empty], np.maximum(arrays[4][empty], 0.0)
+        f, d_up, d_down, d_sigma_up, d_sigma_down, d_sigma_total = pbe_spin_energy_partials(
+            np.maximum(arrays[0][empty], 0.0),
+            np.maximum(arrays[1][empty], 0.0),
+            suu,
+            sdd,
+            np.maximum(suu + 2.0 * sud + sdd, 0.0),
+        )
+        for output, value in zip(
+            outputs,
+            (f, d_up, d_down, d_sigma_up + d_sigma_total, 2.0 * d_sigma_total, d_sigma_down + d_sigma_total),
+        ):
+            output[empty] = value
     return tuple(outputs)
 
 
@@ -663,8 +699,27 @@ def pbe_spin_polarized(
         down = down + 0.5 * core
     if np.any(up < -1.0e-14) or np.any(down < -1.0e-14):
         raise ValueError("PBE requires nonnegative spin densities")
+    return discrete_spin_gga_ab(up, down, grid, pbe_spin_polarized_partials)
+
+
+def discrete_spin_gga_ab(up: np.ndarray, down: np.ndarray, grid, partials) -> SpinPolarizedXCResult:
+    """Spin GGA energy and exact discrete potentials in the variables ``s_ab = D n_a . D n_b``.
+
+    ``partials(n_up, n_down, s_uu, s_ud, s_dd)`` returns the energy per volume
+    ``f`` and ``(df/dn_up, df/dn_down, df/ds_uu, df/ds_ud, df/ds_dd)`` in
+    Hartree (the variables and derivatives of libxc: ``vrho``, ``vsigma``).
+    The potential of channel ``a`` is the derivative of ``h**3 sum_i f_i``,
+
+    ``v_a = df/dn_a + D.T @ (2 f_aa D n_a + f_ab D n_b)``,
+
+    returned in Rydberg with the energy.  ``up`` and ``down`` already hold
+    their halves of any frozen core density.  The stencil, the zero padding of
+    a cluster, the wraparound of a periodic cell and the oblique and
+    non-orthogonal grids are those of :func:`discrete_gga`.
+    """
+
     if getattr(grid, "is_general_periodic", False):
-        return _pbe_spin_polarized_general_periodic(up, down, grid)
+        return _pbe_spin_polarized_general_periodic(up, down, grid, partials)
 
     weights = first_derivative_coefficients(grid.settings.expansion_order)
     mix = _oblique_mix(grid)
@@ -690,9 +745,7 @@ def pbe_spin_polarized(
     s_dd = sum(g * g for g in grad_down)
     s_ud = sum(a * b for a, b in zip(grad_up, grad_down))
 
-    f, f_up, f_down, f_uu, f_ud, f_dd = pbe_spin_polarized_partials(
-        up, down, s_uu, s_ud, s_dd
-    )
+    f, f_up, f_down, f_uu, f_ud, f_dd = partials(up, down, s_uu, s_ud, s_dd)
 
     def divergence_adjoint(fluxes):
         if mix is not None:
@@ -725,8 +778,10 @@ def pbe_spin_polarized(
     )
 
 
-def _pbe_spin_polarized_general_periodic(up, down, grid) -> SpinPolarizedXCResult:
-    """:func:`pbe_spin_polarized` on a non-orthogonal periodic grid.
+def _pbe_spin_polarized_general_periodic(
+    up, down, grid, partials=pbe_spin_polarized_partials
+) -> SpinPolarizedXCResult:
+    """:func:`discrete_spin_gga_ab` on a non-orthogonal periodic grid.
 
     Same construction as the general-grid branch of :func:`discrete_gga`: lattice-direction
     derivatives made Cartesian by ``inv(A_n)^T`` and the exact transpose for
@@ -744,9 +799,7 @@ def _pbe_spin_polarized_general_periodic(up, down, grid) -> SpinPolarizedXCResul
     s_uu = np.einsum("ij,ij->j", grad_up, grad_up)
     s_dd = np.einsum("ij,ij->j", grad_down, grad_down)
     s_ud = np.einsum("ij,ij->j", grad_up, grad_down)
-    f, f_up, f_down, f_uu, f_ud, f_dd = pbe_spin_polarized_partials(
-        up, down, s_uu, s_ud, s_dd
-    )
+    f, f_up, f_down, f_uu, f_ud, f_dd = partials(up, down, s_uu, s_ud, s_dd)
     potential_up = f_up + cartesian_gradient_transpose(
         2.0 * f_uu[None, :] * grad_up + f_ud[None, :] * grad_down, grid, weights
     )
@@ -765,6 +818,7 @@ def _pbe_spin_polarized_general_periodic(up, down, grid) -> SpinPolarizedXCResul
 __all__ = [
     "density_gradient",
     "discrete_gga",
+    "discrete_spin_gga_ab",
     "first_derivative_coefficients",
     "pbe",
     "pbe_energy_partials",

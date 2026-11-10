@@ -210,6 +210,8 @@ class DeviceBackendDriversTests(unittest.TestCase):
     def test_scf_drivers_match_the_cpu_with_the_host_solver(self) -> None:
         for name in ("spin_polarized", "soc", "noncollinear"):
             with self.subTest(driver=name):
+                # the serial run on the CPU (test_kpoint_parallel names it: with a GPU visible this was
+                # the CuPy route up to 2026-11-05, which agrees with the host only to the convergence)
                 serial = parallel_tests._run(name, "1")
                 driver, flags, soc = parallel_tests.DRIVERS[name]
                 with mock.patch.dict(
@@ -311,6 +313,51 @@ class DeviceResidentSolverTests(unittest.TestCase):
                 install()
         self.assertGreater(stats.get("subspace_steps", 0), 0)
         self.assertEqual(stats["first_solves"], len(parallel_tests._K))
+
+
+def _cupy_usable() -> bool:
+    try:
+        return resolve_kpoint_backend("cupy").name == "cupy"
+    except Exception:  # noqa: BLE001 - no CuPy or no CUDA device
+        return False
+
+
+def _levels_and_density(result):
+    """Every eigenvalue and the (total) density of a run, whatever the driver."""
+    if getattr(result, "eigenvalues", None) is not None:
+        return np.ravel(result.eigenvalues), np.ravel(result.density)
+    levels = np.concatenate([np.ravel(result.eigenvalues_up), np.ravel(result.eigenvalues_down)])
+    return levels, np.ravel(result.density_up) + np.ravel(result.density_down)
+
+
+@unittest.skipUnless(_cupy_usable(), "CuPy with a usable CUDA device is required")
+class CupyResidentSolverTests(unittest.TestCase):
+    """The route of a GPU machine (``--device auto``: the k-points on every visible device, the
+    periodic Hartree CG on the first) reaches the serial CPU result, for all five drivers.
+
+    The device eigensolver is another path to the same SCF, so the runs are converged tightly (as in
+    :class:`DeviceResidentSolverTests`).  Measured on A100 (1 and 4 GPUs, 2026-11-05, Convergence_Criterion
+    2e-5) the largest differences from the CPU over the five drivers were 2.4e-10 Ry in the total energy,
+    8.5e-6 Ry in the Fermi level, 1.04e-5 Ry in an eigenvalue and 3.3e-6 in the density (all from the
+    non-collinear driver but the density, from spin-orbit); the bounds below leave a factor 5 to 20.  At the
+    criterion 2e-3 of test_kpoint_parallel the same routes differ by up to 5.1e-4 Ry in an eigenvalue
+    (spin-orbit, 9 SCF steps on the GPU against 12 on the CPU), which is why those tests name the CPU.
+    """
+
+    GPU = {"PARSEC_KPOINT_BACKEND": "cupy"}
+
+    def test_every_driver_reaches_the_cpu_result(self) -> None:
+        for name in parallel_tests.DRIVERS:
+            with self.subTest(driver=name):
+                serial = _converged(name, DeviceResidentSolverTests.CPU)
+                device = _converged(name, self.GPU)
+                self.assertTrue(serial.converged and device.converged)
+                self.assertAlmostEqual(device.energies.total, serial.energies.total, delta=5.0e-9)
+                self.assertAlmostEqual(device.fermi_level, serial.fermi_level, delta=5.0e-5)
+                levels, density = _levels_and_density(device)
+                serial_levels, serial_density = _levels_and_density(serial)
+                np.testing.assert_allclose(levels, serial_levels, rtol=0.0, atol=1.0e-4)
+                np.testing.assert_allclose(density, serial_density, rtol=0.0, atol=2.0e-5)
 
 
 if __name__ == "__main__":

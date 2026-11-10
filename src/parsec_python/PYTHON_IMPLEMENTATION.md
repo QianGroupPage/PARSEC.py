@@ -552,7 +552,11 @@ Differences from Fortran PARSEC:
   skips the `ca` functional there and drops the PBE exchange energy, so a
   state with an empty channel (H, H2+, any one-electron system) neither
   converges nor has a meaningful energy in Fortran. Here it is an ordinary
-  calculation; it has no Fortran reference.
+  calculation; it has no Fortran reference. Since 5 November 2026 the spin
+  forms of the periodic, spin-orbit and non-collinear drivers do the same
+  (`ca_lda_spin_polarized` had kept Fortran's guard; `pbe_spin_polarized`
+  takes the regularized `phi` of `V_xc/pbe_spin.py` at a point with an empty
+  channel instead of its 1e-16 floor).
 - Spin-polarized PBE uses the potential of the discrete energy, like the
   unpolarized PBE of this package, where Fortran evaluates the continuum
   expression. The two programs then solve different discrete problems; with

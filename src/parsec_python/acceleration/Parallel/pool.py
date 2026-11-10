@@ -36,7 +36,7 @@ import threading
 import traceback
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
-from .blas import set_blas_threads
+from .blas import blas_threads, set_blas_threads
 
 WORKERS_ENV = "PARSEC_KPOINT_WORKERS"
 
@@ -111,8 +111,11 @@ class _ThreadPool:
         # OpenBLAS called from several Python threads at once returned wrong
         # results (diverged Chebyshev filters, residuals 10x those of a serial run),
         # so each worker gets a single-threaded BLAS for the lifetime of the pool;
-        # the parallelism is across the workers.
-        self._blas_restore = available_cpus() if set_blas_threads(1) else None
+        # the parallelism is across the workers.  Closing gives every library the
+        # count it had (all allowed CPUs for a library that does not tell it), so an
+        # OPENBLAS_NUM_THREADS of the launch or an enclosing pool's single thread is kept.
+        previous = blas_threads()
+        self._blas_restore = (available_cpus(), previous) if set_blas_threads(1) else None
         self._commands: list[queue.Queue] = []
         self._results: queue.Queue = queue.Queue()
         self._threads = []
@@ -175,7 +178,8 @@ class _ThreadPool:
         self._commands = []
         self._threads = []
         if self._blas_restore is not None:
-            set_blas_threads(self._blas_restore)
+            count, previous = self._blas_restore
+            set_blas_threads(count, previous=previous)
             self._blas_restore = None
 
 

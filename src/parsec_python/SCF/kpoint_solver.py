@@ -149,7 +149,19 @@ def device_solver_supports(settings: EigvalSettings) -> bool:
     ARPACK and DIAGLA (``Eigensolver: arpack`` / ``diagla``) are host
     eigensolvers: a device worker runs them with the host route (the device
     Hamiltonian as a linear operator), as before the device solver existed.
+    The options of the PARSEC 1.5 round that the device solver does not
+    carry (PARSEC 1.5's residual-driven CHEBFF, another reorthogonalization
+    threshold) take the host route too.  A ``Vector_Rng_Seed`` reaches the
+    device solver through ``random_seed``, the seed of its start basis.
     """
+    chebff = getattr(settings, "chebff", None)
+    subspace = getattr(settings, "subspace", None)
+    if (
+        getattr(chebff, "residual_tolerance", None) is not None
+        or getattr(chebff, "reorthogonalization_threshold", 0.1) != 0.1
+        or getattr(subspace, "reorthogonalization_threshold", 0.1) != 0.1
+    ):
+        return False
     return getattr(settings, "initial_method", "chebff") in DEVICE_FIRST_SOLVERS
 
 

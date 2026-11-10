@@ -53,6 +53,9 @@ ITERATIVE_SOLVERS = frozenset({"arpack", "diagla"})
 # parsec.F90:1106-1111 (intended): the first SCF iteration of a loop with
 # Dynamic_Diag_Tol uses this eigensolver tolerance.
 DYNAMIC_TOLERANCE_START = 0.1
+# twomach_eps of PARSEC 1.5 (math/const.F90:32): the empty-channel bypass of
+# the dynamic tolerance (parsec.F90:1665-1675).
+_TWO_MACHINE_EPSILON = 4.440892098500626161694526672363e-16
 
 
 def dynamic_diagonalization_tolerance(
@@ -74,9 +77,17 @@ def dynamic_diagonalization_tolerance(
     ``Dynamic_Diag_Tol``, so ``dyntoler = toler`` (parsec.F90:1109) stores
     0.1 as the floor and the tolerance stays 0.1 throughout, the input
     ``Diag_Tolerance`` being lost.
+
+    PARSEC 1.5 (``parsec.F90:1665-1675``) takes ``maxval(sre)`` instead of
+    ``minval(sre)`` when the smallest SRE is not above ``2 eps``: the SRE of
+    an empty spin channel is zero, and the tolerance would otherwise drop to
+    the floor at once.
     """
 
-    smallest = min(float(value) for value in weighted_residuals)
+    values = [float(value) for value in weighted_residuals]
+    smallest = min(values)
+    if not smallest > _TWO_MACHINE_EPSILON:
+        smallest = max(values)
     return max(min(float(tolerance), smallest / 10.0), float(floor))
 
 
@@ -353,6 +364,13 @@ def solve_eigval(
                 operator,
                 working_states,
                 settings=settings.chebff,
+                # PARSEC 1.5's residual-driven mode (residual_tolerance)
+                # tests the States_Num states, its whole working space.
+                **(
+                    {}
+                    if settings.chebff.residual_tolerance is None
+                    else {"residual_states": requested_states}
+                ),
             )
             first_residuals = None
             chebff_result: ChebFFResult | None = first

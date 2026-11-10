@@ -187,6 +187,234 @@ void periodic_local_force_chunks(
 
 _COMPILED: dict[int, object] = {}
 
+# The density terms of the forces on a general (oblique) lattice (Forces/periodic_spline.py): the self-consistency
+# term (V_out - V_in times the slope of the atomic valence density) and the core term (V_xc times the slope of a
+# linearly interpolated core density), over the images whose fractional offset lies within reach |inverse[:, m]|.
+_LATTICE_DENSITY_FORCE_KERNEL = _fields.RADIAL_HELPERS + r"""
+__device__ __forceinline__ double lattice_table_slope(
+    const double r, const double* radii, const double* table, const int samples,
+    const double scale_a, const double scale_b)
+{
+    // slope of np.interp(r, radii, table): zero below the first sample
+    if (r < radii[0]) return 0.0;
+    const long long j = radial_segment(r, radii, samples, scale_a, scale_b);
+    return (table[j + 1] - table[j]) / (radii[j + 1] - radii[j]);
+}
+
+extern "C" __global__
+void periodic_lattice_density_force_chunks(
+    const long long point_count,
+    const int chunk_points,
+    const long long chunk_count,
+    const int atom_count,
+    const double* coordinates,
+    const double* residual,
+    const double* xc,
+    const double* positions,
+    const int* species,
+    const double* lattice,
+    const double* inverse,
+    const double* widths,
+    const double* radii,
+    const double* valence,
+    const double* core,
+    const int* offsets,
+    const int* counts,
+    const double* parameters,
+    double* partial)
+{
+    const long long task = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (task >= (long long)atom_count * chunk_count) return;
+    const int atom = (int)(task / chunk_count);
+    const long long chunk = task % chunk_count;
+    const int kind = species[atom];
+    const double* r_table = radii + offsets[kind];
+    const double* v_table = valence + offsets[kind];
+    const double* c_table = core + offsets[kind];
+    const int samples = counts[kind];
+    const double* p = parameters + 6 * kind;
+    const double scale_a = p[0], scale_b = p[1], cutoff = p[2];
+    const double valence_reach = p[3], core_reach = p[4];
+    double reach = valence_reach;
+    if (core_reach > reach) reach = core_reach;
+    double sums[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    const long long first = chunk * chunk_points;
+    long long last = first + chunk_points;
+    if (last > point_count) last = point_count;
+    if (reach > 0.0) {
+        for (long long point = first; point < last; ++point) {
+            const double dv = residual[point];
+            const double vxc = xc[point];
+            const double dx = coordinates[3 * point + 0] - positions[3 * atom + 0];
+            const double dy = coordinates[3 * point + 1] - positions[3 * atom + 1];
+            const double dz = coordinates[3 * point + 2] - positions[3 * atom + 2];
+            long long low[3], high[3];
+            for (int m = 0; m < 3; ++m) {
+                const double f = dx * inverse[0 * 3 + m] + dy * inverse[1 * 3 + m] + dz * inverse[2 * 3 + m];
+                low[m] = (long long)ceil(f - reach * widths[m]) - 1;
+                high[m] = (long long)floor(f + reach * widths[m]) + 1;
+            }
+            for (long long t0 = low[0]; t0 <= high[0]; ++t0) {
+                for (long long t1 = low[1]; t1 <= high[1]; ++t1) {
+                    for (long long t2 = low[2]; t2 <= high[2]; ++t2) {
+                        const double ex = dx - ((double)t0 * lattice[0] + (double)t1 * lattice[3] + (double)t2 * lattice[6]);
+                        const double ey = dy - ((double)t0 * lattice[1] + (double)t1 * lattice[4] + (double)t2 * lattice[7]);
+                        const double ez = dz - ((double)t0 * lattice[2] + (double)t1 * lattice[5] + (double)t2 * lattice[8]);
+                        const double r = sqrt(ex * ex + ey * ey + ez * ez);
+                        if (!(r > 0.0) || !(r < cutoff)) continue;
+                        const double inverse_r = 1.0 / r;
+                        if (r <= valence_reach) {
+                            const double weight =
+                                dv * lattice_table_slope(r, r_table, v_table, samples, scale_a, scale_b) * inverse_r;
+                            sums[0] += weight * ex;
+                            sums[1] += weight * ey;
+                            sums[2] += weight * ez;
+                        }
+                        if (r <= core_reach) {
+                            const double weight =
+                                vxc * lattice_table_slope(r, r_table, c_table, samples, scale_a, scale_b) * inverse_r;
+                            sums[3] += weight * ex;
+                            sums[4] += weight * ey;
+                            sums[5] += weight * ez;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    double* target = partial + 6 * task;
+    for (int term = 0; term < 6; ++term) target[term] = sums[term];
+}
+"""
+_COMPILED_LATTICE: dict[int, object] = {}
+
+
+def _lattice_density_force_kernel(cp):
+    device = int(cp.cuda.Device().id)
+    if device not in _COMPILED_LATTICE:
+        kernel = cp.RawKernel(
+            _LATTICE_DENSITY_FORCE_KERNEL, "periodic_lattice_density_force_chunks", options=("--std=c++11",)
+        )
+        kernel.compile()
+        _COMPILED_LATTICE[device] = kernel
+    return _COMPILED_LATTICE[device]
+
+
+def device_lattice_density_forces(
+    grid, atoms, potentials, specifications, lattice_vectors, potential_residual, xc_potential, *, host_core=frozenset()
+):
+    """The self-consistency and core terms of the local forces of an oblique cell on the device, or ``None``.
+
+    The terms of :func:`parsec_python.acceleration.Forces.periodic_spline.spline_periodic_local_forces` on the
+    general grid (:func:`parsec_python.acceleration.V_ion.periodic_device.lattice_handles`): the slopes of the
+    linearly interpolated valence and core tables over the images within their reach
+    (:func:`parsec_python.acceleration.V_ion.periodic_device.density_reach`), one thread per atom and chunk of
+    grid points.  ``host_core`` leaves the core term of those species to the host (a ``Cubic_Spline`` core
+    density).  ``(self_consistency, core_correction)`` in Ry/bohr, equal to the host sums to round-off.
+    """
+
+    if not _fields.lattice_handles(grid):
+        return None
+    cp = _fields._cupy()
+    if cp is None:
+        return None
+    residual = np.ascontiguousarray(potential_residual, dtype=np.float64)
+    xc = np.ascontiguousarray(xc_potential, dtype=np.float64)
+    count = len(atoms)
+    if count == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    residual_present = bool(np.any(residual != 0.0))
+    xc_present = bool(np.any(xc != 0.0))
+    symbols = list(dict.fromkeys(atom.symbol for atom in atoms))
+    radii, valence, core, offsets, counts, parameters = [], [], [], [], [], []
+    cursor = 0
+    for symbol in symbols:
+        potential = potentials[symbol]
+        specification = specifications[symbol]
+        samples = np.asarray(potential.radii, dtype=np.float64)
+        valence_table = np.asarray(_fields.valence_density_table(potential, specification), dtype=np.float64)
+        has_core = bool(potential.has_nonlinear_core_correction)
+        core_table = np.asarray(potential.core_density, dtype=np.float64) if has_core else np.zeros_like(samples)
+        radii.append(samples)
+        valence.append(valence_table)
+        core.append(core_table)
+        offsets.append(cursor)
+        counts.append(samples.size)
+        cursor += samples.size
+        parameters.append(
+            [
+                potential.radial_parameter_a,
+                potential.radial_parameter_b,
+                float(potential.interpolation_cutoff),
+                _fields.density_reach(potential, valence_table) if residual_present else 0.0,
+                _fields.density_reach(potential, core_table)
+                if has_core and xc_present and symbol not in host_core
+                else 0.0,
+                0.0,
+            ]
+        )
+    lattice = np.ascontiguousarray(np.asarray(lattice_vectors, dtype=np.float64))
+    inverse = np.ascontiguousarray(np.linalg.inv(lattice))
+    coordinates = np.ascontiguousarray(grid.coordinates, dtype=np.float64)
+    positions = np.array([np.asarray(atom.position, dtype=np.float64) for atom in atoms])
+    kinds = np.array([symbols.index(atom.symbol) for atom in atoms], dtype=np.int32)
+    points = int(coordinates.shape[0])
+    chunks = max(1, (points + CHUNK_POINTS - 1) // CHUNK_POINTS)
+    batch = max(1, int(_PARTIAL_BYTES // (48 * chunks)))
+    result = np.empty((count, 6), dtype=np.float64)
+    with cp.cuda.Device(_fields.device_id(cp)):
+        device = {
+            "coordinates": cp.asarray(coordinates),
+            "residual": cp.asarray(residual),
+            "xc": cp.asarray(xc),
+            "lattice": cp.asarray(lattice.reshape(-1)),
+            "inverse": cp.asarray(inverse.reshape(-1)),
+            "widths": cp.asarray(np.linalg.norm(inverse, axis=0)),
+            "radii": cp.asarray(np.concatenate(radii)),
+            "valence": cp.asarray(np.concatenate(valence)),
+            "core": cp.asarray(np.concatenate(core)),
+            "offsets": cp.asarray(np.asarray(offsets, dtype=np.int32)),
+            "counts": cp.asarray(np.asarray(counts, dtype=np.int32)),
+            "parameters": cp.asarray(np.asarray(parameters, dtype=np.float64).reshape(-1)),
+        }
+        kernel = _lattice_density_force_kernel(cp)
+        for start in range(0, count, batch):
+            stop = min(count, start + batch)
+            here = stop - start
+            partial = cp.empty((here, chunks, 6), dtype=cp.float64)
+            tasks = here * chunks
+            kernel(
+                ((tasks + _THREADS - 1) // _THREADS,),
+                (_THREADS,),
+                (
+                    np.int64(points),
+                    np.int32(CHUNK_POINTS),
+                    np.int64(chunks),
+                    np.int32(here),
+                    device["coordinates"],
+                    device["residual"],
+                    device["xc"],
+                    cp.asarray(positions[start:stop].reshape(-1)),
+                    cp.asarray(kinds[start:stop]),
+                    device["lattice"],
+                    device["inverse"],
+                    device["widths"],
+                    device["radii"],
+                    device["valence"],
+                    device["core"],
+                    device["offsets"],
+                    device["counts"],
+                    device["parameters"],
+                    partial,
+                ),
+            )
+            result[start:stop] = cp.asnumpy(partial.sum(axis=1))
+            del partial
+        device.clear()
+    result *= grid.volume_element
+    return result[:, 0:3].copy(), result[:, 3:6].copy()
+
+
 
 def _force_kernel(cp):
     device = int(cp.cuda.Device().id)
@@ -217,7 +445,11 @@ def takes(grid, lattice_vectors, specifications, atoms) -> bool:
 
 
 def _long_range_forces(cp, grid, positions, charges, eta, tolerance, density) -> np.ndarray:
-    """The force of the Fourier series of :func:`.periodic_setup._structure_factor_series`, on the device."""
+    """The force of the Fourier series of :func:`.periodic_setup._structure_factor_series`, on the device.
+
+    ``cp`` is the array module: CuPy, or NumPy for the host forces of
+    :mod:`parsec_python.acceleration.Forces.periodic_spline`.
+    """
 
     n, sides, _ = _setup._axis_spacing(grid)
     volume = float(np.prod(sides))
@@ -236,8 +468,22 @@ def _long_range_forces(cp, grid, positions, charges, eta, tolerance, density) ->
 
     spectrum = cp.fft.fftn(cp.asarray(np.asarray(density, dtype=np.float64).reshape(tuple(int(v) for v in n))))
     index = [cp.asarray(np.mod(frequencies[axis], n[axis])) for axis in range(3)]
-    # Q(G) = sum_r rho(r) exp(i G.r) = conj(fftn(rho)) at the frequencies of G.
+    # Q(G) = sum_r rho(r) exp(i G.r) = conj(fftn(rho)) at the frequencies of G, times exp(i G.s h) for the points
+    # (j + s) h of a shifted grid (no factor for s = 0).
     q = cp.conj(spectrum[cp.ix_(index[0], index[1], index[2])])
+    shifts = _setup._plain_shift(grid)
+    if np.any(shifts != 0.0):
+        q = q * cp.asarray(
+            np.exp(
+                2.0j
+                * np.pi
+                * (
+                    frequencies[0][:, None, None] * (shifts[0] / n[0])
+                    + frequencies[1][None, :, None] * (shifts[1] / n[1])
+                    + frequencies[2][None, None, :] * (shifts[2] / n[2])
+                )
+            )
+        )
     amplitude = cp.asarray(weight) * q
     gx, gy, gz = (cp.asarray(axis) for axis in g_axes)
     forces = np.zeros((len(positions), 3), dtype=np.float64)
@@ -254,7 +500,9 @@ def _long_range_forces(cp, grid, positions, charges, eta, tolerance, density) ->
                 cp.sum(gz * pz * (py @ along_x)),
             )
         )
-        forces[atom] = (8.0 * np.pi / volume) * float(charge) * np.imag(cp.asnumpy(sums))
+        forces[atom] = (8.0 * np.pi / volume) * float(charge) * np.imag(
+            cp.asnumpy(sums) if hasattr(cp, "asnumpy") else np.asarray(sums)
+        )
     return forces * grid.volume_element
 
 
@@ -297,8 +545,23 @@ def device_periodic_local_forces(
 
 
 def _device_local_forces(
-    cp, grid, atoms, potentials, specifications, lattice_vectors, density, potential_residual, xc_potential, tolerance
+    cp,
+    grid,
+    atoms,
+    potentials,
+    specifications,
+    lattice_vectors,
+    density,
+    potential_residual,
+    xc_potential,
+    tolerance,
+    *,
+    ionic: bool = True,
+    host_core: frozenset = frozenset(),
 ) -> LocalForceTerms:
+    """The kernel sums and the long-range term.  ``ionic=False`` leaves the ionic term out (zero) and
+    ``host_core`` the core term of those species (zero): the density terms of
+    :mod:`.periodic_spline`, whose ionic and spline core terms are summed on the host."""
     count = len(atoms)
     zeros = np.zeros((count, 3))
     if count == 0:
@@ -337,9 +600,9 @@ def _device_local_forces(
                 potential.radial_parameter_b,
                 float(samples[0]),
                 float(potential.interpolation_cutoff),
-                _fields.local_reach(potential, local_l, split),
+                _fields.local_reach(potential, local_l, split) if ionic else 0.0,
                 _fields.density_reach(potential, valence_table) if residual_present else 0.0,
-                _fields.density_reach(potential, core_table) if has_core else 0.0,
+                _fields.density_reach(potential, core_table) if has_core and symbol not in host_core else 0.0,
                 2.0 * float(potential.ionic_charge),
                 split.eta,
                 0.0,
@@ -403,20 +666,29 @@ def _device_local_forces(
         del partial
     device.clear()
     result *= grid.volume_element
-    ionic = result[:, 0:3] + _long_range_forces(
-        cp, grid, positions, charges, split.eta, tolerance, fields[0]
-    )
+    if ionic:
+        ionic_terms = result[:, 0:3] + _long_range_forces(
+            cp, grid, positions, charges, split.eta, tolerance, fields[0]
+        )
+    else:
+        ionic_terms = np.zeros((count, 3))
     return LocalForceTerms(
-        ionic=ionic,
+        ionic=ionic_terms,
         self_consistency=result[:, 3:6].copy(),
         core_correction=result[:, 6:9].copy(),
     )
 
 
 def _local_force_provider(grid, atoms, potentials, specifications, lattice_vectors, density, residual, xc):
-    return device_periodic_local_forces(
+    found = device_periodic_local_forces(
         grid, atoms, potentials, specifications, lattice_vectors, density, residual, xc
     )
+    if found is not None:
+        return found
+    # Cubic_Spline species: the host forces of the fast potential (built by the same provider here)
+    from .periodic_spline import spline_periodic_local_forces
+
+    return spline_periodic_local_forces(grid, atoms, potentials, specifications, lattice_vectors, density, residual, xc)
 
 
 @contextmanager
@@ -513,26 +785,47 @@ def update_periodic_reference(system, atoms):
     return update_periodic_geometry(system, atoms)
 
 
-def _spline_species_local_forces(system, atoms, specifications, lattice, density, residual, xc):
-    """The local terms by ball sums for ``Cubic_Spline`` species (``None`` for the others), on the device of the run.
+def _device_self_consistency(system, atoms, specifications, lattice, density, residual, xc):
+    """The self-consistency term of the local forces (Ry/bohr, with the volume element) from the CUDA kernel, or ``None``.
 
-    The device kernel of :func:`device_periodic_local_forces` takes linearly interpolated species only; the readable
-    term for the others scans the whole grid for each of about 580 images of each atom (hours for a few hundred atoms
-    on a grid of 10^5 points).  :func:`.periodic_local.fortran_spline_local_forces` forms the same terms from the grid
-    points of a ball around each image.
+    The kernel of :func:`.periodic_spline._device_density_terms` (the linear slopes of the valence tables over the balls
+    of their reach, the terms of the readable routine to round-off); ``None`` without a usable device or for a grid it
+    does not handle.
+    """
+
+    from .periodic_spline import _device_density_terms
+
+    found = _device_density_terms(
+        system.grid, atoms, system.pseudopotentials, specifications, lattice, (density, residual, xc), 1.0e-14
+    )
+    return None if found is None else found[0].self_consistency
+
+
+def _spline_species_local_forces(system, atoms, specifications, lattice, density, residual, xc):
+    """The local terms of a cell with Fortran's G-space local potential and ``Cubic_Spline`` species, else ``None``.
+
+    The ionic term is :func:`parsec_python.V_ion.gspace_local.gspace_local_forces` (an FFT, on the device of the run) and
+    the core term the ball sums of :func:`.periodic_local.fast_core_correction_forces` (only a few species have a core
+    density, with short balls); the self-consistency term, most of the work, is the CUDA kernel
+    (:func:`_device_self_consistency`) where a device is usable, else the host ball sums.  The real-space local potential
+    of such species is differentiated by :mod:`.periodic_spline` (through the readable entry,
+    :func:`_local_force_provider`), whose ionic ball sums are cheap.
     """
 
     from .compute import _array_module
     from .periodic_local import fortran_spline_local_forces, spline_species_takes
 
+    if getattr(system.grid.settings, "local_potential", "real_space") != "g_space":
+        return None
     if not spline_species_takes(system.grid, lattice, specifications, atoms):
         return None
     xp, erf, device = _array_module(system)
+    on_device = _device_self_consistency(system, atoms, specifications, lattice, density, residual, xc)
     arguments = (system.grid, atoms, system.pseudopotentials, specifications, lattice, density, residual, xc)
     if device is None:
-        return fortran_spline_local_forces(*arguments)
+        return fortran_spline_local_forces(*arguments, self_consistency=on_device)
     with xp.cuda.Device(device):
-        return fortran_spline_local_forces(*arguments, xp=xp, erf=erf)
+        return fortran_spline_local_forces(*arguments, xp=xp, erf=erf, self_consistency=on_device)
 
 
 def compute_device_periodic_forces(system, result, *, symmetrize: bool = True, operations=None):
@@ -612,6 +905,7 @@ __all__ = [
     "CHUNK_POINTS",
     "compute_device_periodic_forces",
     "device_periodic_forces",
+    "device_lattice_density_forces",
     "device_periodic_local_forces",
     "takes",
 ]

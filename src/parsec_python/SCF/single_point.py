@@ -38,6 +38,7 @@ from ..Eigensolvers import (
     dynamic_diagonalization_tolerance,
     solve_eigval,
 )
+from ..Embedding.frozen_density import embedded_exchange_correlation, embedding_energies
 from ..Energy import total_energy
 from ..Energy.total_energy import with_dispersion
 from ..Grid import (
@@ -65,7 +66,7 @@ from ..Hartree import (
     valence_point_charges,
 )
 from ..Laplacian import build_negative_laplacian
-from ..Mixer import make_mixer, potential_residual_metrics
+from ..Mixer import make_mixer, potential_residual_metrics, preconditioned_mixer
 from ..Occupations import (
     check_fixed_occupations,
     check_spin_fixed_occupations,
@@ -149,6 +150,12 @@ class PreparedSinglePointSystem:
     ``hubbard`` holds the LDA+U projectors of the atoms with ``ldaplusu_u``
     or ``ldaplusu_j`` (:mod:`parsec_python.Hamiltonian.hubbard`) and is
     ``None`` without LDA+U.
+
+    ``embedding`` is, for FDET (``Potential_Field``), the frozen sample
+    field on the grid (:class:`parsec_python.Embedding.frozen_density.FrozenSampleField`):
+    its potential is part of ``ionic_potential``, and the point charges then
+    enter the ion-ion energy only (``parsec.F90:1022-1028``); ``None``
+    without FDET.
     """
 
     input: SinglePointInput
@@ -171,6 +178,7 @@ class PreparedSinglePointSystem:
     point_charges: tuple = ()
     density_symmetry: GridPointGroup | None = None
     hubbard: HubbardProjectors | None = None
+    embedding: object | None = None
 
     @property
     def hartree_boundary_tail_maximum(self) -> float | None:
@@ -180,7 +188,12 @@ class PreparedSinglePointSystem:
         return None if tail is None else tail.maximum
 
     def hamiltonian(
-        self, effective_potential: np.ndarray, hubbard: object | None = None
+        self,
+        effective_potential: np.ndarray,
+        hubbard: object | None = None,
+        exchange: object | None = None,
+        kinetic_potential: np.ndarray | None = None,
+        gradient_flux: np.ndarray | None = None,
     ) -> KohnShamHamiltonian:
         """Compose the current SCF Hamiltonian without forming a dense matrix.
 
@@ -193,8 +206,33 @@ class PreparedSinglePointSystem:
 
         ``H = -nabla_FD^2 + diag(V_eff) + V_NL``,
 
-        plus the LDA+U term ``hubbard`` of the channel where it is given.
+        plus the LDA+U term ``hubbard`` of the channel where it is given,
+        the exact-exchange term ``a_x V_ACE`` of a hybrid functional
+        (``exchange``, :mod:`parsec_python.SCF.hybrid`) and the orbital term
+        ``-div(vtau grad)`` of a meta-GGA (``kinetic_potential`` = ``vtau``,
+        :mod:`parsec_python.V_xc.meta_gga`).
         """
+        if kinetic_potential is not None:
+            from ..V_xc.meta_gga import KineticPotentialOperator, grid_gradient
+
+            return KohnShamHamiltonian(
+                self.negative_laplacian,
+                effective_potential,
+                self.nonlocal_operator,
+                hubbard,
+                exchange,
+                KineticPotentialOperator(
+                    grid_gradient(self.grid), kinetic_potential, gradient_flux=gradient_flux
+                ),
+            )
+        if exchange is not None:
+            return KohnShamHamiltonian(
+                self.negative_laplacian,
+                effective_potential,
+                self.nonlocal_operator,
+                hubbard,
+                exchange,
+            )
         if hubbard is None:
             return KohnShamHamiltonian(
                 self.negative_laplacian,
@@ -241,9 +279,38 @@ class PreparedSinglePointSystem:
             boundary_tail=self.hartree_boundary_tail,
         )
 
-    def evaluate_xc(self, density: np.ndarray) -> XCResult:
-        """Evaluate the selected XC functional including frozen NLCC."""
+    def evaluate_xc(
+        self, density: np.ndarray, tau: np.ndarray | None = None, density_gradient: np.ndarray | None = None
+    ) -> XCResult:
+        """Evaluate the selected XC functional including frozen NLCC.
 
+        For a hybrid functional this is its semilocal part (the reduced
+        semilocal exchange and the correlation); the exact exchange is the
+        operator of :mod:`parsec_python.SCF.hybrid`.  A meta-GGA needs
+        ``tau``, the kinetic-energy density of the valence orbitals
+        (:meth:`kinetic_energy_density`), and returns a
+        :class:`~parsec_python.V_xc.meta_gga.MetaGGAXCResult`.
+        """
+
+        if getattr(self.input.scf, "is_meta_gga", False):
+            from ..V_xc.meta_gga import meta_gga_evaluator, meta_gga_xc
+
+            if tau is None:
+                raise ValueError("a meta-GGA needs the kinetic-energy density of the orbitals")
+            return meta_gga_xc(
+                meta_gga_evaluator(self.input.scf),
+                density,
+                tau,
+                self.grid,
+                self.core_density,
+                negative_laplacian=self.negative_laplacian,
+                name=self.input.scf.xc_functional,
+                density_gradient=None if density_gradient is None else np.stack(density_gradient),
+            )
+        if getattr(self.input.scf, "is_hybrid", False):
+            from .hybrid import scf_semilocal_xc
+
+            return scf_semilocal_xc(self.input.scf, density, self.grid, self.core_density)
         if self.input.scf.xc_functional == "ca":
             return ca_lda(density, self.grid.volume_element, self.core_density)
         if self.input.scf.xc_functional == "pbe":
@@ -261,6 +328,10 @@ class PreparedSinglePointSystem:
     ) -> SpinPolarizedXCResult:
         """Collinear spin-polarized XC (LSDA or PBE) including frozen NLCC."""
 
+        if getattr(self.input.scf, "is_hybrid", False):
+            return as_spin_polarized_result(
+                self.evaluate_spin_xc(density_up, density_down)
+            )
         functional = self.input.scf.xc_functional
         if functional == "ca":
             return ca_lda_spin_polarized(
@@ -284,6 +355,30 @@ class PreparedSinglePointSystem:
             )
         )
 
+    def kinetic_energy_density(self, wavefunctions, occupations, degeneracy: float = 2.0, gradient: bool = False):
+        """``tau`` (Hartree) of Euclidean-normalized grid orbitals (:func:`parsec_python.V_xc.meta_gga.kinetic_energy_density`).
+
+        With ``gradient`` also the orbital form of the density gradient,
+        ``(tau, (g_x, g_y, g_z))`` (:func:`parsec_python.V_xc.meta_gga.orbital_density_gradient`).
+        """
+
+        from ..V_xc.meta_gga import grid_gradient, kinetic_energy_density, orbital_density_gradient
+
+        operators = grid_gradient(self.grid)
+        tau = kinetic_energy_density(
+            wavefunctions,
+            occupations,
+            operators,
+            self.grid.volume_element,
+            degeneracy=degeneracy,
+        )
+        if not gradient:
+            return tau
+        values = orbital_density_gradient(
+            wavefunctions, occupations, operators, self.grid.volume_element, degeneracy=degeneracy
+        )
+        return tau, tuple(values)
+
     def evaluate_xc_noncollinear(
         self, density: np.ndarray, magnetization: np.ndarray
     ) -> NoncollinearXCResult:
@@ -291,14 +386,47 @@ class PreparedSinglePointSystem:
 
         return noncollinear_xc(density, magnetization, self.evaluate_xc_spin_polarized)
     def evaluate_spin_xc(
-        self, density_up: np.ndarray, density_down: np.ndarray
+        self,
+        density_up: np.ndarray,
+        density_down: np.ndarray,
+        tau_up: np.ndarray | None = None,
+        tau_down: np.ndarray | None = None,
+        density_gradients=None,
     ) -> SpinXCResult:
         """Evaluate the selected spin-polarized XC functional.
 
         Each channel sees its valence density plus half of the frozen NLCC
-        density (``rho_hart.F90``).
+        density (``rho_hart.F90``).  For a hybrid functional, its semilocal
+        part.  A meta-GGA needs the ``tau`` of both channels and returns a
+        :class:`~parsec_python.V_xc.meta_gga.MetaGGASpinXCResult`.
         """
 
+        if getattr(self.input.scf, "is_meta_gga", False):
+            from ..V_xc.meta_gga import meta_gga_evaluator, meta_gga_xc_spin
+
+            if tau_up is None or tau_down is None:
+                raise ValueError("a meta-GGA needs the kinetic-energy densities of both channels")
+            return meta_gga_xc_spin(
+                meta_gga_evaluator(self.input.scf),
+                density_up,
+                density_down,
+                tau_up,
+                tau_down,
+                self.grid,
+                self.core_density,
+                negative_laplacian=self.negative_laplacian,
+                name=self.input.scf.xc_functional,
+                density_gradients=None
+                if density_gradients is None
+                else tuple(np.stack(gradient) for gradient in density_gradients),
+            )
+
+        if getattr(self.input.scf, "is_hybrid", False):
+            from .hybrid import scf_semilocal_spin_xc
+
+            return scf_semilocal_spin_xc(
+                self.input.scf, density_up, density_down, self.grid, self.core_density
+            )
         if self.input.scf.xc_functional == "ca":
             return ca_lda_spin(
                 density_up, density_down, self.grid.volume_element, self.core_density
@@ -349,6 +477,23 @@ class SCFWarmStart:
     close to the one of the moved atoms while the saved orbitals still belong
     to the old structure; one stronger filter lets them catch up before the
     mixer sees their density.
+
+    ``exchange_orbitals`` are, for a hybrid functional, the orbitals of the
+    structure before (one :class:`parsec_python.SCF.hybrid.OrbitalSet` per
+    spin channel set): the first exchange operator of the Fock loop is built
+    from them instead of a semilocal start.  ``None`` otherwise.
+
+    ``mixer`` is a mixer whose history this loop continues instead of a fresh
+    one (the inner loops of a hybrid's Fock loop,
+    :class:`parsec_python.Mixer.carried.CarriedAndersonMixer`); ``None``
+    starts afresh, as PARSEC does.  ``relative_criterion`` lets the loop also
+    stop once its residual fell below that share of its first residual (an
+    inexact inner loop of the Fock loop, :func:`loop_criterion`); ``None``
+    keeps the stop test of the input.  ``level_tolerance`` (Ry): once the loop
+    has converged, one more iteration solves the same ``H[V_in]`` until no
+    level moves by more than that (:func:`refine_levels`) and takes its
+    density and energies from those eigenpairs; ``None`` stops at the
+    converged iteration, as PARSEC does.
     """
 
     input_potential: np.ndarray
@@ -357,6 +502,75 @@ class SCFWarmStart:
     density_guess: np.ndarray | None = None
     hxc_reference: np.ndarray | None = None
     first_iteration_degree: int | None = None
+    exchange_orbitals: tuple | None = None
+    mixer: object | None = None
+    relative_criterion: float | None = None
+    level_tolerance: float | None = None
+    # A meta-GGA: the mixed vtau of the loop before (a pair for spin), full grid; None starts with PBE.
+    kinetic_potential: object | None = None
+    # ... and in the orbital form of the density gradient the mixed W of each channel (the loop's layout).
+    gradient_flux: object | None = None
+
+
+#: Eigensolver passes of a level refinement (``SCFWarmStart.level_tolerance``) at most.
+LEVEL_PASSES = 40
+
+
+def refine_levels(solve, operator, count: int, settings, state, eigenvalues, vectors, tolerance: float, *, release=True):
+    """More eigensolver passes with the Hamiltonian of a converged loop's last iteration.
+
+    ``operator`` is that Hamiltonian (``H[V_in]`` of the last iteration, with
+    its fixed terms); each pass is one call of ``solve`` on the loop's
+    subspace ``state``.  The passes stop once no one of the ``count`` levels
+    moved by more than ``tolerance`` (Ry) in the last one, after
+    ``LEVEL_PASSES`` at most: the eigenpairs that the stop test of the loop
+    does not see (the empty levels).  ``vectors`` are the orbitals the first
+    pass replaces (``None``: already released).  Returns ``(solution,
+    passes, seconds, change)``, ``change`` the largest move of a level in
+    the last pass (Ry).
+    """
+
+    started = time.perf_counter()
+    previous = np.asarray(eigenvalues, dtype=np.float64)
+    solution = None
+    passes = 0
+    change = float("inf")
+    while passes < LEVEL_PASSES:
+        drop = getattr(vectors, "release_intermediate_storage", None) if release else None
+        if callable(drop):
+            # The views of the last orbitals are no state once the next solve begins.
+            drop()
+        solution = solve(operator, count, settings=settings, state=state)
+        passes += 1
+        state, vectors = solution.state, solution.vectors
+        values = np.asarray(solution.eigenvalues, dtype=np.float64)
+        change = (
+            float(np.max(np.abs(values - previous), initial=0.0))
+            if values.shape == previous.shape
+            else float("inf")
+        )
+        previous = values
+        if change < tolerance:
+            break
+    return solution, passes, time.perf_counter() - started, change
+
+
+def warm_start_mixer(warm_start: SCFWarmStart | None, build: Callable[[], object]) -> object:
+    """The mixer of a loop: the one ``warm_start`` carries, or ``build()``."""
+
+    carried = getattr(warm_start, "mixer", None)
+    return build() if carried is None else carried
+
+
+def loop_criterion(warm_start: SCFWarmStart | None, criterion: float, first_residual: float) -> float:
+    """The stop threshold of an SCF loop (Ry): ``criterion``, or for a loop with
+    ``warm_start.relative_criterion`` ``max(criterion, share * first_residual)``,
+    ``first_residual`` the selected residual of the loop's first iteration."""
+
+    share = getattr(warm_start, "relative_criterion", None)
+    if share is None:
+        return criterion
+    return max(float(criterion), float(share) * float(first_residual))
 
 
 @dataclass(frozen=True)
@@ -570,13 +784,48 @@ def warm_start_for_moved_atoms(
     density further along the trajectory that ``history`` follows.
     """
 
+    warm_start = meta_gga_warm_start(
+        _parsec_warm_start(previous_system, previous_result, system), previous_result
+    )
+    if getattr(previous_result, "exact_exchange", None) is not None:
+        # A hybrid functional: the orbitals before the move start the Fock loop.
+        from .hybrid import exchange_start_orbitals
+
+        warm_start = replace(
+            warm_start, exchange_orbitals=exchange_start_orbitals(previous_result)
+        )
+    if getattr(system, "embedding", None) is not None:
+        # FDET of PARSEC 1.5: translation by whole grid steps, or the tip sphere
+        # (parsec_python.Embedding.warm_start); FDET takes no extrapolation.
+        from ..Embedding.warm_start import embedding_warm_start
+
+        return embedding_warm_start(previous_system, previous_result, system, warm_start)
     return extrapolated_warm_start(
-        _parsec_warm_start(previous_system, previous_result, system),
+        warm_start,
         previous_system,
         previous_result,
         system,
         extrapolation,
         history,
+    )
+
+
+def meta_gga_warm_start(warm_start: SCFWarmStart, previous_result) -> SCFWarmStart:
+    """``warm_start`` with the mixed ``vtau`` of a meta-GGA loop before the move (a pair for spin).
+
+    ``vtau`` is a grid field of the electrons like the mixed potential, which
+    the loop of the moved atoms also takes over.  Without a meta-GGA the
+    warm start is returned unchanged.
+    """
+
+    record = getattr(previous_result, "meta_gga", None)
+    if record is None:
+        return warm_start
+    fields = tuple(np.asarray(field, dtype=np.float64) for field in record.next_kinetic_potentials)
+    return replace(
+        warm_start,
+        kinetic_potential=fields[0] if len(fields) == 1 else fields,
+        gradient_flux=getattr(record, "next_gradient_fluxes", None),
     )
 
 
@@ -655,6 +904,60 @@ def _with_point_charge_potential(ionic_potential, grid, point_charges):
     if ionic_potential is None or not point_charges:
         return ionic_potential
     return ionic_potential + point_charge_potential(grid.coordinates, point_charges)
+
+
+def _embedding_field(problem: SinglePointInput, grid: RealSpaceGrid, atoms=(), pseudopotentials=None, tip=None):
+    """The frozen sample field of an FDET input on ``grid``, ``None`` without FDET.
+
+    ``tip`` is ``(S, spot-frame point charges)`` of the tip sphere
+    (:func:`_tip_sphere_frame`); ``atoms`` are then in the tip frame.
+    """
+
+    settings = getattr(problem, "embedding", None)
+    if settings is None:
+        return None
+    if tip is not None:
+        from ..Embedding.tip_sphere import tip_sphere_field
+
+        offset, spot_charges = tip
+        return tip_sphere_field(problem, grid, atoms, pseudopotentials, offset, spot_point_charges=spot_charges)
+    from ..Embedding.frozen_density import frozen_sample_field
+
+    return frozen_sample_field(settings, grid)
+
+
+def _tip_sphere_frame(problem: SinglePointInput, atoms, point_charges):
+    """Atoms and point charges of an FDET tip sphere in the tip frame (``tipsphere_recenter``).
+
+    Returns ``(atoms, point_charges, tip)`` with ``tip = (S, spot-frame
+    point charges)``; unchanged with ``tip = None`` without the tip sphere.
+    """
+
+    settings = getattr(problem, "embedding", None)
+    if settings is None or not settings.tip_sphere:
+        return atoms, point_charges, None
+    from ..Embedding.tip_sphere import place_tip
+
+    moved_atoms, moved_charges, offset, spot_charges = place_tip(atoms, point_charges, problem.grid.spacing)
+    return moved_atoms, moved_charges, (offset, spot_charges)
+
+
+def _with_external_fields(ionic_potential, grid, point_charges, embedding):
+    """The local ionic potential with the point charges or the FDET sample field.
+
+    Without FDET the potential of the point charges is added (``ionpot.f90``).
+    With FDET the sample ions act through the frozen field, which is added
+    instead (``parsec.F90:1022-1028, 1087-1089``); the point charges then
+    enter the ion-ion energy and forces only.
+    """
+
+    if embedding is None:
+        return _with_point_charge_potential(ionic_potential, grid, point_charges)
+    if ionic_potential is None:
+        return None
+    from ..Embedding.frozen_density import with_sample_potential
+
+    return with_sample_potential(ionic_potential, embedding)
 
 
 def _with_point_charge_energy(fields: dict, atoms, pseudopotentials, point_charges) -> dict:
@@ -869,6 +1172,8 @@ def prepare_single_point(
         else tuple(problem.atoms)
     )
     point_charges = placed_point_charges(problem)
+    # FDET tip sphere: the tip at the centre of its own sphere (tipsphere_recenter).
+    atoms, point_charges, tip = _tip_sphere_frame(problem, atoms, point_charges)
     stage_start = time.perf_counter()
     pseudopotentials = load_pseudopotentials(
         problem.pseudopotentials,
@@ -918,6 +1223,8 @@ def prepare_single_point(
     )
     grid_seconds = time.perf_counter() - stage_start
     _require_atoms_inside_domain(problem.grid, atoms)
+    # FDET: the frozen sample field on this grid (potfield.F90, tipsphere_field), None without.
+    embedding = _embedding_field(problem, grid, atoms, pseudopotentials, tip)
 
     stage_start = time.perf_counter()
     laplacian_builder = (
@@ -944,7 +1251,7 @@ def prepare_single_point(
             grid, atoms, pseudopotentials, problem.pseudopotentials
         )
     )
-    ionic_potential = _with_point_charge_potential(ionic_potential, grid, point_charges)
+    ionic_potential = _with_external_fields(ionic_potential, grid, point_charges, embedding)
     local_ionic_seconds = time.perf_counter() - stage_start
     stage_start = time.perf_counter()
     build_nonlocal = (
@@ -993,6 +1300,7 @@ def prepare_single_point(
             hartree_boundary=boundary_plan,
             point_charges=point_charges,
             hubbard=hubbard,
+            embedding=embedding,
         )
 
     fields, stage_seconds = _density_and_energy_stages(
@@ -1033,6 +1341,7 @@ def prepare_single_point(
         point_charges=point_charges,
         density_symmetry=density_symmetry,
         hubbard=hubbard,
+        embedding=embedding,
     )
 
 
@@ -1217,8 +1526,8 @@ def complete_single_point(
     ionic_potential = build_local(
         system.grid, system.atoms, system.pseudopotentials, problem.pseudopotentials
     )
-    ionic_potential = _with_point_charge_potential(
-        ionic_potential, system.grid, system.point_charges
+    ionic_potential = _with_external_fields(
+        ionic_potential, system.grid, system.point_charges, getattr(system, "embedding", None)
     )
     local_ionic_seconds = time.perf_counter() - started
     fields, stage_seconds = _density_and_energy_stages(
@@ -1307,6 +1616,15 @@ def update_geometry(
         new.symbol != old.symbol for new, old in zip(atoms, system.atoms)
     ):
         raise ValueError("moved atoms must keep their number, order and species")
+    embedding = getattr(system, "embedding", None)
+    point_charges = system.point_charges
+    if embedding is not None and embedding.tip_sphere is not None:
+        # FDET tip sphere: ``atoms`` are in the spot frame (manual.dat); the
+        # tip goes back to the centre of its sphere and the field moves
+        # (parsec.F90:2614-2637, 2794-2800).
+        from ..Embedding.tip_sphere import moved_tip
+
+        atoms, point_charges, embedding = moved_tip(system, atoms)
     problem = replace(
         system.input,
         atoms=atoms,
@@ -1372,10 +1690,9 @@ def update_geometry(
         grid, atoms, pseudopotentials, problem.pseudopotentials
     )
     # The point charges stay where they are (parsec.F90 calls ionpot and
-    # forceion again after the move).
-    ionic_potential = _with_point_charge_potential(
-        ionic_potential, grid, system.point_charges
-    )
+    # forceion again after the move); so does a classical FDET field
+    # (parsec.F90:2780-2806 reads the same pot.dat again).
+    ionic_potential = _with_external_fields(ionic_potential, grid, point_charges, embedding)
     local_ionic_seconds = time.perf_counter() - stage_start
 
     boundary_plan = system.hartree_boundary
@@ -1392,7 +1709,7 @@ def update_geometry(
         boundary_plan,
         build_atomic_tail,
     )
-    _with_point_charge_energy(fields, atoms, pseudopotentials, system.point_charges)
+    _with_point_charge_energy(fields, atoms, pseudopotentials, point_charges)
     if pending is not None:
         nonlocal_operator, nonlocal_ionic_seconds = pending.result()
     density_symmetry = system.density_symmetry
@@ -1418,6 +1735,11 @@ def update_geometry(
         ),
         hartree_boundary=boundary_plan,
         hubbard=hubbard,
+        **(
+            {}
+            if embedding is None
+            else {"embedding": embedding, "point_charges": point_charges}
+        ),
     )
 
 
@@ -1543,6 +1865,56 @@ def iteration_eigensolver_fields(counts, next_tolerance: float | None) -> dict:
     return fields_
 
 
+def solver_option_fields(
+    eigensolver_settings, tolerance: float, filter_degree: int | None = None
+) -> tuple[dict, dict, dict]:
+    """The options of the PARSEC 1.5 round for one SCF step's eigensolvers.
+
+    Three dictionaries of fields, for :class:`ChebFFSettings`,
+    :class:`ChebDavSettings` and :class:`SubspaceSettings`, all empty at the
+    defaults (the settings are then those of every earlier version):
+    ``Vector_Rng_Seed`` (the LAPACK seed of the first-solve start vectors),
+    ``Reorthogonalization_Threshold`` (the first ratio of ``orth_normal``) and
+    PARSEC 1.5's residual-driven CHEBFF, whose tolerance is ``tolerance``,
+    the eigensolver tolerance of the step (``Diag_Tolerance``, or 0.1 in the
+    first step of ``Dynamic_Diag_Tol`` as 1.5 has it), and PARSEC 1.5's
+    SUBSPACE rules (``Smart_Subspace``, ``Chebyshev_Scaled``,
+    ``Bounds_Method``/``Bounds_Iter``: ``max(filter_degree/2, Bounds_Iter)``
+    Lanczos steps, ``filter_degree`` being the SUBSPACE degree of the step,
+    as ``solver%polym`` in ``chebff.f90z``/``subspace.f90z`` of 1.5).
+    """
+
+    chebff: dict = {}
+    chebdav: dict = {}
+    subspace: dict = {}
+    if getattr(eigensolver_settings, "vector_seed", None) is not None:
+        chebff["basis_seed"] = chebdav["basis_seed"] = eigensolver_settings.basis_seed
+    threshold = getattr(eigensolver_settings, "reorthogonalization_threshold", 0.1)
+    if threshold != 0.1:
+        for fields_ in (chebff, chebdav, subspace):
+            fields_["reorthogonalization_threshold"] = threshold
+    residual_test = getattr(eigensolver_settings, "first_filter_residual_test", "off")
+    if residual_test != "off":
+        chebff["residual_tolerance"] = float(tolerance)
+        chebff["residual_failure"] = residual_test
+    rule = getattr(eigensolver_settings, "lanczos_bounds", "parsec")
+    if rule != "parsec":
+        degree = eigensolver_settings.filter_degree if filter_degree is None else filter_degree
+        steps = max(int(degree) // 2, int(eigensolver_settings.lanczos_bound_steps))
+        chebff["bounds"] = rule
+        chebff["bound_steps"] = steps
+        # lancz_bound_full_orth serves the CHEBFF first solve only; 1.5's
+        # CHEBDAV keeps its five steps (chebdav.f90z:336 of 1.5).
+        subspace["bounds"] = chebdav["bounds"] = "lanczos"
+        subspace["bound_steps"] = steps
+    lower_rule = getattr(eigensolver_settings, "subspace_lower_bound", "monotone")
+    if lower_rule != "monotone":
+        subspace["lower_bound_rule"] = lower_rule
+    if getattr(eigensolver_settings, "scaled_subspace_filter", False):
+        subspace["scaled_filter"] = True
+    return chebff, chebdav, subspace
+
+
 def eigval_settings_for(
     eigensolver_settings,
     filter_degree: int,
@@ -1560,6 +1932,9 @@ def eigval_settings_for(
 
     if tolerance is None:
         tolerance = eigensolver_settings.tolerance
+    chebff_options, chebdav_options, subspace_options = solver_option_fields(
+        eigensolver_settings, tolerance, filter_degree
+    )
     return EigvalSettings(
         **iterative_solver_fields(eigensolver_settings, tolerance, neighbors),
         safety_buffer=eigensolver_settings.working_buffer,
@@ -1573,6 +1948,7 @@ def eigval_settings_for(
             block_size=eigensolver_settings.matvec_block_size,
             reset_recurrence_per_block=False,
             random_seed=eigensolver_settings.random_seed,
+            **chebff_options,
         ),
         chebdav=(
             ChebDavSettings(
@@ -1584,6 +1960,7 @@ def eigval_settings_for(
                 lanczos_steps=5,
                 max_outer_restarts=2,
                 random_seed=eigensolver_settings.random_seed,
+                **chebdav_options,
             )
             if eigensolver_settings.method == "chebdav"
             # A CHEBFF degree of 10 is valid.  Do not feed that unrelated
@@ -1598,8 +1975,48 @@ def eigval_settings_for(
             block_size=eigensolver_settings.matvec_block_size,
             reset_recurrence_per_block=False,
             random_seed=eigensolver_settings.random_seed,
+            **subspace_options,
         ),
     )
+
+
+def meta_gga_loop(system, *, channels: int, adapter, warm_start, exchange_term=None):
+    """The :class:`parsec_python.SCF.meta_gga.MetaGGALoop` of a meta-GGA, ``None`` for another functional."""
+
+    if not getattr(system.input.scf, "is_meta_gga", False):
+        return None
+    # A meta-GGA hybrid (``exchange_term``, the inner loops of SCF.hybrid): the
+    # Hamiltonians hold the orbital term and the exchange operator; the energies
+    # remove the band energy of both (MetaGGALoop.energies, then the operator's).
+    if warm_start is not None and (
+        getattr(warm_start, "density_guess", None) is not None or getattr(warm_start, "mixer", None) is not None
+    ):
+        raise NotImplementedError(
+            "a meta-GGA needs the orbitals of a density: Potential_Extrapolation: atomic (a guessed "
+            "density without orbitals) is not implemented for it"
+        )
+    from .meta_gga import MetaGGALoop
+
+    return MetaGGALoop(system, channels=channels, adapter=adapter, warm_start=warm_start)
+
+
+def refuse_exchange_hooks(**hooks) -> None:
+    """Stop an SCF loop that would leave out the exchange operator of a hybrid.
+
+    The operator joins the Hamiltonian of :meth:`PreparedSinglePointSystem.hamiltonian`
+    and reads the full-grid host orbitals of every iteration; an execution
+    backend that applies a Hamiltonian of its own (or keeps fields on a
+    symmetry wedge) would drop it, unless the system holds the operator in
+    its device Hamiltonians (``exchange_device`` of the accelerated systems,
+    :mod:`parsec_python.acceleration.SCF.hybrid`).
+    """
+
+    given = sorted(name for name, hook in hooks.items() if hook is not None)
+    if given:
+        raise NotImplementedError(
+            "self-consistent hybrid functionals run on the reference SCF path only; "
+            f"the execution hooks {', '.join(given)} would drop the exact-exchange operator"
+        )
 
 
 def refuse_hubbard_and_dispersion(system, driver: str, *, dispersion: bool = True) -> None:
@@ -1713,6 +2130,7 @@ def run_scf(
     warm_start: SCFWarmStart | None = None,
     convergence_criterion: float | None = None,
     iteration_state_callback: Callable[[SCFIterationFields], None] | None = None,
+    exchange_term: object | None = None,
 ) -> SinglePointResult:
     """Run PARSEC-style potential mixing on a prepared system.
 
@@ -1740,7 +2158,54 @@ def run_scf(
 
     The mixer constructs ``V_in^(k+1)`` from these two local fields.  Kinetic
     and nonlocal terms are never mixed because they are density independent.
+
+    With FDET (``system.embedding``) ``V_ion,local`` holds the frozen sample
+    field, the XC terms read ``rho + rho_core + rho_A`` and both fields hold
+    the non-additive kinetic potential ``v_nad`` of the iteration
+    (:mod:`parsec_python.Embedding.frozen_density`); the energies are the
+    FDET energies of ``totnrg.f90``.
+
+    A hybrid ``Correlation_Type`` (``system.input.scf.is_hybrid``) runs the
+    Fock loop of :func:`parsec_python.SCF.hybrid.run_hybrid_scf`, whose inner
+    loops come back here with ``exchange_term``: the fixed exact-exchange
+    operator of the loop (:class:`parsec_python.SCF.hybrid.FockOperator`).
+    It joins every Hamiltonian of the loop, ``H = H[V_in] + a_x V_ACE``, and
+    the energies of every iteration (:meth:`FockOperator.iteration_energies`).
     """
+    if exchange_term is None and getattr(system.input.scf, "is_hybrid", False):
+        from .hybrid import run_hybrid_scf
+
+        return run_hybrid_scf(
+            system,
+            callback=callback,
+            eigenproblem_solver=eigenproblem_solver,
+            orbital_density_builder=orbital_density_builder,
+            mixer_factory=mixer_factory,
+            residual_metrics_evaluator=residual_metrics_evaluator,
+            total_energy_evaluator=total_energy_evaluator,
+            scalar_field_adapter=scalar_field_adapter,
+            warm_start=warm_start,
+            convergence_criterion=convergence_criterion,
+            iteration_state_callback=iteration_state_callback,
+        )
+    if exchange_term is not None and getattr(system, "exchange_device", None) is None:
+        # An accelerated system whose device Hamiltonians hold the operator
+        # (acceleration.SCF.hybrid) takes its hooks along.
+        refuse_exchange_hooks(
+            eigenproblem_solver=eigenproblem_solver,
+            orbital_density_builder=orbital_density_builder,
+            mixer_factory=mixer_factory,
+            residual_metrics_evaluator=residual_metrics_evaluator,
+            total_energy_evaluator=total_energy_evaluator,
+            scalar_field_adapter=scalar_field_adapter,
+        )
+    embedding = getattr(system, "embedding", None)
+    if embedding is not None and (
+        getattr(system.input.scf, "spin_polarized", False) or scalar_field_adapter is not None
+    ):
+        raise NotImplementedError(
+            "FDET (Potential_Field) runs spin-unpolarized on the full grid only (no symmetry sectors)"
+        )
     if getattr(system.input.scf, "spin_polarized", False):
         from .spin_polarized import run_spin_scf
 
@@ -1760,8 +2225,10 @@ def run_scf(
                 if iteration_state_callback is None
                 else {"iteration_state_callback": iteration_state_callback}
             ),
+            **({} if exchange_term is None else {"exchange_term": exchange_term}),
         )
     scf_start = time.perf_counter()
+    level_detail = None
     # The validated reference path always selects ``solve_eigval`` here.  The
     # optional callable is a narrow execution hook used by the sibling
     # accelerated package to retain the same SCF/mixing/energy control flow
@@ -1816,6 +2283,9 @@ def run_scf(
         total_energy_evaluator=total_energy_evaluator,
         scalar_field_adapter=scalar_field_adapter,
     )
+    # A meta-GGA: tau of the orbitals, -div(vtau grad) in every Hamiltonian,
+    # (V, vtau) mixed together, PBE in the first iteration (SCF.meta_gga).
+    meta = meta_gga_loop(system, channels=1, adapter=scalar_field_adapter, warm_start=warm_start, exchange_term=exchange_term)
     # LDA+U potential matrices of the present iteration: zero (None) in the
     # first iteration of every SCF loop, as upot.F90 leaves them.
     hubbard_state = None
@@ -1861,7 +2331,12 @@ def run_scf(
         # XC sees rho_valence + frozen rho_core (CA-LDA or PBE, as selected).
         # The Hartree solve immediately above sees rho_valence only.
         stage_start = time.perf_counter()
-        xc = system.evaluate_xc(density)
+        if meta is not None:
+            xc = meta.start_xc(density)
+        elif embedding is None:
+            xc = system.evaluate_xc(density)
+        else:
+            xc, nonadditive = embedded_exchange_correlation(system, density)
         initial_xc_seconds = time.perf_counter() - stage_start
         xc_potential = xc.potential
         # This array is the diagonal, local part of H.  V_NL is intentionally
@@ -1870,6 +2345,9 @@ def run_scf(
         input_potential = (
             ionic_potential + hartree_potential + xc_potential
         )
+        if embedding is not None:
+            # parsec.F90:1296: vold = vion + vxc + vhart + vnadd.
+            input_potential = input_potential + nonadditive.potential
     else:
         # The structure before the move supplies the first input potential,
         # the starting vector of the first Poisson solve and the subspace of
@@ -1895,17 +2373,30 @@ def run_scf(
             )
             initial_hartree_seconds = time.perf_counter() - stage_start
             stage_start = time.perf_counter()
-            moved_xc = system.evaluate_xc(guess)
+            if embedding is None:
+                moved_xc = system.evaluate_xc(guess)
+                moved_xc_potential = moved_xc.potential
+            else:
+                # The reference holds v_nad of the last output potential.
+                moved_xc, moved_nonadditive = embedded_exchange_correlation(system, guess)
+                moved_xc_potential = moved_xc.potential + moved_nonadditive.potential
             initial_xc_seconds = time.perf_counter() - stage_start
             hartree_potential = moved_hartree.potential
             input_potential = (
                 input_potential
-                + (hartree_potential + moved_xc.potential)
+                + (hartree_potential + moved_xc_potential)
                 - to_internal_scalar(
                     np.array(warm_start.hxc_reference, dtype=np.float64)
                 )
             )
-    mixer = build_mixer(system.input.mixing)
+    # Mixing_Preconditioner: kerker wraps the mixer (Mixer.preconditioner);
+    # at its default "none" the mixer is the one built here.
+    mixer = warm_start_mixer(
+        warm_start,
+        (lambda: preconditioned_mixer(build_mixer(system.input.mixing), system, adapter=scalar_field_adapter))
+        if meta is None
+        else (lambda: meta.mixer(build_mixer, system.input.mixing)),
+    )
     history: list[SCFIteration] = []
     # This is the later-SCF SUBSPACE polynomial degree.  The first-solver
     # degree is a separate setting.  Near SCF convergence PARSEC lowers the
@@ -1933,7 +2424,13 @@ def run_scf(
     xc_total = 0.0
     mixing_energy_total = 0.0
 
-    for iteration in range(1, settings.max_iterations + 1):
+    # SCFWarmStart.level_tolerance: after the converged iteration one more
+    # (``refining``) on the same V_in, its eigenpairs to that tolerance.
+    level_tolerance = None if warm_start is None else getattr(warm_start, "level_tolerance", None)
+    refining = False
+    for iteration in range(1, settings.max_iterations + 1 + int(level_tolerance is not None)):
+        if iteration > settings.max_iterations and not refining:
+            break
         iteration_start = time.perf_counter()
         # 3. Solve the Kohn--Sham eigenproblem with PARSEC's fixed number of
         # first-filter cycles or one later-filter pass.
@@ -1959,8 +2456,22 @@ def run_scf(
         # KB terms; LinearOperator routes all Lanczos and Chebyshev H@Q calls
         # through that same three-term action.
         binding_start = time.perf_counter()
-        if hubbard_projectors is None:
+        if meta is not None and meta.kinetic_potential(0) is not None:
+            # A meta-GGA hybrid: the orbital term and the fixed exchange operator.
+            hamiltonian = system.hamiltonian(
+                input_potential,
+                None,
+                None if exchange_term is None else exchange_term.operator(0),
+                kinetic_potential=meta.kinetic_potential(0),
+                **meta.flux_keywords(0),
+            )
+        elif hubbard_projectors is None and exchange_term is None:
             hamiltonian = system.hamiltonian(input_potential)
+        elif hubbard_projectors is None:
+            # A hybrid functional: the fixed exchange operator of the loop.
+            hamiltonian = system.hamiltonian(
+                input_potential, None, exchange_term.operator(0)
+            )
         else:
             if iteration > 1:
                 # calcden.f90z: N and D from the orbitals and occupations of
@@ -1990,12 +2501,31 @@ def run_scf(
         )
         if callable(release_previous_orbitals):
             release_previous_orbitals()
-        eigensolution = solve_current_eigenproblem(
-            hamiltonian_operator,
-            number_of_states,
-            settings=eigval_settings,
-            state=eigval_state,
-        )
+        if refining:
+            # The loop converged at the iteration before: the same H[V_in]
+            # until no level moves by more than level_tolerance.
+            eigensolution, level_passes, level_seconds, level_change = refine_levels(
+                solve_current_eigenproblem,
+                hamiltonian_operator,
+                number_of_states,
+                eigval_settings,
+                eigval_state,
+                eigenvalues,
+                None,
+                float(level_tolerance),
+            )
+            level_detail = {
+                "level_passes": float(level_passes),
+                "level_seconds": float(level_seconds),
+                "level_change": float(level_change),
+            }
+        else:
+            eigensolution = solve_current_eigenproblem(
+                hamiltonian_operator,
+                number_of_states,
+                settings=eigval_settings,
+                state=eigval_state,
+            )
         # Persist all buffered Ritz pairs and filter history, not only the
         # number_of_states columns returned below.  This is what makes later
         # SCF diagonalizations saved-subspace updates instead of fresh solves.
@@ -2047,6 +2577,7 @@ def run_scf(
         density = build_orbital_density(
             wavefunctions, occupations, system.grid.volume_element
         )
+        tau = None if meta is None else meta.tau(wavefunctions, occupations, 2.0)
         symmetrization = ()
         density_symmetry = getattr(system, "density_symmetry", None)
         if density_symmetry is not None:
@@ -2063,6 +2594,15 @@ def run_scf(
                 )
             )
             symmetrization = (report,)
+            if tau is not None:
+                # tau is a scalar field of the same group: averaged alike, and
+                # the orbital form's g as a vector field.
+                tau, _ = (
+                    symmetrize(tau, system.grid.volume_element)
+                    if callable(symmetrize)
+                    else symmetrize_density(tau, density_symmetry, system.grid.volume_element)
+                )
+                meta.symmetrize_gradient(0, density_symmetry)
         occupations_density_seconds = (
             time.perf_counter() - occupations_density_start
         )
@@ -2079,7 +2619,13 @@ def run_scf(
         hartree_total += hartree_seconds
         hartree_potential = hartree.potential
         xc_start = time.perf_counter()
-        xc = system.evaluate_xc(density)
+        if meta is not None:
+            xc = system.evaluate_xc(density, tau=tau, **meta.gradient_keywords(0))
+        elif embedding is None:
+            xc = system.evaluate_xc(density)
+        else:
+            # FDET: XC of rho + rho_core + rho_A and T_nad, v_nad (exc.f90:816-822).
+            xc, nonadditive = embedded_exchange_correlation(system, density)
         xc_seconds = time.perf_counter() - xc_start
         xc_total += xc_seconds
         xc_potential = xc.potential
@@ -2089,6 +2635,9 @@ def run_scf(
         output_potential = (
             ionic_potential + hartree_potential + xc_potential
         )
+        if embedding is not None:
+            # parsec.F90:1631-1633: vnew = vhart + vxc + vion + vnadd.
+            output_potential = output_potential + nonadditive.potential
 
         # 6. Evaluate convergence diagnostics and the total energy.  With
         # R_i=V_out,i-V_in,i, the default weighted SRE is
@@ -2131,6 +2680,20 @@ def run_scf(
                 }
             ),
         )
+        if embedding is not None:
+            # totnrg.f90:159-197: the FDET energy of tip and sample.
+            energies = embedding_energies(
+                energies, embedding, density, ionic_potential, nonadditive, system.grid.volume_element
+            )
+        if meta is not None:
+            # The band energy holds 2 h^3 sum vtau_in tau of the orbital term.
+            energies = meta.energies(energies, (tau,), getattr(xc, "fermi_hole_clamped", 0), xc=xc)
+        if exchange_term is not None:
+            # The exchange operator's part of the band energy is removed and
+            # the exact exchange of the functional this loop minimizes added.
+            energies = exchange_term.iteration_energies(
+                energies, (wavefunctions,), (occupations,)
+            )
         # 7. Mix the effective potential and apply PARSEC's SCF stop test.
         # Only V_eff is mixed.  T, V_NL, and the fixed local ionic component
         # remain unchanged; V_ion appears in both input and output and thus
@@ -2139,9 +2702,19 @@ def run_scf(
         # V_in).  Later calls use the retained residual/input history and its
         # configured restart schedule.  PARSEC also performs mixing before the
         # stop test, so a converged result still has a diagnostic V_next.
-        mixed_potential = mixer.mix(
-            input_potential, output_potential, iteration=iteration
-        )
+        if meta is None:
+            mixed_potential = mixer.mix(
+                input_potential, output_potential, iteration=iteration
+            )
+        else:
+            mixed_potential = meta.mix(
+                mixer,
+                [input_potential],
+                [output_potential],
+                [xc.kinetic_potential],
+                iteration=iteration,
+                densities=[density],
+            )[0]
         # SCF convergence is a local-potential fixed-point test, not an energy
         # difference and not the Ritz residual reported above.
         selected_residual = (
@@ -2152,7 +2725,7 @@ def run_scf(
         # Convergence_Criterion_Approach, by default 100*vconv.
         approach_residual = metrics.weighted
         if (
-            iteration > 5
+            iteration > settings.degree_decrease_after
             and approach_residual < settings.approach_criterion
             and filter_degree > minimum_filter_degree
         ):
@@ -2161,7 +2734,11 @@ def run_scf(
             filter_degree -= 1
         # The strict inequality is PARSEC's fixed-point stop rule.  Energy,
         # Hartree, and eigenpair residuals remain diagnostics only.
-        iteration_converged = selected_residual < settings.convergence_criterion
+        if iteration == 1:
+            first_residual = selected_residual
+        iteration_converged = selected_residual < loop_criterion(
+            warm_start, settings.convergence_criterion, first_residual
+        )
         if eigensolver_settings.dynamic_tolerance:
             diagonalization_tolerance = dynamic_diagonalization_tolerance(
                 diagonalization_tolerance,
@@ -2211,6 +2788,7 @@ def run_scf(
             mixing_energy_seconds=mixing_energy_seconds,
             total_seconds=iteration_seconds,
             density_symmetrization=symmetrization,
+            **({"level_refinement": True} if refining else {}),
             **hubbard_iteration_record(hubbard_state),
             **iteration_eigensolver_fields(
                 (getattr(eigensolution, "iterative_counts", None),),
@@ -2235,10 +2813,16 @@ def run_scf(
                 )
             )
 
-        if iteration_converged:
+        if iteration_converged or refining:
+            if level_tolerance is not None and not refining:
+                # V_in stays: the next iteration solves the same Hamiltonian.
+                refining = True
+                continue
             converged = True
             break
         input_potential = mixed_potential
+        if meta is not None:
+            meta.advance()
 
     if energies is None:
         raise RuntimeError("SCF loop did not execute")
@@ -2263,6 +2847,7 @@ def run_scf(
         xc_seconds=xc_total,
         mixing_energy_seconds=mixing_energy_total,
         total_seconds=time.perf_counter() - scf_start,
+        **({} if level_detail is None else {"detail": level_detail}),
     )
     return SinglePointResult(
         converged=converged,
@@ -2279,6 +2864,8 @@ def run_scf(
         input_effective_potential=to_public_scalar(last_input_potential),
         output_effective_potential=to_public_scalar(
             ionic_potential + hartree_potential + xc_potential
+            if embedding is None
+            else output_potential
         ),
         next_effective_potential=to_public_scalar(mixed_potential),
         nonlocal_operator=system.nonlocal_operator,
@@ -2294,4 +2881,6 @@ def run_scf(
         eigensolver_state=eigval_state,
         hubbard=hubbard_state,
         dispersion=dispersion,
+        embedding=None if embedding is None else nonadditive,
+        **({} if meta is None else {"meta_gga": meta.record()}),
     )

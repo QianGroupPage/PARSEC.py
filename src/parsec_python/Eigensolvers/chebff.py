@@ -12,10 +12,16 @@ Python implementation of the orchestration:
 4. orthonormalize and perform a Rayleigh--Ritz rotation, and
 5. update the filter bounds before the next configured filter cycle.
 
-CHEBFF deliberately does *not* test individual Ritz residuals.  PARSEC marks
+By default CHEBFF does *not* test individual Ritz residuals.  PARSEC marks
 all requested pairs as approximate convergence after ``FF_MaxIter`` cycles;
 this module preserves that policy and never falls back to ARPACK or another
-eigensolver.
+eigensolver.  PARSEC 1.5 adds a residual-driven mode (``chebff.f90z:431-453``
+of 1.5, residuals of ``chefsi_cycle.f90z:1145-1237``): with a tolerance
+``tol > 0`` the cycles stop as soon as the largest residual
+``||H psi_i - lambda_i psi_i||`` of the states is below it, and the run stops
+(``info = -1``, eigval.F90 ierr 401) when ``FF_MaxIter`` cycles have not
+reached it.  ``ChebFFSettings.residual_tolerance`` selects that mode
+(:class:`ChebFFResidualError` is the stop).
 """
 
 from __future__ import annotations
@@ -26,10 +32,10 @@ from typing import Any
 import numpy as np
 
 from .chebyshev import chebff_filter
-from .lapack_random import LapackRandom
+from .lapack_random import LapackRandom, PARSEC_RANDOM_ARRAY_SEED
 from .orthogonalize import orthonormalize
 from .rayleigh_ritz import rayleigh_ritz
-from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
+from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound, spectral_bound
 
 
 @dataclass(frozen=True)
@@ -37,7 +43,7 @@ class ChebFFSettings:
     """Input controls corresponding to PARSEC's CHEBFF solver fields.
 
     ``polynomial_degree`` is ``Chebdav_Degree`` and ``filter_cycles`` is
-    ``FF_MaxIter``.  Every cycle performs that many recurrence steps followed
+    ``FF_MaxIter`` (default 3, PARSEC 1.5's).  Every cycle performs that many recurrence steps followed
     by orthonormalization and one Rayleigh--Ritz rotation.  In particular,
     ``filter_cycles`` is a fixed work count, not a maximum checked against an
     eigenpair-residual tolerance.
@@ -50,26 +56,83 @@ class ChebFFSettings:
 
     ``random_seed`` and ``reset_recurrence_per_block`` are explicit Python
     reproducibility/testing controls, not PARSEC input-file labels.  The trial
-    basis itself always starts from PARSEC's canonical LAPACK seed; this seed
-    controls the separate NumPy short-Lanczos starting vector.
+    basis starts from the LAPACK seed ``basis_seed``, PARSEC's canonical one
+    unless ``Vector_Rng_Seed`` selects another
+    (:func:`parsec_python.Eigensolvers.lapack_random.lapack_seed_from_integer`);
+    ``random_seed`` controls the separate NumPy short-Lanczos starting vector.
+
+    ``residual_tolerance`` (``None`` by default: fixed cycles) is PARSEC 1.5's
+    residual-driven CHEBFF (see the module text): the largest residual of the
+    first ``residual_states`` states of :func:`run_chebff` is tested after
+    every cycle; ``residual_failure`` says what happens when ``filter_cycles``
+    cycles do not reach it: ``"stop"`` (PARSEC 1.5) raises
+    :class:`ChebFFResidualError`, ``"continue"`` keeps the subspace of the
+    last cycle (the early exit only).  ``reorthogonalization_threshold`` is
+    the first ratio test of
+    the selective Gram--Schmidt (:func:`orthogonalize.orthonormalize`): 0.1 as
+    in the earlier PARSEC, 0.68 in PARSEC 1.5.  ``bounds`` is the Lanczos
+    bound: ``"parsec"`` (the earlier PARSEC, its ``[4, 8]`` step clamp),
+    ``"lanczos"`` or ``"lanczos_full"`` (PARSEC 1.5's ``Bounds_Method``,
+    :func:`spectral_bounds.spectral_bound`, ``bound_steps`` steps, or
+    ``lanczos_steps`` when it is ``None``).
     """
 
     polynomial_degree: int = 20
-    filter_cycles: int = 2
+    filter_cycles: int = 3
     lanczos_steps: int = 10
     block_size: int = 6
     reset_recurrence_per_block: bool = False
     random_seed: int = 7
+    basis_seed: tuple[int, int, int, int] = PARSEC_RANDOM_ARRAY_SEED
+    residual_tolerance: float | None = None
+    residual_failure: str = "stop"
+    reorthogonalization_threshold: float = 0.1
+    bounds: str = "parsec"
+    bound_steps: int | None = None
 
     def __post_init__(self) -> None:
         if self.polynomial_degree < 1:
             raise ValueError("polynomial_degree must be positive")
-        if not 1 <= self.filter_cycles < 20:
-            raise ValueError("filter_cycles must be in PARSEC's [1, 19] range")
+        # PARSEC 1.5 accepts FF_MaxIter up to 50 (usrinputfile.F90:2303).
+        if not 1 <= self.filter_cycles <= 50:
+            raise ValueError("filter_cycles must be in PARSEC's [1, 50] range")
         if self.lanczos_steps < 1:
             raise ValueError("lanczos_steps must be positive")
         if self.block_size < 1:
             raise ValueError("block_size must be positive")
+        object.__setattr__(
+            self, "basis_seed", LapackRandom(tuple(self.basis_seed)).seed
+        )
+        if self.residual_tolerance is not None and not (
+            np.isfinite(self.residual_tolerance) and self.residual_tolerance > 0
+        ):
+            raise ValueError("residual_tolerance must be positive (or None)")
+        if self.residual_failure not in ("stop", "continue"):
+            raise ValueError("residual_failure must be stop or continue")
+        if not 0.0 < self.reorthogonalization_threshold < 1.0:
+            raise ValueError("reorthogonalization_threshold must be in (0, 1)")
+        if self.bounds not in ("parsec", "lanczos", "lanczos_full"):
+            raise ValueError("CHEBFF bounds must be parsec, lanczos or lanczos_full")
+
+
+class ChebFFResidualError(RuntimeError):
+    """PARSEC 1.5's stop of a residual-driven CHEBFF (eigval.F90 ierr 401).
+
+    ``chebff.f90z:438-452`` of 1.5: the largest residual of the wave
+    functions is still above ``Diag_Tolerance`` after ``FF_MaxIter`` cycles.
+    """
+
+    def __init__(self, maximum_residual: float, tolerance: float, cycles: int) -> None:
+        self.maximum_residual = float(maximum_residual)
+        self.tolerance = float(tolerance)
+        self.cycles = int(cycles)
+        super().__init__(
+            "CHEBFF (residual-driven, PARSEC 1.5): the maximum residual of the "
+            f"wave functions, {self.maximum_residual:.6e}, is still larger than "
+            f"the tolerance {self.tolerance:.6e} after FF_MaxIter={self.cycles} "
+            "cycles (PARSEC 1.5 quits the program here: eigval.F90 ierr 401). "
+            "Raise FF_MaxIter or Diag_Tolerance."
+        )
 
 
 @dataclass(frozen=True)
@@ -83,6 +146,8 @@ class ChebFFCycle:
     upper_bound_out: float
     smallest_ritz_value: float
     largest_ritz_value: float
+    # Residual-driven mode only: the largest tested residual of the cycle.
+    maximum_residual: float | None = None
 
 
 @dataclass(frozen=True)
@@ -238,6 +303,7 @@ def run_chebff(
     wanted_states: int,
     *,
     settings: ChebFFSettings = ChebFFSettings(),
+    residual_states: int | None = None,
 ) -> ChebFFResult:
     """Build PARSEC's initial approximate eigensubspace.
 
@@ -250,6 +316,10 @@ def run_chebff(
         adding PARSEC's safety states before calling this routine.
     settings
         First-filter degree, cycle count, bound-estimator length, and seed.
+    residual_states
+        With ``settings.residual_tolerance``: how many leading states the
+        residual test covers (the requested ``States_Num``, PARSEC 1.5's
+        whole working space; ``None`` tests every working state).
 
     Notes
     -----
@@ -262,9 +332,9 @@ def run_chebff(
 
     ``(Q.T @ H @ Q) U = U diag(epsilon)``, ``Psi = Q @ U``.
 
-    No residual threshold terminates this loop early.  PARSEC treats the
-    complete working subspace as approximately converged after the requested
-    number of cycles.
+    Without ``settings.residual_tolerance`` no residual threshold terminates
+    this loop early.  PARSEC treats the complete working subspace as
+    approximately converged after the requested number of cycles.
     """
 
     dimension = _operator_dimension(operator)
@@ -276,7 +346,7 @@ def run_chebff(
     # Stage 1: form the complete buffered trial basis.  PARSEC random_array
     # (DLARNV) and Fortran RANDOM_NUMBER have independent state, so the basis
     # and short-Lanczos start below deliberately come from different streams.
-    basis_generator = LapackRandom()
+    basis_generator = LapackRandom(settings.basis_seed)
     bound_generator = np.random.default_rng(settings.random_seed)
     complex_values = _operator_is_complex(operator)
     vectors = _random_vectors(
@@ -288,11 +358,20 @@ def run_chebff(
     # Stage 2: estimate the unwanted spectrum's upper edge.  The SCF caller
     # requests ten Lanczos steps for CHEBFF; the non-BETA bound routine itself
     # applies PARSEC's inclusive [4, 8] clamp, so production uses eight.
-    bound = lanczos_upper_bound(
-        operator,
-        steps=settings.lanczos_steps,
-        rng=bound_generator,
-    )
+    if settings.bounds == "parsec":
+        bound = lanczos_upper_bound(
+            operator,
+            steps=settings.lanczos_steps,
+            rng=bound_generator,
+        )
+    else:
+        # PARSEC 1.5's Bounds_Method (chebff.f90z:259-298 of 1.5).
+        bound = spectral_bound(
+            operator,
+            settings.bounds,
+            settings.lanczos_steps if settings.bound_steps is None else settings.bound_steps,
+            rng=bound_generator,
+        )
 
     upper_bound = float(bound.upper_bound)
     # Before the first Rayleigh--Ritz solve, ``smallest_ritz`` is the short-
@@ -322,7 +401,11 @@ def run_chebff(
         # Stage 3b: repair the filtered basis, then diagonalize H only in this
         # small working subspace.  The same LAPACK stream is retained for the
         # rare random-replacement branch of orthonormalization.
-        vectors = orthonormalize(vectors, rng=basis_generator).basis
+        vectors = orthonormalize(
+            vectors,
+            rng=basis_generator,
+            reorthogonalization_threshold=settings.reorthogonalization_threshold,
+        ).basis
         ritz = rayleigh_ritz(operator, vectors)
         eigenvalues = np.asarray(ritz.eigenvalues, dtype=float)
         vectors = np.asarray(ritz.wavefunctions)
@@ -342,6 +425,15 @@ def run_chebff(
             smallest_ritz,
             largest_ritz,
         )
+        maximum_residual = None
+        if settings.residual_tolerance is not None:
+            # chefsi_cycle.f90z:1145-1237 (1.5): ||H psi_i - lambda_i psi_i||
+            # of the states; the residuals of rayleigh_ritz come from the H Q
+            # product already formed (1.5 spends one more product per state).
+            tested = wanted_states if residual_states is None else int(residual_states)
+            maximum_residual = float(
+                np.max(np.asarray(ritz.residual_norms, dtype=float)[:tested])
+            )
         cycle_records.append(
             ChebFFCycle(
                 number=cycle_number,
@@ -351,8 +443,18 @@ def run_chebff(
                 upper_bound_out=upper_bound,
                 smallest_ritz_value=smallest_ritz,
                 largest_ritz_value=largest_ritz,
+                maximum_residual=maximum_residual,
             )
         )
+        if maximum_residual is not None:
+            # chebff.f90z:431-453 (1.5): exit below the tolerance, stop the
+            # run when the last cycle has not reached it.
+            if maximum_residual < settings.residual_tolerance:
+                break
+            if cycle_number == settings.filter_cycles and settings.residual_failure == "stop":
+                raise ChebFFResidualError(
+                    maximum_residual, settings.residual_tolerance, cycle_number
+                )
 
     state = ChebFFState(
         operator_dimension=dimension,

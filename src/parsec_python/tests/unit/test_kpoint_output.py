@@ -16,6 +16,8 @@ from pathlib import Path
 import numpy as np
 
 from parsec_python.cli import main as cli_main
+from parsec_python.tests.archives import read_archive
+from parsec_python.tests.kramers import assert_level_moments_cancel
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -76,7 +78,7 @@ class KpointOutputTests(unittest.TestCase):
             )
             self.assertEqual(cli_main([str(directory / "parsec.in"), "--quiet"]), 0)
             log = (directory / "parsec.out").read_text(encoding="utf-8")
-            archive = np.load(directory / "parsec_python_results.npz")
+            archive = read_archive(directory / "parsec_python_results.npz")
             return log, {key: archive[key] for key in archive.files}
 
     def _final_section(self, log: str, marker: str) -> str:
@@ -138,7 +140,10 @@ class KpointOutputTests(unittest.TestCase):
         for start in (0, 20):
             for i in range(start, start + 16, 2):
                 self.assertAlmostEqual(eigenvalues[i], eigenvalues[i + 1], delta=1e-4)
-                self.assertAlmostEqual(moments[i] + moments[i + 1], 0.0, delta=0.05)
+            # the spin cancels per degenerate level, not per pair inside a quartet (tests/kramers.py)
+            assert_level_moments_cancel(
+                self, eigenvalues[start : start + 20], moments[start : start + 20], checked=16
+            )
 
         final = self._final_section(log, "Converged spin-orbit-split spinor states")
         self.assertIn("k-point   1 of   2", final)
@@ -174,7 +179,7 @@ class KpointOutputTests(unittest.TestCase):
             text = text[: text.index("Kpoint_Method")]
             (directory / "parsec.in").write_text(text, encoding="utf-8")
             self.assertEqual(cli_main([str(directory / "parsec.in"), "--quiet"]), 0)
-            archive = np.load(directory / "parsec_python_results.npz")
+            archive = read_archive(directory / "parsec_python_results.npz")
             self.assertNotIn("k_points_cartesian_inv_bohr", archive.files)
             log = (directory / "parsec.out").read_text(encoding="utf-8")
             self.assertNotIn("by k-point", log)

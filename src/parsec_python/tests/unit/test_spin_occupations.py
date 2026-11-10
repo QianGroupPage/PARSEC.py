@@ -29,6 +29,7 @@ from parsec_python.Occupations import (
     spin_fermi_occupations,
     spin_fixed_occupations,
 )
+from parsec_python.Occupations.spin import COUNT_TOLERANCE
 from parsec_python.tests.martins_old_reference import DATA
 
 
@@ -77,20 +78,22 @@ class SpinFermiLevelTests(unittest.TestCase):
                 with self.subTest(temperature=temperature, electrons=electrons):
                     spin = spin_fermi_occupations(levels, levels, electrons, temperature)
                     plain = fermi_occupations(levels, electrons, temperature)
+                    # Both bisections stop within the electron-count
+                    # tolerance of PARSEC 1.5 (1e-10, flevel.f90:43).
                     np.testing.assert_allclose(
-                        spin.occupations[0], plain.occupations, rtol=0, atol=2.0e-11
+                        spin.occupations[0], plain.occupations, rtol=0, atol=4.0 * COUNT_TOLERANCE
                     )
                     np.testing.assert_array_equal(
                         spin.occupations[0], spin.occupations[1]
                     )
-                    self.assertAlmostEqual(spin.electron_count, electrons, delta=1.0e-12)
+                    self.assertAlmostEqual(spin.electron_count, electrons, delta=COUNT_TOLERANCE)
                     self.assertEqual(spin.net_magnetic_moment, 0.0)
 
     def test_one_level_for_both_channels_at_high_temperature(self) -> None:
         up = np.array([-0.60, -0.30, 0.10])
         down = np.array([-0.55, -0.20, 0.15])
         result = spin_fermi_occupations(up, down, 3.0, 20000.0)
-        self.assertAlmostEqual(result.electron_count, 3.0, delta=1.0e-12)
+        self.assertAlmostEqual(result.electron_count, 3.0, delta=COUNT_TOLERANCE)
         kbt = 6.33327186e-6 * 20000.0
         for levels, occupations in zip((up, down), result.occupations):
             np.testing.assert_allclose(
@@ -244,16 +247,21 @@ class SpinDensityResidualEnergyTests(unittest.TestCase):
         # parsec.F90 tests the larger of the two.
         self.assertEqual(metrics.weighted, max(metrics.weighted_by_spin))
         self.assertEqual(metrics.plain, max(metrics.plain_by_spin))
-        # getsre.f90: no weighted residual for a channel without electrons.
-        empty = spin_potential_residual_metrics(
-            inputs,
-            outputs,
-            (densities[0], np.zeros(size)),
-            self.volume_element,
-            (electrons[0], 0.0),
-        )
-        self.assertEqual(empty.weighted_by_spin[1], 0.0)
-        self.assertGreater(empty.plain_by_spin[1], 0.0)
+        # getsre.f90 of PARSEC 1.5: no residual at all (weighted and plain)
+        # for a channel with fewer than 2 eps electrons (the previous tree
+        # kept the plain one).
+        for count in (0.0, 1.0e-17):
+            empty = spin_potential_residual_metrics(
+                inputs,
+                outputs,
+                (densities[0], np.zeros(size)),
+                self.volume_element,
+                (electrons[0], count),
+            )
+            self.assertEqual(empty.weighted_by_spin[1], 0.0)
+            self.assertEqual(empty.plain_by_spin[1], 0.0)
+            self.assertEqual(empty.plain_by_spin[0], metrics.plain_by_spin[0])
+            self.assertEqual(empty.plain, metrics.plain_by_spin[0])
 
     def test_identical_channels_give_the_unpolarized_energy(self) -> None:
         size = self.orbitals.shape[0]

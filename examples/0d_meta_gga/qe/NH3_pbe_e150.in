@@ -1,0 +1,35 @@
+ &control
+    calculation = 'scf'
+    prefix = 'NH3_pbe_L20_e150'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+    tprnfor = .true.
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 20.000000
+    assume_isolated = 'mt'
+    nat = 4
+    ntyp = 2
+    ecutwfc = 150.0
+    ecutrho = 600.0
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'pbe'
+ /
+ &electrons
+    conv_thr = 1.0d-09
+    mixing_beta = 0.4
+    electron_maxstep = 300
+ /
+ATOMIC_SPECIES
+ H 1.008 h_pbe_tm.UPF
+ N 14.007 n_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ N 9.5570814680 10.0000000000 10.3600192354
+ H 11.3287555960 10.0000000000 9.6399807646
+ H 8.6712444040 11.5343148020 9.6399807646
+ H 8.6712444040 8.4656851980 9.6399807646
+K_POINTS gamma

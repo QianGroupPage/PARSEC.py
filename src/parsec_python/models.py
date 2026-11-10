@@ -41,7 +41,27 @@ XCFunctional = Literal[
     "pw91",
     "lb94",
     "casida_salahub",
+    "hf",
+    "pbe0",
+    "pbeh",
+    "hse06",
+    "hse03",
+    "b3lyp",
+    "b3lyp5",
+    "b3pw91",
+    "lc-wpbe",
+    "cam-b3lyp",
+    "scan",
 ]
+# Self-consistent hybrid functionals (generalized Kohn-Sham with a nonlocal
+# exchange operator, parsec_python.SCF.hybrid): the labels of the registry
+# parsec_python.V_xc.hybrid.HYBRID_FUNCTIONALS; no Fortran PARSEC label.
+HYBRID_XC_FUNCTIONALS = frozenset(
+    ("hf", "pbe0", "pbeh", "hse06", "hse03", "b3lyp", "b3lyp5", "b3pw91", "lc-wpbe", "cam-b3lyp")
+)
+# Meta-GGAs of this package (orbital kinetic-energy density in the functional,
+# parsec_python.V_xc.meta_gga): SCAN (V_xc.scan); no Fortran PARSEC label.
+META_GGA_XC_FUNCTIONALS = frozenset(("scan",))
 XC_FUNCTIONAL_NAMES = frozenset(
     (
         "ca",
@@ -54,9 +74,22 @@ XC_FUNCTIONAL_NAMES = frozenset(
         "lb94",
         "casida_salahub",
     )
-)
+) | HYBRID_XC_FUNCTIONALS | META_GGA_XC_FUNCTIONALS
 # Functionals without a spin-polarized form (none in Fortran's exc_spn.f90).
 UNPOLARIZED_ONLY_XC_FUNCTIONALS = frozenset(("xalpha", "wigner", "hedin_lundqvist"))
+# libxc's functionals (optional library, parsec_python.V_xc.libxc): ``xc_functional``
+# "libxc:<name>[+<name>...][;fhc=on|off][;threshold=<t>][;tau=<t>]" with libxc's lowercase names.
+LIBXC_XC_PREFIX = "libxc:"
+
+
+def _libxc_spec(xc_functional):
+    """The parsed ``libxc:`` spec of ``xc_functional``, ``None`` for the code's own functionals."""
+
+    if not (isinstance(xc_functional, str) and xc_functional.startswith(LIBXC_XC_PREFIX)):
+        return None
+    from .V_xc.libxc import parse_libxc_spec
+
+    return parse_libxc_spec(xc_functional)
 # ``sad``, ``file``, or a density model of ``MLDensity.registry`` (built in:
 # ``charge3net``, ``scdp``, ``custom``).
 InitialDensityMethod = str
@@ -446,6 +479,11 @@ class GridSettings:
     ``domain_parameters = (r_x, r_y, r_z)`` and ``cylinder`` with
     ``domain_parameters = (radius, length, axis)`` (axis 1, 2 or 3 for x, y,
     z; ``|coordinate| <= length/2`` along it), all in bohr.
+
+    ``foldblock_side_length`` is PARSEC 1.5's ``Foldblock_Side_Length``
+    (``grid_partition.f90:525-607``): with 2 the domain is filled up to whole
+    blocks of 2 x 2 x 2 points starting at even indices (a block enters when
+    any of its points lies inside the shape); 1 is the shape alone.
     """
 
     spacing: float
@@ -456,13 +494,15 @@ class GridSettings:
     box_lengths: tuple[float, float, float] | None = None
     double_grid_order: int = 1
     domain_parameters: tuple[float, float, float] | None = None
+    foldblock_side_length: int = 1
 
     def __repr__(self) -> str:
-        # The double grid and the parameters of an ellipsoid or a cylinder
-        # print nothing at their defaults, so the text of every calculation
-        # without them stays what it was (cache keys hash it).
+        # The double grid, the parameters of an ellipsoid or a cylinder and
+        # the fold blocks print nothing at their defaults, so the text of every
+        # calculation without them stays what it was (cache keys hash it).
         return _repr_without_defaults(
-            self, {"double_grid_order": 1, "domain_parameters": None}
+            self,
+            {"double_grid_order": 1, "domain_parameters": None, "foldblock_side_length": 1},
         )
 
     def __post_init__(self) -> None:
@@ -519,6 +559,10 @@ class GridSettings:
             )
         object.__setattr__(self, "expansion_order", order)
         object.__setattr__(self, "shift", tuple(float(x) for x in self.shift))
+        side = int(self.foldblock_side_length)
+        if side != self.foldblock_side_length or side not in (1, 2):
+            raise ValueError("foldblock_side_length must be 1 or 2")
+        object.__setattr__(self, "foldblock_side_length", side)
 
     @property
     def stencil_half_width(self) -> int:
@@ -601,11 +645,11 @@ class PeriodicGridSettings:
     periodicity: int = 3
     # ``Boundary_Sphere_Radius`` of a wire or slab (bohr), None for bulk.
     confinement_radius: float | None = None
-    # Fortran ``adjust_step`` (inipbc.f90:327-429) on the general grid: per
-    # lattice direction, the fractional translations |M t| of the space
-    # group that the step must be commensurate with.  Empty: none (a
-    # symmorphic group, Ignore_Symmetry, or the orthorhombic grid, which
-    # keeps its own rule).
+    # Fortran ``adjust_step`` (inipbc.f90:327-429) on the grids of the
+    # Fortran-derived routines: per lattice direction, the fractional
+    # translations |M t| of the space group that the step must be
+    # commensurate with.  Empty: none (a symmorphic group, Ignore_Symmetry,
+    # or no search: molecular dynamics, manual movements).
     fractional_translations: tuple[tuple[float, ...], ...] = ()
     # The local pseudopotential of a 3-D cell: ``"real_space"``, this port's
     # Ewald split (:func:`parsec_python.V_ion.ewald_local_ionic_potential`),
@@ -705,10 +749,11 @@ class PeriodicGridSettings:
                 "points_rule belongs to the default routines; the Fortran-derived routines "
                 "(fortran_routines=True) choose their own points"
             )
-        if not self.fortran_routines:
-            if len(self.shift) != 3 or not np.all(np.isfinite(self.shift)):
-                raise ValueError("grid shift must have three finite entries")
-            object.__setattr__(self, "shift", tuple(float(value) for value in self.shift))
+        # Both sets of routines read the shift (the Fortran-derived orthorhombic grid since the parity round of
+        # PARSEC 1.5; before it started at the origin whatever the shift said).
+        if len(self.shift) != 3 or not np.all(np.isfinite(self.shift)):
+            raise ValueError("grid shift must have three finite entries")
+        object.__setattr__(self, "shift", tuple(float(value) for value in self.shift))
         order = int(self.expansion_order)
         if order != self.expansion_order:
             raise ValueError("PARSEC expansion_order must be an integer")
@@ -755,6 +800,14 @@ class HartreeSettings:
     (:mod:`parsec_python.Hartree.gspace`) instead of the finite-difference
     Poisson solve.  It is not printed by ``repr`` at its default (the
     accelerated driver hashes the settings text).
+
+    ``cg_criterion`` is the stopping test of the conjugate-gradient Poisson
+    solve, PARSEC 1.5's ``Hartree_CG_Criterion`` (``ipar(3)`` of SPARSKIT's
+    ``cg`` in ``potential/hartree.F90:2096-2108``): 1 (the default) stops at
+    ``||r_k|| <= relative_tolerance*||r_0|| + absolute_tolerance``, 2 at
+    ``||r_k|| <= relative_tolerance*||b|| + absolute_tolerance`` with ``b``
+    the right-hand side (:func:`parsec_python.Hartree.poisson.cg_stopping_threshold`).  It is not printed by
+    ``repr`` at its default.
     """
 
     multipole_order: int = 9
@@ -767,9 +820,10 @@ class HartreeSettings:
     atomic_tail: HartreeAtomicTail = "auto"
     minimum_multipole_order: int | None = None
     periodic_g_space: bool = False
+    cg_criterion: int = 1
 
     def __repr__(self) -> str:
-        return _repr_without_defaults(self, {"periodic_g_space": False})
+        return _repr_without_defaults(self, {"periodic_g_space": False, "cg_criterion": 1})
 
     def __post_init__(self) -> None:
         order = int(self.multipole_order)
@@ -806,6 +860,8 @@ class HartreeSettings:
             raise ValueError("invalid Hartree solver tolerance")
         if max_iterations != self.max_iterations or max_iterations < 1:
             raise ValueError("Hartree max_iterations must be positive")
+        if self.cg_criterion not in (1, 2):
+            raise ValueError("Hartree cg_criterion must be 1 (initial residual) or 2 (right-hand side)")
         if self.boundary_method not in {"auto", "multipole", "direct"}:
             raise ValueError("Hartree boundary_method must be auto, multipole, or direct")
         if (
@@ -825,7 +881,8 @@ class EigensolverSettings:
     """PARSEC eigensolver controls retained by the pure-Python port.
 
     ``first_filter_degree`` is PARSEC's ``Chebdav_Degree`` for CHEBFF and
-    CHEBDAV.  ``first_filter_cycles`` is ``FF_MaxIter`` and affects CHEBFF
+    CHEBDAV.  ``first_filter_cycles`` is ``FF_MaxIter`` (default 3, PARSEC
+    1.5's, since 2026-11-04; 2 before) and affects CHEBFF
     only; CHEBDAV instead uses ``tolerance`` for residual locking.
     ``filter_degree`` and ``filter_degree_delta`` control the later subspace
     filter.  The input translator resolves PARSEC's ``Matvec_Blocksize``
@@ -855,12 +912,45 @@ class EigensolverSettings:
     print nothing at their defaults, so the text of the settings of every
     earlier calculation is unchanged (it enters cache keys of the
     accelerated driver).
+
+    Options of the PARSEC 1.5 round (all off by default, printed only when
+    set): ``vector_seed`` is ``Vector_Rng_Seed``: the start vectors of the
+    first solve (CHEBFF/CHEBDAV) come from the LAPACK seed it selects
+    (:func:`parsec_python.Eigensolvers.lapack_random.lapack_seed_from_integer`)
+    and ``random_seed`` is set to it by the input reader, so the Lanczos
+    starts follow too; ``None`` keeps PARSEC's canonical seed.
+    ``reorthogonalization_threshold`` is the first ratio of the selective
+    Gram--Schmidt (0.1, the earlier PARSEC; 1.5 uses 0.68).
+    ``first_filter_residual_test`` is PARSEC 1.5's residual-driven CHEBFF
+    (``FF_Residual_Test``): ``"off"`` (fixed cycles, the default), ``"stop"``
+    (1.5: the first-solve cycles stop once the largest residual of the
+    ``States_Num`` states is below the eigensolver tolerance of the
+    iteration, and the run stops, 1.5 ierr 401, when ``first_filter_cycles``
+    cycles do not reach it) or ``"continue"`` (the same early exit; the SCF
+    goes on after ``first_filter_cycles`` cycles otherwise).
+    ``exact_state_count`` is PARSEC 1.5's working space of exactly
+    ``States_Num`` vectors (``Exact_State_Count: .true.``; 1.5 has no buffer at
+    all, ``eigen_solver_module.F90:53``).  The PARSEC 1.5 SUBSPACE rules
+    (readable eigensolvers only): ``subspace_lower_bound`` ``"monotone"``
+    (the earlier PARSEC: the largest Ritz value, never lowered), ``"smart"``
+    or ``"adaptive"`` (``Smart_Subspace`` true or false,
+    ``subspace.f90z:237-327`` of 1.5); ``scaled_subspace_filter``
+    (``Chebyshev_Scaled``: the filter normalized at the lowest Ritz value);
+    ``lanczos_bounds`` ``"parsec"`` (5 SUBSPACE and 8 CHEBFF steps, the
+    earlier bound), ``"lanczos"`` or ``"lanczos_full"`` (``Bounds_Method`` of
+    1.5: ``max(degree/2, lanczos_bound_steps)`` steps and 1.5's bound,
+    ``lancz_bound.f90z`` of 1.5; ``lanczos_full`` with full
+    reorthogonalization), ``lanczos_bound_steps`` being ``Bounds_Iter``.
+    ``filter_restart`` is ``(Filter_Restart_After, Restart_Cheb_Remained_Times,
+    Remained_Times_Atomic_Chrg_Den)`` of PARSEC 1.5 for relaxation and
+    molecular dynamics (:mod:`parsec_python.SCF.filter_restart`), ``None``
+    without it.
     """
 
     method: EigensolverName = "chebff"
     tolerance: float = 1.0e-4
     first_filter_degree: int = 20
-    first_filter_cycles: int = 2
+    first_filter_cycles: int = 3
     matvec_block_size: int = 6
     subspace_buffer: int = 6
     filter_degree: int = 15
@@ -871,6 +961,15 @@ class EigensolverSettings:
     dynamic_tolerance: bool = False
     maximum_matvec: int = DEFAULT_MAXIMUM_MATVEC
     fixed_state_count: bool = False
+    vector_seed: int | None = None
+    reorthogonalization_threshold: float = 0.1
+    first_filter_residual_test: str = "off"
+    exact_state_count: bool = False
+    subspace_lower_bound: str = "monotone"
+    scaled_subspace_filter: bool = False
+    lanczos_bounds: str = "parsec"
+    lanczos_bound_steps: int = 10
+    filter_restart: tuple[int, int, int] | None = None
 
     def __repr__(self) -> str:
         # Hidden at their defaults: the text of these settings is hashed by
@@ -880,6 +979,15 @@ class EigensolverSettings:
             "dynamic_tolerance": not self.dynamic_tolerance,
             "maximum_matvec": self.maximum_matvec == DEFAULT_MAXIMUM_MATVEC,
             "fixed_state_count": not self.fixed_state_count,
+            "vector_seed": self.vector_seed is None,
+            "reorthogonalization_threshold": self.reorthogonalization_threshold == 0.1,
+            "first_filter_residual_test": self.first_filter_residual_test == "off",
+            "exact_state_count": not self.exact_state_count,
+            "subspace_lower_bound": self.subspace_lower_bound == "monotone",
+            "scaled_subspace_filter": not self.scaled_subspace_filter,
+            "lanczos_bounds": self.lanczos_bounds == "parsec",
+            "lanczos_bound_steps": self.lanczos_bound_steps == 10,
+            "filter_restart": self.filter_restart is None,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -909,7 +1017,20 @@ class EigensolverSettings:
         eigenpairs, ``States_Num``, in every solve).
         """
 
-        return 0 if self.fixed_state_count else self.subspace_buffer
+        return 0 if self.fixed_state_count or self.exact_state_count else self.subspace_buffer
+
+    @property
+    def basis_seed(self) -> tuple[int, int, int, int]:
+        """The LAPACK seed of the first-solve start vectors (``Vector_Rng_Seed``)."""
+
+        from .Eigensolvers.lapack_random import (
+            PARSEC_RANDOM_ARRAY_SEED,
+            lapack_seed_from_integer,
+        )
+
+        if self.vector_seed is None:
+            return PARSEC_RANDOM_ARRAY_SEED
+        return lapack_seed_from_integer(self.vector_seed)
 
     def __post_init__(self) -> None:
         if self.method not in {"chebff", "chebdav", "arpack", "diagla", "none"}:
@@ -931,6 +1052,37 @@ class EigensolverSettings:
                 )
         object.__setattr__(self, "dynamic_tolerance", bool(self.dynamic_tolerance))
         object.__setattr__(self, "fixed_state_count", bool(self.fixed_state_count))
+        object.__setattr__(self, "exact_state_count", bool(self.exact_state_count))
+        object.__setattr__(
+            self, "scaled_subspace_filter", bool(self.scaled_subspace_filter)
+        )
+        if self.first_filter_residual_test not in ("off", "stop", "continue"):
+            raise ValueError("first_filter_residual_test must be off, stop or continue")
+        if self.subspace_lower_bound not in ("monotone", "smart", "adaptive"):
+            raise ValueError("subspace_lower_bound must be monotone, smart or adaptive")
+        if self.lanczos_bounds not in ("parsec", "lanczos", "lanczos_full"):
+            raise ValueError("lanczos_bounds must be parsec, lanczos or lanczos_full")
+        steps = int(self.lanczos_bound_steps)
+        if steps != self.lanczos_bound_steps or steps < 1:
+            raise ValueError("lanczos_bound_steps must be a positive integer")
+        object.__setattr__(self, "lanczos_bound_steps", steps)
+        if self.filter_restart is not None:
+            restart = tuple(int(item) for item in self.filter_restart)
+            if len(restart) != 3 or restart[0] < 1:
+                raise ValueError(
+                    "filter_restart is (Filter_Restart_After >= 1, restarts, density resets)"
+                )
+            object.__setattr__(self, "filter_restart", restart)
+        if self.vector_seed is not None:
+            if int(self.vector_seed) != self.vector_seed:
+                raise ValueError("vector_seed must be an integer")
+            object.__setattr__(self, "vector_seed", int(self.vector_seed))
+        threshold = float(self.reorthogonalization_threshold)
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("reorthogonalization_threshold must be in (0, 1)")
+        object.__setattr__(self, "reorthogonalization_threshold", threshold)
+        if self.first_filter_residual_test != "off" and self.method != "chebff":
+            raise ValueError("first_filter_residual_test is a CHEBFF option")
         maximum_matvec = int(self.maximum_matvec)
         if maximum_matvec != self.maximum_matvec or maximum_matvec < 1:
             raise ValueError("maximum_matvec must be a positive integer")
@@ -963,13 +1115,19 @@ class EigensolverSettings:
                 f"first_filter_degree must be at least {minimum_first_degree} "
                 f"for {self.method}"
             )
-        if not 1 <= self.first_filter_cycles <= 9:
-            raise ValueError("first_filter_cycles must be between 1 and 9")
+        # 1..9 in the earlier PARSEC, up to 50 in PARSEC 1.5
+        # (usrinputfile.F90:2303 of 1.5).
+        if not 1 <= self.first_filter_cycles <= 50:
+            raise ValueError("first_filter_cycles must be between 1 and 50")
         if self.matvec_block_size < 1:
             raise ValueError("matvec_block_size must be positive")
         if self.subspace_buffer < 0:
             raise ValueError("subspace_buffer cannot be negative")
-        if self.filters_later_iterations and self.subspace_buffer < 6:
+        if (
+            self.filters_later_iterations
+            and self.subspace_buffer < 6
+            and not self.exact_state_count
+        ):
             raise ValueError(
                 "PARSEC filtering requires a subspace buffer of at least 6"
             )
@@ -984,6 +1142,12 @@ class EigensolverSettings:
 
 # PARSEC's Mixing_Method values (const.f90: ANDERSON, BROYDEN, MSECANT1-3).
 MIXING_METHODS = ("anderson", "broyden", "msecant1", "msecant2", "msecant3")
+#: ``Mixing_Preconditioner`` (PARSEC.py; PARSEC has none): ``none`` mixes the
+#: residual as it is, ``kerker`` filters it in G-space first
+#: (:mod:`parsec_python.Mixer.preconditioner`, 3-D periodic cells only).
+MIXING_PRECONDITIONERS = ("none", "kerker")
+#: ``Kerker_Wavevector`` q0 (bohr^-1) of ``Mixing_Preconditioner: kerker``.
+DEFAULT_KERKER_WAVEVECTOR = 1.0
 
 
 @dataclass(frozen=True)
@@ -1013,6 +1177,14 @@ class MixingSettings:
     the Broyden mixer) and, for the Broyden mixer, a positive ``restart``.
     ``regularization`` and the safeguard are options of the Anderson mixer
     of this port and are refused for the others.
+
+    ``preconditioner`` (``Mixing_Preconditioner``, PARSEC.py only) is
+    ``none`` or ``kerker``: the residual ``V_out - V_in`` of a 3-D periodic
+    cell filtered by ``P(G) = (G^2 + q0^2/eps)/(G^2 + q0^2)`` before the
+    mixer sees it, with ``q0 = kerker_wavevector`` (bohr^-1,
+    ``Kerker_Wavevector``) and ``eps = kerker_dielectric_constant``
+    (``Kerker_Dielectric_Constant``, infinite for Kerker's form
+    ``G^2/(G^2 + q0^2)``); see :mod:`parsec_python.Mixer.preconditioner`.
     """
 
     parameter: float = 0.30
@@ -1029,13 +1201,16 @@ class MixingSettings:
     restart_factor: float = 0.3
     expand_factor: float = 2.0
     preferred_type: int = 1
+    preconditioner: str = "none"
+    kerker_wavevector: float = DEFAULT_KERKER_WAVEVECTOR
+    kerker_dielectric_constant: float = float("inf")
 
     def __repr__(self) -> str:
         # The text of these settings is hashed by the cache keys of the
-        # accelerated driver and stored in test records.  The method and the
-        # multisecant fields at their defaults print nothing, so that the
-        # text of every Anderson calculation stays what it was before the
-        # fields existed.
+        # accelerated driver and stored in test records.  The method, the
+        # multisecant fields and the preconditioner fields at their defaults
+        # print nothing, so that the text of every Anderson calculation stays
+        # what it was before the fields existed.
         defaults = {
             "method": "anderson",
             "group_size": 1,
@@ -1043,6 +1218,9 @@ class MixingSettings:
             "restart_factor": 0.3,
             "expand_factor": 2.0,
             "preferred_type": 1,
+            "preconditioner": "none",
+            "kerker_wavevector": DEFAULT_KERKER_WAVEVECTOR,
+            "kerker_dielectric_constant": float("inf"),
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -1114,6 +1292,165 @@ class MixingSettings:
                 raise ValueError(f"mixing {name} must be finite")
         for name, value in integers.items():
             object.__setattr__(self, name, value)
+        preconditioner = str(self.preconditioner).strip().lower()
+        if preconditioner not in MIXING_PRECONDITIONERS:
+            raise ValueError(
+                f"unknown mixing preconditioner {self.preconditioner!r}; the "
+                "preconditioners are " + ", ".join(MIXING_PRECONDITIONERS)
+            )
+        object.__setattr__(self, "preconditioner", preconditioner)
+        wavevector = float(self.kerker_wavevector)
+        if not np.isfinite(wavevector) or wavevector <= 0.0:
+            raise ValueError("the Kerker wavevector must be positive and finite (bohr^-1)")
+        dielectric = float(self.kerker_dielectric_constant)
+        if np.isnan(dielectric) or dielectric < 1.0:
+            raise ValueError("the Kerker dielectric constant must be at least 1 (inf for Kerker's form)")
+        object.__setattr__(self, "kerker_wavevector", wavevector)
+        object.__setattr__(self, "kerker_dielectric_constant", dielectric)
+
+
+#: ``Exx_Max_Iter``: outer (Fock) iterations of a hybrid SCF.  100 is the cap of
+#: Quantum ESPRESSO's outer loop (``electron_maxstep``): a state with a soft mode
+#: converges linearly and slowly (a ring of 12 hydrogen atoms, bond 1.40 bohr,
+#: PBE0: dexx shrinks by 0.90 per outer iteration here and in QE 7.5, which needs 66).
+DEFAULT_EXX_MAX_ITERATIONS = 100
+#: ``Exx_Tolerance`` (Ry): the estimated exchange error of the Fock loop
+#: (Quantum ESPRESSO's ``dexx``) below which it stops.
+DEFAULT_EXX_TOLERANCE = 1.0e-6
+#: ``Exx_Batch_Size``: pair densities per batched Poisson solve.
+DEFAULT_EXX_BATCH_SIZE = 32
+#: ``Exx_Inner_Criterion``: ``adaptive`` (the inner loops stop at a share of their
+#: first residual while the Fock loop is far from converged, the last one at
+#: ``Convergence_Criterion``) or ``fixed`` (every inner loop at it).
+EXX_INNER_CRITERIA = ("adaptive", "fixed")
+DEFAULT_EXX_INNER_CRITERION = "adaptive"
+#: ``Exx_Mixer_History``: ``carry`` (the inner loops continue one Anderson
+#: history with its secant pairs) or ``restart`` (a new mixer per inner loop).
+EXX_MIXER_HISTORIES = ("carry", "restart")
+DEFAULT_EXX_MIXER_HISTORY = "restart"
+#: ``Exx_Outer_Mixing``: ``diis`` (Anderson extrapolation of the density matrix
+#: of the Fock loop, with a saddle guard) or ``none`` (the plain fixed point).
+EXX_OUTER_MIXINGS = ("diis", "none")
+DEFAULT_EXX_OUTER_MIXING = "diis"
+#: ``Exx_Divergence`` (periodic cells): the treatment of the Coulomb singularity of
+#: the exchange at ``q + G = 0`` (``parsec_python.Hartree.exchange_kernel``):
+#: Gygi-Baldereschi, Gygi-Baldereschi with Quantum ESPRESSO's ``x_gamma_extrapolation``,
+#: or none (the Coulomb ``q + G = 0`` element zero).  ``None`` (the input's ``auto``):
+#: the kernel's default (Gygi-Baldereschi, the extrapolation on the ``1/r`` component of a bulk cell).
+EXX_DIVERGENCES = ("gygi-baldereschi", "gygi-baldereschi-x", "none")
+#: ``Exx_Slab_Coulomb`` (slabs): ``padded`` (the bulk kernel on the slab box padded to
+#: twice its height: the images along z beyond the density, the Gygi-Baldereschi
+#: element of a bulk cell), ``truncated`` (the kernel cut along z, exactly isolated, but
+#: converging slowly with the in-plane mesh) or ``periodic`` (3-D periodic on the slab
+#: box itself, as Quantum ESPRESSO's exact exchange even with ``assume_isolated='2D'``).
+EXX_SLAB_COULOMBS = ("padded", "truncated", "periodic")
+DEFAULT_EXX_SLAB_COULOMB = "padded"
+
+
+@dataclass(frozen=True)
+class ExactExchangeSettings:
+    """Controls of a self-consistent hybrid functional (``SCFSettings.exact_exchange``).
+
+    ``fraction`` is ``Exact_Exchange_Fraction`` and ``screening`` is
+    ``Screening_Parameter`` (bohr^-1); ``None`` takes the value of the
+    functional (:mod:`parsec_python.SCF.hybrid`).  ``max_iterations``
+    (``Exx_Max_Iter``) bounds the outer Fock iterations, ``tolerance``
+    (``Exx_Tolerance``, Ry) is the estimated exchange error at which they
+    stop, and ``batch_size`` (``Exx_Batch_Size``) is the number of pair
+    densities each Poisson call solves.  ``pair_solver`` (``Exx_Pair_Solver``)
+    is ``"kronecker"`` (the direct solver on the bounding box, every kernel)
+    or ``"cg"`` (the conjugate gradients of the Hartree solver, 1/r only).
+    ``inner_criterion`` (``Exx_Inner_Criterion``), ``mixer_history``
+    (``Exx_Mixer_History``) and ``outer_mixing`` (``Exx_Outer_Mixing``)
+    choose how the Fock loop gets there (:mod:`parsec_python.SCF.fock_controls`),
+    not where it stops.  ``divergence`` (``Exx_Divergence``) and
+    ``slab_coulomb`` (``Exx_Slab_Coulomb``) belong to periodic cells
+    (:mod:`parsec_python.SCF.hybrid_periodic`): the treatment of the Coulomb
+    singularity (``None``: the kernel's default) and the kernel of a slab;
+    so does ``auxiliary_exponent`` (``Exx_Auxiliary_Exponent``, bohr^2, the
+    exponent of the Gygi-Baldereschi auxiliary function, zero or positive;
+    ``None``: the kernel's, the limit ``a -> 0``).
+    The text of the settings names only what differs from the defaults.
+    """
+
+    fraction: float | None = None
+    screening: float | None = None
+    max_iterations: int = DEFAULT_EXX_MAX_ITERATIONS
+    tolerance: float = DEFAULT_EXX_TOLERANCE
+    batch_size: int = DEFAULT_EXX_BATCH_SIZE
+    pair_solver: str = "kronecker"
+    inner_criterion: str = DEFAULT_EXX_INNER_CRITERION
+    mixer_history: str = DEFAULT_EXX_MIXER_HISTORY
+    outer_mixing: str = DEFAULT_EXX_OUTER_MIXING
+    divergence: str | None = None
+    slab_coulomb: str = DEFAULT_EXX_SLAB_COULOMB
+    auxiliary_exponent: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.auxiliary_exponent is not None:
+            exponent = float(self.auxiliary_exponent)
+            if not np.isfinite(exponent) or exponent < 0.0:
+                raise ValueError("Exx_Auxiliary_Exponent must be zero or positive (bohr^2)")
+            object.__setattr__(self, "auxiliary_exponent", exponent)
+        if self.divergence is not None and self.divergence not in EXX_DIVERGENCES:
+            raise ValueError(f"Exx_Divergence must be one of {', '.join(EXX_DIVERGENCES)}, got {self.divergence!r}")
+        if self.slab_coulomb not in EXX_SLAB_COULOMBS:
+            raise ValueError(
+                f"Exx_Slab_Coulomb must be one of {', '.join(EXX_SLAB_COULOMBS)}, got {self.slab_coulomb!r}"
+            )
+        if self.pair_solver not in ("kronecker", "cg"):
+            raise ValueError("the pair solver must be 'kronecker' or 'cg'")
+        for name, choices, label in (
+            ("inner_criterion", EXX_INNER_CRITERIA, "Exx_Inner_Criterion"),
+            ("mixer_history", EXX_MIXER_HISTORIES, "Exx_Mixer_History"),
+            ("outer_mixing", EXX_OUTER_MIXINGS, "Exx_Outer_Mixing"),
+        ):
+            if getattr(self, name) not in choices:
+                raise ValueError(f"{label} must be one of {', '.join(choices)}, got {getattr(self, name)!r}")
+        if self.fraction is not None:
+            fraction = float(self.fraction)
+            if not np.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+                raise ValueError("the exact-exchange fraction must lie in (0, 1]")
+            object.__setattr__(self, "fraction", fraction)
+        if self.screening is not None:
+            screening = float(self.screening)
+            if not np.isfinite(screening) or screening <= 0.0:
+                raise ValueError("the screening parameter must be positive (bohr^-1)")
+            object.__setattr__(self, "screening", screening)
+        iterations = int(self.max_iterations)
+        if iterations != self.max_iterations or iterations < 1:
+            raise ValueError("the Fock-loop iteration limit must be a positive integer")
+        object.__setattr__(self, "max_iterations", iterations)
+        tolerance = float(self.tolerance)
+        if not np.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError("the Fock-loop tolerance must be positive (Ry)")
+        object.__setattr__(self, "tolerance", tolerance)
+        batch = int(self.batch_size)
+        if batch != self.batch_size or batch < 1:
+            raise ValueError("the pair-density batch size must be a positive integer")
+        object.__setattr__(self, "batch_size", batch)
+
+    def __repr__(self) -> str:
+        defaults = {
+            "fraction": None,
+            "screening": None,
+            "max_iterations": DEFAULT_EXX_MAX_ITERATIONS,
+            "tolerance": DEFAULT_EXX_TOLERANCE,
+            "batch_size": DEFAULT_EXX_BATCH_SIZE,
+            "pair_solver": "kronecker",
+            "inner_criterion": DEFAULT_EXX_INNER_CRITERION,
+            "mixer_history": DEFAULT_EXX_MIXER_HISTORY,
+            "outer_mixing": DEFAULT_EXX_OUTER_MIXING,
+            "divergence": None,
+            "slab_coulomb": DEFAULT_EXX_SLAB_COULOMB,
+            "auxiliary_exponent": None,
+        }
+        shown = [
+            f"{item.name}={getattr(self, item.name)!r}"
+            for item in fields(self)
+            if getattr(self, item.name) != defaults[item.name]
+        ]
+        return f"{type(self).__qualname__}({', '.join(shown)})"
 
 
 @dataclass(frozen=True)
@@ -1204,6 +1541,64 @@ class SCFSettings:
     # a zero average every time it is evaluated (the Hartree potential has a
     # zero average anyway).  Applied by the periodic prepared system.
     zero_average_xc_potential: bool = False
+    # The later-SCF Chebyshev degree is lowered from the iteration after this
+    # one on: 4, PARSEC 1.5's ``iter > 4`` (parsec.F90:1942-1952 of 1.5), the
+    # default since 2026-11-04 (5, the earlier PARSEC's
+    # ``iter > 5`` of parsec.F90:1453, gives the runs before it bit for bit);
+    # see :attr:`approach_criterion`.
+    degree_decrease_after: int = 4
+    # The Fock-loop controls of a hybrid ``xc_functional``
+    # (:class:`ExactExchangeSettings`); ``None`` for every other functional.
+    exact_exchange: ExactExchangeSettings | None = None
+    # ``Spin_Symmetry_Sectors`` (PARSEC.py): whether the accelerated driver
+    # solves the two channels of a spin-polarized run in the symmetry sectors
+    # (``"auto"``) or on the full grid (``"off"``); ``None`` is the default of
+    # the run, :attr:`spin_symmetry_sector_mode`.
+    spin_symmetry_sectors: str | None = None
+
+    @property
+    def is_hybrid(self) -> bool:
+        """Whether ``xc_functional`` has a nonlocal exact-exchange term (a libxc ``hyb_`` functional too)."""
+
+        if self.xc_functional in HYBRID_XC_FUNCTIONALS:
+            return True
+        spec = _libxc_spec(self.xc_functional)
+        return spec is not None and spec.is_hybrid
+
+    @property
+    def is_libxc(self) -> bool:
+        """Whether ``xc_functional`` names libxc functionals (``libxc:...``)."""
+
+        return _libxc_spec(self.xc_functional) is not None
+
+    @property
+    def is_meta_gga(self) -> bool:
+        """Whether ``xc_functional`` depends on the kinetic-energy density of the orbitals.
+
+        The meta-GGAs of :mod:`parsec_python.V_xc.meta_gga` (``scan``) and
+        those a registered provider (libxc) returns.
+        """
+
+        if self.xc_functional in META_GGA_XC_FUNCTIONALS:
+            return True
+        from .V_xc.meta_gga import is_meta_gga
+
+        return is_meta_gga(self)
+
+    @property
+    def spin_symmetry_sector_mode(self) -> str:
+        """``Spin_Symmetry_Sectors`` of this run: the value given, else its default.
+
+        The default is ``auto`` for every ``xc_functional`` (the sectors, with
+        the symmetry guard of
+        :mod:`parsec_python.acceleration.SCF.spin_sectors`); ``off`` keeps
+        both channels on the full grid.  The reference solver keeps the full
+        grid in every case.
+        """
+
+        if self.spin_symmetry_sectors is not None:
+            return self.spin_symmetry_sectors
+        return "auto"
 
     def __repr__(self) -> str:
         # The text of these settings is hashed by the cache keys of the
@@ -1225,6 +1620,9 @@ class SCFSettings:
             ),
             "ionization_energy_difference": self.ionization_energy_difference == 0.0,
             "zero_average_xc_potential": not self.zero_average_xc_potential,
+            "degree_decrease_after": self.degree_decrease_after == 4,
+            "exact_exchange": self.exact_exchange is None,
+            "spin_symmetry_sectors": self.spin_symmetry_sectors is None,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -1238,10 +1636,13 @@ class SCFSettings:
         """The SRE below which later SCF iterations lower the filter degree.
 
         ``vconv_approach`` of parsec.F90:1452-1454: once the iteration is
-        beyond the fifth and the weighted SRE (the larger of the spin
-        channels) falls below it, the later-SCF Chebyshev degree drops by one
-        per iteration, down to 10.  The default ``100 * vconv`` follows the
-        criterion of this loop (``Relaxation_SCF_Upscale`` replaces it).
+        beyond the fourth (:attr:`degree_decrease_after`) and the weighted SRE
+        (the larger of the spin channels) falls below it, the later-SCF
+        Chebyshev degree drops by one per iteration, down to 10.  The default
+        ``100 * vconv`` follows the criterion of this loop
+        (``Relaxation_SCF_Upscale`` replaces it); PARSEC 1.5's default is
+        ``2 * vconv`` (usrinputfile.F90:2596-2601 of 1.5), which an explicit
+        ``Convergence_Criterion_Approach`` gives.
         """
 
         if self.convergence_criterion_approach is None:
@@ -1266,15 +1667,20 @@ class SCFSettings:
             )
         if not np.isfinite(self.net_charge):
             raise ValueError("net_charge must be finite")
+        decrease_after = int(self.degree_decrease_after)
+        if decrease_after != self.degree_decrease_after or decrease_after < 0:
+            raise ValueError("degree_decrease_after must be a nonnegative integer")
+        object.__setattr__(self, "degree_decrease_after", decrease_after)
         if self.convergence_criterion_approach is not None:
             approach = float(self.convergence_criterion_approach)
             if not np.isfinite(approach):
                 raise ValueError("convergence_criterion_approach must be finite")
             object.__setattr__(self, "convergence_criterion_approach", approach)
-        if self.xc_functional not in XC_FUNCTIONAL_NAMES:
+        if self.xc_functional not in XC_FUNCTIONAL_NAMES and _libxc_spec(self.xc_functional) is None:
             raise ValueError(
                 "xc_functional must be one of "
                 + ", ".join(repr(name) for name in sorted(XC_FUNCTIONAL_NAMES))
+                + " or a libxc functional 'libxc:<name>[+<name>...]'"
             )
         if self.xc_functional in UNPOLARIZED_ONLY_XC_FUNCTIONALS and (
             self.spin_polarized or self.noncollinear
@@ -1284,6 +1690,18 @@ class SCFSettings:
                 "form; it cannot be used with spin polarization or "
                 "non-collinear magnetism"
             )
+        if self.is_hybrid:
+            if self.exact_exchange is None:
+                object.__setattr__(self, "exact_exchange", ExactExchangeSettings())
+            elif not isinstance(self.exact_exchange, ExactExchangeSettings):
+                raise TypeError("exact_exchange must be an ExactExchangeSettings")
+        elif self.exact_exchange is not None:
+            raise ValueError(
+                "exact_exchange settings belong to a hybrid xc_functional, not "
+                f"to {self.xc_functional!r}"
+            )
+        if self.spin_symmetry_sectors not in (None, "auto", "off"):
+            raise ValueError("spin_symmetry_sectors must be None, 'auto' or 'off'")
         energy_difference = float(self.ionization_energy_difference)
         if not np.isfinite(energy_difference):
             raise ValueError("ionization_energy_difference must be finite")
@@ -1468,6 +1886,11 @@ class RelaxationSettings:
     loop of a structure may be while the forces are large (1, the default,
     keeps the criterion fixed as PARSEC does; see
     :func:`parsec_python.Relaxation.ionic_loop.adaptive_scf_criterion`).
+    ``write_restart`` is PARSEC 1.5's ``Write_Relax_Restart``: whether
+    ``relax_restart.dat`` is written after every move.  1.5 writes it only
+    on request (``relaxation/domove.f90:390``, "I think this is broken");
+    here it is written unless the input says ``.false.`` (the writer works
+    and is atomic).
     """
 
     method: RelaxationMethod
@@ -1478,6 +1901,11 @@ class RelaxationSettings:
     bfgs_corrections: int = 7
     restart: bool = False
     scf_upscale: float = 1.0
+    write_restart: bool = True
+
+    def __repr__(self) -> str:
+        # Write_Relax_Restart is new; the repr of a run without it is unchanged.
+        return _repr_without_defaults(self, {"write_restart": True})
 
     def __post_init__(self) -> None:
         if self.method not in {"simple", "bfgs", "manual"}:
@@ -1555,13 +1983,28 @@ class BandStructureSettings:
 
     The shortest segment gets ``points`` k-points and the others
     proportionally more (see :func:`~parsec_python.Grid.kpoints.band_path_kpoints`).
-    Each k-point is solved from scratch with the SCF's first eigensolver
-    (CHEBFF: ``FF_MaxIter`` filter cycles of degree ``Chebdav_Degree``) in the
-    converged self-consistent potential, exactly as Fortran ``calc_bands``.
+    ``rounding`` is how a segment's share is made an integer: ``"truncate"``
+    (this port's rule, that of the previous Fortran tree) or ``"nint"``
+    (PARSEC 1.5, ``utilities/calc_bands.f90:152-158``).  This port keeps its
+    default, 20 points with truncation, where the input gives no
+    ``Bandstruc_Points`` (PARSEC 1.5's default is 100); a written
+    ``Bandstruc_Points`` takes 1.5's rounding (since 2026-11-04 the rule for
+    defaults that 1.5 changed).  Each k-point is solved from scratch
+    with the SCF's first eigensolver (CHEBFF: ``FF_MaxIter`` filter cycles of
+    degree ``Chebdav_Degree``) in the converged self-consistent potential,
+    exactly as Fortran ``calc_bands``.  ``ff_maxiter`` is 1.5's
+    ``Bands_FF_MaxIter``: the CHEBFF filter cycles of the band k-points
+    (``calc_bands.f90:336-338``); ``None`` keeps ``FF_MaxIter``.
     """
 
     segments: tuple[BandSegment, ...]
     points: int = 20
+    ff_maxiter: int | None = None
+    rounding: str = "truncate"
+
+    def __repr__(self) -> str:
+        # Bands_FF_MaxIter and the rounding are new; the repr of a run without them is unchanged.
+        return _repr_without_defaults(self, {"ff_maxiter": None, "rounding": "truncate"})
 
     def __post_init__(self) -> None:
         segments = tuple(
@@ -1574,6 +2017,12 @@ class BandStructureSettings:
         if int(self.points) < 1:
             raise ValueError("bandstruc_points must be at least 1")
         object.__setattr__(self, "points", int(self.points))
+        if self.ff_maxiter is not None:
+            if int(self.ff_maxiter) != self.ff_maxiter or int(self.ff_maxiter) < 1:
+                raise ValueError("bands_ff_maxiter must be a positive integer")
+            object.__setattr__(self, "ff_maxiter", int(self.ff_maxiter))
+        if self.rounding not in ("truncate", "nint"):
+            raise ValueError("the rounding of band-path points is truncate or nint")
 
 
 #: Values of ``Output_Grid_Data`` (``usrinputfile.F90`` l.2598-2638), in the
@@ -1760,6 +2209,42 @@ class GWSettings:
             object.__setattr__(self, "fermi_level", float(self.fermi_level))
 
 
+# --- FDET (PARSEC 1.5 frozen-density embedding) --------------------------------
+
+
+@dataclass(frozen=True)
+class EmbeddingSettings:
+    """``Potential_Field``: frozen-density embedding of PARSEC 1.5 (FDET/AFM).
+
+    The run is the active tip ``B`` in the frozen field of a sample ``A``
+    that an earlier run wrote to ``field_path`` (``Potential_Field_Name``,
+    a ``pot.dat`` of :mod:`parsec_python.Output.pot_dat`).
+    ``kinetic_functional`` is ``Kinetic_Energy_Functional`` (``tf``, ``tw``,
+    ``pw``, ``pb``, ``none``), ``pbe_mu``/``pbe_kappa`` are ``pbe_m``/``pbe_k``
+    of ``pb``, ``kinetic_form`` is ``FDET_Kinetic_Form`` (``corrected``, the
+    default, or ``parsec1.5``, :mod:`parsec_python.Embedding.kinetic`), and
+    ``tip_sphere`` is ``Boundary_Sphere_Around_Tip`` (the tip in a sphere of
+    its own, :mod:`parsec_python.Embedding.tip_sphere`).
+    """
+
+    field_path: Path
+    kinetic_functional: str = "tf"
+    pbe_mu: float = 0.2319
+    pbe_kappa: float = 0.8438
+    kinetic_form: str = "corrected"
+    tip_sphere: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "field_path", Path(self.field_path))
+        if self.kinetic_functional not in ("tf", "tw", "pw", "pb", "none"):
+            raise ValueError("kinetic_functional must be tf, tw, pw, pb or none")
+        if self.kinetic_form not in ("corrected", "parsec1.5"):
+            raise ValueError("kinetic_form must be corrected or parsec1.5")
+        object.__setattr__(self, "pbe_mu", float(self.pbe_mu))
+        object.__setattr__(self, "pbe_kappa", float(self.pbe_kappa))
+        object.__setattr__(self, "tip_sphere", bool(self.tip_sphere))
+
+
 @dataclass(frozen=True)
 class SinglePointInput:
     """
@@ -1815,6 +2300,9 @@ class SinglePointInput:
     calculation uses it: the irreducible wedge of a ``monkhorst_pack_shift``
     grid and ``SCFSettings.symmetrize_density``.  ``None`` stands for the
     identity alone."""
+    embedding: EmbeddingSettings | None = None
+    """PARSEC 1.5's frozen-density embedding (``Potential_Field``) of an
+    isolated, spin-unpolarized tip run; ``None`` without it."""
 
     def __repr__(self) -> str:
         # Point charges and charged sheets that are not there, and the
@@ -1826,6 +2314,7 @@ class SinglePointInput:
             "charged_sheets": not self.charged_sheets,
             "monkhorst_pack_shift": self.monkhorst_pack_shift is None,
             "space_group": self.space_group is None,
+            "embedding": self.embedding is None,
         }
         shown = [
             f"{item.name}={getattr(self, item.name)!r}"
@@ -1995,6 +2484,158 @@ class CorrectedEnergyBreakdown(EnergyBreakdown):
 
 
 @dataclass(frozen=True)
+class MetaGGAEnergyBreakdown(EnergyBreakdown):
+    """:class:`EnergyBreakdown` of a meta-GGA (:mod:`parsec_python.V_xc.meta_gga`), in Ry.
+
+    ``eigenvalue`` is the band energy of the Hamiltonian with the orbital term
+    ``-div(vtau_in grad)``; ``integral_vtau_tau`` is the part of it that term
+    gives, ``2 h^3 sum vtau_in tau``, which ``electronic`` removes (double
+    counting).  ``exchange_correlation`` is ``E_xc[n + n_core, tau]`` and
+    ``integral_vxc_rho`` that of ``dE_xc/dn``.
+    """
+
+    integral_vtau_tau: float = 0.0
+
+
+@dataclass(frozen=True)
+class HybridEnergyBreakdown(EnergyBreakdown):
+    """:class:`EnergyBreakdown` of a hybrid functional (generalized Kohn-Sham), in Ry.
+
+    ``eigenvalue`` is the band energy of the Hamiltonian with the exchange
+    operator ``a_x V_x``; ``exact_exchange_band`` is the part of it that
+    operator gives, ``w sum_i f_i <q_i|a_x V_x|q_i>``, which ``electronic``
+    removes (double counting).  ``exact_exchange`` is the scaled exact
+    exchange energy ``a_x E_x`` the total holds and
+    ``semilocal_exchange_correlation`` the semilocal part of the functional
+    (with its reduced semilocal exchange); ``exchange_correlation`` is their
+    sum.  ``integral_vxc_rho`` is that of the semilocal potential.
+
+    Within an inner SCF loop the operator is fixed (built from the orbitals
+    ``P0`` of the outer iteration before) and ``linearized`` is true:
+    ``exact_exchange = a_x (2 E_x(P, P0) - E_x(P0))``, the exchange energy of
+    the functional that loop minimizes.  After the loop ``exact_exchange``
+    is ``a_x E_x(P)`` of the new orbitals and ``linearized`` false.
+    """
+
+    semilocal_exchange_correlation: float = 0.0
+    exact_exchange: float = 0.0
+    exact_exchange_band: float = 0.0
+    exact_exchange_fraction: float = 0.0
+    linearized: bool = False
+
+
+@dataclass(frozen=True)
+class SpinSectorFallbackRecord:
+    """A spin-polarized loop in the symmetry sectors left them (``Spin_Symmetry_Sectors``).
+
+    The accelerated driver hands it to the iteration callback before it
+    starts the run again on the full grid: after ``stage`` (``the SCF loop``,
+    ``the semilocal start of the Fock loop``, ``the end of the Fock loop``)
+    an occupation of a channel was fractional, ``min(f, 1 - f)`` as large as
+    ``largest_fractional_occupation`` against ``tolerance``.  ``multiplets``
+    describe the levels that hold fractional occupations.  It is no SCF
+    iteration and carries no levels of its own.
+    """
+
+    stage: str
+    largest_fractional_occupation: float
+    tolerance: float
+    multiplets: tuple[str, ...] = ()
+    # What the guard found (``fractional occupations``, ``a partly filled
+    # multiplet``, ``a channel density that breaks the point group of the
+    # atoms``) and the quantity ``largest_fractional_occupation`` holds.
+    reason: str = "fractional occupations"
+    measure: str = "largest min(f, 1-f)"
+
+
+@dataclass(frozen=True)
+class ExchangeLoopIteration:
+    """One outer iteration of the Fock loop of a hybrid SCF (energies in Ry).
+
+    ``iteration`` 0 is the operator built from the orbitals of the start
+    (the semilocal SCF ``start_functional``, or the structure before a move);
+    iteration ``n >= 1`` reports the inner SCF loop run with the operator of
+    iteration ``n - 1``.  ``exchange_energy`` is ``E_x`` of the orbitals of
+    this iteration (no fraction), ``cross_exchange_energy`` the exchange
+    energy of those orbitals with the operator they were solved with,
+    ``E_x(P_n, P_n-1)``, ``estimated_error`` Quantum ESPRESSO's ``dexx``,
+    ``a_x (2 E_x(P_n, P_n-1) - E_x(P_n-1) - E_x(P_n))`` (nonnegative), and
+    ``total_energy`` the total energy of the hybrid functional of the
+    orbitals of this iteration.  ``pair_solves`` and the times are those of
+    this iteration's exchange evaluation; ``operator_ranks`` the number of
+    orbitals of the operator built after it, per spin channel (empty when no
+    operator was built).  ``inner_criterion`` is the residual the inner loop
+    stopped at with ``Exx_Inner_Criterion: adaptive`` (Ry; ``None``: the
+    fixed ``Convergence_Criterion``), ``mixer_seeds`` the secant pairs its
+    mixer carried in from the loop before (``Exx_Mixer_History: carry``).
+    ``extrapolated`` says that the operator built after this iteration is that
+    of the extrapolated density matrix (``Exx_Outer_Mixing: diis``),
+    ``outer_note`` why a plain step was taken instead (empty otherwise; for
+    iteration 0 a note on the start), and ``level_passes`` the eigensolver
+    passes that converged the levels of the inner loop at its last
+    Hamiltonian (``SCFWarmStart.level_tolerance``; 0: none) and
+    ``level_change`` the largest move of a level in the last of them (Ry).
+    """
+
+    iteration: int
+    functional: str
+    fraction: float
+    exchange_energy: float
+    total_energy: float | None = None
+    previous_exchange_energy: float | None = None
+    cross_exchange_energy: float | None = None
+    estimated_error: float | None = None
+    tolerance: float = 0.0
+    inner_iterations: int = 0
+    inner_converged: bool = True
+    converged: bool = False
+    pair_solves: int = 0
+    poisson_seconds: float = 0.0
+    exchange_seconds: float = 0.0
+    operator_ranks: tuple[int, ...] = ()
+    start_functional: str | None = None
+    pair_solver: str = ""
+    operator_asymmetry: float = 0.0
+    inner_criterion: float | None = None
+    mixer_seeds: int = 0
+    extrapolated: bool = False
+    outer_note: str = ""
+    level_passes: int = 0
+    level_change: float = 0.0
+
+
+@dataclass(frozen=True)
+class EmbeddingEnergyBreakdown(EnergyBreakdown):
+    """:class:`EnergyBreakdown` of an FDET tip run (``totnrg.f90:159-197``), in Ry.
+
+    ``electron_ion`` reads the ionic potential with the sample field
+    (Fortran's ``eion``), ``exchange_correlation`` is
+    ``E_xc[rho_B + rho_core + rho_A]`` and ``integral_vxc_rho`` its potential
+    times ``rho_B``.  The other terms: ``nonadditive_kinetic`` ``T_nad``,
+    ``integral_vnad_rho`` ``Integral v_nad rho_B`` (it cancels in the total),
+    ``tip_ion_sample_electron`` ``Integral rho_A v_tip,ion``, ``sample_hartree``
+    ``E_H[rho_A] = Integral rho_A v_H^A / 2``, ``sample_electron_ion``
+    ``Integral rho_A v_A,ion``, ``sample_kinetic`` the ``newk`` of the sample
+    file, and with the tip sphere ``sample_xc_on_tip_grid`` (``E_xc[rho_A]``
+    on the tip grid) and ``tip_ion_sample_electron_outside`` (the
+    attraction of the sample electrons outside the tip sphere).  With the tip
+    sphere the total leaves out the sample Hartree, electron-ion, kinetic and
+    exchange-correlation energies, a constant of the sample.  ``electronic``
+    holds every term but ``ion_ion``.
+    """
+
+    nonadditive_kinetic: float = 0.0
+    integral_vnad_rho: float = 0.0
+    tip_ion_sample_electron: float = 0.0
+    sample_hartree: float = 0.0
+    sample_electron_ion: float = 0.0
+    sample_kinetic: float = 0.0
+    tip_sphere: bool = False
+    sample_xc_on_tip_grid: float = 0.0
+    tip_ion_sample_electron_outside: float = 0.0
+
+
+@dataclass(frozen=True)
 class PreparationTimings:
     """Wall-clock timings for density-independent single-point preparation.
 
@@ -2092,6 +2733,10 @@ class SCFIteration:
     # Dynamic_Diag_Tol only: the eigensolver tolerance of the next
     # iteration (parsec.F90:1304-1311, "New tolerance").
     next_eigensolver_tolerance: float | None = None
+    # SCFWarmStart.level_tolerance only: the iteration after the converged one,
+    # on the same V_in, whose eigensolver passes converge the levels; the loop
+    # converged at the iteration before (its residual is the loop's).
+    level_refinement: bool = field(default=False, repr=False)
 
     @property
     def spin_polarized(self) -> bool:
@@ -2161,6 +2806,10 @@ class SpinPolarizedSCFIteration:
     diagonalization_seconds: float = 0.0
     total_seconds: float = 0.0
     eigen_residual_max: float = float("nan")
+    # SCFWarmStart.level_tolerance only (the inner loops of a hybrid's Fock
+    # loop): the iteration after the converged one, on the same V_in, as in
+    # SCFIteration.
+    level_refinement: bool = field(default=False, repr=False)
 
 
 @dataclass
@@ -2239,6 +2888,18 @@ class SinglePointResult:
     """``(atoms, 3)`` nonlocal (Kleinman-Bylander) forces in Ry/bohr, summed over the k-points from the converged
     eigenvectors of the last SCF step.  A k-point run does not keep its eigenvectors, so it accumulates this term
     while they exist (``run_scf_kpoints(..., compute_forces=True)``); ``None`` when not requested."""
+    embedding: object | None = None
+    """FDET (``Potential_Field``): the :class:`parsec_python.Embedding.kinetic.NonadditiveKinetic`
+    of the last iteration (``T_nad`` and ``v_nad``, which ``input_effective_potential`` and
+    ``output_effective_potential`` hold and ``xc_potential`` does not); ``None`` without FDET."""
+    exact_exchange: object | None = None
+    """A hybrid functional: the :class:`parsec_python.SCF.hybrid.FockLoopSummary` of the Fock
+    loop (its outer iterations and what an ionic step needs to start the next structure);
+    ``None`` otherwise.  ``xc_potential`` is then the semilocal part only."""
+    meta_gga: object | None = None
+    """A meta-GGA: the :class:`parsec_python.SCF.meta_gga.MetaGGARecord` of the loop (``vtau`` of the
+    last eigenproblem, the mixed ``vtau`` a next structure starts from, ``tau``); ``None`` otherwise.
+    ``xc_potential`` is ``dE_xc/dn`` at fixed ``tau``."""
 
     @property
     def all_electron_total(self) -> float:
@@ -2326,6 +2987,15 @@ class SpinPolarizedSinglePointResult:
     otherwise (as :class:`SinglePointResult`)."""
     timings: RunTimings | None = None
     """Stage timings, recorded by the k-point driver (``None`` where not measured)."""
+    history: list = field(default_factory=list, repr=False)
+    """The iteration records of the k-point driver (empty where not kept)."""
+    eigensolver_state: object | None = field(default=None, repr=False)
+    """With ``keep_states`` of the k-point driver: the Ritz states by task (``spin * n_k + k``)."""
+    exact_exchange: object | None = field(default=None, repr=False)
+    """A hybrid functional: the :class:`parsec_python.SCF.hybrid.FockLoopSummary` of its Fock loop."""
+    meta_gga: object | None = field(default=None, repr=False)
+    """A meta-GGA with k-points: the :class:`parsec_python.SCF.meta_gga.MetaGGARecord` of the loop (as
+    :class:`SinglePointResult`); ``None`` otherwise."""
 
     @property
     def magnetic_moment(self) -> float:

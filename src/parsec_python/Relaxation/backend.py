@@ -35,7 +35,11 @@ class IonicBackend:
     ``symmetry_operations(system)``, where given, returns the operations a
     relaxation keeps its structure on (a periodic cell, see
     :func:`fortran_periodic_backend`); without it they are the point-group
-    operations of the atoms of an isolated system.
+    operations of the atoms of an isolated system.  ``drop_subspace(carried)``,
+    where given, returns the warm start ``carried`` without its saved
+    eigensolver subspace (the restart of ``Filter_Restart_After``, PARSEC 1.5);
+    without it :func:`parsec_python.SCF.filter_restart.drop_eigensolver_subspace`
+    does it.
     """
 
     run_scf: Callable[..., object]
@@ -50,6 +54,7 @@ class IonicBackend:
     # calculation; Andrew Grieder's loops) or are new atoms of symbol and position (the Fortran-derived
     # routines of the parity round, ``fortran_spinor_backend``).
     keep_atom_fields: bool = True
+    drop_subspace: Callable[[object], object] | None = None
 
 
 def moved_atoms(atoms, positions, keep_fields: bool = True) -> tuple:
@@ -220,6 +225,11 @@ def fortran_periodic_backend(
         )
 
     def kpoint_warm_start(previous_system, previous_result, system):
+        if getattr(previous_result, "exact_exchange", None) is not None:
+            # A hybrid functional: potentials, Ritz states and the Bloch orbitals that start the Fock loop.
+            from ..SCF.hybrid_periodic import bloch_warm_start
+
+            return bloch_warm_start(previous_system, previous_result, system, warm_start)
         if getattr(previous_result, "next_potentials", None) is not None:
             return spin_warm_start(previous_system, previous_result, system)
         return warm_start(previous_system, previous_result, system)
@@ -238,6 +248,20 @@ def fortran_periodic_backend(
             if iteration_state_callback is None
             else {"iteration_state_callback": iteration_state_callback}
         )
+        if getattr(system.input.scf, "is_hybrid", False):
+            # A hybrid functional: the Fock loop on Bloch factors (SCF/hybrid_periodic.py), started from the
+            # warm start of kpoint_warm_start.
+            from ..SCF.hybrid_periodic import run_periodic_hybrid_scf
+
+            return run_periodic_hybrid_scf(
+                system,
+                k_points,
+                k_weights,
+                callback=callback,
+                warm_start=warm_start,
+                convergence_criterion=convergence_criterion,
+                **state,
+            )
         if system.input.scf.spin_polarized:
             from ..SCF.kpoints import run_scf_kpoints_spin_polarized
 
@@ -259,6 +283,11 @@ def fortran_periodic_backend(
         if warm_start is not None:
             initial = np.asarray(warm_start.input_potential, dtype=np.float64)
             guess = getattr(warm_start, "density_guess", None)
+            if guess is not None and getattr(system.input.scf, "is_meta_gga", False):
+                raise NotImplementedError(
+                    "a meta-GGA needs the orbitals of a density: Potential_Extrapolation: atomic (a guessed "
+                    "density without orbitals) is not implemented for it"
+                )
             if guess is not None:
                 # Potential_Extrapolation: the Hartree and XC potentials of
                 # the extrapolated density replace those of the last output.
@@ -271,6 +300,8 @@ def fortran_periodic_backend(
                     + system.evaluate_xc(guess).potential
                     - np.asarray(warm_start.hxc_reference, dtype=np.float64)
                 )
+        # A meta-GGA: the vtau (and W) of the structure before go with its potential.
+        meta = {} if getattr(warm_start, "kinetic_potential", None) is None else {"meta_gga_start": warm_start}
         return run_scf_kpoints(
             system,
             k_points,
@@ -279,6 +310,7 @@ def fortran_periodic_backend(
             initial_potential=initial,
             keep_wavefunctions=True,
             **state,
+            **meta,
         )
 
     return IonicBackend(
@@ -287,7 +319,9 @@ def fortran_periodic_backend(
         update_geometry=update_geometry,
         warm_start=kpoint_warm_start,
         restart_scf=lambda system, result: (
-            spin_warm_start(system, result, system)
+            kpoint_warm_start(system, result, system)
+            if getattr(result, "exact_exchange", None) is not None
+            else spin_warm_start(system, result, system)
             if getattr(result, "next_potentials", None) is not None
             else warm_start_for_moved_atoms(system, result, system)
         ),
@@ -430,6 +464,7 @@ def fortran_spinor_backend(k_sampling=None, *, periodic: bool = False) -> IonicB
         restart_scf=lambda system, result: _MovedStructureStart(warm_start_for_moved_atoms(system, result, system)),
         symmetry_operations=operations if periodic else None,
         keep_atom_fields=False,
+        drop_subspace=_drop_moved_structure_subspace,
     )
 
 
@@ -461,6 +496,20 @@ def periodic_backend(
         k_weights = np.asarray(k_weights, dtype=float)
 
     def solve(system, *, callback=None, warm_start=None, convergence_criterion=None):
+        if sampled and getattr(system.input.scf, "is_hybrid", False):
+            # A hybrid functional: the Fock loop on Bloch factors (SCF/hybrid_periodic.py), which keeps the
+            # orbitals the forces read; the orbitals of the structure before start it.
+            from ..SCF.hybrid_periodic import run_periodic_hybrid_scf
+
+            return run_periodic_hybrid_scf(
+                system,
+                k_points,
+                k_weights,
+                callback=callback,
+                warm_start=warm_start,
+                convergence_criterion=convergence_criterion,
+                compute_forces=True,
+            )
         if sampled:
             return run_scf_kpoints(
                 system,
@@ -598,6 +647,21 @@ class _MovedStructureStart:
     :class:`parsec_python.SCF.single_point.SCFWarmStart`, told apart from the start of a ``Restart_Run``)."""
 
     start: object
+
+
+def _drop_moved_structure_subspace(carried):
+    """``Filter_Restart_After`` of :func:`fortran_spinor_backend`: the wrapped start without its subspaces.
+
+    The spinor drivers then filter new vectors (a k-point driver imports no
+    ``{k-point: state}`` subspaces); the potentials, the exchange-correlation
+    field of a non-collinear run included, are kept.
+    """
+
+    from ..SCF.filter_restart import drop_eigensolver_subspace
+
+    if isinstance(carried, _MovedStructureStart):
+        return _MovedStructureStart(drop_eigensolver_subspace(carried.start))
+    return drop_eigensolver_subspace(carried)
 
 
 def release_orbitals(result) -> None:

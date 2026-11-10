@@ -1,7 +1,8 @@
 """Forces of a spin-polarized periodic cell.
 
 Two Ge atoms (a nonlinear core correction and nonlocal projectors) in a 7.7 bohr cubic cell, Gamma point.  Neutral they
-are closed-shell; with one electron removed the cell is magnetic.  The forces of a spin-polarized result are the
+are closed-shell; with one electron removed the cell is magnetic, and a starting polarization of 0.5 brings it into its
+state of moment 3 (the lowest of the three it has, see ``setUpClass``).  The forces of a spin-polarized result are the
 formulas of the unpolarized ones on the total density, the channel average of the exchange-correlation potential and the
 orbitals of both channels at one electron per state (``forcloc.f90``, ``forcnloc.f90``), so the tests check
 
@@ -66,7 +67,13 @@ class PeriodicSpinForceTests(unittest.TestCase):
         # the fast periodic setup gives the same potentials as the dense one (to 1e-7 Ry) in a second instead of minutes
         cls._saved = (ewald._local_potential_provider, _ionic._support_finder)
         periodic_setup.install()
-        cls.magnetic_system = prepare_periodic_single_point(_problem(net_charge=1.0, spin=True))
+        # Ge2+ has (at least) three self-consistent spin states within 12 mRy: the moment 1.00 at -51.70779 Ry,
+        # 1.24 at -51.70592 Ry and 3.00 at -51.71740 Ry (four close levels at the Fermi level, 300 K).  From a
+        # starting polarization of 0.1 both drivers move electrons between those levels for 40 to 80 iterations
+        # and end in a state that round-off decides (machine, threads, solver defaults, test order), so the
+        # energies compared below differed by 2 to 12 mRy.  0.5 starts both drivers in the basin of the moment-3
+        # state, which they keep from the first iteration on and reach in about 20 iterations.
+        cls.magnetic_system = prepare_periodic_single_point(_problem(net_charge=1.0, spin=True, polarization=0.5))
         cls.magnetic = run_scf(cls.magnetic_system)
         cls.spin_system = prepare_periodic_single_point(_problem(net_charge=0.0, spin=True, polarization=0.0))
         cls.spin_closed = run_scf(cls.spin_system)
@@ -87,9 +94,13 @@ class PeriodicSpinForceTests(unittest.TestCase):
     def test_the_spin_loop_is_magnetic_and_reaches_the_energy_of_the_narrow_driver(self) -> None:
         self.assertTrue(self.magnetic.converged)
         up, down = self.magnetic.spin
-        moment = (np.sum(up.density) - np.sum(down.density)) * self.magnetic_system.grid.volume_element
-        self.assertGreater(moment, 0.5)
+        dv = self.magnetic_system.grid.volume_element
+        moment = (np.sum(up.density) - np.sum(down.density)) * dv
+        self.assertGreater(moment, 2.5)  # the moment-3 state (see setUpClass)
         narrow = run_scf_spin_polarized(self.magnetic_system)
+        # the same state first: two states differ by mRy, and an unconverged run is in none of them
+        self.assertTrue(narrow.converged)
+        self.assertAlmostEqual(moment, (np.sum(narrow.density_up) - np.sum(narrow.density_down)) * dv, delta=1.0e-4)
         self.assertAlmostEqual(self.magnetic.energies.total, narrow.energies.total, delta=1.0e-6)
         self.assertNotEqual(self.magnetic.energies.ion_ion, 0.0)
 

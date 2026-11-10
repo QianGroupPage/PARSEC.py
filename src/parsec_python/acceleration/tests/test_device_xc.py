@@ -220,6 +220,23 @@ class DeviceGridTests(unittest.TestCase):
             )
             self.assert_same(reference, evaluator(self.up, self.down), f"spin {functional}")
 
+    def test_spin_functionals_with_an_empty_channel(self) -> None:
+        # a fully polarized density (the minority channel exactly empty, as the Fermi occupations give it):
+        # the device kernels take the zeta = +-1 limit as the host does, with finite potentials in both channels
+        empty = np.zeros_like(self.density)
+        for functional in SPIN:
+            for label, up, down in (("zeta=+1", self.density, empty), ("zeta=-1", empty, self.density)):
+                if functional == "pbe":
+                    reference = pbe_spin(up, down, self.grid, None)
+                else:
+                    reference = evaluate_spin_xc(functional, up, down, self.grid, None, ionization_energy_difference=0.3)
+                evaluator = device_xc.DeviceSpinXCEvaluator(functional, self.grid, ionization_energy_difference=0.3)
+                value = evaluator(up, down)
+                self.assert_same(reference, value, f"spin {functional} {label}")
+                for field in ("potential_up", "potential_down"):
+                    self.assertTrue(np.all(np.isfinite(np.asarray(getattr(value, field)))), f"{functional} {label}")
+                self.assertLess(value.total_energy, 0.0, f"{functional} {label}")
+
     def test_periodic_cell(self) -> None:
         from parsec_python.Grid.pbc import build_periodic_grid
         from parsec_python.models import PeriodicCell, PeriodicGridSettings
@@ -428,8 +445,10 @@ class DeviceSCFTests(unittest.TestCase):
     def test_spin_polarized_functionals(self) -> None:
         for name, mode, label in (
             ("ch3_default", "auto", "CuPy float64 spin-polarized PW92-LDA"),
-            # ``on`` up to 2026-10-30; the default since.
-            ("h2o_spin_pb", "auto", "CuPy float64 spin-polarized discrete-variational PBE"),
+            # ``on`` up to 2026-10-30; the default since.  Water has a point
+            # group: both channels in its sectors (Spin_Symmetry_Sectors: auto,
+            # the default since 2026-11-07), the functional on the orbits.
+            ("h2o_spin_pb", "auto", "CuPy float64 spin-polarized discrete-variational PBE on the symmetry orbits"),
         ):
             case = _xc_case(name)
             device, device_label, _ = _solve(case, mode)

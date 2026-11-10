@@ -1,0 +1,31 @@
+# O2 triplet (1.2075 A), spin-polarized: SCAN (Sun, Ruzsinszky and Perdew 2015), this code's native SCAN
+# Quantum ESPRESSO reference: input_dft = 'XC-000I-000I-000I-000I-263L-267L' (libxc MGGA_X_SCAN + MGGA_C_SCAN) (qe/README.md)
+
+Boundary_Sphere_Radius: 11.14
+Grid_Spacing: 0.160
+Coordinate_Unit: Cartesian_Bohr
+Expansion_Order: 12
+Correlation_Type: scan
+States_Num: 11
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+Spin_Polarization: true
+Fermi_Temp: -1 K   # occupations of occup.in (triplet)
+
+Atom_Types_Num: 1
+
+Atom_Type: O
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 1.6
+begin Electron_Per_Orbital
+2 4 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.
+Initial_Spin_Polarization: 0.3
+begin Atom_Coord
+     0.0000000000    0.0000000000    1.1409221477
+     0.0000000000    0.0000000000   -1.1409221477
+end Atom_Coord

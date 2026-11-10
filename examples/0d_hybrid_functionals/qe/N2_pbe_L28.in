@@ -1,0 +1,30 @@
+ &control
+    calculation = 'scf'
+    prefix = 'N2_pbe_L28_e150'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 28.000000
+    nat = 2
+    ntyp = 1
+    ecutwfc = 150.0
+    assume_isolated = 'mt'
+    nbnd = 9
+    occupations = 'fixed'
+    input_dft = 'pbe'
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ N 14.007 n_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ N 14.0000000000 14.0000000000 15.0371761835
+ N 14.0000000000 14.0000000000 12.9628238165
+K_POINTS gamma

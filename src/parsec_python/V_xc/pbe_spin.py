@@ -182,9 +182,28 @@ def pbe_spin_energy_partials(
     if not np.any(positive):
         return energy, d_up, d_down, d_sigma_up, d_sigma_down, d_sigma_total
 
-    n = density[positive]
-    sig = np.maximum(sig_total[positive], 0.0)
-    zeta = (up[positive] - down[positive]) / n
+    correlation, correlation_up, correlation_down, correlation_sigma = _spin_correlation_partials(
+        density[positive], up[positive], down[positive], sig_total[positive]
+    )
+    energy[positive] += correlation
+    d_up[positive] += correlation_up
+    d_down[positive] += correlation_down
+    d_sigma_total[positive] = correlation_sigma
+    return energy, d_up, d_down, d_sigma_up, d_sigma_down, d_sigma_total
+
+
+def _spin_correlation_partials(
+    n: np.ndarray, up: np.ndarray, down: np.ndarray, sigma_total: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """PBE correlation of two spin densities: ``f_c``, ``df_c/dn_up``, ``df_c/dn_down``, ``df_c/dsigma``.
+
+    The correlation half of :func:`pbe_spin_energy_partials` (Hartree) at points
+    whose total density ``n = up + down`` is above the vacuum threshold;
+    ``sigma_total`` is the squared gradient of ``n``.
+    """
+
+    sig = np.maximum(sigma_total, 0.0)
+    zeta = (up - down) / n
     kf = _KF_COEFFICIENT * np.cbrt(n)
     rs = np.cbrt(3.0 / (4.0 * np.pi * n))
     epsilon, epsilon_rs, epsilon_zeta = pw92_spin_correlation(rs, zeta)
@@ -250,12 +269,12 @@ def pbe_spin_energy_partials(
         epsilon_zeta + h_a * a_epsilon * epsilon_zeta + h_phi * phi_zeta
     )
     common = per_electron + n * per_electron_n
-
-    energy[positive] += n * per_electron
-    d_up[positive] += common + (1.0 - zeta) * per_electron_zeta
-    d_down[positive] += common - (1.0 + zeta) * per_electron_zeta
-    d_sigma_total[positive] = n * h_t * dt2_dsigma
-    return energy, d_up, d_down, d_sigma_up, d_sigma_down, d_sigma_total
+    return (
+        n * per_electron,
+        common + (1.0 - zeta) * per_electron_zeta,
+        common - (1.0 + zeta) * per_electron_zeta,
+        n * h_t * dt2_dsigma,
+    )
 
 
 def pbe_spin(

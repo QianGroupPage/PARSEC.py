@@ -47,7 +47,12 @@ The example holds native CPU work at 14 threads for comparable 1/2/4-GPU
 tests. Additional CPUs allocated by Slurm are not automatically additional
 workers. More OpenMP or BLAS threads can be slower; benchmark the chosen system.
 `--backend auto` enables native Hartree with GPU orbitals when both backends
-are installed. Check the reported backend and fallback reasons.
+are installed; since 2026-11-07 the conjugate gradients of that Hartree solve
+run on one GPU of the process (`hartree_backend =
+native-boundary/cupy-linear`, `PARSEC_HARTREE_LINEAR_BACKEND`,
+`Hartree/GPU_HARTREE.md`), and so do the boundary values where the host has
+no orbit table for them (full grid); a symmetry wedge keeps them on the
+host. Check the reported backend and fallback reasons.
 
 ### Several nodes
 
@@ -112,11 +117,19 @@ electrons on 1, 4 and 16 GPUs, 14,680 on 4, 23,768 on 8 and 16, 29,576 on 8
 and 39,368 on 16.
 
 These are the settings of the measured runs, not the defaults of the code.
-Unset, the ionic backend, the Hartree linear backend and the Hartree boundary
-backend are `native`, the rotation is `allocate`, and the device random
+Unset, the ionic backend is `native`, the Hartree linear backend `auto`
+(the GPU CG of the series wherever the orbitals run on a GPU, since
+2026-11-07; `native` for the host CG of the code before), the resident
+Hartree chain `auto` (since the same day: on the wedge of the sectors the
+boundary on the GPU, with the wedge kernels whether the plan is engaged or
+not, where the series took the full-grid kernels for PARSEC's boundary; `0`
+for the orbit table on the host and the host interface of the code before)
+and the Hartree boundary elsewhere the native builders (the GPU kernels of
+the series where they have no orbit table, since the same day), the
+rotation is `allocate`, and the device random
 numbers, the filter graphs, the column-major filter, the native sector
 assembly, the generalized first Ritz step, the distributed filter, the
-recycled state, the resident Hartree chain and the stage timing are off: a
+recycled state and the stage timing are off: a
 run without them takes other routes than the measured ones.
 `PARSEC_NATIVE_PROJECTOR_LOOKUP=1` and `PARSEC_CUPY_RESIDENT_PREDICTOR=host`
 are the defaults, the Ritz condition follows the place of the small solve
@@ -126,9 +139,11 @@ default device solve does not read. The storage of the sector states and
 their allocator are `auto` when unset, which keeps a basis that does not fit
 its device on the host instead of stopping (below); four runs of the series
 left both unnamed. The inputs of the series set
-`Eigensolver: chebff`, `FF_MaxIter: 4`, `Chebdav_Degree: 30` and
-`Chebyshev_Degree: 15`; `tests/data/C795H300_parsec.in` of the reference
-package is the smallest of them.
+`Eigensolver: chebff`, `FF_MaxIter: 3`, `Chebdav_Degree: 30` and
+`Chebyshev_Degree: 15` (the series of 5 November 2026; the earlier series used
+`FF_MaxIter: 4`, which made the program 2-18 % slower in 31 of 32 cells);
+`tests/data/C795H300_parsec.in` of the reference package is the smallest of
+them, with `FF_MaxIter: 4`.
 
 ### Relaxations and forces on several nodes
 
@@ -163,6 +178,251 @@ with identical trajectories; a later structure costs 2.3 s of SCF, 0.5 s of
 forces and 0.26 s of rebuilding on 16 GPUs. The comparisons with Fortran
 PARSEC and the other measurements are in
 [FORCES_AND_RELAXATION.md](../FORCES_AND_RELAXATION.md).
+
+### Hybrid functionals on several nodes
+
+The same runner and launch script run a self-consistent hybrid functional
+(`../README.md`, "Self-consistent hybrid functionals"), unpolarized or
+spin-polarized in the symmetry sectors, single points, forces, relaxations
+and molecular dynamics (`SCF/hybrid_mpi.py`). The root runs the Fock loop of
+one process; every piece of it that touches orbitals is a command `exx_*`
+that all ranks execute together, and the root alone decides (stop rule,
+adaptive inner criterion, outer DIIS) from scalars the ranks hand it, so a
+run on several nodes takes the decisions of one node.
+
+- Every sector basis lies on one device of its rank (the exchange term is not
+  held by a basis that several devices share), and every GPU of every rank
+  solves pair densities. A rank may own no sector: with more ranks than
+  sectors, and in a run without point group (molecular dynamics, `manual`
+  relaxations), where the sector of the identity lies on the first GPU of
+  the root and the other ranks, one per node or one per GPU
+  (`--rank-per-gpu`), solve the pair densities of its exchange.
+- Every rank keeps the sector orbitals of its last solve. For a build of
+  `W = V_x Psi` each owner broadcasts the occupied columns of its sectors
+  (and the empty ones for a build of all columns), and every rank holds them
+  as a replica on its least loaded device. The tiles of the build are those
+  of one process (blocks of `Exx_Batch_Size` columns, each pair once),
+  assigned to the GPUs of all ranks, the most expensive first, each to the
+  least loaded GPU; a rank solves its tiles with the kernels of one process
+  (reflection-parity classes) and sends the parts of `W` of the other ranks'
+  sectors to their owners, which add them in rank order. `M = -Psi^T W`,
+  its Cholesky factor and `xi_G` are formed on the owner of each sector,
+  where `xi_G` stays in the sector operator; `E_x` and the band energies of
+  the operator are sums over the owners' sectors that the root adds in the
+  order of one process. The window of the outer DIIS keeps its copies on the
+  owners; only its small matrices come to the root.
+- Orbitals travel as device arrays where Cray MPICH takes them: the runner
+  sets `MPICH_GPU_SUPPORT_ENABLED=1` before `MPI_Init` for an input with a
+  hybrid `Correlation_Type`; `PARSEC_MPI_EXCHANGE_TRANSPORT=host` stages
+  them through the host instead (`auto`, the default, follows the variable).
+  Messages are columns of at most `PARSEC_MPI_EXCHANGE_CHUNK_BYTES` (256
+  MiB). Measured between two A100 nodes: broadcasts 10.6-11.7 GB/s and owner
+  sums 7.3-14.7 GB/s received per rank with device arrays, 5.7 and 1.0 GB/s
+  staged (`benchmarks/exchange_transport.py`).
+- A spin-polarized run, hybrid or semilocal, divides the sectors of both
+  channels: every command names its channel, and a rank keeps a subspace of
+  each channel in each of its sectors. A run that the symmetry guard sends to
+  the full grid is prepared again and finished in the process of the root, on
+  the GPUs of its node, while the other ranks wait (every rank first lets the
+  exchange of the sectors go); spin channels on the full grid are otherwise
+  refused on several ranks. Single points only: the forces, relaxations and
+  molecular dynamics of a spin-polarized run are refused on several ranks
+  (the force terms of both channels summed over the ranks are not validated
+  yet). Measured on 2 nodes against one rank: O2 PBE dE -2.8e-14 Ry, O2 PBE0
+  -3.3e-13, O2 Hartree-Fock 1.4e-14, each with the iterations of one node.
+- Each rank counts what a build holds on its devices (its sectors' `W`, the
+  new replicas of the other ranks' orbitals with the columns they had, its
+  parts of their `W`, two chunks of a message of its sectors (columns it
+  broadcasts, sums of `W` it receives), the tile work; `xi`, the expansions
+  and the plans in the memory rules of its sectors) and makes these arrays
+  before any tile or broadcast runs: a build that does not fit is refused
+  with the numbers of the rank, on every rank, and the outer DIIS takes such
+  a refusal as on one node. A failure on one rank inside an exchange command
+  is raised on every rank before the next collective call; after a refusal
+  for memory no rank keeps what the command made.
+- `timing.json` holds under `per_rank[].exchange` the seconds of every
+  command and phase of the exchange (replicas, tiles, sums to the owners),
+  the bytes moved and the pair solves of each rank.
+
+Measured on A100 nodes of four GPUs (2026-11-07, first runs, one rank per
+node), PBE0 of the inputs of `examples/0d_nanodiamonds/fortran_comparison`
+with the PBE potentials of `examples/0d_hybrid_functionals` (D2, four
+sectors), against the runner with one rank on one node, which takes the path
+of `main.py` (1.9e-10 Ry from it for C185H124). Exchange tiles are the wall
+seconds of the pair solves of all ACE builds, the broadcasts included; the
+broadcasts and the sums to the owners are their own wall seconds; peak is the
+largest device of any rank.
+
+| system | GPUs | program [s] | SCF [s] | exchange tiles [s] | broadcasts, sums [s] | peak [GiB] | E - E(4 GPUs) [Ry] |
+|---|---|---|---|---|---|---|---|
+| C185H124 | 4 | 33.9 | 29.8 | 15.3 | - | 5.7 | |
+| | 8 | 27.8 | 23.3 | 8.4 | 0.43, 0.33 | 6.9 | -3.0e-11 |
+| | 16 | 20.1 | 16.8 | 6.3 | 0.99, 0.44 | 8.9 | -1.3e-10 |
+| C459H204 | 4 | 242.8 | 233.0 | 186.0 | - | 11.4 | |
+| | 8 | 146.6 | 137.4 | 97.0 | 2.3, 1.3 | 17.5 | -1.3e-9 |
+| | 16 | 97.1 | 88.5 | 52.7 | 3.7, 2.5 | 17.0 | -1.2e-9 |
+| C795H300 | 4 | 715.4 | 699.8 | 597.0 | - | 21.5 | |
+| | 8 | 413.9 | 399.3 | 313.6 | 4.2, 2.6 | 31.4 | -1.5e-10 |
+| | 16 | 251.1 | 236.4 | 157.1 | 7.4, 4.9 | 32.2 | -4.6e-10 |
+
+The rows of 8 GPUs of C459H204 are those of the code as it stands; the other
+rows of 8 and 16 GPUs ran the version before, which solved a rank's tiles of
+its own sectors and those of the others in two passes (the C459H204 tiles on
+8 GPUs took 108.5 s that way). Every run took the SCF and outer iterations of
+one node (24, 46, 54 SCF iterations); `E_x` agrees within 3e-11 Ry, the total
+energies within the noise of an inner SCF that stops at 2e-4 Ry (2e-9 Ry
+between 1 and 4 GPUs of one node for C459H204). The exchange scales nearly
+with the GPUs (3.5x and 3.8x on 4x the GPUs for C459H204 and C795H300); the
+inner SCF does not, since every sector stays on one GPU, and is a third of
+the program on 16 GPUs. The broadcasts and sums are 2-12 % of the tiles
+of C459H204 and C795H300 (23 % for C185H124 on 16 GPUs);
+the overlap of the broadcasts with the tiles (`PARSEC_MPI_EXCHANGE_OVERLAP`)
+gains about 1 % (C459H204 on 8 GPUs: 146.6 s, 147.3 s without). Each rank
+holds replicas of the other ranks' occupied orbitals during a build, so the
+peak grows with the node count (C795H300: 21.5, 31.4, 32.2 GiB).
+
+The same comparison for the other routes, 2 nodes against one rank:
+C185H124 HSE06 dE -2.9e-11 Ry (SCF 37.9 -> 27.9 s); O2 PBE0 spin-polarized
+(D2h, 8 sectors) dE -3.3e-13, 72 iterations; O2 Hartree-Fock spin-polarized
+and CO Hartree-Fock with two DIIS extrapolations each, dE 1.4e-14 and
+1.8e-13 with the same extrapolations; two BFGS moves of C185H124 PBE0 with
+the forces of every structure, energies within 6.7e-10 Ry, forces within
+1.2e-11 Ry/bohr; three steps of molecular dynamics of H2O PBE0 (one sector,
+the second rank owning none), the trajectory of one node to the last bit;
+an oxygen atom PBE0 whose start sends it to the full grid, `main.py`'s
+result to the last bit.
+
+### Periodic cells at the Gamma point on several nodes
+
+The same runner and launch script run the SCF of a bulk periodic cell
+(`Boundary_Conditions: bulk`) at the Gamma point: real orbitals, an
+orthorhombic cell, no spin, a native LDA or GGA (`ca`, `pbe` and the other
+functionals of `V_xc/device_xc.py`). The accelerated path detects no space
+group, so the cell is one sector of the identity (every grid point an orbit,
+`AxisReflectionReduction.identity`), the sector of a molecular dynamics run:
+on several nodes one rank per GPU shares its orbitals
+(`Eigensolvers/mpi_shared_basis.py`), on one node one rank shares them among
+the GPUs of its node (`Eigensolvers/distributed_state.py`) or one rank per
+GPU does. Inside the allocation of `N` nodes with four GPUs each:
+
+```bash
+scripts/run_multi_gpu_scf.sh --nodes N --rank-per-gpu bulk/parsec.in NEW_DIRECTORY
+```
+
+which starts `4 N` ranks of `benchmarks/mpi_full_scf.py`, each seeing its GPU
+(`--devices 0`). Every rank filters its columns of the orbitals with the
+stencil and the projectors of the whole cell (wrap-around rows of the
+periodic Laplacian, projectors with their lattice images); the Ritz step
+moves them to row blocks and back (three `Alltoallv` per step, GPU-aware MPI)
+and the root solves the small eigenproblem on its GPU. The root alone holds
+the SCF loop: the periodic Hartree solve (`Hartree/periodic_device.py`, the
+finite-difference CG or `Calc_Hartree_G` on its GPU), the XC functional on
+its GPU, the local ionic potential, densities and Ewald terms of the
+reference preparation, and the mixer. The other ranks build the grid, the
+Laplacian and the projectors only (`driver._prepare_periodic_orbital_operators`,
+the same arrays element for element). The ranks compare the lattice vectors,
+the settings of the grid and the prepared grid (point counts, step, shift)
+before the SCF. `timing.json` has `result.domain` and `result.hartree_boundary`
+null for a cell and a note that says so.
+
+What does not run there is refused by name before any rank prepares
+(`driver.periodic_sector_refusal`, `_refuse_unsupported_periodic` of the
+runner): k-points beyond Gamma (`parsec_python/main.py --mpi`, whose ranks
+take the k-points), spin, spin-orbit and non-collinear runs, hybrids,
+meta-GGAs, libxc functionals, oblique cells, wires and slabs, LDA+U, the TS
+correction, forces, relaxation and molecular dynamics of a cell, the band
+structure and `nscf` runs (all `parsec_python/main.py`), Fortran's general
+grid (`Use_Fortran_Routines` with sides of different steps) and
+`--symmetry on`. A single process takes the same route with
+`PARSEC_CUPY_SINGLE_SECTOR=on` (the GPUs of the process share the sector);
+without it a cell keeps the full grid of one GPU, as before.
+
+Measured on A100 nodes (2026-11-08, bulk diamond `examples/3d_diamond_benchmark`,
+18 points per cubic edge, PBE, the eigensolver and mixing of the nanodiamond
+series, launch settings of the script; `run_mpi_case.py` makes the input on
+every rank and runs the runner, `summarize_timing.py` reads `timing.json`):
+
+- The ranks give the energies of one rank on one GPU, the same route: 2 x 2 x 2
+  cells (64 atoms) -729.4306335707903 Ry on one GPU, within 2.8e-12 Ry on 4 ranks of
+  one node and 2.9e-12 on 16 ranks of four nodes; 3 x 3 x 3 (216 atoms) within
+  3e-12 on 16 ranks and 9e-12 on one rank with four GPUs; the same 23 and 55 SCF
+  steps everywhere.
+- Against the full grid of one GPU (`main.py`): the first SCF step is the same,
+  the later ones differ by a few 1e-4 Ry at these eigensolver settings, which
+  leave the SCF of a bulk cell limited by the eigensolver (its energy still
+  falls by mRy per step where the SRE criterion stops it). Converged further
+  (`Convergence_Criterion: 1e-6 Ry`) the two agree within 7e-8 Ry at 64 atoms;
+  at 216 atoms (Chebyshev degree 40, a buffer of 44 states) within 6e-6 Ry at the
+  last step of the full grid, the gap shrinking as the energy converges.
+- With PARSEC's former lower bound of the later filters (`Smart_Subspace` off,
+  the measurements of this paragraph and the next two up to the memory rule of
+  three shares) the overlap of the filtered basis of a bulk cell exceeded the
+  condition limit of the generalized Ritz step (1e8) by the second SCF step: the
+  filter interval left the occupied states, tens of Ry below it, amplified by
+  factors that differ by orders of magnitude. The sector then took the shifted
+  Cholesky QR of `MPIShardGroup.orthonormal_ritz` from then on (one GPU does the
+  same on its own fallback), whose factorizations run on the root's GPU: a later
+  SCF step of 1,728 atoms (3,468 states) on 16 GPUs took 10.0 s with the former
+  host factorizations and 2.4 s with these. With the smart bound, the default of
+  bulk cells, no step of 1,728, 2,744 and 4,096 atoms fell back.
+- Later SCF steps on 16 GPUs: 0.5 s (512 atoms), 2.9 s (1,728 atoms, 1.26 M
+  points), 7.7 s (2,744 atoms, 2.0 M points, 5,494 states) and 21 s (4,096
+  atoms, 2.99 M points, 8,204 states; of a pass of the Ritz step 2.5 s to the
+  rows and 1.1 s back, 2.9 s of Gram products, 2.7 s for the small problem on
+  the root, 1.3 s of rotation, besides 1.5 s of filter and the Cholesky QR
+  passes; 0.6 s Hartree). The first eigensolve of 4,096 atoms took 35 s. The
+  preparation is that of the root's reference system on the host: 13.5 s, 50 s,
+  106 s and 304 s (at 4,096 atoms the Ewald ion-ion energy 202 s, the local
+  ionic potential 42 s, the projectors 30 s, the starting density 18 s); the
+  other ranks build their operators in a ninth of that and wait.
+- Memory per GPU: the arrays of a rank hold at most about three times its
+  share of the orbitals (`8 N m / ranks` bytes) and 2 GiB of exchange buffers
+  (the filtered columns, `H` times them and the rows of the Ritz step), the
+  root a few `m x m` matrices more (`PARSEC_DEVICE_LIVE_PEAK=1` of the runner
+  records it): 8.4 GiB (root 8.9) at 1,728 atoms, 37.5 GiB (root 42.5) at 4,096
+  atoms, of which CuPy's pool held up to 11.2 and 51.3 GiB (nvidia-smi). By that
+  rule bulk diamond fits 16 A100 of 80 GB up to 8 x 8 x 8 cubic cells; 9 x 9 x 9
+  (5,832 atoms, 11,670 states) would take about 76 GiB per rank and 86 on the
+  root, which needs a Ritz step that holds two shares (the rows of `H X` formed
+  and projected a round of columns at a time) or more ranks. Host memory: 6.7
+  GiB on the root and 4.7 on the other ranks at 4,096 atoms.
+- That Ritz step is the default of a cell (`PARSEC_MPI_SHARED_RITZ`, `auto`:
+  `rounds` for a cell, whose runner names it, `rows` for clusters, which keep
+  their bits; `MPIShardGroup._ritz_in_rounds`). It keeps the row block of the
+  filtered basis and the columns, forms `H X` a round of exchange columns at a
+  time, projects each round as it arrives and sends the rotated rows back in
+  the same rounds; the overlap and the projection are the lower triangles of
+  blocks of round order (fewer Gram products than the full overlap of the two
+  row blocks). The condition number of the small problem, a symmetric spectrum
+  that took as long as its eigensolve (cuSOLVER on an A100: 0.95 and 1.03 s at
+  8,204 states, 2.31 and 2.58 s at 11,670), is estimated on rank 1 while the
+  root factors and solves (`PARSEC_CUPY_RITZ_CONDITION_HELPER=off` keeps it on
+  the root): the same coefficients bit for bit, also for clusters (C459H204 on
+  4 ranks, 49 SCF steps, every energy the same bits). With the smart bound,
+  4,096 atoms on 16 A100 (Max_Iter 6): a later SCF step 11.0 s with the two row
+  blocks, 9.9 s in rounds, 8.9 s in rounds with the condition number on rank 1
+  (per pass 1.0 s filter, 1.7 s to the rows, 1.5 s Gram products, 1.4 s small
+  problem, 1.45 s rotation, 0.9 s back); arrays at most 27.1 GiB per rank and
+  30.6 on the root, where the two row blocks held 36.6 and 42.0 (nvidia-smi
+  29.8 and 36.2 GB, against 41.7 and 51.3). The first SCF steps agree with the
+  two row blocks within 8e-7 Ry (6e-8 at the first, an SCF of -46,710 Ry far
+  from converged); converged SCFs of 216 and 512 atoms on 4 ranks end within
+  2e-12 and 2e-11 Ry of them in the same steps, C459H204 within 1.2e-10 Ry.
+- 9 x 9 x 9 cubic cells (5,832 atoms, 4.25 M points, 11,670 states) fit 16 A100
+  in rounds: arrays at most 51.6 GiB per rank (54.7 on rank 1, which estimates
+  the condition number, 61.2 on the root), nvidia-smi 57 to 61 GB (root 71.5);
+  preparation 60 s, first eigensolve 68 s, later SCF steps 20.6 s (per pass
+  3.1 s filter, 3.5 s to the rows, 4.3 s Gram products, 3.8 s small problem,
+  3.9 s rotation, 1.7 s back; 1.0 s Hartree). The rule that decides whether the
+  sector states keep CuPy's pool (`PARSEC_CUPY_LARGE_PROBLEM_ALLOCATOR` and
+  `PARSEC_CUPY_SECTOR_STATE_STORAGE`, `auto`) counts a shared basis in rounds as
+  two shares, three exchange buffers and the summed `m x m` pair (55.0 GB a rank
+  here); counted as four shares it chose the direct allocator, under which the
+  first Ritz step ran out of memory on most ranks. An error that stops some
+  ranks inside a step of the shared basis, while the others wait in an
+  exchange, now ends the job with `FULL_SCF_FAILED` and its traceback
+  (`mpi_shared_basis.set_failure_handler`, installed by the runner); before, the
+  job waited until its time limit.
 
 ## Correctness and memory
 
@@ -1146,7 +1406,65 @@ balance of those sectors; the nanodiamond examples have four. The MPI runner
 rank among the sectors it owns, and the devices of a sector share its basis,
 so that four sectors use 8 or 16 GPUs on two or four nodes of four. No sector
 is spread over ranks, and through
-`main.py` an asymmetric system uses one GPU.
+`main.py` an asymmetric system uses one GPU. A hybrid functional puts every
+sector basis on one GPU and its exchange on all GPUs of all ranks (above).
+
+A self-consistent hybrid functional (`../README.md`, "Self-consistent hybrid
+functionals") runs on the GPUs of one process: the compressed exchange
+operator of each symmetry sector stays on the device of the sector, and the
+pair densities of all sectors are solved as tiles on every GPU of the
+process, so an asymmetric system uses all of them for its exchange while
+its eigensolver stays on one. The exchange's device bytes enter the memory
+rules of the sectors above (states are spilled to the host where they and
+the exchange do not fit), and a build that cannot hold `W = V_x Psi` is
+refused with the numbers. On several nodes the MPI runner divides the
+sectors among its ranks and the pair densities among all their GPUs
+("Hybrid functionals on several nodes", above); `main.py --mpi` (the
+k-point solver) refuses hybrids. A libxc functional (hybrid or not) and a
+meta-GGA are refused on several ranks; they run in one process on the GPUs
+of one node (`--serial-control` of the runner).
+
+A hybrid of a periodic cell (`README.md`, "Hybrid functionals of periodic
+cells on the device") uses the GPUs of one process in two ways. At the Gamma
+point without spin it is the loop above on the full grid (one eigensolver
+GPU, the pair tiles on all of them). With k-points or spin the k-point pool
+deals the k-points (and spin channels) to one worker per GPU, each keeping its
+k-points' orbitals, `W` and `xi` on its device; the pair tiles of a build go
+to every GPU, each of which holds a copy of the occupied columns of the whole
+mesh (and, for the pairs solved once for both states, their partial `W`), so
+the memory of a GPU grows with the occupied columns of all k-points. Builds
+below 1e9 pair-density points stay on one GPU.
+
+A spin-polarized run in the sectors (`Spin_Symmetry_Sectors: auto`, the
+default; `../README.md`, "Spin channels in the symmetry sectors")
+places the sectors on the devices as an unpolarized run does; both channels
+use the same sector operators and devices, one after the other, each with
+its own subspace there. The memory rules count the subspaces of both
+channels, and sector states spilled to the host take the former staging
+(no persistent host buffers, which are one per sector). Without the sectors
+(`off`, or a run the symmetry guard sends to the full grid) both channels
+stay on one device.
+
+The pair densities of sector orbitals are solved in reflection-parity
+classes on the octant of the Kronecker box (`../README.md`): a tile gathers
+its two blocks from their sectors into the coset form (the values at the
+images `h r` of the octant points `r` under one sign operation `h` per coset
+of the group, `N/g` rows per column instead of `N`), forms the class
+densities and both blocks' `W` there with two CUDA kernels, and folds `W`
+into the sectors by one gather; no device holds a full-grid block or the
+full-box Kronecker plan. `PARSEC_CUPY_EXCHANGE_PARITY=off` (default `auto`)
+unfolds the blocks to the full grid as before. The class densities are
+written by their kernel straight onto the octant box, which is then the
+right-hand side of the class solve in place (no scatter);
+`PARSEC_CUPY_EXCHANGE_PARITY_BOX=0` (default 1) forms them on the octant
+points and lets the solve scatter them (comparisons; about 8 % slower).
+Measured on A100 (PBE0 of the nanodiamond inputs of `examples/0d_nanodiamonds`,
+D2, four sectors; full-grid path -> parity classes): an ACE build of k04 76.0
+-> 12.0 s on one GPU and 19.5 -> 3.7 s on four, k05 183 -> 34 s on four; the
+whole k04 run 386 -> 100 s (one GPU) and 111 -> 38 s (four), k05 1174 -> 277 s
+(four); peak device memory lower in every case. Energies agree with the
+full-grid path within the round-off of the Kronecker solver (1e-11 to 8e-10
+Ry, `acceleration/benchmarks/exchange_parity.py` for the builds alone).
 
 Record the GPU model, active GPU count, allocated and active CPU counts,
 precision, input hashes, code revision, iterations, and peak memory. Separate

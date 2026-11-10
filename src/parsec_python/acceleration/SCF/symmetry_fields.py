@@ -232,6 +232,35 @@ class SymmetrySCFReducer:
             wedge_residual=residual_wedge,
         )
 
+    def join_blocks(self, fields) -> np.ndarray:
+        """The orbit values of several fields end to end (the meta-GGA's ``(V, vtau)``)."""
+
+        return np.concatenate([self.wedge_values(field) for field in fields])
+
+    def split_blocks(self, values, count: int) -> list:
+        """The ``count`` fields of a joined vector (:meth:`join_blocks`)."""
+
+        values = np.asarray(values, dtype=np.float64)
+        size = int(self.reduction.wedge_size)
+        if values.shape != (count * size,):
+            raise ValueError("the joined orbit values do not match the wedge")
+        return [self.field(values[index * size : (index + 1) * size].copy()) for index in range(count)]
+
+    def block_mixer(self, settings: MixingSettings, count: int):
+        """The mixer of ``settings.method`` for ``count`` joined orbit fields (:meth:`join_blocks`)."""
+
+        blocks = OrbitBlocks(self, count)
+        if settings.method == "anderson":
+            mixer = SymmetryAndersonMixer(blocks, settings)
+            from parsec_python.SCF.meta_gga import meta_gga_anderson
+
+            if meta_gga_anderson() == "weighted":
+                # SCF/meta_gga.py: inner products weighted by the densities of
+                # the blocks as well (set before every step).
+                mixer.set_weights = blocks.set_field_weights
+            return mixer
+        return SymmetryWeightedMixer(blocks, make_mixer(settings, weights=blocks.weights))
+
     def mixer(
         self, settings: MixingSettings
     ) -> "SymmetryAndersonMixer | SymmetryWeightedMixer":
@@ -338,6 +367,54 @@ class SymmetrySCFReducer:
             electronic=electronic,
             total=electronic + float(ion_ion_energy),
         )
+
+
+class OrbitBlocks:
+    """``count`` orbit fields as one vector, for a mixer of this module (the meta-GGA's ``(V, vtau)``).
+
+    What :class:`SymmetryAndersonMixer` and :class:`SymmetryWeightedMixer`
+    read of a reducer: the multiplicity weights of every block, and plain
+    arrays in and out.
+    """
+
+    def __init__(self, reducer: "SymmetrySCFReducer", count: int) -> None:
+        reduction = reducer.reduction
+        self.size = int(count) * int(reduction.wedge_size)
+        weights = np.tile(np.asarray(reducer.weights, dtype=np.float64), int(count))
+        weights.setflags(write=False)
+        self.weights = weights
+        from types import SimpleNamespace
+
+        self.reduction = SimpleNamespace(
+            multiplicities=np.tile(reduction.multiplicities, int(count)),
+            wedge_size=self.size,
+        )
+
+        self._multiplicities = np.asarray(self.reduction.multiplicities, dtype=np.float64)
+        self._base_weights = weights
+
+    def set_field_weights(self, values) -> None:
+        """Multiply the multiplicity weights by per-value weights (a density-weighted mixer)."""
+
+        values = np.maximum(np.asarray(values, dtype=np.float64), 0.0)
+        if values.shape != (self.size,):
+            raise ValueError("the weights do not match the joined orbit values")
+        weights = self._base_weights * values
+        weights.setflags(write=False)
+        self.weights = weights
+        self.reduction.multiplicities = self._multiplicities * values
+
+    def wedge_values(self, values) -> np.ndarray:
+        array = np.asarray(values, dtype=np.float64)
+        if array.shape != (self.size,):
+            raise ValueError("the joined orbit values do not match the wedge")
+        return array
+
+    def field(self, values) -> np.ndarray:
+        return self.wedge_values(values)
+
+    def expand_values(self, values) -> np.ndarray:
+        return self.wedge_values(values)
 
 
 @dataclass

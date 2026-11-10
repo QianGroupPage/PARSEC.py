@@ -28,6 +28,7 @@ from parsec_python.Output.bands import (
     write_bands_files,
 )
 from parsec_python.cli import main as cli_main
+from parsec_python.tests.archives import read_archive
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -80,6 +81,17 @@ _PATH = (
 )
 
 
+def _cupy_visible() -> bool:
+    """Whether CuPy sees a CUDA device.  Then a band run left at its default backend
+    (``PARSEC_DEVICE=auto``) solves its k-points on the GPU, with the device-resident
+    eigensolver and one worker per device whatever ``workers`` says."""
+    try:
+        from parsec_python.acceleration.Hamiltonian.device_bloch import resolve_kpoint_backend
+    except ImportError:
+        return False
+    return resolve_kpoint_backend("auto").name == "cupy"
+
+
 class BandPathTests(unittest.TestCase):
     def test_fortran_point_counts_and_closure(self) -> None:
         # Segment lengths 1 : 2 : 1.5 with 4 points on the shortest.
@@ -95,10 +107,37 @@ class BandPathTests(unittest.TestCase):
         np.testing.assert_allclose(np.diff(segments[1][:, 1]), 0.25)
 
     def test_count_is_truncated_like_the_fortran_integer_assignment(self) -> None:
+        # The default rule (this port's, and the previous tree's): truncation.
         starts = np.array([[0, 0, 0], [1, 0, 0.0]])
         ends = np.array([[1, 0, 0], [1, 1.7, 0.0]])
         segments = band_path_kpoints(starts, ends, 3)
         self.assertEqual(len(segments[1]), int(1.7 * 3) + 1)
+        starts = np.array([[0, 0, 0], [1, 0, 0.0], [1, 1.9, 0.0]])
+        ends = np.array([[1, 0, 0], [1, 1.9, 0.0], [1, 1.9, 1.0]])
+        self.assertEqual([len(s) for s in band_path_kpoints(starts, ends, 3)], [3, 5, 3 + 1])
+
+    def test_count_is_rounded_like_parsec15_nint(self) -> None:
+        # PARSEC 1.5 calc_bands.f90:152-158 rounds (nint), the rule of a
+        # written Bandstruc_Points: 1.7*3 = 5.1 -> 5 (+1 closing point) either
+        # way, but 1.9*3 = 5.7 -> 6, and an interior 2.5*2 = 5.0 stays 5.
+        starts = np.array([[0, 0, 0], [1, 0, 0.0]])
+        ends = np.array([[1, 0, 0], [1, 1.7, 0.0]])
+        segments = band_path_kpoints(starts, ends, 3, rounding="nint")
+        self.assertEqual(len(segments[1]), 5 + 1)
+        ends = np.array([[1, 0, 0], [1, 1.9, 0.0]])
+        segments = band_path_kpoints(starts, ends, 3, rounding="nint")
+        self.assertEqual(len(segments[1]), 6 + 1)
+        starts = np.array([[0, 0, 0], [1, 0, 0.0], [1, 1.9, 0.0]])
+        ends = np.array([[1, 0, 0], [1, 1.9, 0.0], [1, 1.9, 1.0]])
+        segments = band_path_kpoints(starts, ends, 3, rounding="nint")
+        self.assertEqual([len(s) for s in segments], [3, 6, 3 + 1])
+        # nint(x + 1) of the last line: 1.5*3 + 1 = 5.5 -> 6.
+        starts = np.array([[0, 0, 0], [1, 0, 0.0]])
+        ends = np.array([[1, 0, 0], [1, 1.5, 0.0]])
+        self.assertEqual(len(band_path_kpoints(starts, ends, 3, rounding="nint")[1]), 6)
+        self.assertEqual(len(band_path_kpoints(starts, ends, 3)[1]), 5)
+        with self.assertRaises(ValueError):
+            band_path_kpoints(starts, ends, 3, rounding="round")
 
     def test_invalid_paths_are_rejected(self) -> None:
         zero = np.zeros((1, 3))
@@ -139,8 +178,39 @@ class BandInputTests(unittest.TestCase):
 
     def test_default_points_and_missing_label(self) -> None:
         bands = self._parse("begin bandstruc\n1 0 0 0 0.5 0 0\nend bandstruc\n").problem.bands
+        # This port's default, 20 with truncation (PARSEC 1.5's is 100, with
+        # nint): this port keeps its defaults where 1.5 changed them.
         self.assertEqual(bands.points, 20)
+        self.assertEqual(bands.rounding, "truncate")
+        self.assertIsNone(bands.ff_maxiter)
+        self.assertNotIn("ff_maxiter", repr(bands))
+        self.assertNotIn("rounding", repr(bands))
         self.assertEqual(bands.segments[0].name, "")
+        # a written Bandstruc_Points takes 1.5's rounding, also at 20
+        written = self._parse(
+            "begin bandstruc\n1 0 0 0 0.5 0 0\nend bandstruc\nbandstruc_points 20\n"
+        ).problem.bands
+        self.assertEqual((written.points, written.rounding), (20, "nint"))
+        self.assertIn("rounding='nint'", repr(written))
+
+    def test_bands_ff_maxiter(self) -> None:
+        translation = self._parse(
+            "begin bandstruc\n1 0 0 0 0.5 0 0\nend bandstruc\nBands_FF_MaxIter 4\n"
+        )
+        self.assertEqual(translation.problem.bands.ff_maxiter, 4)
+        self.assertIn("ff_maxiter=4", repr(translation.problem.bands))
+        # The input's eigensolver is chebdav: the cycles of CHEBFF do nothing.
+        self.assertTrue(any("Bands_FF_MaxIter" in note for note in translation.warnings))
+        with self.assertRaises(ParsecInputError):
+            self._parse("begin bandstruc\n1 0 0 0 0.5 0 0\nend bandstruc\nBands_FF_MaxIter 0\n")
+
+    def test_points_without_a_block_are_read_and_ignored(self) -> None:
+        # PARSEC 1.5 reads Bandstruc_Points with or without the block.
+        translation = self._parse("bandstruc_points 10\n")
+        self.assertIsNone(translation.problem.bands)
+        self.assertTrue(any("Bandstruc_Points" in note for note in translation.warnings))
+        with self.assertRaises(ParsecInputError):
+            self._parse("bandstruc_points 0\n")
 
     def test_no_bands_by_default(self) -> None:
         self.assertIsNone(self._parse("").problem.bands)
@@ -149,8 +219,7 @@ class BandInputTests(unittest.TestCase):
         cases = {
             "short line": "begin bandstruc\n1 0 0 0 0.5 0\nend bandstruc\n",
             "zero length segment": "begin bandstruc\n1 0 0 0 0 0 0 a-a\nend bandstruc\n",
-            "points without a block": "bandstruc_points 10\n",
-            "non-numeric": "begin bandstruc\n1 0 0 0 x 0 0 a-b\nend bandstruc\n",
+            "non-numeric":"begin bandstruc\n1 0 0 0 x 0 0 a-b\nend bandstruc\n",
         }
         for name, text in cases.items():
             with self.subTest(name), self.assertRaises(ParsecInputError):
@@ -174,7 +243,7 @@ class BandStructureRunTests(unittest.TestCase):
             )
             self.assertEqual(cli_main([str(directory / "parsec.in"), "--quiet"]), 0)
             log = (directory / "parsec.out").read_text(encoding="utf-8")
-            scf = np.load(directory / "parsec_python_results.npz")
+            scf = read_archive(directory / "parsec_python_results.npz")
             scf = {key: scf[key] for key in scf.files}
             bands_dat = read_bands_dat(directory / "bands.dat")
             archive = load_band_structure_archive(directory / "parsec_python_bands.npz")
@@ -310,7 +379,7 @@ class BandsFromArchiveTests(unittest.TestCase):
             self.assertEqual(cli_main([str(parsec_in), "--quiet"]), 0)
             first = load_band_structure_archive(directory / "parsec_python_bands.npz")
             scf_log = (directory / "parsec.out").read_text(encoding="utf-8")
-            archive = np.load(directory / "parsec_python_results.npz")
+            archive = read_archive(directory / "parsec_python_results.npz")
             self.assertIn("output_effective_potential_ry", archive.files)
 
             (directory / "parsec_python_bands.npz").unlink()
@@ -338,7 +407,7 @@ class BandsFromArchiveTests(unittest.TestCase):
                 parsec_in.read_text(encoding="utf-8").replace(_PATH, ""), encoding="utf-8"
             )
             self.assertEqual(cli_main([str(no_bands), "--quiet", "--output", "scf.npz"]), 0)
-            archive = np.load(directory / "scf.npz")
+            archive = read_archive(directory / "scf.npz")
             self.assertIn("scf_potential_effective_potential", archive.files)
             self.assertEqual(
                 archive["scf_potential_effective_potential"].shape[0], archive["density_e_per_bohr3"].shape[0]
@@ -364,9 +433,119 @@ class BandsFromArchiveTests(unittest.TestCase):
 
 
 class BandRetryTests(unittest.TestCase):
-    """A CHEBDAV result with a large residual is re-solved with a larger block."""
+    """A k-point whose first solve leaves a large residual is solved again, and the attempts recorded.
+
+    Both eigensolver routes of the band workers go through the re-solve of
+    ``solve_kpoint_bands``: the host CHEBDAV (the CPU backend) again with a block larger by
+    two, and the device-resident first solve of a device worker (``DeviceBlochConverter.eigensolve``,
+    the route of a GPU) again from another random start.  Every run pins its backend: left at
+    the default, a visible GPU takes the k-points on the device-resident route, which never calls
+    the host ``solve_eigval`` that the host case scrambles.
+    """
 
     def test_scrambled_first_attempt_is_retried_and_recorded(self) -> None:
+        from unittest import mock
+
+        from parsec_python.Eigensolvers import solve_eigval as real_solve
+        from parsec_python.driver import prepare_periodic_single_point
+        from parsec_python.Grid import kpoint_sampling
+        from parsec_python.SCF import bands as bands_module
+        from parsec_python.SCF.kpoints import run_scf_kpoints
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        directory = Path(scratch.name)
+        shutil.copy(_AU_POTRE, directory / "Au_POTRE.DAT")
+        (directory / "parsec.in").write_text(
+            _INPUT.format(states=12, so_psp="false", extra="", kpoints=_MP, bands=_PATH),
+            encoding="utf-8",
+        )
+        problem = parse_parsec_input(directory / "parsec.in").problem
+        system = prepare_periodic_single_point(problem)
+        k_points, weights = kpoint_sampling(problem)
+        scf = run_scf_kpoints(system, k_points, weights)
+        potentials = bands_module.band_potentials(scf, "scalar")
+
+        def run(**options):
+            return bands_module.run_band_structure(
+                system,
+                problem.bands,
+                mode="scalar",
+                potentials=potentials,
+                fermi_level=scf.fermi_level,
+                number_of_states=12,
+                **options,
+            )
+
+        # The host route, with one worker: the odd/even count below marks the first attempt of
+        # every k-point only when the k-points are solved one after the other.
+        blocks_used: list[int] = []
+
+        def flaky(operator, requested, *, settings, state):
+            blocks_used.append(settings.chebdav.block_size)
+            solution = real_solve(operator, requested, settings=settings, state=state)
+            if len(blocks_used) % 2 == 1:  # every first attempt returns garbage vectors
+                rng = np.random.default_rng(len(blocks_used))
+                garbage = rng.normal(size=solution.vectors.shape) + 0j
+                garbage /= np.linalg.norm(garbage, axis=0)
+                solution = dataclasses.replace(solution, vectors=garbage)
+            return solution
+
+        with self.subTest(route="host CHEBDAV", backend="cpu"):
+            with mock.patch.object(bands_module, "solve_eigval", flaky):
+                result = run(workers=1, backend="cpu")
+            self.assertTrue(np.all(result.attempts == 2))
+            self.assertEqual(blocks_used[:2], [6, 8])  # first the configured block, then block + 2
+            self.assertLess(result.residual_norms.max(), 2e-2)
+            reference = run(workers=1, backend="cpu")
+            self.assertTrue(np.all(reference.attempts == 1))
+
+        # The device-resident route: the device code on the host everywhere, CuPy on every
+        # visible GPU.  The first attempt of every k-point (attempt 0) returns garbage vectors
+        # with their true residual.
+        try:
+            from parsec_python.acceleration.Hamiltonian.device_bloch import DeviceBlochConverter
+        except ImportError:
+            return
+        real_eigensolve = DeviceBlochConverter.eigensolve
+        attempts_seen: list[int] = []
+
+        def scrambled(converter, hamiltonian, number_of_states, settings, attempt=0):
+            attempts_seen.append(attempt)
+            values, vectors, residual = real_eigensolve(
+                converter, hamiltonian, number_of_states, settings, attempt
+            )
+            if attempt == 0:
+                rng = np.random.default_rng(len(attempts_seen))
+                garbage = rng.normal(size=vectors.shape) + 0j
+                garbage /= np.linalg.norm(garbage, axis=0)
+                applied = hamiltonian.as_linear_operator() @ garbage
+                residual = float(np.max(np.linalg.norm(applied - garbage * values[None, :], axis=0)))
+                vectors = garbage
+            return values, vectors, residual
+
+        routes = [("numpy-device", {"PARSEC_KPOINT_WORKERS": "1"})]
+        if _cupy_visible():
+            routes.append(("cupy", {}))
+        for backend, environment in routes:
+            environment = {"PARSEC_KPOINT_SOLVER": "device", **environment}
+            with self.subTest(route="device-resident", backend=backend), mock.patch.dict(
+                os.environ, environment
+            ):
+                reference = run(backend=backend)
+                self.assertTrue(np.all(reference.attempts == 1))
+                n_k = len(reference.k_points)
+                attempts_seen.clear()
+                with mock.patch.object(DeviceBlochConverter, "eigensolve", scrambled):
+                    retried = run(backend=backend)
+                self.assertTrue(np.all(retried.attempts == 2))
+                # one scrambled first attempt and one fresh start (seed + 1) per k-point
+                self.assertEqual(sorted(attempts_seen), [0] * n_k + [1] * n_k)
+                self.assertLess(retried.residual_norms.max(), 2e-2)
+
+    def test_bands_ff_maxiter_sets_the_chebff_cycles_of_the_band_kpoints(self) -> None:
+        # PARSEC 1.5 calc_bands.f90:336-338: solver%ff_maxiter = bands_ff_maxiter
+        # around the band eigval call, FF_MaxIter for the SCF.
         from unittest import mock
 
         from parsec_python.Eigensolvers import solve_eigval as real_solve
@@ -378,49 +557,53 @@ class BandRetryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             shutil.copy(_AU_POTRE, directory / "Au_POTRE.DAT")
-            (directory / "parsec.in").write_text(
-                _INPUT.format(states=12, so_psp="false", extra="", kpoints=_MP, bands=_PATH),
-                encoding="utf-8",
-            )
+            text = _INPUT.format(states=12, so_psp="false", extra="", kpoints=_MP, bands=_PATH)
+            text = text.replace("Eigensolver: chebdav", "Eigensolver: chebff")
+            (directory / "parsec.in").write_text(text + "Bands_FF_MaxIter 4\n", encoding="utf-8")
             problem = parse_parsec_input(directory / "parsec.in").problem
+            self.assertEqual(problem.bands.ff_maxiter, 4)
             system = prepare_periodic_single_point(problem)
             k_points, weights = kpoint_sampling(problem)
             scf = run_scf_kpoints(system, k_points, weights)
             potentials = bands_module.band_potentials(scf, "scalar")
 
-            blocks_used: list[int] = []
+            cycles: list[int] = []
 
-            def flaky(operator, requested, *, settings, state):
-                blocks_used.append(settings.chebdav.block_size)
-                solution = real_solve(operator, requested, settings=settings, state=state)
-                if len(blocks_used) % 2 == 1:  # every first attempt returns garbage vectors
-                    rng = np.random.default_rng(len(blocks_used))
-                    garbage = rng.normal(size=solution.vectors.shape) + 0j
-                    garbage /= np.linalg.norm(garbage, axis=0)
-                    solution = dataclasses.replace(solution, vectors=garbage)
-                return solution
+            def recording(operator, requested, *, settings, state):
+                cycles.append(settings.chebff.filter_cycles)
+                return real_solve(operator, requested, settings=settings, state=state)
 
-            with mock.patch.object(bands_module, "solve_eigval", flaky):
-                result = bands_module.run_band_structure(
-                    system,
-                    problem.bands,
-                    mode="scalar",
-                    potentials=potentials,
-                    fermi_level=scf.fermi_level,
-                    number_of_states=12,
-                )
-            self.assertTrue(np.all(result.attempts == 2))
-            self.assertEqual(blocks_used[:2], [6, 8])  # first the configured block, then block + 2
-            self.assertLess(result.residual_norms.max(), 2e-2)
-            reference = bands_module.run_band_structure(
-                system, problem.bands, mode="scalar", potentials=potentials,
-                fermi_level=scf.fermi_level, number_of_states=12,
-            )
-            self.assertTrue(np.all(reference.attempts == 1))
+            for bands, expected in (
+                (problem.bands, 4),
+                (dataclasses.replace(problem.bands, ff_maxiter=None), problem.eigensolver.first_filter_cycles),
+            ):
+                cycles.clear()
+                with mock.patch.object(bands_module, "solve_eigval", recording):
+                    bands_module.run_band_structure(
+                        system,
+                        bands,
+                        mode="scalar",
+                        potentials=potentials,
+                        fermi_level=scf.fermi_level,
+                        number_of_states=12,
+                        workers=1,
+                        backend="cpu",
+                    )
+                self.assertEqual(len(cycles), 3)
+                self.assertEqual(set(cycles), {expected})
 
 
 class ParallelBandTests(unittest.TestCase):
-    """Band k-points are independent: workers must not change the bands."""
+    """Band k-points are independent: workers must not change the bands.
+
+    The reference is the readable definition, pinned to the CPU backend with one worker: the
+    host eigensolver, one k-point after the other.  Left at the default backend
+    (``PARSEC_DEVICE=auto``) a visible GPU would take it on the device-resident route, with one
+    worker per GPU whatever ``workers`` says: neither serial nor the route of the host-solver
+    runs it is compared with.  A run on the same eigensolver route reproduces the reference to
+    round-off whatever its workers and device; the device-resident first solve is another
+    algorithm and reaches the same bands to the eigensolver tolerance.
+    """
 
     def test_workers_reproduce_serial_bands_and_report_every_k_point(self) -> None:
         from parsec_python.driver import prepare_periodic_single_point
@@ -463,15 +646,30 @@ class ParallelBandTests(unittest.TestCase):
                 )
                 return result, seen
 
-            serial, seen_serial = bands(workers=1)
+            serial, seen_serial = bands(workers=1, backend="cpu")
             self.assertEqual(serial.k_points.shape[0], 7)
-            # the same computation as the serial run: identical to round-off.  "host" is the route
-            # with the host eigensolver and only the filter on the device.
-            for options, environment in (
-                (dict(workers=3), {}),
-                (dict(workers=2), {}),
-                (dict(backend="numpy-device"), {"PARSEC_KPOINT_SOLVER": "host"}),
-            ):
+            self.assertEqual([index for index, _, _ in seen_serial], list(range(7)))
+            gpu = _cupy_visible()
+
+            def reported_every_k_point(seen):
+                # several workers report in completion order
+                self.assertEqual(sorted(index for index, _, _ in seen), list(range(7)))
+                self.assertTrue(all(count == 7 for _, count, _ in seen))
+
+            # The host eigensolver: the same computation as the serial run, identical to
+            # round-off.  "host" on a device is the route with the host eigensolver and only the
+            # filter on the device; CuPy runs it on every visible GPU.
+            host_routes = [
+                (dict(workers=3, backend="cpu"), {}),
+                (dict(workers=2, backend="cpu"), {}),
+                (
+                    dict(backend="numpy-device"),
+                    {"PARSEC_KPOINT_SOLVER": "host", "PARSEC_KPOINT_WORKERS": "2"},
+                ),
+            ]
+            if gpu:
+                host_routes.append((dict(backend="cupy"), {"PARSEC_KPOINT_SOLVER": "host"}))
+            for options, environment in host_routes:
                 with self.subTest(**options, **environment), mock.patch.dict(os.environ, environment):
                     parallel, seen = bands(**options)
                     np.testing.assert_allclose(
@@ -481,18 +679,40 @@ class ParallelBandTests(unittest.TestCase):
                     np.testing.assert_allclose(
                         parallel.residual_norms, serial.residual_norms, atol=1e-9
                     )
-                    self.assertEqual(sorted(index for index, _, _ in seen), list(range(7)))
-                    self.assertTrue(all(count == 7 for _, count, _ in seen))
-            # the device-resident first solve (CHEBFF, or CHEBFF plus SUBSPACE refinement for
-            # Eigensolver: chebdav) reaches the same bands to the eigensolver tolerance
-            with self.subTest(route="device-resident"), mock.patch.dict(
-                os.environ, {"PARSEC_KPOINT_SOLVER": "device"}
-            ):
-                device, seen = bands(backend="numpy-device")
-                np.testing.assert_allclose(device.eigenvalues, serial.eigenvalues, atol=5e-5)
-                self.assertLess(float(device.residual_norms.max()), 5e-2)
-                self.assertEqual(sorted(index for index, _, _ in seen), list(range(7)))
-            self.assertEqual([index for index, _, _ in seen_serial], list(range(7)))
+                    reported_every_k_point(seen)
+            # The device-resident first solve (CHEBFF, with more CHEBFF cycles to CHEBDAV's
+            # residual test for Eigensolver: chebdav) reaches the same bands to the eigensolver
+            # tolerance: both routes stop at ||H x - e x|| <= Diag_Tolerance * max|e| (3.4e-4 Ry
+            # here; CHEBDAV allows up to twice that for its last states), a test that leaves the
+            # eigenvalues uncertain far above round-off (the two routes differ by 3e-7 Ry on the
+            # top band, the host one 2.9e-7 Ry above the exact level).  Its own runs agree to
+            # round-off whatever the worker count and device.  The host double and CuPy draw
+            # their random start blocks from different generators: two different runs.
+            device_routes = [
+                ("numpy-device", ({"PARSEC_KPOINT_WORKERS": "1"}, {"PARSEC_KPOINT_WORKERS": "3"})),
+            ]
+            if gpu:
+                device_routes.append(
+                    ("cupy", ({"PARSEC_CUPY_DEVICES": "0"}, {"PARSEC_CUPY_DEVICES": "auto"}))
+                )
+            for backend, environments in device_routes:
+                first = None
+                for environment in environments:
+                    environment = {"PARSEC_KPOINT_SOLVER": "device", **environment}
+                    with self.subTest(route="device-resident", backend=backend, **environment), (
+                        mock.patch.dict(os.environ, environment)
+                    ):
+                        device, seen = bands(backend=backend)
+                        np.testing.assert_allclose(device.eigenvalues, serial.eigenvalues, atol=5e-5)
+                        self.assertLess(float(device.residual_norms.max()), 5e-2)
+                        reported_every_k_point(seen)
+                        if first is None:
+                            first = device
+                        else:
+                            np.testing.assert_allclose(device.eigenvalues, first.eigenvalues, atol=1e-9)
+                            np.testing.assert_allclose(
+                                device.residual_norms, first.residual_norms, atol=1e-9
+                            )
 
 
 class BandFileTests(unittest.TestCase):

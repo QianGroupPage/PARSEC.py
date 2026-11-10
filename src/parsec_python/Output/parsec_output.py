@@ -45,6 +45,7 @@ from .correction_output import (
     hubbard_setup_lines,
 )
 from .force_output import force_report_lines
+from .hybrid_output import hybrid_energy_lines, hybrid_finish_lines
 from .kpoint_output import (
     kpoint_generation_lines,
     monkhorst_pack_input_lines,
@@ -186,6 +187,21 @@ def density_symmetrization_lines(reports) -> list[str]:
             f" electron charge after symmetrization: {report.charge_after:10.4f}",
         ]
     return lines
+
+
+def spin_sector_fallback_lines(record) -> list[str]:
+    """``parsec.out`` lines of a :class:`parsec_python.models.SpinSectorFallbackRecord`."""
+
+    return [
+        "",
+        f" NOTE: Spin_Symmetry_Sectors: {getattr(record, 'reason', 'fractional occupations')} after {record.stage}",
+        f"       ({getattr(record, 'measure', 'largest min(f, 1-f)')} = {record.largest_fractional_occupation:.3E}, "
+        f"kept only below {record.tolerance:.0E}).",
+        "       The symmetry sectors cannot hold a density that breaks the point group of the atoms;",
+        "       the calculation starts again on the full grid (Spin_Symmetry_Sectors: off).",
+        *(f"       {line}" for line in record.multiplets),
+        "",
+    ]
 
 
 def dynamic_tolerance_lines(step) -> list[str]:
@@ -363,7 +379,9 @@ def periodic_geometry_lines(system, translation) -> list[str]:
         )
     problem = getattr(system, "input", None)
     cell = getattr(problem, "periodic_cell", None)
-    if cell is not None and any(
+    # (The Fortran-derived routines translate every atom about the cell centre at start, PARSEC 1.5's
+    # back_to_cell, and the preparation into [0, 1): the note is for atoms the input gave outside [0, 1).)
+    if cell is not None and getattr(translation, "atoms_outside_cell", None) is not False and any(
         not np.array_equal(np.asarray(given.position), np.asarray(placed.position))
         for given, placed in zip(problem.atoms, system.atoms)
     ):
@@ -1300,6 +1318,68 @@ def _mixer_lines(mixing) -> list[str]:
     ]
 
 
+def _preconditioner_lines(mixing) -> list[str]:
+    """The line of ``Mixing_Preconditioner`` (PARSEC.py), none at its default."""
+
+    if getattr(mixing, "preconditioner", "none") == "none":
+        return []
+    dielectric = mixing.kerker_dielectric_constant
+    return [
+        " Kerker preconditioner of the residual: P(G) = (G^2 + q0^2/eps)/(G^2 + q0^2),"
+        f" q0 = {mixing.kerker_wavevector:.4g} bohr^-1, eps = "
+        + ("inf" if dielectric == float("inf") else f"{dielectric:.4g}")
+    ]
+
+
+def parsec15_solver_header_lines(eigensolver, scf) -> tuple[str, ...]:
+    """The lines of the PARSEC 1.5 solver options an input sets (none at the defaults).
+
+    The wording of ``usrinputfile.F90`` of 1.5 where 1.5 prints one (Vector
+    Seed, S.M.A.R.T, Scaled Chebyshev, the filter restart); the PARSEC.py
+    extensions say what they select.
+    """
+
+    lines = []
+    seed = getattr(eigensolver, "vector_seed", None)
+    if seed is not None:
+        lines += [" **Vector Seed Specified", f" Vector Seed: {seed:12d}"]
+    if getattr(eigensolver, "exact_state_count", False):
+        lines.append(" Working space of exactly States_Num vectors (Exact_State_Count, PARSEC 1.5)")
+    test = getattr(eigensolver, "first_filter_residual_test", "off")
+    if test != "off":
+        lines.append(
+            " First filter stops when the largest residual is below the diagonalization "
+            f"tolerance ({'stop' if test == 'stop' else 'continue'} after FF_MaxIter cycles)"
+        )
+    if getattr(eigensolver, "scaled_subspace_filter", False):
+        lines.append(" Performing (EXPERIMENTAL) Scaled Chebyshev subspace filtering")
+    rule = getattr(eigensolver, "subspace_lower_bound", "monotone")
+    if rule == "smart":
+        lines.append(" Using (EXPERIMENTAL) S.M.A.R.T adaptive lower filter bound")
+    elif rule == "adaptive":
+        lines.append(" Using the adaptive lower filter bound of PARSEC 1.5 (Smart_Subspace false)")
+    bounds = getattr(eigensolver, "lanczos_bounds", "parsec")
+    if bounds != "parsec":
+        lines.append(
+            f" Lanczos bounds of PARSEC 1.5 ({bounds}), max(degree/2, "
+            f"{getattr(eigensolver, 'lanczos_bound_steps', 10)}) steps"
+        )
+    threshold = getattr(eigensolver, "reorthogonalization_threshold", 0.1)
+    if threshold != 0.1:
+        lines.append(f" Gram-Schmidt reorthogonalization threshold {threshold:8.4f}")
+    after = getattr(scf, "degree_decrease_after", 4)
+    if after != 4:
+        lines.append(f" Chebyshev polynomial degree may decrease after iteration {after:4d}")
+    restart = getattr(eigensolver, "filter_restart", None)
+    if restart is not None:
+        lines += [
+            f" Will restart from scratch after {restart[0]:12d} ionic steps",
+            f" restart_cheb_remained_times {restart[1]:12d}",
+            f" remained_times_atomic_chrg_den {restart[2]:12d}",
+        ]
+    return tuple(lines)
+
+
 def iterative_eigensolver_header_lines(eigensolver) -> tuple[str, ...]:
     """Eigensolver lines of usrinputfile.F90 for ARPACK, DIAGLA and TEST mode."""
 
@@ -1387,10 +1467,19 @@ def fourier_filter_lines(problem) -> tuple[str, ...]:
         getattr(item, "has_fourier_filter", False) for item in species.values()
     ):
         return ()
-    from ..Grid.pbc import adjust_step, uses_general_periodic_grid
+    from ..Grid.pbc import adjust_step, fortran_grid_counts, fortran_orthorhombic_counts
 
-    if uses_general_periodic_grid(cell, problem.grid):
-        # grid%step(1) of Fortran's general grid (adjust_step).
+    if getattr(problem.grid, "fortran_routines", False):
+        counts = fortran_orthorhombic_counts(cell, problem.grid)
+        if counts is None:
+            # grid%step(1) of Fortran's general grid (adjust_step with the space group's translations).
+            spacing = float(fortran_grid_counts(cell, problem.grid)[1][0])
+        else:
+            # the one spacing L_0/n_0 of the orthorhombic grid (Fortran's counts)
+            side = float(np.diag(cell.lattice_vectors)[0])
+            spacing = side / float(counts[0])
+    elif _round_rule_general(cell, problem.grid):
+        # (Andrew Grieder's grid: the lines as they have been printed.)
         spacing = adjust_step(
             float(np.linalg.norm(cell.lattice_vectors[0])), problem.grid.spacing
         )[1]
@@ -1415,7 +1504,26 @@ def fourier_filter_lines(problem) -> tuple[str, ...]:
     return tuple(lines)
 
 
-def _correlation_lines(scf) -> list[str]:
+def _round_rule_general(cell, settings, tolerance: float = 1.0e-6) -> bool:
+    """The test of ``uses_general_periodic_grid`` before PARSEC 1.5's parity round (``round(L/h)`` points), which
+    the Fourier-filter lines of Andrew Grieder's grids keep."""
+
+    from ..Grid.cell import is_diagonal_lattice
+
+    vectors = cell.lattice_vectors
+    if not is_diagonal_lattice(vectors):
+        return True
+    sides = np.diag(vectors)
+    if np.any(sides <= 0.0):
+        return True
+    counts = np.round(sides / settings.spacing).astype(np.int64)
+    if np.any(counts <= 2 * settings.stencil_half_width):
+        return True
+    steps = sides / counts
+    return not np.allclose(steps, steps[0], rtol=tolerance)
+
+
+def _correlation_lines(scf, periodic: bool = False) -> list[str]:
     """The functional lines under "Correlation data" (usrinputfile.F90:2330-2361).
 
     CA and PBE keep the lines this report has always had (PBE is named
@@ -1426,6 +1534,24 @@ def _correlation_lines(scf) -> list[str]:
     """
 
     functional = scf.xc_functional
+    if getattr(scf, "is_hybrid", False):
+        from .hybrid_output import hybrid_correlation_lines
+
+        return hybrid_correlation_lines(scf, periodic=periodic) if periodic else hybrid_correlation_lines(scf)
+    if getattr(scf, "is_libxc", False):
+        from ..V_xc.libxc import libxc_citation_lines
+
+        lines = [f" Exchange-Correlation functional is {functional}", *libxc_citation_lines(functional)]
+        if getattr(scf, "is_meta_gga", False):
+            from ..V_xc.meta_gga import meta_gga_lines
+
+            # tau and the form of the density gradient (the lines of the native SCAN after its name).
+            lines += meta_gga_lines(scf)[2:]
+        return lines
+    if getattr(scf, "is_meta_gga", False):
+        from ..V_xc.meta_gga import meta_gga_lines
+
+        return meta_gga_lines(scf)
     if functional == "ca":
         return [
             " Exchange-Correlation functional is ca",
@@ -1799,6 +1925,8 @@ class ParsecTextReporter:
                 else ()
             ),
             f" Buffer size in subspace is {eigensolver.subspace_buffer:6d}",
+            # The PARSEC 1.5 solver options of the input (none by default).
+            *parsec15_solver_header_lines(eigensolver, scf),
             "",
             " Mixer data:",
             " -----------",
@@ -1826,10 +1954,11 @@ class ParsecTextReporter:
                 )
             ),
             *_mixer_lines(mixing),
+            *_preconditioner_lines(mixing),
             "",
             " Correlation data:",
             " -----------------",
-            *_correlation_lines(scf),
+            *_correlation_lines(scf, periodic=self.problem.periodic_cell is not None),
             # Only where Energy_Refinement asks for it.
             *(
                 ()
@@ -1935,7 +2064,8 @@ class ParsecTextReporter:
                         else "  pseudopotential format : new Martins"
                     ),
                     f"  pseudopotential file   : {potential.source}",
-                    # pseudo.f90 warns and goes on; CA and PBE refuse the file.
+                    # pseudo.f90 warns and goes on; CA and PBE refuse the file (but a CA file
+                    # in a PBE run, as PARSEC 1.5's Tier_xc inputs have).
                     *(
                         ()
                         if pseudopotential_matches_functional(
@@ -2125,6 +2255,10 @@ class ParsecTextReporter:
                 for second in range(periodicity):
                     if first != second and abs(metric[first, second]) > 0.0:
                         shift[first] = 0.0
+        requested = getattr(translation, "grid_shift", None)
+        if requested is not None:
+            # PARSEC 1.5's Grid_Shift block: the shift of the grid (the rule above without it)
+            shift = [float(value) for value in problem.grid.shift]
         relaxation = getattr(translation, "relaxation", None)
         mode = symmetry_search_mode(
             ignore_symmetry=ignore,
@@ -2341,10 +2475,24 @@ class ParsecTextReporter:
             self.iteration_spin_polarized(step)
             return
         # (The spinor records also carry diagonalization_seconds now: test the type.)
-        from ..models import SelfConsistentSOCIteration
+        from ..models import (
+            ExchangeLoopIteration,
+            SelfConsistentSOCIteration,
+            SpinSectorFallbackRecord,
+        )
 
         if isinstance(step, SelfConsistentSOCIteration):
             self.iteration_self_consistent_soc(step)
+            return
+        if isinstance(step, SpinSectorFallbackRecord):
+            # Spin_Symmetry_Sectors: the sector run is not kept.
+            self.write("\n".join(spin_sector_fallback_lines(step)))
+            return
+        if isinstance(step, ExchangeLoopIteration):
+            # An outer (Fock) iteration of a hybrid functional.
+            from .hybrid_output import exchange_loop_lines
+
+            self.write("\n".join(exchange_loop_lines(step)))
             return
         self._diagonalization_total += step.diagonalization_seconds
         self._hartree_total += step.hartree_seconds
@@ -2452,6 +2600,8 @@ class ParsecTextReporter:
                 ),
                 # LDA+U Energy where it is not zero (totnrg.f90).
                 *energy_correction_lines(energies),
+                # A hybrid functional: its exact exchange.
+                *hybrid_energy_lines(energies),
             ]
         )
         if self._previous_total is not None:
@@ -2606,6 +2756,8 @@ class ParsecTextReporter:
         lines = [
             # The TS report of parsec.F90 after convergence (Van_Der_Waals).
             *dispersion_report_lines(result),
+            # A hybrid functional: the energies of the Fock loop.
+            *hybrid_finish_lines(result),
             status,
             "",
             (
@@ -2660,7 +2812,9 @@ class ParsecTextReporter:
         timings = getattr(result, "timings", None)
         if timings is not None:
             preparation = timings.preparation
-            xc_timing_name = XC_DISPLAY_NAMES[self.problem.scf.xc_functional]
+            xc_timing_name = XC_DISPLAY_NAMES.get(
+                self.problem.scf.xc_functional, self.problem.scf.xc_functional.upper()
+            )
             initial_hamiltonian_total = (
                 preparation.finite_difference_seconds
                 + preparation.local_ionic_seconds
@@ -2955,9 +3109,11 @@ class ParsecTextReporter:
             ("worker_upload_seconds", "Operator upload"),
             ("worker_solve_seconds", "Eigensolver"),
             ("worker_spill_seconds", "Subspace to the host"),
+            ("worker_restore_seconds", "Subspace back to the device"),
             ("worker_download_seconds", "Eigenvectors to the host"),
             ("worker_density_seconds", "Density of the k-points"),
             ("worker_gather_seconds", "Density joined over the MPI ranks"),
+            ("worker_pool_wait_seconds", "Waiting for the other pools"),
             ("worker_halo_begin_seconds", "Halo rows packed and sent (rank 0)"),
             ("worker_halo_wait_seconds", "Waiting for the halo rows (rank 0)"),
             ("worker_allsum_seconds", "Projector overlaps summed over ranks (rank 0)"),
@@ -2979,6 +3135,43 @@ class ParsecTextReporter:
             lines.append(" Device eigensolver [worker-sec]")
             for key, label in present:
                 lines.append(f"   {label:28s} : {detail[key]:12.6f}")
+        # the MPI k-point pools (acceleration/SCF/kpoint_pools.py): this rank's share of the exchanges
+        # inside the orthonormalization and Rayleigh-Ritz steps above, and the plan of the pools
+        exchanges = (
+            ("pool_to_rows_seconds", "Columns to rows (Alltoallv)"),
+            ("pool_to_columns_seconds", "Rows to columns (Alltoallv)"),
+            ("pool_reduce_seconds", "Sums over the pool"),
+            ("pool_broadcast_seconds", "Root's factors broadcast"),
+        )
+        present = [(key, label) for key, label in exchanges if key in detail]
+        if present:
+            lines.append(" Of which exchanges in the pool (rank 0) [sec]")
+            for key, label in present:
+                lines.append(f"   {label:28s} : {detail[key]:12.6f}")
+        if "pools" in detail:
+            lines.append(
+                f" {'MPI k-point pools':30s} : {int(detail['pools']):12d}"
+                f"   ({int(detail.get('pool_ranks', 0))} rank(s), {int(detail.get('pool_tasks', 0))} task(s) on rank 0)"
+            )
+            lines.append(
+                f" {'Estimate per GPU [GB]':30s} : {detail.get('pool_estimate_bytes', 0.0) / 1e9:12.3f}"
+                f"   (operator data {detail.get('pool_static_bytes', 0.0) / 1e9:.3f} GB per task,"
+                f" sent {detail.get('pool_sent_bytes', 0.0) / 1e9:.3f} GB)"
+            )
+            if detail.get("pool_reserved_bytes"):
+                lines.append(
+                    f" {'Device memory pool (rank 0) [GB]':30s} : {detail['pool_reserved_bytes'] / 1e9:12.3f}"
+                    + (
+                        f"   ({int(detail.get('pool_resident', 0))} subspace(s) on the device, the others on the host)"
+                        if detail.get("pool_host_storage")
+                        else ""
+                    )
+                )
+            if detail.get("pool_host_peak_bytes"):
+                lines.append(
+                    f" {'Host memory (rank 0) [GB]':30s} : {detail['pool_host_peak_bytes'] / 1e9:12.3f}"
+                    f"   (peak; {detail.get('pool_host_setup_bytes', 0.0) / 1e9:.3f} GB after the preparation)"
+                )
         counters = (
             ("first_solves", "First solves"),
             ("subspace_steps", "Subspace steps"),
@@ -3014,6 +3207,8 @@ class ParsecTextReporter:
         lines = [
             # The TS report of parsec.F90 after convergence (Van_Der_Waals).
             *dispersion_report_lines(result),
+            # A hybrid functional: the energies of the Fock loop.
+            *hybrid_finish_lines(result),
             status,
             "",
             f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",
@@ -3248,6 +3443,8 @@ class ParsecTextReporter:
         lines = [
             # The TS report of parsec.F90 after convergence (Van_Der_Waals).
             *dispersion_report_lines(result),
+            # A hybrid functional: the energies of the Fock loop.
+            *hybrid_finish_lines(result),
             status,
             "",
             f"Time for self-consistent field [sec] : {elapsed_seconds:10.2f}",

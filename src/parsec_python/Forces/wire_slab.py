@@ -296,12 +296,19 @@ def wire_slab_kpoint_nonlocal_forces(system, result) -> np.ndarray:
     ``F_a = 4 sum_k w_k sum_n f_nk sum_(q on a) s_q Re[conj(<beta_qk|u_nk>) <grad beta_qk|u_nk>]``
     with the Bloch-phase projectors of
     :func:`parsec_python.V_ion.build_nonlocal_projectors` and their gradients
-    (:func:`wire_slab_projector_gradients`).  The k-point SCF keeps no
-    orbitals, so each k-point is diagonalized once more with the potential the
+    (:func:`wire_slab_projector_gradients`).  A semilocal k-point SCF need not
+    keep its orbitals, so each k-point is diagonalized once more with the potential the
     converged loop returns (``input_effective_potential``), by CHEBDAV to a
     residual of :data:`KPOINT_FORCE_TOLERANCE`; the occupations are those of
     the result, state by state.  At self-consistency this is the eigenproblem of the loop to the
     convergence of the potential.
+
+    A hybrid functional (a result with ``exact_exchange``, from
+    :func:`parsec_python.SCF.hybrid_periodic.run_periodic_hybrid_scf`) has an
+    exchange operator that ``input_effective_potential`` does not hold: its
+    forces read the Bloch factors of the last inner loop (``k_wavefunctions``,
+    always kept there), as the spin-polarized forces do
+    (:func:`wire_slab_spin_kpoint_nonlocal_forces`).
     """
 
     from ..Eigensolvers import solve_eigval
@@ -318,16 +325,26 @@ def wire_slab_kpoint_nonlocal_forces(system, result) -> np.ndarray:
     count = k_points.shape[0]
     occupations = np.asarray(result.occupations, dtype=np.float64).reshape(count, -1)
     states = occupations.shape[1]
-    potential = np.asarray(result.input_effective_potential, dtype=np.float64)
-    # The nonlocal force is not variational in the orbitals: their error
-    # enters to first order, so the re-solve is a tight CHEBDAV whatever the
-    # solver of the loop.
-    base = _eigval_settings(system, system.input.eigensolver.filter_degree)
-    settings = replace(
-        base,
-        initial_method="chebdav",
-        chebdav=replace(base.chebdav, convergence_tolerance=KPOINT_FORCE_TOLERANCE),
-    )
+    kept = None
+    if getattr(result, "exact_exchange", None) is not None:
+        # A hybrid: the eigenproblem of the loop has the exchange operator, so its own orbitals.
+        kept = getattr(result, "k_wavefunctions", None)
+        if kept is None:
+            raise ValueError(
+                "the k-point result of a hybrid functional holds no orbitals (k_wavefunctions): "
+                "its forces need the Bloch factors of the Fock loop"
+            )
+    else:
+        potential = np.asarray(result.input_effective_potential, dtype=np.float64)
+        # The nonlocal force is not variational in the orbitals: their error
+        # enters to first order, so the re-solve is a tight CHEBDAV whatever the
+        # solver of the loop.
+        base = _eigval_settings(system, system.input.eigensolver.filter_degree)
+        settings = replace(
+            base,
+            initial_method="chebdav",
+            chebdav=replace(base.chebdav, convergence_tolerance=KPOINT_FORCE_TOLERANCE),
+        )
     forces = np.zeros((len(atoms), 3), dtype=np.float64)
     for index, k_point in enumerate(k_points):
         occupied = np.flatnonzero(occupations[index] != 0.0)
@@ -343,13 +360,16 @@ def wire_slab_kpoint_nonlocal_forces(system, result) -> np.ndarray:
         )
         if operator.projectors.shape[1] == 0:
             continue
-        hamiltonian = KPointKohnShamHamiltonian(
-            system.negative_laplacian, system.gradient, potential, operator, k_point
-        )
-        solution = solve_eigval(
-            hamiltonian.as_linear_operator(), states, settings=settings, state=None
-        )
-        vectors = np.asarray(solution.vectors)[:, occupied]
+        if kept is not None:
+            vectors = np.asarray(kept[index])[:, occupied]
+        else:
+            hamiltonian = KPointKohnShamHamiltonian(
+                system.negative_laplacian, system.gradient, potential, operator, k_point
+            )
+            solution = solve_eigval(
+                hamiltonian.as_linear_operator(), states, settings=settings, state=None
+            )
+            vectors = np.asarray(solution.vectors)[:, occupied]
         gradients = wire_slab_projector_gradients(
             system.grid, atoms, system.pseudopotentials, specifications, k_point=k_point
         )
@@ -537,7 +557,9 @@ def _spin_kpoint_force_fields(result):
         + (np.asarray(potentials["potential_down"]) - np.asarray(inputs[1]))
     )
     xc = 0.5 * (np.asarray(xc_channels[0]) + np.asarray(xc_channels[1]))
-    return density, residual, xc, np.asarray(hartree_potential)
+    from .periodic import meta_gga_core_potential
+
+    return density, residual, meta_gga_core_potential(result, xc), np.asarray(hartree_potential)
 
 
 def compute_wire_slab_forces(system, result, *, symmetrize: bool = True, operations=None) -> WireSlabForceResult:
@@ -547,7 +569,8 @@ def compute_wire_slab_forces(system, result, *, symmetrize: bool = True, operati
     and ``result`` its SCF result: a Gamma-point result with full-grid
     orbitals (also collinear spin through
     :func:`parsec_python.SCF.run_spin_scf`), an unpolarized k-point result
-    (:func:`wire_slab_kpoint_nonlocal_forces`) or a collinear spin k-point
+    (:func:`wire_slab_kpoint_nonlocal_forces`; a hybrid's reads its kept
+    orbitals) or a collinear spin k-point
     result with its orbitals (:func:`wire_slab_spin_kpoint_nonlocal_forces`).
     As ``forcnloc.f90``: with ``symmetrize`` the forces are averaged over
     ``operations`` (default :func:`wire_slab_symmetry_operations`: the space
@@ -573,7 +596,9 @@ def compute_wire_slab_forces(system, result, *, symmetrize: bool = True, operati
         # As compute_forces: the total density, and the channel averages of the
         # potential difference and of V_xc for a spin-polarized result.
         density = np.asarray(result.density)
-        xc = np.asarray(result.xc_potential)
+        from .periodic import meta_gga_core_potential
+
+        xc = meta_gga_core_potential(result, np.asarray(result.xc_potential))
         residual = np.asarray(result.output_effective_potential) - np.asarray(
             result.input_effective_potential
         )

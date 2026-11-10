@@ -178,8 +178,12 @@ class DeviceRouteTests(unittest.TestCase):
                     np.testing.assert_allclose(levels[backend], levels["cpu"], atol=1e-6)
 
     def test_ylm_dos_eigen_dat_and_bands_of_a_kpoint_scf_on_the_device(self) -> None:
+        # The grid from the origin (Ignore_Symmetry): the H2 bands of this box are so flat that their tetrahedra
+        # fill about ten of the 1800 values of the DOS file, and on the grid half a step off the origin (Fortran's
+        # without Ignore_Symmetry since PARSEC 1.5's parity round) a single one, too few for the comparison below.
         extra = (
             MP.format(nz=1)
+            + "Ignore_Symmetry: .true.\n"
             + "Create_DOS: .true.\nDOS_Pnum: 200\nYLM_DOS_L: 1\nylm_dos_cutoff: 1.2\n"
             + "Output_Eigenvalues: .true.\nSave_Intermediate_Eigenvalues: .true.\n"
             + "Output_All_States: .true.\n"

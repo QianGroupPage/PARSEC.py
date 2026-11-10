@@ -161,9 +161,10 @@ python src\parsec_python\main.py parsec.in --device cpu --threads all
 ```
 
 `--gpus` or `--gpu-ids` alone asks for a GPU run. `--threads` sets the team
-of the C++/OpenMP kernels (setup and Hartree on a GPU run, the whole solver
-on a CPU run with the native extension); the BLAS of NumPy keeps its own
-variables (`OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`).
+of the C++/OpenMP kernels (setup and the Hartree boundary on a GPU run, whose
+Hartree conjugate gradients run on the GPU since 2026-11-07, and the whole
+solver on a CPU run with the native extension); the BLAS of NumPy keeps its
+own variables (`OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`).
 
 What ran is at the top of `parsec.out`, and `--dry-run` prints the same plan
 without starting a calculation:
@@ -391,8 +392,8 @@ not a guarantee of a completely cold GPU runtime.
 
 ### 5. Several GPUs and several nodes
 
-`scripts/run_multi_gpu_scf.sh` runs one SCF calculation of an isolated system
-(the runner refuses periodic cells) on the GPUs of one node or of several
+`scripts/run_multi_gpu_scf.sh` runs one SCF calculation of an isolated system,
+or of a bulk cell at the Gamma point, on the GPUs of one node or of several
 nodes, one MPI rank per node, with the launch settings the multi-GPU solver
 was measured with (1 to 16 A100 80 GB GPUs). Most of these settings are not
 defaults of the code: started without them, a calculation takes slower
@@ -410,8 +411,21 @@ without point-group symmetry, such as molecular dynamics, has a single
 symmetry sector; on several nodes add `--rank-per-gpu`, which starts one rank
 per GPU that share its orbitals (C1653H508 MD: 40.5 s per step on one node,
 23.0 s on four).
-`src/parsec_python/acceleration/MULTI_GPU.md` ("Several nodes") lists the
-settings and says which ones the solver chooses for itself.
+
+A bulk cell (`Boundary_Conditions: bulk`) runs at the Gamma point with real
+orbitals, an orthorhombic cell, no spin and a native LDA or GGA, as one
+sector whose orbitals all ranks share; on several nodes launch it with
+`--rank-per-gpu` (bulk diamond with 5,832 atoms: 308 s on 16 A100,
+`examples/3d_diamond_benchmark`). K-points of a cell run under
+`python -m parsec_python.main parsec.in --mpi` (k-point pools, "Several GPUs
+and nodes for one large eigenproblem (MPI)" below); spin, hybrids,
+meta-GGAs, oblique cells, wires, slabs and the forces of a cell go to
+`main.py`, and the runner refuses them by name. A spin-polarized cluster
+runs its single point on several ranks; its forces, relaxation and
+molecular dynamics need one rank (`--serial-control`) or `main.py`.
+`src/parsec_python/acceleration/MULTI_GPU.md` ("Several nodes", "Periodic
+cells at the Gamma point on several nodes") lists the settings and says
+which ones the solver chooses for itself.
 
 ### Troubleshooting
 
@@ -490,7 +504,10 @@ Atomic_Energy_Correction: -572.190341 Ry
 
 `Local_Component` is the channel that passed the ghost-state test; do not
 replace it by another one without testing. Use `Correlation_Type: pbe` with
-the potentials of `PBE/` and `Correlation_Type: ca` with those of `CA/`.
+the potentials of `PBE/` and `Correlation_Type: ca` with those of `CA/`; the
+self-consistent hybrid functionals (`pbe0`, `hse06`, `b3lyp`, `hf`, ...; see
+[the package guide](src/parsec_python/README.md#self-consistent-hybrid-functionals))
+read those of `PBE/`.
 
 ### Generating further potentials
 
@@ -582,11 +599,76 @@ factor (the Gaussian width is chosen so the series ends below the Nyquist freque
 it exact on the grid). The 864-atom cell is prepared in about a minute. The potential equals the direct sum
 once that sum is converged; the direct sum at its default tolerance leaves out images that still contribute a
 few 1e-6 Ry, so the two differ by that much (`acceleration/tests/test_periodic_setup.py`). Both replacements
-are for the orthorhombic grid with one spacing; Fortran's general grid (oblique cells, a step per lattice
-direction, the 0.5 shift) and the wire/slab grids keep the direct scan and the direct Ewald sum. Where the FFT
+are for the orthorhombic grid with one spacing (with its shift, 0.5 steps unless `Ignore_Symmetry` or the
+`Grid_Shift` block of PARSEC 1.5: the index boxes and the FFT phases follow it); Fortran's general grid (oblique
+cells, a step per lattice direction) and the wire/slab grids keep the direct scan and the direct Ewald sum. Where the FFT
 potential is used, the periodic local forces differentiate the converged Ewald sum
 (`V_ion.ewald.local_potential_tolerance`), so that they stay the derivative of the energy the SCF computed (with
 the default truncation they missed about 1e-7 Ry/bohr in a Si2 cube and 5e-7 in the Si8 cube).
+
+Since 8 November 2026 the other parts of the preparation scale to thousands of atoms as well (bulk diamond,
+`examples/3d_diamond_benchmark/profile_setup.py`, one A100 node, the stages of `prepare_periodic_single_point`):
+
+- **Ewald ion-ion energy and forces** (`V_ion/ewald.py: ewald_ion_ion_terms`): the real-space terms over the atom
+  pairs within the cutoff (a k-d tree of the images of the atoms within the cutoff of the cell, any cell shape) and
+  the reciprocal terms from the structure factors on a box of reciprocal vectors (a product of one phase factor per
+  lattice direction, one matrix product per block of atoms), with the Ewald parameter of least estimated cost and
+  both truncations at 1e-18. 4,096 atoms: 0.5 s instead of 197 s for the sum over every translation and atom pair,
+  the same energy to 6e-14 relative (the old sum's own truncation).
+- **Projectors**: one radial spline per species and channel (it was rebuilt for every image) and only the images
+  whose support reaches the grid: the same operator, 10 times faster.
+- **Local ionic potential**: the image balls of the atoms on worker threads (`PARSEC_PERIODIC_SETUP_THREADS`, else
+  `OMP_NUM_THREADS`), added in the batches of the single-thread loop: the same potential bit for bit.
+- **Atomic densities** (the SAD start and the core density of an orthorhombic bulk cell): on the GPU where one is
+  usable (`acceleration/V_ion/periodic_device.py: device_bulk_atomic_density`), every grid point adding its terms in
+  the order and with the floating-point operations of the host's image blocks (no fused multiply-add): the same
+  density bit for bit (`--device cpu` keeps the host sum).
+- **Gradient matrices** (the `-2 i k.grad` term of k-points, band structures, meta-GGAs) are built where they are
+  read (`SCF.pbc.LazyGradient`): a Gamma-point run never holds them.
+
+Bulk diamond on one A100 node (CPUs shared with other runs): 2,744 atoms, 2.0 M points 102 s -> 26 s; 4,096 atoms,
+3.0 M points 297 s -> 37 s (before the device densities), of which the atomic density 18 s, the local potential 9 s,
+the finite-difference matrices 7 s, the projectors 3 s and the Ewald energy 0.5 s; a rank that shares the basis
+(projectors and Laplacian only) 34 s -> 7 s.
+
+## Averages of the potential of a periodic cell
+
+A 3-D periodic cell takes PARSEC 1.5's two conventions for the constant parts of its potential (since 8 November 2026):
+
+- **The local ionic potential has a zero average.** PARSEC builds it in G space without its `G = 0` term
+  (`ionpbc.f90`: `vionz(1) = 0`) and puts the average into the energy, `E_alpha = (N_e/Omega) sum_a alpha_a` with
+  `alpha_a = int (V_a + 2 Z/r) d^3r`. This code keeps its real-space Ewald split as the construction
+  (`Periodic_Local_Potential: g_space` is Fortran's) and removes the average of the split
+  (`SCF.pbc.zero_average_local_potential`), `sum_a alpha_a/V - 2 Z_tot/V^(1/3)`: its Ewald parameter
+  `sqrt(pi)/V^(1/3)` shrinks with the cell, and the average was -9.5 n^2 Ry for n^3 conventional cells of
+  diamond (-37 Ry for 64 atoms, -608 Ry for 4,096), with all the eigenvalues. The energy takes Fortran's
+  `E_alpha` (the `Alpha Energy` of the report) in place of the term that cancelled that constant. On the grid the
+  average is zero up to the sampling of the short-ranged pieces (4e-4 Ry for carbon at 18 points per 3.567 A).
+- **`Zero_Average_Vxc`** (PARSEC's `potshift`, the average of `V_xc` removed at every evaluation) is the default
+  of an unpolarized collinear 3-D cell; `Zero_Average_Vxc: .false.` restores the earlier potential. A
+  spin-polarized cell keeps it off unless the input asks for it (each channel losing its own average moves the
+  channels against each other: other occupations and another energy of a magnetic cell); wires and slabs never
+  take it (Fortran applies it for `pbc%per == 3` only).
+
+Neither changes the total energy, the density or the forces: the band energy loses `N_e` times each average and
+the double-counting terms give it back (bulk diamond, 8 atoms: the total energy within 2.4e-13 Ry and the same 17
+SCF iterations; the density within 2e-9, the SCF path). The eigenvalues and the Fermi level lose both averages
+(+10.30 Ry for those 8 atoms: 9.35 from the local potential, 0.95 from `V_xc`) and now compare with Fortran's.
+Outputs written before the change print the earlier eigenvalues, and a `parsec.dat` written before it holds a
+potential with the earlier constants.
+
+## SCF of large bulk cells
+
+A bulk cell takes `Smart_Subspace: .true.` by default (since 8 November 2026; `Subspace_Lower_Bound: monotone`
+restores the earlier PARSEC's rule, `Smart_Subspace: .false.` selects PARSEC 1.5's adaptive one).  PARSEC's later-SCF filter clips its lower bound at
+0 Ry, which suits clusters (their unwanted states start near the vacuum level) but not a bulk cell, whose
+eigenvalues lay tens of Ry below 0 with this code's periodic potential before its averages were removed (bulk
+diamond: -37 Ry at 64 atoms, -84 Ry at 216; [Averages of the potential of a periodic cell](#averages-of-the-potential-of-a-periodic-cell)): the filter then barely separates the occupied states from the conduction band, and the SCF test is met
+while the energy is still far off (512 atoms: 65 iterations, 4.9 mRy/atom high; 1,000 atoms: 104 iterations, 13.9
+mRy/atom high).  PARSEC 1.5's smart bound gives 8, 10, 16 and 17 iterations for 64, 216, 512 and 1,000 atoms, within
+0.002 mRy/atom of the converged energy.  A Kerker-type preconditioner of the
+mixing (`Mixing_Preconditioner: kerker`, opt-in) is available for periodic cells; see
+[the package README](src/parsec_python/README.md#bulk-cells-the-subspace-lower-bound) for both.
 
 ## Parallel k-points, band paths and GPUs (periodic systems)
 
@@ -610,7 +692,7 @@ or the environment variables `PARSEC_KPOINT_WORKERS` (`auto` or a number; `auto`
 single k-point and for small grids) and `PARSEC_KPOINT_BACKEND` (`cpu`, `cupy`, `auto`, `numpy-device`; an explicit override of `--device`).
 The workers are threads of one process, as in the multi-GPU solver (there is no `fork`, which is
 unsafe after the native OpenMP kernels or a CUDA context exist); the NumPy/SciPy/BLAS kernels release
-the GIL, and each worker runs a single-threaded BLAS (a multi-threaded BLAS called from several threads at once gave wrong eigenpairs; the BLAS thread count is restored when the pool closes). The sparse Bloch operators are
+the GIL, and each worker runs a single-threaded BLAS (a multi-threaded BLAS called from several threads at once gave wrong eigenpairs on Linux and an access violation on Windows; every BLAS library gets its former thread count back when the pool closes, so an `OPENBLAS_NUM_THREADS` of the launch is kept; the libraries are found on Linux and Windows, not on macOS). The sparse Bloch operators are
 memory-bandwidth bound, so the gain depends on the machine: 2.9x for 8 workers and 1.9x for 4 on a
 4-P-core + 8-E-core laptop (4-atom Co, 28^3 grid, 44 spinor states, 8 k-points, 3 SCF iterations),
 more on a server with more memory channels. Memory grows with the number of workers only through
@@ -630,8 +712,12 @@ converged first solve serves every k-point of a band path, with the existing ret
 start when the residual stays above the band tolerance. The eigenvectors come to the host only to form
 the density. If the subspaces of a worker's k-points would take more than 75% of the device memory they
 stay on the host between solves (`PARSEC_KPOINT_STATE_STORAGE=auto|device|host`).
+This device eigensolver is another path to the same SCF, so it agrees with the CPU to the convergence of
+the SCF, not to round-off: on A100 with `Convergence_Criterion` 2e-5 (a gold cell, four k-points, the five
+drivers) the total energy within 3e-10 Ry and the eigenvalues within 1.1e-5 Ry, with 2e-3 the
+eigenvalues within 5.1e-4 Ry, after a different number of SCF steps at times.
 `PARSEC_KPOINT_SOLVER=host` restores the former route (host eigensolver, only the filter on the
-device); `Eigensolver: arpack` and `diagla` always take that route (they are host eigensolvers; the device
+device), which equals the CPU to round-off; `Eigensolver: arpack` and `diagla` always take that route (they are host eigensolvers; the device
 solver implements CHEBFF and CHEBDAV), and `Dynamic_Diag_Tol` hands the tolerance of every iteration to the
 device workers (the residual test of the converged first solve). LDA+U keeps the k-point eigenproblems on the
 CPU workers (the device operator has no LDA+U term). The k-point drivers print an `SCF timing analysis` (initial potentials, diagonalization,
@@ -695,7 +781,10 @@ A `bandstruc` block adds a non-self-consistent band structure after the SCF, as 
 Fortran PARSEC's `calc_bands`. Each line is a path segment in *relative*
 (reciprocal-lattice) coordinates followed by a label, and `bandstruc_points` is the number of
 k-points on the shortest segment (default 20); longer segments get proportionally more, so the
-density along the path is constant:
+density along the path is constant. Without the keyword a segment's share is truncated to an
+integer, as before; a written `bandstruc_points` rounds it to the nearest integer, as PARSEC 1.5
+does (1.5's own default is 100). `Bands_FF_MaxIter` (PARSEC 1.5) sets the CHEBFF filter cycles of
+the band k-points (default `FF_MaxIter`):
 
 ```
 begin bandstruc
@@ -749,7 +838,9 @@ Outputs (written next to `parsec.in`):
   eigensolver returned it. For a Rashba or Dresselhaus system the bands are non-degenerate away from the
   time-reversal-invariant points and carry a well-defined spin texture.
 
-Plot the spin texture (bands coloured by `<S_x>`, `<S_y>`, `<S_z>`, energies relative to the Fermi level):
+The plots below need matplotlib, which is not among the requirements (`python -m pip install matplotlib`);
+the files above are written without it. Plot the spin texture (bands coloured by `<S_x>`, `<S_y>`, `<S_z>`,
+energies relative to the Fermi level):
 
 ```bash
 python -m parsec_python.Output.bands --spin parsec_python_bands.npz --components xyz \
@@ -860,34 +951,108 @@ parameter `Use_Fortran_Routines` chooses:
   default is the Fortran-derived routines (parsec.out names that default in its routines line):
   - slabs (`Boundary_Conditions: slab`);
   - a shifted Monkhorst-Pack grid of a bulk cell (`Monkhorst_Pack_Shift`);
+  - a `Kpoint_List` of unequal weights of a bulk cell (Andrew Grieder's routines refused it before 8 November 2026;
+    with `.false.` they take it now, see "Irreducible k-points on the default routines");
   - forces, a relaxation or molecular dynamics of a bulk cell at the Gamma point (no k-point input), with or
     without spin polarization, where the orthorhombic grid of the Fortran-derived routines has the points of
-    Andrew Grieder's grid (the same counts and steps, no shift: `Ignore_Symmetry`, sides that `round(L/h)`
-    divides into an even number of points) and every species uses `Cubic_Spline` (his local potential is the
-    cubic spline), so that the run with forces has the energy of the run without them: the accelerated path of
-    the Fortran-derived routines is 2.5-5 times faster there, and their forces are the derivative of their
-    energy. In practice that is `Ignore_Symmetry` inputs with spline species; widening it needs the orthorhombic
-    grid of the Fortran-derived routines to be Fortran's and the same local potential;
+    Andrew Grieder's grid (the same counts, steps and shift) and every species uses `Cubic_Spline` (his local
+    potential is the cubic spline), so that the run with forces has the energy of the run without them: the
+    accelerated path of the Fortran-derived routines is 2.5-5 times faster there, and their forces are the
+    derivative of their energy. Since the parity round of PARSEC 1.5 both orthorhombic grids are Fortran's
+    (`adjust_step`'s even number of points, half a step off the origin unless `Ignore_Symmetry`), so this holds
+    for cells with and without symmetry; the grids differ where the space group's fractional translations
+    change the number of points (Andrew Grieder's grid has no space group) and where a side is an even multiple
+    of the spacing only up to round-off (PARSEC 1.5's slack of `adjust_step`);
   - a bulk cell on Fortran's general grid whose space group's fractional translations change the number of grid
     points (diamond in the fcc cell: 16 points per vector at a spacing of 0.4 bohr, against 18 without the space
     group), in a run with k-points, spin polarization or spinors and without forces.
 
-  Andrew Grieder's routines stay the default where the grids differ (a cell without `Ignore_Symmetry`, whose
-  grid is half a step off the origin as in Fortran), for linear radial tables, and where the Fortran-derived ones would be slower: an oblique
+  Andrew Grieder's routines stay the default where the grids differ, for linear radial tables, and where the Fortran-derived ones would be slower: an oblique
   cell at the Gamma point (his accelerated oblique path), the Gamma point given as a one-point k-point grid,
   forces on an oblique cell, forces with k-points, and the forces and ionic loops of spinor orbitals;
-- `.false.`: Andrew Grieder's routines wherever his code accepts the input, his slab and his full shifted mesh
-  (equal weights, no reduction to the irreducible wedge) included;
+- `.false.`: Andrew Grieder's routines wherever his code accepts the input, his slab and his shifted mesh
+  included (see "Irreducible k-points on the default routines" below);
 - `.true.`: the Fortran-derived routines.
   The Gamma point given as a one-point k-point grid (`Kpoint_Method: mp`, `1 1 1`, or a list of one k = 0) is the
   Gamma-point calculation of the accelerated path under both sets of routines (real orbitals, no k-point loop,
   reported as such in parsec.out); with `.true.` it used to go to the reference k-point solver.
 
+### Irreducible k-points on the default routines
+
+With `Use_Fortran_Routines: .false.` the `Monkhorst_Pack_Shift` mesh of a bulk single point (more than one point,
+scalar orbitals with or without spin polarization, no hybrid functional, no forces or moving atoms) is reduced to
+its irreducible wedge, as on the Fortran-derived routines, but on the grid of `Grid_Spacing`. The Fortran-derived
+routines make their grid commensurate with the fractional translations of the space group (`adjust_step`), which
+for diamond's quarter translations means 16 points per cubic edge where `Grid_Spacing` asks for 18. The default
+routines keep their grid and use the operations of the crystal that map that grid, and the k-point mesh, onto
+themselves (`Grid.space_group.find_grid_space_group`, `Grid.kpoints.mesh_preserving_operations`), with time
+reversal; the density is averaged over the same operations (`Symmetrize_Charge_Density`, true by default there as
+on Fortran's k-point path). For diamond at 18 points per edge, with an atom at the origin and the points half a
+step off it, these are the 24 operations of Td about the atom: with time reversal they give the wedge of Oh,
+4, 4 and 10 points for Gamma-centred 2x2x2, 3x3x3 and 4x4x4 meshes (8, 27 and 64 before). parsec.out names the
+operations that were dropped (`24 of the 48 operations ...`). Since the operations map the mesh onto itself, the
+wedge with the averaged density is the full mesh: the 8-atom cube at 18 points per edge (PBE, `Convergence_Criterion`
+1e-8 Ry) gives the energy of the full mesh within 1e-10 Ry for 2x2x2, 3x3x3 and 4x4x4 (-91.1711622940,
+-91.2224516198, -91.2250126608 Ry; 4x4x4 in 59 s against 263 s for the 64 points on a laptop CPU).
+`Ignore_Symmetry` or `Symmetrize_Charge_Density: .false.` reduce by time reversal alone (`k` and `-k` have the same
+density). Hybrids (their exchange sums over the full mesh), spinors and moving atoms keep the full mesh of equal
+weights, as before 8 November 2026, when every input with `.false.` did. Without `Use_Fortran_Routines` a shifted
+mesh still selects the Fortran-derived routines (above).
+
+A `Kpoint_List` of unequal weights of a bulk single point runs on the default routines with `.false.` (before 8
+November 2026 it went to the Fortran-derived routines by itself): every level is weighted by its point in the Fermi
+level, the density and the band energy, and the density is that of the listed points, as in PARSEC, whose
+`Symmetrize_Charge_Density` is false for a list (a warning says so). For a list that is an irreducible wedge,
+`Symmetrize_Charge_Density: .true.` averages the density over the operations that map the grid onto itself (the
+2x2x2 wedge of the 8-atom cube written as a list, weights 1, 3, 3, 1: -91.1711622940 Ry, the full mesh). Forces and
+moving atoms with such a list, and the average with spinors or a hybrid, keep the Fortran-derived routines (the forces
+of a wedge are completed over the space group there). `Symmetrize_Charge_Density: .true.` of any other input of these
+routines selects the Fortran-derived ones as before.
+
+The space group is found by a neighbour-tree search (`Grid.space_group.fast_crystal_operations`, the operations
+and translations of Fortran's `atftmt`; 0.8 s and a few MB for 4,096 atoms, where the statement-by-statement port
+`_crystal_operations` needs `(N, N)` arrays), once per structure. The fractional translations that `adjust_step`
+meets are snapped to fractions `p/q` (`q <= 48`) within `1e-8` (`Grid.space_group.snapped_translation`): coordinates
+written with ten decimals gave `0.2499999999963` for diamond's quarter, whose steps never settled. The density
+table is built from the integer affine maps of the operations (3 M points and 24 operations: 1.5 s, 0.29 GB of
+int32); `acceleration/SCF/periodic_symmetry.py` applies them on a GPU without the table.
+
 An input that Andrew Grieder's routines do not compute (wires, charged sheets, forces of a slab, unequal k-point
-weights, LDA+U, NSCF, other pseudopotential formats or functionals, ...) runs on the Fortran-derived routines by
-itself, also with `.false.`, with a warning in the log and in parsec.out. A
+weights of a slab or with forces, LDA+U, NSCF, other pseudopotential formats or functionals, ...) runs on the Fortran-derived routines by
+itself, also with `.false.`, with a warning in the log and in parsec.out. Labels that the shared eigensolvers
+and SCF loops read the same way under both sets choose nothing: `FF_MaxIter`, `Chebyshev_Degree_Decrease_After`,
+`Convergence_Criterion_Approach`, `Chebyshev_Filtering`, `Maximum_Matvec`, `Fix_Number_Eigenvalues` and PARSEC 1.5's
+eigensolver labels, the MPI and library tuning labels (`MPI_Groups`/`Npcol`, `Exp_Comm`, `Max_Lap_Buffers`,
+`Use_ScaLAPACK`, ...), the FDET labels (`Potential_Field: .false.`, which PARSEC 1.5's `bak_complete_parsec.in`
+writes in every run, `Write_Potential_Field`, `AFM_Scan`, ...: FDET itself is refused for a periodic input) and
+`Recenter_Atoms_In_Aperiodic_Directions` (`.false.` keeps the coordinates of the input, as Andrew Grieder's routines
+do for a bulk cell). Any other label chooses nothing either when it is written at a value that does nothing:
+`Input/routines.py` holds the table `NO_EFFECT` (label -> the predicate "has no effect" and its reason), for example
+`Add_Point_Charges: .false.`, `Point_Typ_Num 0`, `Alpha_Filter 0`, `Create_DOS: .false.`, `DOS_Pnum` without
+`Create_DOS`, `LDAplusU_U 0`, the mixer defaults (`Mixing_Restart_Factor 0.3`, ...), `NSCF_States_Num` without a
+non-self-consistent run, `Output_Data: .true.`, which are the lines PARSEC 1.5's `bak_complete_parsec.in` writes at
+their defaults. A value that acts still chooses the Fortran-derived routines, and the warning names it
+(`input option(s) mixing_restart_factor = 0.1 (read by the Fortran-derived routines only)`). Before 4 November 2026 writing `Convergence_Criterion_Approach`, `Chebyshev_Filtering`,
+`Maximum_Matvec`, `Fix_Number_Eigenvalues`, `MPI_Groups`, `Exp_Comm` or `Max_Lap_Buffers` moved a periodic input to the
+Fortran-derived routines (Si8 at h 0.45: 1.3 mRy at the Gamma point, 3.8 mRy on a 2x2x2 grid, from the routines). A
 Restart_Run, NSCF or DOS input runs on the Fortran-derived routines, so the SCF that writes its `parsec.dat`
 should run on them too (a file of another grid is refused).
+
+The grids of the Fortran-derived routines are PARSEC's (1.5): along every lattice vector the largest even number
+of points whose step is not below `Grid_Spacing`, commensurate with the fractional translations of the space
+group (none with `Ignore_Symmetry`, molecular dynamics or manual movements), and the points half a step off the
+origin, or on it with `Ignore_Symmetry` and along a lattice vector that is not orthogonal to another one. An
+orthorhombic cell whose steps agree takes the orthorhombic grid and its fast paths, every other cell Fortran's
+general grid. Up to the parity round of PARSEC 1.5 their orthorhombic grid had `round(L/h)` points from the origin;
+its results, and the `parsec.dat` files written on it, changed with the rule (a restart from such a file is
+refused by its shift). Periodic atoms are translated to fractional coordinates in `[-1/2, 1/2)` at start, as
+PARSEC 1.5 does (printed coordinates and trajectories; no number of the run changes beyond round-off).
+
+PARSEC 1.5's `Grid_Shift` block (one line of three numbers in grid steps, their absolute values; zero along an
+oblique periodic direction) sets the shift of every grid, clusters included, whatever `Ignore_Symmetry` says.
+`Foldblock_Side_Length 2` fills a cluster domain up to whole blocks of 2 x 2 x 2 points and switches the symmetry
+off, as 1.5 does (TierI/0d_H2: 25600 points instead of 22575); for a bulk cell it changes no grid point (the
+symmetry is still switched off). Other sides, wires and slabs are refused.
 
 ## Modular Python API
 
@@ -1083,7 +1248,7 @@ src/
 │   ├── Pseudopotential/           PARSEC POTRE reader and radial splines
 │   ├── V_ion/                     local potential and nonlocal projectors
 │   ├── Hartree/                   Poisson solve and open-boundary data
-│   ├── V_xc/                      CA/PZ LDA and PBE, also spin-polarized
+│   ├── V_xc/                      LDA, GGA, the hybrids' semilocal parts and exact exchange (ACE)
 │   ├── Hamiltonian/               matrix-free Kohn--Sham operator
 │   ├── Eigensolvers/              PARSEC-style ChebFF/CHEBDAV/subspace code
 │   ├── Occupations/               Fermi level, occupations, and density

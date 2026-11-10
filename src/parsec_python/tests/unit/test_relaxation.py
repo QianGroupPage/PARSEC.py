@@ -2156,18 +2156,25 @@ class IonicLoopTests(unittest.TestCase):
             np.testing.assert_array_equal(mine.positions, theirs.positions)
 
     def test_scf_loop_that_did_not_converge_is_remembered(self) -> None:
-        """The run goes on, as PARSEC does, and says so at the end."""
+        """The run stops at that structure, as PARSEC 1.5 does (parsec.F90:2124-2137).
 
-        outcome, _ = self.run_loop(
+        Its forces are computed and recorded; the atoms are not moved from
+        it.  (The previous tree moved on: [True, False, True].)
+        """
+
+        outcome, surface = self.run_loop(
             replace(self.TIGHT, max_movements=2),
             surface=_SurfaceBackend(unconverged=(1,)),
         )
-        self.assertEqual(
-            [record.converged for record in outcome.records], [True, False, True]
-        )
+        self.assertEqual([record.converged for record in outcome.records], [True, False])
         self.assertTrue(outcome.scf_failed)
+        self.assertTrue(outcome.stopped_by_scf_failure)
+        self.assertEqual(len(surface.scf_calls), 2)
+        self.assertEqual(len(surface.force_calls), 2)
+        np.testing.assert_array_equal(outcome.positions, outcome.records[-1].positions)
         clean, _ = self.run_loop(replace(self.TIGHT, max_movements=2))
         self.assertFalse(clean.scf_failed)
+        self.assertFalse(clean.stopped_by_scf_failure)
 
     def test_optimizer_that_ends_stops_the_run(self) -> None:
         """A bounded run that converges at its bounds: done, not relaxed."""
@@ -4011,16 +4018,46 @@ class DriverOnTheSpringsTests(_ScratchCase):
         self.assertNotIn("Minimum force is", self.log())
 
     def test_scf_failure_is_exit_code_three(self) -> None:
-        """Also when the last structure meets the force criterion."""
+        """The relaxation stops at the structure whose SCF loop failed (PARSEC 1.5).
 
-        code, _ = self.run_driver(
+        parsec.F90:2124-2137 of 1.5 switches the movement off ("No point to
+        continue without convergence"); the previous tree moved on and could
+        still end on the force criterion.
+        """
+
+        code, surface = self.run_driver(
             "Minimization: BFGS\nForce_Min: 0.005",
             _SurfaceBackend(unconverged=(1,)),
             **self.ASYMMETRIC_ROWS,
         )
         self.assertEqual(code, 3)
-        self.assertEqual(self.statements(), [MINIMUM_FOUND])
-        self.assertIn("  WARNING: SCF convergence not achieved", self.log())
+        self.assertEqual(len(surface.scf_calls), 2)
+        self.assertNotIn(MINIMUM_FOUND, self.statements())
+        log = self.log()
+        self.assertIn(" WARNING !!! atom movement is terminated", log)
+        self.assertIn(" No point to continue without convergence", log)
+        self.assertIn("  WARNING: SCF convergence not achieved", log)
+
+    def test_write_relax_restart_false_writes_no_restart_file(self) -> None:
+        """PARSEC 1.5's Write_Relax_Restart (domove.f90:390): .false. writes none.
+
+        Without the keyword this port writes relax_restart.dat as before (1.5
+        writes it only with .true.).
+        """
+
+        control = "Minimization: BFGS\nForce_Min: 0.005\nMovement_Num: 2"
+        restart = self.directory / "relax_restart.dat"
+        for extra, written in (("", True), ("\nWrite_Relax_Restart: .true.", True),
+                               ("\nWrite_Relax_Restart: .false.", False)):
+            with self.subTest(extra=extra):
+                if restart.exists():
+                    restart.unlink()
+                code, surface = self.run_driver(control + extra, **self.ASYMMETRIC_ROWS)
+                # 4: the two movements did not reach Force_Min (not this test's point)
+                self.assertIn(code, (0, 4))
+                self.assertGreater(len(surface.scf_calls), 1)
+                self.assertEqual(restart.exists(), written)
+                self.assertTrue((self.directory / "atom.cor").exists())
 
     def test_energy_that_is_not_finite_fails_the_run(self) -> None:
         """Exit code 1; the log names the structure, and nothing moves from it."""

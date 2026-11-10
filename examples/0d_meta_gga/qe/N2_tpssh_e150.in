@@ -1,0 +1,38 @@
+ &control
+    calculation = 'scf'
+    prefix = 'N2_tpssh_L20_e150'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+    tprnfor = .true.
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 20.000000
+    assume_isolated = 'mt'
+    nat = 2
+    ntyp = 1
+    ecutwfc = 150.0
+    ecutrho = 600.0
+    nbnd = 9
+    occupations = 'fixed'
+    input_dft = 'XC-000I-000I-000I-000I-000I-457L'
+    nqx1 = 1
+    nqx2 = 1
+    nqx3 = 1
+    x_gamma_extrapolation = .false.
+    exxdiv_treatment = 'vcut_spherical'
+    ecutfock = 300.0
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 300
+ /
+ATOMIC_SPECIES
+ N 14.007 n_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ N 10.0000000000 10.0000000000 11.0371761835
+ N 10.0000000000 10.0000000000 8.9628238165
+K_POINTS gamma

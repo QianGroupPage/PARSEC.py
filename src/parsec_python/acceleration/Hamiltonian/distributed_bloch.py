@@ -192,8 +192,8 @@ class DistributedBlochConverter(DeviceBlochConverter):
         plan = self._halo_plan(hamiltonian)
         self._plan = plan
 
-        def stencil(host_matrix):
-            """Device ``(local part, halo part)`` of this rank's rows of a stencil matrix (cached)."""
+        def parts(host_matrix):
+            """A builder of the device ``(local part, halo part)`` of this rank's rows of a stencil matrix."""
 
             def build():
                 local, halo = plan.split(host_matrix.tocsr()[plan.start : plan.stop])
@@ -202,13 +202,14 @@ class DistributedBlochConverter(DeviceBlochConverter):
                     None if halo is None else backend.matrix(halo, dtype=np.float64),
                 )
 
-            return self._cached(host_matrix, build)
+            return build
 
-        laplacian, laplacian_halo = stencil(hamiltonian.negative_laplacian)
+        laplacian, laplacian_halo = self._cached(hamiltonian.negative_laplacian, parts(hamiltonian.negative_laplacian))
         host_gradient = getattr(hamiltonian, "_k_gradient", None)
         k_gradient = k_gradient_halo = None
         if host_gradient is not None:
-            k_gradient, k_gradient_halo = stencil(host_gradient)
+            # by the gradient operators and the k-point (a new host k.grad comes with every SCF step)
+            k_gradient, k_gradient_halo = self._cached_k_gradient(hamiltonian, parts(host_gradient))
         self._halo_matrices = (laplacian_halo, k_gradient_halo)
         return laplacian, k_gradient
 

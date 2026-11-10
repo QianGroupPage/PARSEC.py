@@ -464,9 +464,11 @@ class SpeciesCursorTests(unittest.TestCase):
         species = (
             # Pseudopotential_Format is read for every species: without its
             # own line H would take the first one, fhipp, as in PARSEC.
+            # Potential_Num is read by fhipp and old (PARSEC 1.5,
+            # usrinputfile.F90:3244-3248): H and Na take none.
             self.block(
                 "H",
-                "Pseudopotential_Format: martins_new\nLocal_Component: s\nPotential_Num: 1",
+                "Pseudopotential_Format: martins_new\nLocal_Component: s",
                 "0 0 4",
             )
             + self.block(
@@ -475,7 +477,7 @@ class SpeciesCursorTests(unittest.TestCase):
                 "Core_Cutoff_Radius: 2.4\nNonlinear_Core_Correction: .true.\n"
                 "begin Electron_Per_Orbital\n2 0 0 0\nend Electron_Per_Orbital",
             )
-            + self.block("Na", "Pseudopotential_Format: martins_wang\nPotential_Num: 9\nCore_Cutoff_Radius: 3.1", "0 0 -4")
+            + self.block("Na", "Pseudopotential_Format: martins_wang\nCore_Cutoff_Radius: 3.1", "0 0 -4")
             + self.block(
                 "Si",
                 "Pseudopotential_Format: martins_old\nLocal_Component: p\nPotential_Num: 2\n"
@@ -504,6 +506,9 @@ class SpeciesCursorTests(unittest.TestCase):
                 species.replace("Potential_Num: 2\n", "Potential_Num: 2\nNonlinear_Core_Correction: true\n"),
                 4,
             )
+        # The layout of the PARSEC before 1.5 (a Potential_Num for every species) is refused.
+        with self.assertRaisesRegex(ParsecInputError, "Potential_Num occurs 3 times"):
+            self.parse(species.replace("Local_Component: s", "Local_Component: s\nPotential_Num: 1"), 4)
 
     def test_refusals(self) -> None:
         fhipp = (

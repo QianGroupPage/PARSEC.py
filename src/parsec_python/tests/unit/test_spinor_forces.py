@@ -54,6 +54,7 @@ from parsec_python.Relaxation.backend import spinor_backend
 from parsec_python.SCF import update_geometry, update_periodic_geometry
 from parsec_python.SCF.pbc import prepare_periodic_single_point
 from parsec_python.SCF.single_point import prepare_single_point
+from parsec_python.tests.archives import read_archive
 
 _AU = Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
 _POSITIONS = np.array([[-2.31, 0.17, 0.22], [2.43, -0.11, 0.13]])
@@ -79,6 +80,9 @@ def _cluster(*, mode: str, net_charge: float = 1.0, polarization: float = 0.5) -
             self_consistent_spin_orbit=True,
         ),
         hartree=HartreeSettings(multipole_order=4),
+        # The defaults (FF_MaxIter 3).  Before 2026-11-05 recentring dropped the initial moments of
+        # this off-centre Au2+, and with FF_MaxIter 3 or 4 the run often ended non-magnetic, 20 mRy
+        # above the magnetic state.
         eigensolver=EigensolverSettings(method="chebff", tolerance=1.0e-7),
     )
 
@@ -475,6 +479,9 @@ class PeriodicSpinorForceTests(unittest.TestCase):
         compute_periodic_forces(self.system, result)
 
 
+# The input writes no FF_MaxIter: spinor runs take 3 as every run and keep the degree decrease after
+# iteration 5 (the default since 2026-11-05).  Before recentring kept the initial moments, the
+# relaxation of SpinorIonicCliTests ended at |m| = 0.0019 with FF_MaxIter 3.
 _CLUSTER_INPUT = """\
 Boundary_Sphere_Radius: 8.0
 Grid_Spacing: 0.7
@@ -619,13 +626,90 @@ class SpinorIonicCliTests(unittest.TestCase):
         code = cli_main([str(self._write(ionic, extra, periodic=periodic, plain=plain)), "--quiet"])
         return code, (self.directory / "parsec.out").read_text(encoding="utf-8")
 
+    def test_spinor_runs_keep_the_degree_rule_of_before(self) -> None:
+        # The default since 2026-11-05 (checked on A100): without FF_MaxIter and
+        # Chebyshev_Degree_Decrease_After a spinor run (non-collinear, self-consistent or perturbative
+        # spin-orbit) takes FF_MaxIter 3 as every run and keeps the decrease after iteration 5; other
+        # runs take PARSEC 1.5's 3 and 4; written values hold for both.
+        from parsec_python.Input.parsec_input import parse_parsec_input
+
+        for name, kwargs in (("ncl", {}), ("soc", {"plain": True})):
+            with self.subTest(run=name):
+                problem = parse_parsec_input(self._write("", **kwargs)).problem
+                self.assertEqual(problem.eigensolver.first_filter_cycles, 3)
+                self.assertEqual(problem.scf.degree_decrease_after, 5)
+        written = parse_parsec_input(
+            self._write("", "FF_MaxIter: 2\nChebyshev_Degree_Decrease_After: 4\n")
+        ).problem
+        self.assertEqual((written.eigensolver.first_filter_cycles, written.scf.degree_decrease_after), (2, 4))
+        text = self._write("").read_text(encoding="utf-8")
+        text = text.replace("Non_Collinear_magnetism: .true.", "Non_Collinear_magnetism: .false.")
+        text = text.replace("SO_from_scratch: .true.", "SO_from_scratch: .false.")
+        text = text.replace("SO_PSP: .true.", "SO_PSP: .false.")
+        text = text.replace("begin Initial_NCL_Moment\n1 0 0\n0 1 0\nend Initial_NCL_Moment\n", "")
+        (self.directory / "parsec.in").write_text(text, encoding="utf-8")
+        scalar = parse_parsec_input(self.directory / "parsec.in").problem
+        self.assertEqual((scalar.eigensolver.first_filter_cycles, scalar.scf.degree_decrease_after), (3, 4))
+
+    def test_an_off_centre_cluster_keeps_its_initial_moments_on_both_command_lines(self) -> None:
+        # The bounding box of the two atoms lies 0.19 bohr off the origin, so the cluster is recentred.
+        # center_cluster_geometry dropped Initial_NCL_Moment until 2026-11-05: the run then started
+        # without moments and, with an exact first solve (FF_MaxIter 4), stayed at |m| = 0.0000.
+        # Two SCF steps from the moments give |m| = 2.35.
+        from parsec_python.acceleration.cli import main as accelerated_main
+        from parsec_python.Input.parsec_input import parse_parsec_input
+        from parsec_python.SCF.noncollinear import _initial_magnetization
+
+        path = self._write("", "FF_MaxIter: 4\n")
+        path.write_text(path.read_text(encoding="utf-8").replace("Max_Iter: 80", "Max_Iter: 2"), encoding="utf-8")
+        problem = parse_parsec_input(path).problem
+        system = prepare_single_point(problem)
+        self.assertGreater(
+            float(np.max(np.abs(np.asarray(system.atoms[0].position) - np.asarray(problem.atoms[0].position)))), 0.05
+        )
+        self.assertEqual([atom.initial_moment.tolist() for atom in system.atoms], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        moment = np.sum(_initial_magnetization(system), axis=1) * system.grid.volume_element
+        self.assertGreater(float(np.linalg.norm(moment)), 5.0)
+        for name, main in (("reference", cli_main), ("accelerated", accelerated_main)):
+            with self.subTest(cli=name):
+                self.assertIn(main([str(path), "--quiet"]), (0, 3))
+                log = (self.directory / "parsec.out").read_text(encoding="utf-8")
+                line = [row for row in log.splitlines() if row.startswith("Converged magnetic moment vector")][-1]
+                self.assertGreater(float(line.split("|m| =")[1]), 1.0)
+
+    def test_an_off_centre_collinear_cluster_keeps_its_initial_moment(self) -> None:
+        # Collinear spin starts from the species' Initial_Spin_Polarization, which recentring does not touch:
+        # the initial moment of the off-centre cluster is that of the same cluster given centred.
+        from parsec_python.acceleration.cli import main as accelerated_main
+
+        def initial_moments(text: str) -> list[str]:
+            lines = []
+            for main in (cli_main, accelerated_main):
+                (self.directory / "parsec.in").write_text(text, encoding="utf-8")
+                self.assertIn(main([str(self.directory / "parsec.in"), "--quiet"]), (0, 3))
+                log = (self.directory / "parsec.out").read_text(encoding="utf-8")
+                lines += [row.strip() for row in log.splitlines() if "Initial magnetic moment" in row]
+            return lines
+
+        text = self._write("").read_text(encoding="utf-8")
+        text = text.replace("Non_Collinear_magnetism: .true.", "Spin_Polarization: .true.")
+        text = text.replace("SO_from_scratch: .true.", "SO_from_scratch: .false.")
+        text = text.replace("SO_PSP: .true.", "SO_PSP: .false.")
+        text = text.replace("begin Initial_NCL_Moment\n1 0 0\n0 1 0\nend Initial_NCL_Moment\n", "")
+        text = text.replace("Max_Iter: 80", "Max_Iter: 1")
+        centred = text.replace("-2.31 0.17 0.22\n   2.43 -0.11 0.13", "-2.37 0.14 0.045\n   2.37 -0.14 -0.045")
+        off = initial_moments(text)
+        self.assertEqual(len(off), 2)
+        self.assertEqual(off, initial_moments(centred))
+        self.assertGreater(abs(float(off[0].split("=")[1])), 1.0)
+
     def test_a_single_point_with_forces_reports_and_archives_them(self) -> None:
         code, log = self._run("Skip_Force: .false.\n")
         self.assertEqual(code, 0)
         self.assertIn("Reporting non-local force components", log)
         self.assertIn("Converged magnetic moment vector", log)
         self.assertIn("The forces of a spin-polarized or non-collinear spin-orbit calculation are not symmetrized", log)
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         forces = archive["forces_total"]
         self.assertEqual(forces.shape, (2, 3))
         np.testing.assert_allclose(forces.sum(axis=0), 0.0, atol=1.0e-9)
@@ -638,7 +722,7 @@ class SpinorIonicCliTests(unittest.TestCase):
         self.assertNotIn("starts afresh", log)
         # the second structure is magnetic too: the moved atoms keep the direction of their initial moments
         self.assertEqual(log.count("Converged magnetic moment vector"), 2)
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         positions = archive["relaxation_positions"]
         self.assertEqual(positions.shape, (2, 2, 3))
         self.assertGreater(float(np.max(np.abs(positions[1] - positions[0]))), 1.0e-3)
@@ -659,7 +743,7 @@ class SpinorIonicCliTests(unittest.TestCase):
             "Molecular_Dynamics: .true.\nTinit: 300\nT_Final: 200\nT_Step: 10\nTime_Step: 20\nStep_Num: 2\nRng_Seed: 7\n"
         )
         self.assertEqual(code, 0, log[-1500:])
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertEqual(archive["dynamics_positions"].shape[1:], (2, 3))
         self.assertGreaterEqual(archive["dynamics_positions"].shape[0], 3)
         energies = archive["dynamics_energies"]
@@ -673,7 +757,7 @@ class SpinorIonicCliTests(unittest.TestCase):
             periodic=True,
         )
         self.assertEqual(code, 0, log[-2000:])
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertEqual(archive["forces_total"].shape, (2, 3))
         self.assertGreater(float(np.max(np.abs(archive["forces_total"]))), 0.1)
 

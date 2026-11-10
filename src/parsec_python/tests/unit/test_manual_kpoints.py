@@ -24,6 +24,7 @@ from parsec_python.Grid import (
     read_kpoint_file,
 )
 from parsec_python.cli import main as cli_main
+from parsec_python.tests.archives import read_archive
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -204,7 +205,7 @@ class ManualKpointCliTests(unittest.TestCase):
             )
             code = cli_main([str(directory / "parsec.in"), "--quiet"])
             self.assertEqual(code, 0)
-            archive = np.load(directory / "parsec_python_results.npz")
+            archive = read_archive(directory / "parsec_python_results.npz")
             return {key: archive[key] for key in archive.files}
 
     def _dry_run_code(self, kpoints: str, files: dict | None = None) -> int:
@@ -288,12 +289,15 @@ class ManualKpointCliTests(unittest.TestCase):
                 "Kpoint_Method: manual\nbegin Kpoint_List\n0 0 0 -1\n0 0 1 2\nend Kpoint_List\n"
             ),
             "list without manual": "begin Kpoint_List\n0 0 0\nend Kpoint_List\n",
-            "unit without manual": "Kpoint_Unit: reciprocal_lattice_vectors\n",
         }
         files = {"kpts.dat": "0 0 0\n"}
         for name, text in cases.items():
             with self.subTest(name):
                 self.assertEqual(self._dry_run_code(text, files), 2, msg=name)
+        # PARSEC 1.5 reads Kpoint_Unit always and uses it for a manual list only
+        # (usrinputfile.F90:1618, 1747); its bak_complete_parsec.in writes it for
+        # every run: accepted without a manual list, with a warning.
+        self.assertEqual(self._dry_run_code("Kpoint_Unit: reciprocal_lattice_vectors\n", files), 0)
         # Unequal weights are normalized to one, as PARSEC's init_var does.
         self.assertEqual(
             self._dry_run_code(

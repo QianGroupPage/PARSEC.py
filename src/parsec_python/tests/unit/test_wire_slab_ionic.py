@@ -474,7 +474,8 @@ class PostProcessingTests(unittest.TestCase):
         np.testing.assert_allclose(wire.problem.periodic_cell.lattice_vectors, np.diag([6.0, 1.0, 1.0]))
         self.assertEqual(wire.super_cell, (2, 1, 1))
         self.assertEqual(len(wire.problem.atoms), 4)
-        np.testing.assert_allclose(wire.problem.atoms[1].position, (3.0, 0.0, 0.7))
+        # half a cell along the wire: -1/2 after PARSEC 1.5's start-up back_to_cell (fractional coordinates in [-1/2, 1/2))
+        np.testing.assert_allclose(wire.problem.atoms[1].position, (-3.0, 0.0, 0.7))
         slab = parse_parsec_input(
             self.write(
                 "slab",
@@ -487,7 +488,7 @@ class PostProcessingTests(unittest.TestCase):
         )
         self.assertEqual(slab.super_cell_vacuum, (1, 0, 0))
         self.assertEqual(len(slab.problem.atoms), 4)
-        np.testing.assert_allclose(slab.problem.atoms[1].position, (0.0, 3.2, 0.7))
+        np.testing.assert_allclose(slab.problem.atoms[1].position, (0.0, -3.2, 0.7))
 
     def test_dos_of_a_wire(self) -> None:
         from parsec_python.Output.dos import _image_translations

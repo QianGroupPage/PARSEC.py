@@ -86,6 +86,42 @@ class PreparePeriodicSinglePointTests(unittest.TestCase):
         system = prepare_periodic_single_point(problem)
         np.testing.assert_array_equal(system.atoms[0].position, [5.5, 3.0, 3.0])
 
+    def test_conventions_of_the_potential_and_the_lazy_gradient(self) -> None:
+        # PARSEC 1.5's zero average (to the sampling of the short-range sum) and its alpha term, for both sets of
+        # routines; the gradient matrices are built where they are read, element for element build_gradient's
+        import pickle
+
+        from parsec_python.Laplacian import build_gradient
+        from parsec_python.V_ion import load_pseudopotentials
+        from parsec_python.V_ion.gspace_local import alpha_coefficient
+
+        for fortran in (True, False):
+            with self.subTest(fortran_routines=fortran):
+                problem = _hydrogen_box(6.0, 0.6)
+                if not fortran:
+                    problem = SinglePointInput(
+                        atoms=problem.atoms,
+                        pseudopotentials=problem.pseudopotentials,
+                        grid=PeriodicGridSettings(spacing=0.6, expansion_order=4),
+                        periodic_cell=problem.periodic_cell,
+                    )
+                system = prepare_periodic_single_point(problem)
+                # the grid sum of the short-ranged pieces against their integral: 1e-2 Ry for H at 0.6 bohr
+                # (4e-4 Ry for the carbon of diamond at 0.374 bohr), against the -0.329 Ry removed here
+                self.assertLess(abs(float(np.mean(system.ionic_potential))), 2.0e-2)
+                potential = load_pseudopotentials(problem.pseudopotentials)["H"]
+                self.assertAlmostEqual(
+                    system.alpha_z_energy, system.electron_count * alpha_coefficient(potential, 0) / 216.0, places=12
+                )
+                self.assertFalse(system.gradient.built)
+                expected = build_gradient(system.grid)
+                restored = pickle.loads(pickle.dumps(system.gradient))
+                for lazy, matrix in zip(system.gradient, expected):
+                    self.assertEqual((lazy != matrix).nnz, 0)
+                self.assertTrue(system.gradient.built)
+                self.assertEqual(len(restored), 3)
+                self.assertEqual((restored[1] != expected[1]).nnz, 0)
+
 
 class RunPeriodicSinglePointTests(unittest.TestCase):
     def test_hydrogen_in_a_box_converges(self) -> None:

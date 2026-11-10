@@ -236,6 +236,30 @@
       "verification_evidence": []
     },
     {
+      "component": "frozen_density_embedding",
+      "python_package": "Embedding",
+      "python_modules": [
+        "Embedding/frozen_density.py",
+        "Embedding/kinetic.py",
+        "Embedding/tip_sphere.py",
+        "Embedding/warm_start.py",
+        "Embedding/afm.py",
+        "Output/pot_dat.py"
+      ],
+      "parsec_sources": [
+        "PARSEC 1.5 potential/potfield.F90",
+        "PARSEC 1.5 potential/kinetic.f90",
+        "PARSEC 1.5 potential/fdet_tipsphere.F90",
+        "PARSEC 1.5 io/potsave.F90",
+        "PARSEC 1.5 scf/totnrg.f90",
+        "PARSEC 1.5 parsec.F90"
+      ],
+      "concept_package_status": "implemented_unverified",
+      "existing_python_assessment": "FDET of PARSEC 1.5 for cluster tips: pot.dat read and written byte for byte, the frozen field, the five non-additive kinetic functionals (pointwise equal to kinetic.f90; the corrected u and gradient-expansion coefficient by default, the 1.5 form on request), the FDET energy and forces, the tip sphere and the warm starts of manual scans; the end-to-end energies equal the 1.5 binary to 1e-8 Ry on CA-LDA inputs (tests/unit/test_fdet_end_to_end.py). The AFM scan with k_ts is a PARSEC.py extension.",
+      "literal_parsec_status": "not_verified",
+      "verification_evidence": []
+    },
+    {
       "component": "scf",
       "python_package": "SCF",
       "python_modules": [

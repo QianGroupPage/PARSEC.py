@@ -56,15 +56,21 @@ from typing import Callable, Sequence
 
 import numpy as np
 
+from ..Occupations.fermi_dirac import (
+    FERMI_COUNT_TOLERANCE,
+    FERMI_EXPONENT_CUTOFF,
+    FERMI_MAX_BISECTIONS,
+)
+
 #: ``tempkry`` of ``const.f90``: Kelvin to Rydberg.
 KELVIN_TO_RYDBERG = 6.33327186e-06
-#: ``difmax`` of ``flevel.f90``: beyond ``|beta (E - E_F)|`` of 35 an
-#: occupation is exactly one or zero.
-_DIFMAX = 35.0
-#: ``small`` of ``flevel.f90``: the electron count of the bisection.
-_SMALL = 1.0e-12
-#: ``iterlim`` of ``flevel.f90``.
-_ITERATION_LIMIT = 100
+#: ``difmax`` of ``flevel.f90``: beyond ``|beta (E - E_F)|`` of 36.7 an
+#: occupation is exactly one or zero; ``small``, the electron count of the
+#: bisection; ``iterlim``.  PARSEC 1.5's values (``utilities/flevel.f90:43-51``:
+#: 36.7, 1e-10, 1000; the previous tree had 35, 1e-12, 100).
+_DIFMAX = FERMI_EXPONENT_CUTOFF
+_SMALL = FERMI_COUNT_TOLERANCE
+_ITERATION_LIMIT = FERMI_MAX_BISECTIONS
 
 
 class FermiLevelError(RuntimeError):
@@ -89,7 +95,7 @@ def fermi_level_from_levels(
     one channel of ``spinors`` single electrons too (``xele * nspin/2`` with
     ``nspin = 2``, ``mxwd = 2``).  The bisection starts from the bounds
     ``[min, max]`` of all levels with the guess ``max`` and stops when the
-    count is within 1e-12 of the target.
+    count is within 1e-10 of the target (PARSEC 1.5).
     """
 
     channels = len(eigenvalues)
@@ -116,7 +122,7 @@ def fermi_level_from_levels(
     for _ in range(_ITERATION_LIMIT):
         # The terms in the order of the Fortran loop (channel, then the
         # sorted levels), summed one after the other as there; a channel's
-        # loop ends at its first level 35 kT above the guess.
+        # loop ends at its first level difmax kT above the guess.
         terms = []
         for values, level_weights in pooled:
             scaled = (values - fermi) * beta

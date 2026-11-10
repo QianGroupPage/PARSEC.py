@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from parsec_python.Grid.cell import (
+    back_to_cell,
     cell_diagonal_length,
     lattice_plane_spacings,
     replicate_positions,
@@ -491,9 +492,11 @@ class SuperCellInputTests(unittest.TestCase):
         expected = []
         for base in ([1.5, 1.5, 1.5], [0.0, 0.75, 0.0]):
             expected.extend(replicate_positions(np.array(base), 3.0 * np.eye(3), (2, 1, 3)))
+        # translated about the cell centre at start, as PARSEC 1.5 does (back_to_cell; Fortran-derived routines)
+        expected = [back_to_cell(position, np.diag([6.0, 6.0, 9.0])) for position in expected]
         np.testing.assert_array_equal([atom.position for atom in problem.atoms], expected)
-        # i3 runs fastest, as in usrinputfile.F90.
-        np.testing.assert_array_equal(problem.atoms[1].position, [1.5, 1.5, 4.5])
+        # i3 runs fastest, as in usrinputfile.F90 (z = 4.5, half the cell: -4.5 after back_to_cell).
+        np.testing.assert_array_equal(problem.atoms[1].position, [1.5, 1.5, -4.5])
         self.assertEqual(translation.super_cell, (2, 1, 3))
         self.assertEqual(translation.super_cell_vacuum, (0, 1, 0))
         self.assertEqual(len(translation.movable), 12)

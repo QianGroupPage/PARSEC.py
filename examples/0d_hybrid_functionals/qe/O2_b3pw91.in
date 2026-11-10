@@ -1,0 +1,38 @@
+ &control
+    calculation = 'scf'
+    prefix = 'O2_b3pw91_L24_e150'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 24.000000
+    nat = 2
+    ntyp = 1
+    ecutwfc = 150.0
+    assume_isolated = 'mt'
+    nbnd = 11
+    occupations = 'fixed'
+    input_dft = 'XC-000I-000I-401L-000I-000I-000I'
+    nspin = 2
+    tot_magnetization = 2
+    nqx1 = 1
+    nqx2 = 1
+    nqx3 = 1
+    x_gamma_extrapolation = .false.
+    exxdiv_treatment = 'vcut_spherical'
+    ecutfock = 300.0
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ O 15.999 o_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ O 12.0000000000 12.0000000000 13.1409221477
+ O 12.0000000000 12.0000000000 10.8590778523
+K_POINTS gamma

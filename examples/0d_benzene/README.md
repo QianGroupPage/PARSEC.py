@@ -35,15 +35,18 @@ python src\parsec_python\main.py examples\0d_benzene\parsec.in --no-archive
 ```
 
 The physical calculation writes `parsec.out` in this directory. The
-completed native CHEBFF/SUBSPACE run used the full 268,096-point grid and
-converged in 15 SCF iterations:
+retained `parsec_python.out` is the second command with
+`--log parsec_python.out`, run with the code of 5 November 2026 on a laptop
+GPU (RTX 5070). The native CHEBFF/SUBSPACE run solved the eight `D_2h`
+representations of the 268,096-point grid separately and converged in
+10 SCF iterations:
 
 | Quantity | Python |
 |---|---:|
-| Total energy | -75.38863311 Ry |
-| Charge-weighted SRE | 0.0000947232 |
-| SCF time | 410.91 s |
-| Total wall time | 411.84 s |
+| Total energy | -75.38863333 Ry |
+| Charge-weighted SRE | 0.0001034149 |
+| SCF time | 5.43 s |
+| Total wall time | 15.12 s |
 
 ## PARSEC reference
 
@@ -55,7 +58,7 @@ OpenMPI build and eight MPI ranks. Copies are stored here as
 PARSEC found the eight-operation `D_2h` subgroup and reduced the Hamiltonian
 from 268,096 to 33,512 grid points per representation. It converged in 17 SCF
 iterations to `-75.38863314 Ry`. The Python-minus-PARSEC total-energy
-difference is `+0.00000003 Ry`.
+difference is `-0.00000019 Ry`.
 
 See `COMPARISON.md` for the energy components, frontier eigenvalues, convergence
 values, and timing caveats.

@@ -205,6 +205,20 @@ def pw91_energy_partials(
     n = density[positive]
     sig = np.maximum(sigma[positive], 0.0)
     exchange, exchange_dn, exchange_dsigma = _exchange_partials(n, sig)
+    correlation, correlation_dn, correlation_dsigma = _correlation_partials(n, sig)
+
+    energy_density[positive] = exchange + correlation
+    derivative_density[positive] = exchange_dn + correlation_dn
+    derivative_sigma[positive] = exchange_dsigma + correlation_dsigma
+    return energy_density, derivative_density, derivative_sigma
+
+
+def _correlation_partials(n: np.ndarray, sig: np.ndarray):
+    """PW91 correlation ``f_c = n (e_c + H)`` of an unpolarized density and its partials.
+
+    The correlation half of :func:`pw91_energy_partials` (Hartree) for positive
+    ``n`` and nonnegative ``sig``.
+    """
 
     kf = _KF_COEFFICIENT * np.cbrt(n)
     rs = np.cbrt(3.0 / (4.0 * np.pi * n))
@@ -214,13 +228,11 @@ def pw91_energy_partials(
     t2 = sig * dt2_dsigma
     # zeta = 0: g = 1 and d g/d zeta = 0.
     h, hrs, ht, _ = _gradient_correction(rs, np.ones_like(n), zeta, ec, ecrs, eczet, t2)
-
-    energy_density[positive] = exchange + n * (ec + h)
-    derivative_density[positive] = exchange_dn + (
-        ec - rs * ecrs / 3.0 + h + hrs - (7.0 / 6.0) * t2 * ht
+    return (
+        n * (ec + h),
+        ec - rs * ecrs / 3.0 + h + hrs - (7.0 / 6.0) * t2 * ht,
+        0.5 * n * ht * dt2_dsigma,
     )
-    derivative_sigma[positive] = exchange_dsigma + 0.5 * n * ht * dt2_dsigma
-    return energy_density, derivative_density, derivative_sigma
 
 
 def pw91_spin_energy_partials(
@@ -287,9 +299,25 @@ def pw91_spin_energy_partials(
     if not np.any(positive):
         return energy, d_up, d_down, d_sigma_up, d_sigma_down, d_sigma_total
 
-    n = density[positive]
-    sig = np.maximum(sig_total[positive], 0.0)
-    zeta = (up[positive] - down[positive]) / n
+    correlation, correlation_up, correlation_down, correlation_sigma = _spin_correlation_partials(
+        density[positive], up[positive], down[positive], sig_total[positive]
+    )
+    energy[positive] += correlation
+    d_up[positive] += correlation_up
+    d_down[positive] += correlation_down
+    d_sigma_total[positive] = correlation_sigma
+    return energy, d_up, d_down, d_sigma_up, d_sigma_down, d_sigma_total
+
+
+def _spin_correlation_partials(n, up, down, sigma_total):
+    """PW91 correlation of two spin densities: ``f_c``, ``df_c/dn_up``, ``df_c/dn_down``, ``df_c/dsigma``.
+
+    The correlation half of :func:`pw91_spin_energy_partials` (Hartree) at
+    points whose total density ``n`` is above the vacuum threshold.
+    """
+
+    sig = np.maximum(sigma_total, 0.0)
+    zeta = (up - down) / n
     kf = _KF_COEFFICIENT * np.cbrt(n)
     rs = np.cbrt(3.0 / (4.0 * np.pi * n))
     ec, ecrs, eczet = pw92_lsd_correlation(rs, zeta)
@@ -305,11 +333,12 @@ def pw91_spin_energy_partials(
     h, hrs, ht, hz = _gradient_correction(rs, g, gz, ec, ecrs, eczet, t2)
     pref = hz - gz * t2 * ht / g
     common = ec - rs * ecrs / 3.0 + h + hrs - (7.0 / 6.0) * t2 * ht
-    energy[positive] += n * (ec + h)
-    d_up[positive] += common + (1.0 - zeta) * (eczet + pref)
-    d_down[positive] += common - (1.0 + zeta) * (eczet + pref)
-    d_sigma_total[positive] = 0.5 * n * ht * dt2_dsigma
-    return energy, d_up, d_down, d_sigma_up, d_sigma_down, d_sigma_total
+    return (
+        n * (ec + h),
+        common + (1.0 - zeta) * (eczet + pref),
+        common - (1.0 + zeta) * (eczet + pref),
+        0.5 * n * ht * dt2_dsigma,
+    )
 
 
 def pw91(

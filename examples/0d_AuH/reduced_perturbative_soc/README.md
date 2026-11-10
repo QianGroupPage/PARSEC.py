@@ -19,10 +19,10 @@ not involved -- run from a directory containing only `parsec_fortran.in`
 renamed to `parsec.in` plus the two POTRE files.)
 
 Converged scalar-relativistic (pre-SOC) spin-polarized total energy:
-Fortran -68.32490203 Ry vs PARSEC.py -68.32491144 Ry (9.4e-6 Ry). Converged
+Fortran -68.32490203 Ry vs PARSEC.py -68.32490805 Ry (6.0e-6 Ry). Converged
 perturbative-SOC state 1 eigenvalue/<S_z>: Fortran -0.818415 Ry / 0.9779 vs
-PARSEC.py -0.818696 Ry / 0.9779. See the parent conversation's summary for
-the full state-by-state comparison; states inside tightly-spaced
+PARSEC.py -0.818297 Ry / 0.9778 (PARSEC.py of 5 November 2026,
+`src/parsec_python/reference_main.py parsec.in`). States inside tightly-spaced
 near-degenerate multiplets (Au's d-manifold) show larger <S_z> spread
 between the two codes, expected basis-sensitivity rather than a
 discrepancy.

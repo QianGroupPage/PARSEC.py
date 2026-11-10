@@ -33,10 +33,15 @@ sectors. Geometries:
 - k08 to k14 are cut from the ideal diamond lattice, terminated with hydrogen
   and not relaxed.
 
+`structures/` shows how each geometry was made: the lattice cut, the GFN-FF
+and GFN2-xTB optimization and, for k05 to k07, a projection onto the exact
+point group, with the scripts, xyz files, xTB summaries and the commands that
+reproduce them ([`structures/README.md`](structures/README.md)).
+
 k06 appears in both folders with the same atoms. The two inputs differ in
 solver controls and in the Hartree boundary (see the notes below), so their
 total energies differ by 3.2e-2 Ry. The benchmark inputs use first-step filter
-settings that keep the large clusters at 10 or 11 SCF steps.
+settings that keep the large clusters at 9 to 12 SCF steps.
 
 ```text
 0d_nanodiamonds/
@@ -82,7 +87,7 @@ It checks these at the start, and `--check` prints the commands without
 running them; `--help` lists every option. Each line of the table looks like:
 
 ```text
-  k06 C795H300: ok, 10 steps (reference 10), E = -9437.81995096 Ry (difference 0.0e+00), 10.1 s (A100 10.1), peak 4.2 GiB (A100 4.2)
+  k06 C795H300: ok, 10 steps (reference 10), E = -9437.81996163 Ry (difference 0.0e+00), 9.0 s (A100 9.0), peak 4.2 GiB (A100 4.2)
 ```
 
 A run whose total energy is within 1e-5 Ry of the reference is reported as
@@ -160,32 +165,38 @@ took 7.5 s).
 
 ### GPU benchmark (k06-k14): program wall time in seconds
 
+Against the previous series (23 October 2026, `FF_MaxIter: 4`) these times are
+2 to 18 % lower in 31 of the 32 cells; k09 on 1 GPU takes 3.1 % longer, as k09
+needs 12 SCF steps instead of 11 and its basis is there in host memory.
+
 | Case | Formula | Valence electrons | Grid points | States computed | SCF steps | Total energy (Ry) | 1 GPU | 2 GPUs | 4 GPUs | 8 GPUs | 16 GPUs |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| k06 | C795H300 | 3,480 | 2,710,168 | 1,767 | 10 | -9437.81995096 | 21.8 | 14.4 | 10.1 | 6.4 | 5.7 |
-| k07 | C1213H412 | 5,264 | 4,125,288 | 2,659 | 10 | -14346.75097475 | 43.3 | 25.4 | 16.4 | 10.7 | 8.0 |
-| k08 | C1653H508 | 7,120 | 4,778,880 | 3,588 | 10 | -19488.31721372 | 68.7 | 38.6 | 23.3 | 14.5 | 10.4 |
-| k09 | C2455H636 | 10,456 | 7,699,168 | 5,256 | 11 | -28808.04029769 | 348.4 (a) | 90.8 | 51.5 | 31.0 | 21.0 |
-| k10 | C3469H804 | 14,680 | 10,419,384 | 7,367 | 11 | -40596.27462396 |  | 180.9 | 98.5 | 57.8 | 35.6 |
-| k11 | C4601H988 | 19,392 | 11,493,600 | 9,724 | 10 | -53752.09127639 |  |  | 145.7 | 82.5 | 48.5 |
-| k12 | C5659H1132 | 23,768 | 15,147,328 | 11,911 | 10 | -66016.14132692 |  |  |  | 138.6 | 78.9 |
-| k13 | C7067H1308 | 29,576 | 16,522,040 | 14,815 | 10 | -82319.08242217 |  |  |  | 201.1 | 111.8 |
-| k14 | C9449H1572 | 39,368 | 22,640,800 | 19,711 | 10 | -109862.37143299 |  |  |  |  | 224.6 |
+| k06 | C795H300 | 3,480 | 2,710,168 | 1,767 | 10 | -9437.81996163 | 18.8 | 12.2 | 9.0 | 5.9 | 4.9 |
+| k07 | C1213H412 | 5,264 | 4,125,288 | 2,659 | 10 | -14346.75100522 | 38.9 | 23.3 | 14.7 | 9.4 | 7.2 |
+| k08 | C1653H508 | 7,120 | 4,778,880 | 3,587 | 9 | -19488.31722277 | 56.6 | 32.3 | 19.5 | 12.3 | 9.0 |
+| k09 | C2455H636 | 10,456 | 7,699,168 | 5,255 | 12 | -28808.04030869 | 359.2 (a) | 87.1 | 49.2 | 30.2 | 20.5 |
+| k10 | C3469H804 | 14,680 | 10,419,384 | 7,368 | 10 | -40596.27456801 |  | 152.8 | 83.9 | 49.8 | 31.2 |
+| k11 | C4601H988 | 19,392 | 11,493,600 | 9,724 | 10 | -53752.09127159 |  |  | 132.2 | 76.8 | 45.7 |
+| k12 | C5659H1132 | 23,768 | 15,147,328 | 11,911 | 10 | -66016.14126698 |  |  |  | 129.0 | 73.9 |
+| k13 | C7067H1308 | 29,576 | 16,522,040 | 14,815 | 11 | -82319.08244905 |  |  |  | 196.8 | 111.2 |
+| k14 | C9449H1572 | 39,368 | 22,640,800 | 19,711 | 10 | -109862.37132558 |  |  |  |  | 208.5 |
 
 Measured on Perlmutter at NERSC: nodes of four A100-SXM4-80GB, one MPI rank
 per node, launched with `scripts/run_multi_gpu_scf.sh`. Runs on 1, 2 and
-4 GPUs use one node; runs on 8 and 16 GPUs use two and four nodes. One run per
-cell after a warm-up run (k09 on 1 GPU and k10 on 2 GPUs: the second of two
-runs on a node). Measured on 23 October 2026 with `master` 0f47a3f, with the
-Python environment, the sources and the CuPy kernel cache on node-local
-storage (`performance/README.md`). Blank cells: the basis does not fit in
-the memory of that many 80 GB GPUs. (a) With this input the basis of k09 does
-not fit on one card, so the code keeps it in page-locked host buffers (78 GiB
-of host memory in all) and moves one sector at a time to the GPU. Without the
-`Boundary_Sphere_Radius` line, the code chooses a sphere 0.7 Angstrom smaller,
-which fits on one card (205 s with the code of 10 October 2026).
-`performance/` has figures of these times and memory peaks and how they grow
-with the size of the system.
+4 GPUs use one node; runs on 8 and 16 GPUs use two and four nodes under one
+network switch. One run per cell after a warm-up run of the same cell (k09 on
+1 GPU and k10 on 2 GPUs: the second of two runs on a node). Measured on
+5 November 2026 with the code of that date (`FF_MaxIter: 3` in the inputs,
+`Chebyshev_Degree_Decrease_After` at its default 4), with the Python
+environment, the sources, the CuPy and CUDA kernel caches, the inputs and the
+outputs on node-local storage (`performance/README.md`). Blank cells: the
+basis does not fit in the memory of that many 80 GB GPUs. (a) With this input
+the basis of k09 does not fit on one card, so the code keeps it in page-locked
+host buffers (78 GiB of host memory in all) and moves one sector at a time to
+the GPU. Without the `Boundary_Sphere_Radius` line, the code chooses a sphere
+0.7 Angstrom smaller, which fits on one card (205 s with the code of 10 October
+2026). `performance/` has figures of these times and memory peaks and how they
+grow with the size of the system.
 
 ### GPU benchmark (k06-k14): peak memory of the fullest GPU in GiB
 
@@ -225,22 +236,23 @@ Notes:
   cache) in double precision. Program time runs from the end of input parsing
   to the final report and includes CUDA initialization.
 - **Version of the benchmark references.** The times and memory peaks of the
-  two GPU tables (and the references of `run_benchmark.sh`) were measured with
-  `master` 0f47a3f of 23 October 2026. The `gpu_benchmark/` outputs and the
-  total energies in the table come from the code published on 10 October 2026;
-  the code of 23 October gives the same SCF step counts in all 32 cells and
-  total energies within 2e-7 Ry of them. Its Rayleigh-Ritz step on 8 and 16
-  GPUs copies between the GPUs of a sector beside its products and without
-  pack kernels: with the same totals to the last bit as the code of 21
-  October, the SCF time is 5 to 9 % lower on 8 GPUs and 5 to 8 % lower on 16
-  GPUs (k14: 232.9 against 218.0 s), and the fullest GPU holds 0.4 to 1.2 GiB
-  less; on 1 to 4 GPUs the SCF time stays within 3 % of it. These runs read
-  the software from node-local storage: on Perlmutter a Python environment and
-  CuPy kernel cache on the project file system (CFS) added 1 to 3 s to the
-  first SCF step of runs on four nodes, at times, since the maintenance of 21
-  October 2026. The code of 21 October had cut the SCF time against that of 17
-  October by 3 to 24 % (its stencil kernel keeps more loads in flight). Against
-  the code of 10
-  October the code of 17 October had changed the program time by -7 to +1 % on
-  1 to 16 GPUs (-46 % for k09 on one GPU, whose basis lives in host memory) and
+  two GPU tables, the references of `run_benchmark.sh`, the total energies in
+  the table and the `gpu_benchmark/` outputs (the runs on 16 GPUs) come from
+  the series of 5 November 2026: inputs with `FF_MaxIter: 3` and
+  `Chebyshev_Degree_Decrease_After` at its default 4. A case takes the same
+  number of SCF steps at every GPU count, with total energies within 1e-10 Ry
+  of each other. Against the series of 23 October 2026 (`FF_MaxIter: 4`,
+  `Chebyshev_Degree_Decrease_After` 5) the first eigensolve is 24 to 36 %
+  shorter (13 % for k09 on one GPU), k08 and k10 take one SCF step fewer and
+  k09 and k13 one more, the total energies move by -3.0e-5 to +1.1e-4 Ry
+  (within the SCF criterion of 2e-4 Ry), the SCF time on 16 GPUs is 2 to 18 %
+  lower (k14: 199.2 against 218.0 s) and the peak of the fullest GPU is the
+  same. These runs read the software from node-local storage: on Perlmutter a
+  Python environment and CuPy kernel cache on the project file system (CFS)
+  added 1 to 3 s to the first SCF step of runs on four nodes, at times, since
+  the maintenance of 21 October 2026. The code of 23 October had cut the SCF
+  time on 8 and 16 GPUs by 5 to 9 % against that of 21 October, which had cut
+  it by 3 to 24 % against that of 17 October. Against the code of 10 October
+  the code of 17 October had changed the program time by -7 to +1 % on 1 to
+  16 GPUs (-46 % for k09 on one GPU, whose basis lives in host memory) and
   lowered the peak of the fullest GPU by up to 2.5 GiB.

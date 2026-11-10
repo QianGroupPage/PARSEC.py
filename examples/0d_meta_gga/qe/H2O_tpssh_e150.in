@@ -1,0 +1,40 @@
+ &control
+    calculation = 'scf'
+    prefix = 'H2O_tpssh_L20_e150'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+    tprnfor = .true.
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 20.000000
+    assume_isolated = 'mt'
+    nat = 3
+    ntyp = 2
+    ecutwfc = 150.0
+    ecutrho = 600.0
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'XC-000I-000I-000I-000I-000I-457L'
+    nqx1 = 1
+    nqx2 = 1
+    nqx3 = 1
+    x_gamma_extrapolation = .false.
+    exxdiv_treatment = 'vcut_spherical'
+    ecutfock = 300.0
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 300
+ /
+ATOMIC_SPECIES
+ H 1.008 h_pbe_tm.UPF
+ O 15.999 o_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ O 10.0000000000 10.0000000000 9.4464214780
+ H 11.4304288085 10.0000000000 10.5535785220
+ H 8.5695711915 10.0000000000 10.5535785220
+K_POINTS gamma

@@ -19,9 +19,12 @@ the present and of the previous step give
 ``v(t)    = [r(t) - r(t-dt)]/dt + dt [2 a(t) + a(t-dt)]/6``
 ``r(t+dt) = r(t) + dt v(t) + dt**2 [4 a(t) - a(t-dt)]/6``
 
-and the velocity kept for the restart file is the estimate
+and the velocity kept for the next step is the estimate
 ``v(t) + dt [3 a(t) - a(t-dt)]/2``.  The velocity of the centre of mass of
-the movable atoms is subtracted from ``v(t)`` in every step.
+the movable atoms is subtracted from ``v(t)`` in every step.  The restart
+files hold ``v(t)`` itself (``vxold_print`` of PARSEC 1.5,
+``md/moldyn.f90:332,528,604``; the previous tree wrote the estimate):
+:attr:`MoldynStep.current_velocities`.
 
 Otherwise (canonical ensemble): the Langevin equation
 ``dv/dt = F/m - beta v + G/m`` with a Gaussian random acceleration of
@@ -35,6 +38,14 @@ The first call of a run that is not a restart has no previous step.  It draws
 Maxwell velocities at the initial temperature, removes the centre-of-mass
 velocity, rescales to the exact temperature and takes one step
 ``r(dt) = r(0) + dt v(0) + dt**2 a(0)/2``.
+
+A restarted run continues from ``mdinit.dat``.  Its velocities enter only the
+friction term of a Langevin run.  Since PARSEC 1.5 they are ``v(t)`` of the
+step that wrote the file, not the estimate an uninterrupted run would use, so
+a restarted Langevin run is not bit-continuous with an uninterrupted one (as
+in 1.5).  With ``test_rng`` the first step of a restart draws ``2 (frame - 1)``
+numbers first (``ffw_rand_test``, ``md/moldyn.f90:445-455, 1088-1107``), so
+that the generator continues about where the earlier run left it.
 
 Atoms that must not move (``clust%mvat = 0``) have their velocity and
 acceleration multiplied by zero.  They still consume random numbers.
@@ -245,6 +256,10 @@ class MoldynStep:
     ``finished``
         the atom movement loop of ``parsec.F90`` ends after this call
         (``move%num > Step_num``); ``positions`` is then not used any more.
+    ``current_velocities``
+        ``v(t)`` at ``frame`` (bohr per atomic unit of time, ``(atoms, 3)``):
+        what PARSEC 1.5 writes to ``md_mech.dat`` (``vxold_print``), where
+        ``state.velocities`` holds the estimate the next call uses.
     """
 
     state: MolecularDynamicsState
@@ -261,6 +276,7 @@ class MoldynStep:
     center_of_mass_velocity: np.ndarray
     last_step: bool
     finished: bool
+    current_velocities: np.ndarray | None = None
 
 
 def start_molecular_dynamics(
@@ -347,6 +363,7 @@ def moldyn_step(
     total_energy: float,
     *,
     random: UniformSource | None = None,
+    keep_center_of_mass: bool = False,
 ) -> MoldynStep:
     """Advance the atoms by one time step (one call of ``moldyn``).
 
@@ -370,6 +387,18 @@ def moldyn_step(
         :meth:`MolecularDynamicsSettings.random_source`.  It is needed by the
         first call of a fresh run (initial velocities) and by every call of a
         Langevin run; it is advanced in place.
+
+    keep_center_of_mass:
+        the forces keep a net force (FDET, ``Forces.ForceResult.net_force_kept``):
+        the microcanonical branch then does not subtract the centre-of-mass
+        velocity in every step, so that the motion the net force drives is
+        integrated (Newton's equations; the reported temperature counts the
+        3 N degrees of freedom that then move).  Deviation from PARSEC 1.5,
+        whose ``moldyn.f90:461-503`` removes it also under ``fex_is`` while
+        ``forcnloc.F90:869-875`` keeps the net force: the trajectory is then
+        not Newtonian and the energy is not conserved.  The Maxwell velocities
+        of the first step still have no centre-of-mass part, and the Langevin
+        branch holds no centre of mass in any case.
 
     The caller ends the run when ``finished`` is true, and does not call at
     all when ``settings.step_num`` is zero, as ``parsec.F90`` does.
@@ -396,6 +425,19 @@ def moldyn_step(
     # temperature in Hartree
     tempeh = tempi * KELVIN_RYDBERG * 0.5
 
+    if (
+        state.restarted
+        and imove == 0
+        and settings.use_test_rng
+        and random is not None
+        and iframe > 1
+    ):
+        # PARSEC 1.5 md/moldyn.f90:445-455: the first call of a restart
+        # fast-forwards the test generator by 2 (iframe - 1) numbers
+        # (ffw_rand_test, 1088-1107).
+        for _ in range(2 * (iframe - 1)):
+            random.uniform()
+
     if state.is_first_step:
         # Maxwell velocities, 0.5 k T = 0.5 m vel**2 per component
         vel = np.sqrt(tempeh / amass)
@@ -415,6 +457,7 @@ def moldyn_step(
             rescale = 1.0
         vold = vold * rescale
         tke = tke * rescale * rescale
+        current_velocities = vold
 
         xold = xcur
         if beta < MICROCANONICAL_FRICTION:
@@ -437,13 +480,15 @@ def moldyn_step(
             (xcur - state.previous_positions) / deltat
             + deltat * (forces / amass + accolder) / 6.0
         )
-        vav = _center_of_mass_velocity(state.masses, amove1, vold)
-        vold = vold - vav * amove
+        if not keep_center_of_mass:
+            vav = _center_of_mass_velocity(state.masses, amove1, vold)
+            vold = vold - vav * amove
         xold = xcur
         xcur = xold + deltat * (
             vold + deltat * (2.0 * forces * amove / amass - accolder) / 6.0
         )
         tke = _kinetic_energy(state.masses, vold)
+        current_velocities = vold
         vold = vold + deltat * (1.5 * forces * amove / amass - accolder) * 0.5
         accold = 0.5 * forces * amove / amass
     else:
@@ -460,6 +505,7 @@ def moldyn_step(
         voldr = (xold - xolder) / deltat + deltat * (2.0 * accold + accolder) / 6.0
         xcur = xold + deltat * (voldr + deltat * (4.0 * accold - accolder) / 6.0)
         tke = _kinetic_energy(state.masses, voldr)
+        current_velocities = voldr
         vold = voldr + deltat * (3.0 * accold - accolder) * 0.5
 
     # "just for the purpose of reporting"
@@ -520,4 +566,5 @@ def moldyn_step(
         center_of_mass_velocity=vav,
         last_step=last_step,
         finished=imove + 1 > settings.step_num,
+        current_velocities=np.array(current_velocities, dtype=float),
     )

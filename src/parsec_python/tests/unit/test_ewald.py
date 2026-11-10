@@ -146,6 +146,107 @@ class EwaldIonIonEnergyTests(unittest.TestCase):
         self.assertAlmostEqual(cube_energy, -67.20371829, delta=5.0e-9)
 
 
+def direct_ewald_sum(atoms, potentials, lattice_vectors, *, tolerance: float = 1.0e-18, forces: bool = False):
+    """The Ewald ion-ion energy (Ry) and forces (Ry/bohr) as the code summed them before 2026-11-08.
+
+    Every lattice translation ``T`` with ``|T| <= r_c + 2 max|r_a - centroid|`` and every atom pair, every ``G``
+    with ``|G| <= G_c``, ``eta = sqrt(pi)/V^(1/3)``: ``O(N^2)`` per translation, the reference the pair sums of
+    :func:`parsec_python.V_ion.ewald.ewald_ion_ion_terms` are tested against.
+    """
+    from scipy.special import erfc, erfcinv
+
+    lattice = np.asarray(lattice_vectors, dtype=float)
+    volume = abs(float(np.linalg.det(lattice)))
+    positions = np.array([np.asarray(atom.position, dtype=float) for atom in atoms])
+    charges = np.array([potentials[atom.symbol].ionic_charge for atom in atoms], dtype=float)
+    eta = float(np.sqrt(np.pi) / volume ** (1.0 / 3.0))
+    real_cutoff = float(erfcinv(tolerance) / eta)
+    reciprocal_cutoff = float(2.0 * eta * np.sqrt(-np.log(tolerance)))
+    reciprocal = 2.0 * np.pi * np.linalg.inv(lattice).T
+
+    def points(basis, dual, cutoff):
+        spacing = 2.0 * np.pi / np.linalg.norm(dual, axis=1)
+        top = np.ceil(cutoff / spacing).astype(int) + 1
+        mesh = np.meshgrid(*[np.arange(-m, m + 1) for m in top], indexing="ij")
+        found = np.column_stack([axis.reshape(-1) for axis in mesh]) @ basis
+        return found[np.linalg.norm(found, axis=1) <= cutoff]
+
+    reach = 2.0 * float(np.max(np.linalg.norm(positions - positions.mean(axis=0), axis=1)))
+    energy = 0.0
+    force = np.zeros_like(positions)
+    products = charges[:, None] * charges[None, :]
+    for translation in points(lattice, reciprocal, real_cutoff + reach):
+        displacement = positions[:, None, :] - positions[None, :, :] + translation
+        distance = np.linalg.norm(displacement, axis=2)
+        if np.all(translation == 0.0):
+            np.fill_diagonal(distance, np.inf)
+        energy += 0.5 * np.sum(products * erfc(eta * distance) / distance)
+        radial = (erfc(eta * distance) / distance**2
+                  + 2.0 * eta * np.exp(-((eta * distance) ** 2)) / (np.sqrt(np.pi) * distance)) / distance
+        force += np.einsum("ab,abk->ak", products * radial, displacement)
+    vectors = points(reciprocal, lattice, reciprocal_cutoff)
+    vectors = vectors[np.any(vectors != 0.0, axis=1)]
+    g_squared = np.sum(vectors**2, axis=1)
+    weight = np.exp(-g_squared / (4.0 * eta**2)) / g_squared
+    phases = np.exp(1j * positions @ vectors.T)
+    structure = np.sum(charges[:, None] * phases, axis=0)
+    energy += (2.0 * np.pi / volume) * float(np.sum(weight * np.abs(structure) ** 2))
+    sine = np.imag(phases * np.conj(structure)[None, :])
+    force += (4.0 * np.pi / volume) * charges[:, None] * ((sine * weight[None, :]) @ vectors)
+    energy += -(eta / np.sqrt(np.pi)) * float(np.sum(charges**2))
+    energy += -(np.pi / (2.0 * eta**2 * volume)) * float(np.sum(charges)) ** 2
+    return (2.0 * energy, 2.0 * force) if forces else 2.0 * energy
+
+
+class EwaldPairSumTests(unittest.TestCase):
+    """The pair and structure-factor sums against the direct sum of every translation and atom pair."""
+
+    _POTENTIALS = {
+        "A": SimpleNamespace(ionic_charge=4.0),
+        "B": SimpleNamespace(ionic_charge=1.0),
+        "C": SimpleNamespace(ionic_charge=-2.5),
+    }
+    _CELLS = {
+        "cube": 10.26 * np.eye(3),
+        "oblique": np.array([[6.0, 0.0, 0.0], [1.7, 6.5, 0.0], [-1.1, 2.2, 7.0]]),
+        "fcc": 5.4 * (np.ones((3, 3)) - np.eye(3)),
+        "elongated": np.diag([5.0, 6.0, 23.0]),
+    }
+
+    def test_energy_and_forces_equal_the_direct_sum(self) -> None:
+        from parsec_python.Forces.ion_ion import ewald_ion_ion_forces
+
+        generator = np.random.default_rng(3)
+        for name, lattice in self._CELLS.items():
+            for count in (1, 3, 17):
+                with self.subTest(cell=name, atoms=count):
+                    # fractional coordinates outside [0, 1) too: the sums take the atoms into the cell
+                    fractional = generator.uniform(-0.3, 1.3, (count, 3))
+                    symbols = generator.choice(sorted(self._POTENTIALS), count)
+                    atoms = [Atom(str(symbol), position) for symbol, position in zip(symbols, fractional @ lattice)]
+                    direct, direct_forces = direct_ewald_sum(atoms, self._POTENTIALS, lattice, forces=True)
+                    energy = ewald_ion_ion_energy(atoms, self._POTENTIALS, lattice)
+                    self.assertAlmostEqual(energy, direct, delta=1.0e-13 * max(1.0, abs(direct)))
+                    np.testing.assert_allclose(
+                        ewald_ion_ion_forces(atoms, self._POTENTIALS, lattice), direct_forces, rtol=0.0, atol=2.0e-13
+                    )
+
+    def test_diamond_supercell_energy_per_atom(self) -> None:
+        # 2 x 2 x 2 conventional cells of the bulk-diamond benchmark (64 carbon atoms, Z = 4): the energy per atom
+        # of the primitive crystal, and the direct sum
+        side = 3.567 / 0.529177210903
+        basis = np.array([[0.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5], [0.5, 0.5, 0.0]])
+        sites = np.concatenate((basis, basis + 0.25))
+        cells = np.array([[i, j, k] for i in range(2) for j in range(2) for k in range(2)], dtype=float)
+        atoms = [Atom("C", (site + cell) * side) for cell in cells for site in sites]
+        potentials = {"C": SimpleNamespace(ionic_charge=4.0)}
+        lattice = 2.0 * side * np.eye(3)
+        energy = ewald_ion_ion_energy(atoms, potentials, lattice)
+        self.assertAlmostEqual(energy, direct_ewald_sum(atoms, potentials, lattice), delta=1.0e-11)
+        primitive = ewald_ion_ion_energy(atoms[:8], potentials, side * np.eye(3))
+        self.assertAlmostEqual(energy / 64.0, primitive / 8.0, delta=1.0e-12)
+
+
 class EwaldLocalIonicPotentialTests(unittest.TestCase):
     _hydrogen_box = staticmethod(_hydrogen_box)
 

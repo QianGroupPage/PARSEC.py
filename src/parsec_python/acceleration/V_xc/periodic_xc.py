@@ -31,6 +31,15 @@ wire/slab grids keep the host, :func:`~parsec_python.acceleration.V_xc.device_xc
 and neither spin-orbit nor non-collinear runs (their drivers keep the host).
 The zero-average shift (``Zero_Average_Vxc``) is applied by the caller as on
 the host.  Importing :mod:`parsec_python.acceleration` installs it.
+
+In an MPI run (``--mpi``) the replicated drivers of every rank also evaluate
+the unpolarized semilocal functionals on the device of the rank
+(:func:`device_unpolarized_evaluator`, :class:`~parsec_python.acceleration.V_xc.device_xc.DeviceXCEvaluator`,
+the functionals ``PARSEC_CUPY_XC`` puts on the device, PBE among them): the
+kernels translate the readable functionals, so the results differ from the
+host ones by round-off (6e-14 of the energy of C795H300), and their
+fixed-order sums give every rank the same potential.  A run of one process
+keeps the readable functionals (its numbers unchanged).
 """
 
 from __future__ import annotations
@@ -38,11 +47,13 @@ from __future__ import annotations
 from collections import OrderedDict
 import threading
 
-from parsec_python.SCF.pbc import set_periodic_spin_xc_provider
+from parsec_python.SCF.pbc import set_periodic_spin_xc_provider, set_periodic_xc_provider
 from parsec_python.V_xc.selection import as_spin_polarized_result
 
 from .device_xc import (
+    DEVICE_XC_FUNCTIONALS,
     DeviceSpinXCEvaluator,
+    DeviceXCEvaluator,
     device_grid_supported,
     device_xc_mode,
     device_xc_selected,
@@ -78,16 +89,16 @@ class _Evaluators:
         self._entries: OrderedDict[tuple, tuple] = OrderedDict()
         self._lock = threading.Lock()
 
-    def get(self, system, functional: str, device_id: int):
+    def get(self, system, functional: str, device_id: int, *, spin: bool = True):
         grid = system.grid
-        key = (id(grid), functional, device_id, float(system.input.scf.ionization_energy_difference))
+        key = (id(grid), functional, device_id, float(system.input.scf.ionization_energy_difference), spin)
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None:
                 self._entries.move_to_end(key)
         if entry is None:
             holder = [system.core_density]
-            evaluator = DeviceSpinXCEvaluator(
+            evaluator = (DeviceSpinXCEvaluator if spin else DeviceXCEvaluator)(
                 functional,
                 grid,
                 core_density=lambda: holder[0],
@@ -138,6 +149,50 @@ def device_spin_evaluator(system):
     return _EVALUATORS.get(system, functional, device_id)
 
 
+def device_unpolarized_evaluator(system):
+    """The device evaluator of ``system``'s unpolarized functional in an MPI run, or ``None`` (the host evaluates).
+
+    Only the replicated drivers of an MPI run (``--mpi``) take it, on the device of the rank
+    (:func:`~parsec_python.acceleration.Hartree.periodic_device.hartree_device_id`); meta-GGAs, hybrids,
+    spinor runs, CA-LDA (its own path) and the grids :func:`device_grid_supported` does not take stay
+    on the host.
+    """
+
+    from ..Parallel import mpi
+
+    if not mpi.requested():
+        return None
+    scf = system.input.scf
+    if (
+        getattr(scf, "is_meta_gga", False)
+        or getattr(scf, "is_hybrid", False)
+        or getattr(scf, "noncollinear", False)
+        or getattr(scf, "self_consistent_spin_orbit", False)
+    ):
+        return None
+    functional = scf.xc_functional
+    if functional not in DEVICE_XC_FUNCTIONALS or not device_xc_selected(functional):
+        return None
+    grid = system.grid
+    if not (hasattr(grid, "cell") and device_grid_supported(grid)):
+        return None
+    from ..Hartree.periodic_device import hartree_device_id
+
+    device_id = hartree_device_id()
+    if device_id is None:
+        return None
+    return _EVALUATORS.get(system, functional, device_id, spin=False)
+
+
+def provide_xc(system, density):
+    """The hook of :mod:`parsec_python.SCF.pbc` (``set_periodic_xc_provider``)."""
+
+    evaluator = device_unpolarized_evaluator(system)
+    if evaluator is None:
+        return None
+    return evaluator(density)
+
+
 def provide_spin_xc(system, kind: str, density_up, density_down):
     """The hook of :mod:`parsec_python.SCF.pbc` (``set_periodic_spin_xc_provider``)."""
 
@@ -152,18 +207,22 @@ def provide_spin_xc(system, kind: str, density_up, density_down):
 
 def install() -> None:
     set_periodic_spin_xc_provider(provide_spin_xc)
+    set_periodic_xc_provider(provide_xc)
 
 
 def uninstall() -> None:
     set_periodic_spin_xc_provider(None)
+    set_periodic_xc_provider(None)
 
 
 __all__ = [
     "HOST_UNLESS_ASKED",
     "clear_cache",
     "device_spin_evaluator",
+    "device_unpolarized_evaluator",
     "install",
     "periodic_spin_device_selected",
     "provide_spin_xc",
+    "provide_xc",
     "uninstall",
 ]

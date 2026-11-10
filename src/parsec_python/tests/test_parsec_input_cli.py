@@ -114,7 +114,8 @@ class ParsecInputTests(unittest.TestCase):
         self.assertEqual(problem.scf.fermi_temperature_kelvin, 500.0)
         self.assertEqual(problem.eigensolver.method, "chebff")
         self.assertEqual(problem.eigensolver.first_filter_degree, 10)
-        self.assertEqual(problem.eigensolver.first_filter_cycles, 2)
+        # FF_MaxIter of CHEBFF defaults to 3 (PARSEC 1.5) since 2026-11-04 (2 before).
+        self.assertEqual(problem.eigensolver.first_filter_cycles, 3)
         self.assertEqual(problem.eigensolver.matvec_block_size, 6)
         self.assertEqual(problem.eigensolver.subspace_buffer, 6)
         self.assertEqual(problem.eigensolver.filter_degree, 10)
@@ -150,7 +151,8 @@ class ParsecInputTests(unittest.TestCase):
 
         self.assertEqual(settings.method, "chebff")
         self.assertEqual(settings.first_filter_degree, 20)
-        self.assertEqual(settings.first_filter_cycles, 2)
+        # FF_MaxIter of CHEBFF defaults to 3 (PARSEC 1.5) since 2026-11-04 (2 before).
+        self.assertEqual(settings.first_filter_cycles, 3)
         self.assertEqual(settings.matvec_block_size, 6)
         self.assertEqual(settings.filter_degree, 15)
         self.assertEqual(settings.filter_degree_delta, 3)
@@ -162,7 +164,7 @@ class ParsecInputTests(unittest.TestCase):
             {
                 "Chebdav_Degree: 10": (
                     "Chebdav_Degree: 4\n"
-                    "FF_MaxIter: 12\n"
+                    "FF_MaxIter: 60\n"
                     "Matvec_Blocksize: 3\n"
                     "Subspace_Buffer_Size: 2"
                 ),
@@ -170,15 +172,19 @@ class ParsecInputTests(unittest.TestCase):
         )
         settings = translation.problem.eigensolver
 
-        self.assertEqual(settings.first_filter_degree, 15)
-        self.assertEqual(settings.first_filter_cycles, 2)
+        # PARSEC 1.5 (usrinputfile.F90:2279-2310): a CHEBFF Chebdav_Degree
+        # below 10 becomes 12 (the earlier PARSEC: 15), FF_MaxIter is valid up
+        # to 50 (earlier 1..9; 60 resets to the default, 3 since 2026-11-04).
+        self.assertEqual(settings.first_filter_degree, 12)
+        # FF_MaxIter of CHEBFF defaults to 3 (PARSEC 1.5) since 2026-11-04 (2 before).
+        self.assertEqual(settings.first_filter_cycles, 3)
         self.assertEqual(settings.matvec_block_size, 3)
         self.assertEqual(settings.subspace_buffer, 6)
         self.assertTrue(
             any("Chebdav_Degree=4" in item for item in translation.warnings)
         )
         self.assertTrue(
-            any("FF_MaxIter=12" in item for item in translation.warnings)
+            any("FF_MaxIter=60" in item for item in translation.warnings)
         )
         self.assertTrue(
             any("Subspace_Buffer_Size=2" in item for item in translation.warnings)
@@ -280,7 +286,8 @@ class ParsecInputTests(unittest.TestCase):
         self.assertIn("Atoms: 2", summary)
         self.assertIn("Species: H", summary)
         self.assertIn(str((DATA / "H_POTRE.DAT").resolve()), summary)
-        self.assertIn("first_filter=10x2", summary)
+        # FF_MaxIter of CHEBFF defaults to 3 (PARSEC 1.5) since 2026-11-04 (2 before).
+        self.assertIn("first_filter=10x3", summary)
         self.assertIn("block=6", summary)
 
     def test_full_physical_h2_potential_is_not_the_synthetic_fixture(self) -> None:
@@ -420,8 +427,11 @@ class PeriodicAndClusterInputTests(unittest.TestCase):
         periodic = HYDROGEN_INPUT.format(domain=PERIODIC_DOMAIN)
         for old, new, message in (
             (
+                # PARSEC reads no Periodic_System: without the line it is
+                # inferred from Boundary_Conditions, a line that says otherwise
+                # is refused.
                 "Periodic_System: .true.\n",
-                "",
+                "Periodic_System: .false.\n",
                 "Periodic_System and Boundary_Conditions disagree",
             ),
             (

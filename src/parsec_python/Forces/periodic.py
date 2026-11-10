@@ -139,7 +139,8 @@ SLOPES_ENV = "PARSEC_PERIODIC_FORCE_SLOPES"
 #: The distance below which ``1/|d|`` of a projector gradient is clamped (bohr), and at most the first radial knot:
 #: an atom within round-off of a grid point (ideal positions on the grid) gets the gradient of this distance instead
 #: of ``1/1e-15`` (found when both sets of routines were compared).  Far below any physical displacement, far above round-off.
-ROUND_OFF_DISTANCE = 1.0e-6
+#: The projectors take the same rule for their harmonics (``V_ion.ionic_potential.PROJECTOR_CENTER_ROUND_OFF``).
+ROUND_OFF_DISTANCE = _ionic_potential.PROJECTOR_CENTER_ROUND_OFF
 
 
 def radial_slope_setting() -> str:
@@ -346,10 +347,13 @@ def set_local_force_provider(provider=None) -> None:
 
     ``provider(grid, atoms, potentials, specifications, lattice_vectors, density,
     potential_residual, xc_potential)`` returns the :class:`LocalForceTerms` of the fields it
-    built, or ``None`` for a cell it does not take (the sums below then run).  Nothing is installed
-    by default; the accelerated command line installs the derivatives of the device fields of
-    ``parsec_python.acceleration.V_ion.periodic_device`` together with those fields
-    (``parsec_python.acceleration.Forces.periodic_device.device_periodic_forces``).
+    built, or ``None`` for a cell it does not take (the sums below then run).  ``import parsec_python``
+    installs the forces of the fast potential of ``Cubic_Spline`` species on the orthorhombic grid
+    (``parsec_python.acceleration.Forces.periodic_spline``, with
+    ``parsec_python.acceleration.V_ion.periodic_setup.install``); the accelerated command line installs
+    the derivatives of the device fields of ``parsec_python.acceleration.V_ion.periodic_device``
+    together with those fields (``parsec_python.acceleration.Forces.periodic_device.device_periodic_forces``),
+    which hand the ``Cubic_Spline`` species to the former.
     """
 
     global _local_force_provider
@@ -385,7 +389,7 @@ def periodic_local_forces(
     superposed atomic valence densities, both with their lattice images.
 
     A provider installed with :func:`set_local_force_provider` takes the
-    cell first (none is installed by default).
+    cell first (see there).
     """
 
     if _local_force_provider is not None:
@@ -1188,6 +1192,16 @@ def _kpoint_blocks(result):
             offsets[channel] = start + count
 
 
+def meta_gga_core_potential(result, xc_potential):
+    """``dE_xc/dn_core`` (Ry) of the core-correction force: ``xc_potential``, or for a meta-GGA in the orbital form
+    of the density gradient the record's ``core_potential`` (its local potential ``de/dn`` lacks the divergence of
+    ``W = de/dg``, which reaches ``n_core`` through the gradient of the core density)."""
+
+    record = getattr(result, "meta_gga", None)
+    core = None if record is None else getattr(record, "core_potential", None)
+    return xc_potential if core is None else np.asarray(core, dtype=np.float64)
+
+
 def periodic_force_fields(system, result) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """``(density, V_out - V_in, V_xc)`` of a periodic result for the local terms.
 
@@ -1218,7 +1232,7 @@ def periodic_force_fields(system, result) -> tuple[np.ndarray, np.ndarray, np.nd
             + (np.asarray(outputs[1]) - np.asarray(inputs[1]))
         )
         xc = 0.5 * (np.asarray(xc_channels[0]) + np.asarray(xc_channels[1]))
-        return density, residual, xc
+        return density, residual, meta_gga_core_potential(result, xc)
 
     density = np.asarray(result.density, dtype=np.float64)
     output_potential = np.asarray(result.output_effective_potential, dtype=np.float64)
@@ -1231,7 +1245,7 @@ def periodic_force_fields(system, result) -> tuple[np.ndarray, np.ndarray, np.nd
         )
     else:
         residual = output_potential - np.asarray(result.input_effective_potential)
-    return density, residual, np.asarray(result.xc_potential, dtype=np.float64)
+    return density, residual, meta_gga_core_potential(result, np.asarray(result.xc_potential, dtype=np.float64))
 
 
 def compute_periodic_forces(

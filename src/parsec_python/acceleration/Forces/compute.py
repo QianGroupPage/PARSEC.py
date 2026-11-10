@@ -29,6 +29,7 @@ from parsec_python.Forces import (
     nonlocal_forces,
     point_charge_forces,
 )
+from parsec_python.Forces.total import embedding_force_fields
 
 
 def sector_columns(representations: np.ndarray) -> np.ndarray:
@@ -111,6 +112,21 @@ def _spin_nonlocal_forces(system, channels, operator, atom_count: int) -> np.nda
     its device or in the result.
     """
 
+    sectors = getattr(system.backend, "symmetry_eigensolver", None)
+    if sectors is not None:
+        # Both channels in the symmetry sectors (Spin_Symmetry_Sectors): each
+        # channel's sector subspaces, half its occupations.
+        selections = []
+        for channel in channels:
+            representations = np.asarray(channel.representations, dtype=np.int32) - 1
+            selections.append(
+                (
+                    representations,
+                    sector_columns(representations),
+                    0.5 * np.asarray(channel.occupations, dtype=np.float64),
+                )
+            )
+        return _atom_sums(sectors.spin_projector_force_terms(selections), operator.labels, atom_count)
     gradients = system.projector_gradients()
     for_channel = getattr(system.eigenproblem_solver, "for_spin_channel", None)
     device_operator = getattr(system.backend, "device_operator", None)
@@ -285,14 +301,16 @@ def compute_forces(
     residual = np.asarray(result.output_effective_potential) - np.asarray(
         result.input_effective_potential
     )
+    # FDET: rho_B + rho_A and V_xc + v_nad (Forces.total.embedding_force_fields).
+    density, xc_potential, embedded = embedding_force_fields(system, result)
     fields = (
         system.grid,
         atoms,
         system.pseudopotentials,
         specifications,
-        result.density,
+        density,
         residual,
-        result.xc_potential,
+        xc_potential,
     )
     if system.backend_info.selected == "cupy":
         from .local_device import (
@@ -339,6 +357,7 @@ def compute_forces(
         phase_seconds=clock,
         **corrections,
         **({} if charged is None else {"point_charge": charged}),
+        **({"keep_net_force": True} if embedded else {}),
     )
     clock["symmetrization"] = perf_counter() - mark
     return replace(forces, seconds=perf_counter() - started)

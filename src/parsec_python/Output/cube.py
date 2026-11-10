@@ -103,9 +103,10 @@ def dense_box(values: np.ndarray, grid) -> tuple[np.ndarray, np.ndarray, np.ndar
         dense[points[:, 0], points[:, 1], points[:, 2]] = values
         lattice = np.asarray(grid.cell.lattice_vectors, dtype=float)
         voxels = lattice / np.asarray(counts, dtype=float)[:, None]
-        if getattr(grid, "is_general_periodic", False):
-            # Fortran's general grid starts at its shift along each direction.
+        if getattr(grid, "is_general_periodic", False) or getattr(grid.settings, "fortran_routines", False):
+            # Fortran's grids (general and orthorhombic) start at their shift along each direction.
             return dense, grid.physical_coordinates(np.zeros((1, 3)))[0], voxels
+        # (Andrew Grieder's grid: the origin as it has been written, also for a shifted grid.)
         return dense, np.zeros(3), voxels
     dense = np.zeros(grid.lookup.shape, dtype=float)
     local = np.asarray(grid.integer_coordinates) - np.asarray(grid.index_min)[None, :]

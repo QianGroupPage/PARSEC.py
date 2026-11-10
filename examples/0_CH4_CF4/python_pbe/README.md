@@ -159,7 +159,9 @@ For this cold run, CH4 IS/FS used 28/21 SCF iterations and CF4 IS/FS used
 40/37.  CF4 wall times were 793/627 seconds on the tested hybrid machine.  Its
 dominant cost was the native Hartree linear solve (446/407 seconds), followed
 by GPU diagonalization (225/111 seconds); PBE evaluation itself was not the
-dominant kernel.
+dominant kernel. Since 2026-11-07 that linear solve runs on the GPU by default
+(`PARSEC_HARTREE_LINEAR_BACKEND`, `src/parsec_python/acceleration/Hartree/GPU_HARTREE.md`);
+`PARSEC_HARTREE_LINEAR_BACKEND=native` takes the host CG of the kept logs.
 
 ## B3LYP status
 

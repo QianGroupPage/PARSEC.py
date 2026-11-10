@@ -623,14 +623,15 @@ class SlabRecentringTests(unittest.TestCase):
                 "",
             ],
         )
-        # |z_mov| = 0.075 is not above the threshold; a wire, a restart and manual
-        # movements keep the coordinates of the input (Fortran: per == 2,
-        # istart == 0, not MANUAL).
+        # |z_mov| = 0.075 is not above the threshold; a wire, manual movements and
+        # PARSEC 1.5's Recenter_Atoms_In_Aperiodic_Directions: .false. keep the
+        # coordinates of the input (Fortran 1.5 initial.f90:196-327: per == 2, not
+        # MANUAL; a restart is re-centred too since 1.5, below).
         for first, second, boundary, cell, extra in (
             ("0.75", "-0.6", "slab", SLAB_CELL, ""),
             ("1.65", "0.25", "wire", " 5.0", ""),
-            ("1.65", "0.25", "slab", SLAB_CELL, "Restart_Run: .true."),
             ("1.65", "0.25", "slab", SLAB_CELL, "Minimization: manual"),
+            ("1.65", "0.25", "slab", SLAB_CELL, "Recenter_Atoms_In_Aperiodic_Directions: .false."),
         ):
             with self.subTest(boundary=boundary, extra=extra, z=(first, second)):
                 kept = self.parse(first, second, boundary, cell, extra)
@@ -639,8 +640,18 @@ class SlabRecentringTests(unittest.TestCase):
                 np.testing.assert_array_equal(
                     [atom.position[2] for atom in kept.problem.atoms], [float(first), float(second)]
                 )
+        # PARSEC 1.5 re-centres a slab with Restart_Run as well (the test
+        # istart == 0 of the previous tree is commented out, initial.f90:287-289),
+        # so the restart lands in the frame of the first run.
         restart = self.parse(extra="Restart_Run: .true.")
-        self.assertTrue(any("re-centres a slab" in note and "-0.9500" in note for note in restart.warnings))
+        self.assertAlmostEqual(restart.slab_shift, 0.95, places=14)
+        np.testing.assert_allclose(
+            [atom.position for atom in restart.problem.atoms],
+            [atom.position for atom in translation.problem.atoms],
+            rtol=0,
+            atol=0,
+        )
+        self.assertFalse(any("re-centres a slab" in note for note in restart.warnings))
 
     def test_restart_structures_of_a_slab(self) -> None:
         from parsec_python.Relaxation.files import BOHR_TO_ANGSTROM

@@ -11,6 +11,8 @@ from pathlib import Path
 import numpy as np
 
 from parsec_python.cli import main as cli_main
+from parsec_python.tests.archives import read_archive
+from parsec_python.tests.kramers import assert_level_moments_cancel
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -77,14 +79,15 @@ class PeriodicSelfConsistentSOCCliTests(unittest.TestCase):
         self.assertIn("Self-consistent SOC iter", log_text)
         self.assertIn("Self-consistency convergence achieved.", log_text)
 
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertTrue(bool(archive["converged"]))
         self.assertEqual(archive["eigenvalues_ry"].shape, (20,))
         eigenvalues = archive["eigenvalues_ry"]
         moments = archive["magnetic_moment_per_state"]
         for i in range(0, len(eigenvalues) - 3, 2):
             self.assertAlmostEqual(eigenvalues[i], eigenvalues[i + 1], delta=1.0e-4)
-            self.assertAlmostEqual(moments[i] + moments[i + 1], 0.0, delta=0.05)
+        # the spin cancels per degenerate level, not per pair inside a quartet (tests/kramers.py)
+        assert_level_moments_cancel(self, eigenvalues, moments, checked=len(eigenvalues) - 2)
 
     def test_monkhorst_pack_run_pools_every_kpoint(self) -> None:
         input_path = self._write_input(
@@ -99,7 +102,7 @@ class PeriodicSelfConsistentSOCCliTests(unittest.TestCase):
         exit_code = cli_main([str(input_path), "--quiet"])
         self.assertEqual(exit_code, 0)
 
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertTrue(bool(archive["converged"]))
         # 2 k-points x 20 states each = 40 pooled eigenvalues.
         self.assertEqual(archive["eigenvalues_ry"].shape, (40,))

@@ -354,42 +354,159 @@ class PeriodicDriverTests(unittest.TestCase):
             ValueError, "symmetry='on' is not supported for periodic problems"
         ):
             prepare_single_point(self.problem, backend="scipy", symmetry="on")
-        # A rank of an MPI run is refused before it prepares anything.
+        # A periodic cell that one sector of the identity does not take is refused
+        # in an MPI run before a rank prepares anything, by name.
+        oblique = replace(
+            self.problem,
+            periodic_cell=PeriodicCell(
+                lattice_vectors=np.array([[6.0, 0.0, 0.0], [3.0, 5.2, 0.0], [0.0, 0.0, 6.0]])
+            ),
+        )
+        sampled = replace(self.problem, monkhorst_pack_dimensions=(2, 1, 1))
         with patch.object(
             driver_module,
             "_resolve_and_prepare_reference",
             side_effect=AssertionError("the rank prepared a reference"),
         ):
-            for rank in (0, 1):
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "MPI sector context is not supported for periodic problems",
-                ):
-                    prepare_single_point(
-                        self.problem,
-                        backend="scipy",
-                        mpi_context=SimpleNamespace(rank=rank, root=0, size=2),
-                    )
+            for problem, name in ((oblique, "an oblique cell"), (sampled, "k-point sampling")):
+                for rank in (0, 1):
+                    with self.subTest(name=name, rank=rank), self.assertRaisesRegex(
+                        ValueError, f"{name}.*does not run as an MPI SCF"
+                    ):
+                        prepare_single_point(
+                            problem,
+                            backend="scipy",
+                            mpi_context=SimpleNamespace(rank=rank, root=0, size=2),
+                        )
+        # A cell that the route takes, on a backend that has no sectors: refused once
+        # the reference shows that it cannot be one sector of the identity.
+        with self.assertRaisesRegex(ValueError, "does not take here .*backend scipy"):
+            prepare_single_point(
+                self.problem,
+                backend="scipy",
+                mpi_context=SimpleNamespace(rank=0, root=0, size=2),
+            )
 
-    def test_mpi_runner_refuses_a_periodic_input_before_it_prepares(self) -> None:
+    def test_a_rank_that_shares_the_basis_of_a_cell_builds_its_orbital_operators_alone(self) -> None:
+        full = prepare_periodic_single_point(self.problem)
+        self.assertTrue(driver_module._periodic_operators_only_available(self.problem))
+        lean = driver_module._prepare_periodic_orbital_operators(self.problem)
+        for name in ("data", "indices", "indptr"):
+            np.testing.assert_array_equal(
+                getattr(lean.negative_laplacian, name), getattr(full.negative_laplacian, name)
+            )
+        self.assertEqual((lean.nonlocal_operator.projectors != full.nonlocal_operator.projectors).nnz, 0)
+        np.testing.assert_array_equal(lean.nonlocal_operator.signs, full.nonlocal_operator.signs)
+        self.assertEqual(tuple(lean.nonlocal_operator.labels), tuple(full.nonlocal_operator.labels))
+        self.assertEqual(lean.grid.shape, full.grid.shape)
+        self.assertEqual(lean.electron_count, full.electron_count)
+        for name in ("ionic_potential", "initial_density", "core_density", "gradient"):
+            self.assertIsNone(getattr(lean, name))
+        # The Fortran-derived routines keep the full preparation.
+        fortran = replace(self.problem, grid=replace(self.problem.grid, fortran_routines=True))
+        self.assertFalse(driver_module._periodic_operators_only_available(fortran))
+
+    @unittest.skipUnless(cupy_available(), "CuPy and a CUDA device are required")
+    def test_a_cell_as_one_sector_of_the_identity_gives_the_energy_of_the_full_grid(self) -> None:
+        full = run_scf(prepare_single_point(self.problem, backend="cupy"))
+        os.environ["PARSEC_CUPY_SINGLE_SECTOR"] = "on"
+        system = prepare_single_point(self.problem, backend="cupy")
+        details = dict(system.backend_info.details)
+        self.assertIn("one sector of the identity", details["symmetry_detection"])
+        self.assertEqual(details["orbital_sector_dimensions"], str(system.grid.size))
+        # The SCF fields are orbit fields of the identity, in the order of the grid.
+        self.assertIsNotNone(system.scalar_field_adapter)
+        sector = run_scf(system)
+        self.assertTrue(full.converged and sector.converged)
+        self.assertEqual(sector.iterations, full.iterations)
+        self.assertAlmostEqual(sector.energies.total, full.energies.total, delta=1.0e-6)
+
+    def test_the_cells_that_one_sector_of_the_identity_takes(self) -> None:
+        refusal = driver_module.periodic_sector_refusal
+        self.assertIsNone(refusal(self.problem))
+        scf = self.problem.scf
+        for changed, name in (
+            (replace(self.problem, scf=replace(scf, spin_polarized=True)), "spin polarization"),
+            (replace(self.problem, scf=replace(scf, xc_functional="pbe0")), "a hybrid functional"),
+            (replace(self.problem, monkhorst_pack_dimensions=(1, 1, 2)), "k-point sampling"),
+            (
+                replace(self.problem, grid=replace(self.problem.grid, periodicity=1, confinement_radius=3.0)),
+                "a wire or slab",
+            ),
+        ):
+            with self.subTest(name=name):
+                self.assertIn(name, refusal(changed))
+        # The Gamma point named as a mesh of one point is the Gamma point.
+        self.assertIsNone(refusal(replace(self.problem, monkhorst_pack_dimensions=(1, 1, 1))))
+
+    def test_mpi_runner_refuses_a_periodic_input_it_does_not_run_before_it_prepares(self) -> None:
         from parsec_python.acceleration.benchmarks import mpi_full_scf
 
         comm = SimpleNamespace(rank=0, size=1, allgather=lambda value: [value])
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "run"
-            arguments = mpi_full_scf._build_parser().parse_args(
-                ["--input", str(PERIODIC_SILICON), "--output-dir", str(output), "--quiet"]
-            )
-            with (
-                patch.object(
-                    driver_module,
-                    "prepare_single_point",
-                    side_effect=AssertionError("the runner prepared the input"),
-                ),
-                self.assertRaisesRegex(ValueError, "a periodic input"),
-            ):
-                mpi_full_scf.execute(arguments, None, comm, None, 0.0)
-            self.assertFalse(output.exists())
+        text = PERIODIC_SILICON.read_text()
+        for added, message in (
+            ("Kpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 2 2\nend Monkhorst_Pack_Grid\n",
+             "k-point sampling.*main.py --mpi"),
+            ("Spin_Polarization: true\n", "spin polarization"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "parsec.in"
+                source.write_text(text.replace(" Atom_Types_Num:", added + " Atom_Types_Num:"))
+                shutil.copy(PERIODIC_SILICON.parent / "Si_POTRE.DAT", directory)
+                output = Path(directory) / "run"
+                arguments = mpi_full_scf._build_parser().parse_args(
+                    ["--input", str(source), "--output-dir", str(output), "--quiet"]
+                )
+                with (
+                    patch.object(
+                        driver_module,
+                        "prepare_single_point",
+                        side_effect=AssertionError("the runner prepared the input"),
+                    ),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    mpi_full_scf.execute(arguments, None, comm, None, 0.0)
+                self.assertFalse(output.exists())
+
+    def test_mpi_runner_record_of_a_periodic_domain(self) -> None:
+        from parsec_python.acceleration.benchmarks import mpi_full_scf
+
+        translation = parse_parsec_input(PERIODIC_SILICON)
+        # The Gamma point of a bulk cell runs: nothing refused.
+        mpi_full_scf._refuse_unsupported_periodic(translation)
+        record = mpi_full_scf._parsed_domain(translation)
+        self.assertEqual(record[0], "periodic")
+        self.assertEqual(record[1][0], float(10.26).hex())
+        mpi_full_scf._require_same_domain([record, record])
+        other = (record[0], record[1], float(0.5).hex(), *record[3:])
+        with self.assertRaisesRegex(ValueError, "periodic cell or the settings of its grid differ"):
+            mpi_full_scf._require_same_domain([record, other])
+        moving = replace(translation, compute_forces=True)
+        with self.assertRaisesRegex(ValueError, "forces, relaxation and molecular dynamics of a periodic cell"):
+            mpi_full_scf._refuse_unsupported_periodic(moving)
+        # The prepared grid of every rank is compared before the SCF.
+        system = SimpleNamespace(grid=prepare_periodic_single_point(self.problem).grid)
+        prepared = mpi_full_scf._prepared_cell_grid(system)
+        self.assertEqual(prepared[0], (10, 10, 10))
+        mpi_full_scf._require_same_cell_grid([prepared, prepared])
+        with self.assertRaisesRegex(ValueError, "grid of the periodic cell differs across ranks"):
+            mpi_full_scf._require_same_cell_grid([prepared, ((10, 10, 12), *prepared[1:])])
+
+    def test_zero_average_xc_of_orbit_fields_weighs_the_orbits(self) -> None:
+        from parsec_python.acceleration.SCF.symmetry_fields import SymmetryScalarField
+        from parsec_python.acceleration.Symmetry import AxisReflectionReduction
+        from parsec_python.acceleration.V_xc.device_xc import ZeroAverageXC
+
+        reduction = AxisReflectionReduction(
+            signs=np.array([[1, 1, 1], [-1, 1, 1]], dtype=np.int8),
+            representative_rows=np.array([0, 1]),
+            full_to_wedge=np.array([0, 1, 1]),
+            multiplicities=np.array([1, 2]),
+        )
+        shifted = ZeroAverageXC._shifted(SymmetryScalarField(reduction, np.array([3.0, 6.0])))
+        # The full field (3, 6, 6) has the mean 5.
+        np.testing.assert_allclose(shifted.values, [-2.0, 1.0])
+        np.testing.assert_allclose(ZeroAverageXC._shifted(np.array([3.0, 6.0, 6.0])), [-2.0, 1.0, 1.0])
 
     def test_switches_of_the_cluster_boundary_do_not_act_on_a_periodic_cell(self) -> None:
         plain = prepare_single_point(self.problem, backend="scipy")
@@ -418,7 +535,7 @@ class PeriodicDriverTests(unittest.TestCase):
             ("PARSEC_HARTREE_BOUNDARY", "sometimes", "must be auto or legacy"),
             ("PARSEC_HARTREE_LPOLE", "many", "must be an integer"),
             ("PARSEC_HARTREE_BOUNDARY_KERNEL", "fast", "must be auto, full, or wedge"),
-            ("PARSEC_HARTREE_LINEAR_BACKEND", "fast", "must be native or cupy"),
+            ("PARSEC_HARTREE_LINEAR_BACKEND", "fast", "must be auto, native or cupy"),
         ):
             with (
                 self.subTest(switch=name),

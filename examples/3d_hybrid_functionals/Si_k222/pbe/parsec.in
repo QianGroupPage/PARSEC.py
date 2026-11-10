@@ -1,0 +1,50 @@
+# Si, diamond structure, primitive fcc cell (a = 10.26 bohr), Gamma-centred 2x2x2 mesh
+# PBE (E_PBE of the comparison E_hyb - E_PBE)
+# Quantum ESPRESSO reference: qe/si_pbe_k222_e60.in (ecutwfc 60 Ry)
+
+Periodic_System: .true.
+Boundary_Conditions: bulk
+begin Cell_Shape
+  0.0000000000 5.1300000000 5.1300000000
+  5.1300000000 0.0000000000 5.1300000000
+  5.1300000000 5.1300000000 0.0000000000
+end Cell_Shape
+Lattice_Vector_Scale: 1.0 bohr
+Coordinate_Unit: Cartesian_Bohr
+Grid_Spacing: 0.250
+Expansion_Order: 12
+Correlation_Type: pbe
+States_Num: 8
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+Fermi_Temp: 1 K
+# the Gamma-centred 2x2x2 mesh of QE (K_POINTS automatic 2 2 2 0 0 0) written out:
+# every point of the uniform mesh, equal weights (the exchange sums over all of them)
+Kpoint_Method: manual
+Kpoint_Unit: reciprocal_lattice_vectors
+begin Kpoint_List
+  0.000000000000 0.000000000000 0.000000000000
+  0.000000000000 0.000000000000 0.500000000000
+  0.000000000000 0.500000000000 0.000000000000
+  0.000000000000 0.500000000000 0.500000000000
+  0.500000000000 0.000000000000 0.000000000000
+  0.500000000000 0.000000000000 0.500000000000
+  0.500000000000 0.500000000000 0.000000000000
+  0.500000000000 0.500000000000 0.500000000000
+end Kpoint_List
+Atom_Types_Num: 1
+
+Atom_Type: Si
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 2.1
+begin Electron_Per_Orbital
+2 2 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.   # spline of the radial table, as in examples/0d_hybrid_functionals
+begin Atom_Coord
+     0.0000000000    0.0000000000    0.0000000000
+     2.5650000000    2.5650000000    2.5650000000
+end Atom_Coord

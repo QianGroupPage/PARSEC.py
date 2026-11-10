@@ -1,9 +1,240 @@
-# Experimental GPU Hartree linear solve
+# GPU Hartree linear solve
 
-Enable with `PARSEC_HARTREE_LINEAR_BACKEND=cupy` and `--backend auto`.
-The native C++ extension and CuPy are both required. The default remains
-`PARSEC_HARTREE_LINEAR_BACKEND=native` until end-to-end cluster benchmarks
-demonstrate a benefit. This is different from the older `--backend cupy` path.
+The conjugate gradients of the cluster Hartree solve run on a GPU by default
+since 2026-11-07, wherever the orbitals do with the native Hartree
+components (`--backend auto` on a GPU, the native C++ extension and CuPy
+installed). `PARSEC_HARTREE_LINEAR_BACKEND` chooses:
+
+| Value | Conjugate gradients |
+|---|---|
+| unset or `auto` (default) | on the GPU where it applies; elsewhere the CG of the selected backend (C++/OpenMP on a CPU run, SciPy for `--backend scipy`, the device CSR CG of `--backend cupy`, the periodic solver of a cell). The C++/OpenMP CG takes over, on the same symmetry wedge, where the GPU CG cannot be made (an out-of-memory error, a CUDA runtime or driver error, a wedge whose stencil it cannot take) and, beside a full-grid eigensolver, where the GPU Hartree arrays would take more than 1/20 of the free device memory (below); `hartree_linear_backend` says which and why |
+| `native` | the C++/OpenMP CG on the host, the default before 2026-11-07 (bit for bit the former runs) |
+| `cupy` | the GPU CG by name; refused where it does not apply, and a failure to make it stops the run |
+
+`hartree_backend` reports `native-boundary/cupy-linear` (or
+`cupy-boundary/cupy-linear` with the GPU boundary below) and
+`hartree_linear_backend` the choice and its reason. The older
+`--backend cupy` path, with its own Poisson solver, is a different route.
+
+Both CGs run one recurrence: no preconditioner, the stopping test
+`||r_k|| <= rtol ||r_0|| + atol` (`Hartree_CG_Tolerance`, default `1e-7`,
+`atol 1e-13`), the same matrix-vector budget, the chronological starting
+vector of `NativePoissonSolver` and the explicit final residual. They differ
+in the order of the floating-point sums only (fixed-order block reductions on
+the GPU, so a GPU run repeats its own bits), so the Hartree potential moves
+within the CG tolerance and the results by what the SCF tolerance passes on:
+on A100 nodes, against `native`, the total energies of the example inputs
+that run on this path in minutes (the small-molecule folders, all 56 inputs
+of `0d_hybrid_functionals`, the 16 of `0_CH4_CF4`, the 14 SAD inputs of
+`ml_initial_density` with one SCDP and one ChargE3Net start, the relaxations
+and 11 of the 224 inputs of `0d_xps_core_levels`; 3 hybrids with
+`--symmetry off`) moved by at most 1.3e-11 Ry at their own SCF tolerances,
+the exact-exchange energies by 4e-11 Ry, forces and relaxation paths by
+1.5e-11 Ry/bohr (1e-9 Ry/bohr with the CA potentials of CF4), refined B3LYP
+energies by 6e-13 Ry, with the same number of SCF steps in every case.
+Occupied levels moved by at most 1.4e-10 Ry except where the spin channels of
+O2 are solved on the full grid: 1.1e-8 Ry for PBE (7e-10 Ry at an SCF
+tolerance of 1e-9 Ry) and, through the different paths that the Fock loop then
+takes to its tolerance, 5e-6 Ry for PBE0 at 1e-6 Ry (2e-7 Ry at 1e-9 Ry), with
+totals within 2e-10 Ry (3e-13 Ry at 1e-9 Ry). That is less than the CG
+tolerance itself leaves there: with `Hartree_CG_Tolerance: 1e-10` the two CGs
+agree within 5e-10 Ry in every level and 5e-13 Ry in the total, and either of
+them lies 1.2e-6 Ry in the occupied levels (and 1.6e-6 Ry in the exact
+exchange) from the host run at the default `1e-7`. The extensive totals of the
+nanodiamonds C185H124 and C459H204 on four GPUs moved by 6e-11 to 1.0e-9 Ry
+at their tolerance of 2e-4 Ry and by 3e-11 to 5e-10 Ry at 1e-8 Ry. The pair
+densities of
+`Energy_Refinement` follow the CG of the SCF (`Hartree/pair_poisson.py`); the
+Kronecker pair solves of the hybrid functionals are not this solver.
+
+Program wall time in seconds, first runs in FP64 on A100 80 GB nodes, one GPU
+of a node held whole (`--gpus 1`) unless four are named; the host CG with 16
+OpenMP threads (in brackets: the launcher's default of 124 threads, which is
+not faster for a grid of 1.4 million points); "GPU" is the default, the CG and
+for a full grid the boundary on the GPU:
+
+| Case (grid points, Hartree problem) | native | GPU | Hartree seconds |
+|---|---:|---:|---|
+| H2O PBE, `0d_hybrid_functionals` (1.57 M, C2v wedge) | 28.1 | 10.1 | 21.6 -> 4.0 |
+| H2O PBE0 | 44.6 (39.1) | 18.9 (18.7) | 31.0 -> 5.4 |
+| H2O PBE0, `--symmetry off` (full grid; one GPU of a shared node) | 449 | 59.5 | 414 -> 18.7 |
+| C6H6 PBE (C2v wedge) | 26.2 | 12.4 | 16.4 -> 2.7 |
+| C6H6 PBE0 | 59.3 (56.7) | 32.8 (33.3) | 31.3 -> 5.1 |
+| O2 PBE, spin channels on the full grid (1.41 M, the semilocal default) | 101 (163) | 26.2 | 84.4 -> 8.1 |
+| O2 PBE, `Spin_Symmetry_Sectors: auto` | 16.9 | 11.4 | 6.5 -> 1.2 |
+| O2 PBE0, sectors (the hybrid default) | 38.6 | 25.5 | 15.7 -> 2.7 |
+| O2 PBE0, full grid | 253 | 69.0 | 206 -> 19.8 |
+| CF4 PBE, `0_CH4_CF4/python_pbe` (3.10 M, full grid) | 323 (312) | 41.9 | 298 -> 15.3 |
+| CF4 PBE + B3LYP refinement, 136 pair solves (one GPU of a shared node) | 1105 | 108.5 | refinement 741 -> 61.8 |
+| O atom, spin, `0d_xps_core_levels` (1.44 M, full grid) | 38.7 | 15.7 | 28.1 -> 3.3 |
+| protonated water, B3LYP refinement (1.36 M, full grid) | 81.8 | 20.0 | 39.6 -> 5.1 |
+| C185H124 PBE, four GPUs (D2 wedge) | 13.9 | 10.6 | 3.1 -> 0.6 |
+| C185H124 PBE0, four GPUs | 37.3 | 31.9 | 5.7 -> 1.1 |
+| C459H204 PBE, four GPUs | 49.6 | 34.1 | 17.1 -> 3.3 |
+| C459H204 PBE0, four GPUs | 263.4 | 242.9 | 24.6 -> 4.4 |
+| O2 PBE / PBE0 full grid, four GPUs (GPU CG, host boundary) | 95.2 / 241.6 | 33.3 / 73.0 | 76.0 -> 12.1 / 193 -> 26.4 |
+
+Cases of a few thousand points (H2, the SiNa4 relaxation) take the same time
+either way. The boundary of a full grid on the GPU, against the host
+recurrences beside the GPU CG: O2 PBE 32.8 -> 26.2 s, CF4 46.2 -> 41.9 s, the
+O atom 17.7 -> 15.7 s, protonated water 23.2 -> 20.0 s (totals within 2e-13
+Ry).
+
+## The resident chain on the wedge (default since 2026-11-07)
+
+Where the orbitals are solved in symmetry sectors and the GPU CG solves the
+wedge that the SCF fields use, the boundary of that wedge is built on the
+Hartree device as well and every solve runs in the device-resident chain
+(`Hartree/cupy_resident.py`): the density goes up as one value per orbit;
+the multipoles, the boundary values, the normalized right-hand side, the
+chronological starting vector and the CG stay on the device; the potential
+and the right-hand side come back as one value per orbit. Before, the
+native builder formed the right-hand side on the host from its orbit table,
+which was uploaded, solved and downloaded in every solve.
+`PARSEC_CUPY_RESIDENT_HARTREE` chooses:
+
+| Value | Hartree solve on the wedge of a sector run |
+|---|---|
+| unset or `auto` (default) | the chain where the GPU CG solves the wedge of the SCF fields with a multipole boundary, on a grid of int32 indices; elsewhere the host interface. The boundary of the wedge then takes the wedge kernels on an axis-reflection group, whether the plan is engaged or not, and the kernels of the plan on another group |
+| `0` | the host interface and, on a wedge, the orbit table on the host: the route before, bit for bit |
+| `1` | the chain by name; refused where it does not apply, and a failure to build it stops the run |
+
+`PARSEC_HARTREE_BOUNDARY_BACKEND=native` (or `PARSEC_HARTREE_BOUNDARY_KERNEL=full`
+without a GPU boundary named) keeps the orbit table and so the route before
+as well. `hartree_resident_chain` says whether the chain runs and why,
+`hartree_full_grid_transfer_policy` is `device-resident` or `host-interface`,
+`hartree_boundary_kernel` names the kernels and `hartree_resident_device_bytes`
+what the chain adds on the device.
+
+The chain changes results by round-off only: the wedge kernels form the same
+expansion as the orbit table in another order of the sums, and the chain
+runs the CG, the predictor and the projections of the host interface on the
+device. On A100 nodes, against `0`, the 85 example inputs of the sweep of the
+GPU CG (above) that take the chain (the small-molecule folders, the 56 hybrids, the O2 spin
+sectors, the ML starting densities, the relaxations and the forces) moved
+by at most 2.6e-11 Ry in the total (Si28H36), 1.4e-10 Ry in the exact
+exchange (CO HSE06), 2.3e-10 Ry in an occupied level, 1.4e-11 Ry/bohr in the
+forces and 1.1e-12 in the relaxation paths, with the same number of SCF
+steps in every case; the 30 inputs that do not take it (the full grids of
+the spin channels, CH4/CF4, the core holes, periodic cells, symmetry off)
+gave the same bits. `0` and `PARSEC_HARTREE_BOUNDARY_BACKEND=native` gave
+the bits of the code before (f007f03a) for H2O PBE0, CH4 HSE06, O2 PBE and
+PBE0 in sectors, the water relaxation, H2O PBE forces and benzene. The
+refined B3LYP totals of `Energy_Refinement` on the wedges of H2O and CH4
+moved by 4e-12 Ry. With the SCF tightened to 1e-9 Ry, H2O PBE0 and O2 PBE0
+in sectors took the same steps and moved by 4e-13 Ry; C6H6 PBE took 74
+steps where `0` took 77 (total 6e-13 Ry apart, occupied levels 1.5e-9 Ry),
+which is the floor that the CG tolerance leaves: with
+`Hartree_CG_Tolerance: 1e-10` both took 51 steps and agreed within 5e-10 Ry
+in every level. The extensive totals of the nanodiamonds on four GPUs moved
+by 5e-12 to 9e-10 Ry (C185H124, C459H204) and by 2.3e-9 and 2.6e-9 Ry
+(C795H300 PBE and PBE0) at their tolerance of 2e-4 Ry and, at 1e-8 Ry, by
+2.0e-10 (C185H124 PBE), 1.4e-10 (its PBE0), 2.9e-10 (C459H204) and 2.0e-9 Ry
+for C795H300 (9,417 Ry: 2e-13 of the total, the round-off of moment sums
+over 22 million points in another order: the host recurrences of the
+native full-grid builder, `PARSEC_HARTREE_BOUNDARY_BACKEND=native`, gave a
+total 5.1e-9 Ry from `0` and 3.1e-9 Ry from the default, and the wedge
+kernels through the host interface gave the default's bits). An MPI SCF over two
+nodes (H2O PBE, `benchmarks/mpi_full_scf.py`, four GPUs each) ran the chain
+on the Hartree device of the root and gave the total of `0` within 4e-14 Ry
+in 44 steps either way.
+
+Where `auto` cannot keep the chain it falls back to the route before. A GPU
+boundary that cannot be built (an extension without the geometry exporter, an
+out-of-memory error), a GPU CG that gives way to the host CG, and a chain
+whose arrays cannot be made leave the boundary of that route (the orbit
+table, or the GPU kernels where it has none); the results are then those of
+`0` bit for bit. A device allocation that fails in a solve in the middle of
+the SCF (CuPy's out-of-memory error, or a CUDA runtime or driver error of
+status 2; any other error stops the run) ends the chain for the rest of the
+calculation: its arrays and its GPU boundary builder are released, the host
+builder of the wedge (the orbit table, or the host recurrences where it has
+none) takes their place, and the host interface beside the GPU CG repeats
+that solve and takes every later one, its chronological predictor continued
+from the chain's history; `hartree_resident_chain` of the result says from
+which solve on, and the boundary lines name the host builder.
+
+The boundary builder of the chain lies on the device of its CG: the Hartree
+device (`PARSEC_HARTREE_DEVICE`), or, with a single GPU or with that switch
+`off`, the first device of the sectors, where the CG goes. A GPU that is not
+device 0 (`--gpu-ids N`, `PARSEC_CUPY_DEVICES=N`) so holds the whole chain;
+a builder and a CG found on two devices give the route before. A full-grid
+density or starting potential, which the SCF does not pass, is reduced to
+the wedge on the host, so a builder of the wedge keeps no full-grid map on
+the device. The chain runs in MPI runs too, on the root rank, which alone
+builds the Hartree objects (on its Hartree device, the last device of the
+rank); the serial control of the MPI runner names `0`.
+
+Program wall time in seconds (Hartree seconds in brackets) and the largest
+sampled device peak, first runs in FP64 on A100 80 GB nodes, one GPU of a node
+held whole unless four are named, the same code with `0` and by default:
+
+| Case | `0` | default | peak MiB `0` / default |
+|---|---:|---:|---|
+| H2O PBE, `0d_hybrid_functionals` (C2v) | 10.3 (3.91) | 8.87 (2.56) | 1156 / 1216 |
+| H2O PBE0 | 17.5 (4.84) | 15.6 (3.14) | 1690 / 1814 |
+| C6H6 PBE | 12.0 (2.53) | 11.1 (1.85) | 1552 / 1610 |
+| C6H6 PBE0 | 32.9 (5.09) | 30.8 (3.54) | 2810 / 2732 |
+| CH4 PBE (D2) | 10.3 (3.62) | 8.72 (2.31) | 1454 / 1520 |
+| CH4 PBE0 | 14.3 (4.13) | 13.0 (2.73) | 2004 / 2110 |
+| O2 PBE, spin sectors | 11.9 (1.14) | 11.2 (0.78) | 1074 / 1102 |
+| O2 PBE0, spin sectors | 26.2 (2.71) | 24.4 (1.91) | 1626 / 1640 |
+| water relaxation, `0d_water_geoopt` (7 structures) | 7.06 (1.76) | 6.08 (0.80) | 600 / 612 |
+| SiNa4 relaxation (4 structures) | 2.24 (0.10) | 2.08 (0.13) | 430 / 430 |
+| C185H124 PBE, four GPUs (D2) | 10.8 (0.57) | 10.8 (0.55) | 3344 / 3516 |
+| C185H124 PBE0, four GPUs | 32.1 (1.12) | 31.8 (0.96) | 5768 / 5828 |
+| C459H204 PBE, four GPUs | 36.1 (3.25) | 34.4 (2.57) | 5450 / 5540 |
+| C459H204 PBE0, four GPUs | 242.7 (4.31) | 240.8 (3.42) | 11616 / 11710 |
+| C795H300 PBE, four GPUs | 60.1 (6.00) | 59.4 (3.50) | 9112 / 8984 |
+| C795H300 PBE, four GPUs, SCF to 1e-8 Ry | 79.2 (10.4) | 76.2 (6.04) | 9112 / 8984 |
+| C795H300 PBE0, four GPUs | 713.9 (8.34) | 709.7 (4.94) | 22142 / 21974 |
+The wedge kernels are what gains: at f007f03a by switches, the full-grid GPU
+kernels with the chain (the earlier opt-in route for PARSEC's boundary,
+`PARSEC_HARTREE_BOUNDARY_BACKEND=cupy` and `PARSEC_CUPY_RESIDENT_HARTREE=auto`)
+took 1.01 s of Hartree for O2 PBE in sectors and 2.91 s for H2O PBE, at peaks
+130 to 380 MiB above the wedge kernels, and the wedge kernels through the host
+interface ran within 1 % of the chain. The peaks rose by 0 to 124 MiB on one
+GPU: the boundary of the wedge (40 to 47 MB for the small molecules,
+`hartree_boundary_device_bytes`) and the chain (23 to 27 MB,
+`hartree_resident_device_bytes`) on the Hartree device. C795H300 had no orbit
+table before (its table exceeds 512 MiB) and took the full-grid GPU kernels
+(258 MB); the wedge kernels hold 63 MB and its largest device peaked lower.
+
+## Device memory and placement
+
+The CG holds `rows x (5 w + 40)` bytes on the Hartree device for a stencil of
+`w` entries per row (25 at `Expansion_Order: 8`, 37 at 12): 45 MB for the
+wedge of C185H124, 95 MB for C459H204, 318 MB for the full grid of O2, 512 MB
+for CF4 (`hartree_cg_device_bytes`). The sampled peak of that device rose by
+40 to 230 MiB on a wedge (C459H204 PBE0 on four GPUs: 14,942 -> 14,988 MiB,
+the largest device) and by 300 to 920 MiB on a full grid with its GPU boundary
+(CF4: 12.0 -> 12.9 GiB).
+
+Where the orbitals are solved in symmetry sectors, the GPU Hartree arrays (the
+CG, the GPU boundary and the resident chain, `hartree_cg_device_bytes`,
+`hartree_boundary_device_bytes` and `hartree_resident_device_bytes`; the
+chain's count holds its maps and the working vectors of one solve, which it
+was missing before 2026-11-07) are told to the memory rules of the sectors as
+`resident_device_bytes` of their device, beside the device XC evaluator and the
+exchange of a hybrid: the rule of the state storage and the rule that shares a
+basis plan around them, and a basis that does not fit beside them is spilled
+or not shared instead of failing later. A full-grid eigensolver has no such
+rule. There `auto` plans the arrays up front (`Hartree/gpu_memory.py`: the CG
+`rows x (5 w + 40)` bytes and 60 bytes per row of the streaming boundary)
+against what CuPy may still allocate on their device (the driver's free
+memory and the free blocks of the pool, within `CUPY_GPU_MEMORY_LIMIT`), and
+keeps them on the GPU only where they take at most 1/20 of it: the full-grid
+runs above took 10 to 17 times those arrays beside them. Under a pool cap of
+7 GiB, O2 PBE0 with the spin channels on the full grid ran with the host CG
+and stopped with an out-of-memory error at its first exchange build with the
+GPU CG and boundary (they needed 7.5 GiB); with the rule the default plans
+the arrays (380 MiB) against the less than 7 GiB that the cap leaves free,
+takes the host CG and finishes as `native` does, bit for bit (111 SCF steps,
+the same total). The pair solves of
+`Energy_Refinement` plan a new full-grid CG in the same way, at most half of
+the free memory, and take the host CG where it does not fit or cannot be
+made (`Hartree/pair_poisson.py`). `PARSEC_HARTREE_LINEAR_BACKEND=native` keeps
+every one of these arrays off the device.
 
 The existing native multipole boundary/RHS, normalized symmetry projection,
 finite-difference coefficients, FP64 arithmetic, chronological initial guess,
@@ -25,9 +256,11 @@ the first stopping iteration, including in the middle of a graph group.
 Hartree uses one of the selected orbital GPUs (see `PARSEC_HARTREE_DEVICE`
 below); it does not distribute a single Poisson solve across devices. This
 removes CPU work from the serial portion
-of multi-GPU SCF. Boundary/RHS construction, the chronological predictor, and
-public SCF scalar fields remain on CPU, so vectors are transferred once per
-solve. CUDA work buffers and the operator are persistent. Metadata reports
+of multi-GPU SCF. Through the host interface the boundary/RHS construction,
+the chronological predictor and the public SCF scalar fields remain on the
+CPU, so vectors are transferred once per solve; in the resident chain of a
+sector run (above) only the density and the returned fields cross. CUDA work
+buffers and the operator are persistent. Metadata reports
 the actual GPU, allocated solver bytes, graph size and boundary/linear timings.
 
 The first GPU also holds the owner's share of a sector basis, so with the
@@ -120,9 +353,12 @@ of a group or, without one, on the full grid:
   are then summed over every grid row and each boundary value is still
   evaluated once per unique exterior point, which four to five stencil
   entries share; the builder has the full-grid interface and the driver
-  projects its right-hand side as before. `full` elsewhere, so a boundary
+  projects its right-hand side as before. The boundary of the resident
+  chain (above) takes `wedge` on an axis-reflection group whether the plan
+  is engaged or not (since 2026-11-07). `full` elsewhere, so a boundary
   that is PARSEC's keeps its kernels and its bits. `wedge` without such a
-  reduction or without the GPU boundary is an error.
+  reduction, or without a GPU boundary (named, or that of the resident
+  chain), is an error.
 
 What the raised order costs depends on these kernels (laptop GPU, 1.1 million
 grid points, per right-hand side; no A100 figure is measured). The former
@@ -140,12 +376,22 @@ table: without a reduction, or where the table of the raised order exceeds
 512 MiB, they repeat the full-grid recurrences in every solve (2.3 million
 points, order 16: 249 ms against 12 ms for the GPU wedge kernels and 21 ms for
 the former boundary, laptop). An engaged plan takes the GPU kernels in that
-case if the orbital backend is CuPy; `PARSEC_HARTREE_BOUNDARY_BACKEND=native`
-or `PARSEC_HARTREE_BOUNDARY_KERNEL=full` by name keep the native route.
+case if the orbital backend is CuPy, and since 2026-11-07 so does any plan
+whose conjugate gradients run on the GPU (the default above): the full-grid
+GPU kernels for PARSEC's boundary, the unique-point kernels (on the wedge or
+under the identity) for an engaged one, on the Hartree device. That covers every Hartree problem on the full
+grid, the spin channels outside the sectors among them. A wedge keeps its
+orbit table on the host through the host interface, where the GPU kernels
+measured no faster; the wedge of the resident chain is built on the GPU
+(above). `PARSEC_HARTREE_BOUNDARY_BACKEND=native` or
+`PARSEC_HARTREE_BOUNDARY_KERNEL=full` by name keep the native route.
 
 The serial control of the MPI runner (`benchmarks/mpi_full_scf.py
---serial-control`) sets `PARSEC_HARTREE_BOUNDARY_KERNEL=full` and
-`PARSEC_HARTREE_ATOMIC_TAIL_VALUES=host` where the launcher names neither:
+--serial-control`) sets `PARSEC_HARTREE_BOUNDARY_KERNEL=full`,
+`PARSEC_HARTREE_ATOMIC_TAIL_VALUES=host` and, since 2026-11-07,
+`PARSEC_HARTREE_LINEAR_BACKEND=native` and `PARSEC_CUPY_RESIDENT_HARTREE=0`
+where the launcher names none of them: the host CG and host interface of the
+code before the GPU defaults, and
 the same boundary values through the full-grid kernels, with the tail in rows
 that are built from the surface shell and host threads. A control on the
 wedge kernels of the run would repeat its Hartree computation bit for bit and

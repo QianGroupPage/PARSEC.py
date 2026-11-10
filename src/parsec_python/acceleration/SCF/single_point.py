@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Callable
 
+import numpy as np
+
 from parsec_python.SCF.single_point import (
     PreparedSinglePointSystem,
     run_scf as run_reference_scf,
@@ -61,6 +63,22 @@ class AcceleratedPreparedSinglePointSystem:
     # grid sums on a device (Energy.dispersion_device); ``None`` takes the
     # reference correction on the host.
     dispersion_device: Callable[..., object] | None = None
+    # FDET of PARSEC 1.5: the grid operations of the non-additive kinetic
+    # terms on a device (acceleration.Embedding.device_kinetic); ``None``
+    # evaluates them on the host (and without FDET).
+    kinetic_operators: object | None = None
+    # A hybrid functional: its exact exchange in the device Hamiltonians and
+    # the device pieces of the Fock loop (.hybrid.DeviceExchange); ``None``
+    # without a hybrid.
+    exchange_device: object | None = None
+    # Spin_Symmetry_Sectors: how a spin-polarized loop in the symmetry
+    # sectors goes back to the full grid when its occupations are
+    # fractional (driver._SpinSectorFallback); ``None`` everywhere else.
+    spin_sector_fallback: object | None = None
+    # A meta-GGA: its orbital term in the device Hamiltonians and tau where
+    # the orbitals are (Hamiltonian.meta_gga_device.DeviceMetaGGA); ``None``
+    # without a meta-GGA and on the CPU backends, which add the host term.
+    meta_gga_device: object | None = None
 
     def __getattr__(self, name: str):
         return getattr(self.reference, name)
@@ -88,19 +106,56 @@ class AcceleratedPreparedSinglePointSystem:
 
         return wedge_density_symmetry(group, self.scalar_field_adapter.reduction)
 
-    def hamiltonian(self, effective_potential, hubbard=None) -> BoundHamiltonian:
+    def hamiltonian(
+        self, effective_potential, hubbard=None, exchange=None, kinetic_potential=None, gradient_flux=None
+    ) -> BoundHamiltonian:
         """Bind ``V_eff``; ``hubbard`` is the LDA+U term of the channel (``plusu.f90z``).
 
         The reference loop passes it from the second iteration on, where
         the system has LDA+U atoms.  The device Hamiltonians hold the term
         (``hubbard_device`` writes its coefficients, zero for ``None``); the
-        CPU backends add it to the bound host Hamiltonian.
+        CPU backends add it to the bound host Hamiltonian.  ``exchange`` is
+        ``a_x V_ACE`` of the channel of a hybrid's inner loop, which
+        ``exchange_device`` writes into the device Hamiltonians (``None``
+        removes it: the semilocal loops of the same devices).
+        ``kinetic_potential`` is ``vtau`` of a meta-GGA's channel, which
+        ``meta_gga_device`` writes into the device Hamiltonians (``None``
+        removes the term); the CPU backends add the host term.
+        ``gradient_flux`` is ``W`` of the orbital form of the density gradient
+        (three Cartesian components in the layout of ``vtau``, see
+        :class:`~parsec_python.acceleration.Hamiltonian.meta_gga_device.OrbitVectorFields`).
         """
 
+        if self.meta_gga_device is not None:
+            self.meta_gga_device.bind(kinetic_potential, gradient_flux)
+        if self.exchange_device is not None:
+            self.exchange_device.bind(exchange)
+        elif exchange is not None:
+            raise NotImplementedError(
+                "this accelerated system holds no exact-exchange operator in its Hamiltonians"
+            )
         device = self.hubbard_device
         if device is not None:
             return device.hamiltonian(self.backend, effective_potential, hubbard)
         bound = self.backend.bind(effective_potential)
+        if kinetic_potential is not None and self.meta_gga_device is None:
+            if hubbard is not None:
+                raise NotImplementedError("LDA+U is not implemented with a meta-GGA")
+            from parsec_python.V_xc.meta_gga import KineticPotentialOperator, grid_gradient
+
+            from ..Hamiltonian.meta_gga_device import HostKineticHamiltonian
+
+            scalar = self.scalar_field_adapter
+            values = kinetic_potential if scalar is None else scalar.to_full(kinetic_potential)
+            flux = None
+            if gradient_flux is not None:
+                flux = self._full_vector_field(gradient_flux)
+            return HostKineticHamiltonian(
+                bound,
+                KineticPotentialOperator(grid_gradient(self.reference.grid), values, gradient_flux=flux),
+            )
+        if gradient_flux is not None and kinetic_potential is None:
+            raise ValueError("W of the orbital form comes with vtau")
         if hubbard is None:
             return bound
         from ..Hamiltonian.hubbard_device import HostHubbardHamiltonian
@@ -121,6 +176,42 @@ class AcceleratedPreparedSinglePointSystem:
         if self.spin_xc_evaluator is not None:
             return self.spin_xc_evaluator(*args, **kwargs)
         return self.reference.evaluate_spin_xc(*args, **kwargs)
+
+    def kinetic_energy_density(self, wavefunctions, occupations, degeneracy: float = 2.0, gradient: bool = False):
+        """``tau`` of the eigensolver's orbitals where they are (a meta-GGA), in the layout of the SCF's fields.
+
+        With ``gradient`` also the orbital form of the density gradient,
+        ``(tau, (g_x, g_y, g_z))``: on orbits the Cartesian components at the
+        representatives (:class:`~parsec_python.acceleration.Hamiltonian.meta_gga_device.OrbitVectorFields`).
+        """
+
+        if self.meta_gga_device is not None:
+            return self.meta_gga_device.tau(wavefunctions, occupations, degeneracy, gradient=gradient)
+        computed = self.reference.kinetic_energy_density(wavefunctions, occupations, degeneracy, gradient=gradient)
+        tau, components = computed if gradient else (computed, None)
+        scalar = self.scalar_field_adapter
+        if scalar is not None:
+            tau = scalar.from_full(tau)
+        if not gradient:
+            return tau
+        if scalar is None:
+            return tau, tuple(components)
+        reduced = self._vector_fields().reduce(np.stack(components))
+        return tau, tuple(scalar.field(np.ascontiguousarray(row)) for row in reduced)
+
+    def _vector_fields(self):
+        from ..Hamiltonian.meta_gga_device import orbit_vector_fields
+
+        return orbit_vector_fields(self.reference.grid, self.scalar_field_adapter.reduction)
+
+    def _full_vector_field(self, components) -> np.ndarray:
+        """The full-grid ``(3, n)`` Cartesian components of a vector field in the layout of the SCF's fields."""
+
+        scalar = self.scalar_field_adapter
+        if scalar is None:
+            return np.stack([np.asarray(component, dtype=np.float64) for component in components])
+        values = np.stack([np.asarray(scalar.wedge_values(component), dtype=np.float64) for component in components])
+        return self._vector_fields().expand(values)
 
 
 def run_scf(
@@ -229,6 +320,15 @@ def materialize_wavefunctions(system, result) -> None:
                 )
 
 
+def _final_state_counts(symmetry_eigensolver, symmetry_state) -> str:
+    """The vectors kept per sector after the last solve; of both channels of a spin-polarized loop."""
+
+    record = getattr(symmetry_eigensolver, "sector_state_counts_record", None)
+    if isinstance(record, str) and getattr(symmetry_eigensolver, "spin_channel_count", 1) == 2:
+        return record
+    return " ".join(str(value) for value in symmetry_state.sector_state_counts)
+
+
 def _finalize_result(system, result, symmetry_eigensolver):
     """Finalize output inside the allocator-restoration scope, including OOMs."""
     if system.materialize_final_wavefunctions:
@@ -282,10 +382,7 @@ def _finalize_result(system, result, symmetry_eigensolver):
         ) + (
             (
                 "orbital_sector_final_state_counts",
-                " ".join(
-                    str(value)
-                    for value in symmetry_state.sector_state_counts
-                ),
+                _final_state_counts(symmetry_eigensolver, symmetry_state),
             ),
             (
                 "orbital_memory_allocator",

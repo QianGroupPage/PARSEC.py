@@ -60,6 +60,7 @@ from ..SCF.single_point import (
     PreparedSinglePointSystem,
     first_diagonalization_tolerance,
     iterative_solver_fields,
+    solver_option_fields,
     next_diagonalization_tolerance,
     preconditioner_neighbors,
     state_for_new_potential,
@@ -114,6 +115,9 @@ def _eigval_settings(
     eigensolver_settings = system.input.eigensolver
     if tolerance is None:
         tolerance = eigensolver_settings.tolerance
+    chebff_options, chebdav_options, subspace_options = solver_option_fields(
+        eigensolver_settings, tolerance, filter_degree
+    )
     if eigensolver_settings.method in ("arpack", "diagla"):
         # The complex ARPACK (znaupd) and zdiagla_diag paths.
         return EigvalSettings(
@@ -131,6 +135,7 @@ def _eigval_settings(
                 block_size=eigensolver_settings.matvec_block_size,
                 reset_recurrence_per_block=False,
                 random_seed=eigensolver_settings.random_seed,
+                **subspace_options,
             ),
         )
     if eigensolver_settings.method != "chebff":
@@ -149,6 +154,7 @@ def _eigval_settings(
             block_size=eigensolver_settings.matvec_block_size,
             reset_recurrence_per_block=False,
             random_seed=eigensolver_settings.random_seed,
+            **chebff_options,
         ),
         chebdav=ChebDavSettings(),
         subspace=SubspaceSettings(
@@ -158,6 +164,7 @@ def _eigval_settings(
             block_size=eigensolver_settings.matvec_block_size,
             reset_recurrence_per_block=False,
             random_seed=eigensolver_settings.random_seed,
+            **subspace_options,
         ),
     )
 
@@ -393,7 +400,7 @@ def run_self_consistent_soc_spin_polarized(
                 )
             )
         if (
-            iteration > 5
+            iteration > settings.degree_decrease_after
             and metrics.weighted < settings.approach_criterion
             and filter_degree > minimum_filter_degree
         ):

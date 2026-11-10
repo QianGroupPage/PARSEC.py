@@ -173,10 +173,17 @@ def force_report_lines(forces, output_level: int = 1, *, periodic: bool = False)
         "             tot.  (net) force [Ry/bohr]:   "
         + "".join(f"{value:11.6f} " for value in forces.net_force)
     )
+    kept = bool(getattr(forces, "net_force_kept", False))
     lines += [
         "",
         " coordinates and tot. forces (after setting net force to zero)",
-        *_table(positions, forces.total),
+        # FDET keeps the net force; forcnloc.F90 prints the table without it all the same.
+        *_table(
+            positions,
+            forces.total
+            if not kept
+            else np.asarray(forces.symmetrized) - np.asarray(forces.net_force) / max(len(positions), 1),
+        ),
     ]
     if periodic:
         # Andrew Grieder's report of a crystal: no torque
@@ -188,6 +195,9 @@ def force_report_lines(forces, output_level: int = 1, *, periodic: bool = False)
             + "".join(f"{value:11.6f} " for value in forces.torque),
             "",
         ]
+    if kept:
+        # forcnloc.F90:869-875.
+        lines.append(" Net forces not removed in FDET.")
     return lines
 
 
@@ -220,10 +230,18 @@ def relaxation_summary_lines(
     minimum_force_found: bool,
     manual: bool,
     scf_failed: bool,
+    stopped_by_scf_failure: bool = False,
 ) -> list[str]:
-    """Closing statements of a relaxation (end of ``parsec.F90``)."""
+    """Closing statements of a relaxation (end of ``parsec.F90``).
+
+    ``stopped_by_scf_failure``: the warning PARSEC 1.5 prints when it ends
+    the movement after an SCF loop that did not converge
+    (``parsec.F90:2124-2137``).
+    """
 
     lines: list[str] = []
+    if stopped_by_scf_failure:
+        lines += scf_failure_stop_lines()
     if movements_exhausted:
         lines += [" NOTICE: Maximum number of movements used.", ""]
     if not manual:
@@ -238,8 +256,20 @@ def relaxation_summary_lines(
     return lines
 
 
+def scf_failure_stop_lines() -> list[str]:
+    """``parsec.F90:2129-2134`` of PARSEC 1.5: relaxation or molecular dynamics ended by an SCF failure."""
+
+    return [
+        "",
+        " WARNING !!! atom movement is terminated",
+        " No point to continue without convergence",
+        "",
+    ]
+
+
 __all__ = [
     "force_report_lines",
     "movement_report_lines",
     "relaxation_summary_lines",
+    "scf_failure_stop_lines",
 ]

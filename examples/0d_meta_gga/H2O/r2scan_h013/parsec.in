@@ -1,0 +1,42 @@
+# H2O: r2SCAN (Furness et al. 2020) of libxc: MGGA_X_R2SCAN + MGGA_C_R2SCAN
+# Quantum ESPRESSO reference: input_dft = 'XC-000I-000I-000I-000I-497L-498L' (qe/README.md)
+# grid spacing 0.130 bohr (the convergence rows of the README; 0.16 bohr elsewhere)
+
+Boundary_Sphere_Radius: 11.53
+Grid_Spacing: 0.130
+Coordinate_Unit: Cartesian_Bohr
+Expansion_Order: 12
+LibXC_Functional: mgga_x_r2scan mgga_c_r2scan
+States_Num: 8
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+
+Atom_Types_Num: 2
+
+Atom_Type: H
+Pseudopotential_Format: fhipp
+Potential_Num: 1
+Local_Component: s
+Core_Cutoff_Radius: 1.3
+begin Electron_Per_Orbital
+1
+end Electron_Per_Orbital
+Cubic_Spline: .true.
+begin Atom_Coord
+     1.4304288085    0.0000000000    0.5535785220
+    -1.4304288085    0.0000000000    0.5535785220
+end Atom_Coord
+
+Atom_Type: O
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 1.6
+begin Electron_Per_Orbital
+2 4 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.
+begin Atom_Coord
+     0.0000000000    0.0000000000   -0.5535785220
+end Atom_Coord

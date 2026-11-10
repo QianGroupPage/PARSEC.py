@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -60,10 +62,11 @@ class SplineLocalForceTests(unittest.TestCase):
         cls.atoms = _ATOMS + (Atom("Ge", np.array([1.4, 4.1, 2.2])),)
 
     def _readable(self):
-        self.assertIsNone(periodic_forces._local_force_provider)  # the scan of the grid, not a provider
-        return periodic_forces.periodic_local_forces(
-            self.grid, self.atoms, self.potentials, self.species, self.lattice, self.density, self.residual, self.xc
-        )
+        # the scan of the grid: importing the acceleration package installs a provider (periodic_spline) behind this entry
+        with mock.patch.object(periodic_forces, "_local_force_provider", None):
+            return periodic_forces.periodic_local_forces(
+                self.grid, self.atoms, self.potentials, self.species, self.lattice, self.density, self.residual, self.xc
+            )
 
     def test_the_other_two_terms_equal_the_readable_terms(self) -> None:
         readable = self._readable()
@@ -103,9 +106,10 @@ class SplineLocalForceTests(unittest.TestCase):
         grid = build_periodic_grid(_CUBE, settings)
         density, residual, xc = _fields(grid, self.lattice)
         self.assertTrue(fast.spline_species_takes(grid, self.lattice, self.species, self.atoms))
-        readable = periodic_forces.periodic_local_forces(
-            grid, self.atoms, self.potentials, self.species, self.lattice, density, residual, xc
-        )
+        with mock.patch.object(periodic_forces, "_local_force_provider", None):
+            readable = periodic_forces.periodic_local_forces(
+                grid, self.atoms, self.potentials, self.species, self.lattice, density, residual, xc
+            )
         quick = fast.fortran_spline_local_forces(
             grid, self.atoms, self.potentials, self.species, self.lattice, density, residual, xc
         )
@@ -113,6 +117,53 @@ class SplineLocalForceTests(unittest.TestCase):
         np.testing.assert_allclose(quick.self_consistency, readable.self_consistency, atol=1.0e-7, rtol=0.0)
         np.testing.assert_allclose(quick.core_correction, readable.core_correction, atol=1.0e-7, rtol=0.0)
         self.assertGreater(np.abs(readable.core_correction).max(), 1.0e-3)
+
+    def test_a_self_consistency_term_formed_elsewhere_is_taken_as_it_is(self) -> None:
+        # the CUDA kernel of periodic_spline._device_density_terms hands its term over; the host ball sums are skipped
+        marker = np.arange(3 * len(self.atoms), dtype=float).reshape(-1, 3)
+        for local in ("real_space", "g_space"):
+            with self.subTest(local=local):
+                settings = PeriodicGridSettings(
+                    fortran_routines=True, spacing=0.7, expansion_order=4, local_potential=local
+                )
+                grid = build_periodic_grid(_CUBE, settings)
+                density, residual, xc = _fields(grid, self.lattice)
+                with mock.patch.object(fast, "fast_self_consistency_forces", side_effect=AssertionError("host sum")):
+                    terms = fast.fortran_spline_local_forces(
+                        grid, self.atoms, self.potentials, self.species, self.lattice, density, residual, xc,
+                        self_consistency=marker,
+                    )
+                np.testing.assert_array_equal(terms.self_consistency, marker)
+
+    def test_the_g_space_route_of_the_accelerated_forces_uses_the_device_term(self) -> None:
+        from ..Forces import periodic_device
+
+        settings = PeriodicGridSettings(fortran_routines=True, spacing=0.7, expansion_order=4, local_potential="g_space")
+        grid = build_periodic_grid(_CUBE, settings)
+        density, residual, xc = _fields(grid, self.lattice)
+        system = SimpleNamespace(grid=grid, pseudopotentials=self.potentials, backend_info=SimpleNamespace(selected="numpy"))
+        arguments = (system, self.atoms, self.species, self.lattice, density, residual, xc)
+        host = periodic_device._spline_species_local_forces(*arguments)  # no device: the host ball sums
+        with mock.patch.object(periodic_forces, "_local_force_provider", None):
+            readable = periodic_forces.periodic_local_forces(
+                grid, self.atoms, self.potentials, self.species, self.lattice, density, residual, xc
+            )
+        np.testing.assert_allclose(host.self_consistency, readable.self_consistency, atol=1.0e-7, rtol=0.0)
+        # a device that returns its term: it replaces the self-consistency term only
+        device_term = 2.0 * host.self_consistency + 0.25
+        with mock.patch.object(periodic_device, "_device_self_consistency", return_value=device_term):
+            routed = periodic_device._spline_species_local_forces(*arguments)
+        np.testing.assert_array_equal(routed.self_consistency, device_term)
+        np.testing.assert_array_equal(routed.ionic, host.ionic)
+        np.testing.assert_array_equal(routed.core_correction, host.core_correction)
+        # the real-space local potential stays with periodic_spline (through the readable entry)
+        real = build_periodic_grid(_CUBE, _SETTINGS)
+        self.assertIsNone(
+            periodic_device._spline_species_local_forces(
+                SimpleNamespace(grid=real, pseudopotentials=self.potentials, backend_info=SimpleNamespace(selected="numpy")),
+                self.atoms, self.species, self.lattice, *_fields(real, self.lattice),
+            )
+        )
 
     def test_the_inputs_it_takes(self) -> None:
         self.assertTrue(fast.spline_species_takes(self.grid, self.lattice, self.species, self.atoms))

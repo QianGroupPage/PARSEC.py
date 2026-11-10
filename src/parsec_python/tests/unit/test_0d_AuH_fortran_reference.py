@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from parsec_python.cli import main as cli_main
+from parsec_python.tests.archives import read_archive
 
 _FIXTURES = Path(__file__).resolve().parents[4] / "examples" / "0d_AuH"
 
@@ -44,7 +45,7 @@ class PerturbativeSOCFortranReferenceTests(unittest.TestCase):
         exit_code = cli_main([str(directory / "parsec.in"), "--quiet"])
         if exit_code != 0:
             raise AssertionError(f"CLI run failed with exit code {exit_code}")
-        cls.archive = np.load(directory / "parsec_python_results.npz")
+        cls.archive = read_archive(directory / "parsec_python_results.npz")
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -97,7 +98,7 @@ class SelfConsistentSOCFortranReferenceTests(unittest.TestCase):
         exit_code = cli_main([str(directory / "parsec.in"), "--quiet"])
         if exit_code != 0:
             raise AssertionError(f"CLI run failed with exit code {exit_code}")
-        cls.archive = np.load(directory / "parsec_python_results.npz")
+        cls.archive = read_archive(directory / "parsec_python_results.npz")
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -153,7 +154,7 @@ class SelfConsistentSOCSpinPolarizedFortranReferenceTests(unittest.TestCase):
         )
         if exit_code != 0:
             raise AssertionError(f"CLI run failed with exit code {exit_code}")
-        cls.archive = np.load(directory / "parsec_python_results.npz")
+        cls.archive = read_archive(directory / "parsec_python_results.npz")
 
     @classmethod
     def tearDownClass(cls) -> None:

@@ -6,12 +6,91 @@ from typing import Any
 
 import numpy as np
 
-from parsec_python.Eigensolvers.spectral_bounds import LanczosBoundResult
+from parsec_python.Eigensolvers.spectral_bounds import (
+    LanczosBoundResult,
+    lanczos_bound_from_ritz,
+    lanczos_bound_steps,
+)
 
 from ..backends.cupy import require_cupy
 
 
 _BREAKDOWN_TOLERANCE = 2.5e-16
+
+
+def filter_bound_policy() -> str:
+    """``PARSEC_META_GGA_FILTER_BOUND``: ``gershgorin`` (default), ``targeted`` or ``lanczos`` (:func:`with_orbital_term`)."""
+
+    import os
+
+    value = os.environ.get("PARSEC_META_GGA_FILTER_BOUND", _DEFAULT_POLICY).strip().lower()
+    if value not in ("targeted", "gershgorin", "lanczos"):
+        raise ValueError("PARSEC_META_GGA_FILTER_BOUND must be targeted, gershgorin or lanczos")
+    return value
+
+
+_DEFAULT_POLICY = "gershgorin"
+
+
+def with_orbital_term(operator: Any, upper_bound: float, *, steps: int = 8, rng=None, rule: str = "parsec") -> float:
+    """The filter's upper bound of an operator that may hold a meta-GGA term.
+
+    The term ``sum_a B_a^T diag(vtau) B_a`` (and the first-order term of the
+    orbital form) reports a bound ``m`` of its eigenvalues
+    (``spectral_margin``, Gershgorin's row sums).  Where ``vtau`` has a
+    narrow spike (low density) the term has localized eigenvalues far above
+    the rest of the spectrum, which the short Lanczos run from a random
+    vector does not see; the Chebyshev filter would amplify them without
+    limit.  With the term, the bound is ``max(lanczos, bare + m)``, ``bare``
+    the last Lanczos bound of the same operator without the term (the first
+    iteration of a meta-GGA has none), or ``lanczos + m`` before one exists:
+    ``lambda_max(H_0 + M) <= lambda_max(H_0) + m``.  ``bare`` is raised by
+    the rise of the largest value of the effective potential since it was
+    taken.  Without the term the Lanczos bound is recorded as ``bare`` on
+    operators that keep one.  This is ``PARSEC_META_GGA_FILTER_BOUND=gershgorin``.
+
+    ``targeted`` runs a second short Lanczos recurrence on the operator from
+    a start vector concentrated on the rows where the term is large (its
+    Gershgorin row sums with random signs, ``spectral_start_vector``), which
+    overlaps the localized modes of the spikes, and takes the larger of the
+    two Lanczos bounds: the spectrum's top of ``H_0`` (the checkerboard mode
+    of the Laplacian, which the derivative stencil does not see) is not added
+    to that of the term.  ``lanczos`` keeps the Lanczos bound alone (a
+    comparison; it can end in the filter's failure described above).
+    """
+
+    margin = float(getattr(operator, "spectral_margin", 0.0) or 0.0)
+    if margin <= 0.0:
+        if hasattr(operator, "bare_upper_bound") and getattr(operator, "kinetic_term", None) is None:
+            operator.bare_upper_bound = (float(upper_bound), _potential_top(operator))
+        return float(upper_bound)
+    policy = filter_bound_policy()
+    if policy == "lanczos":
+        return float(upper_bound)
+    start = getattr(operator, "spectral_start_vector", None) if policy == "targeted" else None
+    if start is not None:
+        cp, _ = require_cupy()
+        generator = np.random.default_rng(20261108) if rng is None else rng
+        signs = cp.asarray(generator.standard_normal(int(start.shape[0])))
+        targeted = _lanczos_bound(operator, cp.asarray(start, dtype=cp.float64) * signs, steps, rule=rule)
+        return max(float(upper_bound), float(targeted.upper_bound))
+    bare = getattr(operator, "bare_upper_bound", None)
+    if bare is None:
+        base = float(upper_bound)
+    else:
+        base, top = bare
+        now = _potential_top(operator)
+        if top is not None and now is not None:
+            base += max(0.0, now - top)
+    return max(float(upper_bound), base + margin)
+
+
+def orbital_term_margin(operator: Any) -> float:
+    """The bound of the orbital term an operator holds (``spectral_margin``), 0 under ``PARSEC_META_GGA_FILTER_BOUND=lanczos``."""
+
+    from parsec_python.Eigensolvers.spectral_bounds import orbital_term_margin as host_margin
+
+    return host_margin(operator)
 
 
 def lanczos_upper_bound(
@@ -20,8 +99,38 @@ def lanczos_upper_bound(
     steps: int = 5,
     *,
     rng: np.random.Generator | None = None,
+    rule: str = "parsec",
 ) -> LanczosBoundResult:
-    """Run the non-reorthogonalized 4--8 step PARSEC recurrence on CuPy.
+    """PARSEC's short Lanczos bound (:func:`_lanczos_bound`), with a meta-GGA's orbital term taken in (:func:`with_orbital_term`).
+
+    ``rule`` is the bound of :func:`parsec_python.Eigensolvers.spectral_bounds.lanczos_bound_from_ritz`:
+    ``parsec`` (the default: the radius ``max(theta_max, |theta_min|)``, 4 to 8 steps) or ``lanczos``
+    (PARSEC 1.5's ``Bounds_Method: lanczos``: ``theta_max``, ``steps`` as given).
+    """
+
+    from dataclasses import replace
+
+    bound = _lanczos_bound(operator, initial_vector, steps, rng=rng, rule=rule)
+    upper = with_orbital_term(operator, bound.upper_bound, steps=steps, rng=rng, rule=rule)
+    return bound if upper == bound.upper_bound else replace(bound, upper_bound=float(upper))
+
+
+def _potential_top(operator: Any) -> float | None:
+    potential = getattr(operator, "effective_potential", None)
+    if potential is None:
+        return None
+    return float(potential.max())
+
+
+def _lanczos_bound(
+    operator: Any,
+    initial_vector: Any | None = None,
+    steps: int = 5,
+    *,
+    rng: np.random.Generator | None = None,
+    rule: str = "parsec",
+) -> LanczosBoundResult:
+    """Run the non-reorthogonalized 4--8 step PARSEC recurrence on CuPy (``rule`` ``lanczos``: ``steps`` steps).
 
     The ``N``-component current/previous/residual vectors stay on the device.
     Recurrence scalars stay as zero-dimensional device arrays while CUDA
@@ -45,7 +154,7 @@ def lanczos_upper_bound(
     requested_steps = int(steps)
     if requested_steps != steps:
         raise ValueError("steps must be an integer")
-    target_steps = min(max(requested_steps, 4), 8, size)
+    target_steps = lanczos_bound_steps(rule, requested_steps, size)
 
     if initial_vector is None:
         generator = np.random.default_rng() if rng is None else rng
@@ -152,26 +261,14 @@ def lanczos_upper_bound(
             projected[indices, indices + 1] = off_diagonal
 
     ritz_values = np.linalg.eigvalsh(projected[:actual_steps, :actual_steps])
-    lower_bound = float(ritz_values[0])
-    spectral_radius = max(float(ritz_values[-1]), abs(lower_bound))
-    middle = 0.5 * (spectral_radius + lower_bound)
-    residual_scale = raw_beta_value
-    if residual_scale < 1.0e-2:
-        residual_scale *= 10.0
-    elif residual_scale < 1.0e-1:
-        residual_scale *= 5.0
-    upper_bound = spectral_radius + residual_scale
-    return LanczosBoundResult(
-        upper_bound=float(upper_bound),
-        lower_bound=lower_bound,
-        middle=float(middle),
-        ritz_values=ritz_values,
-        raw_beta=raw_beta_value,
-        residual_scale=float(residual_scale),
+    return lanczos_bound_from_ritz(
+        rule,
+        ritz_values,
+        raw_beta_value,
         steps=actual_steps,
         requested_steps=requested_steps,
         breakdown=breakdown,
     )
 
 
-__all__ = ["LanczosBoundResult", "lanczos_upper_bound"]
+__all__ = ["LanczosBoundResult", "filter_bound_policy", "lanczos_upper_bound", "with_orbital_term"]

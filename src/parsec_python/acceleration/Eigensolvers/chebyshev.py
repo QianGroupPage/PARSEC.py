@@ -85,7 +85,7 @@ def _mixed_filter_requested(
     """
 
     policy = mixed_filter_policy()
-    if policy == "off":
+    if policy == "off" or holds_exchange(operator):
         return False
     available = getattr(operator, "mixed_precision_recurrence", None) is not None
     if not available or policy == "on":
@@ -352,6 +352,137 @@ def _batched_block_filter(
     return current
 
 
+def holds_exchange(operator: Any) -> bool:
+    """Whether ``operator`` holds a term outside its fused kernels.
+
+    The exchange term of a hybrid functional or the orbital term of a
+    meta-GGA (``kinetic_term``): the filter then groups its blocks
+    (:func:`_exchange_block_filter`), takes no FP32 recurrence, no captured
+    graph and no filter spread over devices, whose kernels hold neither.
+    """
+
+    return (
+        getattr(operator, "exchange_projectors", None) is not None
+        or getattr(operator, "kinetic_term", None) is not None
+    )
+
+
+def _carried_sigmas(
+    blocks: tuple[FilterBlock, ...],
+    sigma_one: float,
+    reset_recurrence_per_block: bool,
+) -> list[list[float]]:
+    """``sigma`` of every step ``2..degree`` of every block, PARSEC's carry included.
+
+    Entry ``k - 2`` of a block's list is the ``sigma`` that step ``k`` reads;
+    the last one is followed by the ``sigma_next`` of that step, which the
+    next block starts from unless ``reset_recurrence_per_block``.
+    """
+
+    sigmas: list[list[float]] = []
+    carried: float | None = None
+    for block in blocks:
+        sigma = sigma_one if reset_recurrence_per_block or carried is None else carried
+        steps = []
+        for _ in range(2, block.degree + 1):
+            steps.append(float(sigma))
+            sigma = 1.0 / (2.0 / sigma_one - sigma)
+        steps.append(float(sigma))
+        carried = sigma
+        sigmas.append(steps)
+    return sigmas
+
+
+def _exchange_block_filter(
+    operator: Any,
+    matrix: Any,
+    blocks: tuple[FilterBlock, ...],
+    lower_bound: float,
+    upper_bound: float,
+    reference_eigenvalue: float,
+    reset_recurrence_per_block: bool,
+):
+    """The block filter for an operator with the exchange term of a hybrid.
+
+    The adaptively compressed exchange ``a_x V_ACE = -a_x xi xi^T`` costs two
+    GEMMs with the ``rank``-column factor ``xi`` per application, which read
+    all of ``xi`` whatever the width of the block: applied to PARSEC's
+    six-column memory blocks it would read ``xi`` once per block and step.
+    Here the blocks of a group of consecutive blocks advance together, one
+    application of the group's active columns per polynomial step (the
+    recurrence of :func:`_batched_block_filter`, with PARSEC's sigma carried
+    from block to block, :func:`_carried_sigmas`).  Each column receives the
+    polynomial its block receives in :func:`chebyshev_filter`; only the
+    grouping of the products differs.  A group holds as many columns as
+    three recurrence arrays of it fit into 60 % of the free device memory
+    (all of them where they fit).  Block degrees must not decrease, as for
+    CHEBFF and PARSEC's SUBSPACE split; otherwise the blocks are filtered one
+    by one.
+    """
+
+    cp, _ = require_cupy()
+    degrees = [block.degree for block in blocks]
+    if any(right < left for left, right in zip(degrees, degrees[1:])):
+        return None
+    half_span = 0.5 * (float(upper_bound) - float(lower_bound))
+    if half_span <= 0.0:
+        raise ValueError("upper_bound must be greater than lower_bound")
+    center = 0.5 * (float(upper_bound) + float(lower_bound))
+    denominator = float(reference_eigenvalue) - center
+    if denominator == 0.0:
+        raise ValueError("reference_eigenvalue cannot equal the interval center")
+    sigma_one = half_span / denominator
+    sigmas = _carried_sigmas(blocks, sigma_one, reset_recurrence_per_block)
+    rows = int(matrix.shape[0])
+    filtered = cp.empty(matrix.shape, dtype=cp.float64, order="F")
+    free_bytes, _total = cp.cuda.runtime.memGetInfo()
+    pool = cp.get_default_memory_pool()
+    available = int(free_bytes) + int(pool.free_bytes())
+    # Four row-sized arrays per column (previous, current, following and the
+    # operator's output); a meta-GGA's orbital term adds its own per
+    # application (DeviceKineticTerm.apply: the scaled block, the result and,
+    # in the orbital form, the derivative block, on the larger target rows).
+    arrays = 4 + int(getattr(getattr(operator, "kinetic_term", None), "block_arrays", 0))
+    width = max(1, int(0.60 * available) // max(1, arrays * 8 * rows))
+    groups: list[list[int]] = [[]]
+    count = 0
+    for index, block in enumerate(blocks):
+        size = block.stop - block.start
+        if groups[-1] and count + size > width:
+            groups.append([])
+            count = 0
+        groups[-1].append(index)
+        count += size
+    for group in groups:
+        first, last = blocks[group[0]].start, blocks[group[-1]].stop
+        source = matrix[:, first:last]
+        previous = cp.array(source, dtype=cp.float64, order="F")
+        current = operator @ source
+        current -= center * source
+        current *= sigma_one / half_span
+        for step in range(2, max(blocks[index].degree for index in group) + 1):
+            active = [index for index in group if blocks[index].degree >= step]
+            start = blocks[active[0]].start - first
+            sigma = np.concatenate(
+                [np.full(blocks[i].stop - blocks[i].start, sigmas[i][step - 2]) for i in active]
+            )
+            sigma_next = np.concatenate(
+                [np.full(blocks[i].stop - blocks[i].start, sigmas[i][step - 1]) for i in active]
+            )
+            window = current[:, start:]
+            following = operator @ window
+            following -= center * window
+            following *= 2.0 / half_span
+            following -= previous[:, start:] * cp.asarray(sigma)[None, :]
+            following *= cp.asarray(sigma_next)[None, :]
+            previous[:, start:] = window
+            current[:, start:] = following
+            del following, window
+        filtered[:, first:last] = current
+        del previous, current
+    return filtered
+
+
 def chebff_filter(
     operator: Any,
     vectors: Any,
@@ -374,6 +505,13 @@ def chebff_filter(
     cp, _ = require_cupy()
     matrix, was_vector = _as_device_columns(vectors)
     blocks = uniform_filter_blocks(matrix.shape[1], block_size, degree)
+    if holds_exchange(operator):
+        grouped = _exchange_block_filter(
+            operator, matrix, blocks, lower_bound, upper_bound,
+            reference_eigenvalue, reset_recurrence_per_block,
+        )
+        if grouped is not None:
+            return grouped[:, 0] if was_vector else grouped
     from .filter_graph import graph_filter
 
     captured = graph_filter(
@@ -487,7 +625,16 @@ def subspace_filter(
     blocks = subspace_filter_blocks(
         matrix.shape[1], block_size, degree, degree_delta
     )
-    if os.environ.get("PARSEC_CUPY_DISTRIBUTED_FILTER", "0") == "1":
+    if holds_exchange(operator):
+        # The FP64 filter of a hybrid's operator (the FP32 one holds no
+        # exchange term and is refused by the operator).
+        grouped = _exchange_block_filter(
+            operator, matrix, blocks, lower_bound, upper_bound,
+            lower_bound, reset_recurrence_per_block,
+        )
+        if grouped is not None:
+            return grouped[:, 0] if was_vector else grouped
+    if os.environ.get("PARSEC_CUPY_DISTRIBUTED_FILTER", "0") == "1" and not holds_exchange(operator):
         if use_mixed_precision:
             raise ValueError("distributed filter experiment requires FP64")
         from .distributed_filter import distributed_filter

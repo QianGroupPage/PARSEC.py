@@ -1,0 +1,31 @@
+# O2 triplet (1.2075 A), spin-polarized: B3PW91 (as libxc HYB_GGA_XC_B3PW91): 0.20 exact exchange, 0.08 Slater + 0.72 B88, PW92 + 0.81 PW91 gradient correlation
+# Quantum ESPRESSO reference: input_dft = 'XC-000I-000I-401L-000I-000I-000I' (libxc 401)
+
+Boundary_Sphere_Radius: 11.14
+Grid_Spacing: 0.160
+Coordinate_Unit: Cartesian_Bohr
+Expansion_Order: 12
+Correlation_Type: b3pw91
+Exx_Tolerance: 1e-8 Ry   # Fock-loop stop (default 1e-6 Ry), tight for the comparison
+States_Num: 11
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+Spin_Polarization: true
+Fermi_Temp: -1 K   # occupations of occup.in (triplet)
+Atom_Types_Num: 1
+
+Atom_Type: O
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 1.6
+begin Electron_Per_Orbital
+2 4 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.   # spline of the radial table, see README
+Initial_Spin_Polarization: 0.3
+begin Atom_Coord
+     0.0000000000    0.0000000000    1.1409221477
+     0.0000000000    0.0000000000   -1.1409221477
+end Atom_Coord

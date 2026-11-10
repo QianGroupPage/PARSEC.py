@@ -27,6 +27,7 @@ level (written in the last column, the number of states in it).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from pathlib import Path
 from typing import Sequence
 
@@ -35,6 +36,26 @@ import numpy as np
 from ..models import BandStructureResult
 
 RYDBERG_TO_EV = 13.605693122994
+
+#: matplotlib is not a requirement of the package (``requirements.txt``: NumPy and SciPy); only the
+#: plots of this module need it.  The data files are written without it.
+MATPLOTLIB_MISSING = (
+    "the band-structure plots need matplotlib, which is not among the requirements of parsec_python: "
+    "python -m pip install matplotlib (bands.dat, bands_plot.dat and bands_spin.dat need no matplotlib)"
+)
+
+
+def _pyplot(output):
+    """``matplotlib.pyplot``, on the file backend (Agg) when the figure is saved to ``output``."""
+    try:
+        import matplotlib
+    except ImportError as error:
+        raise ModuleNotFoundError(MATPLOTLIB_MISSING, name="matplotlib") from error
+    if output is not None:
+        matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 def write_bands_files(directory: str | Path, result: BandStructureResult) -> tuple[Path, Path]:
@@ -205,19 +226,19 @@ def save_band_structure_archive(path: str | Path, result: BandStructureResult) -
 
 
 def load_band_structure_archive(path: str | Path) -> BandStructureResult:
-    archive = np.load(path)
-    return BandStructureResult(
-        mode=str(archive["mode"]),
-        channels=tuple(str(value) for value in archive["channels"]),
-        segment_names=tuple(str(value) for value in archive["segment_names"]),
-        segment_counts=archive["segment_counts"],
-        k_points=archive["k_points_cartesian_inv_bohr"],
-        eigenvalues=archive["eigenvalues_ry"],
-        residual_norms=archive["residual_norms"],
-        fermi_level=float(archive["fermi_level_ry"]),
-        spin_expectation=archive["spin_expectation"] if "spin_expectation" in archive.files else None,
-        attempts=archive["solver_attempts"] if "solver_attempts" in archive.files else None,
-    )
+    with np.load(path) as archive:  # the arrays are read out; the file is closed (Windows can remove it)
+        return BandStructureResult(
+            mode=str(archive["mode"]),
+            channels=tuple(str(value) for value in archive["channels"]),
+            segment_names=tuple(str(value) for value in archive["segment_names"]),
+            segment_counts=archive["segment_counts"],
+            k_points=archive["k_points_cartesian_inv_bohr"],
+            eigenvalues=archive["eigenvalues_ry"],
+            residual_norms=archive["residual_norms"],
+            fermi_level=float(archive["fermi_level_ry"]),
+            spin_expectation=archive["spin_expectation"] if "spin_expectation" in archive.files else None,
+            attempts=archive["solver_attempts"] if "solver_attempts" in archive.files else None,
+        )
 
 
 def _tick_labels(result: BandStructureResult) -> tuple[list[float], list[str]]:
@@ -258,13 +279,9 @@ def plot_band_comparison(
     ``entries`` is ``[(label, result), ...]``, e.g. without and with
     spin-orbit coupling.  Spin-polarized channels share the entry's color
     (the down channel dashed).  Returns the matplotlib figure; saves to
-    ``output`` when given.
+    ``output`` when given.  Needs matplotlib (:data:`MATPLOTLIB_MISSING`).
     """
-    import matplotlib
-
-    if output is not None:
-        matplotlib.use("Agg", force=False)
-    import matplotlib.pyplot as plt
+    plt = _pyplot(output)
 
     figure, axis = plt.subplots(figsize=(7.0, 5.0))
     colors = ("#1f77b4", "#d62728", "#2ca02c", "#9467bd")
@@ -319,12 +336,9 @@ def plot_spin_texture(
     Energy relative to the Fermi level; the colour of a segment of a band is the spin of its two end points,
     from -1 (blue) to +1 (red) in units of hbar/2.  Degenerate levels show their mean spin
     (:func:`level_averaged_spin`).  Returns the matplotlib figure; saves it to ``output`` when given.
+    Needs matplotlib (:data:`MATPLOTLIB_MISSING`).
     """
-    import matplotlib
-
-    if output is not None:
-        matplotlib.use("Agg", force=False)
-    import matplotlib.pyplot as plt
+    plt = _pyplot(output)
     from matplotlib.collections import LineCollection
 
     averaged, _ = level_averaged_spin(result, tolerance)
@@ -388,6 +402,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="energy window relative to E_F in eV (default -8 6; -2 2 with --spin)")
     parser.add_argument("-o", "--output", type=Path, default=Path("bands.png"))
     arguments = parser.parse_args(argv)
+    if importlib.util.find_spec("matplotlib") is None:
+        parser.exit(1, f"{parser.prog}: {MATPLOTLIB_MISSING}\n")
     if arguments.spin is not None:
         result = load_band_structure_archive(arguments.spin)
         if arguments.names:

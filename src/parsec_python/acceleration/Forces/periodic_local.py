@@ -453,6 +453,7 @@ def fortran_spline_local_forces(
     xp=np,
     erf=None,
     tolerance: float = 1.0e-14,
+    self_consistency: np.ndarray | None = None,
 ) -> LocalForceTerms:
     """The three local terms of :func:`parsec_python.Forces.periodic.periodic_local_forces` for spline species, fast.
 
@@ -462,17 +463,25 @@ def fortran_spline_local_forces(
     sum, the same function the readable term differentiates, to the splitting accuracy of about 1e-7 Ry/bohr); the
     self-consistency term, which the fast sums of the default routines do not have, is
     :func:`fast_self_consistency_forces`.  See :func:`spline_species_takes` for the inputs it covers.
+
+    ``self_consistency``: that term already formed (``(atoms, 3)``, Ry/bohr, with the volume element), by the CUDA
+    kernel of :mod:`.periodic_device` for instance; the host ball sums are skipped.
     """
+
+    def self_consistency_term() -> np.ndarray:
+        if self_consistency is not None:
+            return np.asarray(self_consistency, dtype=np.float64)
+        return (
+            fast_self_consistency_forces(grid, atoms, potentials, specifications, lattice_vectors, potential_residual)
+            * grid.volume_element
+        )
 
     if getattr(grid.settings, "local_potential", "real_space") == "g_space":
         from parsec_python.V_ion.gspace_local import gspace_local_forces
 
         return LocalForceTerms(
             ionic=gspace_local_forces(grid, atoms, potentials, specifications, lattice_vectors, density),
-            self_consistency=fast_self_consistency_forces(
-                grid, atoms, potentials, specifications, lattice_vectors, potential_residual
-            )
-            * grid.volume_element,
+            self_consistency=self_consistency_term(),
             core_correction=fast_core_correction_forces(
                 grid, atoms, potentials, specifications, lattice_vectors, xc_potential, xp=xp
             )
@@ -484,10 +493,7 @@ def fortran_spline_local_forces(
     )
     return LocalForceTerms(
         ionic=terms.ionic,
-        self_consistency=fast_self_consistency_forces(
-            grid, atoms, potentials, specifications, lattice_vectors, potential_residual
-        )
-        * grid.volume_element,
+        self_consistency=self_consistency_term(),
         core_correction=terms.core_correction,
     )
 

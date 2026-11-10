@@ -20,6 +20,15 @@ from .asymptotic_correction import (
     lb94_spin,
     lb94_spin_potential_corrections,
 )
+from .hybrid import (
+    HYBRID_FUNCTIONALS,
+    ExactExchangeTerm,
+    HybridFunctional,
+    hybrid_functional,
+    hybrid_semilocal_xc,
+    hybrid_semilocal_xc_spin,
+    is_hybrid_label,
+)
 from .local_density import hedin_lundqvist_lda, wigner_lda, xalpha_lda
 from .noncollinear import NoncollinearXCResult, local_spin_densities, noncollinear_xc
 from .pbe import (
@@ -51,6 +60,9 @@ from .selection import (
 __all__ = [
     "B3LYPSemilocalEnergies",
     "ExactExchangeResult",
+    "ExactExchangeTerm",
+    "HYBRID_FUNCTIONALS",
+    "HybridFunctional",
     "FORTRAN_CORRELATION_CODES",
     "FORTRAN_CORRELATION_DESCRIPTIONS",
     "NoncollinearXCResult",
@@ -73,6 +85,10 @@ __all__ = [
     "exact_exchange_energy",
     "first_derivative_coefficients",
     "hedin_lundqvist_lda",
+    "hybrid_functional",
+    "hybrid_semilocal_xc",
+    "hybrid_semilocal_xc_spin",
+    "is_hybrid_label",
     "lb94",
     "lb94_potential_correction",
     "lb94_spin",

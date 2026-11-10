@@ -69,6 +69,34 @@ def fractional_coordinates(positions: np.ndarray, lattice_vectors: np.ndarray) -
     return np.linalg.solve(vectors.T, positions.T).T
 
 
+def back_to_cell(position: np.ndarray, lattice_vectors: np.ndarray, periodicity: int = 3) -> np.ndarray:
+    """Translate one position by lattice vectors to fractional coordinates about ``[-1/2, 1/2]`` (PARSEC 1.5).
+
+    ``back_to_cell`` of ``scf/initial.f90:762-820``, which PARSEC 1.5 applies to every periodic input at start
+    (``initial.f90:326``; the previous tree after moves only): ``u = A^-1 r``, ``u_i -= nint(u_i)`` along the
+    ``periodicity`` periodic directions, ``r = A u``.  Here the translation is ``r - n_1 a_1 - n_2 a_2 - n_3 a_3``
+    with ``n_i = floor(u_i + 1/2)`` (the arithmetic of :func:`parsec_python.SCF.wire_slab.wire_slab_back_to_cell`,
+    which wires and slabs apply after moves), so every ``u`` lands in ``[-1/2, 1/2)``: Fortran's ``nint`` rounds
+    halves away from zero and swaps ``u = 1/2`` and ``-1/2``, which would move an atom of a written input
+    (``bak_complete_parsec.in``) once more when it is read back; the two are the same position modulo the lattice.
+    A position with ``n = 0`` is returned unchanged (the same array), where Fortran's round trip ``A (A^-1 r)``
+    changes its last bits: inside the cell no coordinate moves.  A translation by lattice vectors changes no
+    periodic sum.
+    """
+
+    position = np.asarray(position, dtype=float)
+    vectors = np.asarray(lattice_vectors, dtype=float)
+    fraction = position @ np.linalg.inv(vectors)
+    steps = [int(np.floor(float(fraction[axis]) + 0.5)) for axis in range(periodicity)]
+    if not any(steps):
+        return position
+    moved = position.copy()
+    for axis, step in enumerate(steps):
+        if step:
+            moved = moved - float(step) * vectors[axis]
+    return moved
+
+
 def wrap_into_cell(position: np.ndarray, lattice_vectors: np.ndarray) -> np.ndarray:
     """Translate one position by lattice vectors into the cell ``f in [0, 1)^3``.
 
@@ -170,6 +198,7 @@ def replicate_positions(
 
 
 __all__ = [
+    "back_to_cell",
     "cell_diagonal_length",
     "fractional_coordinates",
     "is_diagonal_lattice",

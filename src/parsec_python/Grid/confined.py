@@ -7,8 +7,10 @@ and ``slab`` (``per = 2``):
   the confined Cartesian directions (``usrinputfile.F90:777-779``): a wire is
   periodic along ``a1 = (a, 0, 0)``, a slab along ``a1``, ``a2`` in the
   ``xy`` plane with ``a3 = z``;
-* periodic directions get the steps of ``adjust_step`` (an even number of
-  points, ``h_i >= h``, ``inipbc.f90:100-121``), confined directions keep the
+* periodic directions get the steps of ``adjust_step`` and the loop around it
+  (an even number of points, ``h_i >= h``, wherever a step is commensurate
+  with the translations; :func:`parsec_python.Grid.pbc.adjusted_steps`,
+  ``inipbc.f90:100-121``), confined directions keep the
   input spacing and ``n = int(2*rmax/h) + 2`` points (``inipbc.f90:90-92``);
 * integer points ``i = -n/2 .. n - n/2 - 1`` along every direction, lattice
   coordinates ``u_i = (shift_i + i)*h_i`` and Cartesian ``r = A_n u``
@@ -33,7 +35,7 @@ from functools import cached_property
 import numpy as np
 
 from ..models import PeriodicCell, PeriodicGridSettings
-from .pbc import GeneralPeriodicGrid, adjust_step
+from .pbc import GeneralPeriodicGrid, adjusted_steps
 
 
 @dataclass(frozen=True)
@@ -249,16 +251,16 @@ def build_confined_periodic_grid(
     confined_points = int(np.floor(2.0 * radius / spacing)) + 2
     points = [confined_points] * 3
     spacings = [spacing] * 3
-    # adjust_step (inipbc.f90:327-429) is called with nper = per: only the
-    # periodic directions see the fractional translations of the space group.
+    # adjust_step and the loop around it (PARSEC 1.5 inipbc.f90:131-252) run
+    # with nper = per: only the periodic directions see the fractional
+    # translations of the space group, and their smallest step is the input
+    # of the next pass.
     translations = getattr(settings, "fractional_translations", ()) or ((), (), ())
-    for axis in range(periodicity):
-        if translations[axis]:
-            points[axis], spacings[axis] = adjust_step(
-                lengths[axis], spacing, translations=translations[axis]
-            )
-        else:
-            points[axis], spacings[axis] = adjust_step(lengths[axis], spacing)
+    periodic_points, periodic_steps = adjusted_steps(
+        lengths[:periodicity], spacing, translations[:periodicity]
+    )
+    points[:periodicity] = periodic_points
+    spacings[:periodicity] = periodic_steps
     points_per_axis = np.asarray(points, dtype=np.int64)
     spacings_array = np.asarray(spacings, dtype=np.float64)
     half_width = settings.stencil_half_width

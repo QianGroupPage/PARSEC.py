@@ -198,19 +198,29 @@ def read_kpoint_file(path) -> np.ndarray:
 
 
 def band_path_kpoints(
-    starts: np.ndarray, ends: np.ndarray, points_in_shortest_segment: int
+    starts: np.ndarray,
+    ends: np.ndarray,
+    points_in_shortest_segment: int,
+    *,
+    rounding: str = "truncate",
 ) -> list[np.ndarray]:
     """K-points of each band-path segment, as in Fortran ``calc_bands``.
 
     ``starts``/``ends`` are the Cartesian (1/bohr) end points of every
     segment.  The shortest segment gets ``points_in_shortest_segment`` points
     and the others proportionally more, so the point density along the path is
-    constant: ``nkpt = int(length / min_length * points)`` (truncated, as in
-    the Fortran integer assignment).  A segment does not include its end
-    point -- that is the first point of the next segment -- except the last
-    segment, which gets one extra point to close the path.
+    constant.  ``rounding="truncate"`` (the default, this port's rule and that
+    of the previous Fortran tree): ``nkpt = int(length / min_length * points)``,
+    the Fortran integer assignment.  ``rounding="nint"`` (PARSEC 1.5,
+    ``utilities/calc_bands.f90:152-158``, which the parser takes where the
+    input writes ``Bandstruc_Points``): ``nint(length / min_length * points)``.
+    A segment does not include its end point -- that is the first point of the
+    next segment -- except the last segment, which gets one extra point to
+    close the path (``int(...) + 1``, or 1.5's ``nint(... + 1)``).
     """
 
+    if rounding not in ("truncate", "nint"):
+        raise ValueError("rounding must be truncate or nint")
     starts = np.asarray(starts, dtype=float)
     ends = np.asarray(ends, dtype=float)
     if starts.shape != ends.shape or starts.ndim != 2 or starts.shape[1] != 3:
@@ -226,9 +236,17 @@ def band_path_kpoints(
     segments = []
     last = starts.shape[0] - 1
     for index, (start, end, length) in enumerate(zip(starts, ends, lengths)):
-        count = int(length / shortest * points_in_shortest_segment)
+        if rounding == "truncate":
+            count = int(length / shortest * points_in_shortest_segment)
+            if index == last:
+                count += 1
+        else:
+            scaled = length / shortest * points_in_shortest_segment
+            if index == last:
+                scaled += 1.0
+            # Fortran nint: halves away from zero (the values are positive).
+            count = int(np.floor(scaled + 0.5))
         if index == last:
-            count += 1
             fractions = np.arange(count) / (count - 1) if count > 1 else np.zeros(1)
         else:
             fractions = np.arange(count) / count
@@ -260,6 +278,22 @@ def translate01(vector) -> list[float]:
             shifted = shifted + 1.0
         result.append(shifted)
     return result
+
+
+def fold_to_centered_zone(fractions) -> np.ndarray:
+    """Reciprocal-lattice coordinates folded component by component into ``(-1/2, 1/2]``.
+
+    ``f - ceil(f - 1/2)``: the representative of ``f`` modulo the reciprocal lattice with the smallest
+    components (the shortest one of an orthorhombic cell), PARSEC 1.5's intent in ``irrbz.f90:132-157``, whose
+    swap never runs (``norm2`` carries ``+ eight``).  Exactly ``1/2`` stays ``1/2`` (``-1/2`` becomes ``1/2``): a
+    component in ``[0, 1/2]`` keeps its bits, so a grid whose points all lie there is unchanged, and folding a
+    folded set changes nothing.  The finite-difference Bloch operator ``-nabla^2 - 2i k.grad + k^2`` is not
+    invariant under ``k -> k + G``; with the folded points a run without symmetry takes the k-points a symmetric
+    run reaches by rotating its representatives.
+    """
+
+    values = np.asarray(fractions, dtype=np.float64)
+    return values - np.ceil(values - 0.5)
 
 
 def _times(matrix, vector) -> list[float]:
@@ -314,8 +348,9 @@ class MonkhorstPackSampling:
     """Fortran PARSEC's Monkhorst-Pack sampling, reduced to the irreducible wedge.
 
     ``fractional`` are the representatives in reciprocal-lattice
-    coordinates, unfolded as ``irrbz`` keeps them (each is the first grid
-    point met of its star); ``k_points = B f`` are Cartesian (1/bohr, rows),
+    coordinates (each is the first grid point met of its star), folded into
+    ``(-1/2, 1/2]`` (:func:`fold_to_centered_zone`; ``irrbz`` keeps them in
+    ``[0, 1)``); ``k_points = B f`` are Cartesian (1/bohr, rows),
     the k-points of the Bloch Hamiltonians.  ``counts`` are the numbers of
     full-grid points each represents, ``weights`` the normalized weights
     ``counts/N`` (renormalized to sum one as ``init_var.F90:365-367``).
@@ -376,6 +411,7 @@ def irreducible_monkhorst_pack(
     reciprocal_rotations=None,
     *,
     time_reversal: bool = True,
+    fold: bool = True,
 ) -> MonkhorstPackSampling:
     """Translation of ``irrbz.f90`` (lines 12-213): the IBZ of a shifted MP grid.
 
@@ -389,7 +425,14 @@ def irreducible_monkhorst_pack(
     point to that representative; a point without one becomes a new
     representative, stored unfolded.  Fortran's "replace by the shortest
     member" branch is kept as written, which makes it dead (``norm2`` has
-    ``+ 8`` added): the representative is the first member met.  ``E_kin``
+    ``+ 8`` added): the representative is the first member met.  With
+    ``fold`` (the default, a decision of this port) the representatives are
+    then folded into ``(-1/2, 1/2]`` (:func:`fold_to_centered_zone`), which
+    PARSEC 1.5 intends and does not do: its k-points stay in ``[0, 1)``, so a
+    run without symmetry differs from the symmetric one through the
+    finite-difference Bloch operator (Si8, MP 2x2x2 shifted, h 0.64: 15 mRy).
+    The counts, weights, ``grid_map`` and ``E_kin`` do not depend on it;
+    ``fold=False`` gives PARSEC 1.5's set.  ``E_kin``
     of a new representative is ``|B (k' - anint(k'))|^2`` with ``k'`` the
     point rotated by the *last* operation, as the Fortran computes it.
 
@@ -475,7 +518,10 @@ def irreducible_monkhorst_pack(
             "counted (PARSEC error 241)"
         )
     fractional = np.array(kibz, dtype=np.float64)
-    k_points = np.array([_times(bvec, point) for point in kibz], dtype=np.float64)
+    if fold:
+        # the representatives themselves (the search above compares them modulo G, as irrbz does)
+        fractional = fold_to_centered_zone(fractional)
+    k_points = np.array([_times(bvec, [float(v) for v in point]) for point in fractional], dtype=np.float64)
     weights = np.array([float(count) / float(total) for count in counts], dtype=np.float64)
     norm = 0.0
     for value in weights:
@@ -495,6 +541,48 @@ def irreducible_monkhorst_pack(
     )
 
 
+def mesh_preserving_operations(group, dimensions, shift, *, tolerance: float = 1.0e-8):
+    """The operations of ``group`` whose rotation maps a Monkhorst-Pack mesh onto itself, as a ``SpaceGroup``.
+
+    The mesh point ``f = (i + s)/n`` (reciprocal-lattice coordinates) goes to ``G f`` with ``G = transpose(M)``
+    (:attr:`~parsec_python.Grid.space_group.SpaceGroup.reciprocal_rotations`), a mesh point again (modulo the
+    reciprocal lattice) when ``n (G f) - s`` is a whole vector for every ``i``: an affine function of ``i``, tested
+    on the corners of one mesh cell.  ``irrbz`` reduces any mesh by the whole group and the density average then
+    restores the star of each representative, also its members outside the mesh, the sampling of the symmetrized
+    mesh.  With the operations kept here every star lies in the mesh, so the wedge with the averaged density gives
+    the density of the full mesh (time reversal needs no such test: ``k`` and ``-k`` have the same density, and a
+    star ``-G k`` with one member in a mesh that ``G`` preserves lies in it entirely).  Returns ``group`` itself when
+    every operation is kept.
+    """
+
+    from .space_group import SYMMETRY_TOLERANCE, SpaceGroup
+
+    counts = np.asarray([int(value) for value in dimensions], dtype=np.float64)
+    offsets = np.asarray([float(value) for value in shift], dtype=np.float64)
+    corners = np.array([[a, b, c] for a in (0, 1) for b in (0, 1) for c in (0, 1)], dtype=np.float64)
+    points = (corners + offsets) / counts
+    kept = []
+    for index, rotation in enumerate(group.reciprocal_rotations):
+        target = (points @ rotation.T.astype(np.float64)) * counts - offsets
+        if np.max(np.abs(target - np.rint(target))) <= tolerance:
+            kept.append(index)
+    if len(kept) == group.order:
+        return group
+    last = group.translations[kept[-1]]
+    return SpaceGroup(
+        rotations=tuple(group.rotations[index] for index in kept),
+        translations=tuple(group.translations[index] for index in kept),
+        cartesian_rotations=tuple(group.cartesian_rotations[index] for index in kept),
+        labels=tuple(group.labels[index] for index in kept),
+        crystal_system=group.crystal_system,
+        full_holohedry=False,
+        lattice_operations=group.lattice_operations,
+        candidate_numbers=tuple(group.candidate_numbers[index] for index in kept),
+        symmorphic=not (abs(last[0]) + abs(last[1]) + abs(last[2]) > SYMMETRY_TOLERANCE),
+        ignored=group.ignored,
+    )
+
+
 def kpoint_sampling_details(problem) -> MonkhorstPackSampling | None:
     """The Fortran-path sampling of a ``SinglePointInput``, or ``None``.
 
@@ -503,13 +591,15 @@ def kpoint_sampling_details(problem) -> MonkhorstPackSampling | None:
     ``monkhorst_pack_dimensions`` with that shift, reduced by the input's
     ``space_group`` (the identity where it is ``None``, e.g. with
     ``Ignore_Symmetry``) and by time reversal unless the calculation is
-    non-collinear (``irrbz.f90:96-99``).
+    non-collinear (``irrbz.f90:96-99``).  A hybrid functional takes time
+    reversal only (its exchange operator sums over the full mesh,
+    :mod:`parsec_python.SCF.hybrid_periodic`).
     """
 
     shift = getattr(problem, "monkhorst_pack_shift", None)
     if shift is None or problem.monkhorst_pack_dimensions is None:
         return None
-    group = getattr(problem, "space_group", None)
+    group = None if _hybrid(problem) else getattr(problem, "space_group", None)
     lattice = tuple(
         tuple(float(value) for value in row)
         for row in np.asarray(problem.periodic_cell.lattice_vectors, dtype=float)
@@ -554,24 +644,66 @@ def _cached_irreducible_monkhorst_pack(lattice, dimensions, shift, rotations, ti
     return sampling
 
 
+def _hybrid(problem) -> bool:
+    return bool(getattr(getattr(problem, "scf", None), "is_hybrid", False))
+
+
+def time_reversal_reduced(k_points, weights, lattice_vectors) -> tuple[np.ndarray, np.ndarray]:
+    """The representatives of a uniform mesh of equal weights under time reversal (``k ~ -k``).
+
+    The first point of each pair is kept with twice the weight; a point with
+    ``-k = k`` modulo the reciprocal lattice of ``lattice_vectors`` keeps its
+    own.  The order of the first members is kept.
+    """
+
+    k_points = np.atleast_2d(np.asarray(k_points, dtype=float))
+    weights = np.asarray(weights, dtype=float)
+    fractions = k_points @ np.linalg.inv(reciprocal_lattice(lattice_vectors))
+    taken = np.zeros(k_points.shape[0], dtype=bool)
+    kept, kept_weights = [], []
+    for index in range(k_points.shape[0]):
+        if taken[index]:
+            continue
+        taken[index] = True
+        weight = float(weights[index])
+        total = fractions + fractions[index]
+        partners = np.flatnonzero(np.all(np.abs(total - np.round(total)) < 1.0e-8, axis=1) & ~taken)
+        if partners.size:
+            taken[partners[0]] = True
+            weight += float(weights[partners[0]])
+        kept.append(index)
+        kept_weights.append(weight)
+    return k_points[kept].copy(), np.asarray(kept_weights, dtype=float)
+
+
 def kpoint_sampling(problem) -> tuple[np.ndarray, np.ndarray] | None:
     """``(k_points, weights)`` requested by a ``SinglePointInput``, or ``None``.
 
     An explicit list (``problem.kpoints``), Fortran's reduced grid
     (``problem.monkhorst_pack_shift`` given, :func:`kpoint_sampling_details`)
     or this port's unreduced Monkhorst-Pack grid
-    (``problem.monkhorst_pack_dimensions``); ``None`` means Gamma only.
+    (``problem.monkhorst_pack_dimensions``); ``None`` means Gamma only.  For a
+    hybrid functional the port's grid and a list of equal weights are reduced
+    by time reversal (:func:`time_reversal_reduced`) and Fortran's grid by
+    time reversal only; the exchange checks that the set is a uniform mesh
+    (:mod:`parsec_python.SCF.hybrid_periodic`).
     """
 
     if getattr(problem, "kpoints", None) is not None:
-        return np.asarray(problem.kpoints, dtype=float), np.asarray(
-            problem.kpoint_weights, dtype=float
-        )
+        k_points = np.asarray(problem.kpoints, dtype=float)
+        weights = np.asarray(problem.kpoint_weights, dtype=float)
+        if _hybrid(problem) and np.allclose(weights, weights[0], rtol=1.0e-12, atol=0.0):
+            # a list of equal weights (a full mesh written out): its time-reversal representatives
+            return time_reversal_reduced(k_points, weights, problem.periodic_cell.lattice_vectors)
+        return k_points, weights
     details = kpoint_sampling_details(problem)
     if details is not None:
         return details.k_points.copy(), details.weights.copy()
     if problem.monkhorst_pack_dimensions is not None:
-        return monkhorst_pack_grid(problem.periodic_cell, problem.monkhorst_pack_dimensions)
+        k_points, weights = monkhorst_pack_grid(problem.periodic_cell, problem.monkhorst_pack_dimensions)
+        if _hybrid(problem):
+            return time_reversal_reduced(k_points, weights, problem.periodic_cell.lattice_vectors)
+        return k_points, weights
     return None
 
 
@@ -581,10 +713,13 @@ __all__ = [
     "MonkhorstPackSampling",
     "explicit_kpoints",
     "band_path_kpoints",
+    "fold_to_centered_zone",
     "irreducible_monkhorst_pack",
     "kpoint_sampling",
     "kpoint_sampling_details",
+    "mesh_preserving_operations",
     "monkhorst_pack_grid",
     "read_kpoint_file",
+    "time_reversal_reduced",
     "translate01",
 ]

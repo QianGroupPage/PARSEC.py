@@ -97,6 +97,28 @@ class NativePoissonSolver:
         self.chronological_prediction_calls = 0
         self.last_chronological_alpha: float | None = None
 
+    def adopt_history(self, history) -> None:
+        """Continue the chronological predictor from solves made elsewhere.
+
+        ``history`` lists up to two ``(right_hand_side, solution)`` pairs of
+        this operator, the older first: the device-resident chain hands its
+        own over where it gives way to this solver in the middle of a
+        calculation (``driver.py``), so that the next starting vector is
+        extrapolated as if this solver had made those solves.
+        """
+
+        pairs = [
+            (
+                np.array(rhs, dtype=np.float64, copy=True),
+                np.array(solution, dtype=np.float64, copy=True),
+            )
+            for rhs, solution in list(history)[-2:]
+        ]
+        older = pairs[0] if len(pairs) == 2 else (None, None)
+        newer = pairs[-1] if pairs else (None, None)
+        self._previous_previous_rhs, self._previous_previous_solution = older
+        self._previous_rhs, self._previous_solution = newer
+
     @property
     def negative_laplacian(self) -> sp.csr_matrix:
         """Canonical CSR operator of the backend.

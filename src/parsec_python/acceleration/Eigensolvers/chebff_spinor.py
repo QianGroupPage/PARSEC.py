@@ -36,7 +36,8 @@ import numpy as np
 
 from parsec_python.Eigensolvers.chebff import ChebFFSettings
 from parsec_python.Eigensolvers.chebyshev import subspace_filter_blocks
-from parsec_python.Eigensolvers.subspace import SubspaceSettings, _adapt_polynomial_degree
+from parsec_python.Eigensolvers.spectral_bounds import bound_request, lanczos_bound_from_ritz, lanczos_bound_steps
+from parsec_python.Eigensolvers.subspace import SubspaceSettings, _adapt_polynomial_degree, subspace_filter_bounds
 
 from ..backends.cupy import require_cupy
 
@@ -232,11 +233,15 @@ def _solve_triangular_inverse(xp, lower):
 
 
 # --------------------------------------------------------------------- primitives
-def _lanczos_upper_bound(cp, operator, dimension: int, steps: int, rng: np.random.Generator):
+def _lanczos_upper_bound(
+    cp, operator, dimension: int, steps: int, rng: np.random.Generator, *, with_middle=False, rule: str = "parsec"
+):
     """Device counterpart of
-    :func:`parsec_python.Eigensolvers.spectral_bounds.lanczos_upper_bound`."""
+    :func:`parsec_python.Eigensolvers.spectral_bounds.lanczos_upper_bound`: ``(upper, theta_min)``, with
+    ``with_middle`` also the ``middle`` of the bound (the SUBSPACE rules of PARSEC 1.5); ``rule`` the bound of
+    :func:`parsec_python.Eigensolvers.spectral_bounds.lanczos_bound_from_ritz` (``parsec`` or ``lanczos``)."""
 
-    target_steps = min(max(int(steps), 4), 8, dimension)
+    target_steps = lanczos_bound_steps(rule, int(steps), dimension)
     host_start = rng.random(dimension) + 1j * rng.random(dimension)
     local_start = host_start
     take_local = getattr(operator, "local_vector", None)
@@ -268,15 +273,45 @@ def _lanczos_upper_bound(cp, operator, dimension: int, steps: int, rng: np.rando
         actual_steps = column + 1
 
     ritz_values = np.linalg.eigvalsh(projected[:actual_steps, :actual_steps])
-    lower_bound = float(ritz_values[0])
-    spectral_radius = max(float(ritz_values[-1]), abs(lower_bound))
-    residual_scale = raw_beta
-    if residual_scale < 1.0e-2:
-        residual_scale *= 10.0
-    elif residual_scale < 1.0e-1:
-        residual_scale *= 5.0
-    upper_bound = spectral_radius + residual_scale
+    bound = lanczos_bound_from_ritz(
+        rule, ritz_values, raw_beta, steps=actual_steps, requested_steps=int(steps), breakdown=False
+    )
+    lower_bound = bound.lower_bound
+    upper_bound = bound.upper_bound
+    margin = _orbital_term_margin(operator)
+    if margin > 0.0:
+        # A meta-GGA's orbital terms (DeviceBlochOperator.kinetic): the policy of the cluster
+        # path (acceleration.Eigensolvers.spectral_bounds.with_orbital_term), max(lanczos,
+        # bare + margin), with ``bare`` the Lanczos bound of the same operator without the
+        # terms (a second short run from its own start vector; the caller's generator is
+        # left as it was).
+        holder = _term_holder(operator)
+        saved = holder.kinetic
+        holder.kinetic = None
+        try:
+            bare, _ = _lanczos_upper_bound(cp, operator, dimension, steps, np.random.default_rng(20261108), rule=rule)
+        finally:
+            holder.kinetic = saved
+        upper_bound = max(upper_bound, bare + margin)
+    if with_middle:
+        return float(upper_bound), lower_bound, float(bound.middle)
     return float(upper_bound), lower_bound
+
+
+def _term_holder(operator):
+    """The operator that holds the orbital terms behind the wrappers of the solve (``_CountingOperator``)."""
+    while "kinetic" not in vars(operator) and getattr(operator, "_operator", None) is not None:
+        operator = operator._operator
+    return operator
+
+
+def _orbital_term_margin(operator) -> float:
+    """The Gershgorin bound of a meta-GGA's orbital terms an operator holds (0 without them)."""
+    if getattr(operator, "kinetic", None) is None:
+        return 0.0
+    from parsec_python.Eigensolvers.spectral_bounds import orbital_term_margin
+
+    return orbital_term_margin(operator)
 
 
 def _chebyshev_filter(
@@ -480,9 +515,10 @@ def _first_solve(
             -1.0, 1.0, (rows, c1 - c0)
         )
     bound_rng = np.random.default_rng(settings.random_seed + 1)
+    bound_rule, bound_steps = bound_request(settings)
     with stats.timed("lanczos_seconds"):
         upper_bound, smallest_ritz = _lanczos_upper_bound(
-            xp, operator, dimension, settings.lanczos_steps, bound_rng
+            xp, operator, dimension, bound_steps, bound_rng, rule=bound_rule
         )
     # chebff.f90z: lowb = (lowb0 + (lowb0 + upperb)) / 3
     lower_bound = (2.0 * smallest_ritz + upper_bound) / 3.0
@@ -546,6 +582,15 @@ def _first_solve(
 
 
 # ----------------------------------------------------------------- later solves
+@dataclass(frozen=True)
+class _Bounds:
+    """The short-Lanczos numbers that :func:`subspace_filter_bounds` reads."""
+
+    upper_bound: float
+    lower_bound: float
+    middle: float
+
+
 def _next_filter_lower_bound(state: SpinorEigvalState) -> float:
     largest_saved_ritz = float(np.max(state.eigenvalues))
     if state.first_filter or state.filter_lower_bound is None:
@@ -557,12 +602,21 @@ def _subspace_step(xp, operator, state: SpinorEigvalState, settings: SubspaceSet
     """One later-SCF SUBSPACE update of ``state`` (see the module docstring)."""
     dimension = state.operator_dimension
     working = state.working_states
-    lower_bound = _next_filter_lower_bound(state)
     bound_rng = np.random.default_rng(settings.random_seed + state.filters_completed)
+    bound_rule, bound_steps = bound_request(settings)
     with stats.timed("lanczos_seconds"):
-        upper_bound, _ = _lanczos_upper_bound(
-            xp, operator, dimension, settings.lanczos_steps, bound_rng
+        upper_bound, smallest, middle = _lanczos_upper_bound(
+            xp, operator, dimension, bound_steps, bound_rng, with_middle=True, rule=bound_rule
         )
+    # The lower-bound rule of every SUBSPACE filter (Smart_Subspace; the default
+    # "monotone" is _next_filter_lower_bound with this upper bound).
+    lower_bound, upper_bound = subspace_filter_bounds(
+        settings.lower_bound_rule,
+        float(np.max(state.eigenvalues)),
+        state.filter_lower_bound,
+        state.first_filter,
+        _Bounds(upper_bound, smallest, middle),
+    )
     degree = _adapt_polynomial_degree(settings.polynomial_degree, lower_bound, upper_bound)
     blocks = subspace_filter_blocks(working, settings.block_size, degree, settings.degree_delta)
 

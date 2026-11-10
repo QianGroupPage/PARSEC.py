@@ -60,6 +60,7 @@ def load_pseudopotentials(
     specifications: Mapping[str, SpeciesPotential],
     *,
     xc_functional: str = "ca",
+    check_correlation: bool = True,
 ) -> dict[str, ParsecPseudopotential]:
     """Read and validate one PARSEC pseudopotential per chemical species.
 
@@ -72,9 +73,10 @@ def load_pseudopotentials(
       the matching p/d spin-orbit channels (without ``SO_PSP`` only the scalar
       components of a relativistic file are used); and
     * the pseudopotential was generated for the selected XC family.  A file
-      of another functional is refused for CA and PBE; for the other
-      functionals it is used with a ``UserWarning``, as ``pseudo.f90``
-      (lines 383-394) only warns.
+      of another functional is refused for CA and PBE, but for a CA file in a
+      PBE run; for that one and for the other functionals it is used with a
+      ``UserWarning``, as ``pseudo.f90`` (lines 383-394; PARSEC 1.5
+      ``io/pseudo.f90:482-492``) only warns.
 
     A file's spin-orbit channels (if present) are always parsed into
     :attr:`~parsec_python.Pseudopotential.ParsecPseudopotential.spin_orbit_channel_potentials`
@@ -89,9 +91,22 @@ def load_pseudopotentials(
     valence/core densities, and the ionic valence charge ``Z_ion``.
     Checking the correlation label validates how the file was generated; this
     function does not itself evaluate an exchange-correlation functional.
+    A hybrid functional reads the files of its semilocal family
+    (:func:`hybrid_pseudopotential_labels`: PBE, for B3PW91 also PW91): a CA
+    file is used with a warning, as in a PBE run, any other is refused.
+    ``check_correlation=False`` reads the files without that check (the input
+    reader makes it itself, to refuse by name before the run).
+    A libxc functional (``libxc:...``) reads the files of its family: CA/LDA
+    files for an LDA, PBE files for everything else
+    (:func:`parsec_python.V_xc.libxc.libxc_pseudopotential_functional`); a
+    file of another label is used with a warning.
     """
+    from ..V_xc.libxc import is_libxc_functional
+
+    libxc = is_libxc_functional(xc_functional)
     result: dict[str, ParsecPseudopotential] = {}
-    requested = xc_functional.strip().lower()
+    hybrid_labels = hybrid_pseudopotential_labels(xc_functional.strip().lower())
+    requested = pseudopotential_functional(xc_functional.strip().lower())
     if requested not in _REQUIRED_PSEUDOPOTENTIAL_LABELS and (
         requested not in _EXPECTED_PSEUDOPOTENTIAL_LABELS
     ):
@@ -165,8 +180,36 @@ def load_pseudopotentials(
                 f"does not contain spin-orbit potentials (relativity="
                 f"{potential.relativity!r})"
             )
-        if not pseudopotential_matches_functional(potential, requested):
-            if requested in _REQUIRED_PSEUDOPOTENTIAL_LABELS:
+        if not check_correlation:
+            pass
+        elif hybrid_labels is not None:
+            if not pseudopotential_matches_functional(potential, xc_functional.strip().lower()):
+                label = potential.correlation.strip().lower()
+                if label not in _CA_LABELS:
+                    raise ValueError(hybrid_pseudopotential_refusal(
+                        symbol, specification.path, label, xc_functional.strip().lower()
+                    ))
+                warnings.warn(
+                    f"{specification.path} was generated for {potential.correlation!r}, not for "
+                    f"{hybrid_pseudopotential_family(xc_functional.strip().lower())}, the "
+                    f"pseudopotentials of the hybrid {xc_functional}; it is used, as a PBE run uses it",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        elif not pseudopotential_matches_functional(potential, requested):
+            if libxc:
+                warnings.warn(
+                    f"{specification.path} was generated for {potential.correlation!r}, not for "
+                    f"{requested.upper()}, the pseudopotentials of the libxc functional {xc_functional}; "
+                    "it is used",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                result[symbol] = potential
+                continue
+            if requested in _REQUIRED_PSEUDOPOTENTIAL_LABELS and not (
+                requested == "pbe" and potential.correlation.strip().lower() in _CA_LABELS
+            ):
                 raise ValueError(
                     f"{specification.path} was generated for {potential.correlation!r}, "
                     f"not the requested {requested.upper()} functional"
@@ -200,11 +243,15 @@ def cluster_centering_shift(
 
 
 # The correlation labels a pseudopotential file must carry for the CA and
-# PBE functionals: any other label is refused.
+# PBE functionals: any other label is refused, but for a CA file in a PBE
+# run, which pseudo.f90 (PARSEC 1.5, io/pseudo.f90:482-492) only warns about,
+# as for every other pair: the twelve GGA inputs of 1.5's Tier_xc tests are
+# such runs.
 _REQUIRED_PSEUDOPOTENTIAL_LABELS = {
     "ca": frozenset({"ca", "pz", "lda"}),
     "pbe": frozenset({"pb", "pbe"}),
 }
+_CA_LABELS = _REQUIRED_PSEUDOPOTENTIAL_LABELS["ca"]
 # For the other functionals pseudo.f90 (lines 383-394) only warns when the
 # label of the file differs from the two-letter code of the functional.
 _EXPECTED_PSEUDOPOTENTIAL_LABELS = {
@@ -218,6 +265,66 @@ _EXPECTED_PSEUDOPOTENTIAL_LABELS = {
 }
 
 
+def pseudopotential_functional(xc_functional: str) -> str:
+    """The functional whose pseudopotentials a calculation reads.
+
+    A hybrid functional (``parsec_python.SCF.hybrid``) reads PBE
+    pseudopotentials, as Quantum ESPRESSO's hybrid runs usually do: there are
+    no hybrid norm-conserving pseudopotentials in the libraries of this code
+    (B3PW91 also takes PW91 files, :func:`hybrid_pseudopotential_labels`).
+    A meta-GGA of this package (``parsec_python.V_xc.meta_gga``) reads PBE
+    pseudopotentials too, as its plane-wave references do.  A libxc
+    functional reads CA files (an LDA) or PBE files (the others).  Every
+    other functional reads its own.
+    """
+
+    from ..models import HYBRID_XC_FUNCTIONALS, META_GGA_XC_FUNCTIONALS
+    from ..V_xc.libxc import is_libxc_functional, libxc_pseudopotential_functional
+
+    if is_libxc_functional(xc_functional):
+        return libxc_pseudopotential_functional(xc_functional)
+    if xc_functional in HYBRID_XC_FUNCTIONALS or xc_functional in META_GGA_XC_FUNCTIONALS:
+        return "pbe"
+    return xc_functional
+
+
+#: The correlation labels of the files each hybrid reads beyond PBE's: its semilocal family.
+_HYBRID_EXTRA_LABELS = {"b3pw91": frozenset({"pw", "pw91", "pwgga"})}
+
+
+def hybrid_pseudopotential_labels(xc_functional: str) -> frozenset | None:
+    """The correlation labels of the pseudopotentials a hybrid reads, ``None`` for another functional.
+
+    PBE files (``pb``, ``pbe``) for every hybrid; B3PW91 also PW91 files
+    (``pw``, ``pw91``, ``pwgga``), the semilocal parent of its correlation.
+    A CA file is used with a warning (as in a PBE run); any other label is
+    refused, by the input reader before the run.
+    """
+
+    from ..models import HYBRID_XC_FUNCTIONALS
+
+    if xc_functional not in HYBRID_XC_FUNCTIONALS:
+        return None
+    return _REQUIRED_PSEUDOPOTENTIAL_LABELS["pbe"] | _HYBRID_EXTRA_LABELS.get(xc_functional, frozenset())
+
+
+def hybrid_pseudopotential_family(xc_functional: str) -> str:
+    """Name of the pseudopotentials a hybrid reads (``"PBE"`` or ``"PBE or PW91"``)."""
+
+    return "PBE or PW91" if xc_functional in _HYBRID_EXTRA_LABELS else "PBE"
+
+
+def hybrid_pseudopotential_refusal(symbol: str, path, label: str, xc_functional: str) -> str:
+    """The message that refuses a file of another functional under a hybrid."""
+
+    labels = ", ".join(sorted(hybrid_pseudopotential_labels(xc_functional) or ()))
+    return (
+        f"Atom_Type {symbol}: {path} was generated for {label!r}; a {xc_functional} run reads "
+        f"{hybrid_pseudopotential_family(xc_functional)} pseudopotentials (labels {labels}; a CA "
+        "file is used with a warning)"
+    )
+
+
 def pseudopotential_matches_functional(
     potential: ParsecPseudopotential, xc_functional: str
 ) -> bool:
@@ -226,9 +333,12 @@ def pseudopotential_matches_functional(
     An old Martins file names no functional and matches every one.
     """
 
-    labels = _REQUIRED_PSEUDOPOTENTIAL_LABELS.get(
-        xc_functional, _EXPECTED_PSEUDOPOTENTIAL_LABELS.get(xc_functional)
-    )
+    labels = hybrid_pseudopotential_labels(xc_functional)
+    if labels is None:
+        xc_functional = pseudopotential_functional(xc_functional)
+        labels = _REQUIRED_PSEUDOPOTENTIAL_LABELS.get(
+            xc_functional, _EXPECTED_PSEUDOPOTENTIAL_LABELS.get(xc_functional)
+        )
     if labels is None:
         raise ValueError(f"unsupported XC functional {xc_functional!r}")
     correlation = getattr(potential, "correlation", None)
@@ -253,12 +363,19 @@ def center_cluster_geometry(atoms: Sequence[Atom], threshold: float = 0.1) -> tu
     The operation is separate from grid construction so callers can retain
     absolute coordinates when desired.  It performs only the translation;
     the caller decides whether recentering is enabled for a calculation.
+    Every other field of an atom is kept: the initial moment of a
+    non-collinear run (``Initial_NCL_Moment``) was lost here before
+    2026-11-05, so that an off-centre cluster started without its moments
+    (Au2+ 0.19 bohr off the origin, two SCF steps with FF_MaxIter 4: then
+    |m| = 0, with the moments kept |m| = 2.35).
     """
     positions = np.asarray([atom.position for atom in atoms], dtype=float)
     shift = 0.5 * (positions.min(axis=0) + positions.max(axis=0))
     if np.linalg.norm(shift) <= threshold:
         return tuple(atoms)
-    return tuple(Atom(atom.symbol, atom.position - shift) for atom in atoms)
+    return tuple(
+        replace(atom, position=np.asarray(atom.position, dtype=float) - shift) for atom in atoms
+    )
 
 
 def center_slab_geometry(
@@ -375,11 +492,88 @@ def atomic_density_support_radius(
     return float(min(potential.radii[index], potential.interpolation_cutoff))
 
 
+#: ``|r V + 2 Z| <= COULOMB_ROUND_OFF_TOLERANCE x 2 Z``: the table is the Coulomb tail to round-off from there on (the
+#: POTRE files), the rule of :func:`parsec_python.acceleration.V_ion.periodic_device.coulomb_radius` and of
+#: :func:`_coulomb_to_round_off`, which must stay equal for the POTRE tables to keep their radii.
+COULOMB_ROUND_OFF_TOLERANCE = 1.0e-15
+
+#: The Coulomb tail of a table written with fewer digits (:func:`coulomb_tail_radius`): ``|r V + 2 Z|`` within this
+#: multiple of its largest value over the outer half of the table, and never below ``_COULOMB_TAIL_PRECISION 2 Z``;
+#: a table whose outer half deviates by more than ``_COULOMB_TAIL_NOISE_LIMIT 2 Z`` has no Coulomb tail.
+_COULOMB_TAIL_NOISE_FACTOR = 10.0
+_COULOMB_TAIL_PRECISION = 1.0e-10
+_COULOMB_TAIL_NOISE_LIMIT = 1.0e-6
+
+
+def coulomb_tail_radius(potential: ParsecPseudopotential, local_l: int) -> float | None:
+    """Radius from which ``r V_loc`` is ``-2 Z`` to the precision of its file, or ``None`` (bohr).
+
+    For the tables whose ``r V`` never reaches ``-2 Z`` to the last bit: the FHIPP files of FHI98PP carry
+    ``|r V + 2 Z| / 2 Z`` of 1e-13 to 1e-11 out to the end of the table (406 files of ``src/pp_generation/NCPPs``),
+    the MARTINS_OLD and MARTINS_WANG files of the tree 5e-10 and 5e-8; the POTRE files are ``-2 Z`` to round-off
+    (4e-15) beyond their core and never need this.  With the noise floor ``f = max |r V + 2 Z|`` over the outer half
+    of the table (``r >= rs(ns)/2``, beyond any pseudopotential core), the tail starts at the sample after the last
+    one with ``|r V + 2 Z| > max(10 f, 1e-10 x 2 Z)``: from 1.3 bohr (H) to 14 bohr (Cs) for the FHIPP files of the
+    library, 6.1 bohr for its silicon.  Beyond it a periodic image adds
+    to the Ewald split of the local potential only ``-2 Z erfc(eta r)/r`` and the noise of the file (below
+    ``1e-9/r`` Ry per image for the FHIPP files), and, for a ``Cubic_Spline`` species, the error of the spline of
+    ``V`` between the samples of ``-2 Z/r``, which grows to 1e-5 Ry near the end of the table and must not be summed
+    over the images.  ``None`` where the outer half deviates by more than ``1e-6 x 2 Z`` (no Coulomb tail, such as
+    ``examples/h2_full_nonlocal/H_POTRE.DAT``: 4.6e-5 x 2 Z) or no sample settles: the callers then sum to the end
+    of the table, the deviation being part of the potential, and :func:`warn_spline_without_coulomb_tail` warns
+    that a ``Cubic_Spline`` species adds the spline error of that tail too.
+    """
+
+    radii = np.asarray(potential.radii, dtype=float)
+    two_z = 2.0 * float(potential.ionic_charge)
+    deviation = np.abs(radii * np.asarray(potential.channel_potentials[local_l], dtype=float) + two_z)
+    scale = max(two_z, 1.0)
+    floor = float(np.max(deviation[radii >= 0.5 * radii[-1]], initial=0.0))
+    if floor > _COULOMB_TAIL_NOISE_LIMIT * scale:
+        return None
+    tolerance = max(_COULOMB_TAIL_NOISE_FACTOR * floor, _COULOMB_TAIL_PRECISION * scale)
+    significant = np.flatnonzero(deviation > tolerance)
+    if significant.size == 0:
+        return float(radii[0])
+    following = int(significant[-1]) + 1
+    if following >= radii.size - 1:
+        return None
+    return float(radii[following])
+
+
+def warn_spline_without_coulomb_tail(potential: ParsecPseudopotential, local_l: int, reach: float) -> None:
+    """Warn where the periodic sum of a ``Cubic_Spline`` local potential reaches the end of its table.
+
+    A table that is not ``-2 Z/r`` at its end (:func:`coulomb_tail_radius` is ``None``) is summed over the images out
+    to ``rs(ns-1)``, where the cubic spline of ``V`` misses ``-2 Z/r`` by up to 1e-5 Ry: the error enters every image
+    (for a silicon crystal 0.05 Ry in the mean potential).  The linear interpolation of ``r V`` has no such error.
+    A table with a Coulomb tail is silent even where the erfc reach passes its end (beyond it the sums take
+    ``-2 Z/r`` itself).
+    """
+
+    if reach < float(potential.interpolation_cutoff):
+        return
+    if _coulomb_to_round_off(potential, local_l) or coulomb_tail_radius(potential, local_l) is not None:
+        return
+    import warnings
+
+    warnings.warn(
+        f"{potential.symbol}: the local potential (l={local_l}) of {getattr(potential, 'source', 'its file')} is not "
+        f"-2Z/r at the end of its table, so its periodic images are summed out to {reach:.1f} bohr, where the cubic "
+        "spline of Cubic_Spline: .true. adds its interpolation error (up to 1e-5 Ry per image); Cubic_Spline: .false. "
+        "interpolates r V linearly without it",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 def coulomb_onset_radius(potential: ParsecPseudopotential, local_l: int) -> float:
     """Radius beyond which the local potential table is ``-2 Z/r`` to ``1e-14`` Ry (2 to 7 bohr for the tables in use).
 
     Beyond it a periodic image of the atom adds, to the Ewald split of the local potential, only the short-ranged
-    ``-2 Z erfc(eta r)/r``; the tables themselves run to 118 bohr or more.
+    ``-2 Z erfc(eta r)/r``; the tables themselves run to 118 bohr or more.  A table whose ``r V`` is ``-2 Z`` only to
+    the digits of its file (FHIPP, MARTINS_OLD, MARTINS_WANG; not to ``1e-15`` relative) meets ``1e-14`` Ry late
+    (25 bohr for a FHIPP silicon) or never: it takes :func:`coulomb_tail_radius` where that is smaller.
     """
 
     radii = np.asarray(potential.radii, dtype=float)
@@ -387,7 +581,26 @@ def coulomb_onset_radius(potential: ParsecPseudopotential, local_l: int) -> floa
     significant = np.flatnonzero(deviation > _COULOMB_ONSET_TOLERANCE)
     if significant.size == 0:
         return float(radii[1])
-    return float(min(radii[min(int(significant[-1]) + 1, radii.size - 1)], potential.interpolation_cutoff))
+    onset = float(min(radii[min(int(significant[-1]) + 1, radii.size - 1)], potential.interpolation_cutoff))
+    if not _coulomb_to_round_off(potential, local_l):
+        tail = coulomb_tail_radius(potential, local_l)
+        if tail is not None:
+            return min(onset, tail)
+    return onset
+
+
+def _coulomb_to_round_off(potential: ParsecPseudopotential, local_l: int) -> bool:
+    """Whether ``|r V + 2 Z| <= 1e-15 x 2 Z`` from a radius below ``rs(ns-1)`` on (the POTRE files): the rule of
+    :func:`parsec_python.acceleration.V_ion.periodic_device.coulomb_radius` settles inside the table."""
+
+    radii = np.asarray(potential.radii, dtype=float)
+    two_z = 2.0 * float(potential.ionic_charge)
+    deviation = np.abs(radii * np.asarray(potential.channel_potentials[local_l], dtype=float) + two_z)
+    deviating = np.flatnonzero(deviation > COULOMB_ROUND_OFF_TOLERANCE * max(two_z, 1.0))
+    if deviating.size == 0:
+        return True
+    following = int(deviating[-1]) + 1
+    return following < radii.size and float(radii[following]) < potential.interpolation_cutoff
 
 
 def superpose_atomic_density(
@@ -647,9 +860,16 @@ def ion_ion_energy(
     return float(energy)
 
 
+PROJECTOR_CENTER_ROUND_OFF = 1.0e-6
+"""Bohr: a projector's grid point closer than this (and than the first radial knot) to its atom is the center,
+the clamp of the nonlocal forces (``Forces.periodic.ROUND_OFF_DISTANCE``)."""
+
+
 def real_spherical_harmonics(
     angular_momentum: int,
     relative_coordinates: np.ndarray,
+    *,
+    center_radius: float = 0.0,
 ) -> np.ndarray:
     """Evaluate a real orthonormal spherical-harmonic basis through ``l=3``.
 
@@ -664,6 +884,15 @@ def real_spherical_harmonics(
     the stable zero-limit convention for regular ``l>0`` channels, while
     ``Y_00`` is direction independent.
 
+    ``center_radius`` (bohr, default 0): the cosines are ``x/max(r, c)``, so a
+    point within ``c`` of the center goes continuously to that limit.  The
+    projectors pass the radius their radial table is clamped to, as the forces
+    do (:data:`parsec_python.Forces.periodic.ROUND_OFF_DISTANCE`): a grid point
+    on an atom up to round-off (``1e-16`` to ``1e-12`` bohr) otherwise takes the
+    random direction of its round-off, which breaks the symmetry of the
+    operator (diamond with atoms on the points of its grid: ``2e-4`` of
+    ``V_NL`` under a two-fold axis).
+
     Columns span the complete channel.  Orthogonal rotations, permutations,
     or sign changes within that channel leave
     ``sum_mu |beta_l,mu><beta_l,mu|`` unchanged, which is why the precise real
@@ -675,7 +904,7 @@ def real_spherical_harmonics(
     radius = np.linalg.norm(xyz, axis=1)
     unit = np.zeros_like(xyz)
     nonzero = radius > 0
-    unit[nonzero] = xyz[nonzero] / radius[nonzero, None]
+    unit[nonzero] = xyz[nonzero] / np.maximum(radius[nonzero], float(center_radius))[:, None]
     x, y, z = unit.T
 
     # l=0: s-like constant harmonic Y_00 = 1/sqrt(4*pi).
@@ -911,6 +1140,34 @@ def _image_translations(
     return _periodic_image_translations(lattice_vectors, radius)
 
 
+def _fractional_extent(grid, lattice_vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """``(inverse, lowest, highest, widths)``: the inverse lattice, the range of the fractional coordinates of the
+    grid points along each lattice vector and ``|inverse[:, m]|``, the fractional width of one bohr along it."""
+
+    inverse = np.linalg.inv(np.asarray(lattice_vectors, dtype=float))
+    fractional = np.asarray(grid.coordinates) @ inverse
+    return inverse, fractional.min(axis=0), fractional.max(axis=0), np.linalg.norm(inverse, axis=0)
+
+
+def _reaching_translations(extent, position: np.ndarray, radius: float, translations: np.ndarray) -> np.ndarray:
+    """The translations whose ball of ``radius`` around ``position + T`` can hold a grid point (bohr).
+
+    A point ``p`` within ``radius`` of a centre ``c`` has ``|f_m(p) - f_m(c)| <= radius |inverse[:, m]|`` along every
+    lattice vector (``f = x @ inverse``), so a centre whose interval misses the fractional range of the grid holds
+    none: the support finder would return no rows for it.  The test keeps a margin of 1e-9 for round-off; the
+    images it keeps are searched as before, in their order.
+    """
+
+    inverse, lowest, highest, widths = extent
+    if len(translations) <= 1:
+        return translations
+    centres = (np.asarray(position, dtype=float) + translations) @ inverse
+    margin = 1.0e-9 * (1.0 + np.abs(centres))
+    half = radius * widths
+    keep = np.all((centres + half + margin >= lowest) & (centres - half - margin <= highest), axis=1)
+    return translations[keep]
+
+
 def build_nonlocal_projectors(
     grid: RealSpaceGrid,
     atoms: Sequence[Atom],
@@ -989,6 +1246,14 @@ def build_nonlocal_projectors(
     # Convert a continuous projector beta(r_i) into the Euclidean grid vector
     # b_i=sqrt(dV_grid)*beta(r_i).
     sqrt_dv = np.sqrt(grid.volume_element)
+    # the images of a bulk cell whose support ball can hold a grid point (_reaching_translations)
+    extent = (
+        _fractional_extent(grid, lattice_vectors)
+        if lattice_vectors is not None and periodic_dimensions == 3 and not getattr(grid, "is_confined_periodic", False)
+        else None
+    )
+    # one radial table (and spline) per species and channel, shared by its atoms and their images
+    channels: dict[tuple[str, int], tuple[np.ndarray, float, ParsecRadialSpline | None]] = {}
 
     for atom_index, atom in enumerate(atoms):
         potential = potentials[atom.symbol]
@@ -1002,6 +1267,8 @@ def build_nonlocal_projectors(
             translations = _periodic_image_translations(lattice_vectors, support_radius, periodic_dimensions)
         else:
             translations = _image_translations(grid, lattice_vectors, position, support_radius)
+        if extent is not None:
+            translations = _reaching_translations(extent, position, support_radius, translations)
 
         # KB projectors are localized.  Restrict all following interpolation
         # and harmonic work to grid points within their radial support.
@@ -1036,9 +1303,23 @@ def build_nonlocal_projectors(
 
             # radial_projector returns DeltaV_l*u_l/r/sqrt(|D_l|) together
             # with sign(D_l), which is applied by NonlocalProjectorOperator.
-            radial_grid, denominator_sign = potential.radial_projector(
-                angular_momentum, local_l
-            )
+            key = (atom.symbol, angular_momentum)
+            if key not in channels:
+                radial_grid, denominator_sign = potential.radial_projector(
+                    angular_momentum, local_l
+                )
+                channels[key] = (
+                    radial_grid,
+                    denominator_sign,
+                    ParsecRadialSpline.from_positive_grid(
+                        potential.radii,
+                        radial_grid,
+                        grid.settings.stencil_half_width,
+                    )
+                    if specifications[atom.symbol].use_spline
+                    else None,
+                )
+            radial_grid, denominator_sign, radial_spline = channels[key]
             # One column per real harmonic (2*l+1 of them), shared by every
             # image below: a periodic projector is one function per (atom,
             # l, m), not one per image, so images accumulate into the same
@@ -1053,12 +1334,7 @@ def build_nonlocal_projectors(
                 labels.append((atom_index, angular_momentum, harmonic_index))
 
             for support_rows, relative_support, radius_support, phase in images:
-                if specifications[atom.symbol].use_spline:
-                    radial_spline = ParsecRadialSpline.from_positive_grid(
-                        potential.radii,
-                        radial_grid,
-                        grid.settings.stencil_half_width,
-                    )
+                if radial_spline is not None:
                     # ``nonloc.F90`` clamps the radial interpolation coordinate
                     # to the first positive POTRE radius.  Angular harmonics
                     # still use the actual atom-image-grid displacement below.
@@ -1077,8 +1353,12 @@ def build_nonlocal_projectors(
 
                 # The same normalized radial function is paired with every one
                 # of the 2*l+1 real harmonics in this angular-momentum channel.
+                # A grid point on the atom up to round-off takes the center's
+                # zero-limit direction (the radial value is clamped there too).
                 harmonics = real_spherical_harmonics(
-                    angular_momentum, relative_support
+                    angular_momentum,
+                    relative_support,
+                    center_radius=min(float(potential.radii[0]), PROJECTOR_CENTER_ROUND_OFF),
                 )
                 for harmonic_index, target_column in enumerate(channel_columns):
                     projector = phase * (sqrt_dv * radial * harmonics[:, harmonic_index])

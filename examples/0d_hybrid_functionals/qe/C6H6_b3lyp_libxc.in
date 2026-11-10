@@ -1,0 +1,47 @@
+ &control
+    calculation = 'scf'
+    prefix = 'C6H6_b3lyp_libxc_L32_e120'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 32.000000
+    nat = 12
+    ntyp = 2
+    ecutwfc = 120.0
+    assume_isolated = 'mt'
+    nbnd = 17
+    occupations = 'fixed'
+    input_dft = 'XC-000I-000I-402L-000I-000I-000I'
+    nqx1 = 1
+    nqx2 = 1
+    nqx3 = 1
+    x_gamma_extrapolation = .false.
+    exxdiv_treatment = 'vcut_spherical'
+    ecutfock = 240.0
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ H 1.008 h_pbe_tm.UPF
+ C 12.011 c_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ C 18.6399473961 16.0000000000 16.0000000000
+ C 17.3199736981 18.2862615097 16.0000000000
+ C 14.6800263019 18.2862615097 16.0000000000
+ C 13.3600526039 16.0000000000 16.0000000000
+ C 14.6800263019 13.7137384903 16.0000000000
+ C 17.3199736981 13.7137384903 16.0000000000
+ H 20.6884105152 16.0000000000 16.0000000000
+ H 18.3442052576 20.0602826095 16.0000000000
+ H 13.6557947424 20.0602826095 16.0000000000
+ H 11.3115894848 16.0000000000 16.0000000000
+ H 13.6557947424 11.9397173905 16.0000000000
+ H 18.3442052576 11.9397173905 16.0000000000
+K_POINTS gamma

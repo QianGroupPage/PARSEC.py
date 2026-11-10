@@ -1,0 +1,36 @@
+ &control
+    calculation = 'scf'
+    prefix = 'H2_hse06_libxc_L28_e150'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 28.000000
+    nat = 2
+    ntyp = 1
+    ecutwfc = 150.0
+    assume_isolated = 'mt'
+    nbnd = 5
+    occupations = 'fixed'
+    input_dft = 'XC-000I-000I-428L-000I-000I-000I'
+    nqx1 = 1
+    nqx2 = 1
+    nqx3 = 1
+    x_gamma_extrapolation = .false.
+    exxdiv_treatment = 'gygi-baldereschi'
+    ecutfock = 300.0
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ H 1.008 h_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ H 14.0000000000 14.0000000000 14.7005214744
+ H 14.0000000000 14.0000000000 13.2994785256
+K_POINTS gamma

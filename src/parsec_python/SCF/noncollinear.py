@@ -464,7 +464,7 @@ def _run_noncollinear(
             input_potential = mixed[:n_grid]
             input_field = mixed[n_grid:].reshape(3, n_grid)
             if (
-                iteration > 5
+                iteration > settings.degree_decrease_after
                 and metrics.weighted < settings.approach_criterion
                 and filter_degree > minimum_filter_degree
             ):

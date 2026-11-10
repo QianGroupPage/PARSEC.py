@@ -33,10 +33,16 @@ What this module leaves out, and why:
   periodic consumer reads it: the local potential of a periodic system is
   made in reciprocal space from the transform of the unfiltered table
   (``pbc%vloc``), so the local potential stays unfiltered here as well.
-* The radial derivatives (``drhodr``, ``dvion``, ``ddenc``, and ``dvw``,
-  which ``fourier_f.f90`` sets to the filtered projector itself, calling
-  ``fint`` for ``dfint``) feed the forces only, and forces of periodic
-  systems are not implemented.
+* Of the radial derivatives ``fourier_f.f90`` replaces (``drhodr``,
+  ``dvion``, ``ddenc``, ``dvw``), only ``dvw`` has a reader here: the
+  tabulated projector slopes of the nonlocal forces (wire and slab forces,
+  and the opt-in ``PARSEC_PERIODIC_FORCE_SLOPES=tabulated`` of bulk forces).
+  It is ``dfint``, the radial derivative of the filtered projector
+  (:func:`filtered_derivative`), as in PARSEC 1.5 (``math/fourier_f.f90:267``);
+  the previous tree called ``fint`` there and stored the filtered projector
+  itself as its slope.  The default bulk forces differentiate the
+  interpolant of the filtered projector instead, and the local and core
+  forces of periodic systems do not read ``dvion``/``drhodr``/``ddenc``.
 """
 
 from __future__ import annotations
@@ -176,6 +182,37 @@ def filtered_function(
     return (bessel @ weights) * DELTA_Q * 2.0 / 5.0 / 9.0
 
 
+def filtered_derivative(
+    radii: np.ndarray,
+    transform: np.ndarray,
+    order: int,
+    spacing: float,
+    alpha: float,
+    beta1: float,
+) -> np.ndarray:
+    """``dfint`` of PARSEC 1.5 (``math/auxiliary.F90:2569-2630``) at ``radii``.
+
+    The radial derivative of :func:`filtered_function`: the Bessel factor
+    ``j_l(q r)`` becomes ``q j_l'(q r)`` with
+    ``j_l'(x) = l j_l(x)/x - j_(l+1)(x)``, the same filter and weights, and
+    the ``q = 0`` term left out (``ii = 2, ...`` there).  ``radii`` must be
+    positive (the file radii; ``fourier_f.f90`` sets ``dvw = 0`` at the
+    padded origin).
+    """
+
+    count = transform.size
+    q = DELTA_Q * np.arange(count, dtype=np.float64)
+    weights = filter_weights(count, spacing, alpha, beta1) * transform * q
+    weights[:1] = 0.0
+    argument = np.outer(np.asarray(radii, dtype=np.float64), q)
+    safe = np.where(argument == 0.0, 1.0, argument)
+    slope = order * spherical_bessel(order, argument) / safe - spherical_bessel(
+        order + 1, argument
+    )
+    slope[:, :1] = 0.0
+    return (slope @ weights) * DELTA_Q * 2.0 / 5.0 / 9.0
+
+
 def apply_fourier_filter(
     potential: ParsecPseudopotential,
     local_l: int,
@@ -229,6 +266,7 @@ def apply_fourier_filter(
             radii, transform, 0, spacing, alpha, beta1
         )
         projectors: dict[int, np.ndarray] = {}
+        slopes: dict[int, np.ndarray] = {}
         for angular_momentum in sorted(potential.radial_wavefunctions):
             if angular_momentum == local_l:
                 continue
@@ -237,7 +275,11 @@ def apply_fourier_filter(
             projectors[angular_momentum] = filtered_function(
                 radii, transform, angular_momentum, spacing, alpha, beta1
             )
+            slopes[angular_momentum] = filtered_derivative(
+                radii, transform, angular_momentum, spacing, alpha, beta1
+            )
         changes["filtered_projectors"] = projectors
+        changes["filtered_projector_slopes"] = slopes
     if core > 0.0 and potential.has_nonlinear_core_correction:
         transform = fourier_transform(potential, potential.core_density, 0, count)
         changes["core_density"] = filtered_function(
@@ -250,6 +292,7 @@ __all__ = [
     "DELTA_Q",
     "apply_fourier_filter",
     "filter_weights",
+    "filtered_derivative",
     "filtered_function",
     "fourier_transform",
     "reciprocal_mesh_size",

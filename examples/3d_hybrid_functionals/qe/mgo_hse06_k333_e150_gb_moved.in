@@ -1,0 +1,41 @@
+ &control
+    calculation = 'scf'
+    prefix = 'mgo_hse06_k333_e150_gb_moved'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 0
+    nat = 2
+    ntyp = 2
+    ecutwfc = 150.0
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'hse'
+    nqx1 = 3
+    nqx2 = 3
+    nqx3 = 3
+    x_gamma_extrapolation = .false.
+    exxdiv_treatment = 'gygi-baldereschi'
+    ecutfock = 300.0
+    screening_parameter = 0.11
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ Mg 24.305 mg_pbe_tm.UPF
+ O 15.999 o_pbe_tm.UPF
+CELL_PARAMETERS bohr
+ 0.0000000000 3.9800000000 3.9800000000
+ 3.9800000000 0.0000000000 3.9800000000
+ 3.9800000000 3.9800000000 0.0000000000
+ATOMIC_POSITIONS bohr
+ Mg 0.0000000000 0.0221111111 0.0221111111
+ O 3.9800000000 0.0221111111 0.0221111111
+K_POINTS automatic
+ 3 3 3 0 0 0

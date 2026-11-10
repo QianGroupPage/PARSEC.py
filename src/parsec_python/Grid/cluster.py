@@ -87,11 +87,33 @@ def _inside_domain(settings: GridSettings, coordinates: np.ndarray) -> np.ndarra
     return np.all(np.abs(coordinates) <= 0.5 * lengths + 1.0e-14, axis=1)
 
 
+def _fold_block_points(integer_coordinates: np.ndarray, side: int) -> np.ndarray:
+    """Every point of the blocks of ``side**3`` points that hold one of ``integer_coordinates``.
+
+    PARSEC 1.5 (``grid_partition.f90:531-607``): a block enters the domain whole when any of its points lies
+    inside the shape.  Its blocks start at the lower corner of the padded box ``bbox_pad`` and run in steps of
+    ``side``; for a cluster that corner is made even (``grid_partition.f90:258-320``), so the blocks of side 2
+    are ``[2m, 2m + 1]`` along every axis.  The points come in the order of :func:`build_cluster_grid`: x, then
+    y, then z, each from its largest index to its smallest.
+    """
+
+    blocks = np.unique(np.floor_divide(integer_coordinates, side), axis=0)
+    corner = np.arange(side)
+    offsets = np.stack(np.meshgrid(corner, corner, corner, indexing="ij"), axis=-1).reshape(-1, 3)
+    points = (blocks[:, None, :] * side + offsets[None, :, :]).reshape(-1, 3)
+    order = np.lexsort((-points[:, 2], -points[:, 1], -points[:, 0]))
+    return points[order]
+
+
 def build_cluster_grid(settings: GridSettings) -> RealSpaceGrid:
     """Build the full active cluster domain without symmetry reduction.
 
     PARSEC uses ``n = floor(2*radius/h) + 2`` for a confined system, integer
     bounds ``[-n/2, n-n/2-1]``, and positions ``h*(integer + shift)``.
+
+    ``settings.foldblock_side_length`` 2 (PARSEC 1.5's ``Foldblock_Side_Length``) fills the domain up to whole
+    blocks of 2 x 2 x 2 points (:func:`_fold_block_points`); a block may reach one index beyond the bounds, which
+    then grow by one on each side.
     """
     n = int(np.floor(2.0 * settings.enclosing_radius / settings.spacing)) + 2
     index_min = np.full(3, -(n // 2), dtype=int)
@@ -105,7 +127,15 @@ def build_cluster_grid(settings: GridSettings) -> RealSpaceGrid:
     integer_coordinates = integer_coordinates[active]
     coordinates = coordinates[active]
 
-    lookup = np.full((n, n, n), -1, dtype=np.int64)
+    side = int(getattr(settings, "foldblock_side_length", 1))
+    if side > 1:
+        integer_coordinates = _fold_block_points(integer_coordinates, side)
+        coordinates = (integer_coordinates + np.asarray(settings.shift)) * settings.spacing
+        index_min = index_min - (side - 1)
+        index_max = index_max + (side - 1)
+    extent = int(index_max[0] - index_min[0] + 1)
+
+    lookup = np.full((extent, extent, extent), -1, dtype=np.int64)
     local = integer_coordinates - index_min
     lookup[local[:, 0], local[:, 1], local[:, 2]] = np.arange(integer_coordinates.shape[0])
 

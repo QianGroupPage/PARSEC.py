@@ -30,7 +30,7 @@ import numpy as np
 from .chebyshev import FilterBlock, subspace_filter, subspace_filter_blocks
 from .orthogonalize import orthonormalize
 from .rayleigh_ritz import rayleigh_ritz
-from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound
+from .spectral_bounds import LanczosBoundResult, lanczos_upper_bound, spectral_bound
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,20 @@ class SubspaceSettings:
     ``random_seed``, arbitrary Lanczos-step overrides, and the recurrence reset
     switch are Python reproducibility/testing controls.  PARSEC's ordinary
     real path uses a five-step request and shared recurrence state.
+    ``reorthogonalization_threshold`` is the first ratio test of
+    ``orth_normal`` (0.1; PARSEC 1.5 uses 0.68).
+
+    PARSEC 1.5's SUBSPACE rules (``subspace.f90z`` of 1.5), off by default:
+    ``lower_bound_rule`` ``"monotone"`` (the earlier PARSEC, see
+    :func:`_next_filter_lower_bound`), ``"smart"`` or ``"adaptive"``
+    (``Smart_Subspace`` true or false, :func:`parsec15_lower_bound`);
+    ``scaled_filter`` (``Chebyshev_Scaled``: the recurrence normalized at the
+    lowest saved Ritz value ``aL`` instead of the lower bound, the same span
+    in exact arithmetic); ``bounds`` ``"parsec"`` or ``"lanczos"`` (1.5's
+    :func:`spectral_bounds.lanczos_bound_parsec15`, ``bound_steps`` steps
+    without a clamp, ``lanczos_steps`` when it is ``None``).  1.5's single filter degree for all vectors is not
+    taken over: on Si5H12 (20 states, degree 15) a later SUBSPACE call of 1.5 costs 330 Hamiltonian products
+    against 313 with the split degrees, 5 % more, and saves no SCF iterations.
     """
 
     polynomial_degree: int = 15
@@ -54,8 +68,19 @@ class SubspaceSettings:
     block_size: int = 6
     reset_recurrence_per_block: bool = False
     random_seed: int = 19
+    reorthogonalization_threshold: float = 0.1
+    lower_bound_rule: str = "monotone"
+    scaled_filter: bool = False
+    bounds: str = "parsec"
+    bound_steps: int | None = None
 
     def __post_init__(self) -> None:
+        if self.lower_bound_rule not in ("monotone", "smart", "adaptive"):
+            raise ValueError("lower_bound_rule must be monotone, smart or adaptive")
+        if self.bounds not in ("parsec", "lanczos"):
+            raise ValueError("SUBSPACE bounds must be parsec or lanczos")
+        if not 0.0 < self.reorthogonalization_threshold < 1.0:
+            raise ValueError("reorthogonalization_threshold must be in (0, 1)")
         if self.polynomial_degree < 1:
             raise ValueError("polynomial_degree must be positive")
         if self.degree_delta < 0:
@@ -164,6 +189,113 @@ def _next_filter_lower_bound(state: SubspaceState) -> float:
     return max(float(state.filter_lower_bound), largest_saved_ritz)
 
 
+# eigen_solver_module.F90:322 of 1.5: solver%lowerb starts at mach_eps.
+_MACHINE_EPSILON = float(np.finfo(float).eps)
+
+
+def parsec15_lower_bound(
+    state: SubspaceState,
+    rule: str,
+    bound: LanczosBoundResult,
+) -> tuple[float, float]:
+    """PARSEC 1.5's SUBSPACE lower bound and bound repair (``subspace.f90z:237-359`` of 1.5).
+
+    With ``r_max`` the largest saved Ritz value and ``l_p`` the lower bound
+    of the previous call (``mach_eps`` before the first):
+
+    * first call after the first solver: ``g = 0.99 r_max`` if
+      ``l_p < 2 eps``, else ``max(l_p, (r_max + l_p)/2)``; ``smart``
+      (``Smart_Subspace: .true.``) takes ``max(min(g, middle), 0)`` when
+      ``r_max > 0`` and ``r_max`` otherwise (``middle`` of the Lanczos bound),
+      ``adaptive`` (``.false.``) takes ``max(g, 0)``;
+    * later calls: ``smart`` takes ``r_max``; ``adaptive`` takes ``l_p`` if
+      ``q = |r_max/l_p| > 1.3``, ``(l_p + r_max)/2`` if ``q > 1``, else
+      ``r_max + 0.05``;
+    * if then the upper bound ``u`` lies below the lower bound ``l``:
+      ``l' = (u + theta_min)/2`` and ``u' = u + 0.1 (l - u)``.
+
+    Returns ``(lower, upper)``.
+    """
+
+    return subspace_filter_bounds(
+        rule,
+        float(np.max(state.eigenvalues)),
+        state.filter_lower_bound,
+        state.first_filter,
+        bound,
+    )
+
+
+def subspace_filter_bounds(
+    rule: str,
+    largest: float,
+    previous: float | None,
+    first_filter: bool,
+    bound,
+) -> tuple[float, float]:
+    """The unwanted interval ``[lower, upper]`` (Ry) of one later-SCF SUBSPACE filter.
+
+    The one rule of every SUBSPACE implementation (the reference filter, the
+    device filters of one GPU, of a distributed basis and of the complex
+    k-point solver).  ``largest`` is the largest saved Ritz value ``r_max``,
+    ``previous`` the lower bound of the previous call (``None`` before the
+    first call after the first solver), ``first_filter`` whether this is that
+    first call, ``bound`` the short-Lanczos estimate of the call (attributes
+    ``upper_bound``, ``lower_bound`` = ``theta_min`` and ``middle``, as
+    :class:`~parsec_python.Eigensolvers.spectral_bounds.LanczosBoundResult`).
+
+    * ``"monotone"`` (the earlier PARSEC, the default): ``l = max(r_max, 0)``
+      on the first call, ``l = max(l_p, r_max)`` later, ``u`` the Lanczos
+      bound (:func:`_next_filter_lower_bound`).  The clamp at 0 assumes that
+      the unwanted spectrum starts near the vacuum level, as for a cluster;
+      a periodic cell whose eigenvalues lie far below 0 (bulk diamond:
+      ``r_max`` ~ -36 Ry at 64 atoms, ~ -84 Ry at 216, the offset of the
+      periodic local potential grows with the cell) keeps ``l = 0`` for the
+      whole SCF, and the filter then damps nothing between the subspace and
+      0 Ry.
+    * ``"smart"`` (``Smart_Subspace: .true.``) and ``"adaptive"``
+      (``.false.``): PARSEC 1.5's rules with its repair of a crossed
+      interval (:func:`parsec15_lower_bound`); ``smart`` places ``l`` at
+      ``r_max`` (on the first call at ``max(min(g, middle), 0)`` when
+      ``r_max > 0``), wherever the spectrum lies.
+    """
+
+    largest = float(largest)
+    if rule == "monotone":
+        if first_filter or previous is None:
+            # subspace.f90z firstfilt branch (non-BETA build).
+            return max(largest, 0.0), float(bound.upper_bound)
+        return max(float(previous), largest), float(bound.upper_bound)
+    if rule not in ("smart", "adaptive"):
+        raise ValueError("lower_bound_rule must be monotone, smart or adaptive")
+    previous = _MACHINE_EPSILON if previous is None else float(previous)
+    if first_filter:
+        if previous < 2.0 * _MACHINE_EPSILON:
+            suggestion = 0.99 * largest
+        else:
+            suggestion = max(previous, 0.5 * (largest + previous))
+        if rule == "smart":
+            lower = max(min(suggestion, float(bound.middle)), 0.0) if largest > 0.0 else largest
+        else:
+            lower = max(suggestion, 0.0)
+    elif rule == "smart":
+        lower = largest
+    else:
+        ratio = abs(largest / previous) if previous != 0.0 else float("inf")
+        if ratio > 1.30:
+            lower = previous
+        elif ratio > 1.0:
+            lower = 0.5 * (previous + largest)
+        else:
+            lower = largest + 0.05
+    upper = float(bound.upper_bound)
+    if upper < lower:
+        suggestion = lower
+        lower = 0.5 * (upper + float(bound.lower_bound))
+        upper = upper + 0.1 * (suggestion - upper)
+    return float(lower), float(upper)
+
+
 def _adapt_polynomial_degree(
     requested_degree: int,
     lower_bound: float,
@@ -229,12 +361,24 @@ def run_subspace_filter(
     generator = np.random.default_rng(
         settings.random_seed + state.filters_completed
     )
-    bound = lanczos_upper_bound(
-        operator,
-        steps=settings.lanczos_steps,
-        rng=generator,
-    )
+    if settings.bounds == "parsec":
+        bound = lanczos_upper_bound(
+            operator,
+            steps=settings.lanczos_steps,
+            rng=generator,
+        )
+    else:
+        bound = spectral_bound(
+            operator,
+            settings.bounds,
+            settings.lanczos_steps if settings.bound_steps is None else settings.bound_steps,
+            rng=generator,
+        )
     upper_bound = float(bound.upper_bound)
+    if settings.lower_bound_rule != "monotone":
+        lower_bound, upper_bound = parsec15_lower_bound(
+            state, settings.lower_bound_rule, bound
+        )
     degree = _adapt_polynomial_degree(
         settings.polynomial_degree,
         lower_bound,
@@ -263,10 +407,18 @@ def run_subspace_filter(
         upper_bound=upper_bound,
         block_size=settings.block_size,
         reset_recurrence_per_block=settings.reset_recurrence_per_block,
+        # Chebyshev_Scaled (1.5: lowerb0 = aL, subspace.f90z:449-453).
+        reference_eigenvalue=(
+            float(np.min(state.eigenvalues)) if settings.scaled_filter else None
+        ),
     )
     # Stages 3--4: restore an orthonormal basis and diagonalize only the small
     # projected Hamiltonian.  H itself remains matrix-free.
-    basis = orthonormalize(filtered, rng=generator).basis
+    basis = orthonormalize(
+        filtered,
+        rng=generator,
+        reorthogonalization_threshold=settings.reorthogonalization_threshold,
+    ).basis
     ritz = rayleigh_ritz(operator, basis)
     eigenvalues = np.asarray(ritz.eigenvalues, dtype=float)
     vectors = np.asarray(ritz.wavefunctions)

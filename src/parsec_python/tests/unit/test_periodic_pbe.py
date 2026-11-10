@@ -15,6 +15,8 @@ from parsec_python.cli import main as cli_main
 from parsec_python.Grid.pbc import build_periodic_grid
 from parsec_python.V_xc import pbe, pbe_energy_partials
 from parsec_python.V_xc.pbe import first_derivative_coefficients
+from parsec_python.tests.archives import read_archive
+from parsec_python.tests.kramers import assert_level_moments_cancel
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -174,7 +176,7 @@ class PeriodicSelfConsistentSOCWithPBETests(unittest.TestCase):
             )
             exit_code = cli_main([str(directory / "parsec.in"), "--quiet"])
             self.assertEqual(exit_code, 0)
-            archive = np.load(directory / "parsec_python_results.npz")
+            archive = read_archive(directory / "parsec_python_results.npz")
             return {key: archive[key] for key in archive.files}
 
     def test_pbe_converges_with_kramers_pairs(self) -> None:
@@ -184,7 +186,8 @@ class PeriodicSelfConsistentSOCWithPBETests(unittest.TestCase):
         moments = archive["magnetic_moment_per_state"]
         for i in range(0, len(eigenvalues) - 3, 2):
             self.assertAlmostEqual(eigenvalues[i], eigenvalues[i + 1], delta=1.0e-4)
-            self.assertAlmostEqual(moments[i] + moments[i + 1], 0.0, delta=0.05)
+        # the spin cancels per degenerate level, not per pair inside a quartet (tests/kramers.py)
+        assert_level_moments_cancel(self, eigenvalues, moments, checked=len(eigenvalues) - 2)
 
     def test_pbe_differs_from_lda(self) -> None:
         pbe_result = self._run("PBE", "pb")

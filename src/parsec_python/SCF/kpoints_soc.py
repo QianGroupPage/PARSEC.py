@@ -66,6 +66,7 @@ from ..SCF.single_point import (
     SpinorIterationFields,
     first_diagonalization_tolerance,
     iterative_solver_fields,
+    solver_option_fields,
     next_diagonalization_tolerance,
     preconditioner_neighbors,
 )
@@ -108,6 +109,9 @@ def _eigval_settings(
         )
     if tolerance is None:
         tolerance = eigensolver_settings.tolerance
+    chebff_options, chebdav_options, subspace_options = solver_option_fields(
+        eigensolver_settings, tolerance, filter_degree
+    )
     return EigvalSettings(
         **iterative_solver_fields(
             eigensolver_settings,
@@ -123,6 +127,7 @@ def _eigval_settings(
             block_size=eigensolver_settings.matvec_block_size,
             reset_recurrence_per_block=False,
             random_seed=eigensolver_settings.random_seed,
+            **chebff_options,
         ),
         chebdav=(
             ChebDavSettings(
@@ -133,6 +138,7 @@ def _eigval_settings(
                 lanczos_steps=5,
                 max_outer_restarts=2,
                 random_seed=eigensolver_settings.random_seed,
+                **chebdav_options,
             )
             if eigensolver_settings.method == "chebdav"
             else ChebDavSettings()
@@ -144,6 +150,7 @@ def _eigval_settings(
             block_size=eigensolver_settings.matvec_block_size,
             reset_recurrence_per_block=False,
             random_seed=eigensolver_settings.random_seed,
+            **subspace_options,
         ),
     )
 
@@ -643,7 +650,7 @@ def run_self_consistent_soc_kpoints(
             last_input_potential = input_potential
             input_potential = mixed_potential
             if (
-                iteration > 5
+                iteration > settings.degree_decrease_after
                 and metrics.weighted < settings.approach_criterion
                 and filter_degree > minimum_filter_degree
             ):
@@ -975,7 +982,7 @@ def run_self_consistent_soc_kpoints_spin_polarized(
             input_potential_up = mixed_combined[:n_grid]
             input_potential_down = mixed_combined[n_grid:]
             if (
-                iteration > 5
+                iteration > settings.degree_decrease_after
                 and metrics.weighted < settings.approach_criterion
                 and filter_degree > minimum_filter_degree
             ):

@@ -577,17 +577,17 @@ def grid_steps(grid) -> np.ndarray:
 def grid_shift(grid) -> np.ndarray:
     """``grid%shift`` of the points of ``grid``.
 
-    The orthorhombic periodic grid of this port has shift zero; the general
-    periodic grid uses Fortran's rule (``usrinputfile.F90:786-794``).
+    Every periodic grid carries its own (Fortran's rule ``usrinputfile.F90:786-794`` or PARSEC 1.5's
+    ``Grid_Shift`` block; the orthorhombic grid of the Fortran-derived routines started at the origin before
+    PARSEC 1.5's parity round, and its files of then hold zero), a cluster grid that of its settings.
     """
 
     if _is_general_periodic(grid):
         return np.asarray(grid.shift, dtype=float).copy()
     if _is_periodic(grid):
-        settings = getattr(grid, "settings", None)
-        if not _is_confined(grid) and not getattr(settings, "fortran_routines", True) and hasattr(grid, "shift"):
-            # A bulk grid of Andrew Grieder's routines (Grid.pbc.fortran_grid_shift); a restart of the
-            # Fortran-derived routines from its file then sees the grid it was written on.
+        if hasattr(grid, "shift"):
+            # A bulk grid of either set of routines; a restart from a file written on another grid is refused
+            # by the shift (SCF.restart).
             return np.asarray(grid.shift, dtype=float).copy()
         return np.zeros(3)
     return np.asarray(grid.settings.shift, dtype=float)

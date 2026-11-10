@@ -414,14 +414,18 @@ def run_chebdav(
         else int(settings.max_iterations)
     )
 
-    basis_generator = LapackRandom()
+    basis_generator = LapackRandom(settings.basis_seed)
     if spectral_bound is None:
+        from parsec_python.Eigensolvers.spectral_bounds import bound_request
+
         bound_generator = np.random.default_rng(settings.random_seed)
+        rule, steps = bound_request(settings)
         with device_stage(operator, "initial_bound_seconds"):
             bound = lanczos_upper_bound(
                 operator,
-                steps=settings.lanczos_steps,
+                steps=steps,
                 rng=bound_generator,
+                rule=rule,
             )
     else:
         bound = spectral_bound

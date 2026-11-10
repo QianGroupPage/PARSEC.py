@@ -522,6 +522,39 @@ The lower half of the vectors uses degree `polym-delta`; the upper half uses
 Lanczos estimate. The cutoff starts from the largest saved Ritz value, clipped
 to at least zero, and is nondecreasing.
 
+The clip at zero assumes that the unwanted spectrum begins near the vacuum
+level, as for a cluster. A 3-D periodic cell has no vacuum level. Up to
+8 November 2026 this code's periodic local potential also kept the average
+of its Ewald split (below), and the eigenvalues of bulk diamond lay near
+-37 Ry (64 atoms) and -84 Ry (216 atoms), the mean growing with the cell, so
+the cutoff stayed at 0 for the whole SCF and the filter damped nothing between
+the subspace and 0 Ry. The SCF test (the potential residual) is then met long
+before the orbitals converge: the energies of 64, 216 and 512 atoms stopped
+0.06, 0.37 and 4.9 mRy/atom above their converged values. PARSEC 1.5's
+`Smart_Subspace: .true.` places the cutoff at the largest saved Ritz value
+wherever the spectrum lies (`subspace_filter_bounds` in
+`Eigensolvers/subspace.py`, used by every SUBSPACE implementation of this
+code); the same inputs then converge in 8, 10 and 16 iterations to within
+2e-5 mRy/atom.
+
+The averages of the potential of a 3-D periodic cell follow PARSEC 1.5 since
+8 November 2026. Fortran builds the local ionic potential in G space without
+its `G = 0` term (`ionpbc.f90`: `vionz(1) = 0`) and puts the average into the
+energy, `E_alpha = (N_e/Omega) sum_a alpha_a` with
+`alpha_a = int (V_a + 2 Z/r) d^3r` (`pbc%ealpha`); with `Zero_Average_Vxc`
+(`potshift`, `rho_hart.F90`) the average of `V_xc` is removed at every
+evaluation. This code builds the potential with the real-space Ewald split,
+whose parameter `eta = sqrt(pi)/V^(1/3)` leaves the average
+`sum_a alpha_a/V - 2 Z_tot/V^(1/3)` in it (`-2 Z_tot/V^(1/3)` is
+`-9.5 n^2` Ry for `n^3` conventional cells of diamond); the preparation
+removes the grid average and adds `N_e` times it to the alpha term
+(`SCF.pbc.zero_average_local_potential`), and `Zero_Average_Vxc` is the default
+of an unpolarized collinear bulk cell. The band energy loses `N_e` times both
+averages and the double-counting terms give them back, so the total energy,
+the density and the forces are unchanged (diamond, 8 atoms: 2e-13 Ry, the same
+SCF iterations); the eigenvalues and the Fermi level lose both averages
+(+10.30 Ry there) and compare with Fortran's.
+
 In the audited non-`BETA` source, the recurrence variable `sigma` is initialized
 once per filter call and is carried across memory blocks. Therefore changing
 `Matvec_Blocksize` can change the floating-point filter trajectory. The native
@@ -638,7 +671,11 @@ fbar = f_n + sum_i c_i (f_(n-i)-f_n)
 x_(n+1) = xbar + beta fbar.
 ```
 
-No Kerker preconditioner is applied in this default isolated path.
+No Kerker preconditioner is applied in this default isolated path. A 3-D
+periodic cell may filter the residual by `Mixing_Preconditioner: kerker`
+(`Mixer/preconditioner.py`, opt-in; Fortran PARSEC has no such option):
+`R -> P R` with `P(G) = (G^2 + q0^2/eps)/(G^2 + q0^2)`, `P(0) = 1`, before the
+mixer sees it.
 
 ## Total energy
 

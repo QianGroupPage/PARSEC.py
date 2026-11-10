@@ -41,6 +41,7 @@ from parsec_python.SCF.pbc import prepare_periodic_single_point
 from parsec_python.SCF.single_point import prepare_single_point
 from parsec_python.SCF.spin_polarized import run_scf_spin_polarized
 from parsec_python.V_xc import noncollinear_xc, pbe_spin_polarized
+from parsec_python.tests.archives import read_archive
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -387,10 +388,16 @@ class NoncollinearPeriodicTests(unittest.TestCase):
                 pseudopotentials=species,
                 grid=base.grid,
                 periodic_cell=base.periodic_cell,
+                # 1000 K for both runs, not the default 80 K: at 80 K this Gamma-point cell needs
+                # 36 to 78 of the 80 steps depending on the route (2026-11-05, collinear / general:
+                # A100 CPU 58 / 56, CuPy 55-56 / 36, the device solver on the host 57 / 55; RTX 5070
+                # CPU 68 / 56, CuPy 74-78 (not repeatable) / 69, and once more than 80), so the pass
+                # was chance.  At 1000 K every route needs 9 steps and the two runs agree to 2e-8 Ry.
                 scf=SCFSettings(
                     max_iterations=80,
                     number_of_states=20,
                     convergence_criterion=1e-4,
+                    fermi_temperature_kelvin=1000.0,
                     **scf_flags,
                 ),
                 hartree=base.hartree,
@@ -466,7 +473,7 @@ class NoncollinearInputAndCliTests(unittest.TestCase):
         self.assertEqual(cli_main([str(path), "--quiet"]), 0)
         log = (directory / "parsec.out").read_text(encoding="utf-8")
         self.assertIn("Converged magnetic moment vector", log)
-        archive = np.load(directory / "parsec_python_results.npz")
+        archive = read_archive(directory / "parsec_python_results.npz")
         vector = archive["magnetic_moment_vector"]
         self.assertGreater(_cos(vector, [0, 3, 4]), 0.999)
         self.assertEqual(archive["magnetization_mu_b_per_bohr3"].shape[0], 3)
@@ -485,7 +492,7 @@ class NoncollinearInputAndCliTests(unittest.TestCase):
         path = directory / "parsec.in"
         path.write_text(text, encoding="utf-8")
         self.assertEqual(cli_main([str(path), "--quiet"]), 0)
-        archive = np.load(directory / "parsec_python_results.npz")
+        archive = read_archive(directory / "parsec_python_results.npz")
         self.assertGreater(_cos(archive["magnetic_moment_vector"], [1, 0, 0]), 0.999)
 
     def test_moment_block_without_the_flag_is_rejected(self) -> None:

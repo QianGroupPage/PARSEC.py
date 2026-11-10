@@ -45,6 +45,16 @@ _K = 2.0 * np.pi / _BOX * np.array(
 )
 _WEIGHTS = np.full(4, 0.25)
 
+# The runs of these tests name the CPU backend of the k-point solver.  They are about the CPU thread
+# pool (and its serial reference), but with a GPU visible the default ``--device auto`` sends the
+# k-point eigenproblems to CuPy instead, one worker per device whatever PARSEC_KPOINT_WORKERS says,
+# and the periodic Hartree CG with them (PARSEC_PERIODIC_HARTREE=auto follows the k-point plan).
+# That is a different eigensolver (CHEBFF and SUBSPACE steps on the device) and agrees with the host
+# one to the SCF convergence, not to round-off, so on a GPU node these tests compared the device
+# route with the host and failed (up to 2026-11-05).  The device routes are compared with the CPU in
+# test_device_bloch (DeviceResidentSolverTests, CupyResidentSolverTests).
+_CPU = {"PARSEC_KPOINT_BACKEND": "cpu"}
+
 
 _PREPARED: dict[bool, object] = {}
 
@@ -90,10 +100,10 @@ DRIVERS = {
 
 @functools.lru_cache(maxsize=None)
 def _recorded(name: str, workers: str):
-    """``(result, iteration records)`` of a driver with ``workers`` workers; the runs are shared by the tests."""
+    """``(result, iteration records)`` of a driver with ``workers`` CPU workers; the runs are shared by the tests."""
     driver, flags, soc = DRIVERS[name]
     steps: list = []
-    with mock.patch.dict(os.environ, {"PARSEC_KPOINT_WORKERS": workers}):
+    with mock.patch.dict(os.environ, {**_CPU, "PARSEC_KPOINT_WORKERS": workers}):
         result = driver(_system(soc=soc, **flags), _K, _WEIGHTS, callback=steps.append)
     return result, steps
 
@@ -104,14 +114,16 @@ def _run(name: str, workers: str):
 
 @functools.lru_cache(maxsize=None)
 def _run_reference(name: str):
-    """The reference drivers with no parallel backend installed: the serial definition."""
+    """The reference drivers with no parallel backend installed: the serial definition (on the CPU:
+    the Hartree solve of a GPU machine would otherwise follow the device of the k-point plan)."""
     from parsec_python.acceleration.SCF.kpoint_parallel import install
     from parsec_python.SCF import kpoint_solver
 
     kpoint_solver.set_parallel_backend(None, None)
     try:
         driver, flags, soc = DRIVERS[name]
-        return driver(_system(soc=soc, **flags), _K, _WEIGHTS)
+        with mock.patch.dict(os.environ, _CPU):
+            return driver(_system(soc=soc, **flags), _K, _WEIGHTS)
     finally:
         install()
 

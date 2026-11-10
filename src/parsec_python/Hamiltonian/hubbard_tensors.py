@@ -1,17 +1,20 @@
 """Coulomb tensors ``P3`` and ``P4`` of the LDA+U potential (``upot.F90``).
 
-Generated from ``initialize_p_matrices`` of ``upot.F90`` (PARSEC, lines
-739-1516): every statement ``u_pot%p3(m,mp,k,l) = cmplx(re, im)`` and
+Generated from ``initialize_p_matrices`` of ``upot.F90`` (PARSEC 1.5
+``potential/upot.F90:765-1522``; the previous tree ``upot.F90:757-1514``):
+every statement ``u_pot%p3(m,mp,k,l) = cmplx(re, im, dpc)`` and
 ``u_pot%p4(...)`` is one row ``(m, mp, k, l, re, im)`` below, with the
 Fortran indices (1 to 5, in the order xy, yz, xz, 3z^2-1, x^2-y^2 of the
 real d harmonics) and the decimal literals exactly as written there.  All
 other entries are zero.  The tensors follow Liechtenstein, Anisimov and
 Zaanen, Phys. Rev. B 52, R5467 (1995).
 
-The literals carry no kind parameter, so Fortran stores them as default
-(single precision) reals: ``cmplx(re, im)`` is a ``complex(4)`` value that is
-then widened to double precision.  :func:`parsec_python.Hamiltonian.hubbard.coulomb_tensors`
-rounds each literal to ``float32`` first for that reason.
+PARSEC 1.5 writes the literals with ``d0`` and ``cmplx(..., dpc)``, so they
+are double precision: :func:`parsec_python.Hamiltonian.hubbard.coulomb_tensors`
+takes each decimal literal as the nearest double.  The previous tree wrote
+them without a kind (``cmplx(re, im)`` of default reals, a ``complex(4)``
+value widened to double); 1.5 fixed that, and only the ``J`` terms of ``D``
+see the difference (about 1e-7 relative).
 
 Regenerate with the extraction test
 ``tests/unit/test_hubbard.py`` (``HubbardTensorSourceTest``), which reads

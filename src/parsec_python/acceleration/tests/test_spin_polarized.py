@@ -366,15 +366,29 @@ class SciPyBackendTests(_BackendCases, unittest.TestCase):
         self.assertIn("2.00", moments)
 
     def test_mpi_sectors_are_refused(self) -> None:
+        # The ranks of an MPI SCF divide the symmetry sectors of both channels;
+        # channels that stay on the full grid are refused there, with or without
+        # the exchange of a hybrid.
         case = load_cases()["n_ca"]
         with tempfile.TemporaryDirectory() as directory:
             translation = parse_parsec_input(write_case(case, Path(directory)))
-        with self.assertRaisesRegex(NotImplementedError, "cannot run as an MPI SCF"):
-            driver.prepare_single_point(
-                translation.problem,
-                backend=self.backend,
-                mpi_context=SimpleNamespace(rank=0, root=0),
-            )
+        problem = replace(translation.problem, scf=replace(translation.problem.scf, spin_symmetry_sectors="off"))
+        for context in (SimpleNamespace(rank=0, root=0), SimpleNamespace(rank=0, root=0, exchange=True)):
+            with self.assertRaisesRegex(NotImplementedError, "cannot run as an MPI SCF"):
+                driver.prepare_single_point(problem, backend=self.backend, mpi_context=context)
+
+    def test_mpi_runner_refuses_ionic_steps_of_spin_runs_on_several_ranks(self) -> None:
+        from parsec_python.acceleration.benchmarks.mpi_full_scf import _refuse_spin_ionic_steps
+
+        scf = SimpleNamespace(spin_polarized=True)
+        single = SimpleNamespace(problem=SimpleNamespace(scf=scf), compute_forces=False,
+                                 relaxation=None, molecular_dynamics=None)
+        _refuse_spin_ionic_steps(single, 2)  # a single point is divided among the ranks
+        for changed in (dict(compute_forces=True), dict(relaxation=object()), dict(molecular_dynamics=object())):
+            translation = SimpleNamespace(**{**vars(single), **changed})
+            with self.assertRaisesRegex(ValueError, "spin-polarized calculation are not available on several ranks"):
+                _refuse_spin_ionic_steps(translation, 2)
+            _refuse_spin_ionic_steps(translation, 1)  # one rank (a serial control) is one process
 
 
 @unittest.skipUnless(native_available(), "native extension is unavailable")
@@ -391,22 +405,37 @@ class CuPyBackendTests(_BackendCases, unittest.TestCase):
 
     backend = "cupy"
 
-    def test_symmetric_molecule_is_solved_on_the_full_grid(self) -> None:
-        # Without spin polarization this molecule is solved in the symmetry
-        # representations of its two mirror planes.
-        case, system, result = self.assert_case("h2o_spin_ca", forces=True)
-        details = dict(result.backend.details)
-        self.assertTrue(details["orbital_symmetry"].startswith("full grid (spin-polarized"))
-        self.assertIn("local spin density", details["xc_implementation"])
-        self.assertIsNone(system.scalar_field_adapter)
+    def test_symmetric_molecule_in_the_sectors_and_on_the_full_grid(self) -> None:
+        # As without spin polarization, the default (Spin_Symmetry_Sectors:
+        # auto) solves this molecule in the symmetry representations of its
+        # two mirror planes; off keeps both channels on the full grid.
+        case = load_cases()["h2o_spin_ca"]
+        totals = {}
+        for mode in ("auto", "off"):
+            extra = () if mode == "auto" else ("Spin_Symmetry_Sectors: off",)
+            _, system, result = _solve("h2o_spin_ca", self.backend, extra=extra)
+            assert_matches_fortran(self, result, case)
+            assert_forces_match(self, driver.compute_forces(system, result), case)
+            details = dict(result.backend.details)
+            if mode == "auto":
+                self.assertTrue(details["orbital_symmetry"].startswith("CuPy real"))
+                self.assertIn("sectors", details["spin_symmetry_sectors"])
+            else:
+                self.assertTrue(details["orbital_symmetry"].startswith("full grid (spin-polarized"))
+                self.assertIn("local spin density", details["xc_implementation"])
+                self.assertIsNone(system.scalar_field_adapter)
+            totals[mode] = result.energies.total
         _, plain_system, plain = _solve("h2o_nospin_ca", self.backend)
         self.assertTrue(
             dict(plain.backend.details)["orbital_symmetry"].startswith("CuPy real")
         )
-        self.assertAlmostEqual(result.energies.total, plain.energies.total, delta=2.0e-8)
+        for mode in totals:
+            self.assertAlmostEqual(totals[mode], plain.energies.total, delta=2.0e-8)
+        self.assertAlmostEqual(totals["auto"], totals["off"], delta=1.0e-9)
 
     def test_each_channel_has_its_own_device_subspace(self) -> None:
-        _, system, result = _solve("n_ca", self.backend)
+        # Both channels on the full grid (in the sectors: test_spin_sectors.py).
+        _, system, result = _solve("n_ca", self.backend, extra=("Spin_Symmetry_Sectors: off",))
         solver = system.eigenproblem_solver
         first, second = solver.for_spin_channel(0), solver.for_spin_channel(1)
         self.assertIsNot(first, second)

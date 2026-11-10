@@ -12,7 +12,8 @@ net magnetic moment in Bohr magnetons is their difference.
 The level is found by the bisection of ``flevel.f90``, statement by
 statement: it starts at the highest eigenvalue of both channels, with the
 lowest and highest eigenvalues as bounds, and stops when the electron count
-is within ``1e-12``.  Between two levels of a gapped system the level is
+is within ``1e-10`` (the limits of PARSEC 1.5, ``utilities/flevel.f90:43-51``;
+the previous tree had ``1e-12``).  Between two levels of a gapped system the level is
 not unique, and this is the value PARSEC reports.
 
 A negative ``Fermi_Temp`` takes the occupations of both channels from
@@ -28,14 +29,21 @@ from typing import Sequence
 
 import numpy as np
 
-from .fermi_dirac import BOLTZMANN_RYDBERG_PER_KELVIN, fermi_occupations
+from .fermi_dirac import (
+    BOLTZMANN_RYDBERG_PER_KELVIN,
+    FERMI_COUNT_TOLERANCE,
+    FERMI_EXPONENT_CUTOFF,
+    FERMI_MAX_BISECTIONS,
+    fermi_occupations,
+)
 from .fixed import ELECTRON_COUNT_TOLERANCE
 
 
-#: ``small``, ``difmax`` and ``iterlim`` of ``flevel.f90``.
-COUNT_TOLERANCE = 1.0e-12
-EXPONENT_CUTOFF = 35.0
-MAXIMUM_BISECTIONS = 100
+#: ``small``, ``difmax`` and ``iterlim`` of PARSEC 1.5's ``flevel.f90`` (1e-10,
+#: 36.7, 1000; the previous tree had 1e-12, 35, 100).
+COUNT_TOLERANCE = FERMI_COUNT_TOLERANCE
+EXPONENT_CUTOFF = FERMI_EXPONENT_CUTOFF
+MAXIMUM_BISECTIONS = FERMI_MAX_BISECTIONS
 #: Electron count accepted from a bisection whose level double precision can
 #: no longer refine (many levels within kT of the Fermi level), where
 #: ``flevel.f90`` stops with "Fermi level not found".
@@ -85,7 +93,7 @@ def _channels(
 
 
 def _fermi_function(eigenvalues: np.ndarray, level: float, beta: float) -> np.ndarray:
-    """One below ``-35``, zero from ``35`` on, Fermi-Dirac between."""
+    """One below ``-difmax``, zero from ``difmax`` on, Fermi-Dirac between."""
 
     exponent = (eigenvalues - level) * beta
     occupations = np.zeros_like(exponent)

@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from parsec_python.Grid.kpoints import (
+    fold_to_centered_zone,
     irreducible_monkhorst_pack,
     kpoint_sampling,
     kpoint_sampling_details,
@@ -246,9 +247,22 @@ class IrreducibleWedgeTests(unittest.TestCase):
         cls.sampling = irreducible_monkhorst_pack(
             _FCC, (5, 5, 5), (0.5, 0.5, 0.5), cls.group.reciprocal_rotations
         )
+        cls.unfolded = irreducible_monkhorst_pack(
+            _FCC, (5, 5, 5), (0.5, 0.5, 0.5), cls.group.reciprocal_rotations, fold=False
+        )
 
     def test_fcc_table_is_fortrans(self) -> None:
-        self.assertEqual("\n".join(kpoint_generation_lines(self.sampling)), _BGW_TABLE)
+        # PARSEC 1.5's table is that of the unfolded set (fold=False); the default folds the representatives into
+        # (-1/2, 1/2] and changes nothing else (counts, weights, E_kin, grid_map)
+        self.assertEqual("\n".join(kpoint_generation_lines(self.unfolded)), _BGW_TABLE)
+        np.testing.assert_array_equal(self.sampling.fractional, fold_to_centered_zone(self.unfolded.fractional))
+        self.assertTrue(np.all(np.abs(self.sampling.fractional) <= 0.5))
+        self.assertGreater(int(np.sum(self.unfolded.fractional > 0.5)), 0)
+        for name in ("counts", "weights", "kinetic_energies", "grid_map"):
+            np.testing.assert_array_equal(getattr(self.sampling, name), getattr(self.unfolded, name))
+        reciprocal = 2.0 * np.pi * np.linalg.inv(_FCC).T
+        difference = (self.sampling.k_points - self.unfolded.k_points) @ np.linalg.inv(reciprocal)
+        np.testing.assert_allclose(difference, np.rint(difference), atol=1e-12)
         self.assertEqual(self.sampling.count, 19)
         self.assertEqual(int(self.sampling.counts.sum()), 125)
         self.assertAlmostEqual(float(self.sampling.weights.sum()), 1.0, places=15)
@@ -279,8 +293,9 @@ class IrreducibleWedgeTests(unittest.TestCase):
             self.assertTrue(
                 any(np.max(np.abs(q - representative - np.rint(q - representative))) < 1e-8 for q in images)
             )
-        # The first member met is the representative, kept unfolded.
-        np.testing.assert_array_equal(sampling.fractional[4], [0.1, 0.1, 0.9])
+        # The first member met is the representative, folded into (-1/2, 1/2].
+        np.testing.assert_array_equal(self.unfolded.fractional[4], [0.1, 0.1, 0.9])
+        np.testing.assert_allclose(sampling.fractional[4], [0.1, 0.1, -0.1], rtol=0, atol=1e-15)
 
     def test_closed_grid_weights_are_star_sizes(self) -> None:
         sampling = irreducible_monkhorst_pack(
@@ -302,7 +317,7 @@ class IrreducibleWedgeTests(unittest.TestCase):
             _ORTHO, (2, 2, 2), (0.5, 0.5, 0.5), ortho.reciprocal_rotations
         )
         np.testing.assert_array_equal(reduced.counts, [4, 4])
-        np.testing.assert_allclose(reduced.fractional, [[0.25, 0.25, 0.25], [0.25, 0.75, 0.25]])
+        np.testing.assert_allclose(reduced.fractional, [[0.25, 0.25, 0.25], [0.25, -0.25, 0.25]])
 
     def test_translate01(self) -> None:
         self.assertEqual(translate01([0.0, 1.0, -1.0]), [0.0, 0.0, 0.0])
@@ -330,8 +345,9 @@ class WeightedOccupationTests(unittest.TestCase):
         levels = np.sort(np.linspace(-1.0, 1.0, 30))
         weights = np.tile([0.1, 0.3, 0.6], 10) / 10.0
         result = weighted_fermi_occupations(levels, weights, 1.5, 800.0, degeneracy=2.0)
-        self.assertAlmostEqual(2.0 * float(np.dot(weights, result.occupations)), 1.5, places=10)
-        self.assertAlmostEqual(result.electron_count, 1.5, places=10)
+        # The pairs are counted to small = 1e-10 (PARSEC 1.5 flevel.f90:43), the electrons to twice that.
+        self.assertAlmostEqual(2.0 * float(np.dot(weights, result.occupations)), 1.5, delta=2.0e-10)
+        self.assertAlmostEqual(result.electron_count, 1.5, delta=2.0e-10)
         zero = weighted_fermi_occupations(levels, weights, 1.5, 0.0, degeneracy=2.0)
         self.assertAlmostEqual(2.0 * float(np.dot(weights, zero.occupations)), 1.5, places=12)
         self.assertTrue(np.all((zero.occupations >= 0.0) & (zero.occupations <= 1.0)))
@@ -549,7 +565,7 @@ class InputTests(unittest.TestCase):
         self.assertEqual(relaxation.relaxation.method, "bfgs")
         self.assertTrue(self._parse(shift="", extra="Skip_force: .false.\n").compute_forces)
 
-    def test_noncommensurate_orthorhombic_grid_is_refused(self) -> None:
+    def test_the_orthorhombic_grid_is_commensurate_with_the_translations(self) -> None:
         text = """\
 Periodic_System: .true.
 Use_Fortran_Routines: .true.
@@ -582,9 +598,14 @@ begin Atom_Coord
   0.75  0.75  0.25
 end Atom_Coord
 """
-        with self.assertRaises(UnsupportedParsecOptionError) as caught:
-            self._parse(text=text.format(spacing=0.57))
-        self.assertIn("Symmetrize_Charge_Density", str(caught.exception))
+        # Since PARSEC 1.5's parity round the orthorhombic grid takes adjust_step's counts with the quarter
+        # translations of diamond: 16 points at 0.57 bohr (round(L/h) gave 18, which the symmetrization refused)
+        problem = self._parse(text=text.format(spacing=0.57)).problem
+        self.assertEqual(problem.space_group.order, 48)
+        self.assertTrue(problem.scf.symmetrize_density)
+        grid = build_periodic_grid(problem.periodic_cell, problem.grid)
+        self.assertEqual(grid.points_per_axis.tolist(), [16, 16, 16])
+        np.testing.assert_array_equal(grid.shift, [0.5, 0.5, 0.5])
         problem = self._parse(text=text.format(spacing=0.64)).problem
         self.assertEqual(problem.space_group.order, 48)
         problem = self._parse(

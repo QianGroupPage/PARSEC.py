@@ -104,22 +104,30 @@ def hartree_device_id() -> int | None:
 
     The first device of the k-point plan (``PARSEC_DEVICE``,
     ``PARSEC_KPOINT_BACKEND``, ``PARSEC_CUPY_DEVICES``); ``numpy-device`` (the
-    host test double) and the CPU give ``None``, and so does an MPI run
-    (``--mpi``): its ranks run the drivers replicated, which these solves
-    leave on the host as before.
+    host test double) and the CPU give ``None``.  In an MPI run (``--mpi``)
+    every rank runs the drivers replicated and solves on its own device, the
+    one its k-point solver uses (``device_ids[local rank % count]``): the
+    fixed-order sums of the device CG give every rank the same potential
+    (until 2026-11-08 an MPI run solved on the host of every rank).
     """
 
     from ..Parallel import mpi
     from ..SCF.kpoint_parallel import resolve_backend
 
-    if mpi.requested():
-        return None
     try:
         plan = resolve_backend()
     except Exception:  # noqa: BLE001 - no usable device: the host solves
         return None
     if plan is None or plan.name != "cupy" or not plan.device_ids:
         return None
+    if mpi.requested():
+        try:
+            context = mpi.context()
+        except ImportError:  # no mpi4py: the run stops before its drivers; nothing to place
+            return None
+        if context is None:
+            return None
+        return int(plan.device_ids[context.local_rank % len(plan.device_ids)])
     return int(plan.device_ids[0])
 
 
@@ -263,7 +271,15 @@ class FusedConjugateGradient:
         matrix_vector_products = 1
         residual_squared = _device_scalar(cp.vdot(residual, residual))
         initial_norm = float(np.sqrt(residual_squared))
-        tolerance = settings.relative_tolerance * initial_norm + settings.absolute_tolerance
+        if getattr(settings, "cg_criterion", 1) == 2:
+            # Hartree_CG_Criterion 2 of PARSEC 1.5: the test against ||b|| (Hartree.poisson.cg_stopping_threshold)
+            from parsec_python.Hartree.poisson import cg_stopping_threshold
+
+            tolerance = cg_stopping_threshold(
+                settings, initial_norm, float(np.sqrt(_device_scalar(cp.vdot(rhs, rhs))))
+            )
+        else:
+            tolerance = settings.relative_tolerance * initial_norm + settings.absolute_tolerance
         if initial_norm <= tolerance:
             return solution, True, 0, matrix_vector_products, initial_norm, initial_norm
         direction = residual.copy()

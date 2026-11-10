@@ -64,7 +64,8 @@ from weakref import ref
 import numpy as np
 
 from parsec_python.Eigensolvers.chebff import ChebFFCycle, ChebFFSettings
-from parsec_python.Eigensolvers.subspace import SubspaceSettings
+from parsec_python.Eigensolvers.spectral_bounds import bound_request
+from parsec_python.Eigensolvers.subspace import SubspaceSettings, subspace_filter_bounds
 
 from ..backends.cupy import device_stage, require_cupy
 from ..backends.cupy_stencil_major import CuPyStencilMajorFiniteDifference
@@ -103,7 +104,6 @@ from .tall_product import transposed_product
 from .subspace import (
     DeviceSubspaceResult,
     DeviceSubspaceState,
-    _next_filter_lower_bound,
     _validate_state,
     filter_degree,
 )
@@ -4367,15 +4367,16 @@ def run_distributed_chebff(
     if not 1 <= wanted_states <= dimension:
         raise ValueError("wanted_states is outside the operator dimension")
     blocks = uniform_filter_blocks(wanted_states, settings.block_size, settings.polynomial_degree)
-    basis_generator = LapackRandom()
+    basis_generator = LapackRandom(settings.basis_seed)
     basis = group.random_basis(basis_generator, dimension, group.column_layout(blocks))
     stats = getattr(operator, "timing_stats", None)
     if stats is not None and os.environ.get("PARSEC_CUPY_DEVICE_RANDOM", "0").lower() in {"1", "true", "on"}:
         stats.initial_random_device_values += dimension * wanted_states
 
     if spectral_bound is None:
+        rule, steps = bound_request(settings)
         bound = lanczos_upper_bound(
-            operator, steps=settings.lanczos_steps, rng=np.random.default_rng(settings.random_seed)
+            operator, steps=steps, rng=np.random.default_rng(settings.random_seed), rule=rule
         )
     else:
         bound = spectral_bound
@@ -4496,15 +4497,22 @@ def run_distributed_subspace(
     release_coefficients(state.handover)
     mode = "triangular" if handover == "triangular" and pending is None else "rotation"
     _validate_state(operator, state)
-    lower_bound = _next_filter_lower_bound(state)
     generator = np.random.default_rng(settings.random_seed + state.filters_completed)
+    rule, steps = bound_request(settings)
     with device_stage(operator, "subspace_bound_seconds"):
         bound = (
-            lanczos_upper_bound(operator, steps=settings.lanczos_steps, rng=generator)
+            lanczos_upper_bound(operator, steps=steps, rng=generator, rule=rule)
             if spectral_bound is None
             else spectral_bound
         )
-    upper_bound = float(bound.upper_bound)
+    # The lower-bound rule of subspace.run_subspace_filter (Smart_Subspace).
+    lower_bound, upper_bound = subspace_filter_bounds(
+        settings.lower_bound_rule,
+        float(state.eigenvalues.max().item()),
+        state.filter_lower_bound,
+        state.first_filter,
+        bound,
+    )
     degree = filter_degree(settings, state, lower_bound, upper_bound)
     blocks = subspace_filter_blocks(
         state.working_states, settings.block_size, degree, settings.degree_delta

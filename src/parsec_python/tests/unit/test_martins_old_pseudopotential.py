@@ -624,17 +624,18 @@ class InputTranslationTests(unittest.TestCase):
 
     def test_potential_num_is_handed_out_in_species_order(self) -> None:
         head, silicon, sodium, tail = self.species_blocks()
-        # Na first: its read takes the only Potential_Num and Fortran stops
-        # with error 138, "impossible number of potentials", for Si.
-        with self.assertRaisesRegex(ParsecInputError, "n-th Potential_Num"):
-            self.parse(head + sodium + silicon + tail)
-        # With a line for Na to take, Fortran gives the energy of the example.
-        translation = self.parse(
-            head + [sodium[0], "Potential_Num: 3"] + sodium[1:] + silicon + tail
-        )
+        # PARSEC 1.5 reads Potential_Num for martins_old and fhipp species
+        # only (usrinputfile.F90:3244-3248): Na (martins_new) first takes none,
+        # and Si gets the only line.  (The tree before 1.5 read one for every
+        # species: there Na took it and Si stopped with error 138.)
+        translation = self.parse(head + sodium + silicon + tail)
         self.assertEqual(list(translation.problem.pseudopotentials), ["Na", "Si"])
         self.assertEqual(translation.problem.pseudopotentials["Si"].number_of_channels, 2)
         self.assertIsNone(translation.problem.pseudopotentials["Na"].number_of_channels)
+        # The layout of the tree before 1.5, a line for Na as well, would hand
+        # Na's line to Si in 1.5: refused.
+        with self.assertRaisesRegex(ParsecInputError, "Potential_Num occurs 2 times"):
+            self.parse(head + [sodium[0], "Potential_Num: 3"] + sodium[1:] + silicon + tail)
 
     def test_missing_or_misplaced_species_input_is_refused(self) -> None:
         # Fortran would run without the nonlocal projectors of Si.
@@ -651,12 +652,21 @@ class InputTranslationTests(unittest.TestCase):
         with self.assertRaisesRegex(ParsecInputError, "beyond the number of channels"):
             lines = self.replaced("Local_Component: p", "Local_Component: d")
             self.parse(lines)
-        # A line under the new-format species would go to the next old one.
+        # A line under the new-format species before the old one would go to
+        # the old one (ESDF's cursor): refused.
         head, silicon, sodium, tail = self.species_blocks()
         with self.assertRaisesRegex(ParsecInputError, "core_cutoff_radius occurs 2 times"):
             self.parse(
-                head + silicon + [sodium[0], "Core_Cutoff_Radius: 3.0"] + sodium[1:] + tail
+                head + [sodium[0], "Core_Cutoff_Radius: 3.0"] + sodium[1:] + silicon + tail
             )
+        # After it (the layout of PARSEC 1.5's bak_complete_parsec.in, one line
+        # under every Atom_Type) the line is never read, as in PARSEC 1.5.
+        translation = self.parse(
+            head + silicon + [sodium[0], "Core_Cutoff_Radius: 3.0"] + sodium[1:] + tail
+        )
+        self.assertEqual(translation.problem.pseudopotentials["Si"].core_cutoff_radius, 2.5)
+        self.assertIsNone(translation.problem.pseudopotentials["Na"].core_cutoff_radius)
+        self.assertTrue(any("one line under every Atom_Type" in note for note in translation.warnings))
         # usrinputfile.F90 error 234.
         with self.assertRaisesRegex(ParsecInputError, "Read_VCD needs a martins_new"):
             self.parse(head + [silicon[0], "Read_VCD: .true."] + silicon[1:] + sodium + tail)
@@ -678,9 +688,7 @@ class InputTranslationTests(unittest.TestCase):
         # Na first and Si last: pseudo.f90 tests the format of the last
         # Atom_Type for the Read_VCD of Na and stops with error 23.
         with self.assertRaisesRegex(ParsecInputError, "tests the format of the last Atom_Type"):
-            self.parse(
-                head + [with_vcd[0], "Potential_Num: 3"] + with_vcd[1:] + silicon + tail
-            )
+            self.parse(head + with_vcd + silicon + tail)
 
     def test_electron_per_orbital_block(self) -> None:
         block = self.lines.index("begin Electron_Per_Orbital")
@@ -713,13 +721,15 @@ class InputTranslationTests(unittest.TestCase):
         # The other two formats read files of their own names
         # (Pseudopotential/potrw.py and fhipp.py have their own tests).
         for name, suffix in (("martins_wang", "POTRW"), ("fhipp", "FHIPP")):
+            lines = self.replaced(
+                "Pseudopotential_Format: martins_old",
+                f"Pseudopotential_Format: {name}",
+            )
+            if name == "martins_wang":
+                # PARSEC 1.5 reads no Potential_Num for a Martins-Wang species
+                lines = [line for line in lines if not line.startswith("Potential_Num")]
             with self.assertRaisesRegex(ParsecInputError, f"Si_{suffix}.DAT"):
-                self.parse(
-                    self.replaced(
-                        "Pseudopotential_Format: martins_old",
-                        f"Pseudopotential_Format: {name}",
-                    )
-                )
+                self.parse(lines)
         # usrinputfile.F90 error 134.
         with self.assertRaisesRegex(ParsecInputError, "unknown Pseudopotential_Format"):
             self.parse(

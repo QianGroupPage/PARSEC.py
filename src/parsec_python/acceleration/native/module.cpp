@@ -86,6 +86,7 @@ PYBIND11_MODULE(parsec_accelerated_native, module) {
         info["maximum_multipole_order"] = 60;
         info["dtype"] = "float64";
         info["fixed_summation_order"] = true;
+        info["projector_center_round_off"] = parsec_accelerated_native::kProjectorCenterRoundOff;
         info["implemented_kernels"] = py::make_tuple(
             "build_negative_laplacian_buffers",
             "FusedHamiltonian",

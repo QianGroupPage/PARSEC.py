@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from parsec_python.cli import main as cli_main
+from parsec_python.tests.archives import read_archive
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -77,7 +78,7 @@ class SpinOrbitCliTests(unittest.TestCase):
         self.assertIn("Perturbative spin-orbit correction", log_text)
         self.assertIn("Self-consistency convergence achieved.", log_text)
 
-        archive = np.load(self.directory / "parsec_python_results.npz")
+        archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertEqual(archive["eigenvalues_up_ry"].shape, (6,))
         self.assertEqual(archive["eigenvalues_down_ry"].shape, (6,))
         self.assertEqual(archive["soc_eigenvalues_ry"].shape, (12,))

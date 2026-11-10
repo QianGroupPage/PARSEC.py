@@ -12,8 +12,12 @@ rounds: the row blocks equal the rows of the matrix and come back to the
 same columns bit for bit; the summed Gram matrices of the row blocks equal
 the product of the whole matrix; the trial basis of each rank equals its
 columns of the single-device DLARNV basis bit for bit, and the generator
-ends where the single-device one ends.  Prints one line per check on the
-root and exits with 1 if any failed on any rank.
+ends where the single-device one ends; the Rayleigh--Ritz step in rounds
+(``PARSEC_MPI_SHARED_RITZ=rounds``, one and several rounds) gives the Ritz
+values of the two row blocks to round-off and their Ritz vectors up to signs;
+the condition number of the small solve estimated on the next rank gives the
+Ritz pairs of the root's own estimate bit for bit.  Prints one line per check
+on the root and exits with 1 if any failed on any rank.
 """
 
 from __future__ import annotations
@@ -82,6 +86,64 @@ def main() -> int:
             reference = matrix.T @ matrix
             error = float(np.max(np.abs(cp.asnumpy(gram) - reference)) / np.max(np.abs(reference)))
             check(f"summed Gram matrix [{label}], relative error {error:.1e}", error < 1e-12)
+    os.environ.pop("PARSEC_MPI_SHARED_EXCHANGE_BYTES", None)
+    # The Ritz step in rounds (PARSEC_MPI_SHARED_RITZ=rounds) against the two row blocks: the same Ritz values to
+    # round-off, Ritz vectors of a simple spectrum equal up to their signs, every column back on its rank.
+    import cupyx.scipy.sparse as csp
+    import scipy.sparse as sp
+
+    generator = np.random.default_rng(17)
+    off = generator.uniform(-1.0, 1.0, rows - 1)
+    hamiltonian = sp.diags((off, generator.uniform(-2.0, 6.0, rows), off), (-1, 0, 1), format="csr")
+
+    class _Operator(_Device):
+        def __init__(self):
+            super().__init__(cp)
+            self.hamiltonian = csp.csr_matrix(hamiltonian)
+
+        def apply_into(self, block, out):
+            out[...] = self.hamiltonian @ block
+
+    operator = _Operator()
+
+    def ritz_pairs(route, transport, per_round):
+        from parsec_python.acceleration.Eigensolvers.mpi_shared_basis import SharedBasis
+
+        os.environ["PARSEC_MPI_SHARED_RITZ"] = route
+        if per_round is None:
+            os.environ.pop("PARSEC_MPI_SHARED_EXCHANGE_BYTES", None)
+        else:
+            os.environ["PARSEC_MPI_SHARED_EXCHANGE_BYTES"] = str(8 * rows * per_round)
+        group = MPIShardGroup(comm, operator, transport=transport)
+        layout = group.column_layout(blocks)
+        local = cp.asfortranarray(cp.asarray(_local_columns(layout, rank, matrix)))
+        values, rotated, _whitened = group.ritz(operator, SharedBasis(group, local, layout), stages=False)
+        whole = np.zeros((rows, states))
+        for column, offset, count in layout.spans(rank):
+            whole[:, column : column + count] = cp.asnumpy(rotated.local[:, offset : offset + count])
+        comm.Allreduce(MPI.IN_PLACE, whole)
+        return np.asarray(values), whole
+
+    for transport in ("cuda", "host"):
+        if transport == "cuda" and os.environ.get("MPICH_GPU_SUPPORT_ENABLED") != "1":
+            continue
+        reference_values, reference_basis = ritz_pairs("rows", transport, None)
+        # The condition number on the next rank (the default) or on the root: the same bits.
+        os.environ["PARSEC_CUPY_RITZ_CONDITION_HELPER"] = "off"
+        alone_values, alone_basis = ritz_pairs("rows", transport, None)
+        os.environ.pop("PARSEC_CUPY_RITZ_CONDITION_HELPER", None)
+        check(f"condition number beside the root changes no bit [{transport}]",
+              np.array_equal(alone_values, reference_values) and np.array_equal(alone_basis, reference_basis))
+        for per_round in (None, 7):
+            label = f"{transport}, {'one round' if per_round is None else f'{per_round} columns per round'}"
+            values, basis = ritz_pairs("rounds", transport, per_round)
+            scale = float(np.max(np.abs(reference_values)))
+            value_error = float(np.max(np.abs(values - reference_values))) / scale
+            signs = np.sign(np.sum(basis * reference_basis, axis=0))
+            vector_error = float(np.max(np.abs(basis * signs - reference_basis)))
+            check(f"Ritz values in rounds = two row blocks [{label}], relative {value_error:.1e}", value_error < 1e-12)
+            check(f"Ritz vectors in rounds = two row blocks [{label}], {vector_error:.1e}", vector_error < 1e-9)
+    os.environ.pop("PARSEC_MPI_SHARED_RITZ", None)
     os.environ.pop("PARSEC_MPI_SHARED_EXCHANGE_BYTES", None)
     for on_device in ("1", "0"):
         os.environ["PARSEC_CUPY_DEVICE_RANDOM"] = on_device

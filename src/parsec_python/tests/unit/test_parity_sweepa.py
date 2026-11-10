@@ -36,6 +36,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from parsec_python.Input import UnsupportedParsecOptionError, parse_parsec_input
+from parsec_python.tests.environment import pin_kpoints_on_the_cpu
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 HYDROGEN = DATA / "water_H_POTRE.DAT"
@@ -45,7 +46,7 @@ AUH = Path(__file__).resolve().parents[4] / "examples" / "0d_AuH"
 
 class _Directory(unittest.TestCase):
     def setUp(self) -> None:
-        os.environ.setdefault("PARSEC_KPOINT_BACKEND", "cpu")
+        pin_kpoints_on_the_cpu(self)
         self._directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self._directory.cleanup)
         self.directory = Path(self._directory.name)
@@ -499,7 +500,9 @@ class SpinOrbitDoubleGridForceTests(unittest.TestCase):
             "H": SpeciesPotential(AUH / "H_POTRE.DAT", 0),
         }
         atoms = (Atom("Au", np.array([3.4, 3.1, 3.3])), Atom("H", np.array([0.6, 3.5, 2.9])))
-        cell = PeriodicCell(lattice_vectors=6.5 * np.eye(3))
+        # 12 points of 0.5 bohr per side (Fortran's even count: 6.5 bohr, 13 points of round(L/h) before PARSEC
+        # 1.5's parity round, is now 12 points of 0.54)
+        cell = PeriodicCell(lattice_vectors=6.0 * np.eye(3))
         grid = build_periodic_grid(
             cell, PeriodicGridSettings(fortran_routines=True, spacing=0.5, expansion_order=4, double_grid_order=2)
         )

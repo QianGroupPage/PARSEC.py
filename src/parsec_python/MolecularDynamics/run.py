@@ -24,6 +24,7 @@ from typing import Callable, Sequence
 import numpy as np
 
 from ..Relaxation.backend import IonicBackend, moved_atoms, release_orbitals
+from ..SCF.filter_restart import FilterRestart
 from .atomic_masses import atomic_masses
 from .md_files import (
     MD_NRG_HEADER,
@@ -85,6 +86,9 @@ class MolecularDynamicsOutcome:
     state: MolecularDynamicsState | None = None
     positions: np.ndarray | None = None
     scf_failed: bool = False
+    # The SCF loop of the last structure did not converge and the run
+    # stopped there (PARSEC 1.5, parsec.F90:2124-2137).
+    stopped_by_scf_failure: bool = False
     files: tuple[Path, ...] = ()
 
 
@@ -119,7 +123,12 @@ def restart_structure(translation, input_directory: Path):
     # previous ones, initial.f90:201-228): nothing is shifted or reported.
     translation = replace(
         translation,
-        problem=replace(problem, atoms=atoms, recenter_geometry=True),
+        # Recenter_Atoms_In_Aperiodic_Directions: .false. (PARSEC 1.5) keeps them.
+        problem=replace(
+            problem,
+            atoms=atoms,
+            recenter_geometry=bool(getattr(translation, "recenter_aperiodic", True)),
+        ),
         slab_shift=0.0,
     )
     return translation, restart, [
@@ -252,6 +261,7 @@ def run_recorded_molecular_dynamics(
     outcome = MolecularDynamicsOutcome(state=state, positions=positions)
     carried = None
     index = 0
+    filter_restart = FilterRestart.from_eigensolver(translation.problem.eigensolver)
     while True:
         started = time.perf_counter()
         result = backend.run_scf(system, callback=reporter.iteration, warm_start=carried)
@@ -273,8 +283,25 @@ def run_recorded_molecular_dynamics(
                 with open(Path(directory) / FRAMES, "a", encoding="utf-8", newline="\n") as handle:
                     handle.write(frame)
         step = None
-        if settings.step_num != 0:
-            step = moldyn_step(settings, state, forces.total, energy, random=source)
+        if not result.converged and settings.step_num != 0:
+            # PARSEC 1.5 (parsec.F90:2124-2137): no point in continuing the
+            # dynamics without convergence; the forces of this structure are
+            # reported and the atoms are not moved (the previous tree went on).
+            from ..Output.force_output import scf_failure_stop_lines
+
+            outcome.stopped_by_scf_failure = True
+            write("\n".join(scf_failure_stop_lines()))
+        elif settings.step_num != 0:
+            step = moldyn_step(
+                settings,
+                state,
+                forces.total,
+                energy,
+                random=source,
+                # FDET keeps the net force: integrate the motion it drives
+                # (the centre of mass is not held; MolecularDynamics.moldyn).
+                **({"keep_center_of_mass": True} if getattr(forces, "net_force_kept", False) else {}),
+            )
             files.append(step_records(state, step, species))
             write(
                 "\n".join(
@@ -310,9 +337,20 @@ def run_recorded_molecular_dynamics(
             break
         # Andrew Grieder's loops keep the initial moment of a non-collinear calculation
         atoms = moved_atoms(system.atoms, step.positions, getattr(backend, "keep_atom_fields", True))
-        release_orbitals(result)
+        # A hybrid functional's warm start reads the orbitals: they go after it.
+        hybrid = getattr(result, "exact_exchange", None) is not None
+        if not hybrid:
+            release_orbitals(result)
         moved = backend.update_geometry(system, atoms)
         carried = backend.warm_start(system, result, moved)
+        if hybrid:
+            release_orbitals(result)
+        if filter_restart is not None:
+            # Filter_Restart_After (PARSEC 1.5, parsec.F90:2944-3026): the
+            # movements made so far are the steps done.
+            carried, _reset = filter_restart.warm_start_after_move(
+                carried, index + 1, getattr(backend, "drop_subspace", None)
+            )
         system = moved
         index += 1
     outcome.files = tuple(files.started)

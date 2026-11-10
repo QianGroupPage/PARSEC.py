@@ -32,6 +32,7 @@ from parsec_python.SCF.kpoints_soc import (
 )
 from parsec_python.SCF.pbc import prepare_periodic_single_point
 from parsec_python.V_ion import build_nonlocal_projectors, load_pseudopotentials
+from parsec_python.tests.archives import read_archive
 
 _AU_POTRE = (
     Path(__file__).resolve().parents[4] / "examples" / "0d_AuH" / "Au_POTRE.DAT"
@@ -332,7 +333,7 @@ class PeriodicSpinPolarizedSOCCliTests(unittest.TestCase):
             exit_code = cli_main([str(directory / "parsec.in"), "--quiet"])
             self.assertEqual(exit_code, 0)
             log = (directory / "parsec.out").read_text(encoding="utf-8")
-            archive = np.load(directory / "parsec_python_results.npz")
+            archive = read_archive(directory / "parsec_python_results.npz")
             return log, {key: archive[key] for key in archive.files}
 
     def test_gamma_run_reports_moment(self) -> None:

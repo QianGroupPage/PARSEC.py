@@ -41,7 +41,7 @@ from parsec_python.V_ion import (
     load_pseudopotentials,
     superpose_atomic_density,
 )
-from parsec_python.V_ion.ewald import ewald_ion_ion_energy, ewald_local_ionic_potential
+from parsec_python.V_ion.ewald import ewald_local_ionic_potential
 from parsec_python.V_ion.ionic_potential import dense_support
 
 _EXAMPLES = Path(__file__).resolve().parents[4] / "examples" / "0d_AuH"
@@ -218,8 +218,11 @@ def _mixed_cell():
 
     H sits on a grid point (a distance of exactly 0) and its table ends at 1.6 bohr, inside the erfc
     tail of the split: the terms beyond the table are evaluated and then exactly zero.
+
+    The sides are even multiples of 0.6 (Fortran's counts of the orthorhombic grid since PARSEC 1.5's parity
+    round; 5.4 bohr, 9 points of the earlier ``round(L/h)``, now takes 8 points of 0.675 and the general grid).
     """
-    sides = (4.8, 5.4, 6.0)  # spacing 0.6
+    sides = (4.8, 6.0, 7.2)  # spacing 0.6
     atoms = (
         Atom("Ge", [1.37, 4.02, 2.71], [0.0, 0.0, 0.0]),
         Atom("H", [3.0, 1.2, 4.8], [0.0, 0.0, 0.0]),
@@ -272,6 +275,26 @@ class ImageBlockTests(unittest.TestCase):
                     blocks = self._potential(cell, PARSEC_PERIODIC_SETUP_THREADS=threads)
                     _assert_same_bits(self, blocks, balls)
 
+    def test_the_device_density_is_the_host_sum_bit_for_bit(self) -> None:
+        # periodic_device.device_bulk_atomic_density: the terms of every point in the host's order and arithmetic
+        # (H on a grid point, a six-sample table, core densities), on the grid of either set of routines
+        from parsec_python.acceleration.V_ion import periodic_device
+
+        if periodic_device._cupy() is None:
+            self.skipTest("no usable CUDA device")
+        grid, atoms, potentials, specifications, lattice = _mixed_cell()
+        default_grid = build_periodic_grid(
+            PeriodicCell(lattice_vectors=lattice), PeriodicGridSettings(spacing=0.6, expansion_order=6)
+        )
+        for name, target in (("fortran", grid), ("default", default_grid)):
+            for core in (False, True):
+                with self.subTest(grid=name, core=core):
+                    device = periodic_setup._density_provider(target, atoms, potentials, specifications, lattice, core)
+                    with mock.patch.object(periodic_device, "_cupy", return_value=None):
+                        host = periodic_setup._density_provider(target, atoms, potentials, specifications, lattice, core)
+                    self.assertGreater(float(host.max()), 0.0)
+                    _assert_same_bits(self, device, host)
+
     def test_densities_equal_the_readable_sum(self) -> None:
         grid, atoms, potentials, specifications, lattice = _mixed_cell()
         for core in (False, True):
@@ -297,7 +320,8 @@ class ImageBlockTests(unittest.TestCase):
     def test_his_bulk_grid_takes_the_index_boxes_with_his_support_radii(self) -> None:
         # Andrew Grieder's grid of the cell (half a step off the origin, a step per axis): his readable sum, whose
         # images reach atomic_density_support_radius, bit for bit
-        _, atoms, potentials, specifications, lattice = _mixed_cell()
+        _, atoms, potentials, specifications, _ = _mixed_cell()
+        lattice = np.diag((4.8, 5.4, 6.0))  # a step per axis in his grid
         grid = build_periodic_grid(
             PeriodicCell(lattice_vectors=lattice),
             PeriodicGridSettings(spacing=0.6, expansion_order=6, shift=(0.5, 0.5, 0.5), points_rule="fortran"),
@@ -433,29 +457,11 @@ class ImageBlockTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_SETUP_REACH": "Table"}):
             self.assertEqual(periodic_setup.reach_rule(), "table")
 
-    def test_ion_ion_terms_on_threads_keep_the_energy(self) -> None:
-        _, atoms, potentials, _, lattice = _mixed_cell()
-        generator = np.random.default_rng(5)
-        many = tuple(
-            Atom("Ge" if index % 3 else "H", generator.uniform(0.0, 4.8, size=3), [0.0, 0.0, 0.0])
-            for index in range(24)
-        )
-        for cell_atoms in (atoms, many):
-            periodic_setup.uninstall()
-            try:
-                serial = ewald_ion_ion_energy(cell_atoms, potentials, lattice)
-            finally:
-                periodic_setup.install()
-            for threads in ("1", "4"):
-                with self.subTest(atoms=len(cell_atoms), threads=threads), mock.patch.dict(
-                    os.environ, {"PARSEC_PERIODIC_SETUP_THREADS": threads}
-                ):
-                    threaded = ewald_ion_ion_energy(cell_atoms, potentials, lattice)
-                    self.assertEqual(np.float64(threaded).tobytes(), np.float64(serial).tobytes())
-        # the map hands the terms back in the order of the translations
-        with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_SETUP_THREADS": "4"}):
-            order = list(periodic_setup._translation_map(lambda t: t * t, list(range(50)), 10))
-        self.assertEqual(order, [t * t for t in range(50)])
+    def test_ordered_results_keep_the_order_of_the_items(self) -> None:
+        # the blocks of the densities and of the local potential are added in the order of their items
+        for threads in (1, 4):
+            order = list(periodic_setup._ordered_results(lambda t: t * t, list(range(50)), threads))
+            self.assertEqual(order, [t * t for t in range(50)])
 
     def test_thread_setting(self) -> None:
         with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_SETUP_THREADS": "3", "OMP_NUM_THREADS": "7"}):
@@ -475,6 +481,96 @@ class ImageBlockTests(unittest.TestCase):
             self.assertGreaterEqual(eta * r, periodic_setup._ERF_ONE_FROM)
             self.assertLess(eta * float(np.nextafter(r, 0.0)), periodic_setup._ERF_ONE_FROM)
             self.assertEqual(float(erf(eta * r)), 1.0)
+
+
+def _shifted(cell, shift):
+    """``_mixed_cell`` on its grid shifted by ``shift`` steps (PARSEC 1.5's parity round: Fortran's points)."""
+    grid, atoms, potentials, specifications, lattice = cell
+    settings = PeriodicGridSettings(fortran_routines=True, spacing=0.6, expansion_order=6, shift=shift)
+    shifted = build_periodic_grid(grid.cell, settings)
+    return shifted, atoms, potentials, specifications, lattice
+
+
+def _translated(cell, shift):
+    """``_mixed_cell`` on its grid without shift, the atoms moved by ``-shift`` steps: the points of ``_shifted``
+    relative to the atoms."""
+    grid, atoms, potentials, specifications, lattice = cell
+    step = float(grid.spacing)
+    moved = tuple(
+        Atom(atom.symbol, np.asarray(atom.position, dtype=float) - np.asarray(shift) * step, [0.0, 0.0, 0.0])
+        for atom in atoms
+    )
+    return grid, moved, potentials, specifications, lattice
+
+
+@_TABLE_REACH
+class ShiftedGridTests(unittest.TestCase):
+    """The orthorhombic grid of these routines with a shift (``Grid_Shift``, 0.5 without ``Ignore_Symmetry``): the
+    index boxes and the FFT phases of the fast preparation follow it."""
+
+    SHIFTS = ((0.5, 0.5, 0.5), (0.25, 0.0, 0.5))
+
+    def setUp(self) -> None:
+        self.addCleanup(periodic_setup.install)
+        periodic_setup.install()
+
+    def test_grid_ball_equals_the_dense_scan(self) -> None:
+        generator = np.random.default_rng(11)
+        for shift in self.SHIFTS:
+            grid = _shifted(_mixed_cell(), shift)[0]
+            self.assertEqual(float(grid.coordinates[-1, 2]), (grid.points_per_axis[2] - 1 + shift[2]) * grid.spacing)
+            for _ in range(40):
+                centre = generator.uniform(-6.0, 12.0, size=3)
+                radius = float(generator.uniform(0.2, 7.0))
+                with self.subTest(shift=shift):
+                    rows, relative, distances = periodic_setup.grid_ball(grid, centre, radius)
+                    expected = dense_support(grid, centre, radius)
+                    np.testing.assert_array_equal(rows, expected[0])
+                    np.testing.assert_array_equal(relative, expected[1])
+                    np.testing.assert_array_equal(distances, expected[2])
+
+    def test_densities_equal_the_readable_sum(self) -> None:
+        for shift in self.SHIFTS:
+            grid, atoms, potentials, specifications, lattice = _shifted(_mixed_cell(), shift)
+            for core in (False, True):
+                with self.subTest(shift=shift, core=core):
+                    readable = _readable_density(grid, atoms, potentials, specifications, lattice, core)
+                    provided = periodic_setup.periodic_atomic_density(
+                        grid, atoms, potentials, specifications, lattice, core
+                    )
+                    _assert_same_bits(self, provided, readable)
+
+    def test_the_local_potential_is_the_direct_sum_and_moves_with_the_grid(self) -> None:
+        for shift in self.SHIFTS:
+            shifted = _shifted(_mixed_cell(), shift)
+            with self.subTest(shift=shift):
+                fast = self._potential(shifted)
+                blocks_free = self._potential(shifted, balls=True)
+                _assert_same_bits(self, fast, blocks_free)
+                periodic_setup.uninstall()
+                try:
+                    direct = ewald_local_ionic_potential(*shifted, tolerance=1.0e-26)
+                finally:
+                    periodic_setup.install()
+                np.testing.assert_allclose(fast, direct, rtol=0.0, atol=1.0e-9)
+                # the same points relative to the atoms: the grid without shift and the atoms moved back
+                translated = self._potential(_translated(_mixed_cell(), shift))
+                np.testing.assert_allclose(fast, translated, rtol=0.0, atol=1.0e-10)
+
+    def test_a_zero_shift_keeps_the_numbers_of_the_grid_from_the_origin(self) -> None:
+        cell = _mixed_cell()
+        _assert_same_bits(self, self._potential(_shifted(cell, (0.0, 0.0, 0.0))), self._potential(cell))
+        grid, atoms, potentials, specifications, lattice = cell
+        np.testing.assert_array_equal(_shifted(cell, (0.0, 0.0, 0.0))[0].coordinates, grid.coordinates)
+
+    def _potential(self, cell, *, balls: bool = False):
+        grid, atoms, potentials, specifications, lattice = cell
+        if balls:
+            with mock.patch.object(periodic_setup, "_axis_coordinates", return_value=None):
+                return periodic_setup.fft_local_ionic_potential(
+                    grid, atoms, potentials, specifications, lattice, None, 1.0e-14
+                )
+        return periodic_setup.fft_local_ionic_potential(grid, atoms, potentials, specifications, lattice, None, 1.0e-14)
 
 
 if __name__ == "__main__":

@@ -99,6 +99,14 @@ class CuPySCFEigensolver:
         result = self.solver.solve(requested_states, settings=settings)
         return self._result(result)
 
+    def translate_saved_rows(self, source_rows):
+        """FDET warm start: the saved subspace translated on the grid
+        (:meth:`CuPyEigvalSolver.translate_saved_rows`); ``None`` before any solve."""
+
+        if self.solver is None:
+            return None
+        return self.solver.translate_saved_rows(source_rows)
+
     def start_new_scf_loop(self):
         """Keep the subspace for the SCF loop of the next structure.
 

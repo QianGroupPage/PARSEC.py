@@ -361,15 +361,36 @@ class RoutingTests(unittest.TestCase):
             for text, name in (
                 (_SLAB.format(extra=""), "wire or slab in an MPI run"),
                 (_CELL.format(xc="ca", extra="Calc_Hartree_G: .true."), "Calc_Hartree_G) in an MPI run"),
-                (_CELL.format(xc="ca", extra="Zero_Average_Vxc: .true."), "Zero_Average_Vxc) in an MPI run"),
                 (_CELL.format(xc="ca", extra="Periodic_Local_Potential: g_space"), "g_space) in an MPI run"),
             ):
                 with self.subTest(name=name):
                     features = self.features(text)
                     self.assertTrue(any(name in item for item in features), features)
             self.assertEqual(self.features(_CELL.format(xc="ca", extra="")), [])
-            with mock.patch.dict(os.environ, {"PARSEC_KPOINT_BACKEND": "cupy"}):
-                self.assertIsNone(periodic_device.hartree_device_id())
+            # Zero_Average_Vxc (PARSEC 1.5's potshift) is the default of a 3-D cell since 2026-11-08: the route of
+            # the cell, given or not
+            self.assertEqual(self.features(_CELL.format(xc="ca", extra="Zero_Average_Vxc: .true.")), [])
+            self.assertEqual(self.features(_CELL.format(xc="ca", extra="Zero_Average_Vxc: .false.")), [])
+
+    def test_an_mpi_rank_solves_on_its_own_device(self) -> None:
+        # the replicated k-point drivers of an MPI run (since 2026-11-08): the device of the rank's k-point
+        # solver, device_ids[local rank % count]; the CPU plans keep the host
+        from types import SimpleNamespace
+
+        from parsec_python.acceleration.Hamiltonian.device_bloch import KPointBackend
+        from parsec_python.acceleration.Parallel import mpi
+
+        with mock.patch.dict(os.environ, {"PARSEC_MPI": "1"}), mock.patch.object(
+            mpi, "context", return_value=SimpleNamespace(local_rank=5)
+        ):
+            with mock.patch(
+                "parsec_python.acceleration.SCF.kpoint_parallel.resolve_backend",
+                return_value=KPointBackend("cupy", (0, 1, 2, 3)),
+            ):
+                self.assertEqual(periodic_device.hartree_device_id(), 1)
+            for backend in ("cpu", "numpy-device"):
+                with self.subTest(backend=backend), mock.patch.dict(os.environ, {"PARSEC_KPOINT_BACKEND": backend}):
+                    self.assertIsNone(periodic_device.hartree_device_id())
 
     def test_combinations_stay_routed_by_name(self) -> None:
         kpoints = "Kpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n 2 2 1\nend Monkhorst_Pack_Grid"

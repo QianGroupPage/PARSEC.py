@@ -13,11 +13,19 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 - Isolated systems (`Boundary_Conditions: cluster`), sphere or box domain,
   CA/PZ LDA or PBE, without or with spin polarization, with or without
   nonlinear core correction, projectors through `l = 3`.
+- Self-consistent hybrid functionals of isolated systems (PBE0, HSE06,
+  B3LYP, HF, ...), without or with spin polarization: forces, relaxation and
+  molecular dynamics on both command lines (`main.py` on the GPUs of one
+  node) and on several nodes (the MPI runner of
+  [acceleration/MULTI_GPU.md](acceleration/MULTI_GPU.md#hybrid-functionals-on-several-nodes));
+  of periodic cells (bulk at the Gamma point, also with spin, and with
+  k-points; slabs) on the readable solver and on the GPUs of one node; see
+  [Hybrid functionals](#hybrid-functionals) below.
 - Periodic cells (`Boundary_Conditions: bulk`), without spin-orbit coupling, at the Gamma point or with a Monkhorst-Pack
   k-point sampling (collinear spin polarization at the Gamma point only): forces, `Minimization: bfgs | simple | manual`
   and molecular dynamics. See "Periodic cells" below; the spin-unpolarized Gamma-point cell also runs on the accelerated
   path, and a cell with k-points on the GPUs of the k-point solver (see "On GPUs"). A spin-polarized one with k-points
-  does not have them yet.
+  does not have them on these routines; such an input runs on the Fortran-derived routines by itself, with a warning.
 - Self-consistent spin-orbit coupling (`SO_from_scratch`, alone or with `Spin_Polarization`) and non-collinear magnetism
   (`Non_Collinear_magnetism`, with or without spin-orbit), isolated or periodic at the Gamma point or with k-points:
   forces, relaxation and molecular dynamics. See "Spin-orbit coupling and non-collinear magnetism" below. The
@@ -74,9 +82,12 @@ Units are PARSEC's throughout: bohr, Rydberg, Ry/bohr.
 | `Min_Step` | 1e-4 bohr | `simple`: displacement of a coordinate whose force equals `Force_Min`. |
 | `BFGS_number_corr` | 7 | Corrections the limited-memory matrix keeps. |
 | `Relax_Restart` | `false` | Read `relax_restart.dat` beside the input: its coordinates replace those of the input and its BFGS block continues the optimizer. |
+| `Write_Relax_Restart` | `true` here | PARSEC 1.5: write `relax_restart.dat` after every movement. 1.5 writes it only with `true` (its default is `false`); this package writes it unless the input says `false`. |
+| `Calculate_Force` | not given | PARSEC 1.5: `true` gives the forces of a single point (as `Skip_Force: false`), `false` none. Without either keyword a single point computes no forces here (PARSEC computes them in every run). `false` with a relaxation or molecular dynamics is refused. `Use_Old_Forces` (1.5's serial force routines, the same forces) is accepted and changes nothing. |
+| `Recenter_Atoms_In_Aperiodic_Directions` | `true` | PARSEC 1.5: `false` keeps the coordinates of the input (no re-centring of a cluster or, along z, of a slab; also in a molecular dynamics restart). Since 1.5 a slab is re-centred in a `Restart_Run` too. |
 | `Move_Flag` (per `Atom_Type`) | 0 | 0 moves every atom of the type, `n > 0` its first `n` atoms, a negative value reads a fourth column of `Atom_Coord` (1 moves, 0 fixes). |
 | `Molecular_Dynamics` | `false` | Switches molecular dynamics on; it excludes `Minimization`. |
-| `Cooling_Method`, `Tinit`, `T_Final`, `T_Step`, `Time_Step`, `Friction_Coefficient`, `Step_num`, `Restart_mode`, `rng_seed`, `test_rng` | PARSEC's | Controls of `moldyn.f90`; see "Molecular dynamics" below. |
+| `Cooling_Method`, `Tinit`, `T_Final`, `T_Step`, `Time_Step`, `Friction_Coefficient`, `Step_num`, `Restart_mode`, `rng_seed` (PARSEC 1.5: `Mol_RNG_Seed`), `test_rng` | PARSEC's | Controls of `moldyn.f90`; see "Molecular dynamics" below. |
 | `Initial_Structure` | `input` | Not a PARSEC keyword. `mlff` relaxes the input structure with a machine-learned force field (UMA, MACE, `MLFF_Model`) before the first SCF loop; see [MLFF/README.md](MLFF/README.md). |
 | `Potential_Extrapolation` | `none` | Not a PARSEC keyword. How the SCF loop of a moved structure starts: `none` as PARSEC, `atomic` with the superposed atomic densities moved along with the atoms, `second_order` with the density change also extrapolated along the trajectory; see "Start of the next SCF loop" below. |
 | `Relaxation_SCF_Upscale` | 1 | Not a PARSEC keyword. `bfgs` and `simple` only: the SCF loop of a structure may stop at up to this many times `Convergence_Criterion` while the forces are large; 1 keeps the criterion fixed as PARSEC does. See "SCF criterion of a relaxation". |
@@ -104,7 +115,11 @@ scripts/run_multi_gpu_scf.sh calculation/parsec.in output_directory
 
 The exit status is 0 for a finished run, 3 when an SCF loop did not converge
 and 4 when the structure is not relaxed (movements used up, or the optimizer
-stopped above `Force_Min`).
+stopped above `Force_Min`).  As in PARSEC 1.5, an SCF loop that does not
+converge ends a relaxation or molecular dynamics run: the forces of that
+structure are computed and reported, the atoms are not moved from it, and the
+log says " WARNING !!! atom movement is terminated" (the previous Fortran tree,
+and this package before, moved on).
 
 Two inputs of Fortran PARSEC are kept as runnable examples with their Fortran
 trajectories: `examples/0d_water_geoopt` (BFGS) and
@@ -126,7 +141,10 @@ directory):
 | `parsec_python_results.npz` | Unless `--no-archive`: the result of the last structure and, under `relaxation_*`, positions, energies and forces of all of them. |
 
 Molecular dynamics writes PARSEC's `md_nrg.dat`, `md_mech.dat`, `mdinit.dat`,
-`atom.cor` and `movie.xyz`.
+`atom.cor` and `movie.xyz`, in the formats of PARSEC 1.5: integer fields `i6`
+for the steps and `i7` for the atom count, and the velocities of
+`md_mech.dat` (and so of an `mdinit.dat` cut from it) are `v(t)` of the step,
+where the previous Fortran tree wrote its estimate of the next step's velocity.
 
 ### From Python
 
@@ -185,6 +203,91 @@ out, as in PARSEC.
 correction, core correction and nonlocal forces, the total before and after
 symmetrization, the net force that was removed and the torque.
 
+### Hybrid functionals
+
+With a hybrid `Correlation_Type` ([README.md](README.md#self-consistent-hybrid-functionals))
+the forces keep the form above, with the orbitals and the density of the
+converged generalized Kohn-Sham state: with norm-conserving
+pseudopotentials the exchange operator has no explicit dependence on the
+ions, and the only term that sees the core density is the semilocal part,
+whose potential (with the reduced semilocal exchange) the core-correction
+force reads. Finite differences of the total energy (H2, H2O and LiH, whose
+Li has a core correction, `h = 0.4` bohr, displacements of 0.01 bohr) give
+the same analytic-minus-numeric difference for PBE0 as for PBE, 1.2e-3 to
+3.4e-3 Ry/bohr (the grid error of that spacing), equal within 1e-4 Ry/bohr.
+In a relaxation or in molecular dynamics the Fock loop of a moved structure
+builds its first exchange operator from the orbitals of the structure
+before, so only the first structure runs the PBE start.
+
+On several nodes (`scripts/run_multi_gpu_scf.sh`) the ranks keep the orbitals
+of their sectors between the structures as well, and the nonlocal force terms
+come from the sectors of every rank as for a semilocal functional; a
+structure without symmetry (molecular dynamics, `manual` moves) has its sector
+on one GPU of the root and the pair densities of its exchange on the GPUs of
+all ranks. Measured on A100 nodes: two BFGS moves of C185H124 (PBE0, forces
+of every structure) on 2 nodes against one node, energies within 6.7e-10 Ry,
+forces within 1.2e-11 Ry/bohr, the same SCF iterations; three steps of
+molecular dynamics of H2O (PBE0, one sector) on 2 nodes, the trajectory of one
+node to the last bit.
+
+Periodic cells ([README.md](README.md#periodic-cells)) take the same forces:
+at the Gamma point from the real orbitals of the Fock loop (also with
+collinear spin), with k-points from the Bloch factors of every k-point the
+loop solved (the time-reversal representatives of the mesh, whose weights
+count their partners); on Andrew Grieder's routines the nonlocal force is
+accumulated from them after the loop
+(`SCF/hybrid_periodic.bloch_nonlocal_forces`), on the Fortran-derived ones
+`Forces/periodic.py` reads them. A moved structure starts its Fock loop
+from the potentials, the eigensubspaces of every k-point and the Bloch
+orbitals of the structure before. There is no stress.
+
+### Meta-GGA functionals
+
+With a meta-GGA ([README.md](README.md#meta-gga-functionals)) the forces keep
+the form above as well: `tau` is a functional of the orbitals alone, and the
+orbital term `-div(vtau grad)` (with the first-order term of `W = de/dg` in
+the orbital form of the density gradient) has no explicit dependence on the
+ions. The only term that sees the frozen core density is the core
+correction. The core density enters the density `n` and the density
+gradient, never `tau` (as in Quantum ESPRESSO and PARSEC 1.5 with libxc), so
+the force reads `dE_xc/dn_core`:
+
+- density form: the exchange-correlation potential `vrho + D^T (2 vsigma D n)`
+  of the total density, as for a GGA;
+- orbital form: `vrho + D^T W` with `W` formed from the gradient of the valence
+  orbitals plus that of the core density
+  (`MetaGGARecord.core_potential`, half the core density per channel with
+  spin), since the potential of that form holds `vrho` alone.
+
+The SCF test of `tests/unit/test_meta_gga_scf.py` compares this force with
+the derivative of the meta-GGA energy with respect to the position of the
+core density (LiH, both forms): 2e-4 relative, as for PBE. The SCF
+correction force uses `V_out - V_in` as for every functional; the residual
+of `vtau` (and `W`) is not part of it. In a relaxation or in molecular
+dynamics the next structure starts from the mixed `vtau` (and `W`) of the
+structure before, so only the first one runs the PBE start.
+
+Periodic cells (bulk at Gamma and with k-points, slabs and wires) take the same terms: the periodic and slab
+forces read `dE_xc/dn_core` through `Forces.periodic.meta_gga_core_potential` (the core potential of the orbital form,
+the exchange-correlation potential otherwise), and the k-point loops carry `vtau` and `W` to the next structure
+(Andrew Grieder's backend through `SCFWarmStart`, the Fortran-derived one through `meta_gga_start` of
+`run_scf_kpoints`). Central differences of the total energy of a Si cell (fcc, two atoms, one displaced by
+(0.1, 0.05, -0.08) bohr, Andrew Grieder's routines, step 0.01 bohr, SCF to 1e-9 Ry) against the forces of
+`compute_periodic_forces`, largest component difference in Ry/bohr (forces ~0.03-0.06):
+
+| functional | Gamma, h 0.4 | 2 k-points, h 0.4 | Gamma, h 0.3 |
+|---|---|---|---|
+| PBE | 3.5e-4 | 2.7e-4 | 1.7e-4 |
+| smooth test meta-GGA (`tests/unit/test_meta_gga.py`) | 3.4e-4 | - | - |
+| SCAN, density form | 1.8e-3 | 2.5e-3 | 3.8e-4 |
+| SCAN, orbital form | - | 2.6e-3 | - |
+
+The meta-GGA terms of the forces are complete: the smooth meta-GGA matches PBE, and SCAN's larger difference at
+h 0.4 falls by a factor of five at h 0.3 (PBE's by two), the grid sensitivity of SCAN rather than a missing term. On
+the Fortran-derived routines (`Use_Fortran_Routines: .true.`, the same cell with the FHI98PP potential of
+`examples/3d_meta_gga`, two k-points, h 0.3, `Forces.compute_forces`) the differences are 2.1e-3 (PBE) and 2.6e-3
+Ry/bohr (SCAN): the meta-GGA adds nothing to what those routines show for PBE.
+
 ## Periodic cells
 
 A periodic cell has forces, relaxation and molecular dynamics through the periodic backend
@@ -196,7 +299,8 @@ Forces (`Forces.compute_periodic_forces`; the Fortran routines are `forpbc.f90`,
 `forcnloc.f90`):
 
 1. **Ion-ion**: the exact derivative of the Ewald energy (`Forces/ion_ion.py: ewald_ion_ion_forces`): the real-space sum
-   over images and the reciprocal sum.
+   over the atom pairs within the cutoff and the reciprocal sum over the structure factors of a box of reciprocal
+   vectors (`V_ion.ewald.ewald_ion_ion_terms`, 4 s for 4,096 atoms on a laptop).
 2. **Local pseudopotential** (`Forces/periodic_local.py`): `integral rho(r) grad V_a(r - R_a)` over the images of the local
    potential as it is built (the short-ranged `V_a(d) + 2 Z erf(eta d)/d` and the reciprocal series), and
    `integral V_xc(r) rho_core'(d) d/|d|` over the images of the core density. There is no SCF-residual term, as in
@@ -466,7 +570,12 @@ trajectory can be compared with Fortran PARSEC only where both draw the same
 ones:
 
 - `test_rng: true` selects PARSEC's own deterministic generator, started from
-  `rng_seed`; the numbers are those of the Fortran program.
+  `rng_seed`; the numbers are those of the Fortran program.  A restart draws
+  `2 (iframe - 1)` numbers first, as PARSEC 1.5 does, so that the generator
+  continues about where the earlier run left it.
+- `Mol_RNG_Seed` is PARSEC 1.5's name of `rng_seed` (1.5 no longer reads the
+  old name); both are read here with the same meaning, an input with both is
+  refused.
 - `rng_seed: n` with `n > 0` alone makes PARSEC seed the generator of its
   compiler. This package then draws what a PARSEC built by gfortran 8 or
   later draws, so the two give the same trajectory;
@@ -494,9 +603,11 @@ real-space Ewald split instead of the G-space `v_first`/`pot_local`):
 - local: `dV sum_r rho(r) [sum_T f'(|d_T|) d_T/|d_T| + 2Z (4 pi/V) sum_G w_G G sin(G.(r - R))]`
   with `f = V_loc + 2Z erf(eta r)/r` and the translations and G vectors of
   `ewald_local_ionic_potential`; ion-ion: the derivative of
-  `ewald_ion_ion_energy` with its translations (both sums keep every image a
-  pair or a grid point reaches, for any cell shape, so an atom that crosses a
-  cell face and is translated back changes no energy);
+  `ewald_ion_ion_energy` over the same atom pairs within the real-space cutoff
+  and the same reciprocal vectors (`V_ion.ewald.ewald_ion_ion_terms` evaluates
+  both; both sums keep every image a pair or a grid point reaches, for any cell
+  shape, so an atom that crosses a cell face and is translated back changes no
+  energy);
 - radial functions are differentiated as the energy samples them (slope of the
   linear interpolant of `r V`, of the densities and of the projectors, or the
   spline derivative). `PARSEC_PERIODIC_FORCE_SLOPES=tabulated` takes for the
@@ -580,8 +691,21 @@ built on the device (`acceleration/V_ion/periodic_device.py`,
   projectors of the device Hamiltonian in place, and the next SCF loop
   continues from the saved subspace, as for a cluster.
 
-`Cubic_Spline` species and the G-space local potential keep the readable
-fields and forces. A plain single point (no forces, no moving atoms) keeps
+The G-space local potential keeps the readable fields and forces.
+`Cubic_Spline` species keep the fields of the host preparation
+(`periodic_setup.py`); their local forces are the derivatives of those fields
+(`acceleration/Forces/periodic_spline.py`, since 2026-11-07: the short-ranged
+terms on the host over the balls of the potential, the reciprocal part from
+one FFT, the self-consistency and core terms in the CUDA kernel above). The
+readable routine they replace summed every grid point of every image within
+`erfcinv(1e-26)/eta`: 34 s against 3.5 s for the local forces of the 8-atom cube
+at h 0.25 on an A100 node, 892 s against 5.2 s for the 64-atom cube at h 0.30.
+On Fortran's general (oblique) grid, whose `Cubic_Spline` potential takes the
+same split by default (`PARSEC_PERIODIC_OBLIQUE_SPLIT`), the same routine
+differentiates it over the lattice balls (the density terms in a lattice
+kernel on the device; within 2.2e-8 Ry/bohr of fourth-order differences of
+the energy of the potential for a distorted fcc Si16 cell at h 0.30, 4.5e-7 of
+the readable forces for a distorted Si2 cell). A plain single point (no forces, no moving atoms) keeps
 the readable fields bit for bit on both command lines. The projector
 gradients of the forces find their grid points with the grid-ball query of
 `periodic_setup.py` (the same matrices). Si8 cube (h 0.64 bohr, laptop RTX
@@ -869,7 +993,15 @@ and largest force of `atom.cor` equal in all printed digits.
 Molecular dynamics, both SCF loops converged to 1e-8 Ry: `md_nrg.dat` is the
 same text as the Fortran file in every case below, and positions, velocities
 and accelerations of `md_mech.dat` agree within one unit of their last
-printed digit.
+printed digit (the previous Fortran tree; since the formats of PARSEC 1.5 the
+integer fields are wider and the velocities are `v(t)`).  Against PARSEC 1.5
+itself (H2, Langevin with `test_rng` and `Mol_RNG_Seed`, 3 steps and a restart
+of 2, both codes with their own SCF): `md_nrg.dat` and `movie.xyz` are the same
+text (but for the last digit of one temperature), `md_mech.dat` agrees to its
+eighth digit (the forces of the two codes differ at 1e-7), and a restart
+reproduces 1.5 only with its fast-forward of the generator
+(`tests/unit/test_moldyn.py::Parsec15ExecutableTests` replays 1.5's printed
+forces).
 
 | Case | Steps |
 |---|---:|

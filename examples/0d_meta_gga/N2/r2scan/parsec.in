@@ -1,0 +1,28 @@
+# N2: r2SCAN (Furness et al. 2020) of libxc: MGGA_X_R2SCAN + MGGA_C_R2SCAN
+# Quantum ESPRESSO reference: input_dft = 'XC-000I-000I-000I-000I-497L-498L' (qe/README.md)
+
+Boundary_Sphere_Radius: 11.04
+Grid_Spacing: 0.160
+Coordinate_Unit: Cartesian_Bohr
+Expansion_Order: 12
+LibXC_Functional: mgga_x_r2scan mgga_c_r2scan
+States_Num: 9
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+
+Atom_Types_Num: 1
+
+Atom_Type: N
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 1.6
+begin Electron_Per_Orbital
+2 3 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.
+begin Atom_Coord
+     0.0000000000    0.0000000000    1.0371761835
+     0.0000000000    0.0000000000   -1.0371761835
+end Atom_Coord

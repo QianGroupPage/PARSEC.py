@@ -7,11 +7,14 @@ Two sets of routines build them (``PeriodicGridSettings.fortran_routines``, the 
 * the default (Andrew Grieder's): :class:`PeriodicRealSpaceGrid` for every cell, with grid axes along the
   lattice vectors and the step vectors ``s_m = a_m/n_m``; an oblique cell carries the metric of the cell in
   its Laplacian (:mod:`parsec_python.Laplacian.lattice_metric`);
-* the Fortran-derived routines of the parity round: :class:`PeriodicRealSpaceGrid` for an orthorhombic cell
-  whose three sides share one grid spacing (``n_i = round(L_i/h)``, points ``i*h``, the port's original
-  convention), and :class:`GeneralPeriodicGrid` for every other cell (non-orthogonal lattice vectors, or
-  sides without a common spacing): Fortran PARSEC's grid along the unit lattice directions (F ``inipbc.f90``,
-  ``grid_partition.f90``).
+* the Fortran-derived routines of the parity round: Fortran PARSEC's grid (F ``inipbc.f90``,
+  ``grid_partition.f90``): along every lattice vector the number of points ``adjust_step`` chooses (even, a step
+  not below the input spacing, commensurate with the fractional translations of the space group) and the points
+  ``(i + shift_i) h_i`` (``settings.shift``: half a step, zero with ``Ignore_Symmetry`` and along oblique
+  directions, or the ``Grid_Shift`` block).  A cell with orthogonal lattice vectors whose steps agree is
+  :class:`PeriodicRealSpaceGrid` (one spacing, the orthorhombic fast paths), every other cell
+  (non-orthogonal lattice vectors, or steps that differ) :class:`GeneralPeriodicGrid`.  Up to the parity round
+  of PARSEC 1.5 the orthorhombic grid of these routines had ``round(L_i/h)`` points from the origin.
 """
 
 from __future__ import annotations
@@ -23,6 +26,9 @@ import numpy as np
 
 from ..models import PeriodicCell, PeriodicGridSettings
 from .cell import is_diagonal_lattice
+
+#: ``parsec_tol`` of PARSEC 1.5 (``math/const.F90:36``), the slack of the exit test of ``adjust_step``.
+_PARSEC_TOL = 1.0e-15
 
 
 @dataclass(frozen=True)
@@ -38,7 +44,8 @@ class PeriodicRealSpaceGrid:
     has grid axes along its lattice vectors.
 
     With the Fortran-derived routines (``settings.fortran_routines``) this class is the orthorhombic grid of
-    one common spacing only, whose points start at the origin (every other cell gets :class:`GeneralPeriodicGrid`).
+    one common spacing only (Fortran's counts, :func:`fortran_orthorhombic_counts`), its points ``(i + shift) h``
+    (every other cell gets :class:`GeneralPeriodicGrid`).
     """
 
     cell: PeriodicCell
@@ -67,13 +74,10 @@ class PeriodicRealSpaceGrid:
 
     @cached_property
     def shift(self) -> np.ndarray:
-        """Offset of the first point along each lattice axis, in grid steps.
+        """Offset of the first point along each lattice axis, in grid steps (``settings.shift``).
 
-        Zero on the orthorhombic grid of the Fortran-derived routines, which does not read ``settings.shift``.
         (A cached property: :class:`GeneralPeriodicGrid` stores its own as a field.)
         """
-        if getattr(self.settings, "fortran_routines", False):
-            return np.zeros(3, dtype=np.float64)
         return np.asarray(self.settings.shift, dtype=np.float64)
 
     @property
@@ -240,48 +244,19 @@ class GeneralPeriodicGrid(PeriodicRealSpaceGrid):
         return lattice_coordinates @ self.normalized_lattice.T
 
 
-def adjust_step(
-    length: float,
-    spacing: float,
-    *,
-    maximum: int = 1000,
-    translations: tuple[float, ...] = (),
-) -> tuple[int, float]:
-    """Number of points and step along one lattice direction (F ``adjust_step``).
+def _commensurate_step(length: float, stepin: float, taus: tuple[float, ...], maximum: int) -> float | None:
+    """F ``adjust_step`` along one direction (PARSEC 1.5 ``grid/inipbc.f90:567-627``): the step ``x*L``, or ``None``.
 
-    Translation of ``inipbc.f90:327-429``.  ``translations`` are the
-    fractional translations ``|M t|`` of the space group along this
-    direction (:meth:`parsec_python.Grid.space_group.SpaceGroup.commensurate_translations`;
-    none for a symmorphic group or ``Ignore_Symmetry``).  With ``tau_min``
-    the smallest of them (1 without any), ``x = tau_min/nn`` for
-    ``nn = 1, 2, ...`` until ``x < h/L``; a trial is kept when every
-    ``tau/x`` and ``0.5/x`` are integers (within ``1e-8``), so the last one
-    kept is the smallest commensurate step ``x*L >= h`` with an even number
-    of points.  The step is ``x*L`` and ``n = 2*nint(L/(2*step))``
-    (``inipbc.f90:107-121``).  Example without translations: 10 bohr at
-    ``h = 0.6`` gives ``n = 16`` and ``h = 0.625``.
-
-    No trial commensurate with the translations (a translation such as
-    0.27 of an atom moved along a three-fold axis, which no even ``n`` near
-    ``L/h`` divides): Fortran's loop then ends without setting the step,
-    and ``grid%step`` keeps the input spacing that ``inipbc.f90:84`` put
-    there, so ``n = 2*nint(L/(2h))``.  This port takes that ``n`` with the
-    step ``L/n``.  Fortran keeps the step ``h`` itself, a grid of ``n h``
-    in a cell of length ``L`` (fcc Si2, a 0.27 translation, h 0.6: twelve
-    points 0.600 bohr apart along 7.2549 bohr lattice vectors, 0.0204 Ry
-    above its own run of twelve points with ``Ignore_Symmetry``, whose step
-    is 0.605).  The operations then do not map the grid onto itself: what
-    needs that (the density symmetrization) refuses them by name
-    (:func:`parsec_python.Grid.space_group.grid_commensurability_problem`).
+    With ``tau_min`` the smallest translation (1 without any), the trials ``x = tau_min/nn``, ``nn = 1, 2, ...``
+    run until ``x < stepin/L - 1e-15``; a trial is kept when every ``tau/x`` and ``0.5/x`` are integers (within
+    ``1e-8``), so the last one kept is the smallest commensurate step ``x*L >= stepin`` with an even number of
+    points.  ``None`` where no trial is kept (Fortran then leaves ``stepout`` as it was).
     """
 
-    length = float(length)
-    spacing = float(spacing)
-    taus = tuple(float(value) for value in translations)
     tau_min = min(taus) if taus else 1.0
     step = None
     for trial in range(1, maximum + 1):
-        if tau_min / float(trial) < spacing / length:
+        if tau_min / float(trial) < stepin / length - _PARSEC_TOL:
             break
         x = tau_min / float(trial)
         commensurate = True
@@ -295,18 +270,156 @@ def adjust_step(
         if not commensurate:
             continue
         step = x * length
-    if step is None and taus:
-        points = 2 * int(np.floor(length / (2.0 * spacing) + 0.5))
-        if points >= 2:
-            return points, length / float(points)
-    if step is None:
-        raise ValueError(
-            f"a lattice vector of {length:.6g} bohr is shorter than two grid "
-            f"spacings of {spacing:.6g} bohr; PARSEC needs an even number of "
-            "points along every lattice direction"
-        )
-    points = 2 * int(np.floor(length / (2.0 * step) + 0.5))
-    return points, step
+    return step
+
+
+def adjusted_steps(
+    lengths,
+    spacing: float,
+    translations=None,
+    *,
+    maximum: int = 1000,
+    passes: int = 100,
+) -> tuple[list[int], list[float]]:
+    """Numbers of points and steps along the periodic directions: PARSEC 1.5's loop around ``adjust_step``.
+
+    ``grid/inipbc.f90:131-252`` with one point per fold block (``Foldblock_Side_Length`` 1; a larger block switches
+    the symmetry off, and without translations every direction has a commensurate step, whose count the blocks of
+    an even side keep).  ``lengths`` are ``|a_i|`` of the periodic directions (``pbc%box_size(1:per)``),
+    ``translations`` their fractional translations (``|M t|`` of the space group,
+    :meth:`parsec_python.Grid.space_group.SpaceGroup.commensurate_translations`; none for a symmorphic group or
+    ``Ignore_Symmetry``).  Every pass:
+
+    1. :func:`_commensurate_step` of every direction at ``stepin`` (the input spacing at first); a direction
+       without a commensurate step keeps its step (the input spacing, or ``L/n`` of an earlier pass);
+    2. ``stepin`` = the smallest step; the loop ends when it did not change by more than ``1e-15``
+    3. ``n = nint(L/step)`` and, where ``|step - L/n| > 1e-15``, the step ``L/n`` and another pass.
+
+    Where every direction has a commensurate step this is one ``adjust_step`` (the smallest step is one of the
+    steps found and keeps the others: ``n = L/step``, even).  Where one has none (a translation such as 0.27 of
+    an atom moved along a three-fold axis, which no even ``n`` near ``L/h`` divides), that direction gets
+    ``nint(L/h)`` points, odd or even, with the step ``L/n``; when that step is below ``h`` the next pass looks
+    for commensurate steps down to it, so the other directions can get more points (Si2 with a 0.27 translation:
+    28x6x36 where each direction alone gives 24x6x36).  The operations then do not map the grid onto itself: what
+    needs that (the density symmetrization) refuses them by name
+    (:func:`parsec_python.Grid.space_group.grid_commensurability_problem`).  The previous Fortran tree
+    (``inipbc.f90:327-429``) kept the input spacing itself there, a grid of ``n h`` in a cell of length ``L``.
+
+    The slack ``1e-15`` (``parsec_tol``) of the exit test is PARSEC 1.5's (``inipbc.f90:586-588``): a side that is
+    an even multiple of ``h`` up to round-off keeps that number of points (9.6 bohr at ``h = 0.4``: 24, where the
+    test without it, the previous Fortran tree's, gave 22 because ``1/24`` is a rounding below ``0.4/9.6``).
+    Raises ``ValueError`` where a side is shorter than two steps (Fortran would make one point) or the loop does
+    not settle within ``passes`` passes.
+    """
+
+    lengths = [float(value) for value in lengths]
+    spacing = float(spacing)
+    taus = [tuple(float(value) for value in entry) for entry in (translations or [()] * len(lengths))]
+    if len(taus) != len(lengths):
+        raise ValueError("one set of translations per periodic direction")
+    steps = [spacing] * len(lengths)
+    points = [0] * len(lengths)
+    stepin = spacing
+    for _ in range(passes):
+        hold = stepin
+        for axis, length in enumerate(lengths):
+            step = _commensurate_step(length, stepin, taus[axis], maximum)
+            if step is not None:
+                steps[axis] = step
+            elif not taus[axis]:
+                raise ValueError(
+                    f"a lattice vector of {length:.6g} bohr is shorter than two grid "
+                    f"spacings of {stepin:.6g} bohr; PARSEC needs an even number of "
+                    "points along every lattice direction"
+                )
+        stepin = min(steps)
+        settled = abs(hold - stepin) < _PARSEC_TOL
+        for axis, length in enumerate(lengths):
+            count = int(np.floor(length / steps[axis] + 0.5))
+            if count == 0:
+                count = int(np.ceil(length / steps[axis]))
+            points[axis] = count
+            fitted = length / float(count)
+            if abs(steps[axis] - fitted) > _PARSEC_TOL:
+                settled = False
+                steps[axis] = fitted
+        if settled:
+            break
+    else:
+        raise ValueError(f"PARSEC's grid steps along {lengths} at {spacing:.6g} bohr do not settle")
+    for axis, length in enumerate(lengths):
+        if points[axis] < 2:
+            raise ValueError(
+                f"a lattice vector of {length:.6g} bohr is shorter than two grid "
+                f"spacings of {spacing:.6g} bohr; PARSEC needs at least two "
+                "points along every lattice direction"
+            )
+    return points, steps
+
+
+def adjust_step(
+    length: float,
+    spacing: float,
+    *,
+    maximum: int = 1000,
+    translations: tuple[float, ...] = (),
+) -> tuple[int, float]:
+    """Number of points and step along one lattice direction (F ``adjust_step`` and the loop around it).
+
+    :func:`adjusted_steps` of one direction (a cell's directions are adjusted together: their smallest step is the
+    next pass's input).  Example without translations: 10 bohr at ``h = 0.6`` gives ``n = 16`` and ``h = 0.625``.
+    """
+
+    points, steps = adjusted_steps([length], spacing, [tuple(translations)], maximum=maximum)
+    return points[0], steps[0]
+
+
+def fortran_grid_counts(
+    cell: PeriodicCell, settings: PeriodicGridSettings
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(points, steps)`` of Fortran's grid along the three lattice vectors (Fortran-derived routines).
+
+    :func:`adjusted_steps` of the lattice-vector lengths ``|a_i|`` (``pbc%box_size``) at the input spacing, with the
+    fractional translations of ``settings.fractional_translations`` (the space group's; none with
+    ``Ignore_Symmetry``).  Raises ``ValueError`` where a side is shorter than two steps.
+    """
+
+    lengths = np.sqrt(np.sum(np.asarray(cell.lattice_vectors, dtype=float) ** 2, axis=1))
+    translations = getattr(settings, "fractional_translations", ()) or ((), (), ())
+    points, steps = adjusted_steps(lengths, settings.spacing, translations)
+    return np.asarray(points, dtype=np.int64), np.asarray(steps, dtype=float)
+
+
+def fortran_orthorhombic_counts(
+    cell: PeriodicCell,
+    settings: PeriodicGridSettings,
+    *,
+    tolerance: float = 1.0e-6,
+) -> np.ndarray | None:
+    """The points per side of the orthorhombic grid of the Fortran-derived routines, ``None`` where it does not apply.
+
+    Fortran's counts (:func:`fortran_grid_counts`) of a cell with diagonal lattice vectors and positive sides, when
+    each axis has more than ``2*M`` points (``M`` the stencil half width) and the steps ``L_i/n_i`` agree within
+    ``tolerance`` (one spacing: the orthorhombic grid and its fast paths).  ``None`` for every other cell, which gets
+    :class:`GeneralPeriodicGrid` (the same counts, a step per direction).
+    """
+
+    lattice_vectors = cell.lattice_vectors
+    if not is_diagonal_lattice(lattice_vectors):
+        return None
+    side_lengths = np.diag(lattice_vectors)
+    if np.any(side_lengths <= 0.0):
+        return None
+    try:
+        points_per_axis, _ = fortran_grid_counts(cell, settings)
+    except ValueError:
+        return None  # the general grid says why
+    if np.any(points_per_axis <= 2 * settings.stencil_half_width):
+        return None
+    achieved_spacings = side_lengths / points_per_axis
+    if not np.allclose(achieved_spacings, achieved_spacings[0], rtol=tolerance):
+        return None
+    return points_per_axis
 
 
 def uses_general_periodic_grid(
@@ -317,43 +430,39 @@ def uses_general_periodic_grid(
 ) -> bool:
     """Whether ``cell`` gets the :class:`GeneralPeriodicGrid` (Fortran-derived routines).
 
-    The orthorhombic grid takes every cell it always accepted: diagonal
-    lattice vectors with positive sides, more than ``2*M`` points per axis
-    (``M`` the stencil half width) and one common spacing within
-    ``tolerance``.  Every other cell - which that grid refuses - gets
-    Fortran's general grid instead.
+    The orthorhombic grid takes a cell with diagonal lattice vectors and positive sides whose Fortran counts
+    (``adjust_step``, with the fractional translations of ``settings``) give more than ``2*M`` points per axis
+    (``M`` the stencil half width) and one common step within ``tolerance``
+    (:func:`fortran_orthorhombic_counts`).  Every other cell gets Fortran's general grid.
     """
 
-    lattice_vectors = cell.lattice_vectors
-    if not is_diagonal_lattice(lattice_vectors):
-        return True
-    side_lengths = np.diag(lattice_vectors)
-    if np.any(side_lengths <= 0.0):
-        return True
-    points_per_axis = np.round(side_lengths / settings.spacing).astype(np.int64)
-    if np.any(points_per_axis <= 2 * settings.stencil_half_width):
-        return True
-    achieved_spacings = side_lengths / points_per_axis
-    return not np.allclose(achieved_spacings, achieved_spacings[0], rtol=tolerance)
+    return fortran_orthorhombic_counts(cell, settings, tolerance=tolerance) is None
 
 
 def periodic_grid_shift(
-    lattice_vectors: np.ndarray, *, ignore_symmetry: bool
+    lattice_vectors: np.ndarray,
+    *,
+    ignore_symmetry: bool,
+    requested: tuple[float, float, float] | None = None,
+    periodicity: int = 3,
 ) -> tuple[float, float, float]:
     """Fortran's grid shift of a periodic cell, in units of the grid steps (Fortran-derived routines).
 
-    ``shift = 0.5`` along every direction, ``0`` everywhere with
-    ``Ignore_Symmetry``, and ``0`` along a periodic direction that is not
-    orthogonal to another one (F ``usrinputfile.F90:786-794``).  Only the
-    general grid applies it; the orthorhombic grid of this port has always
-    used ``shift = 0``.
+    ``shift = 0.5`` along every direction, ``0`` everywhere with ``Ignore_Symmetry``, or ``requested`` (the
+    ``Grid_Shift`` block of PARSEC 1.5, its absolute values), and then ``0`` along a periodic direction that is not
+    orthogonal to another periodic one (F 1.5 ``io/usrinputfile.F90:1363-1404``; the previous tree
+    ``usrinputfile.F90:786-794``).  ``periodicity`` is ``pbc%per``: the directions of the test (a wire or slab keeps
+    the shift of its confined directions).
     """
 
     vectors = np.asarray(lattice_vectors, dtype=float)
-    shift = [0.0, 0.0, 0.0] if ignore_symmetry else [0.5, 0.5, 0.5]
+    if requested is not None:
+        shift = [abs(float(value)) for value in requested]
+    else:
+        shift = [0.0, 0.0, 0.0] if ignore_symmetry else [0.5, 0.5, 0.5]
     metric = vectors @ vectors.T
-    for first in range(3):
-        for second in range(3):
+    for first in range(periodicity):
+        for second in range(periodicity):
             if first != second and abs(metric[first, second]) > 0.0:
                 shift[first] = 0.0
     return tuple(shift)
@@ -374,15 +483,7 @@ def build_general_periodic_grid(
 
     lattice_vectors = np.asarray(cell.lattice_vectors, dtype=float)
     lengths = np.sqrt(np.sum(lattice_vectors**2, axis=1))
-    translations = getattr(settings, "fractional_translations", ()) or ((), (), ())
-    points = []
-    spacings = []
-    for length, taus in zip(lengths, translations):
-        count, step = adjust_step(length, settings.spacing, translations=taus)
-        points.append(count)
-        spacings.append(step)
-    points_per_axis = np.asarray(points, dtype=np.int64)
-    spacings_array = np.asarray(spacings, dtype=float)
+    points_per_axis, spacings_array = fortran_grid_counts(cell, settings)
     half_width = settings.stencil_half_width
     if np.any(points_per_axis < half_width):
         raise ValueError(
@@ -447,19 +548,14 @@ def build_periodic_grid(
     if cell.dimensions == 2:
         # a slab (Andrew Grieder's slab_boundary): its own grid, whatever the points rule
         return build_slab_grid(cell, settings)
-    if settings.points_rule == "fortran":
-        lengths = np.linalg.norm(lattice_vectors, axis=1)
-        return _build_general_grid(cell, settings, fortran_points_per_axis(lengths, settings.spacing))
-    if not _is_diagonal(lattice_vectors):
-        lengths = np.linalg.norm(lattice_vectors, axis=1)
-        # an even number of points per axis, the nearest to |a_i|/h
-        return _build_general_grid(cell, settings, (2 * np.round(lengths / (2.0 * settings.spacing))).astype(np.int64))
+    if settings.points_rule == "fortran" or not _is_diagonal(lattice_vectors):
+        return _build_general_grid(cell, settings, default_periodic_grid_counts(cell, settings))
     side_lengths = np.diag(lattice_vectors)
     if np.any(side_lengths <= 0.0):
         raise ValueError("lattice_vectors must have positive diagonal side lengths")
     spacing = settings.spacing
 
-    points_per_axis = np.round(side_lengths / spacing).astype(np.int64)
+    points_per_axis = default_periodic_grid_counts(cell, settings)
     half_width = settings.stencil_half_width
     if np.any(points_per_axis <= 2 * half_width):
         raise ValueError(
@@ -492,6 +588,25 @@ def build_periodic_grid(
         coordinates=coordinates,
         lookup=lookup,
     )
+
+
+def default_periodic_grid_counts(cell: PeriodicCell, settings: PeriodicGridSettings) -> np.ndarray:
+    """The points along the three lattice vectors of :func:`build_periodic_grid` on the default routines (a bulk
+    cell, not ``settings.fortran_routines``), without building the grid.
+
+    ``points_rule="fortran"``: :func:`fortran_points_per_axis` of ``|a_i|`` (Andrew Grieder's grid of the parser);
+    ``"round"``: ``round(L_i/h)`` of an orthorhombic cell, ``2 round(|a_i|/(2h))`` of an oblique one.  The checks
+    (stencil width, one common spacing) are the builder's.
+    """
+
+    lattice_vectors = np.asarray(cell.lattice_vectors, dtype=float)
+    if settings.points_rule == "fortran":
+        return fortran_points_per_axis(np.linalg.norm(lattice_vectors, axis=1), settings.spacing)
+    if not _is_diagonal(lattice_vectors):
+        lengths = np.linalg.norm(lattice_vectors, axis=1)
+        # an even number of points per axis, the nearest to |a_i|/h
+        return (2 * np.round(lengths / (2.0 * settings.spacing))).astype(np.int64)
+    return np.round(np.diag(lattice_vectors) / settings.spacing).astype(np.int64)
 
 
 def _build_general_grid(
@@ -531,54 +646,35 @@ def build_fortran_periodic_grid(
 ) -> PeriodicRealSpaceGrid:
     """The grid of the Fortran-derived routines (``Use_Fortran_Routines``).
 
-    An orthorhombic unit cell whose sides share one spacing gets :class:`PeriodicRealSpaceGrid`: the achieved
-    spacing is ``side_length[i] / round(side_length[i] / spacing)`` for each axis, and must agree between axes to
-    within ``tolerance``; its points start at the origin (``settings.shift`` is not read).
+    An orthorhombic unit cell whose Fortran steps agree (:func:`fortran_orthorhombic_counts`: ``adjust_step`` with
+    the space group's fractional translations, within ``tolerance``) gets :class:`PeriodicRealSpaceGrid` with the
+    one spacing ``L_0/n_0`` and the points ``(i + shift) h`` (``settings.shift``, Fortran's ``grid%shift``; F
+    ``grid_partition.f90:550-552``).  Fortran's step is ``x L`` of ``adjust_step``, within a rounding of ``L/n``;
+    ``L_0/n_0`` keeps the points of this grid where its counts did not change (``round(L/h)`` before PARSEC 1.5's
+    parity round) and the points of Andrew Grieder's grid of a cube.
 
     A cell this orthorhombic grid does not accept (see
     :func:`uses_general_periodic_grid`) gets Fortran's
     :class:`GeneralPeriodicGrid` from :func:`build_general_periodic_grid`.
     """
 
-    if uses_general_periodic_grid(cell, settings, tolerance=tolerance):
+    points_per_axis = fortran_orthorhombic_counts(cell, settings, tolerance=tolerance)
+    if points_per_axis is None:
         return build_general_periodic_grid(cell, settings)
 
-    lattice_vectors = cell.lattice_vectors
-    off_diagonal = lattice_vectors - np.diag(np.diag(lattice_vectors))
-    if not np.allclose(off_diagonal, 0.0, atol=1.0e-10):
-        raise ValueError(
-            "build_periodic_grid only supports an orthorhombic cell "
-            "(diagonal lattice_vectors); a general oblique cell needs a "
-            "metric-tensor-weighted stencil that has not been implemented"
-        )
-    side_lengths = np.diag(lattice_vectors)
-    if np.any(side_lengths <= 0.0):
-        raise ValueError("lattice_vectors must have positive diagonal side lengths")
-    spacing = settings.spacing
-
-    points_per_axis = np.round(side_lengths / spacing).astype(np.int64)
-    half_width = settings.stencil_half_width
-    if np.any(points_per_axis <= 2 * half_width):
-        raise ValueError(
-            "the cell is too small for this stencil: each axis needs more "
-            f"than {2 * half_width} grid points (expansion_order="
-            f"{settings.expansion_order}), got {points_per_axis.tolist()}"
-        )
+    side_lengths = np.diag(cell.lattice_vectors)
+    shift = np.asarray(settings.shift, dtype=np.float64)
+    if shift.shape != (3,) or not np.all(np.isfinite(shift)):
+        raise ValueError("the grid shift must have three finite entries")
     achieved_spacings = side_lengths / points_per_axis
-    if not np.allclose(achieved_spacings, achieved_spacings[0], rtol=tolerance):
-        raise ValueError(
-            "cell side lengths are not commensurate with a single common "
-            f"grid spacing near {spacing}; achieved per-axis spacings would "
-            f"be {achieved_spacings.tolist()}, which disagree by more than "
-            f"the relative tolerance {tolerance}"
-        )
 
     n0, n1, n2 = (int(value) for value in points_per_axis)
     axes = [np.arange(n) for n in (n0, n1, n2)]
     mesh = np.meshgrid(*axes, indexing="ij")
     integer_coordinates = np.column_stack([component.reshape(-1) for component in mesh])
     achieved_spacing = float(achieved_spacings[0])
-    coordinates = integer_coordinates.astype(np.float64) * achieved_spacing
+    # (i + 0.0) is i exactly: the points of a zero shift are the products i h of the grid before the shift was read
+    coordinates = (integer_coordinates.astype(np.float64) + shift) * achieved_spacing
     lookup = np.arange(n0 * n1 * n2, dtype=np.int64).reshape(n0, n1, n2)
 
     return PeriodicRealSpaceGrid(
@@ -707,7 +803,10 @@ __all__ = [
     "build_general_periodic_grid",
     "build_periodic_grid",
     "build_slab_grid",
+    "default_periodic_grid_counts",
+    "fortran_grid_counts",
     "fortran_grid_shift",
+    "fortran_orthorhombic_counts",
     "fortran_points_per_axis",
     "periodic_grid_shift",
     "uses_fortran_routines",

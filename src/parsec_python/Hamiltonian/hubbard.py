@@ -49,9 +49,9 @@ same.
 Two properties of the Fortran are kept on purpose and stated here:
 
 * ``P3`` and ``P4`` are the complex tensors of ``initialize_p_matrices``
-  (Liechtenstein, Anisimov and Zaanen, PRB 52, R5467 (1995)) written as
-  single-precision literals; :func:`coulomb_tensors` rounds them to
-  ``float32``.  They are applied to the occupation matrix of the real
+  (Liechtenstein, Anisimov and Zaanen, PRB 52, R5467 (1995)), double
+  precision as in PARSEC 1.5 (the previous tree rounded them to single
+  precision).  They are applied to the occupation matrix of the real
   harmonics, for which they lack the symmetries of the complex basis they
   were written for: with ``J != 0`` the matrix ``D`` is real but not
   symmetric, so ``H_U`` is not Hermitian and the ``J`` term is not the
@@ -108,18 +108,16 @@ def coulomb_tensors() -> tuple[np.ndarray, np.ndarray]:
     """Return ``(P3, P4)``, each ``complex128`` of shape ``(5, 5, 5, 5)``.
 
     Index order ``(m, m', k, l)`` with ``m`` in xy, yz, xz, 3z^2-1, x^2-y^2.
-    Each literal of ``upot.F90`` is rounded to ``float32`` as the Fortran
-    default-real ``cmplx(re, im)`` does, then widened.  The arrays are
-    read-only.
+    Each literal of ``upot.F90`` is the nearest double, as PARSEC 1.5's
+    ``cmplx(re_d0, im_d0, dpc)`` (``potential/upot.F90:765-1522``; the
+    previous tree rounded to single precision).  The arrays are read-only.
     """
 
     tensors = []
     for entries in (P3_ENTRIES, P4_ENTRIES):
         tensor = np.zeros((5, 5, 5, 5), dtype=np.complex128)
         for m, mp, k, l, real, imaginary in entries:
-            tensor[m - 1, mp - 1, k - 1, l - 1] = complex(
-                float(np.float32(real)), float(np.float32(imaginary))
-            )
+            tensor[m - 1, mp - 1, k - 1, l - 1] = complex(float(real), float(imaginary))
         tensor.setflags(write=False)
         tensors.append(tensor)
     return tensors[0], tensors[1]

@@ -23,6 +23,7 @@ CONCEPT_PACKAGES = (
     "Forces",
     "Relaxation",
     "MolecularDynamics",
+    "Embedding",
     "Output",
     "provenance",
 )

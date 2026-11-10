@@ -42,6 +42,7 @@ from .SCF.symmetry_fields import scf_buffers_requested
 # Imported here and not where it is read: the module binds ``require_cupy``
 # when it is first imported, and a preparation may run under a double of it.
 from .V_ion.cupy_ionic import ionic_gpu_count_setting, ionic_sum_grid_setting
+from .V_ion.periodic_setup_fortran import oblique_split as periodic_oblique_split
 from .V_ion.periodic_setup_fortran import reach_rule as periodic_reach_rule
 from .backends.implicit_stencil import (
     FilterPlan,
@@ -67,6 +68,11 @@ _GPU_BOUNDARY_BUILDERS = frozenset(
         "CuPyPointMultipoleBoundaryBuilder",
     }
 )
+# The boundary of the resident chain on an axis-reflection wedge takes the
+# wedge kernels whatever the plan (A100, 2026-11-07: O2 PBE in sectors, Hartree
+# 1.12 s with the orbit table, 1.01 s with the full-grid kernels and 0.78 s
+# with the wedge kernels, peaks 1074, 1230 and 1102 MiB).
+_RESIDENT_WEDGE_KERNELS = True
 _REFERENCE_CACHE: OrderedDict[str, object] = OrderedDict()
 _REFERENCE_CACHE_LOCK = Lock()
 
@@ -115,6 +121,10 @@ def _reference_cache_key(
     # before 2026-10-30, when the table reach was the default).
     if getattr(problem, "periodic_cell", None) is not None and periodic_reach_rule() != "table":
         digest.update(f"periodic-reach-{periodic_reach_rule()}".encode("ascii"))
+    # PARSEC_PERIODIC_OBLIQUE_SPLIT other than its default (auto: the split of the orthorhombic grid on the
+    # oblique grid where a species uses Cubic_Spline).
+    if getattr(problem, "periodic_cell", None) is not None and periodic_oblique_split() != "auto":
+        digest.update(f"periodic-oblique-{periodic_oblique_split()}".encode("ascii"))
     digest.update(bytes((int(bool(defer_native_laplacian)),)))
     cache_path = (
         "disabled"
@@ -439,6 +449,48 @@ def single_sector_setting() -> str:
     return value
 
 
+def periodic_sector_refusal(problem) -> str | None:
+    """Why a periodic cell cannot be solved as one sector of the identity, or ``None``.
+
+    The route of the sectors (one sector of the identity, whose basis the
+    devices of a process or the MPI ranks of the full-SCF runner share) takes
+    a bulk cell at the Gamma point with real orbitals: an orthorhombic cell,
+    unpolarized, with a native LDA or GGA, its local potential, Hartree solve
+    and XC functional on the full grid as on one device.  It has not been
+    built or validated for the other periodic calculations named here; a
+    calculation that names one keeps the full grid of one device (``main.py``),
+    and the MPI runner refuses it.
+    """
+
+    from parsec_python.Grid import kpoint_sampling
+    from parsec_python.V_xc.libxc import is_libxc_functional
+
+    scf = problem.scf
+    lattice = np.asarray(problem.periodic_cell.lattice_vectors, dtype=np.float64)
+    species = getattr(problem, "pseudopotentials", {}).values()
+    if int(getattr(problem.grid, "periodicity", 3)) != 3:
+        return "a wire or slab (Boundary_Conditions: wire or slab)"
+    if problem.has_kpoint_sampling:
+        sampling = kpoint_sampling(problem)
+        if sampling is None or len(sampling[0]) != 1 or np.any(sampling[0]):
+            return "k-point sampling beyond the Gamma point"
+    if scf.spin_polarized or scf.noncollinear or scf.self_consistent_spin_orbit:
+        return "spin polarization, spin-orbit coupling or non-collinear magnetism"
+    if scf.is_hybrid:
+        return "a hybrid functional"
+    if scf.is_meta_gga:
+        return "a meta-GGA functional"
+    if is_libxc_functional(scf.xc_functional):
+        return "a libxc functional"
+    if not np.allclose(lattice, np.diag(np.diag(lattice)), atol=1.0e-10):
+        return "an oblique cell (lattice vectors not along the Cartesian axes)"
+    if any(getattr(item, "has_hubbard", False) for item in species):
+        return "LDA+U"
+    if getattr(scf, "van_der_waals", False):
+        return "the Tkatchenko-Scheffler dispersion correction"
+    return None
+
+
 def _orbital_reduction(symmetry_reduction, stabilizer_disabled: bool):
     """Return the reduction the orbitals take of a detected one, or ``None``.
 
@@ -466,9 +518,55 @@ def _readable_xc_label(xc_functional: str, *, spin_polarized: bool) -> str:
     name = XC_DISPLAY_NAMES.get(xc_functional, xc_functional)
     if xc_functional == "pw91":
         name = f"discrete-variational {name}"
+    if str(xc_functional).startswith("libxc:"):
+        # libxc's C code on the host (a host build, or PARSEC_CUPY_XC=off).
+        return f"host libxc (C) {'spin-polarized ' if spin_polarized else ''}{name}"
     return (
         f"vectorized NumPy {'spin-polarized ' if spin_polarized else ''}{name}"
     )
+
+
+def _readable_spin_xc_label(xc_functional: str) -> str:
+    """Backend label of a spin functional the readable ``V_xc`` package evaluates."""
+
+    if xc_functional == "pbe":
+        return "vectorized NumPy discrete-variational spin-polarized PBE"
+    if xc_functional == "ca":
+        return "vectorized NumPy CA/PZ local spin density"
+    return _readable_xc_label(xc_functional, spin_polarized=True)
+
+
+def _spin_sector_refusal(problem) -> str | None:
+    """Why a spin-polarized ``problem`` keeps both channels on the full grid, or ``None``.
+
+    ``Spin_Symmetry_Sectors`` (``SCFSettings.spin_symmetry_sector_mode``):
+    ``off`` keeps the full grid; ``auto`` takes the symmetry sectors of the
+    point group where the run can use them (the driver still needs a group,
+    the CuPy backend and symmetry on), except for what the spin loop of the
+    sectors does not carry: LDA+U, ``Symmetrize_Charge_Density``, the
+    triangular Ritz hand-over and a filter spread over several devices.
+    """
+
+    scf = problem.scf
+    mode = scf.spin_symmetry_sector_mode
+    if mode == "off":
+        return "Spin_Symmetry_Sectors: off"
+    species = getattr(problem, "pseudopotentials", {}).values()
+    for condition, reason in (
+        (any(getattr(item, "has_hubbard", False) for item in species), "LDA+U"),
+        (bool(getattr(scf, "symmetrize_density", False)), "Symmetrize_Charge_Density"),
+        (
+            os.environ.get("PARSEC_CUPY_RITZ_HANDOVER", "").strip().lower() == "triangular",
+            "PARSEC_CUPY_RITZ_HANDOVER=triangular",
+        ),
+        (
+            os.environ.get("PARSEC_CUPY_DISTRIBUTED_FILTER", "").strip().lower() == "1",
+            "PARSEC_CUPY_DISTRIBUTED_FILTER=1",
+        ),
+    ):
+        if condition:
+            return f"Spin_Symmetry_Sectors: auto keeps the full grid with {reason}"
+    return None
 
 
 def _same_atoms(left, right) -> bool:
@@ -1194,6 +1292,10 @@ def _prepare_reference_physics(
             )
 
     if getattr(problem, "periodic_cell", None) is not None:
+        if orbital_operators_only and _periodic_operators_only_available(problem):
+            # A rank that only shares the basis of the sector: grid, kinetic
+            # operator and projectors alone.
+            return _prepare_periodic_orbital_operators(problem)
         reference = prepare_reference_periodic_single_point(problem)
         if cache_key is not None:
             _remember_reference(cache_key, reference, cache_capacity)
@@ -1338,6 +1440,92 @@ def _prepare_reference_physics(
     return reference
 
 
+def _periodic_operators_only_available(problem) -> bool:
+    """Whether :func:`_prepare_periodic_orbital_operators` builds what the full preparation would of ``problem``.
+
+    Andrew Grieder's routines of a bulk cell on the orthorhombic grid; the
+    Fortran-derived routines, wires and slabs keep the full preparation.
+    """
+
+    grid = problem.grid
+    lattice = np.asarray(problem.periodic_cell.lattice_vectors, dtype=np.float64)
+    return (
+        not getattr(grid, "fortran_routines", False)
+        and int(getattr(grid, "periodicity", 3)) == 3
+        and int(getattr(problem.periodic_cell, "dimensions", 3)) == 3
+        and np.allclose(lattice, np.diag(np.diag(lattice)), atol=1.0e-10)
+    )
+
+
+def _prepare_periodic_orbital_operators(problem):
+    """The orbital operators of a bulk cell for a rank that shares the basis of its sector.
+
+    The steps of :func:`parsec_python.SCF.pbc.prepare_periodic_single_point`
+    that make ``H = -nabla_FD^2 + diag(V) + V_NL`` apart from ``V``, through
+    the same functions of that module and with the same arguments: the
+    pseudopotentials and the electron count, the grid, the finite-difference
+    Laplacian and the projectors with their lattice images.  The kinetic
+    operator and the projectors are those of the full preparation element for
+    element.  What only the SCF loop of the root reads (the gradient matrices,
+    the local ionic potential, the starting and core densities, the Ewald
+    energies) is not built: ``None``, and NaN for the energies.
+    """
+
+    from parsec_python.SCF import pbc as periodic
+
+    started = perf_counter()
+    atoms = tuple(problem.atoms)
+    stage = perf_counter()
+    pseudopotentials = periodic.load_pseudopotentials(
+        problem.pseudopotentials, xc_functional=problem.scf.xc_functional
+    )
+    pseudopotential_seconds = perf_counter() - stage
+    electron_count = periodic.ionic_charge(atoms, pseudopotentials) - problem.scf.net_charge
+    if electron_count <= 0:
+        raise ValueError("the requested system has no valence electrons")
+    stage = perf_counter()
+    grid = periodic.build_periodic_grid(problem.periodic_cell, problem.grid)
+    grid_seconds = perf_counter() - stage
+    lattice_vectors = problem.periodic_cell.lattice_vectors
+    outside = periodic.atom_outside_cell(lattice_vectors, atoms)
+    if outside is not None:
+        raise ValueError(
+            f"atom {outside.symbol} at {np.asarray(outside.position)} lies outside the periodic cell "
+            f"[0, {np.diag(np.asarray(lattice_vectors)).tolist()}); this path does not recenter geometry"
+        )
+    stage = perf_counter()
+    negative_laplacian = periodic.build_negative_laplacian(grid)
+    finite_difference_seconds = perf_counter() - stage
+    stage = perf_counter()
+    nonlocal_operator = periodic.build_nonlocal_projectors(
+        grid, atoms, pseudopotentials, problem.pseudopotentials, lattice_vectors, periodic_dimensions=3
+    )
+    nonlocal_seconds = perf_counter() - stage
+    return periodic.PeriodicPreparedSinglePointSystem(
+        input=problem,
+        atoms=atoms,
+        electron_count=electron_count,
+        pseudopotentials=pseudopotentials,
+        grid=grid,
+        negative_laplacian=negative_laplacian,
+        gradient=None,
+        ionic_potential=None,
+        nonlocal_operator=nonlocal_operator,
+        initial_density=None,
+        core_density=None,
+        ion_ion_energy=float("nan"),
+        atomic_reference_correction=float("nan"),
+        alpha_z_energy=float("nan"),
+        timings=PreparationTimings(
+            pseudopotential_loading_seconds=pseudopotential_seconds,
+            grid_seconds=grid_seconds,
+            finite_difference_seconds=finite_difference_seconds,
+            nonlocal_ionic_seconds=nonlocal_seconds,
+            total_seconds=perf_counter() - started,
+        ),
+    )
+
+
 def _build_backend(
     reference,
     selection: BackendSelection,
@@ -1435,6 +1623,248 @@ def _hartree_device_request() -> int | str | None:
     return value
 
 
+def _resident_hartree_request() -> str:
+    """Parse ``PARSEC_CUPY_RESIDENT_HARTREE``: ``auto`` (the default), ``1`` or ``0``.
+
+    ``auto`` (the default since 2026-11-07) runs the device-resident Hartree
+    chain (``Hartree/cupy_resident.py``) where the conjugate gradients run on
+    a GPU on the symmetry wedge of the SCF fields, with the boundary values
+    built on that device; ``1`` asks for the chain by name and stops where it
+    does not apply or cannot be built; ``0`` keeps the host interface, which
+    was the default before.
+    """
+
+    raw = os.environ.get("PARSEC_CUPY_RESIDENT_HARTREE", "auto").strip().lower()
+    if raw in {"", "auto"}:
+        return "auto"
+    if raw not in {"0", "1"}:
+        raise ValueError("PARSEC_CUPY_RESIDENT_HARTREE must be auto, 1 or 0")
+    return raw
+
+
+def _resident_hartree_plan(
+    request: str,
+    *,
+    linear_backend: str,
+    hartree_reduction,
+    orbital_decomposition,
+    orbital_reduction,
+    boundary_builder_planned: bool,
+) -> tuple[bool, str]:
+    """Whether the preparation builds the resident Hartree chain, and why.
+
+    Decided before the boundary thread starts, because the chain takes its
+    boundary from a GPU builder on the wedge where the host builder would
+    otherwise use its orbit table.  The chain applies where the conjugate
+    gradients run on a GPU (``linear_backend``), on the wedge
+    ``hartree_reduction`` that the SCF fields use too (a symmetry-sector
+    eigensolver, whose reduction is ``orbital_reduction``), with a multipole
+    boundary builder (``boundary_builder_planned``), on a grid of ``int32``
+    indices, and where neither ``PARSEC_HARTREE_BOUNDARY_BACKEND=native`` nor
+    ``PARSEC_HARTREE_BOUNDARY_KERNEL=full`` keeps the boundary on the host by
+    name.  Returns ``(applies, reason)``; ``reason`` completes the
+    ``hartree_resident_chain`` line.
+    """
+
+    if request == "0":
+        return False, "PARSEC_CUPY_RESIDENT_HARTREE=0"
+    prefix = "auto" if request == "auto" else "PARSEC_CUPY_RESIDENT_HARTREE=1"
+    if linear_backend != "cupy":
+        return False, f"{prefix}: the conjugate gradients run on the host"
+    if hartree_reduction is None:
+        return False, f"{prefix}: the Hartree problem is solved on the full grid"
+    if orbital_decomposition is None:
+        return False, (
+            f"{prefix}: the orbitals are solved on the full grid, whose SCF "
+            "fields have no symmetry wedge"
+        )
+    if orbital_reduction is not hartree_reduction:
+        return False, f"{prefix}: the SCF fields use another wedge than the Hartree solve"
+    if not boundary_builder_planned:
+        return False, f"{prefix}: no multipole boundary builder (domain or boundary method)"
+    if int(hartree_reduction.full_size) > np.iinfo(np.int32).max:
+        return False, f"{prefix}: the grid exceeds int32 indices"
+    if os.environ.get("PARSEC_HARTREE_BOUNDARY_BACKEND", "").strip().lower() == "native":
+        return False, f"{prefix}: PARSEC_HARTREE_BOUNDARY_BACKEND=native keeps the boundary on the host"
+    if _hartree_boundary_kernel() == "full" and os.environ.get(
+        "PARSEC_HARTREE_BOUNDARY_BACKEND", ""
+    ).strip().lower() != "cupy":
+        return False, f"{prefix}: PARSEC_HARTREE_BOUNDARY_KERNEL=full keeps the boundary on the host"
+    return True, f"{prefix}: the GPU conjugate gradients on the symmetry wedge of the SCF fields"
+
+
+class _GPUHartreeUnavailable(Exception):
+    """The GPU CG chosen by ``auto`` could not be built on the symmetry wedge."""
+
+
+def _hartree_linear_backend(
+    selection: BackendSelection, *, periodic: bool
+) -> tuple[str, str]:
+    """Choose the conjugate gradients of the cluster Hartree solve.
+
+    Returns ``(backend, reason)``: ``backend`` is ``"cupy"`` for the FP64
+    CG on a GPU (``Hartree/cupy_prepared.py``) and ``"native"`` for the
+    CG of the selected Hartree backend (the C++/OpenMP CG of the native
+    components; the SciPy CG or the CG of ``--backend cupy`` where those are
+    selected, which this choice does not touch).  Both run the same
+    recurrence with the same stopping test ``||r_k|| <= rtol ||r_0|| +
+    atol``, matrix-vector budget and chronological starting vector; they
+    differ in the order of the floating-point sums, so the potential differs
+    within the CG tolerance.
+
+    ``PARSEC_HARTREE_LINEAR_BACKEND``: unset or ``auto`` (the default since
+    2026-11-07) takes the GPU CG where it applies, the CuPy orbital backend
+    with the native Hartree components (``--backend auto`` on a GPU) for an
+    isolated system, and the CG of the selection elsewhere; ``native`` keeps
+    the host CG; ``cupy`` asks for the GPU CG by name and is refused where it
+    does not apply.  A periodic cell is solved by its own periodic solver
+    whatever the variable says.
+    """
+
+    requested = os.environ.get("PARSEC_HARTREE_LINEAR_BACKEND", "").strip().lower()
+    if requested not in {"", "auto", "native", "cupy"}:
+        raise ValueError(
+            "PARSEC_HARTREE_LINEAR_BACKEND must be auto, native or cupy"
+        )
+    if periodic:
+        # The variable chooses the CG of the isolated-cluster Hartree solver.
+        return "native", "periodic cell: the periodic Hartree solver"
+    applies = selection.selected == "cupy" and selection.hartree_backend == "native"
+    if requested == "cupy":
+        if not applies:
+            raise ValueError(
+                "PARSEC_HARTREE_LINEAR_BACKEND=cupy requires the auto/hybrid CUDA "
+                "backend with native boundary construction"
+            )
+        return "cupy", "PARSEC_HARTREE_LINEAR_BACKEND=cupy"
+    if requested == "native":
+        return "native", "PARSEC_HARTREE_LINEAR_BACKEND=native"
+    if applies:
+        return "cupy", "auto: the GPU of the orbitals"
+    return "native", (
+        f"auto: no GPU CG beside the {selection.selected} orbitals and the "
+        f"{selection.hartree_backend} Hartree components"
+    )
+
+
+def _hartree_linear_report(
+    selection: BackendSelection, *, periodic: bool, backend: str, reason: str
+) -> str:
+    """The ``hartree_linear_backend`` line: the CG that runs and why.
+
+    Outside the native Hartree components of CuPy or CPU orbitals the
+    variable chooses nothing, and the line names the solver of the
+    selection instead of ``native``.
+    """
+
+    if periodic:
+        return "periodic (the solver of the periodic cell; PARSEC_HARTREE_LINEAR_BACKEND acts on clusters)"
+    if selection.hartree_backend == "scipy":
+        return "scipy (the SciPy CG of the selected backend; PARSEC_HARTREE_LINEAR_BACKEND acts on the native components)"
+    if selection.hartree_backend == "cupy":
+        return "cupy-csr (the device CSR CG of --backend cupy; PARSEC_HARTREE_LINEAR_BACKEND acts on the native components)"
+    if selection.selected != "cupy":
+        return f"native (the C++/OpenMP CG of a CPU run; {reason})"
+    return f"{backend} ({reason})"
+
+
+def _gpu_hartree_device_bytes(poisson_solver, boundary_builder, resident_hartree=None) -> dict[int, int]:
+    """Device bytes of the GPU Hartree objects, by device (empty for host objects)."""
+
+    counts: dict[int, int] = {}
+    backend = getattr(getattr(poisson_solver, "solver", poisson_solver), "backend", None)
+    if type(backend).__name__ == "CuPyPreparedConjugateGradientBackend":
+        counts[int(backend.device_id)] = int(backend.device_bytes)
+    if type(boundary_builder).__name__ in _GPU_BOUNDARY_BUILDERS:
+        device = getattr(boundary_builder, "device_id", None)
+        stored = getattr(boundary_builder, "device_storage_bytes", None)
+        if device is not None and stored:
+            counts[int(device)] = counts.get(int(device), 0) + int(stored)
+    stored = getattr(resident_hartree, "device_bytes", None)
+    device = getattr(resident_hartree, "device_id", None)
+    if stored and device is not None:
+        counts[int(device)] = counts.get(int(device), 0) + int(stored)
+    return counts
+
+
+class _ResidentHartreeSolve:
+    """The Hartree solver of a prepared system with the resident chain in front.
+
+    Every solve runs ``chain`` (:class:`.Hartree.cupy_resident.CuPyResidentHartree`)
+    and adds its seconds to ``statistics``; the result carries the atomic
+    tail in rows that ``tail()`` returns, as the host interface's does.
+    Where a device allocation of a solve fails (CuPy's ``OutOfMemoryError``,
+    or a CUDA runtime or driver error of status 2; :func:`allocation_failure`)
+    and the chain was not asked for by name, the chain ends for the rest of
+    the calculation and the route before it takes over: the arrays of the
+    chain are dropped, ``leave()`` replaces its GPU boundary builder by the
+    host builder of that wedge (the orbit table) and returns the report lines
+    of what was built, the predictor history goes to the host solver
+    ``poisson_solver`` (the GPU CG stays), and ``host_solve``, the host
+    interface, repeats the solve and takes every later one.  ``fallback``
+    then says why and from which solve on, and ``fallback_details`` holds
+    those report lines.  Any other error stops the run.
+    """
+
+    def __init__(
+        self, chain, host_solve, statistics, *, tail, poisson_solver, named: bool, leave
+    ):
+        self.chain = chain
+        self.host_solve = host_solve
+        self.statistics = statistics
+        self.tail = tail
+        self.poisson_solver = poisson_solver
+        self.named = named
+        self.leave = leave
+        self.solves = 0
+        self.fallback: str | None = None
+        self.fallback_details: tuple[tuple[str, str], ...] = ()
+
+    def __call__(self, density, initial_potential=None, **kwargs):
+        self.solves += 1
+        if self.chain is not None:
+            from .Hartree.gpu_memory import allocation_failure
+
+            started = perf_counter()
+            try:
+                result = self.chain.solve(density, initial_potential, **kwargs)
+            except Exception as error:
+                if self.named or not allocation_failure(error):
+                    raise
+                self._leave_chain(error)
+            else:
+                self.statistics.hartree_solve_calls += 1
+                self.statistics.hartree_rhs_seconds += self.chain.rhs_seconds
+                self.statistics.hartree_linear_solve_seconds += self.chain.solve_seconds
+                self.statistics.hartree_total_seconds += perf_counter() - started
+                tail = self.tail()
+                return result if tail is None else replace(result, boundary_tail=tail)
+        return self.host_solve(density, initial_potential, **kwargs)
+
+    def _leave_chain(self, error) -> None:
+        chain, self.chain = self.chain, None
+        history = chain.host_history()
+        device = chain.device_id
+        chain.release()
+        del chain
+        self.fallback_details = tuple(self.leave())
+        adopt = getattr(getattr(self.poisson_solver, "solver", None), "adopt_history", None)
+        if callable(adopt):
+            adopt(history)
+        try:
+            from .backends.cupy import require_cupy
+
+            cp, _ = require_cupy()
+            with cp.cuda.Device(device):
+                cp.get_default_memory_pool().free_all_blocks()
+        except Exception:  # noqa: BLE001 - the release of cached blocks is a courtesy
+            pass
+        self.fallback = (
+            f"off from Hartree solve {self.solves} (auto: {type(error).__name__}: "
+            f"{error}); the boundary on the host and the host interface from then on"
+        )
+
+
 def _planned_sector_device_groups(
     representation_count: int,
     device_ids: tuple[int, ...],
@@ -1449,6 +1879,9 @@ def _planned_sector_device_groups(
     """
 
     if mpi_context is not None:
+        planned = getattr(mpi_context, "planned_groups", None)
+        if callable(planned):
+            return planned(representation_count, device_ids)
         from .experimental.mpi_scf import sector_device_groups
 
         return sector_device_groups(
@@ -1733,15 +2166,22 @@ def _hartree_boundary_kernel() -> str:
     Where the boundary plan is engaged and the boundary is built on a GPU,
     ``auto`` takes the wedge kernels if an axis-reflection group reduces
     the Hartree problem and the same kernels under the identity alone, one
-    value per unique exterior point of the full grid, if none does.
-    Elsewhere, and with ``full``, the full-grid kernels of PARSEC's boundary
-    run.
+    value per unique exterior point of the full grid, if none does; the
+    boundary of the resident chain takes the wedge kernels of such a group
+    whether the plan is engaged or not.  Elsewhere, and with ``full``, the
+    full-grid kernels of PARSEC's boundary run.
     """
 
     kernel = os.environ.get("PARSEC_HARTREE_BOUNDARY_KERNEL", "auto").strip().lower()
     if kernel not in {"auto", "full", "wedge"}:
         raise ValueError("PARSEC_HARTREE_BOUNDARY_KERNEL must be auto, full, or wedge")
     return kernel
+
+
+def _host_boundary_kernel(symmetric: bool) -> str:
+    """The ``hartree_boundary_kernel`` line of a native boundary builder."""
+
+    return "native wedge (C++ orbit table)" if symmetric else "native full grid (C++)"
 
 
 def _hartree_tail_on_host() -> bool:
@@ -1944,6 +2384,9 @@ def _build_native_boundary_builder(
     tail_on_device: bool = False,
     boundary_tail=None,
     gpu_kernels: bool = False,
+    gpu_linear: bool | None = None,
+    resident_wedge: bool = False,
+    notes: dict | None = None,
 ):
     """Construct the reusable isolated-boundary geometry.
 
@@ -1966,9 +2409,26 @@ def _build_native_boundary_builder(
     builder has no orbit table without a reduction, or where the table of a
     raised order exceeds its storage limit, and then repeats the full-grid
     recurrences in every solve.  An engaged plan takes the GPU kernels
-    there instead, unless ``PARSEC_HARTREE_BOUNDARY_BACKEND=native`` or
-    ``PARSEC_HARTREE_BOUNDARY_KERNEL=full`` asks for the former route by
-    name.
+    there instead, and so does any plan where the Poisson CG runs on the
+    GPU (``gpu_linear``): the multipoles and the right-hand side are then
+    formed on the device that solves, in place of host recurrences over
+    the full grid (since 2026-11-07).  ``PARSEC_HARTREE_BOUNDARY_BACKEND=
+    native`` or ``PARSEC_HARTREE_BOUNDARY_KERNEL=full`` asks for the former
+    route by name.  A builder with an orbit table stays on the host.
+
+    ``gpu_linear`` says that the Poisson CG runs on a GPU, which
+    ``PARSEC_HARTREE_BOUNDARY_BACKEND=auto`` requires too; ``None`` reads
+    it from ``PARSEC_HARTREE_LINEAR_BACKEND=cupy`` (a caller outside the
+    preparation, which has no resolved choice).
+
+    ``resident_wedge`` says that the device-resident chain will solve on
+    ``hartree_reduction`` (:func:`_resident_hartree_plan`).  The boundary of
+    that wedge is then built on the GPU in place of the orbit table (since
+    2026-11-07): the wedge kernels where an axis-reflection group reduces
+    the problem, whether the plan is engaged or not, and otherwise the
+    kernels of the plan.  A GPU builder that cannot be made leaves the
+    orbit table, and ``notes["resident_boundary"]`` says why (``"gpu"``
+    where the GPU builder was made for the chain).
     """
 
     from .Hartree.native_boundary import (
@@ -1999,22 +2459,43 @@ def _build_native_boundary_builder(
     plan = getattr(reference, "hartree_boundary", None)
     engaged = plan is not None and plan.engaged
     order = reference.input.hartree.multipole_order
+    if gpu_linear is None:
+        gpu_linear = os.environ.get(
+            "PARSEC_HARTREE_LINEAR_BACKEND", ""
+        ).strip().lower() == "cupy"
     if boundary_backend == "auto":
         from .Hartree.cupy_boundary import auto_gpu_boundary_requested
 
         wedge_rows = reference.grid.size if hartree_reduction is None else hartree_reduction.wedge_size
         boundary_backend = "cupy" if (
-            os.environ.get("PARSEC_HARTREE_LINEAR_BACKEND", "native").strip().lower() == "cupy"
-            and auto_gpu_boundary_requested(wedge_rows, order)
+            gpu_linear and auto_gpu_boundary_requested(wedge_rows, order)
         ) else "native"
-    if kernel == "wedge" and boundary_backend != "cupy":
+    # The resident chain takes the boundary of the wedge from the GPU, where
+    # the native builder would keep its orbit table on the host; only
+    # ``PARSEC_HARTREE_BOUNDARY_BACKEND=native`` or ``..._KERNEL=full`` by
+    # name keep it there.
+    resident_gpu = (
+        resident_wedge
+        and boundary_backend != "cupy"
+        and gpu_kernels
+        and gpu_linear
+        and hartree_reduction is not None
+        and requested != "native"
+        and kernel in {"auto", "wedge"}
+    )
+    if kernel == "wedge" and boundary_backend != "cupy" and not resident_gpu:
         raise ValueError(
             "PARSEC_HARTREE_BOUNDARY_KERNEL=wedge needs the GPU boundary "
             "(PARSEC_HARTREE_BOUNDARY_BACKEND=cupy)"
         )
 
-    def gpu_builder():
-        """Return a GPU builder and whether it works on the symmetry wedge."""
+    def gpu_builder(wedge_kernels: bool = False):
+        """Return a GPU builder and whether it works on the symmetry wedge.
+
+        ``wedge_kernels`` takes the kernels of the wedge wherever an
+        axis-reflection group reduces the problem, also for a plan that is
+        not engaged (the resident chain).
+        """
 
         from .Hartree.cupy_boundary import (
             CuPyMultipoleBoundaryBuilder,
@@ -2029,7 +2510,10 @@ def _build_native_boundary_builder(
                 "PARSEC_HARTREE_BOUNDARY_KERNEL=wedge needs an axis-reflection "
                 "reduction of the Hartree problem"
             )
-        if not (kernel == "wedge" or (kernel == "auto" and engaged)):
+        if not (
+            kernel == "wedge"
+            or (kernel == "auto" and (engaged or (wedge_kernels and wedge)))
+        ):
             builder = CuPyMultipoleBoundaryBuilder(
                 reference.grid, order, device_id=device_id
             )
@@ -2067,6 +2551,21 @@ def _build_native_boundary_builder(
     if boundary_backend == "cupy":
         builder, symmetry_boundary = gpu_builder()
         return builder, symmetry_boundary, None, perf_counter() - started
+    if resident_gpu:
+        try:
+            builder, symmetry_boundary = gpu_builder(wedge_kernels=_RESIDENT_WEDGE_KERNELS)
+        except (RuntimeError, MemoryError) as error:
+            # As below: the route of a default must not fail where the
+            # native one runs.  The orbit table then serves the host
+            # interface, and the chain is not built.
+            if notes is not None:
+                notes["resident_boundary"] = (
+                    f"the GPU boundary could not be built ({type(error).__name__}: {error})"
+                )
+        else:
+            if notes is not None:
+                notes["resident_boundary"] = "gpu"
+            return builder, symmetry_boundary, None, perf_counter() - started
     builder = None
     symmetry_boundary = False
     cache_info = None
@@ -2093,7 +2592,7 @@ def _build_native_boundary_builder(
     if (
         builder is None
         and gpu_kernels
-        and engaged
+        and (engaged or gpu_linear)
         and requested != "native"
         and kernel == "auto"
     ):
@@ -2383,6 +2882,12 @@ def prepare_single_point(
     every thread began and ended.
     """
 
+    if getattr(getattr(problem, "scf", None), "is_libxc", False):
+        _refuse_libxc_routes(problem, mpi_context=mpi_context)
+    if getattr(getattr(problem, "scf", None), "is_hybrid", False):
+        _refuse_hybrid_routes(problem, backend=backend, mpi_context=mpi_context)
+    if getattr(getattr(problem, "scf", None), "is_meta_gga", False):
+        _refuse_meta_gga_routes(problem, mpi_context=mpi_context)
     preparation = _Preparation()
     try:
         return _prepare_single_point(
@@ -2399,6 +2904,269 @@ def prepare_single_point(
         preparation.close()
 
 
+
+def _refuse_libxc_routes(problem, *, mpi_context) -> None:
+    """Refuse a libxc functional on the MPI routes (``V_xc/libxc.py``).
+
+    No libxc functional has been run on several ranks: neither an LDA or GGA
+    on the distributed solvers (``main.py --mpi`` refuses those by name) nor a
+    hybrid in the MPI runner of several nodes (``scripts/run_multi_gpu_scf.sh``,
+    :mod:`.SCF.hybrid_mpi`), whose root evaluates the semilocal part.  One
+    process on the GPUs of one node runs them (``--serial-control``).
+    """
+
+    if mpi_context is not None:
+        raise NotImplementedError(
+            f"the libxc functional {problem.scf.xc_functional!r} is not implemented for the MPI SCF of several "
+            "ranks or nodes (not tested there); run it in one process on one node (--serial-control), which "
+            "uses all GPUs of that node"
+        )
+
+
+def _refuse_hybrid_routes(problem, *, backend, mpi_context) -> None:
+    """Refuse the routes of a hybrid functional that the device exchange does not cover.
+
+    The device Fock loop (SCF/hybrid.py) runs isolated systems in one
+    process on the GPUs of one node, unpolarized and spin-polarized, on the
+    full grid or in the symmetry sectors with one device per sector basis;
+    on several MPI ranks (SCF/hybrid_mpi.py) in the symmetry sectors, with
+    a sector context made for the exchange (one device per sector basis,
+    the pair tiles on every device of every rank); and periodic cells (bulk
+    and slab) at the Gamma point on the full grid of one process, their pair
+    densities by FFT (Hamiltonian/bloch_exchange_device.py).
+    """
+
+    label = problem.scf.xc_functional
+    if mpi_context is not None and not getattr(mpi_context, "exchange", False):
+        raise NotImplementedError(
+            f"the self-consistent hybrid functional {label!r} needs an MPI sector context made "
+            "for the exchange (MPISectorContext(comm, exchange=True), as the MPI runner makes it)"
+        )
+    if str(backend).lower() not in ("auto", "cupy"):
+        raise NotImplementedError(
+            f"the self-consistent hybrid functional {label!r} runs on the CuPy backend of the "
+            "accelerated path; use --backend auto or cupy, or the reference solver "
+            "(reference_main.py)"
+        )
+    settings = getattr(problem.scf, "exact_exchange", None)
+    periodic = getattr(problem, "periodic_cell", None) is not None
+    if periodic and getattr(problem.grid, "periodicity", 3) == 1:
+        raise NotImplementedError(
+            f"the self-consistent hybrid functional {label!r} is not implemented for a wire "
+            "(Boundary_Conditions: wire); bulk cells and slabs are"
+        )
+    if not periodic and getattr(settings, "pair_solver", "kronecker") != "kronecker":
+        raise NotImplementedError(
+            "the device exchange operator solves the pair densities with the Kronecker "
+            "solver only (Exx_Pair_Solver: kronecker); Exx_Pair_Solver: cg runs on the "
+            "reference solver (reference_main.py)"
+        )
+    for name, refused, reason in (
+        (
+            "PARSEC_CUPY_DISTRIBUTED_FILTER",
+            {"1"},
+            "a filter spread over several devices does not hold the exchange operator",
+        ),
+        (
+            "PARSEC_CUPY_RITZ_HANDOVER",
+            {"triangular"},
+            "the exchange operator is built from Ritz vectors",
+        ),
+        (
+            "PARSEC_CUPY_MIXED_FILTER",
+            {"on"},
+            "the FP32 filter does not hold the exchange operator",
+        ),
+    ):
+        if os.environ.get(name, "").strip().lower() in refused:
+            raise NotImplementedError(
+                f"{name}={os.environ[name]} is not implemented with the self-consistent hybrid "
+                f"functional {label!r}: {reason}"
+            )
+
+
+def _refuse_meta_gga_routes(problem, *, mpi_context) -> None:
+    """Refuse the routes of a meta-GGA that its device term does not cover (Hamiltonian/meta_gga_device.py).
+
+    The term runs in one process on the GPUs of one node (full grid or the
+    symmetry sectors with one device per sector basis) and on the CPU
+    backends.  Filters that bypass the term (captured graphs, a filter
+    spread over devices) give way to the ordinary filter by themselves.
+    """
+
+    label = problem.scf.xc_functional
+    if mpi_context is not None:
+        raise NotImplementedError(
+            f"the meta-GGA {label!r} is not implemented for the MPI SCF of several ranks or nodes; "
+            "run it in one process on one node (--serial-control), which uses all GPUs of that node"
+        )
+    for name, refused, reason in (
+        ("PARSEC_CUPY_MIXED_FILTER", {"on"}, "the FP32 filter does not hold the orbital term -div(vtau grad)"),
+        ("PARSEC_CUPY_RITZ_HANDOVER", {"triangular"}, "tau is formed from Ritz vectors"),
+    ):
+        if os.environ.get(name, "").strip().lower() in refused:
+            raise NotImplementedError(
+                f"{name}={os.environ[name]} is not implemented with the meta-GGA {label!r}: {reason}"
+            )
+
+
+def _hybrid_xc_evaluators(reference, *, backend, reducer, device_id, core_density):
+    """``(unpolarized, spin, (start unpolarized, start spin))`` evaluators of a hybrid.
+
+    The semilocal part of the hybrid on the device where
+    :func:`.V_xc.device_hybrid_xc.device_hybrid_supported` allows it, and
+    the start functional of the Fock loop where ``PARSEC_CUPY_XC`` puts it on
+    the device (:func:`.V_xc.accelerated_xc_evaluators`); ``None`` entries
+    keep the host functionals of the reference system.
+    """
+
+    from types import SimpleNamespace
+
+    from parsec_python.SCF.hybrid import hybrid_definition, hybrid_functional_of
+
+    from .V_xc import accelerated_xc_evaluators, device_xc_mode
+
+    scf = reference.input.scf
+    spin = bool(getattr(scf, "spin_polarized", False))
+    unpolarized = spin_evaluator = None
+    if backend == "cupy" and device_xc_mode() != "off":
+        from .V_xc.device_hybrid_xc import (
+            DeviceHybridXCEvaluator,
+            DeviceSpinHybridXCEvaluator,
+            device_hybrid_supported,
+        )
+
+        functional = hybrid_functional_of(scf)
+        from .V_xc.device_libxc import device_libxc_supported
+
+        if device_libxc_supported(functional.semilocal, reference.grid):
+            # A libxc hybrid: its semilocal part by libxc's CUDA build (V_xc/device_libxc.py).
+            from .V_xc.device_libxc import DeviceLibxcXCEvaluator, DeviceSpinLibxcXCEvaluator
+
+            keywords = dict(
+                name=functional.name, core_density=core_density, reducer=reducer, device_id=device_id
+            )
+            if spin:
+                spin_evaluator = DeviceSpinLibxcXCEvaluator(functional.semilocal, reference.grid, **keywords)
+            else:
+                unpolarized = DeviceLibxcXCEvaluator(functional.semilocal, reference.grid, **keywords)
+        elif device_hybrid_supported(functional, reference.grid):
+            if spin:
+                # On the orbits where the channels are solved in the sectors
+                # (``reducer``; None on the full grid).
+                spin_evaluator = DeviceSpinHybridXCEvaluator(
+                    functional,
+                    reference.grid,
+                    core_density=core_density,
+                    reducer=reducer,
+                    device_id=device_id,
+                )
+            else:
+                unpolarized = DeviceHybridXCEvaluator(
+                    functional,
+                    reference.grid,
+                    core_density=core_density,
+                    reducer=reducer,
+                    device_id=device_id,
+                )
+    # Zero_Average_Vxc of a 3-D cell (potshift): the device evaluators of the hybrid and of its start functional
+    # shift their potentials as the reference system's evaluate_xc does (the default of an unpolarized cell).
+    shift = getattr(reference, "_zero_average", None)
+    if callable(shift) and shift(None) is True:
+        from .V_xc.device_xc import ZeroAverageXC
+
+        unpolarized = None if unpolarized is None else ZeroAverageXC(unpolarized)
+        spin_evaluator = None if spin_evaluator is None else ZeroAverageXC(spin_evaluator)
+    start_scf = replace(
+        scf, xc_functional=hybrid_definition(scf).start_functional, exact_exchange=None
+    )
+    start_reference = SimpleNamespace(
+        input=replace(reference.input, scf=start_scf),
+        grid=reference.grid,
+        core_density=reference.core_density,
+        _zero_average=shift,
+    )
+    start = accelerated_xc_evaluators(
+        start_reference,
+        backend=backend,
+        reducer=reducer,
+        device_id=device_id,
+        core_density=core_density,
+    )
+    return unpolarized, spin_evaluator, start
+
+
+def _count_hybrid_device_bytes(sectors, exchange_device, reference, xc_evaluator, start_xc) -> None:
+    """Hand the device bytes of a hybrid to the memory rules of the sectors (``resident_device_bytes``)."""
+
+    from parsec_python.SCF.hybrid import hybrid_definition
+    from parsec_python.SCF.single_point import _number_of_states
+
+    counts = dict(sectors.resident_device_bytes)
+    for evaluator in (xc_evaluator, *start_xc):
+        planned = getattr(evaluator, "planned_device_bytes", None)
+        device = getattr(evaluator, "device_id", None)
+        if planned is not None and device is not None:
+            counts[int(device)] = counts.get(int(device), 0) + int(planned)
+    planned = exchange_device.planned_device_bytes(
+        reference, hybrid_definition(reference.input.scf), _number_of_states(reference)
+    )
+    for device, count in planned.items():
+        counts[int(device)] = counts.get(int(device), 0) + int(count)
+    exchange_device.planned_bytes = planned
+    sectors.resident_device_bytes = counts
+
+
+def _start_xc_with_reducer(start_xc, reference_of, reducer, *, spin_sectors: bool = False):
+    """The start evaluators of a hybrid's Fock loop, the host ones on the wedge too.
+
+    A missing unpolarized device evaluator of a symmetry-reduced loop is the
+    reference start functional on the full grid with the wedge fields of the
+    loop, as the driver gives every host functional; ``None`` elsewhere (the
+    reference system's own functional).  So is a missing spin evaluator where
+    the spin channels are solved in the sectors (``spin_sectors``).
+    ``reference_of()`` returns the reference system of the present structure:
+    an ionic move replaces it, and with it the frozen core density the start
+    functional reads.
+    """
+
+    unpolarized, spin = start_xc
+    if reducer is None or (unpolarized is not None and (spin is not None or not spin_sectors)):
+        return (unpolarized, spin)
+    from parsec_python.SCF.hybrid import hybrid_definition
+    from parsec_python.V_xc import XCResult
+
+    def start_reference():
+        reference = reference_of()
+        scf = reference.input.scf
+        start_scf = replace(
+            scf, xc_functional=hybrid_definition(scf).start_functional, exact_exchange=None
+        )
+        return replace(reference, input=replace(reference.input, scf=start_scf))
+
+    def start_xc_evaluator(density):
+        evaluated = start_reference().evaluate_xc(reducer.to_full(density))
+        return XCResult(
+            potential=reducer.from_full(evaluated.potential),
+            energy_per_electron=reducer.from_full(evaluated.energy_per_electron),
+            energy_density=reducer.from_full(evaluated.energy_density),
+            total_energy=evaluated.total_energy,
+        )
+
+    scf = getattr(getattr(reference_of(), "input", None), "scf", None)
+    if spin is None and spin_sectors and getattr(scf, "is_hybrid", False):
+        # The spin channels in the sectors: the host start functional on
+        # their orbit fields (SCF/spin_sectors.py).
+        from .SCF.spin_sectors import HostSpinXCOnOrbits
+
+        spin = HostSpinXCOnOrbits(
+            lambda up, down: start_reference().evaluate_spin_xc(up, down),
+            reducer,
+            _readable_spin_xc_label(hybrid_definition(scf).start_functional),
+        )
+    return (start_xc_evaluator if unpolarized is None else unpolarized, spin)
+
+
 def _prepare_single_point(
     problem: SinglePointInput,
     *,
@@ -2412,18 +3180,24 @@ def _prepare_single_point(
 
     stages = preparation.stages
     is_periodic = getattr(problem, "periodic_cell", None) is not None
-    # Two spin channels are solved on the full grid: the representation
-    # sectors, and with them the wedge fields of the SCF loop and the MPI
-    # ranks that divide the sectors, keep one subspace per representation.
+    # The input as it was given: a spin-polarized run that leaves the
+    # symmetry sectors is prepared again from it (_spin_sector_fallback).
+    given_problem = problem
+    # Two spin channels are solved on the full grid unless
+    # Spin_Symmetry_Sectors puts them in the representation sectors
+    # (_spin_sector_refusal); the MPI ranks that divide the sectors keep one
+    # subspace per representation and serve no spin channels.
     spin_polarized = bool(
         getattr(getattr(problem, "scf", None), "spin_polarized", False)
     )
-    if spin_polarized and mpi_context is not None:
+    spin_sector_refusal = _spin_sector_refusal(problem) if spin_polarized else None
+    if spin_polarized and mpi_context is not None and spin_sector_refusal is not None:
+        # The ranks divide the symmetry sectors; two channels on the full grid
+        # run in one process.
         raise NotImplementedError(
-            "a spin-polarized calculation (Spin_Polarization: true) cannot run "
-            "as an MPI SCF: the ranks divide the symmetry sectors, which are "
-            "not implemented for two spin channels. Run it in one process "
-            "(--serial-control)"
+            "a spin-polarized calculation whose channels stay on the full grid "
+            f"({spin_sector_refusal}) cannot run as an MPI SCF: the ranks divide the "
+            "symmetry sectors. Run it in one process (--serial-control or main.py)"
         )
     _refuse_corrections(problem, is_periodic=is_periodic, mpi_context=mpi_context)
     point_charges = bool(getattr(problem, "point_charges", ()))
@@ -2444,6 +3218,19 @@ def _prepare_single_point(
             raise ValueError(
                 "symmetry='on' cannot be used with point charges (Add_Point_Charges): "
                 "the calculation uses no point group"
+            )
+        symmetry = "off"
+    if getattr(problem, "embedding", None) is not None:
+        # FDET of PARSEC 1.5 (Potential_Field): the frozen sample field has no
+        # point group of the tip atoms, and only this process holds it.
+        if mpi_context is not None:
+            raise NotImplementedError(
+                "FDET (Potential_Field) does not run as an MPI SCF; run the input in one process (main.py)"
+            )
+        if _normalize_symmetry_mode(symmetry) == "on":
+            raise ValueError(
+                "symmetry='on' cannot be used with FDET (Potential_Field): the frozen sample field "
+                "breaks the point group of the tip"
             )
         symmetry = "off"
     # A periodic cell has no Hartree boundary values.  The switches are read
@@ -2467,12 +3254,17 @@ def _prepare_single_point(
             "space-group symmetry detection is not implemented for the "
             "accelerated periodic path"
         )
-    if is_periodic and mpi_context is not None:
+    # A periodic cell in an MPI sector context: one sector of the identity
+    # whose basis the ranks share (a bulk cell at Gamma; see
+    # periodic_sector_refusal for what that route does not take).
+    periodic_refusal = periodic_sector_refusal(problem) if is_periodic else None
+    if periodic_refusal is not None and mpi_context is not None:
         raise ValueError(
-            "an MPI sector context is not supported for periodic problems: "
-            "the ranks of an MPI run divide the symmetry sectors of an "
-            "isolated cluster, and the accelerated periodic path uses the "
-            "full grid"
+            f"{periodic_refusal} of a periodic cell does not run as an MPI SCF, whose "
+            "ranks share the basis of one sector of the identity (a bulk "
+            "orthorhombic cell at the Gamma point, unpolarized, native LDA or GGA): "
+            "run it with parsec_python/main.py"
+            + (" --mpi" if "k-point" in periodic_refusal else "")
         )
     # Only the root rank of an MPI run enters the SCF loop.  The other ranks
     # answer eigensolver and density commands for the sectors they own.
@@ -2604,10 +3396,30 @@ def _prepare_single_point(
             or (single_sector_mode == "auto" and mpi_context is not None)
         )
         and symmetry_reduction is None
-        and not is_periodic
+        # A periodic cell where the route of the sectors takes it (a bulk
+        # orthorhombic cell at Gamma on the grid of one spacing).
+        and (
+            not is_periodic
+            or (
+                periodic_refusal is None
+                and not getattr(reference.grid, "is_general_periodic", False)
+            )
+        )
         and not spin_polarized
         and selection.selected == "cupy"
     )
+    if is_periodic and mpi_context is not None and not single_sector:
+        raise ValueError(
+            "the MPI SCF of a periodic cell solves it as one sector of the identity, which this run "
+            + (
+                "cannot take on Fortran's general periodic grid (Use_Fortran_Routines with sides "
+                "of different grid steps)"
+                if getattr(reference.grid, "is_general_periodic", False)
+                else f"does not take here (PARSEC_CUPY_SINGLE_SECTOR={single_sector_mode}, "
+                f"backend {selection.selected})"
+            )
+            + ": run it with parsec_python/main.py"
+        )
     if single_sector:
         from .Symmetry import AxisReflectionReduction
 
@@ -2642,11 +3454,8 @@ def _prepare_single_point(
         orbital_symmetry = (
             "full grid (representation decomposition is currently a CuPy path)"
         )
-    elif spin_polarized:
-        orbital_symmetry = (
-            "full grid (spin-polarized: the representation sectors are not "
-            "implemented for two spin channels)"
-        )
+    elif spin_polarized and spin_sector_refusal is not None:
+        orbital_symmetry = f"full grid (spin-polarized: {spin_sector_refusal})"
     else:
         from .Symmetry import load_or_build_reflection_decomposition
 
@@ -2691,26 +3500,27 @@ def _prepare_single_point(
         # decomposition was asked for or not: before the sector operators
         # are built and long before the first graph capture.
         symmetry_maps.close()
+    # Spin_Symmetry_Sectors: both channels in the sectors of this
+    # decomposition, with the symmetry guard of SCF/spin_sectors.py.
+    spin_sectors = spin_polarized and orbital_decomposition is not None
+    if spin_polarized and mpi_context is not None and not spin_sectors:
+        raise NotImplementedError(
+            f"a spin-polarized calculation on the {orbital_symmetry} cannot run as an MPI SCF: "
+            "the ranks divide the symmetry sectors of both channels. Run it in one process "
+            "(--serial-control or main.py)"
+        )
 
     # Decide the Hartree reduction before constructing the execution backend.
     # This lets the independent boundary-geometry setup overlap the much more
     # expensive GPU orbital-operator construction below.
-    hartree_linear_backend = os.environ.get(
-        "PARSEC_HARTREE_LINEAR_BACKEND", "native"
-    ).strip().lower()
-    if hartree_linear_backend not in {"native", "cupy"}:
-        raise ValueError("PARSEC_HARTREE_LINEAR_BACKEND must be native or cupy")
-    if is_periodic:
-        # The switch chooses the CG of the isolated-cluster Hartree solver.
-        # A periodic cell is solved by the reference periodic CG below.
-        hartree_linear_backend = "native"
-    if hartree_linear_backend == "cupy" and not (
-        selection.selected == "cupy" and selection.hartree_backend == "native"
-    ):
-        raise ValueError(
-            "PARSEC_HARTREE_LINEAR_BACKEND=cupy requires the auto/hybrid CUDA "
-            "backend with native boundary construction"
-        )
+    hartree_linear_backend, hartree_linear_reason = _hartree_linear_backend(
+        selection, periodic=is_periodic
+    )
+    # Whether the variable named the backend: only a choice of ``auto`` may
+    # fall back to the host CG where the GPU CG cannot be built.
+    hartree_linear_named = hartree_linear_reason.startswith(
+        "PARSEC_HARTREE_LINEAR_BACKEND="
+    )
     hartree_reduction = symmetry_reduction
     legacy_hartree_setting = os.environ.get(
         "PARSEC_HARTREE_SYMMETRY", "auto"
@@ -2733,12 +3543,13 @@ def _prepare_single_point(
             "supported symmetry was detected"
         )
     hartree_full_grid_for_spin = False
-    if spin_polarized and hartree_reduction is not None:
+    if spin_polarized and not spin_sectors and hartree_reduction is not None:
         # The orbitals of the two channels are solved on the full grid, where
         # a partly filled degenerate level may take a density that the point
         # group does not leave invariant (the oxygen atom).  The wedge solver
         # would average that density over the symmetry orbits and return the
-        # Hartree potential of another density.
+        # Hartree potential of another density.  (In the sectors every
+        # channel density is invariant: Spin_Symmetry_Sectors.)
         if legacy_hartree_forced:
             raise ValueError(
                 "PARSEC_HARTREE_SYMMETRY requests the symmetry-reduced Hartree "
@@ -2820,6 +3631,67 @@ def _prepare_single_point(
             ),
         )
     if (
+        hartree_linear_backend == "cupy"
+        and not hartree_linear_named
+        and orbital_decomposition is None
+        and not sector_worker
+    ):
+        # A full-grid eigensolver has no memory rule that plans around the
+        # GPU Hartree arrays: ``auto`` keeps them on the GPU only where they
+        # take a small share of what the device has free (decided before the
+        # boundary thread, which follows the CG).
+        from .Hartree.gpu_memory import (
+            FREE_SHARE_BESIDE_FULL_GRID,
+            device_free_bytes,
+            planned_gpu_hartree_bytes,
+        )
+
+        planned_hartree_bytes = planned_gpu_hartree_bytes(
+            reference.grid.size if hartree_reduction is None else hartree_reduction.wedge_size,
+            reference.grid.settings.stencil_half_width,
+            gpu_boundary=hartree_reduction is None,
+        )
+        free_hartree_bytes = device_free_bytes(hartree_device)
+        if (
+            free_hartree_bytes is not None
+            and planned_hartree_bytes > FREE_SHARE_BESIDE_FULL_GRID * free_hartree_bytes
+        ):
+            hartree_linear_backend = "native"
+            hartree_linear_reason = (
+                "auto: the host CG, the GPU Hartree arrays "
+                f"({planned_hartree_bytes / 2**20:.0f} MiB) would take more than "
+                f"1/{round(1 / FREE_SHARE_BESIDE_FULL_GRID)} of the "
+                f"{free_hartree_bytes / 2**20:.0f} MiB free on their device beside "
+                "a full-grid eigensolver, which does not plan around them"
+            )
+    # PARSEC_CUPY_RESIDENT_HARTREE: where the GPU CG solves the wedge of the
+    # SCF fields, the boundary of that wedge is built on its device too and
+    # every solve stays there (decided here, before the boundary thread).
+    resident_request = _resident_hartree_request()
+    resident_wedge, resident_reason = _resident_hartree_plan(
+        resident_request,
+        linear_backend=hartree_linear_backend,
+        hartree_reduction=hartree_reduction,
+        orbital_decomposition=orbital_decomposition,
+        orbital_reduction=orbital_reduction,
+        boundary_builder_planned=boundary_setup_eligible and selection.selected == "cupy",
+    )
+    resident_wedge = resident_wedge and not sector_worker
+    planned_resident_reason = resident_reason
+    resident_prefix = "auto" if resident_request == "auto" else "PARSEC_CUPY_RESIDENT_HARTREE=1"
+    boundary_setup_notes: dict = {}
+    # The boundary builder of the chain lies on the device of the GPU CG: the
+    # Hartree device, or without one (a single device, or
+    # PARSEC_HARTREE_DEVICE=off) the first device of the sectors, which the
+    # CG takes; the default device of the boundary thread may be another.
+    boundary_device = hartree_device
+    if resident_wedge and boundary_device is None:
+        from .Eigensolvers.symmetry import selected_device_ids
+        from .backends.cupy import require_cupy
+
+        cp, _ = require_cupy()
+        boundary_device = selected_device_ids(int(cp.cuda.Device().id))[0]
+    if (
         boundary_setup_eligible
         and boundary_overlap_enabled
         and selection.selected == "cupy"
@@ -2846,9 +3718,12 @@ def _prepare_single_point(
             hartree_reduction,
             symmetry_cache_directory=symmetry_cache_directory,
             symmetry_geometry_cache_info=symmetry_geometry_cache_info,
-            device_id=hartree_device,
+            device_id=boundary_device,
             tail_on_device=True,
             gpu_kernels=True,
+            gpu_linear=hartree_linear_backend == "cupy",
+            resident_wedge=resident_wedge,
+            notes=boundary_setup_notes,
         )
         boundary_setup_status = "overlapped with GPU orbital setup"
 
@@ -2984,7 +3859,80 @@ def _prepare_single_point(
             )
 
     spin_xc_evaluator = None
-    if native_xc_evaluator is None:
+    # A hybrid functional: the semilocal part of the hybrid and the start
+    # functional of its Fock loop (V_xc/device_hybrid_xc.py, device_xc.py).
+    hybrid_start_xc = (None, None)
+    if native_xc_evaluator is None and getattr(
+        getattr(getattr(reference, "input", None), "scf", None), "is_meta_gga", False
+    ):
+        # A meta-GGA: the functional of the reference on the host, the fields
+        # of the sectors expanded for it (V_xc/meta_gga_xc.py).
+        # On the device where the evaluator runs on CuPy arrays (PARSEC_CUPY_XC
+        # not off, a cluster or orthorhombic grid, no Laplacian dependence).
+        from parsec_python.V_xc.meta_gga import meta_gga_evaluator
+
+        from .V_xc import device_xc_mode
+        from .V_xc.meta_gga_xc import (
+            DeviceMetaGGAOnOrbits,
+            HostMetaGGAOnOrbits,
+            HostMetaGGASpinOnOrbits,
+        )
+
+        native_xc_evaluator = HostMetaGGAOnOrbits(lambda: reference, scf_reducer)
+        spin_xc_evaluator = HostMetaGGASpinOnOrbits(
+            lambda: reference, scf_reducer if spin_sectors else None
+        )
+        if selection.selected == "cupy" and device_xc_mode() != "off" and not sector_worker:
+            functional = meta_gga_evaluator(reference.input.scf)
+            try:
+                if spin_polarized:
+                    spin_xc_evaluator = DeviceMetaGGAOnOrbits(
+                        functional,
+                        reference.grid,
+                        reducer=scf_reducer if spin_sectors else None,
+                        device_id=hartree_device if isinstance(hartree_device, int) else 0,
+                        core_density=lambda: reference.core_density,
+                        spin=True,
+                    )
+                else:
+                    native_xc_evaluator = DeviceMetaGGAOnOrbits(
+                        functional,
+                        reference.grid,
+                        reducer=scf_reducer,
+                        device_id=hartree_device if isinstance(hartree_device, int) else 0,
+                        core_density=lambda: reference.core_density,
+                    )
+            except ValueError:
+                # No device evaluation of this functional or grid: the host one.
+                pass
+            planned = getattr(native_xc_evaluator, "planned_device_bytes", None)
+            if symmetry_eigensolver is not None and planned is not None and not spin_polarized:
+                # The memory rules of the sectors count what the device
+                # evaluator keeps and takes on its device (the spin one below).
+                symmetry_eigensolver.resident_device_bytes = {
+                    int(native_xc_evaluator.device_id): int(planned)
+                }
+        if getattr(reference.input.scf, "is_hybrid", False) and not sector_worker:
+            # A meta-GGA hybrid: the start functional (PBE) of its Fock loop where
+            # PARSEC_CUPY_XC puts it on the device; the semilocal part is the meta-GGA's.
+            hybrid_start_xc = _hybrid_xc_evaluators(
+                reference,
+                backend=selection.selected,
+                reducer=scf_reducer,
+                device_id=hartree_device,
+                core_density=lambda: reference.core_density,
+            )[2]
+    elif native_xc_evaluator is None and getattr(
+        getattr(getattr(reference, "input", None), "scf", None), "is_hybrid", False
+    ):
+        native_xc_evaluator, spin_xc_evaluator, hybrid_start_xc = _hybrid_xc_evaluators(
+            reference,
+            backend=selection.selected,
+            reducer=scf_reducer,
+            device_id=hartree_device,
+            core_density=lambda: reference.core_density,
+        )
+    elif native_xc_evaluator is None:
         # The other functionals on the device where PARSEC_CUPY_XC puts them
         # there (V_xc/device_xc.py); None leaves them to the host below.
         from .V_xc import accelerated_xc_evaluators
@@ -3027,6 +3975,25 @@ def _prepare_single_point(
             )
 
         native_xc_evaluator = symmetry_xc_evaluator
+    if spin_sectors and spin_xc_evaluator is None:
+        # A spin functional the device does not evaluate, on the orbit fields
+        # of the sectors: expanded, evaluated on the host, reduced (exact for
+        # invariant channels).  The structure of the present atoms.
+        from .SCF.spin_sectors import HostSpinXCOnOrbits
+
+        spin_xc_evaluator = HostSpinXCOnOrbits(
+            lambda up, down: reference.evaluate_spin_xc(up, down),
+            scf_reducer,
+            _readable_spin_xc_label(xc_functional),
+        )
+    if spin_sectors and symmetry_eigensolver is not None and not getattr(
+        getattr(getattr(reference, "input", None), "scf", None), "is_hybrid", False
+    ):
+        planned = getattr(spin_xc_evaluator, "planned_device_bytes", None)
+        if planned is not None:
+            # The memory rules of the sectors count the device spin evaluator
+            # (a hybrid's are counted with its exchange below).
+            symmetry_eigensolver.resident_device_bytes = {int(spin_xc_evaluator.device_id): int(planned)}
     stages.add("xc_evaluator", stage_started)
 
     # The Hartree solver of the selected backend, with its boundary
@@ -3045,8 +4012,24 @@ def _prepare_single_point(
         # reference.solve_hartree) -- _selection_for_problem forces
         # hartree_backend to "scipy" for periodic precisely so none of the
         # branches below this one can be reached instead.
+        # In one sector of the identity (periodic_sector_refusal) the SCF
+        # keeps its fields as orbit fields of the identity, one value per grid
+        # point in the order of the grid: the full-grid solve sees them
+        # expanded, and its potentials go back to orbit fields, both exact
+        # copies.
         def accelerated_hartree(density, initial_potential=None, **kwargs):
-            return reference.solve_hartree(density, initial_potential, **kwargs)
+            if scf_reducer is None:
+                return reference.solve_hartree(density, initial_potential, **kwargs)
+            result = reference.solve_hartree(
+                scf_reducer.to_full(density),
+                None if initial_potential is None else scf_reducer.to_full(initial_potential),
+                **kwargs,
+            )
+            return replace(
+                result,
+                potential=scf_reducer.from_full(result.potential),
+                right_hand_side=scf_reducer.from_full(result.right_hand_side),
+            )
 
     elif selection.hartree_backend == "cupy":
         from .Hartree.cupy_poisson import CuPyPoissonSolver
@@ -3103,21 +4086,6 @@ def _prepare_single_point(
             materialize_negative_laplacian,
         )
 
-        poisson_factory = NativePoissonSolver
-        if hartree_linear_backend == "cupy":
-            from functools import partial
-            from .Hartree.cupy_prepared import CuPyPreparedPoissonSolver
-
-            poisson_factory = partial(
-                CuPyPreparedPoissonSolver,
-                device_id=(
-                    hartree_device
-                    if hartree_device is not None
-                    else symmetry_eigensolver.device_ids[0]
-                    if symmetry_eigensolver is not None else None
-                ),
-            )
-
         def concrete_negative_laplacian(operator):
             return (
                 materialize_negative_laplacian(operator)
@@ -3125,21 +4093,39 @@ def _prepare_single_point(
                 else operator
             )
 
-        if hartree_reduction is None:
-            poisson_solver = poisson_factory(
-                concrete_negative_laplacian(reference.negative_laplacian)
-            )
-        else:
+        from .Hartree.gpu_memory import cuda_allocation_errors
+
+        def build_poisson_solver(linear_backend, reduction):
+            """The Poisson solver of ``linear_backend`` and the reduction it uses."""
+
+            poisson_factory = NativePoissonSolver
+            if linear_backend == "cupy":
+                from functools import partial
+                from .Hartree.cupy_prepared import CuPyPreparedPoissonSolver
+
+                poisson_factory = partial(
+                    CuPyPreparedPoissonSolver,
+                    device_id=(
+                        hartree_device
+                        if hartree_device is not None
+                        else symmetry_eigensolver.device_ids[0]
+                        if symmetry_eigensolver is not None else None
+                    ),
+                )
+            if reduction is None:
+                return poisson_factory(
+                    concrete_negative_laplacian(reference.negative_laplacian)
+                ), None
             try:
                 reusable_reduced_operator = (
                     symmetry_eigensolver is not None
-                    and orbital_reduction is hartree_reduction
+                    and orbital_reduction is reduction
                 )
                 if not reusable_reduced_operator:
                     reduced_operator = concrete_negative_laplacian(
                         reference.negative_laplacian
                     )
-                elif hartree_linear_backend == "cupy":
+                elif linear_backend == "cupy":
                     # The GPU CG reads the slot-major stencil the totally
                     # symmetric sector was packed into.  Converting it to CSR
                     # and packing that again would put the same neighbor and
@@ -3152,20 +4138,47 @@ def _prepare_single_point(
                     reduced_operator = (
                         symmetry_eigensolver.totally_symmetric_negative_laplacian
                     )
-                poisson_solver = SymmetryReducedPoissonSolver(
+                return SymmetryReducedPoissonSolver(
                     reduced_operator,
-                    hartree_reduction,
+                    reduction,
                     operator_is_reduced=reusable_reduced_operator,
                     solver_factory=poisson_factory,
-                )
-            except (ValueError, RuntimeError):
+                ), reduction
+            except (ValueError, RuntimeError) as error:
+                # A GPU CG of ``auto`` that fails on the wedge gives way to the
+                # host CG on the same wedge (below), not to a GPU CG of the
+                # full grid |G| times its size.  An unusable reduction leaves
+                # the full grid, as for the host CG; the GPU CG asked for by
+                # name stops instead.
+                if linear_backend == "cupy" and not hartree_linear_named:
+                    raise _GPUHartreeUnavailable(str(error)) from error
                 if (symmetry_mode == "on" or legacy_hartree_forced
-                        or hartree_linear_backend == "cupy"):
+                        or (linear_backend == "cupy" and hartree_linear_named)):
                     raise
-                hartree_reduction = None
-                poisson_solver = poisson_factory(
+                return poisson_factory(
                     concrete_negative_laplacian(reference.negative_laplacian)
-                )
+                ), None
+
+        try:
+            poisson_solver, hartree_reduction = build_poisson_solver(
+                hartree_linear_backend, hartree_reduction
+            )
+        except (_GPUHartreeUnavailable, *cuda_allocation_errors()) as error:
+            # CuPy's OutOfMemoryError is a MemoryError, and an exhausted
+            # device also answers through CuPy's CUDA runtime and driver
+            # errors.  The CG chosen by ``auto`` gives way to the host CG on
+            # the same reduction; one asked for by name does not.
+            if hartree_linear_backend != "cupy" or hartree_linear_named:
+                raise
+            cause = error.__cause__ if isinstance(error, _GPUHartreeUnavailable) else error
+            hartree_linear_backend = "native"
+            hartree_linear_reason = (
+                "auto: the host CG, the GPU CG could not be built "
+                f"({type(cause).__name__}: {cause})"
+            )
+            poisson_solver, hartree_reduction = build_poisson_solver(
+                "native", hartree_reduction
+            )
         stages.add("poisson_solver", hartree_started)
         if boundary_setup_eligible:
             if boundary_setup_future is not None:
@@ -3216,6 +4229,7 @@ def _prepare_single_point(
                         ),
                         tail_on_device=selection.selected == "cupy",
                         gpu_kernels=selection.selected == "cupy",
+                        gpu_linear=hartree_linear_backend == "cupy",
                     )
                     boundary_setup_seconds += rebuild_seconds
                     boundary_setup_status = (
@@ -3234,15 +4248,73 @@ def _prepare_single_point(
                     hartree_reduction,
                     symmetry_cache_directory=symmetry_cache_directory,
                     symmetry_geometry_cache_info=symmetry_geometry_cache_info,
-                    device_id=hartree_device,
+                    device_id=boundary_device,
                     tail_on_device=selection.selected == "cupy",
                     gpu_kernels=selection.selected == "cupy",
+                    gpu_linear=hartree_linear_backend == "cupy",
+                    resident_wedge=resident_wedge,
+                    notes=boundary_setup_notes,
                 )
                 boundary_setup_status = (
                     "inline (overlap disabled)"
                     if selection.selected == "cupy"
                     else "inline (no independent GPU setup)"
                 )
+
+        def host_boundary(
+            status: str, *, gpu_kernels: bool, gpu_linear: bool, tail_on_device: bool = True
+        ) -> None:
+            """Put the boundary builder of the route before the chain in its place.
+
+            ``gpu_kernels`` and ``gpu_linear`` are those that route asked
+            the builder with: the orbit table where it fits, and otherwise
+            the GPU kernels or the host recurrences as they decide.  A tail
+            in rows comes from the device kernel if ``tail_on_device``.
+            """
+
+            nonlocal native_boundary_builder, native_symmetry_boundary, hartree_boundary_tail
+            nonlocal native_boundary_cache_info, boundary_setup_seconds, boundary_setup_status
+            discarded = native_boundary_builder
+            native_boundary_builder = None
+            (
+                native_boundary_builder,
+                native_symmetry_boundary,
+                native_boundary_cache_info,
+                rebuild_seconds,
+            ) = stages.timed("hartree_boundary_setup", _build_native_boundary_builder)(
+                reference,
+                hartree_reduction,
+                symmetry_cache_directory=symmetry_cache_directory,
+                symmetry_geometry_cache_info=symmetry_geometry_cache_info,
+                device_id=hartree_device,
+                boundary_tail=_attached_boundary_tail(discarded),
+                tail_on_device=tail_on_device and selection.selected == "cupy",
+                gpu_kernels=gpu_kernels,
+                gpu_linear=gpu_linear,
+            )
+            del discarded
+            implementation.native_boundary_builder = native_boundary_builder
+            hartree_boundary_tail = _attached_boundary_tail(native_boundary_builder)
+            boundary_setup_notes.pop("resident_boundary", None)
+            boundary_setup_seconds += rebuild_seconds
+            boundary_setup_status = status
+
+        if (
+            boundary_setup_notes.get("resident_boundary") == "gpu"
+            and hartree_reduction is not None
+            and hartree_linear_backend != "cupy"
+        ):
+            # The GPU CG gave way to the host CG: the boundary of the wedge as
+            # that route asked for it before (the orbit table, or the GPU
+            # kernels where it has none), with the host CG beside it.
+            resident_reason = f"{resident_prefix}: the conjugate gradients run on the host"
+            host_boundary(
+                "rebuilt after the host-CG fallback",
+                gpu_kernels=selection.selected == "cupy",
+                gpu_linear=True,
+            )
+        elif boundary_setup_notes.get("resident_boundary", "gpu") != "gpu":
+            resident_reason = f"{resident_prefix}: {boundary_setup_notes['resident_boundary']}"
         # CuPy's statistics bridge expects ``poisson_solver`` to expose CuPy
         # event timings.  Keep the native solver under a distinct, inspectable
         # name and accumulate its host timings directly below.
@@ -3374,30 +4446,133 @@ def _prepare_single_point(
                 result = replace(result, boundary_tail=hartree_boundary_tail)
             return result
 
-        resident_policy = os.environ.get("PARSEC_CUPY_RESIDENT_HARTREE", "0").strip().lower()
-        if resident_policy not in {"0", "1", "auto"}:
-            raise ValueError("PARSEC_CUPY_RESIDENT_HARTREE must be 0, 1, or auto")
+        # The resident chain: the GPU boundary builder and the GPU CG on the
+        # wedge of the SCF fields (PARSEC_CUPY_RESIDENT_HARTREE, auto by
+        # default).  The host interface above stays behind it.
         resident_eligible = (
             type(native_boundary_builder).__name__ in _GPU_BOUNDARY_BUILDERS
             and hartree_linear_backend == "cupy"
-            and hartree_reduction is not None and scf_reducer is not None
+            and hartree_reduction is not None
+            and scf_reducer is not None
             and scf_reducer.reduction is hartree_reduction
+            and (
+                resident_request == "1"
+                or int(hartree_reduction.full_size) <= np.iinfo(np.int32).max
+            )
         )
-        if resident_policy == "1" and not resident_eligible:
-            raise ValueError("resident Hartree requires GPU boundary/CG and matching scalar/Poisson wedge")
-        if resident_policy in {"1", "auto"} and resident_eligible:
+        if resident_request == "1" and not resident_eligible:
+            raise ValueError(
+                "PARSEC_CUPY_RESIDENT_HARTREE=1 requires the GPU boundary and CG on the "
+                f"symmetry wedge of the SCF fields ({resident_reason})"
+            )
+        resident_built_here = boundary_setup_notes.get("resident_boundary") == "gpu"
+        if (
+            resident_request != "0"
+            and resident_eligible
+            and int(native_boundary_builder.device_id)
+            != int(poisson_solver.solver.backend.device_id)
+        ):
+            # Builder and CG on two devices would copy every solve across
+            # them (and stop without peer access): the route before instead.
+            message = (
+                f"the boundary builder is on device {native_boundary_builder.device_id}, "
+                f"the CG on device {poisson_solver.solver.backend.device_id}"
+            )
+            if resident_request == "1":
+                raise ValueError(f"PARSEC_CUPY_RESIDENT_HARTREE=1: {message}")
+            resident_eligible = False
+            resident_reason = f"auto: {message}"
+            if resident_built_here:
+                host_boundary(
+                    "rebuilt: builder and CG on two devices",
+                    gpu_kernels=selection.selected == "cupy",
+                    gpu_linear=True,
+                )
+        if resident_request != "0" and resident_eligible:
             from .Hartree.cupy_resident import CuPyResidentHartree
-            resident_hartree = stages.timed("resident_hartree", CuPyResidentHartree)(
-                native_boundary_builder,hartree_reduction,
-                poisson_solver.solver.backend,reference.input.hartree)
-            def accelerated_hartree(density,initial_potential=None,**kwargs):
-                started=perf_counter()
-                result=resident_hartree.solve(density,initial_potential,**kwargs)
-                implementation.statistics.hartree_solve_calls+=1
-                implementation.statistics.hartree_rhs_seconds+=resident_hartree.rhs_seconds
-                implementation.statistics.hartree_linear_solve_seconds+=resident_hartree.solve_seconds
-                implementation.statistics.hartree_total_seconds+=perf_counter()-started
-                return result
+
+            try:
+                resident_hartree = stages.timed("resident_hartree", CuPyResidentHartree)(
+                    native_boundary_builder,
+                    hartree_reduction,
+                    poisson_solver.solver.backend,
+                    reference.input.hartree,
+                )
+            except cuda_allocation_errors() as error:
+                if resident_request == "1":
+                    raise
+                resident_hartree = None
+                resident_reason = (
+                    f"auto: the chain could not be built ({type(error).__name__}: {error})"
+                )
+                if resident_built_here:
+                    host_boundary(
+                        "rebuilt: the resident chain could not be built",
+                        gpu_kernels=selection.selected == "cupy",
+                        gpu_linear=True,
+                    )
+            else:
+                if not resident_built_here:
+                    # A GPU boundary named by PARSEC_HARTREE_BOUNDARY_BACKEND.
+                    resident_reason = (
+                        f"{resident_prefix}: the GPU boundary and CG on the symmetry wedge "
+                        "of the SCF fields"
+                    )
+
+                def leave_chain():
+                    """The boundary of the route before, on the host, after an allocation failure."""
+
+                    host_boundary(
+                        "rebuilt on the host after an allocation failure of the resident chain",
+                        gpu_kernels=False,
+                        gpu_linear=False,
+                        tail_on_device=False,
+                    )
+                    return (
+                        ("hartree_backend", "native-boundary/cupy-linear"),
+                        ("hartree_boundary_kernel", _host_boundary_kernel(native_symmetry_boundary)),
+                        ("hartree_boundary_device_bytes", "0"),
+                        ("hartree_boundary_device", "host"),
+                        ("hartree_boundary_setup", boundary_setup_status),
+                    )
+
+                accelerated_hartree = _ResidentHartreeSolve(
+                    resident_hartree,
+                    accelerated_hartree,
+                    implementation.statistics,
+                    # move_atoms rebinds the tail in rows.
+                    tail=lambda: hartree_boundary_tail,
+                    poisson_solver=poisson_solver,
+                    named=resident_request == "1",
+                    leave=leave_chain,
+                )
+        if resident_hartree is None and resident_reason == planned_resident_reason and resident_wedge:
+            # Planned, but the Hartree solve changed at the join (a reduced
+            # solver that could not be built leaves the full grid): the plan
+            # again, with what was built.
+            _, resident_reason = _resident_hartree_plan(
+                resident_request,
+                linear_backend=hartree_linear_backend,
+                hartree_reduction=hartree_reduction,
+                orbital_decomposition=orbital_decomposition,
+                orbital_reduction=orbital_reduction,
+                boundary_builder_planned=native_boundary_builder is not None,
+            )
+            if resident_reason == planned_resident_reason:
+                resident_reason = f"{resident_prefix}: the boundary is built on the host"
+
+        if symmetry_eigensolver is not None:
+            # The memory rules of the sectors (state storage, shared bases)
+            # count the GPU Hartree arrays on their device beside the XC
+            # evaluator and the exchange of a hybrid.
+            hartree_device_bytes = _gpu_hartree_device_bytes(
+                poisson_solver, native_boundary_builder, resident_hartree
+            )
+            if hartree_device_bytes:
+                counts = dict(symmetry_eigensolver.resident_device_bytes)
+                for device, count in hartree_device_bytes.items():
+                    counts[device] = counts.get(device, 0) + count
+                symmetry_eigensolver.resident_device_bytes = counts
 
     elif selection.hartree_backend == "scipy":
         hartree_boundary_tail = _hartree_boundary_tail(
@@ -3579,8 +4754,37 @@ def _prepare_single_point(
          else "cupy-boundary/native-linear" if boundary_on_gpu
          else selection.hartree_backend),
         ("hartree_implementation", hartree_implementation),
-        ("hartree_full_grid_transfer_policy", "device-resident" if resident_hartree is not None else "host-interface"),
-        ("hartree_resident_predictor", resident_hartree.predictor if resident_hartree is not None else "disabled"),
+        ("hartree_linear_backend", _hartree_linear_report(
+            selection, periodic=is_periodic, backend=hartree_linear_backend,
+            reason=hartree_linear_reason)),
+        (
+            "hartree_full_grid_transfer_policy",
+            "device-resident" if resident_hartree is not None else "host-interface",
+        ),
+        (
+            "hartree_resident_predictor",
+            resident_hartree.predictor if resident_hartree is not None else "disabled",
+        ),
+        # PARSEC_CUPY_RESIDENT_HARTREE: whether the chain runs and why.
+        (
+            "hartree_resident_chain",
+            "not used (no Hartree solver on this rank)"
+            if sector_worker
+            else "not used (periodic cell)"
+            if is_periodic
+            else f"not used (the {selection.hartree_backend} Hartree solver of the selected backend)"
+            if selection.hartree_backend != "native"
+            else "off (the C++/OpenMP CG of a CPU run)"
+            if selection.selected != "cupy"
+            else f"on ({resident_reason})"
+            if resident_hartree is not None
+            else f"off ({resident_reason})",
+        ),
+        *(
+            (("hartree_resident_device_bytes", str(resident_hartree.device_bytes)),)
+            if resident_hartree is not None
+            else ()
+        ),
         *_hartree_boundary_details(
             reference, hartree_boundary_tail, native_boundary_builder
         ),
@@ -3615,13 +4819,7 @@ def _prepare_single_point(
             or (
                 # The SCF loop of two spin channels evaluates the readable
                 # spin functionals on the full grid.
-                (
-                    "vectorized NumPy discrete-variational spin-polarized PBE"
-                    if xc_functional == "pbe"
-                    else "vectorized NumPy CA/PZ local spin density"
-                    if xc_functional == "ca"
-                    else _readable_xc_label(xc_functional, spin_polarized=True)
-                )
+                _readable_spin_xc_label(xc_functional)
                 if spin_polarized
                 else "cached C++/OpenMP float64 CA/PZ-LDA"
                 if xc_functional == "ca"
@@ -4017,6 +5215,9 @@ def _prepare_single_point(
                     operator_build_workers(
                         symmetry_eigensolver.assembled_sector_count
                     )
+                    # (A rank of a hybrid's MPI run may assemble no sector.)
+                    if symmetry_eigensolver.assembled_sector_count
+                    else 0
                 ),
             ),
             (
@@ -4182,11 +5383,16 @@ def _prepare_single_point(
     # ------------------------------------------------------------------
 
     def tail_maximum():
+        # The builder of the present structure: a resident chain that gave
+        # way rebuilds it on the host.
         return (
             hartree_boundary_tail.maximum
             if hartree_boundary_tail is not None
-            else native_boundary_builder.atomic_tail_maximum
-            if boundary_on_wedge_gpu or boundary_on_point_gpu
+            else getattr(native_boundary_builder, "atomic_tail_maximum", None)
+            if type(native_boundary_builder).__name__ in {
+                "CuPySymmetryMultipoleBoundaryBuilder",
+                "CuPyPointMultipoleBoundaryBuilder",
+            }
             else None
         )
 
@@ -4251,13 +5457,13 @@ def _prepare_single_point(
 
         nonlocal reference, hartree_boundary_tail, native_xc_evaluator
         from parsec_python.SCF import update_geometry as update_reference_geometry
-        from parsec_python.models import Atom
 
         positions = np.asarray(positions, dtype=np.float64)
         if positions.shape != (len(reference.atoms), 3):
             raise ValueError("one position per atom of the prepared system is required")
+        # every other field of an atom is kept (the initial moment of a non-collinear run)
         atoms = tuple(
-            Atom(atom.symbol, position)
+            replace(atom, position=position)
             for atom, position in zip(reference.atoms, positions)
         )
         if is_periodic and not uses_fortran_routines(reference.grid):
@@ -4364,6 +5570,127 @@ def _prepare_single_point(
         from .Energy import device_dispersion_correction
 
         dispersion_device = device_dispersion_correction
+    # A hybrid functional: its exact exchange in the device Hamiltonians.
+    from .SCF.hybrid import device_exchange_for
+
+    exchange_device = device_exchange_for(
+        reference,
+        implementation,
+        symmetry_eigensolver,
+        selected_backend=selection.selected,
+        # The structure of the present atoms (move_atoms rebinds it).
+        start_xc=_start_xc_with_reducer(
+            hybrid_start_xc, lambda: reference, scf_reducer, spin_sectors=spin_sectors
+        ),
+    )
+    if exchange_device is not None and mpi_context is not None:
+        # Several ranks: every piece of the Fock loop is a command to all of
+        # them, and this rank's service answers it (SCF/hybrid_mpi.py).
+        from .SCF.hybrid_mpi import mpi_device_exchange_for
+
+        exchange_device = mpi_device_exchange_for(
+            exchange_device, mpi_context, symmetry_eigensolver, reference
+        )
+    if exchange_device is not None and symmetry_eigensolver is not None:
+        # The memory rules of the sectors count what the hybrid keeps on the
+        # devices: its device XC evaluators and the exchange (xi, the
+        # expansions, the Kronecker plans and the tile work), so that the
+        # sector states are spilled where they and the exchange do not fit.
+        _count_hybrid_device_bytes(
+            symmetry_eigensolver,
+            exchange_device,
+            reference,
+            spin_xc_evaluator if spin_sectors else native_xc_evaluator,
+            hybrid_start_xc,
+        )
+    # A meta-GGA: its orbital term in the device Hamiltonians, tau where the
+    # orbitals are; the CPU backends add the host term (SCF/single_point.py).
+    meta_gga_device = None
+    if selection.selected == "cupy" and getattr(
+        getattr(getattr(reference, "input", None), "scf", None), "is_meta_gga", False
+    ):
+        from .Hamiltonian.meta_gga_device import DeviceMetaGGA
+
+        stage_started = perf_counter()
+        meta_gga_device = DeviceMetaGGA(
+            backend=implementation,
+            sectors=symmetry_eigensolver,
+            reducer=scf_reducer,
+            grid=reference.grid,
+        )
+        meta_gga_device.prepare()
+        from parsec_python.V_xc.meta_gga import meta_gga_gradient_form
+
+        orbital_gradient = meta_gga_gradient_form(reference.input.scf)[0] == "orbital"
+        resident = dict(meta_gga_device.device_bytes)
+        if orbital_gradient:
+            for device_id, count in meta_gga_device.flux_device_bytes.items():
+                resident[device_id] = resident.get(device_id, 0) + count
+        if symmetry_eigensolver is not None:
+            # The memory rules of the sectors count the derivative matrices
+            # (and W with the shared-row maps of the orbital form).
+            counts = dict(symmetry_eigensolver.resident_device_bytes)
+            for device_id, count in resident.items():
+                counts[device_id] = counts.get(device_id, 0) + count
+            symmetry_eigensolver.resident_device_bytes = counts
+        implementation.info = replace(
+            implementation.info,
+            details=implementation.info.details
+            + (
+                (
+                    "meta_gga_term",
+                    "-div(vtau grad) as sum_a B_a^T diag(vtau) B_a of the first-derivative stencil"
+                    + (" with 2 sum_a [W_a B_a + B_a^T W_a] of the orbital density gradient" if orbital_gradient else "")
+                    + f" ({'sector-reduced' if symmetry_eigensolver is not None else 'full grid'}, CSR on the devices, "
+                    f"{sum(resident.values())} B)",
+                ),
+            ),
+        )
+        stages.add("meta_gga_term", stage_started)
+    # Spin_Symmetry_Sectors: the adapter of the two channels' orbit fields,
+    # with the symmetry guard, and how the run goes back to the full grid.
+    spin_adapter = None
+    spin_sector_fallback = None
+    if spin_sectors:
+        from .SCF.spin_sectors import SpinSectorReducer
+
+        spin_adapter = SpinSectorReducer(
+            scf_reducer,
+            hybrid=bool(getattr(reference.input.scf, "is_hybrid", False)),
+            fixed_occupations=getattr(reference.input.scf, "fixed_occupations", None) is not None,
+            # The grid and atoms of the present structure (move_atoms rebinds
+            # ``reference``): the point group of the density test.
+            structure=lambda: (reference.grid, reference.atoms),
+        )
+        spin_sector_fallback = _SpinSectorFallback(
+            given_problem,
+            tuple(reference.atoms),
+            backend=backend,
+            symmetry=symmetry,
+            symmetry_cache_directory=symmetry_cache_directory,
+        )
+    if spin_polarized and (
+        spin_sectors or problem.scf.is_hybrid or problem.scf.spin_symmetry_sectors is not None
+    ):
+        # (A semilocal run at the default that stays on the full grid, without
+        # a point group or on a CPU backend, keeps the details it had.)
+        implementation.info = replace(
+            implementation.info,
+            details=implementation.info.details
+            + (
+                (
+                    "spin_symmetry_sectors",
+                    (
+                        f"{problem.scf.spin_symmetry_sector_mode}: both channels in the "
+                        f"{orbital_decomposition.representation_count} sectors; the full grid where the "
+                        "start has a partly filled multiplet, a channel density breaks the point group "
+                        "of the atoms or an occupation ends fractional"
+                    )
+                    if spin_sectors
+                    else f"{problem.scf.spin_symmetry_sector_mode}: full grid",
+                ),
+            ),
+        )
 
     return AcceleratedPreparedSinglePointSystem(
         reference=reference,
@@ -4386,19 +5713,41 @@ def _prepare_single_point(
         ),
         xc_evaluator=native_xc_evaluator,
         spin_xc_evaluator=spin_xc_evaluator,
-        mixer_factory=(None if scf_reducer is None else scf_reducer.mixer),
-        residual_metrics_evaluator=(
-            None
-            if scf_reducer is None
-            else scf_reducer.potential_residual_metrics
+        **(
+            dict(
+                mixer_factory=(None if scf_reducer is None else scf_reducer.mixer),
+                residual_metrics_evaluator=(
+                    None
+                    if scf_reducer is None
+                    else scf_reducer.potential_residual_metrics
+                ),
+                total_energy_evaluator=(
+                    None if scf_reducer is None else scf_reducer.total_energy
+                ),
+                scalar_field_adapter=scf_reducer,
+            )
+            if spin_adapter is None
+            # The two channels on the orbits (run_spin_scf takes these hooks).
+            else spin_adapter.spin_hooks()
         ),
-        total_energy_evaluator=(
-            None if scf_reducer is None else scf_reducer.total_energy
-        ),
-        scalar_field_adapter=scf_reducer,
         hubbard_device=hubbard_device,
         dispersion_device=dispersion_device,
+        exchange_device=exchange_device,
+        spin_sector_fallback=spin_sector_fallback,
+        meta_gga_device=meta_gga_device,
+        **_fdet_kinetic_operators(reference, selection.selected, hartree_device),
     )
+
+
+def _fdet_kinetic_operators(reference, backend: str, device_id) -> dict:
+    """``kinetic_operators`` of an FDET system on CuPy (the device kinetic terms), else nothing."""
+
+    if getattr(reference, "embedding", None) is None:
+        return {}
+    from .Embedding.device_kinetic import device_kinetic_operators
+
+    operators = device_kinetic_operators(reference, backend, device_id)
+    return {} if operators is None else {"kinetic_operators": operators}
 
 
 def _refuse_corrections(problem, *, is_periodic: bool, mpi_context) -> None:
@@ -4486,6 +5835,190 @@ def profile_hamiltonian_components(
     return averages
 
 
+class _SpinSectorFallback:
+    """How a spin-polarized run in the symmetry sectors goes back to the full grid.
+
+    ``Spin_Symmetry_Sectors`` keeps a sector result only where the symmetry
+    guard of :mod:`.SCF.spin_sectors` passes.  Otherwise :meth:`run`
+    prepares the calculation again, from the input as it was given, with
+    ``Spin_Symmetry_Sectors: off`` and the atoms of the present structure,
+    puts the full-grid objects in place of the sector ones in the very
+    system the caller holds (forces, outputs and the next ionic steps then
+    use them), says so to the iteration callback and runs the SCF there:
+    from the atomic densities, the full-grid run of that structure as
+    ``off`` would have given it, bit for bit; after an ionic move from the
+    potentials the sector run started from (:meth:`full_grid_warm_start`),
+    as an ``off`` relaxation starts from its previous structure, with fresh
+    subspaces (equal to ``off`` within the SCF tolerance, not bit for bit:
+    the previous structures were sector runs and ``off`` keeps its
+    subspaces).  The pseudopotential files are read here,
+    while they exist, so that the full grid can be prepared from them
+    later even where the caller has removed them (a temporary directory).
+    """
+
+    def __init__(self, problem, atoms, *, backend, symmetry, symmetry_cache_directory) -> None:
+        self.problem = problem
+        self.atoms = tuple(atoms)
+        self.backend = backend
+        self.symmetry = symmetry
+        self.symmetry_cache_directory = symmetry_cache_directory
+        self.pseudopotential_files = {}
+        for symbol, specification in getattr(problem, "pseudopotentials", {}).items():
+            try:
+                self.pseudopotential_files[symbol] = Path(specification.path).read_bytes()
+            except OSError:
+                pass
+
+    def run(self, system, run, *, callback=None, warm_start=None, **keywords):
+        """``run(system, ...)`` in the sectors; again on the full grid where the guard says so."""
+
+        from .SCF.spin_sectors import SpinSectorsAbandoned
+
+        abandoned = None
+        try:
+            result = run(system, callback=callback, warm_start=warm_start, **keywords)
+            system.scalar_field_adapter.check_spin_result(result, final=True)
+            return result
+        except SpinSectorsAbandoned as error:
+            # Only the report leaves this block: the frames of the sector run,
+            # and the orbitals they hold, go with the exception.
+            abandoned = (error.stage, error.report)
+        stage, report = abandoned
+        if callback is not None:
+            # Said before the full-grid preparation, which may fail on its own.
+            from parsec_python.models import SpinSectorFallbackRecord
+
+            callback(
+                SpinSectorFallbackRecord(
+                    stage=stage,
+                    largest_fractional_occupation=report.largest,
+                    tolerance=report.tolerance,
+                    multiplets=report.lines,
+                    reason=report.reason,
+                    measure=report.measure,
+                )
+            )
+        self.replace_with_full_grid(system, stage, report)
+        return run(system, callback=callback, warm_start=self.full_grid_warm_start(warm_start), **keywords)
+
+    @staticmethod
+    def full_grid_warm_start(warm_start):
+        """The warm start of the full-grid run that replaces a sector run started from ``warm_start``.
+
+        ``None`` (a run from the atomic densities) stays ``None``.  After an
+        ionic move the potentials of both channels and the Hartree potential
+        of the previous structure are full-grid fields already (the public
+        fields of a sector result, a meta-GGA's ``vtau`` and ``W`` included)
+        and are kept, as an ``off`` relaxation keeps them; what lives in the
+        sectors is dropped: the eigensolver
+        subspaces (the full grid starts with its first filter), a hybrid's
+        exchange orbitals and a carried mixer.
+        """
+
+        if warm_start is None:
+            return None
+        return replace(
+            warm_start,
+            eigensolver_state=None,
+            exchange_orbitals=None,
+            mixer=None,
+            first_iteration_degree=None,
+        )
+
+    def _problem_of(self, system):
+        """The input of the full-grid run: as given, at the atoms of the present structure."""
+
+        scf = replace(self.problem.scf, spin_symmetry_sectors="off")
+        atoms = tuple(system.reference.atoms)
+        if _same_atoms(atoms, self.atoms):
+            return replace(self.problem, scf=scf)
+        # A moved structure: its atoms are in the frame of the grid already.
+        return replace(self.problem, scf=scf, atoms=atoms, recenter_geometry=False)
+
+    def _with_present_pseudopotentials(self, problem, directory: Path):
+        """``problem`` with a copy in ``directory`` of each pseudopotential file that is gone since."""
+
+        species = dict(problem.pseudopotentials)
+        changed = False
+        for symbol, specification in species.items():
+            path = Path(specification.path)
+            if path.exists() or symbol not in self.pseudopotential_files:
+                continue
+            copy = directory / symbol / path.name
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            copy.write_bytes(self.pseudopotential_files[symbol])
+            species[symbol] = replace(specification, path=copy)
+            changed = True
+        return replace(problem, pseudopotentials=species) if changed else problem
+
+    def replace_with_full_grid(self, system, stage: str, report) -> None:
+        """Prepare the full-grid system and put its objects into ``system``."""
+
+        import gc
+        from dataclasses import fields
+
+        problem = self._problem_of(system)
+        # What the sectors hold on the devices goes first: the subspaces of
+        # both channels and the exchange's plans.
+        sectors = getattr(system.backend, "symmetry_eigensolver", None)
+        if sectors is not None and getattr(sectors, "spin_channel_count", 1) == 2:
+            for index in (0, 1):
+                sectors.for_spin_channel(index).reset()
+        exchange = getattr(system, "exchange_device", None)
+        if exchange is not None:
+            exchange.bind(None)
+            # On several MPI ranks: what every rank's exchange service holds
+            # (replicas, W, the window of the outer DIIS, the device plans of
+            # its pair solvers) goes before the root prepares the full grid.
+            release = getattr(exchange, "release_build_memory", None)
+            if callable(release):
+                release(final=True)
+            exchange._solvers.clear()
+            exchange.expansions.clear()
+        gc.collect()
+        import tempfile
+
+        try:
+            with tempfile.TemporaryDirectory() as copies:
+                problem = self._with_present_pseudopotentials(problem, Path(copies))
+                full_grid = prepare_single_point(
+                    problem,
+                    backend=self.backend,
+                    # ``on`` asked for the sectors, which were taken; the full grid
+                    # of two spin channels has no reduced component ``on`` demands.
+                    symmetry="auto" if _normalize_symmetry_mode(self.symmetry) == "on" else self.symmetry,
+                    symmetry_cache_directory=self.symmetry_cache_directory,
+                )
+        except ValueError as error:
+            # PARSEC_HARTREE_SYMMETRY=1 forbids the full grid of a spin run.
+            raise ValueError(
+                f"Spin_Symmetry_Sectors: the run left the symmetry sectors after {stage} "
+                f"({report.reason}), and the full grid cannot be prepared: {error}"
+            ) from error
+        note = (
+            "spin_symmetry_sectors",
+            f"auto: left the sectors after {stage} ({report.reason}: {report.measure} = "
+            f"{report.largest:.3e} >= {report.tolerance:.0e}): full grid",
+        )
+        full_grid.backend_info = replace(
+            full_grid.backend_info,
+            details=tuple(item for item in full_grid.backend_info.details if item[0] != note[0]) + (note,),
+        )
+        full_grid.backend.info = full_grid.backend_info
+        kept = system.materialize_final_wavefunctions
+        for item in fields(full_grid):
+            setattr(system, item.name, getattr(full_grid, item.name))
+        system.materialize_final_wavefunctions = kept
+        del full_grid, sectors, exchange
+        gc.collect()
+        from .backends.cupy import require_cupy
+
+        cp, _ = require_cupy()
+        for device in range(cp.cuda.runtime.getDeviceCount()):
+            with cp.cuda.Device(device):
+                cp.get_default_memory_pool().free_all_blocks()
+
+
 def run_scf(
     system: AcceleratedPreparedSinglePointSystem,
     *,
@@ -4501,12 +6034,14 @@ def run_scf(
     ``convergence_criterion`` replaces the criterion of the input for this
     loop.  ``iteration_state_callback`` receives the fields of every
     iteration (``Save_Intermediate_Charge_Density``).
+
+    A spin-polarized loop in the symmetry sectors (``Spin_Symmetry_Sectors``)
+    whose occupations end fractional is run again on the full grid, and
+    ``system`` holds the full-grid objects from then on
+    (:class:`_SpinSectorFallback`).
     """
 
-    result = run_accelerated_scf(
-        system,
-        callback=callback,
-        warm_start=warm_start,
+    keywords = dict(
         convergence_criterion=convergence_criterion,
         **(
             {}
@@ -4514,10 +6049,43 @@ def run_scf(
             else {"iteration_state_callback": iteration_state_callback}
         ),
     )
+    fallback = getattr(system, "spin_sector_fallback", None)
+    if fallback is None:
+        result = run_accelerated_scf(
+            system, callback=callback, warm_start=warm_start, **keywords
+        )
+    else:
+        result = fallback.run(
+            system, run_accelerated_scf, callback=callback, warm_start=warm_start, **keywords
+        )
+    # A hybrid on several MPI ranks: what the builds of its exchange left on
+    # the devices of the ranks (replicas of other ranks' orbitals, the last
+    # parts of W) goes before the forces and the next structure.
+    release = getattr(getattr(system, "exchange_device", None), "release_build_memory", None)
+    if callable(release):
+        release()
     boundary_check = _hartree_boundary_check(system, result)
     if boundary_check:
         result.backend = replace(
             result.backend, details=result.backend.details + boundary_check
+        )
+    solver = getattr(system, "hartree_solver", None)
+    fallback = getattr(solver, "fallback", None)
+    if isinstance(fallback, str):
+        # The resident chain gave way to the route before during a solve.
+        changed = dict(getattr(solver, "fallback_details", ()))
+        changed.update(
+            hartree_resident_chain=fallback,
+            hartree_full_grid_transfer_policy="host-interface",
+            hartree_resident_predictor="disabled",
+        )
+        result.backend = replace(
+            result.backend,
+            details=tuple(
+                (name, changed.get(name, value))
+                for name, value in result.backend.details
+                if name != "hartree_resident_device_bytes"
+            ),
         )
     return result
 
@@ -4558,10 +6126,32 @@ def warm_start_for_moved_atoms(
     SCF loop itself.
     """
 
-    from parsec_python.SCF.single_point import extrapolated_warm_start
+    from parsec_python.SCF.single_point import extrapolated_warm_start, meta_gga_warm_start
 
+    warm_start = meta_gga_warm_start(
+        _parsec_warm_start(previous_system, previous_result, system), previous_result
+    )
+    exchange_device = getattr(system, "exchange_device", None)
+    if exchange_device is not None and getattr(previous_result, "exact_exchange", None) is not None:
+        # A hybrid functional: the orbitals before the move, where the
+        # eigensolvers keep them, build the first exchange operator.
+        warm_start = replace(
+            warm_start, exchange_orbitals=exchange_device.orbital_sets(previous_result)
+        )
+    if getattr(system, "embedding", None) is not None:
+        # FDET of PARSEC 1.5 (parsec_python.Embedding.warm_start): a translation
+        # moves the subspace the device eigensolver keeps.
+        from parsec_python.Embedding.warm_start import embedding_warm_start
+
+        return embedding_warm_start(
+            previous_system,
+            previous_result,
+            system,
+            warm_start,
+            translate_state=getattr(system.eigenproblem_solver, "translate_saved_rows", None),
+        )
     return extrapolated_warm_start(
-        _parsec_warm_start(previous_system, previous_result, system),
+        warm_start,
         previous_system,
         previous_result,
         system,

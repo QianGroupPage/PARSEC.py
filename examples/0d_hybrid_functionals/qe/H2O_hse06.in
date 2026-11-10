@@ -1,0 +1,39 @@
+ &control
+    calculation = 'scf'
+    prefix = 'H2O_hse06_L28_e150'
+    outdir = './tmp'
+    pseudo_dir = './pseudo'
+    verbosity = 'high'
+    disk_io = 'none'
+ /
+ &system
+    ibrav = 1
+    celldm(1) = 28.000000
+    nat = 3
+    ntyp = 2
+    ecutwfc = 150.0
+    assume_isolated = 'mt'
+    nbnd = 8
+    occupations = 'fixed'
+    input_dft = 'hse'
+    nqx1 = 1
+    nqx2 = 1
+    nqx3 = 1
+    x_gamma_extrapolation = .false.
+    exxdiv_treatment = 'gygi-baldereschi'
+    ecutfock = 300.0
+    screening_parameter = 0.11
+ /
+ &electrons
+    conv_thr = 1.0d-10
+    mixing_beta = 0.4
+    electron_maxstep = 200
+ /
+ATOMIC_SPECIES
+ H 1.008 h_pbe_tm.UPF
+ O 15.999 o_pbe_tm.UPF
+ATOMIC_POSITIONS bohr
+ O 14.0000000000 14.0000000000 13.4464214780
+ H 15.4304288085 14.0000000000 14.5535785220
+ H 12.5695711915 14.0000000000 14.5535785220
+K_POINTS gamma

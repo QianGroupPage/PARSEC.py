@@ -1,0 +1,86 @@
+# MgO, rocksalt, primitive fcc cell (a = 7.96 bohr; Mg with core correction), Gamma-centred 3x3x3 mesh
+# HSE06: 1/4 short-range exact exchange (erfc(0.11 r)/r) + PBE exchange - 1/4 short-range PBE exchange + PBE correlation
+# Quantum ESPRESSO reference: qe/mgo_hse06_k333_e150_gb.in (ecutwfc 150 Ry)
+# like-for-like with the QE row: its q+G = 0 treatment and auxiliary exponent (Exx_Divergence, Exx_Auxiliary_Exponent)
+
+Periodic_System: .true.
+Boundary_Conditions: bulk
+begin Cell_Shape
+  0.0000000000 3.9800000000 3.9800000000
+  3.9800000000 0.0000000000 3.9800000000
+  3.9800000000 3.9800000000 0.0000000000
+end Cell_Shape
+Lattice_Vector_Scale: 1.0 bohr
+Coordinate_Unit: Cartesian_Bohr
+Grid_Spacing: 0.140
+Expansion_Order: 12
+Correlation_Type: hse06
+Exx_Tolerance: 1e-8 Ry   # Fock-loop stop (default 1e-6 Ry), tight for the comparison
+Exx_Divergence: gygi-baldereschi   # q+G = 0 as the QE row (x_gamma_extrapolation = .false.)
+Exx_Auxiliary_Exponent: 0.0666667   # QE's 10/ecutwfc in bohr^2 (default: the limit a -> 0)
+States_Num: 8
+Convergence_Criterion: 1e-6 Ry
+Diag_Tolerance: 1e-6
+Max_Iter: 200
+Fermi_Temp: 1 K
+# the Gamma-centred 3x3x3 mesh of QE (K_POINTS automatic 3 3 3 0 0 0) written out:
+# every point of the uniform mesh, equal weights (the exchange sums over all of them)
+Kpoint_Method: manual
+Kpoint_Unit: reciprocal_lattice_vectors
+begin Kpoint_List
+  0.000000000000 0.000000000000 0.000000000000
+  0.000000000000 0.000000000000 0.333333333333
+  0.000000000000 0.000000000000 -0.333333333333
+  0.000000000000 0.333333333333 0.000000000000
+  0.000000000000 0.333333333333 0.333333333333
+  0.000000000000 0.333333333333 -0.333333333333
+  0.000000000000 -0.333333333333 0.000000000000
+  0.000000000000 -0.333333333333 0.333333333333
+  0.000000000000 -0.333333333333 -0.333333333333
+  0.333333333333 0.000000000000 0.000000000000
+  0.333333333333 0.000000000000 0.333333333333
+  0.333333333333 0.000000000000 -0.333333333333
+  0.333333333333 0.333333333333 0.000000000000
+  0.333333333333 0.333333333333 0.333333333333
+  0.333333333333 0.333333333333 -0.333333333333
+  0.333333333333 -0.333333333333 0.000000000000
+  0.333333333333 -0.333333333333 0.333333333333
+  0.333333333333 -0.333333333333 -0.333333333333
+  -0.333333333333 0.000000000000 0.000000000000
+  -0.333333333333 0.000000000000 0.333333333333
+  -0.333333333333 0.000000000000 -0.333333333333
+  -0.333333333333 0.333333333333 0.000000000000
+  -0.333333333333 0.333333333333 0.333333333333
+  -0.333333333333 0.333333333333 -0.333333333333
+  -0.333333333333 -0.333333333333 0.000000000000
+  -0.333333333333 -0.333333333333 0.333333333333
+  -0.333333333333 -0.333333333333 -0.333333333333
+end Kpoint_List
+Atom_Types_Num: 2
+
+Atom_Type: Mg
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 2.6
+begin Electron_Per_Orbital
+2 0 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.   # spline of the radial table, as in examples/0d_hybrid_functionals
+Nonlinear_Core_Correction: .true.
+begin Atom_Coord
+     0.0000000000    0.0000000000    0.0000000000
+end Atom_Coord
+
+Atom_Type: O
+Pseudopotential_Format: fhipp
+Potential_Num: 3
+Local_Component: d
+Core_Cutoff_Radius: 1.6
+begin Electron_Per_Orbital
+2 4 0
+end Electron_Per_Orbital
+Cubic_Spline: .true.   # spline of the radial table, as in examples/0d_hybrid_functionals
+begin Atom_Coord
+     3.9800000000    0.0000000000    0.0000000000
+end Atom_Coord

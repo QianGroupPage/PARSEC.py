@@ -108,8 +108,9 @@ class RankAgreementTests(unittest.TestCase):
                 asked.append(type(value).__name__)
                 if isinstance(value, str):
                     return [value, value + "-other-node"]
-                if isinstance(value, dict):
-                    return [value, value]
+                if isinstance(value, list):
+                    # The input contents, (file name, digest) pairs: the same on both ranks.
+                    return [value, list(value)]
                 # The other rank resolved the next lattice value.
                 return [value, (value[0], value[1], ("16.9 ang", "1.0e-03 Ry"))]
 
@@ -136,12 +137,15 @@ class RankAgreementTests(unittest.TestCase):
             with (
                 patch.object(driver, "prepare_single_point", prepare),
                 patch.object(mpi_full_scf, "_source_provenance", lambda: None),
-                self.assertRaisesRegex(ValueError, "differs across ranks"),
+                self.assertRaisesRegex(
+                    ValueError, "sphere radius or the Hartree boundary tolerance differs across ranks"
+                ),
             ):
                 mpi_full_scf.execute(arguments, None, Comm(), None, 0.0)
             prepare.assert_not_called()
-            # Host names, then input digests, then the domain: nothing after.
-            self.assertEqual(asked, ["str", "dict", "tuple"])
+            # Host names, then the input contents ((file name, digest) pairs: ranks may read copies at other
+            # paths), then the domain: nothing after.
+            self.assertEqual(asked, ["str", "list", "tuple"])
             self.assertFalse((folder / "out").exists())
 
     def test_timing_record_of_an_input_with_a_radius(self) -> None:
@@ -150,6 +154,12 @@ class RankAgreementTests(unittest.TestCase):
         # and the boundary record what a comparison of two runs reads.
         from parsec_python.acceleration.tests import test_mpi_scf
 
+        # The runner names the devices of its run for the process (PARSEC_CUPY_DEVICES=0), as a
+        # launch should; up to 2026-11-05 that stayed set for the rest of the suite, whose later
+        # tests then saw one GPU of a node of four (the k-point tests: 1 worker, not 4).
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
         harness = test_mpi_scf.FullSCFRunnerContextTests(
             "test_switch_is_on_unless_named_off"
         )

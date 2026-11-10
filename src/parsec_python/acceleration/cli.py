@@ -251,6 +251,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="additional pseudopotential directory searched before the input directory",
     )
     parser.add_argument(
+        "--esdf-lenient",
+        action="store_true",
+        help=(
+            "read the input as PARSEC's ESDF does: ignore labels this reader does not know and take the "
+            "first value of a label given twice, with a warning (default: refuse both)"
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -272,6 +280,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--kpoint-pools",
+        default=None,
+        metavar="P|auto",
+        help=(
+            "with --mpi: pools of ranks the k-points and spin channels are dealt to, each basis shared "
+            "by the ranks of its pool (default PARSEC_KPOINT_POOLS, else auto: the best balanced count "
+            "whose memory fits the GPUs)"
+        ),
+    )
+    parser.add_argument(
         "--bands-from",
         type=Path,
         default=None,
@@ -286,9 +304,10 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "run as one of several MPI ranks (start them with mpirun or srun, one per GPU): "
-            "the basis of the k-point and non-collinear eigenproblems is split by blocks of grid "
-            "rows over all the GPUs, so a basis larger than one GPU fits. Every rank runs the same "
-            "calculation; only rank 0 writes the log and the archive. Same as PARSEC_MPI=1"
+            "the k-points and spin channels are dealt to pools of ranks, the basis of each shared "
+            "by the GPUs of its pool (--kpoint-pools); spin-orbit and non-collinear bases are split "
+            "by blocks of grid rows over all the GPUs. Every rank runs the same calculation; only "
+            "rank 0 writes the log, the archive and the data files. Same as PARSEC_MPI=1"
         ),
     )
     parser.add_argument(
@@ -484,11 +503,38 @@ def _resolve_symmetry_mode(
     return mode
 
 
+def _reference_only_solver_options(problem) -> list[str]:
+    """Eigensolver options of the PARSEC 1.5 round that the device eigensolvers do not carry."""
+
+    eigensolver = problem.eigensolver
+    features = []
+    if getattr(eigensolver, "first_filter_residual_test", "off") != "off":
+        features.append("PARSEC 1.5's residual-driven CHEBFF (FF_Residual_Test)")
+    # Smart_Subspace (the lower-bound rule of SUBSPACE) and Bounds_Method: lanczos
+    # with Bounds_Iter (PARSEC 1.5's upper bound) run on the device filters too
+    # (Eigensolvers.subspace.subspace_filter_bounds and
+    # Eigensolvers.spectral_bounds.lanczos_bound_from_ritz, since 2026-11-08).
+    if (
+        getattr(eigensolver, "scaled_subspace_filter", False)
+        or getattr(eigensolver, "lanczos_bounds", "parsec") == "lanczos_full"
+    ):
+        features.append(
+            "PARSEC 1.5's SUBSPACE rules (Chebyshev_Scaled, Bounds_Method: lanczos_full)"
+        )
+    if getattr(eigensolver, "reorthogonalization_threshold", 0.1) != 0.1:
+        features.append(
+            "another Gram-Schmidt reorthogonalization threshold "
+            "(Reorthogonalization_Threshold)"
+        )
+    return features
+
+
 def _reference_only_features(
     translation,
     *,
     accelerated_backend_selected: bool,
     device_eigensolver_selected: bool = False,
+    hybrid_on_device: bool = False,
 ) -> list[str]:
     """Input features only the reference :mod:`parsec_python.cli` dispatches.
 
@@ -503,6 +549,10 @@ def _reference_only_features(
     ``device_eigensolver_selected``: the backend resolves to the CuPy
     eigensolvers, which run ``Eigensolver: arpack`` on the device
     (:mod:`parsec_python.acceleration.Eigensolvers.arpack`).
+    ``hybrid_on_device``: the input has a self-consistent hybrid functional
+    and the backend resolves to CuPy in one process, where the device Fock
+    loop runs it (:mod:`parsec_python.acceleration.SCF.hybrid`); otherwise
+    the reference solver runs it.
     """
 
     problem = translation.problem
@@ -512,6 +562,14 @@ def _reference_only_features(
     # and his grids of every cell shape.
     fortran = getattr(getattr(translation, "routines", None), "fortran", False)
     features = []
+    if getattr(problem.scf, "is_hybrid", False) and not hybrid_on_device:
+        # The device Fock loop (acceleration.SCF.hybrid) needs the CuPy
+        # backend in one process; on the CPU backends and under --mpi the
+        # reference solver runs the Fock loop of parsec_python.SCF.hybrid,
+        # with its single point, forces and relaxation.
+        features.append(
+            f"the self-consistent hybrid functional (Correlation_Type: {problem.scf.xc_functional})"
+        )
     if problem.scf.noncollinear:
         features.append("non-collinear magnetism (Non_Collinear_magnetism)")
     elif problem.scf.self_consistent_spin_orbit:
@@ -672,6 +730,11 @@ def _reference_only_features(
         features.append("the ARPACK eigensolver (Eigensolver: arpack)")
     elif eigensolver.method == "diagla":
         features.append("the DIAGLA eigensolver (Eigensolver: diagla)")
+    # Eigensolver options of the PARSEC 1.5 round that only the readable
+    # eigensolvers carry (a Vector_Rng_Seed start basis, Subspace_Buffer_Size
+    # 0 and the degree decrease of Chebyshev_Degree_Decrease_After run on the
+    # device too).
+    features.extend(_reference_only_solver_options(problem))
     # Pseudopotential set-up: the double grid (acceleration/V_ion/double_grid.py),
     # Old_Interpolation_Format (the native and CuPy local builders and the
     # device local forces) and, for a periodic cell, the Fourier filters and
@@ -761,6 +824,15 @@ def _reference_only_features(
                 "a periodic cell on Fortran's general grid (non-orthogonal "
                 "lattice vectors, or sides without one common grid spacing)"
             )
+    if problem.periodic_cell is None and getattr(problem.hartree, "cg_criterion", 1) == 2:
+        # PARSEC 1.5's Hartree_CG_Criterion 2 (the CG stops against ||b||): the readable CG
+        # (Hartree.poisson.cg_stopping_threshold) and the device CG of wires, slabs and cells
+        # (Hartree/periodic_device.py) have it; the CG backends of the accelerated cluster
+        # driver (CuPy, native, prepared, resident) test the initial residual only.
+        # Hartree_CG_Tolerance alone (criterion 1) runs there.
+        features.append(
+            "the Poisson CG test against the right-hand side (Hartree_CG_Criterion: 2) of a cluster"
+        )
     return features
 
 
@@ -807,7 +879,68 @@ def _mpi_unsupported_features(translation) -> list[str]:
         features.append("the Ylm-projected density of states (YLM_DOS_L)")
     if getattr(translation, "gw", None) is not None:
         features.append("the BerkeleyGW files (Output_GW)")
+    if getattr(problem, "embedding", None) is not None:
+        # FDET of PARSEC 1.5: one process holds the frozen sample field.
+        features.append("FDET (Potential_Field)")
+    if getattr(problem.scf, "is_hybrid", False):
+        # The rows of every orbital are divided among the ranks here; the
+        # hybrid of a cluster runs on several nodes in the MPI runner, whose
+        # ranks divide the symmetry sectors (SCF/hybrid_mpi.py).
+        features.append(
+            f"the self-consistent hybrid functional (Correlation_Type: {problem.scf.xc_functional}; "
+            "on several nodes a cluster's hybrid runs with scripts/run_multi_gpu_scf.sh)"
+        )
+    if str(getattr(problem.scf, "xc_functional", "")).startswith("libxc:") and not (
+        getattr(problem.scf, "is_hybrid", False) or getattr(problem.scf, "is_meta_gga", False)
+    ):
+        # Not tested with the distributed solvers (their XC paths on rows of the grid).
+        features.append(f"the libxc functional {problem.scf.xc_functional} (not tested with --mpi)")
+    if getattr(problem.scf, "is_meta_gga", False):
+        # tau (and g) are sums over the orbitals on every grid point, and the
+        # orbital terms of the Hamiltonian reach the neighbours' rows.
+        features.append(
+            f"the meta-GGA {problem.scf.xc_functional} (its kinetic-energy density needs the orbitals "
+            "on every grid point)"
+        )
     return features
+
+
+def _hybrid_on_device(arguments: argparse.Namespace, translation) -> bool:
+    """Whether the device Fock loop runs this input's hybrid functional.
+
+    The input has one, its pairs are solved by the Kronecker solver (the
+    default ``Exx_Pair_Solver``), the backend resolves to CuPy and the run is
+    one process (no ``--mpi``): the GPUs of one node.  A periodic cell
+    (bulk or slab) takes this loop at the Gamma point, unpolarized (real
+    orbitals, pair densities by cuFFT); with k-points or spin it runs the
+    Fock loop of :mod:`parsec_python.SCF.hybrid_periodic` on the reference
+    solver, whose k-point workers and exchange use the GPUs
+    (:mod:`parsec_python.acceleration.SCF.hybrid_periodic`).  ``False`` for
+    every other input, which the reference solver then runs.
+    """
+
+    from .Parallel import mpi
+
+    problem = translation.problem
+    if not getattr(problem.scf, "is_hybrid", False):
+        return False
+    if getattr(arguments, "mpi", False) or mpi.requested():
+        return False
+    if problem.periodic_cell is not None:
+        if problem.scf.spin_polarized or (problem.has_kpoint_sampling and not _gamma_point_only(problem)):
+            # The Bloch Fock loop on the reference solver (its device k-point pool and exchange).
+            return False
+    else:
+        # The device solves the pair densities of a cluster with the Kronecker solver only;
+        # Exx_Pair_Solver: cg runs on the reference solver.
+        settings = getattr(problem.scf, "exact_exchange", None)
+        if getattr(settings, "pair_solver", "kronecker") != "kronecker":
+            return False
+    try:
+        selection = resolve_backend(arguments.backend, translation.problem)
+    except (BackendUnavailableError, NotImplementedError, ValueError):
+        return False
+    return selection.selected == "cupy"
 
 
 def _device_eigensolver_selected(arguments: argparse.Namespace, translation) -> bool:
@@ -848,6 +981,7 @@ def _reference_argv(arguments: argparse.Namespace) -> list[str]:
         ("--log", arguments.log),
         ("--bands-from", arguments.bands_from),
         ("--kpoint-workers", arguments.kpoint_workers),
+        ("--kpoint-pools", getattr(arguments, "kpoint_pools", None)),
         ("--restart-from", arguments.restart_from),
         ("--energy-refinement", arguments.energy_refinement),
     ):
@@ -861,6 +995,9 @@ def _reference_argv(arguments: argparse.Namespace) -> list[str]:
         ("--dry-run", arguments.dry_run),
         ("--quiet", arguments.quiet),
         ("--debug", arguments.debug),
+        ("--esdf-lenient", getattr(arguments, "esdf_lenient", False)),
+        # the ranks other than 0 of an MPI run (_join_mpi)
+        ("--no-data-files", getattr(arguments, "no_data_files", False)),
     ):
         if enabled:
             argv.append(flag)
@@ -885,15 +1022,17 @@ def _join_mpi(arguments: argparse.Namespace) -> int | None:
         return 2
     if arguments.dry_run:
         return None
+    arguments.mpi_rank = context.rank
     if not context.is_root:
         arguments.quiet = True
         arguments.log = Path(os.devnull)
         arguments.no_archive = True
         arguments.output = None
+        arguments.no_data_files = True  # parsec.dat, eigen.dat, cube files, qpoints.dat: rank 0 writes them
     elif context.size > 1:
         print(
-            f"MPI: {context.size} ranks, {context.ranks_per_node} per node; the eigenproblem basis "
-            "is split by blocks of grid rows over the ranks",
+            f"MPI: {context.size} ranks, {context.ranks_per_node} per node; the k-points are solved by "
+            "pools of ranks (spin-orbit and non-collinear bases split by blocks of grid rows)",
             flush=True,
         )
     return None
@@ -928,6 +1067,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     return status
 
 
+def shared_vector_seed(translation, context=None):
+    """The translation with rank 0's start-vector seed on every MPI rank.
+
+    Every rank parses the input itself, and ``Vector_Rng_Seed: -1`` takes the seed from the clock during
+    the parse (``Input/solver_options.py``), so ranks whose parse falls into different seconds would draw
+    different seeds.  Each rank builds its own columns of the start basis from its seed
+    (``Eigensolvers/mpi_shared_basis.py``): the basis would mix streams, and the seed rank 0 prints and
+    writes to bak_complete_parsec.in would not repeat the run.
+    PARSEC 1.5 reads the input on one process.  An explicit seed is the same on every rank and stays.
+    ``context`` is the MPI context (:func:`.Parallel.mpi.context` when ``None``); every rank of a run with
+    more than one calls this function at the same place (one broadcast).
+    """
+    from .Parallel import mpi
+
+    if context is None:
+        context = mpi.context()
+    if context is None or context.size == 1:
+        return translation
+    eigensolver = translation.problem.eigensolver
+    own = (eigensolver.vector_seed, eigensolver.random_seed)
+    seeds = tuple(context.bcast(own, root=0))
+    if seeds == own:
+        return translation
+    return replace(
+        translation,
+        problem=replace(
+            translation.problem,
+            eigensolver=replace(eigensolver, vector_seed=seeds[0], random_seed=seeds[1]),
+        ),
+    )
+
+
 def _abort_mpi(status: int) -> None:
     """A rank that failed must not leave the others waiting in a collective (the interpreter's exit
     would wait for them in MPI_Finalize): end the whole MPI job."""
@@ -953,10 +1124,12 @@ def _run(
         translation = parse_parsec_input(
             arguments.input,
             pseudopotential_directory=arguments.pp_dir,
+            esdf_lenient=getattr(arguments, "esdf_lenient", False),
         )
     except (ParsecInputError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
+    translation = shared_vector_seed(translation)
     if arguments.mlff is not None:
         from parsec_python.MLFF import apply_mlff_option
 
@@ -1051,6 +1224,7 @@ def _run(
         translation,
         accelerated_backend_selected=accelerated_self_consistent_soc,
         device_eigensolver_selected=_device_eigensolver_selected(arguments, translation),
+        hybrid_on_device=_hybrid_on_device(arguments, translation),
     )
     if unsupported:
         features = ", ".join(unsupported)
@@ -1094,17 +1268,18 @@ def _run(
                 file=sys.stderr,
             )
             return 2
-        print(
-            f"NOTE: {features} is not implemented on the accelerated path; "
-            "running the reference parsec_python.cli solver instead"
-            + (
-                " (its k-point eigensolvers, and the force sums of a periodic cell, use the GPUs when CuPy and a device "
-                "are available; the output names the device)"
-                if reference_uses_gpu and resources.device != "cpu"
-                else ""
-            ),
-            file=sys.stderr,
-        )
+        if getattr(arguments, "mpi_rank", 0) == 0:  # the other ranks of an MPI run are quiet
+            print(
+                f"NOTE: {features} is not implemented on the accelerated path; "
+                "running the reference parsec_python.cli solver instead"
+                + (
+                    " (its k-point eigensolvers, the exchange of a periodic hybrid and the force sums of a periodic "
+                    "cell use the GPUs when CuPy and a device are available; the output names the device)"
+                    if reference_uses_gpu and resources.device != "cpu"
+                    else ""
+                ),
+                file=sys.stderr,
+            )
         return reference_main(_reference_argv(arguments))
     if translation.problem.has_kpoint_sampling:
         # Only the Gamma point named as a one-point sampling gets here (_reference_only_features): this path solves
@@ -1177,6 +1352,26 @@ def _run(
             )
             return 2
         solver_symmetry_mode = "off"
+    scf_settings = translation.problem.scf
+    if (
+        translation.restart_run
+        and scf_settings.spin_polarized
+        and scf_settings.spin_symmetry_sector_mode == "auto"
+    ):
+        # parsec.dat holds full-grid fields of a run that may have broken the
+        # point group of the atoms, which the sectors would average: the two
+        # channels of a restart are solved on the full grid.
+        translation = replace(
+            translation,
+            problem=replace(
+                translation.problem, scf=replace(scf_settings, spin_symmetry_sectors="off")
+            ),
+        )
+        restart_notes = [
+            *restart_notes,
+            "NOTE: Restart_Run of a spin-polarized calculation: both channels on the full grid "
+            "(Spin_Symmetry_Sectors: off for the restart)",
+        ]
 
     summary = summarize_translation(translation)
     if arguments.dry_run:
@@ -1237,6 +1432,19 @@ def _run(
             return 2
 
     input_directory = translation.source.parent
+    # AFM_Scan: one folder per scan or part of a scan (rank 0 of an MPI run takes it).
+    scan_folder_note = None
+    if not arguments.dry_run and getattr(translation, "afm_scan", None) is not None:
+        from parsec_python.Output.afm_scan import claim_scan_folder
+        from .Parallel import mpi as _scan_mpi
+
+        _scan_context = _scan_mpi.context()
+        if _scan_context is None or _scan_context.is_root:
+            try:
+                scan_folder_note = claim_scan_folder(translation, input_directory)
+            except (OSError, ValueError) as error:
+                print(f"Input error: {error}", file=sys.stderr)
+                return 2
     symmetry_cache_directory = _symmetry_cache_directory(arguments)
     # Output_File_Name names the report as in PARSEC; --log overrules it.
     log_path = _resolve_output(
@@ -1316,12 +1524,27 @@ def _run(
 
             for line in post_processing_header_lines(translation):
                 log.write(line)
+            # PARSEC 1.5: FDET (Potential_Field) and pot.dat.
+            from parsec_python.Output.correction_output import embedding_header_lines
+
+            for line in embedding_header_lines(translation):
+                log.write(line)
+            if scan_folder_note is not None:
+                log.write(scan_folder_note)
             for warning in translation.warnings:
                 log.write(f"WARNING: {warning}")
             if symmetry_note is not None:
                 log.write(f"WARNING: {symmetry_note}")
             for note in restart_notes:
                 log.write(note)
+            # Generate_Complete_Parsec_In (PARSEC 1.5): bak_complete_parsec.in beside the input (rank 0 of an MPI run)
+            from parsec_python.Output.complete_input import write_complete_input
+            from .Parallel import mpi as _mpi
+
+            _context = _mpi.context()
+            if _context is None or _context.is_root:
+                for line in write_complete_input(translation):
+                    log.write(line)
             log.write()
             if translation.relaxation is not None:
                 log.write("\n".join(relaxation_header_lines(translation)))
@@ -1350,6 +1573,11 @@ def _run(
                 or translation.molecular_dynamics is not None
             )
             reporter.setup(system)
+            # FDET (PARSEC 1.5): the frozen field and the tip sphere.
+            from parsec_python.Output.correction_output import embedding_setup_lines
+
+            for line in embedding_setup_lines(system):
+                log.write(line)
             log.write("\n".join(_resource_report(resources, system)))
             if translation.problem.eigensolver.method == "none":
                 # Eigensolver: none is PARSEC's TEST mode (parsec.F90:1085-1089):
@@ -1605,6 +1833,16 @@ def _run(
                 )
                 log.write(f"Result archive: {saved}")
             files.finish(result, system.grid, translation.problem)
+            # Write_Potential_Field: pot.dat of PARSEC 1.5, of the last structure.
+            from parsec_python.Output.pot_dat import write_potential_field_after_run
+
+            write_potential_field_after_run(
+                translation, system, result, outcome, dynamics, log.write, input_directory
+            )
+            # AFM_Scan: the table of the scan (afm_scan.dat).
+            from parsec_python.Output.afm_scan import scan_lines_after_run
+
+            scan_lines_after_run(translation, outcome, log.write, input_directory)
             # bandstruc of a Gamma-point cell, Create_DOS of a cluster.
             run_post_scf_outputs(system, translation, result, reporter, log.write, input_directory)
             log.write(f"Text log: {log_path}")

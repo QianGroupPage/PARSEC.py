@@ -96,6 +96,11 @@ class ParsecPseudopotential:
     # The local angular momentum a ``MARTINS_WANG`` file names (``loc``);
     # ``None`` where the input chooses it (``Local_Component``).
     local_channel: int | None = None
+    # ``dvw`` of a filtered channel: the radial derivative of its filtered
+    # projector, ``dfint`` of PARSEC 1.5 (``math/fourier_f.f90:267``; the
+    # previous tree stored the projector itself there).  Same keys as
+    # ``filtered_projectors``; empty for an unfiltered potential.
+    filtered_projector_slopes: dict[int, np.ndarray] = field(default_factory=dict)
 
     @property
     def radial_offset(self) -> float:
@@ -146,6 +151,16 @@ class ParsecPseudopotential:
                 f"available channels: {available}"
             )
 
+    def local_potential_spline(self, local_l: int, spline_padding_width: int) -> ParsecRadialSpline:
+        """The cubic spline :meth:`local_potential` evaluates with ``use_spline`` (PARSEC's origin padding).
+
+        Built from the table each time; a caller that evaluates many batches passes it as ``spline``.
+        """
+        self.validate_local_channel(local_l)
+        return ParsecRadialSpline.from_positive_grid(
+            self.radii, self.channel_potentials[local_l], spline_padding_width
+        )
+
     def local_potential(
         self,
         distances: np.ndarray,
@@ -154,12 +169,15 @@ class ParsecPseudopotential:
         use_spline: bool = False,
         spline_padding_width: int | None = None,
         direct: bool = False,
+        spline: ParsecRadialSpline | None = None,
     ) -> np.ndarray:
         """Evaluate the selected local potential with PARSEC's Coulomb tail.
 
         When ``use_spline`` is true, ``spline_padding_width`` must equal the
         real-space stencil half-width ``Expansion_Order/2``.  PARSEC uses it
-        to extend the radial spline through the atomic origin.
+        to extend the radial spline through the atomic origin.  ``spline``,
+        if given, is that spline already built (:meth:`local_potential_spline`
+        of the same channel and width): the same values without rebuilding it.
 
         Between the radial samples PARSEC interpolates ``r*V(r)`` linearly
         and divides by ``r``.  ``direct`` interpolates ``V(r)`` itself, the
@@ -180,11 +198,12 @@ class ParsecPseudopotential:
                     "spline_padding_width is required when use_spline=True"
                 )
             if np.any(inside):
-                spline = ParsecRadialSpline.from_positive_grid(
-                    self.radii,
-                    values,
-                    spline_padding_width,
-                )
+                if spline is None:
+                    spline = ParsecRadialSpline.from_positive_grid(
+                        self.radii,
+                        values,
+                        spline_padding_width,
+                    )
                 result[inside] = spline(radius[inside])
         elif direct:
             # ``V_j + delr*(V_(j+1) - V_j)``; below the first sample the

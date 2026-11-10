@@ -72,6 +72,10 @@ def graph_filter(operator, matrix, blocks, lower, upper, reference, reset, out=N
     stencil = getattr(operator, "compact_finite_difference", None)
     if not isinstance(stencil, CuPyStencilMajorFiniteDifference):
         return None
+    if getattr(operator, "kinetic_term", None) is not None:
+        # The orbital term of a meta-GGA is outside the captured kernels: the
+        # ordinary filter, which applies it.
+        return None
     if operator.projector_count and (
         not operator.fused_projector_scatter
         or operator.custom_projector_projection is None

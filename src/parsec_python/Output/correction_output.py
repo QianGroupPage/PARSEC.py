@@ -126,6 +126,114 @@ def hubbard_iteration_lines(step) -> list[str]:
     ]
 
 
+_FDET_FUNCTIONAL_LINES = {
+    "pw": " Kinetic Energy Functional is PW91K GGA.",
+    "pb": " Kinetic Energy Functional is PBE-like GGA.",
+    "tf": " Kinetic Energy Functional is Thomas-Fermi LDA.",
+    "tw": " Kinetic Energy Functional is Thomas-Fermi plus GEA.",
+    "none": " CAUTION! Kinetic Energy is not computed.",
+}
+
+
+def embedding_header_lines(translation) -> list[str]:
+    """What ``usrinputfile.F90:2190-2232`` prints about FDET, and pot.dat.
+
+    Empty for an input without ``Potential_Field`` and ``Write_Potential_Field``.
+    """
+
+    lines: list[str] = []
+    settings = getattr(getattr(translation, "problem", None), "embedding", None)
+    if settings is not None:
+        lines += [" External potential field is provided by user.", _FDET_FUNCTIONAL_LINES[settings.kinetic_functional]]
+        if settings.kinetic_functional == "pb":
+            lines += [
+                " PBE mu and kappa:",
+                f" mu    = {settings.pbe_mu:25.16f}",
+                f" kappa = {settings.pbe_kappa:25.16f}",
+            ]
+        if settings.kinetic_functional in ("tw", "pw", "pb"):
+            lines.append(
+                " FDET kinetic potential: "
+                + (
+                    "the derivative of its energy (FDET_Kinetic_Form: corrected)"
+                    if settings.kinetic_form == "corrected"
+                    else "PARSEC 1.5's form (FDET_Kinetic_Form: parsec1.5)"
+                )
+            )
+        if settings.tip_sphere:
+            lines.append(" FDET: the tip is computed in its own sphere (boundary_sphere_around_tip).")
+        lines.append(f" FDET sample field: {settings.field_path}")
+    if getattr(translation, "write_potential_field", False):
+        lines.append(" pot.dat (Write_Potential_Field) is written after the run")
+    return lines
+
+
+def embedding_setup_lines(system) -> list[str]:
+    """What PARSEC 1.5 prints when it reads the frozen field (``potfield``, ``tipsphere_field``).
+
+    Empty for a system without FDET.
+    """
+
+    field = getattr(system, "embedding", None)
+    if field is None:
+        return []
+    state = field.tip_sphere
+    if state is None:
+        return [
+            f" FDET: frozen sample field on all {int(system.grid.size)} grid points; isolated sample "
+            f"kinetic energy {field.kinetic_energy:.8f} Ry",
+            "",
+        ]
+    offset = "".join(f"{value:6d}" for value in state.offset)
+    return [
+        f" FDET tip sphere: tip moved by{offset} grid steps to the centre of its own sphere",
+        " FDET tip sphere: coordinates below are in the tip frame (spot frame minus",
+        "  the grid offset). Total energies leave out sample-only constants, so",
+        "  only energy differences are meaningful. Forces miss the sample electrons",
+        "  outside the tip sphere.",
+        *state.report_lines(int(system.grid.size)),
+        "",
+    ]
+
+
+def embedding_move_lines(system) -> list[str]:
+    """The tip-sphere lines PARSEC 1.5 prints after a move (``tipsphere_field``); empty otherwise."""
+
+    field = getattr(system, "embedding", None)
+    state = None if field is None else field.tip_sphere
+    if state is None:
+        return []
+    return [*state.report_lines(int(system.grid.size)), ""]
+
+
+def embedding_energy_lines(energies) -> list[str]:
+    """The FDET lines of ``totnrg.f90`` (formats 61-69) of an FDET energy breakdown.
+
+    Empty for any other breakdown (:class:`parsec_python.models.EmbeddingEnergyBreakdown`).
+    """
+
+    from ..models import EmbeddingEnergyBreakdown
+
+    if not isinstance(energies, EmbeddingEnergyBreakdown):
+        return []
+    lines = [
+        f"   Non-additive Kinetic Energy   = {energies.nonadditive_kinetic:20.8f} [Ry]",
+        f"   Integral_{{Vnadd*rho}}          = {energies.integral_vnad_rho:20.8f} [Ry]",
+        f"   Tip-ion/Sample-elec. Energy   = {energies.tip_ion_sample_electron:20.8f} [Ry]",
+        f"   Sample Hartree Energy         = {energies.sample_hartree:20.8f} [Ry]",
+        f"   Sample elec.-ion Energy       = {energies.sample_electron_ion:20.8f} [Ry]",
+        f"   Isolated Sample Kinetic Energy= {energies.sample_kinetic:20.8f} [Ry]",
+    ]
+    if energies.tip_sphere:
+        lines += [
+            f"   Exc[rho_sample] on tip grid   = {energies.sample_xc_on_tip_grid:20.8f} [Ry]",
+            f"   Tip-ion/Sample-elec. outside  = {energies.tip_ion_sample_electron_outside:20.8f} [Ry]",
+            "   (tip sphere: total energy without the sample Hartree,",
+            "    sample elec.-ion and sample kinetic energies)",
+        ]
+    return lines
+
+
 def energy_correction_lines(energies, *, dispersion: bool = False) -> list[str]:
     """``TS-vDW correction (included)`` and ``LDA+U Energy`` of ``totnrg.f90``.
 
@@ -140,9 +248,14 @@ def energy_correction_lines(energies, *, dispersion: bool = False) -> list[str]:
             "   TS-vDW correction (included)  = "
             f"{getattr(energies, 'dispersion', 0.0):20.8f} [Ry]"
         )
+    # FDET (PARSEC 1.5, totnrg.f90 formats 61-69), between them.
+    lines.extend(embedding_energy_lines(energies))
     hubbard = float(getattr(energies, "hubbard", 0.0))
     if hubbard != 0.0:
         lines.append(f"   LDA+U Energy                  = {hubbard:20.8f} [Ry]")
+    if hasattr(energies, "integral_vtau_tau"):
+        # A meta-GGA: the band-energy part of -div(vtau grad), which the total removes.
+        lines.append(f"   Integral_{{2 vtau*tau}}         = {energies.integral_vtau_tau:20.8f} [Ry]")
     return lines
 
 

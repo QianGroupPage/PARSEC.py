@@ -131,6 +131,8 @@ class _SolveWorker:
         self.converter = plan.converter(index) if plan is not None else None
         self.device_solver = self.converter is not None and _device_solver_requested()
         self._spill: bool | None = None
+        # export_states hands the device subspaces as they are (the SCF loops of a hybrid's Fock loop)
+        self.device_states = False
 
     def _tick(self, name: str, start: float) -> None:
         """Add the seconds since ``start`` to the worker's ``worker_<name>_seconds`` counter."""
@@ -174,6 +176,17 @@ class _SolveWorker:
         self.vectors.pop(task, None)  # release the previous basis before the next one is made
         if state is not None and isinstance(state.vectors, np.ndarray) and backend.xp is not np:
             state.vectors = backend.asarray(state.vectors)  # a spilled subspace comes back
+        elif (
+            state is not None
+            and backend.xp is not np
+            and isinstance(state.vectors, backend.xp.ndarray)
+            and int(state.vectors.device.id) != int(backend.device_id)
+        ):
+            # a subspace kept on another device (a pool of another layout): copied here
+            source = backend.xp.ascontiguousarray(state.vectors)
+            copy = backend.xp.empty(source.shape, dtype=source.dtype)
+            copy.data.copy_from_device(source.data, source.nbytes)
+            state.vectors = copy
         if state is None and settings.initial_method == "chebdav" and _first_solve_on_host():
             # CHEBDAV (the first solve of Eigensolver: chebdav) runs on the host with the device
             # filter; its subspace then continues on the device.
@@ -285,13 +298,32 @@ class _SolveWorker:
                     total[name] = np.array(value, copy=True)
         yield None, total
 
+    def keep_device_states(self):
+        """Hand the device subspaces as they are from now on (no host copy in :meth:`export_states`)."""
+        self.device_states = True
+        yield None, None
+
+    def device_vectors_of(self, task: int):
+        """The final eigenvectors of ``task`` where they are (a device array, or a spilled host one)."""
+        if task in self.vectors:
+            yield task, self.vectors[task]
+
+    def device_of(self):
+        """``(task, device id)`` of every task of a device worker (none on the CPU)."""
+        if self.converter is not None and self.converter.backend.name == "cupy":
+            for task in self.tasks:
+                yield task, int(self.converter.backend.device_id)
+
     def export_states(self):
-        """``(task, state)`` of every task with a state, its subspace on the host."""
+        """``(task, state)`` of every task with a state, its subspace on the host (or kept on the device)."""
         for task in self.tasks:
             state = self.states.get(task)
             if state is None:
                 continue
             vectors = getattr(state, "vectors", None)
+            if self.device_states:
+                yield task, replace(state)
+                continue
             if vectors is not None and not isinstance(vectors, np.ndarray):  # the subspace of a device
                 self.converter.backend.use()
                 state = replace(state, vectors=self._to_host(vectors))
@@ -395,6 +427,24 @@ class PooledKPointSolver:
             return vectors
         raise KeyError(task)
 
+    def device_vectors(self, task: int):
+        """The final eigenvectors of one task where its worker keeps them: a device array (a view of
+        the task's Ritz subspace, which its next solve overwrites), or a host array where spilled."""
+        for _, vectors in self.pool.results("device_vectors_of", task):
+            return vectors
+        raise KeyError(task)
+
+    def keep_states_on_devices(self) -> None:
+        """Let :meth:`export_states` hand the device subspaces as they are, without host copies (the SCF
+        loops of a hybrid's Fock loop, whose next loop runs on the same devices)."""
+        if not getattr(self, "_device_states", False):
+            self.pool.results("keep_device_states")
+            self._device_states = True
+
+    def task_devices(self) -> dict[int, int]:
+        """The CUDA device of every task (empty on the CPU)."""
+        return dict(self.pool.results("device_of"))
+
     def stats(self) -> dict[str, float]:
         """Eigensolver counters and seconds summed over the workers (device route)."""
         total: dict[str, float] = {}
@@ -466,9 +516,15 @@ def map_tasks(solve_task, n_tasks: int, *, problem_size=None, workers=None, back
 
 
 def make_solver(job: KPointJob, **options):
-    """The solver of a k-point job: row-distributed over the MPI ranks if the run is an MPI run
-    (``PARSEC_MPI=1``), else the pool of threads and devices of this process."""
+    """The solver of a k-point job: in an MPI run (``PARSEC_MPI=1``) the pools of ranks
+    (:class:`.kpoint_pools.MPIPoolKPointSolver`), or for a job with per-task extras (the spin-orbit and
+    non-collinear drivers, forces) the basis split by rows over the ranks (:class:`.kpoint_mpi.MPIKPointSolver`);
+    else the pool of threads and devices of this process."""
     if mpi.context() is not None:
+        if job.extras is None and options.get("problem_size") is not None:
+            from .kpoint_pools import MPIPoolKPointSolver
+
+            return MPIPoolKPointSolver(job, **options)
         from .kpoint_mpi import MPIKPointSolver
 
         return MPIKPointSolver(job, **options)
@@ -524,18 +580,40 @@ def describe() -> list[str]:
         nodes: dict[str, list] = {}
         for host, gpu in placement:
             nodes.setdefault(host, []).append(gpu)
+        from .kpoint_pools import requested_pools
+
+        try:
+            pools = requested_pools()
+        except ValueError:
+            pools = None
         lines.append(
             f" MPI               = {context.size} ranks on {len(nodes)} node(s), {context.ranks_per_node} per node; "
-            "the basis of every eigenproblem is split by blocks of grid rows over the ranks"
+            "k-points and spin channels are solved by pools of ranks"
+            + (f" ({pools} pools, --kpoint-pools)" if pools is not None else " (pools by balance and memory)")
+            + ", each basis shared by columns within its pool; spin-orbit and non-collinear runs split the "
+            "basis by blocks of grid rows over all ranks"
         )
         if device is not None:
+            from ..Eigensolvers.mpi_shared_basis import shared_transport
+
+            try:
+                shared = shared_transport()
+            except ValueError:
+                shared = "host"
             lines.append(
                 " GPU-aware MPI     = "
                 + (
-                    "on: halo rows go between the GPUs and overlap the local product; the sums go "
+                    "on: the pools move their bases between columns and rows as device arrays"
+                    if shared == "cuda"
+                    else "off: the pools move their bases through the host (MPICH_GPU_SUPPORT_ENABLED=1 for "
+                    "device arrays)"
+                )
+                + "; rows of spinors: "
+                + (
+                    "halo rows between the GPUs, sums "
                     + ("between the GPUs" if context.cuda_aware_reduce else "through the host")
                     if context.cuda_aware
-                    else "off: halo rows and sums go through the host (PARSEC_MPI_CUDA_AWARE=1 for GPU buffers)"
+                    else "halo rows and sums through the host (PARSEC_MPI_CUDA_AWARE=1 for GPU buffers)"
                 )
             )
             lines.append(

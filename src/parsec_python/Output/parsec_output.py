@@ -1624,6 +1624,15 @@ class ParsecTextReporter:
         self._occupations_density_total = 0.0
         self._xc_total = 0.0
         self._mixing_energy_total = 0.0
+        # Molecular dynamics: only the levels of the last iteration go to the log (see _state_table).
+        self._hold_states = (
+            getattr(translation, "molecular_dynamics", None) is not None
+            and os.environ.get("PARSEC_MD_EIGENVALUES", "").strip() != "1"
+        )
+        self._held_states = None
+        # What the molecular dynamics loop wants of this structure (MD_Output_Interval): "full", "forces" (the force table
+        # but not the levels) or "brief" (neither).  Any other run is "full".
+        self.frame_detail = "full"
         # eigval.F90's solver%totalmv, for the ARPACK and DIAGLA reports.
         self._cumulative_matvecs = 0
         self.domain: dict | None = None
@@ -2409,6 +2418,43 @@ class ParsecTextReporter:
             )
         ]
 
+    def _state_table(self, step: SCFIteration) -> list[str]:
+        """The table of levels of one SCF iteration.
+
+        In a molecular dynamics run the table of every iteration (about 400 lines, 28 kB for 192 atoms, a million
+        lines per stage) is not written: it is held, and :meth:`finish` writes the one of the last iteration.
+        ``PARSEC_MD_EIGENVALUES=1`` keeps the table of every iteration, as PARSEC does.
+        """
+
+        def table() -> list[str]:
+            return [
+                "   State   Eigenvalue [Ry]      Eigenvalue [eV]    Occup.     Repr.",
+                "",
+                *self._state_lines(
+                    step.eigenvalues,
+                    step.occupations,
+                    (
+                        step.representations
+                        if len(step.representations) == len(step.eigenvalues)
+                        else (1,) * len(step.eigenvalues)
+                    ),
+                ),
+            ]
+
+        if not self._hold_states:
+            return table()
+        self._held_states = table  # formatted only if the loop ends here
+        return []
+
+    def _held_state_lines(self) -> list[str]:
+        """The levels of the last iteration of a molecular dynamics loop (held by :meth:`_state_table`)."""
+
+        held, self._held_states = self._held_states, None
+        if held is None or self.frame_detail != "full":
+            return []
+        table = held()
+        return [" Levels of the last SCF iteration:", "", *table, ""]
+
     def _spin_level_lines(self, step: SCFIteration) -> list[str]:
         """Electrons, moment, Fermi level and the levels of both channels."""
 
@@ -2552,18 +2598,7 @@ class ParsecTextReporter:
                         else ()
                     ),
                     *self._kpoint_note(),
-                    "   State   Eigenvalue [Ry]      Eigenvalue [eV]"
-                    "    Occup.     Repr.",
-                    "",
-                    *self._state_lines(
-                        step.eigenvalues,
-                        step.occupations,
-                        (
-                            step.representations
-                            if len(step.representations) == len(step.eigenvalues)
-                            else (1,) * len(step.eigenvalues)
-                        ),
-                    ),
+                    *self._state_table(step),
                     *density_symmetrization_lines(
                         getattr(step, "density_symmetrization", ())
                     ),
@@ -2760,6 +2795,7 @@ class ParsecTextReporter:
             *hybrid_finish_lines(result),
             status,
             "",
+            *self._held_state_lines(),
             (
                 "Time for self-consistent field [sec] : "
                 f"{elapsed_seconds:10.2f},"
@@ -2885,8 +2921,12 @@ class ParsecTextReporter:
         else:
             lines.extend(
                 [
-                    *force_report_lines(
-                        forces, self.translation.output_level, periodic=self._crystal_report
+                    *(
+                        force_report_lines(
+                            forces, self.translation.output_level, periodic=self._crystal_report
+                        )
+                        if self.frame_detail != "brief"
+                        else ()
                     ),
                     f"Time for forces [sec] : {forces.seconds:11.2f}",
                     *_force_phase_lines(forces),

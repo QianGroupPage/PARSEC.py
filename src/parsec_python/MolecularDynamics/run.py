@@ -143,14 +143,16 @@ class _Files:
         self.directory = None if directory is None else Path(directory)
         self.started: list[Path] = []
 
-    def append(self, records: MoldynRecords) -> None:
+    def append(self, records: MoldynRecords, *, structure: bool = True) -> None:
+        """Add the records of one step; with ``structure`` false only the line of ``md_nrg.dat`` (MD_Output_Interval)."""
+
         if self.directory is None:
             return
         for name, text in (
             (MD_NRG, records.md_nrg),
-            (MD_MECH, records.md_mech),
-            (ATOM_COR, records.atom_cor),
-            (MOVIE, records.movie_xyz),
+            (MD_MECH, records.md_mech if structure else ""),
+            (ATOM_COR, records.atom_cor if structure else ""),
+            (MOVIE, records.movie_xyz if structure else ""),
         ):
             path = self.directory / name
             if path not in self.started:
@@ -262,7 +264,14 @@ def run_recorded_molecular_dynamics(
     carried = None
     index = 0
     filter_restart = FilterRestart.from_eigensolver(translation.problem.eigensolver)
+    interval = max(int(getattr(translation, "md_output_interval", 1)), 1)
     while True:
+        # MD_Output_Interval: the structures, forces and the force table of parsec.out are written every `interval`
+        # steps and at the last; the levels and the other end-of-run blocks only at the last.  A single structure
+        # (Step_Num 0) is both.
+        last_structure = settings.step_num == 0 or state.move_count >= settings.step_num
+        output_structure = last_structure or state.move_count % interval == 0
+        reporter.frame_detail = "full" if last_structure else "forces" if output_structure else "brief"
         started = time.perf_counter()
         result = backend.run_scf(system, callback=reporter.iteration, warm_start=carried)
         elapsed = time.perf_counter() - started
@@ -271,7 +280,7 @@ def run_recorded_molecular_dynamics(
         energy = float(result.energies.total)
         outcome.system, outcome.result, outcome.forces = system, result, forces
         outcome.scf_failed = outcome.scf_failed or not result.converged
-        if directory is not None and os.environ.get(FRAMES_ENVIRONMENT, "") not in ("", "0"):
+        if output_structure and directory is not None and os.environ.get(FRAMES_ENVIRONMENT, "") not in ("", "0"):
             frame = _dft_frame(
                 system,
                 [(e or "").strip() or sym for e, sym in zip(elements, species)],
@@ -302,7 +311,7 @@ def run_recorded_molecular_dynamics(
                 # (the centre of mass is not held; MolecularDynamics.moldyn).
                 **({"keep_center_of_mass": True} if getattr(forces, "net_force_kept", False) else {}),
             )
-            files.append(step_records(state, step, species))
+            files.append(step_records(state, step, species), structure=output_structure)
             write(
                 "\n".join(
                     [

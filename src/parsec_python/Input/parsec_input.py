@@ -5649,6 +5649,8 @@ def _parse_parsec_input(
             fall_back(refusal)
     if routines.warning() is not None:
         warnings.append(routines.warning())
+    elif routines.requested is False and not routines.fortran and choice_matters:
+        warnings.append(_routines_module.NOT_THE_DEFAULT_WARNING)
     if andrew_slab:
         if (
             self_consistent_spin_orbit

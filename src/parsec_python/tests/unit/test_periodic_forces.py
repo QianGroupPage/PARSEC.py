@@ -590,6 +590,26 @@ class CommandLineTests(unittest.TestCase):
         self.assertGreaterEqual(blocks(), 3)
         self.assertEqual(thin.count(" Levels of the last SCF iteration:"), 1)
 
+    def test_use_fortran_routines_false_runs_andrews_routines_with_a_warning(self) -> None:
+        from parsec_python.Input.parsec_input import parse_parsec_input
+
+        text = _CLI_INPUT.replace("Use_Fortran_Routines: .true.", "Use_Fortran_Routines: .false.")
+        self.assertIn("Use_Fortran_Routines: .false.", text)
+        path = self.directory / "parsec.in"
+        path.write_text(text, encoding="utf-8")
+        translation = parse_parsec_input(path)
+        self.assertFalse(translation.routines.fortran)
+        self.assertIs(translation.routines.requested, False)
+        self.assertTrue(any("runs Andrew Grieder's routines" in warning for warning in translation.warnings))
+        # a keyword that only the Fortran-derived routines read still switches them on, with its reason
+        path.write_text(text + "Periodic_Local_Potential: g_space\n", encoding="utf-8")
+        translation = parse_parsec_input(path)
+        self.assertTrue(translation.routines.fortran)
+        # unset, and .true., are the Fortran-derived routines on this branch
+        for line in ("", "Use_Fortran_Routines: .true.\n"):
+            path.write_text(text.replace("Use_Fortran_Routines: .false.\n", line), encoding="utf-8")
+            self.assertTrue(parse_parsec_input(path).routines.fortran)
+
 
 class InputTests(unittest.TestCase):
     def setUp(self) -> None:

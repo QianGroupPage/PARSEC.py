@@ -401,6 +401,14 @@ class RoutineChoice:
 
 DEFAULT = RoutineChoice(fortran=True, requested=True)
 
+#: Printed (and returned among the warnings of the parser) when ``Use_Fortran_Routines: .false.`` runs Andrew Grieder's routines.
+NOT_THE_DEFAULT_WARNING = (
+    "Use_Fortran_Routines: .false. runs Andrew Grieder's routines. On this branch the Fortran-derived routines are the default "
+    "of every input, and the accelerated forces of Cubic_Spline species, Periodic_Local_Potential: g_space and the "
+    "Gamma path of a one-point k grid are written for them; the results of the two sets of routines differ "
+    "(grid rule, local potential conventions)."
+)
+
 
 def routines_report_line(translation) -> str | None:
     """The line of parsec.out that states the routines of a run, ``None`` where the choice changes nothing.
@@ -861,7 +869,13 @@ def decide_routines(
     default is the Fortran-derived routines (:class:`UseFortranRoutines`).
     """
 
-    return RoutineChoice(fortran=True, requested=True)
+    if requested is not False:
+        # pbc_forces: the Fortran-derived routines are the default of every input (main's default is Andrew
+        # Grieder's routines, with the Fortran-derived ones for the features of FORTRAN_DEFAULT_FEATURES).
+        return RoutineChoice(fortran=True, requested=True)
+    # Use_Fortran_Routines: .false. is honored, as on main: Andrew Grieder's routines wherever his code accepts the
+    # input, and the Fortran-derived ones (with the reason) where it does not.  The parser warns that this is not the
+    # default of this branch (:data:`NOT_THE_DEFAULT_WARNING`).
     start = RoutineChoice(requested=requested)
     unknown = sorted(
         key
@@ -889,6 +903,7 @@ def decide_routines(
 
 __all__ = [
     "DEFAULT",
+    "NOT_THE_DEFAULT_WARNING",
     "FORTRAN_DEFAULT_FEATURES",
     "GAMMA_FORCES_FEATURE",
     "SHIFTED_MESH_FEATURE",

@@ -801,7 +801,7 @@ def _device_self_consistency(system, atoms, specifications, lattice, density, re
     return None if found is None else found[0].self_consistency
 
 
-def _spline_species_local_forces(system, atoms, specifications, lattice, density, residual, xc):
+def _spline_species_local_forces(system, atoms, specifications, lattice, density, residual, xc, clock=None):
     """The local terms of a cell with Fortran's G-space local potential and ``Cubic_Spline`` species, else ``None``.
 
     The ionic term is :func:`parsec_python.V_ion.gspace_local.gspace_local_forces` (an FFT, on the device of the run) and
@@ -820,12 +820,16 @@ def _spline_species_local_forces(system, atoms, specifications, lattice, density
     if not spline_species_takes(system.grid, lattice, specifications, atoms):
         return None
     xp, erf, device = _array_module(system)
+    started = perf_counter()
     on_device = _device_self_consistency(system, atoms, specifications, lattice, density, residual, xc)
+    if clock is not None:
+        # the seconds of each local term, in the line of the phases of the force table
+        clock["local_selfcons"] = perf_counter() - started
     arguments = (system.grid, atoms, system.pseudopotentials, specifications, lattice, density, residual, xc)
     if device is None:
-        return fortran_spline_local_forces(*arguments, self_consistency=on_device)
+        return fortran_spline_local_forces(*arguments, self_consistency=on_device, clock=clock)
     with xp.cuda.Device(device):
-        return fortran_spline_local_forces(*arguments, xp=xp, erf=erf, self_consistency=on_device)
+        return fortran_spline_local_forces(*arguments, xp=xp, erf=erf, self_consistency=on_device, clock=clock)
 
 
 def compute_device_periodic_forces(system, result, *, symmetrize: bool = True, operations=None):
@@ -872,7 +876,7 @@ def compute_device_periodic_forces(system, result, *, symmetrize: bool = True, o
     density, residual, xc = periodic_force_fields(system, result)
     # The readable entry: inside device_periodic_forces it differentiates the
     # device fields on the device, outside the fields of the readable builders.
-    local = _spline_species_local_forces(system, atoms, specifications, lattice, density, residual, xc)
+    local = _spline_species_local_forces(system, atoms, specifications, lattice, density, residual, xc, clock)
     if local is None:
         local = periodic_local_forces(
             system.grid, atoms, system.pseudopotentials, specifications, lattice, density, residual, xc

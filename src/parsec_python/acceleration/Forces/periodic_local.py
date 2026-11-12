@@ -454,6 +454,7 @@ def fortran_spline_local_forces(
     erf=None,
     tolerance: float = 1.0e-14,
     self_consistency: np.ndarray | None = None,
+    clock: dict | None = None,
 ) -> LocalForceTerms:
     """The three local terms of :func:`parsec_python.Forces.periodic.periodic_local_forces` for spline species, fast.
 
@@ -465,7 +466,8 @@ def fortran_spline_local_forces(
     :func:`fast_self_consistency_forces`.  See :func:`spline_species_takes` for the inputs it covers.
 
     ``self_consistency``: that term already formed (``(atoms, 3)``, Ry/bohr, with the volume element), by the CUDA
-    kernel of :mod:`.periodic_device` for instance; the host ball sums are skipped.
+    kernel of :mod:`.periodic_device` for instance; the host ball sums are skipped.  ``clock``: a dict that receives the
+    seconds of the ionic and the core-correction terms (``local_ionic``, ``local_core``).
     """
 
     def self_consistency_term() -> np.ndarray:
@@ -477,16 +479,19 @@ def fortran_spline_local_forces(
         )
 
     if getattr(grid.settings, "local_potential", "real_space") == "g_space":
+        from time import perf_counter
+
         from parsec_python.V_ion.gspace_local import gspace_local_forces
 
-        return LocalForceTerms(
-            ionic=gspace_local_forces(grid, atoms, potentials, specifications, lattice_vectors, density, xp=xp),
-            self_consistency=self_consistency_term(),
-            core_correction=fast_core_correction_forces(
-                grid, atoms, potentials, specifications, lattice_vectors, xc_potential, xp=xp
-            )
-            * grid.volume_element,
-        )
+        started = perf_counter()
+        ionic = gspace_local_forces(grid, atoms, potentials, specifications, lattice_vectors, density, xp=xp)
+        if clock is not None:
+            clock["local_ionic"] = perf_counter() - started
+        started = perf_counter()
+        core = fast_core_correction_forces(grid, atoms, potentials, specifications, lattice_vectors, xc_potential, xp=xp)
+        if clock is not None:
+            clock["local_core"] = perf_counter() - started
+        return LocalForceTerms(ionic=ionic, self_consistency=self_consistency_term(), core_correction=core * grid.volume_element)
     terms = fast_periodic_local_forces(
         grid, atoms, potentials, specifications, lattice_vectors, density, xc_potential,
         xp=xp, erf=erf, tolerance=tolerance,

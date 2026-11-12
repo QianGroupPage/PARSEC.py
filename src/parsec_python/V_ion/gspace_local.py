@@ -253,14 +253,16 @@ def _structure_factor(vectors: np.ndarray, positions: np.ndarray) -> np.ndarray:
     return total
 
 
-def gspace_local_ionic_potential(
+def gspace_local_ionic_potential_reference(
     grid,
     atoms: Sequence[Atom],
     potentials: Mapping[str, ParsecPseudopotential],
     specifications: Mapping[str, SpeciesPotential],
     lattice_vectors: np.ndarray,
 ) -> np.ndarray:
-    """Fortran's G-space local potential on ``grid`` (Rydberg), zero average.
+    """The plain sum over the G vectors (the oracle of the tests of :func:`gspace_local_ionic_potential`).
+
+    Fortran's G-space local potential on ``grid`` (Rydberg), zero average.
 
     ``ionpbc.f90``: ``V(G)`` of :func:`gspace_vectors` (``v_first``), placed
     on the FFT box with the phase of the grid shift and transformed
@@ -317,7 +319,7 @@ def gspace_alpha_energy(
     return float(electron_count) * total / volume
 
 
-def gspace_local_forces(
+def gspace_local_forces_reference(
     grid,
     atoms: Sequence[Atom],
     potentials: Mapping[str, ParsecPseudopotential],
@@ -325,7 +327,9 @@ def gspace_local_forces(
     lattice_vectors: np.ndarray,
     density: np.ndarray,
 ) -> np.ndarray:
-    """``-d/dR_a [dV sum_r rho(r) V(r)]`` for :func:`gspace_local_ionic_potential`.
+    """The plain per-atom sum over the G vectors (the oracle of the tests of :func:`gspace_local_forces`).
+
+    ``-d/dR_a [dV sum_r rho(r) V(r)]`` for :func:`gspace_local_ionic_potential`.
 
     ``F_a = -(dV/Omega) sum_G v_a(|G|) G Im(P(G) exp(-i G.R_a))`` with
     ``P(G) = sum_r rho(r) exp(i G.r)`` (one FFT of the density; the G set and
@@ -352,6 +356,269 @@ def gspace_local_forces(
         position = np.asarray(atom.position, dtype=np.float64)
         imaginary = np.imag(weighted * np.exp(-1j * (vectors.vectors @ position)))
         forces[index] = -scale * ((factors[atom.symbol] * imaginary) @ vectors.vectors)
+    return forces
+
+
+# --------------------------------------------------------------------------------------------------------------------------
+# The same sums, separable.  G = m @ B, so exp(-i G.R) = exp(-2 pi i m.f) with the fractional coordinates f = R @ inv(A) is
+# a product of one factor per lattice direction.  The structure factor of a species and the sum over G of the force are then
+# matrix products over the 125^3 box of m (a few GFlop for 192 atoms: well under a second on the host, milliseconds on a
+# device) instead of one complex exponential of every G for every atom (10 s each on the host).  The G set, its phases and the
+# form factors do not depend on the positions: they are built once per grid and lattice.
+# --------------------------------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _DenseSet:
+    """The G vectors of :func:`gspace_vectors` on the full box of ``m`` (``-n//2 .. n//2`` per axis, ``n + 1`` entries for even ``n``)."""
+
+    shape: tuple[int, int, int]
+    ranges: tuple[np.ndarray, np.ndarray, np.ndarray]  # m per axis
+    wrap: tuple[np.ndarray, np.ndarray, np.ndarray]  # m mod n per axis (the FFT index)
+    reciprocal: np.ndarray  # rows b_i, G = m @ B
+    keep: np.ndarray  # bool, the G of the set
+    norms: np.ndarray  # |G| (0 outside the set is not used: ``keep``)
+    phases: np.ndarray  # exp(2 pi i m.s/n) of the grid shift, complex
+    kept_norms: np.ndarray  # norms[keep]
+    distinct: np.ndarray  # sorted unique kept norms
+    inverse: np.ndarray  # kept_norms = distinct[inverse]
+
+
+_DENSE_CACHE: dict = {}
+_FACTOR_CACHE: dict = {}
+
+
+def _dense_set(grid, lattice_vectors: np.ndarray) -> _DenseSet:
+    lattice_vectors = np.asarray(lattice_vectors, dtype=np.float64)
+    shape = tuple(int(value) for value in grid.points_per_axis)
+    if len(shape) != 3:
+        raise ValueError("the G-space local potential needs a 3-D periodic grid")
+    shift = np.asarray(getattr(grid, "shift", np.zeros(3)), dtype=np.float64)
+    spacing = _first_spacing(grid)
+    key = (shape, lattice_vectors.tobytes(), shift.tobytes(), spacing)
+    found = _DENSE_CACHE.get(key)
+    if found is not None:
+        return found
+    half = [count // 2 for count in shape]
+    ranges = tuple(np.arange(-m, m + 1) for m in half)
+    reciprocal = 2.0 * np.pi * np.linalg.inv(lattice_vectors).T
+    vectors = (
+        ranges[0][:, None, None, None] * reciprocal[0]
+        + ranges[1][None, :, None, None] * reciprocal[1]
+        + ranges[2][None, None, :, None] * reciprocal[2]
+    )
+    norms = np.sqrt(np.einsum("...i,...i->...", vectors, vectors))
+    del vectors
+    table_index = np.floor(norms / DELTA_Q + 2.0 + 0.5)
+    keep = (norms > 0.0) & (table_index < fortran_qtable_size(spacing))
+    counts = np.asarray(shape, dtype=np.float64)
+    axis_phase = [np.exp(2j * np.pi * ranges[i] * (shift[i] / counts[i])) for i in range(3)]
+    phases = axis_phase[0][:, None, None] * axis_phase[1][None, :, None] * axis_phase[2][None, None, :]
+    kept_norms = norms[keep]
+    distinct, inverse = np.unique(kept_norms, return_inverse=True)
+    result = _DenseSet(
+        shape=shape,
+        ranges=ranges,
+        wrap=tuple(ranges[i] % shape[i] for i in range(3)),
+        reciprocal=reciprocal,
+        keep=keep,
+        norms=norms,
+        phases=phases,
+        kept_norms=kept_norms,
+        distinct=distinct,
+        inverse=inverse,
+    )
+    if len(_DENSE_CACHE) >= 2:
+        _DENSE_CACHE.pop(next(iter(_DENSE_CACHE)))
+    _DENSE_CACHE[key] = result
+    return result
+
+
+def _dense_factors(
+    dense: _DenseSet,
+    key,
+    potentials: Mapping[str, ParsecPseudopotential],
+    specifications: Mapping[str, SpeciesPotential],
+    symbols: Sequence[str],
+) -> dict[str, np.ndarray]:
+    """``v_a(|G|)`` of each species on the box of ``m`` (zero outside the set), kept for the next call.
+
+    The potentials are held by the cache, so that an identity cannot be reused by another table while it is cached.
+    """
+
+    out = {}
+    for symbol in symbols:
+        potential = potentials[symbol]
+        local_l = specifications[symbol].local_angular_momentum
+        entry_key = (key, symbol, id(potential), local_l)
+        entry = _FACTOR_CACHE.get(entry_key)
+        if entry is None:
+            values = local_form_factor(potential, local_l, dense.distinct)[dense.inverse]
+            table = np.zeros(dense.keep.shape, dtype=np.float64)
+            table[dense.keep] = values
+            if len(_FACTOR_CACHE) >= 8:
+                _FACTOR_CACHE.pop(next(iter(_FACTOR_CACHE)))
+            entry = (table, potential)
+            _FACTOR_CACHE[entry_key] = entry
+        out[symbol] = entry[0]
+    return out
+
+
+def _cache_key(grid, lattice_vectors) -> tuple:
+    shift = np.asarray(getattr(grid, "shift", np.zeros(3)), dtype=np.float64)
+    return (
+        tuple(int(value) for value in grid.points_per_axis),
+        np.asarray(lattice_vectors, dtype=np.float64).tobytes(),
+        shift.tobytes(),
+        _first_spacing(grid),
+    )
+
+
+def _axis_factors(dense: _DenseSet, fractional: np.ndarray, xp) -> list:
+    """``exp(-2 pi i m_i f_i)`` per direction, ``(entries of the box of m, atoms)``."""
+
+    return [
+        xp.exp(-2j * np.pi * xp.asarray(dense.ranges[axis], dtype=np.float64)[:, None] * xp.asarray(fractional[:, axis])[None, :])
+        for axis in range(3)
+    ]
+
+
+def _fold_axis(array: np.ndarray, axis: int, count: int, half: int) -> np.ndarray:
+    """Add the entries of ``m = -half .. half`` of ``axis`` into the ``count`` entries ``m mod count`` (m and m + count meet for even ``count``)."""
+
+    shape = list(array.shape)
+    shape[axis] = count
+    out = np.zeros(shape, dtype=array.dtype)
+
+    def select(low, high):
+        index = [slice(None)] * array.ndim
+        index[axis] = slice(low, high)
+        return tuple(index)
+
+    out[select(0, half + 1)] += array[select(half, 2 * half + 1)]
+    if half:
+        out[select(count - half, count)] += array[select(0, half)]
+    return out
+
+
+def gspace_local_ionic_potential(
+    grid,
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    specifications: Mapping[str, SpeciesPotential],
+    lattice_vectors: np.ndarray,
+) -> np.ndarray:
+    """Fortran's G-space local potential on ``grid`` (Rydberg), zero average.
+
+    ``ionpbc.f90``: ``V(G)`` of :func:`gspace_vectors` (``v_first``), placed
+    on the FFT box with the phase of the grid shift and transformed
+    (``pot_local``), times 2 for Rydberg (here ``v`` is in Rydberg already).
+    The structure factor of every species is a matrix product over the box of ``m`` (see above); the form factors are
+    kept from the previous call.  Equal to :func:`gspace_local_ionic_potential_reference` to rounding.
+    """
+
+    lattice_vectors = np.asarray(lattice_vectors, dtype=np.float64)
+    volume = float(abs(np.linalg.det(lattice_vectors)))
+    if volume <= 0.0:
+        raise ValueError("lattice_vectors must span a nondegenerate cell")
+    total = np.zeros(grid.size, dtype=np.float64)
+    if not atoms:
+        return total
+    dense = _dense_set(grid, lattice_vectors)
+    symbols = list(dict.fromkeys(atom.symbol for atom in atoms))
+    factors = _dense_factors(dense, _cache_key(grid, lattice_vectors), potentials, specifications, symbols)
+    inverse = np.linalg.inv(lattice_vectors)
+    coefficients = np.zeros(dense.keep.shape, dtype=np.complex128)
+    for symbol in symbols:
+        positions = np.array(
+            [np.asarray(atom.position, dtype=np.float64) for atom in atoms if atom.symbol == symbol]
+        )
+        e_x, e_y, e_z = _axis_factors(dense, positions @ inverse, np)
+        counts = e_x.shape[0] * e_y.shape[0]
+        step = max(1, 8_000_000 // counts)
+        structure = np.zeros(dense.keep.shape, dtype=np.complex128)
+        for start in range(0, positions.shape[0], step):
+            part = slice(start, start + step)
+            pairs = (e_x[:, None, part] * e_y[None, :, part]).reshape(counts, -1)
+            structure += (pairs @ e_z[:, part].T).reshape(dense.keep.shape)
+        coefficients += factors[symbol] * structure
+    coefficients *= dense.phases / volume
+    box = coefficients
+    for axis in range(3):
+        box = _fold_axis(box, axis, dense.shape[axis], dense.shape[axis] // 2)
+    values = np.fft.ifftn(box) * box.size
+    return np.ascontiguousarray(values.real).reshape(-1)
+
+
+def gspace_local_forces(
+    grid,
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    specifications: Mapping[str, SpeciesPotential],
+    lattice_vectors: np.ndarray,
+    density: np.ndarray,
+    *,
+    xp=np,
+) -> np.ndarray:
+    """``-d/dR_a [dV sum_r rho(r) V(r)]`` for :func:`gspace_local_ionic_potential`.
+
+    ``F_a = -(dV/Omega) sum_G v_a(|G|) G Im(P(G) exp(-i G.R_a))`` with
+    ``P(G) = sum_r rho(r) exp(i G.r)`` (one FFT of the density; the G set and
+    the form factors do not depend on the positions, so this is exact).
+    ``force_loc_pb.f90`` evaluates the same sum over stars with the
+    star-averaged density.  Ry/bohr, shape ``(atoms, 3)``.
+
+    The sum over G of every atom is separable (exp(-i G.R) is a product of one factor per lattice direction): a matrix
+    product over the box of ``m`` for the atoms of a species, on ``xp`` (``numpy`` or ``cupy``: the density, the FFT and
+    the products are on the device; the form factors and the G set are built once and kept).  Equal to
+    :func:`gspace_local_forces_reference` to rounding.
+    """
+
+    lattice_vectors = np.asarray(lattice_vectors, dtype=np.float64)
+    forces = np.zeros((len(atoms), 3), dtype=np.float64)
+    if not atoms:
+        return forces
+    density = np.asarray(density, dtype=np.float64)
+    if density.shape != (grid.size,):
+        raise ValueError("density must hold one value per grid point")
+    volume = float(abs(np.linalg.det(lattice_vectors)))
+    dense = _dense_set(grid, lattice_vectors)
+    symbols = list(dict.fromkeys(atom.symbol for atom in atoms))
+    factors = _dense_factors(dense, _cache_key(grid, lattice_vectors), potentials, specifications, symbols)
+    transformed = xp.fft.ifftn(xp.asarray(density).reshape(dense.shape)) * density.size
+    wrap = [xp.asarray(values) for values in dense.wrap]
+    weighted = transformed[wrap[0][:, None, None], wrap[1][None, :, None], wrap[2][None, None, :]] * xp.asarray(dense.phases)
+    del transformed
+    scale = grid.volume_element / volume
+    inverse = np.linalg.inv(lattice_vectors)
+    m_axes = [xp.asarray(values, dtype=np.float64) for values in dense.ranges]
+    box = dense.keep.shape
+    for symbol in symbols:
+        members = [index for index, atom in enumerate(atoms) if atom.symbol == symbol]
+        table = weighted * xp.asarray(factors[symbol])  # v(|G|) P(G), zero outside the set
+        flat = table.reshape(box[0] * box[1], box[2])
+        step = max(1, 4_000_000 // (box[0] * box[1]))
+        for start in range(0, len(members), step):
+            chunk = members[start : start + step]
+            positions = np.array([np.asarray(atoms[index].position, dtype=np.float64) for index in chunk])
+            e_x, e_y, e_z = _axis_factors(dense, positions @ inverse, xp)
+            count = len(chunk)
+            first = (flat @ e_z).reshape(box[0], box[1], count)  # sum over mz
+            first_z = (flat @ (m_axes[2][:, None] * e_z)).reshape(box[0], box[1], count)  # with m_z in the sum
+            over_y = xp.einsum("xya,ya->xa", first, e_y)
+            over_y_weighted = xp.einsum("xya,ya->xa", first, m_axes[1][:, None] * e_y)
+            over_y_z = xp.einsum("xya,ya->xa", first_z, e_y)
+            sums = xp.stack(
+                [
+                    ((m_axes[0][:, None] * e_x) * over_y).sum(axis=0),
+                    (e_x * over_y_weighted).sum(axis=0),
+                    (e_x * over_y_z).sum(axis=0),
+                ],
+                axis=1,
+            )  # (atoms, 3): sum_G m_i v P exp(-i G.R)
+            imaginary = np.asarray(xp.asnumpy(sums.imag) if hasattr(xp, "asnumpy") else sums.imag, dtype=np.float64)
+            forces[chunk] = -scale * (imaginary @ dense.reciprocal)
+        del table, flat
     return forces
 
 
@@ -416,7 +683,9 @@ __all__ = [
     "fortran_qtable_size",
     "gspace_alpha_energy",
     "gspace_local_forces",
+    "gspace_local_forces_reference",
     "gspace_local_ionic_potential",
+    "gspace_local_ionic_potential_reference",
     "gspace_vectors",
     "local_form_factor",
     "periodic_alpha_energy",

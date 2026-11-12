@@ -480,7 +480,7 @@ def fortran_spline_local_forces(
         from parsec_python.V_ion.gspace_local import gspace_local_forces
 
         return LocalForceTerms(
-            ionic=gspace_local_forces(grid, atoms, potentials, specifications, lattice_vectors, density),
+            ionic=gspace_local_forces(grid, atoms, potentials, specifications, lattice_vectors, density, xp=xp),
             self_consistency=self_consistency_term(),
             core_correction=fast_core_correction_forces(
                 grid, atoms, potentials, specifications, lattice_vectors, xc_potential, xp=xp

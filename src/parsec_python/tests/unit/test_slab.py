@@ -7,7 +7,8 @@ local ionic potential against itself for two Gaussian widths.
 
 # With both sets of routines: the slab input of this module says Use_Fortran_Routines: .false. (Andrew Grieder's
 # slab; without the parameter a slab runs on the Fortran-derived routines).  The grids built here from
-# PeriodicGridSettings are his (fortran_routines=False, the settings' default).
+# PeriodicGridSettings are built with fortran_routines=False explicitly: the settings' default is the Fortran-derived
+# routines, whose slab grid is another one (Grid/confined.py).
 from __future__ import annotations
 
 from pathlib import Path
@@ -34,7 +35,8 @@ LATTICE = np.array([[8.0, 0.0, 0.0], [2.0, 7.0, 0.0], [0.0, 0.0, 30.0]])
 
 def _slab_grid(lattice=LATTICE, spacing=0.5, order=12):
     return build_periodic_grid(
-        PeriodicCell(lattice, dimensions=2), PeriodicGridSettings(spacing=spacing, expansion_order=order)
+        PeriodicCell(lattice, dimensions=2),
+        PeriodicGridSettings(spacing=spacing, expansion_order=order, fortran_routines=False),
     )
 
 
@@ -171,7 +173,8 @@ class SlabLocalPotentialTests(unittest.TestCase):
         potentials = load_pseudopotentials(specifications, xc_functional="ca")
         lattice = np.array([[6.0, 0.0, 0.0], [0.0, 6.0, 0.0], [0.0, 0.0, 14.0]])
         grid = build_periodic_grid(
-            PeriodicCell(lattice, dimensions=2), PeriodicGridSettings(spacing=0.35, expansion_order=8)
+            PeriodicCell(lattice, dimensions=2),
+            PeriodicGridSettings(spacing=0.35, expansion_order=8, fortran_routines=False),
         )
         laplacian = build_negative_laplacian(grid)
         atoms = [Atom("H", [1.2, 3.0, 0.4]), Atom("H", [4.1, 2.2, -0.9])]

@@ -574,9 +574,11 @@ class MovingCellOptionRouteTests(unittest.TestCase):
         self.assertEqual(features("Calc_Hartree_G: .true.\n"), [])
         # TS (and LDA+U, test_periodic_correction_forces.py) move on the accelerated path.
         self.assertEqual(features("Van_Der_Waals: .true.\nMinimization: bfgs\n"), [])
+        # Fortran's G-space local potential moves on the accelerated path too (its ionic force is gspace_local_forces,
+        # the other terms the ball sums of Forces/periodic_local.py::fortran_spline_local_forces)
+        self.assertEqual(features("Periodic_Local_Potential: g_space\nMinimization: bfgs\n"), [])
         for option in (
             "Calc_Hartree_G: .true.\n",
-            "Periodic_Local_Potential: g_space\n",
         ):
             with self.subTest(option=option):
                 routed = features(option + "Minimization: bfgs\n")

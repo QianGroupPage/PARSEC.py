@@ -785,6 +785,53 @@ def update_periodic_reference(system, atoms):
     return update_periodic_geometry(system, atoms)
 
 
+def _device_self_consistency(system, atoms, specifications, lattice, density, residual, xc):
+    """The self-consistency term of the local forces (Ry/bohr, with the volume element) from the CUDA kernel, or ``None``.
+
+    The kernel of :func:`.periodic_spline._device_density_terms` (the linear slopes of the valence tables over the balls
+    of their reach, the terms of the readable routine to round-off); ``None`` without a usable device or for a grid it
+    does not handle.
+    """
+
+    from .periodic_spline import _device_density_terms
+
+    found = _device_density_terms(
+        system.grid, atoms, system.pseudopotentials, specifications, lattice, (density, residual, xc), 1.0e-14
+    )
+    return None if found is None else found[0].self_consistency
+
+
+def _spline_species_local_forces(system, atoms, specifications, lattice, density, residual, xc, clock=None):
+    """The local terms of a cell with Fortran's G-space local potential and ``Cubic_Spline`` species, else ``None``.
+
+    The ionic term is :func:`parsec_python.V_ion.gspace_local.gspace_local_forces` (an FFT, on the device of the run) and
+    the core term the ball sums of :func:`.periodic_local.fast_core_correction_forces` (only a few species have a core
+    density, with short balls); the self-consistency term, most of the work, is the CUDA kernel
+    (:func:`_device_self_consistency`) where a device is usable, else the host ball sums.  The real-space local potential
+    of such species is differentiated by :mod:`.periodic_spline` (through the readable entry,
+    :func:`_local_force_provider`), whose ionic ball sums are cheap.
+    """
+
+    from .compute import _array_module
+    from .periodic_local import fortran_spline_local_forces, spline_species_takes
+
+    if getattr(system.grid.settings, "local_potential", "real_space") != "g_space":
+        return None
+    if not spline_species_takes(system.grid, lattice, specifications, atoms):
+        return None
+    xp, erf, device = _array_module(system)
+    started = perf_counter()
+    on_device = _device_self_consistency(system, atoms, specifications, lattice, density, residual, xc)
+    if clock is not None:
+        # the seconds of each local term, in the line of the phases of the force table
+        clock["local_selfcons"] = perf_counter() - started
+    arguments = (system.grid, atoms, system.pseudopotentials, specifications, lattice, density, residual, xc)
+    if device is None:
+        return fortran_spline_local_forces(*arguments, self_consistency=on_device, clock=clock)
+    with xp.cuda.Device(device):
+        return fortran_spline_local_forces(*arguments, xp=xp, erf=erf, self_consistency=on_device, clock=clock)
+
+
 def compute_device_periodic_forces(system, result, *, symmetrize: bool = True, operations=None):
     """Forces of a finished accelerated SCF loop of a periodic cell at Gamma.
 
@@ -829,9 +876,11 @@ def compute_device_periodic_forces(system, result, *, symmetrize: bool = True, o
     density, residual, xc = periodic_force_fields(system, result)
     # The readable entry: inside device_periodic_forces it differentiates the
     # device fields on the device, outside the fields of the readable builders.
-    local = periodic_local_forces(
-        system.grid, atoms, system.pseudopotentials, specifications, lattice, density, residual, xc
-    )
+    local = _spline_species_local_forces(system, atoms, specifications, lattice, density, residual, xc, clock)
+    if local is None:
+        local = periodic_local_forces(
+            system.grid, atoms, system.pseudopotentials, specifications, lattice, density, residual, xc
+        )
     clock["local"] = perf_counter() - mark
     mark = perf_counter()
     separable = _nonlocal_forces(system, result, clock)

@@ -74,7 +74,8 @@ def moving_cell_options_reference_only(translation) -> list[str]:
     are those of a bulk cell at the Gamma point on the readable or device
     fields of the real-space local potential, validated without these
     options (and with LDA+U and TS); the reference solver keeps the wire and
-    slab forces and the forces of a cell with ``Calc_Hartree_G`` or ``g_space``.
+    slab forces and the forces of a cell with ``Calc_Hartree_G``.  ``Periodic_Local_Potential: g_space`` moves on the
+    accelerated path too (its ionic force is :func:`~parsec_python.acceleration.Forces.periodic_local.gspace_local_forces`).
     ``Zero_Average_Vxc`` (the default of a 3-D cell since 2026-11-08) moves on the
     accelerated path: its forces read the shifted potentials of the result through
     the reference formula (:func:`parsec_python.Forces.periodic.periodic_force_fields`),
@@ -94,8 +95,9 @@ def moving_cell_options_reference_only(translation) -> list[str]:
         names.append("a wire or slab (Boundary_Conditions: wire or slab)")
     if getattr(problem.hartree, "periodic_g_space", False):
         names.append("Calc_Hartree_G")
-    if getattr(problem.grid, "local_potential", "real_space") != "real_space":
-        names.append("Periodic_Local_Potential: g_space")
+    # (Periodic_Local_Potential: g_space is not named: the accelerated forces take its ionic term from
+    # Forces.periodic.periodic_local_forces, whose G-space branch is gspace_local_forces; see
+    # Forces/periodic_local.py::fortran_spline_local_forces.  Zero_Average_Vxc is not named either, see above.)
     # LDA+U (J = 0) and TS of a bulk cell at Gamma move on the accelerated
     # path: the LDA+U term from the orbitals on the device with the gradients
     # of the cell images (Hamiltonian/hubbard_device.py), the TS forces of the

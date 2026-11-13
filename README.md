@@ -973,6 +973,9 @@ parameter `Use_Fortran_Routines` chooses:
 - `.false.`: Andrew Grieder's routines wherever his code accepts the input, his slab and his shifted mesh
   included (see "Irreducible k-points on the default routines" below);
 - `.true.`: the Fortran-derived routines.
+  The Gamma point given as a one-point k-point grid (`Kpoint_Method: mp`, `1 1 1`, or a list of one k = 0) is the
+  Gamma-point calculation of the accelerated path under both sets of routines (real orbitals, no k-point loop,
+  reported as such in parsec.out); with `.true.` it used to go to the reference k-point solver.
 
 ### Irreducible k-points on the default routines
 

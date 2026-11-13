@@ -154,6 +154,7 @@ DEFAULT_GLOBAL_KEYS = frozenset(
         "test_rng",
         "dynamic_diag_tol",
         "potential_extrapolation",
+        "md_output_interval",
         "initial_structure",
         "mlff_model",
         "mlff_task",

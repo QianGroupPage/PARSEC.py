@@ -16,6 +16,7 @@ force is removed before the integrator sees the forces.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import os
 from pathlib import Path
 import time
 from typing import Callable, Sequence
@@ -48,6 +49,11 @@ MD_MECH = "md_mech.dat"
 MD_RESTART = "mdinit.dat"
 ATOM_COR = "atom.cor"
 MOVIE = "movie.xyz"
+#: Opt-in, one frame per computed structure with the DFT energy and the raw DFT forces (see :func:`_dft_frame`).
+FRAMES = "md_frames.extxyz"
+FRAMES_ENVIRONMENT = "PARSEC_MD_FRAMES"
+_RY_EV = 13.605693122994
+_BOHR_ANGSTROM = 0.529177210903
 
 
 @dataclass(frozen=True)
@@ -137,14 +143,16 @@ class _Files:
         self.directory = None if directory is None else Path(directory)
         self.started: list[Path] = []
 
-    def append(self, records: MoldynRecords) -> None:
+    def append(self, records: MoldynRecords, *, structure: bool = True) -> None:
+        """Add the records of one step; with ``structure`` false only the line of ``md_nrg.dat`` (MD_Output_Interval)."""
+
         if self.directory is None:
             return
         for name, text in (
             (MD_NRG, records.md_nrg),
-            (MD_MECH, records.md_mech),
-            (ATOM_COR, records.atom_cor),
-            (MOVIE, records.movie_xyz),
+            (MD_MECH, records.md_mech if structure else ""),
+            (ATOM_COR, records.atom_cor if structure else ""),
+            (MOVIE, records.movie_xyz if structure else ""),
         ):
             path = self.directory / name
             if path not in self.started:
@@ -178,6 +186,35 @@ def _seeded_compiler(settings, random) -> str | None:
     if random is not None or settings.use_test_rng or settings.rng_seed <= 0:
         return None
     return "gfortran" if seeded_random_numbers() == "gfortran" else None
+
+
+def _dft_frame(system, elements, energy_ry: float, forces_ry_bohr, index: int) -> str | None:
+    """One extended-XYZ frame of a periodic structure: cell, positions, DFT energy and DFT forces.
+
+    ``md_mech.dat`` and ``movie.xyz`` do not hold what a fitted interatomic potential is trained on: ``md_mech.dat``
+    has the accelerations after the mean force is removed and, in a Langevin run, the friction and random force are
+    part of them, and no file has the energy of each structure at full precision.  The frame holds the unmodified
+    Hellmann-Feynman forces of the structure (eV/A, mean force kept), the total energy ``E`` of ``parsec.out``
+    (eV; internal energy, with no -TS term: zero for an insulator, see the notes of the run), the lattice and the
+    positions in A as the calculation holds them (wrapped into the cell when the move wrapped them), and the
+    stress is absent because this code does not compute it.  Returns ``None`` for an isolated system.
+    """
+
+    cell = getattr(getattr(system, "input", None), "periodic_cell", None)
+    if cell is None or getattr(cell, "dimensions", 3) != 3:
+        return None
+    lattice = np.asarray(cell.lattice_vectors, dtype=np.float64) * _BOHR_ANGSTROM
+    positions = np.array([atom.position for atom in system.atoms], dtype=np.float64) * _BOHR_ANGSTROM
+    forces = np.asarray(forces_ry_bohr, dtype=np.float64) * (_RY_EV / _BOHR_ANGSTROM)
+    lines = [
+        str(len(positions)),
+        'Lattice="' + " ".join(f"{x:.10f}" for x in lattice.reshape(-1)) + '" '
+        "Properties=species:S:1:pos:R:3:forces:R:3 "
+        f"energy={energy_ry * _RY_EV:.8f} pbc=\"T T T\" step={index}",
+    ]
+    for symbol, r, f in zip(elements, positions, forces):
+        lines.append(f"{symbol} " + " ".join(f"{x:.8f}" for x in r) + " " + " ".join(f"{x:.8f}" for x in f))
+    return "\n".join(lines) + "\n"
 
 
 def run_recorded_molecular_dynamics(
@@ -227,7 +264,14 @@ def run_recorded_molecular_dynamics(
     carried = None
     index = 0
     filter_restart = FilterRestart.from_eigensolver(translation.problem.eigensolver)
+    interval = max(int(getattr(translation, "md_output_interval", 1)), 1)
     while True:
+        # MD_Output_Interval: the structures, forces and the force table of parsec.out are written every `interval`
+        # steps and at the last; the levels and the other end-of-run blocks only at the last.  A single structure
+        # (Step_Num 0) is both.
+        last_structure = settings.step_num == 0 or state.move_count >= settings.step_num
+        output_structure = last_structure or state.move_count % interval == 0
+        reporter.frame_detail = "full" if last_structure else "forces" if output_structure else "brief"
         started = time.perf_counter()
         result = backend.run_scf(system, callback=reporter.iteration, warm_start=carried)
         elapsed = time.perf_counter() - started
@@ -236,6 +280,17 @@ def run_recorded_molecular_dynamics(
         energy = float(result.energies.total)
         outcome.system, outcome.result, outcome.forces = system, result, forces
         outcome.scf_failed = outcome.scf_failed or not result.converged
+        if output_structure and directory is not None and os.environ.get(FRAMES_ENVIRONMENT, "") not in ("", "0"):
+            frame = _dft_frame(
+                system,
+                [(e or "").strip() or sym for e, sym in zip(elements, species)],
+                energy,
+                forces.total,
+                index + (restart.frame if restart is not None else 0),
+            )
+            if frame is not None:
+                with open(Path(directory) / FRAMES, "a", encoding="utf-8", newline="\n") as handle:
+                    handle.write(frame)
         step = None
         if not result.converged and settings.step_num != 0:
             # PARSEC 1.5 (parsec.F90:2124-2137): no point in continuing the
@@ -256,7 +311,7 @@ def run_recorded_molecular_dynamics(
                 # (the centre of mass is not held; MolecularDynamics.moldyn).
                 **({"keep_center_of_mass": True} if getattr(forces, "net_force_kept", False) else {}),
             )
-            files.append(step_records(state, step, species))
+            files.append(step_records(state, step, species), structure=output_structure)
             write(
                 "\n".join(
                     [

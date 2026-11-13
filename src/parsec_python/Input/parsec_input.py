@@ -187,6 +187,9 @@ class ParsecInputTranslation:
     # density extrapolated along the trajectory
     # (:mod:`parsec_python.SCF.single_point`).
     potential_extrapolation: str = "none"
+    # ``MD_Output_Interval`` (PARSEC.py extension): md_mech.dat, atom.cor, movie.xyz, md_frames.extxyz and the force
+    # table of parsec.out are written every this many MD steps and at the last one; md_nrg.dat every step.
+    md_output_interval: int = 1
     # ``Initial_Structure: mlff``: the input structure is relaxed with a
     # machine-learned force field before the run (:mod:`parsec_python.MLFF`),
     # ``None`` when the run starts from the coordinates of the input.
@@ -2645,6 +2648,8 @@ def _parse_parsec_input(
         "dynamic_diag_tol",
         # PARSEC.py extension: the start of the SCF loop after a move.
         "potential_extrapolation",
+        # PARSEC.py extension: how often molecular dynamics writes its structures (see ParsecInputTranslation).
+        "md_output_interval",
         # PARSEC.py extension: the spin channels of the accelerated driver in
         # the symmetry sectors (SCFSettings.spin_symmetry_sectors).
         "spin_symmetry_sectors",
@@ -5057,6 +5062,14 @@ def _parse_parsec_input(
                 "Potential_Extrapolation is set, but no atom moves; it is ignored."
             )
 
+    md_output_interval = 1
+    if "md_output_interval" in scalar:
+        md_output_interval = _integer(one("md_output_interval"), label="MD_Output_Interval")
+        if md_output_interval < 1:
+            raise ParsecInputError("MD_Output_Interval must be at least 1")
+        if molecular_dynamics is None or not molecular_dynamics.enabled:
+            warnings.append("MD_Output_Interval is set, but this is not a molecular dynamics run; it is ignored.")
+
     mlff = None
     structure_source = _normalize_label(one("initial_structure", "input"))
     if structure_source not in {"input", "mlff"}:
@@ -5806,6 +5819,7 @@ def _parse_parsec_input(
         use_symmetry=use_symmetry,
         molecular_dynamics=molecular_dynamics if molecular_dynamics.enabled else None,
         potential_extrapolation=potential_extrapolation,
+        md_output_interval=md_output_interval,
         mlff=mlff,
         energy_refinement=energy_refinement,
         polarizability_field=electric_field if polarizability else None,

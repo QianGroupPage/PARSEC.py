@@ -454,3 +454,85 @@ class InputTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SeparableSumTests(unittest.TestCase):
+    """The structure factor and the force sum over G as matrix products (exp(-i G.R) is a product per lattice direction)
+    equal the plain sums over the G vectors to rounding, on every kind of grid, and survive moved atoms and a second call."""
+
+    def grids(self):
+        yield from _grids()
+        # a different number of points per axis (Fortran's grids always have an even number: no odd box)
+        box = PeriodicCell(lattice_vectors=np.diag([5.6, 6.6, 7.0]))
+        anisotropic = build_periodic_grid(
+            box, PeriodicGridSettings(fortran_routines=True, spacing=0.7, expansion_order=4, local_potential="g_space")
+        )
+        self.assertGreater(len(set(int(n) for n in anisotropic.points_per_axis)), 1)
+        yield "anisotropic", box, anisotropic
+
+    def test_potential_equals_the_plain_sum(self) -> None:
+        specifications, potentials = _silicon()
+        rng = np.random.default_rng(5)
+        for name, cell, grid in self.grids():
+            lattice = cell.lattice_vectors
+            for attempt in range(2):  # the second call reads the cached G set and form factors
+                atoms = tuple(
+                    Atom("Si", np.asarray(atom.position) + rng.normal(0.0, 0.3, 3)) for atom in _SI_ATOMS
+                ) + (Atom("Si", np.array([0.4, 1.1, 2.3])),)
+                with self.subTest(grid=name, call=attempt):
+                    new = G.gspace_local_ionic_potential(grid, atoms, potentials, specifications, lattice)
+                    old = G.gspace_local_ionic_potential_reference(grid, atoms, potentials, specifications, lattice)
+                    np.testing.assert_allclose(new, old, rtol=0.0, atol=1e-11 * max(1.0, float(np.abs(old).max())))
+
+    def test_forces_equal_the_plain_sum(self) -> None:
+        specifications, potentials = _silicon()
+        rng = np.random.default_rng(6)
+        for name, cell, grid in self.grids():
+            lattice = cell.lattice_vectors
+            density = 0.05 + 0.01 * rng.random(grid.size)
+            for attempt in range(2):
+                atoms = tuple(
+                    Atom("Si", np.asarray(atom.position) + rng.normal(0.0, 0.3, 3)) for atom in _SI_ATOMS
+                ) + (Atom("Si", np.array([0.4, 1.1, 2.3])),)
+                with self.subTest(grid=name, call=attempt):
+                    new = G.gspace_local_forces(grid, atoms, potentials, specifications, lattice, density)
+                    old = G.gspace_local_forces_reference(grid, atoms, potentials, specifications, lattice, density)
+                    np.testing.assert_allclose(new, old, rtol=0.0, atol=1e-12 * max(1.0, float(np.abs(old).max())))
+
+    def test_two_species_in_any_order(self) -> None:
+        # a second species with its own table and local channel; atoms interleaved, so that the groups are not contiguous
+        specifications = {
+            "Si": SpeciesPotential(DATA / "Si_POTRE.DAT", 2),
+            "H": SpeciesPotential(DATA / "H_CORE_POTRE.DAT", 0),
+        }
+        potentials = load_pseudopotentials(specifications)
+        name, cell, grid = next(iter(self.grids()))
+        lattice = cell.lattice_vectors
+        atoms = (
+            Atom("Si", np.array([0.3, 0.2, 0.1])),
+            Atom("H", np.array([2.0, 1.0, 3.0])),
+            Atom("Si", np.array([2.9, 2.6, 3.1])),
+            Atom("H", np.array([4.0, 0.5, 1.5])),
+        )
+        density = 0.05 + 0.01 * np.random.default_rng(7).random(grid.size)
+        new = G.gspace_local_forces(grid, atoms, potentials, specifications, lattice, density)
+        old = G.gspace_local_forces_reference(grid, atoms, potentials, specifications, lattice, density)
+        np.testing.assert_allclose(new, old, rtol=0.0, atol=1e-12)
+        np.testing.assert_allclose(
+            G.gspace_local_ionic_potential(grid, atoms, potentials, specifications, lattice),
+            G.gspace_local_ionic_potential_reference(grid, atoms, potentials, specifications, lattice),
+            rtol=0.0,
+            atol=1e-11,
+        )
+
+    def test_fold_matches_add_at_for_even_and_odd_counts(self) -> None:
+        rng = np.random.default_rng(8)
+        for count in (6, 7, 8, 1, 2):
+            half = count // 2
+            m = np.arange(-half, half + 1)
+            array = rng.normal(size=(2, m.size, 3)) + 1j * rng.normal(size=(2, m.size, 3))
+            expected = np.zeros((2, count, 3), dtype=complex)
+            for position, value in enumerate(m):
+                expected[:, value % count, :] += array[:, position, :]
+            with self.subTest(count=count):
+                np.testing.assert_allclose(G._fold_axis(array, 1, count, half), expected, rtol=0.0, atol=1e-14)

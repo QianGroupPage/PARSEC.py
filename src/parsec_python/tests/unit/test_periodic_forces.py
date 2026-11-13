@@ -14,6 +14,7 @@ Fortran comparison is in the report of the parity round.
 # here are those of the Fortran parity round.
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import unittest
@@ -542,6 +543,73 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(code, 0)
         lines = (self.directory / "md_nrg.dat").read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 4)
+
+    def test_molecular_dynamics_writes_levels_at_the_last_structure_only(self) -> None:
+        """MD writes the table of levels once, for the last structure; PARSEC_MD_EIGENVALUES=1 at every iteration."""
+        from unittest import mock
+
+        md = (
+            "Molecular_Dynamics: .true.\nStep_num: 1\nTinit: 300.0\nT_Final: 300.0\n"
+            "T_Step: 0.0\nTime_Step: 20.0\ntest_rng: .true.\n"
+        )
+        header = "   State   Eigenvalue [Ry]"
+        with mock.patch.dict(os.environ, {"PARSEC_MD_EIGENVALUES": ""}):
+            code, held = self.run_input(md)
+        self.assertEqual(code, 0)
+        self.assertEqual(held.count("Self-consistency convergence achieved."), 2)
+        self.assertGreater(held.count(" SCF iter # "), 2)
+        self.assertEqual(held.count(header), 1)
+        self.assertEqual(held.count(" Levels of the last SCF iteration:"), 1)
+        with mock.patch.dict(os.environ, {"PARSEC_MD_EIGENVALUES": "1"}):
+            code, every = self.run_input(md)
+        self.assertEqual(every.count(header), every.count(" SCF iter # "))
+        self.assertNotIn("Levels of the last SCF iteration", every)
+        # a single point is not affected
+        code, single = self.run_input("Skip_force: .false.\n")
+        self.assertEqual(single.count(header), single.count(" SCF iter # "))
+
+    def test_md_output_interval_thins_the_structures_and_the_force_tables(self) -> None:
+        md = (
+            "Molecular_Dynamics: .true.\nStep_num: 4\nTinit: 300.0\nT_Final: 300.0\n"
+            "T_Step: 0.0\nTime_Step: 20.0\ntest_rng: .true.\n"
+        )
+        table = "coordinates and tot. forces (after setting net force to zero)"
+        code, every = self.run_input(md)
+        self.assertEqual(code, 0)
+        blocks = lambda: (self.directory / "md_mech.dat").read_text(encoding="utf-8").count("Step #")
+        nrg = lambda: len((self.directory / "md_nrg.dat").read_text(encoding="utf-8").splitlines())
+        self.assertEqual(every.count(table), 5)
+        full_blocks, full_lines = blocks(), nrg()
+        code, thin = self.run_input(md + "MD_Output_Interval: 2\n")
+        self.assertEqual(code, 0)
+        # structures 0, 2 and 4 (the last) carry the force table; md_nrg.dat still has every step
+        self.assertEqual(thin.count(table), 3)
+        self.assertEqual(thin.count("Time for forces"), 5)
+        self.assertEqual(nrg(), full_lines)
+        self.assertLess(blocks(), full_blocks)
+        self.assertGreaterEqual(blocks(), 3)
+        self.assertEqual(thin.count(" Levels of the last SCF iteration:"), 1)
+
+    def test_use_fortran_routines_false_runs_andrews_routines(self) -> None:
+        from parsec_python.Input.parsec_input import parse_parsec_input
+
+        text = _CLI_INPUT.replace("Use_Fortran_Routines: .true.", "Use_Fortran_Routines: .false.")
+        self.assertIn("Use_Fortran_Routines: .false.", text)
+        path = self.directory / "parsec.in"
+        path.write_text(text, encoding="utf-8")
+        translation = parse_parsec_input(path)
+        self.assertFalse(translation.routines.fortran)
+        self.assertIs(translation.routines.requested, False)
+        # a keyword that only the Fortran-derived routines read still switches them on, with its reason
+        path.write_text(text + "Periodic_Local_Potential: g_space\n", encoding="utf-8")
+        translation = parse_parsec_input(path)
+        self.assertTrue(translation.routines.fortran)
+        # .true. is the Fortran-derived routines; unset is the choice of the default (Andrew Grieder's routines for
+        # an input they read, as on main)
+        path.write_text(text.replace("Use_Fortran_Routines: .false.\n", "Use_Fortran_Routines: .true.\n"), encoding="utf-8")
+        self.assertTrue(parse_parsec_input(path).routines.fortran)
+        path.write_text(text.replace("Use_Fortran_Routines: .false.\n", ""), encoding="utf-8")
+        self.assertIsNone(parse_parsec_input(path).routines.requested)
 
 
 class InputTests(unittest.TestCase):

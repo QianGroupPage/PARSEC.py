@@ -668,7 +668,7 @@ class PeriodicGridSettings:
     # the grid and every periodic term with the Fortran-derived routines of
     # the parity round, ``False`` (the
     # default) with Andrew Grieder's routines.
-    fortran_routines: bool = True
+    fortran_routines: bool = False
 
     def __repr__(self) -> str:
         # The wire/slab fields, the fractional translations and the local

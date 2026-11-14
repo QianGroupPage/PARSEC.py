@@ -97,6 +97,9 @@ class KleinmanBylanderChannel:
     coupling: float
     cutoff_radius: float
     values: np.ndarray
+    #: the radial derivative of ``values`` where it is known analytically (a Fourier-filtered channel);
+    #: ``None``: it is taken from the table by the stencil of ``radial_derivatives``
+    slopes: np.ndarray | None = None
 
 
 def _attributes(text: str) -> dict[str, str]:
@@ -302,6 +305,14 @@ class OncvPseudopotential(ParsecPseudopotential):
         for channel in self.kb_channels:
             if channel.angular_momentum == angular_momentum and channel.index == index:
                 return np.array(channel.values, dtype=float), channel.sign
+        raise ValueError(f"no projector index {index} for l={angular_momentum} in {self.source}")
+
+    def projector_slopes(self, angular_momentum: int, index: int = 0) -> np.ndarray | None:
+        """The stored radial derivative of a projector (set by the Fourier filter), or ``None``."""
+
+        for channel in self.kb_channels:
+            if channel.angular_momentum == angular_momentum and channel.index == index:
+                return None if channel.slopes is None else np.array(channel.slopes, dtype=float)
         raise ValueError(f"no projector index {index} for l={angular_momentum} in {self.source}")
 
     def projector_count(self, angular_momentum: int) -> int:

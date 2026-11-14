@@ -265,21 +265,34 @@ def apply_fourier_filter(
         changes["filtered_valence_density"] = filtered_function(
             radii, transform, 0, spacing, alpha, beta1
         )
-        projectors: dict[int, np.ndarray] = {}
-        slopes: dict[int, np.ndarray] = {}
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            if angular_momentum == local_l:
-                continue
-            table, _ = potential.radial_projector(angular_momentum, local_l)
-            transform = fourier_transform(potential, table, angular_momentum, count)
-            projectors[angular_momentum] = filtered_function(
-                radii, transform, angular_momentum, spacing, alpha, beta1
-            )
-            slopes[angular_momentum] = filtered_derivative(
-                radii, transform, angular_momentum, spacing, alpha, beta1
-            )
-        changes["filtered_projectors"] = projectors
-        changes["filtered_projector_slopes"] = slopes
+        if getattr(potential, "projectors_are_tabulated", False):
+            # a potential given as projectors (UPF): every projector, several for one l, is filtered on its own and
+            # replaced in the channel, together with its analytic derivative
+            channels = []
+            for channel in potential.kb_channels:
+                transform = fourier_transform(potential, channel.values, channel.angular_momentum, count)
+                channels.append(
+                    replace(
+                        channel,
+                        values=filtered_function(radii, transform, channel.angular_momentum, spacing, alpha, beta1),
+                        slopes=filtered_derivative(radii, transform, channel.angular_momentum, spacing, alpha, beta1),
+                    )
+                )
+            changes["kb_channels"] = tuple(channels)
+        else:
+            projectors: dict[int, np.ndarray] = {}
+            slopes: dict[int, np.ndarray] = {}
+            for angular_momentum, _ in potential.nonlocal_channels(local_l):
+                table, _ = potential.radial_projector(angular_momentum, local_l)
+                transform = fourier_transform(potential, table, angular_momentum, count)
+                projectors[angular_momentum] = filtered_function(
+                    radii, transform, angular_momentum, spacing, alpha, beta1
+                )
+                slopes[angular_momentum] = filtered_derivative(
+                    radii, transform, angular_momentum, spacing, alpha, beta1
+                )
+            changes["filtered_projectors"] = projectors
+            changes["filtered_projector_slopes"] = slopes
     if core > 0.0 and potential.has_nonlinear_core_correction:
         transform = fourier_transform(potential, potential.core_density, 0, count)
         changes["core_density"] = filtered_function(

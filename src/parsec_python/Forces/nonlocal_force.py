@@ -196,7 +196,7 @@ def build_nonlocal_projector_gradients(
     labels: list[tuple[int, int, int]] = []
     column = 0
     sqrt_dv = np.sqrt(grid.volume_element)
-    tables: dict[tuple[str, int], tuple] = {}
+    tables: dict[tuple[str, int, int], tuple] = {}
 
     for atom_index, atom in enumerate(atoms):
         potential = potentials[atom.symbol]
@@ -215,14 +215,12 @@ def build_nonlocal_projector_gradients(
         inverse = 1.0 / clamped
         unit = relative * inverse[:, None]
 
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            if angular_momentum == local_l:
-                continue
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
             # The radial tables belong to the species, not to the atom.
-            key = (atom.symbol, angular_momentum)
+            key = (atom.symbol, angular_momentum, projector_index)
             if key not in tables:
                 radial_grid, radial_slope, sign = radial_projector_with_derivative(
-                    potential, angular_momentum, local_l
+                    potential, angular_momentum, local_l, projector_index
                 )
                 spline = (
                     ParsecRadialSpline.from_positive_grid(
@@ -245,7 +243,7 @@ def build_nonlocal_projector_gradients(
             )
             for harmonic_index in range(2 * angular_momentum + 1):
                 signs.append(sign)
-                labels.append((atom_index, angular_momentum, harmonic_index))
+                labels.append((atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index))
                 gradient = sqrt_dv * (
                     radial[:, None] * harmonic_gradients[:, harmonic_index, :]
                     + (slope * harmonics[:, harmonic_index])[:, None] * unit
@@ -301,7 +299,7 @@ def double_grid_projector_gradients(
     labels: list[tuple[int, int, int]] = []
     column = 0
     sqrt_dv = np.sqrt(grid.volume_element)
-    tables: dict[tuple[str, int], tuple] = {}
+    tables: dict[tuple[str, int, int], tuple] = {}
 
     for atom_index, atom in enumerate(atoms):
         potential = potentials[atom.symbol]
@@ -320,13 +318,11 @@ def double_grid_projector_gradients(
         inverse = 1.0 / clamped
         unit = relative * inverse[:, None]
 
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            if angular_momentum == local_l:
-                continue
-            key = (atom.symbol, angular_momentum)
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
+            key = (atom.symbol, angular_momentum, projector_index)
             if key not in tables:
                 radial_grid, radial_slope, sign = radial_projector_with_derivative(
-                    potential, angular_momentum, local_l
+                    potential, angular_momentum, local_l, projector_index
                 )
                 spline = (
                     ParsecRadialSpline.from_positive_grid(
@@ -348,7 +344,7 @@ def double_grid_projector_gradients(
             )
             for harmonic_index in range(2 * angular_momentum + 1):
                 signs.append(sign)
-                labels.append((atom_index, angular_momentum, harmonic_index))
+                labels.append((atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index))
                 gradient = sqrt_dv * (
                     radial[:, None] * harmonic_gradients[:, harmonic_index, :]
                     + (slope * harmonics[:, harmonic_index])[:, None] * unit
@@ -426,7 +422,7 @@ def build_periodic_projector_gradients(
     labels: list[tuple[int, int, int]] = []
     column = 0
     sqrt_dv = np.sqrt(grid.volume_element)
-    tables: dict[tuple[str, int], tuple] = {}
+    tables: dict[tuple[str, int, int], tuple] = {}
 
     for atom_index, atom in enumerate(atoms):
         potential = potentials[atom.symbol]
@@ -451,13 +447,11 @@ def build_periodic_projector_gradients(
         if not images:
             continue
 
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            if angular_momentum == local_l:
-                continue
-            key = (atom.symbol, angular_momentum)
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
+            key = (atom.symbol, angular_momentum, projector_index)
             if key not in tables:
                 radial_grid, radial_slope, sign = radial_projector_with_derivative(
-                    potential, angular_momentum, local_l
+                    potential, angular_momentum, local_l, projector_index
                 )
                 spline = (
                     ParsecRadialSpline.from_positive_grid(
@@ -472,7 +466,7 @@ def build_periodic_projector_gradients(
             column += len(channel_columns)
             for harmonic_index in range(len(channel_columns)):
                 signs.append(sign)
-                labels.append((atom_index, angular_momentum, harmonic_index))
+                labels.append((atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index))
 
             for support_rows, unit, clamped, inverse, phase in images:
                 if spline is not None:

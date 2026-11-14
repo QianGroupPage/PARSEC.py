@@ -188,10 +188,8 @@ def build_double_grid_projectors(
         if not images:
             continue
 
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            if angular_momentum == local_l:
-                continue
-            table, sign = potential.radial_projector(angular_momentum, local_l)
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
+            table, sign = potential.radial_projector(angular_momentum, local_l, projector_index)
             spline = (
                 ParsecRadialSpline.from_positive_grid(
                     potential.radii, table, grid.settings.stencil_half_width
@@ -204,7 +202,7 @@ def build_double_grid_projectors(
             column += width
             for harmonic_index in range(width):
                 signs.append(sign)
-                labels.append((atom_index, angular_momentum, harmonic_index))
+                labels.append((atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index))
             for support, phase in images:
                 points, fine = support.radius.shape
                 radial = interpolate_projector(

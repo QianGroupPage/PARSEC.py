@@ -226,11 +226,9 @@ def wire_slab_projector_gradients(
             images.append((rows_here, relative[support], clamped, phase))
         if not images:
             continue
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            if angular_momentum == local_l:
-                continue
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
             radial_grid, radial_slope, sign = radial_projector_with_derivative(
-                potential, angular_momentum, local_l
+                potential, angular_momentum, local_l, projector_index
             )
             spline = (
                 ParsecRadialSpline.from_positive_grid(
@@ -243,7 +241,7 @@ def wire_slab_projector_gradients(
             column += len(channel)
             for harmonic_index in range(len(channel)):
                 signs.append(sign)
-                labels.append((atom_index, angular_momentum, harmonic_index))
+                labels.append((atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index))
             for rows_here, relative, clamped, phase in images:
                 inverse = 1.0 / clamped
                 unit = relative * inverse[:, None]

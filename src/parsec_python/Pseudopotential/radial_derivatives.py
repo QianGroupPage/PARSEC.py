@@ -186,6 +186,10 @@ def radial_projector_with_derivative(
         # a potential given as projectors (a UPF file): the table is the projector and its derivative is that of
         # the table, by the same stencil that differentiates the projectors of a Martins file
         projector, sign = potential.radial_projector(angular_momentum, local_l, index)
+        stored = potential.projector_slopes(angular_momentum, index)
+        if stored is not None:
+            # a Fourier-filtered channel: dfint of fourier_f.f90, as for the filtered channels of a Martins file
+            return projector, stored, sign
         constant_through = 2 * DERIVATIVE_HALF_WIDTH - 2
         derivative = log_grid_derivative(potential, projector, first=constant_through)
         if derivative.size > constant_through:

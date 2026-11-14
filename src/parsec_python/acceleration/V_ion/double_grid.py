@@ -134,21 +134,21 @@ def _channel_tables(atoms, potentials, specifications, grid, *, slopes: bool) ->
         radial_projector_with_derivative,
     )
 
-    tables: dict[tuple[str, int], tuple] = {}
+    tables: dict[tuple[str, int, int], tuple] = {}
     for atom in atoms:
         potential = potentials[atom.symbol]
         specification = specifications[atom.symbol]
         local_l = specification.local_angular_momentum
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            key = (atom.symbol, angular_momentum)
-            if angular_momentum == local_l or key in tables:
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
+            key = (atom.symbol, angular_momentum, projector_index)
+            if key in tables:
                 continue
             if slopes:
                 table, slope_table, sign = radial_projector_with_derivative(
-                    potential, angular_momentum, local_l
+                    potential, angular_momentum, local_l, projector_index
                 )
             else:
-                table, sign = potential.radial_projector(angular_momentum, local_l)
+                table, sign = potential.radial_projector(angular_momentum, local_l, projector_index)
                 slope_table = None
             tables[key] = (
                 table,
@@ -207,10 +207,8 @@ def build_double_grid_projectors(
         flat_radius = support.radius.reshape(-1)
         flat_relative = support.relative.reshape(-1, 3)
         columns = []
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            if angular_momentum == local_l:
-                continue
-            table, _slopes, sign, spline = tables[(atom.symbol, angular_momentum)]
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
+            table, _slopes, sign, spline = tables[(atom.symbol, angular_momentum, projector_index)]
             width = 2 * angular_momentum + 1
             radial = interpolate_projector(potential, table, flat_radius, spline)
             harmonics = real_spherical_harmonics(angular_momentum, flat_relative)
@@ -226,7 +224,7 @@ def build_double_grid_projectors(
                         support.rows[keep],
                         projector[keep],
                         sign,
-                        (atom_index, angular_momentum, harmonic_index),
+                        (atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index),
                     )
                 )
         return columns
@@ -295,10 +293,8 @@ def build_double_grid_projector_gradients(
         inverse = 1.0 / clamped
         unit = relative * inverse[:, None]
         columns = []
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            if angular_momentum == local_l:
-                continue
-            table, slope_table, sign, spline = tables[(atom.symbol, angular_momentum)]
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
+            table, slope_table, sign, spline = tables[(atom.symbol, angular_momentum, projector_index)]
             if spline is not None:
                 radial = spline(clamped)
                 slope = spline_derivative(spline, clamped)
@@ -321,7 +317,7 @@ def build_double_grid_projector_gradients(
                         support.rows,
                         summed,
                         sign,
-                        (atom_index, angular_momentum, harmonic_index),
+                        (atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index),
                     )
                 )
         return columns

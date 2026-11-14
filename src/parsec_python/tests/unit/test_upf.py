@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -183,6 +184,22 @@ class SyntheticUpfTests(unittest.TestCase):
         self.assertEqual(potential.projector_count(0), 2)
         self.assertEqual(potential.nonlocal_channels(LOCAL_CHANNEL), [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0)])
 
+    def test_the_local_potential_tail_is_exactly_coulomb_from_an_onset(self) -> None:
+        """The file prints its tail to a few digits; the table is -2Z/r exactly from the radius after which it is so."""
+
+        from parsec_python.acceleration.V_ion.periodic_device import coulomb_radius
+        from parsec_python.V_ion.ionic_potential import warn_spline_without_coulomb_tail
+
+        potential = read_upf_pseudopotential(self.path)
+        r = potential.radii
+        weighted = r * potential.channel_potentials[LOCAL_CHANNEL]
+        onset = coulomb_radius(potential, LOCAL_CHANNEL)
+        self.assertLess(onset, 0.8 * r[-1])
+        np.testing.assert_allclose(weighted[r >= onset], -2.0 * _Z, rtol=0, atol=1e-12)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            warn_spline_without_coulomb_tail(potential, LOCAL_CHANNEL, float(potential.interpolation_cutoff))
+
     def test_radial_projector_returns_table_and_sign_by_index(self) -> None:
         potential = read_upf_pseudopotential(self.path)
         table, sign = potential.radial_projector(0, LOCAL_CHANNEL, 1)
@@ -237,6 +254,11 @@ class PseudoDojoTests(unittest.TestCase):
                 # the tail of the file is the Coulomb one to its printed precision
                 self.assertAlmostEqual(upf.mesh[-1] * upf.local_potential[-1], -2.0 * charge, places=4)
                 self.assertEqual({l: potential.projector_count(l) for l in counts}, counts)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    from parsec_python.V_ion.ionic_potential import warn_spline_without_coulomb_tail
+
+                    warn_spline_without_coulomb_tail(potential, LOCAL_CHANNEL, float(potential.interpolation_cutoff))
                 self.assertEqual(potential.has_nonlinear_core_correction, has_core)
                 # the files come with a diagonal D, so no rotation: each projector keeps its own d
                 self.assertLess(np.max(np.abs(upf.dij - np.diag(np.diag(upf.dij)))), 1.0e-10)

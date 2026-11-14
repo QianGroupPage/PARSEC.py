@@ -320,15 +320,28 @@ class OncvPseudopotential(ParsecPseudopotential):
 
 
 def to_parsec_pseudopotential(
-    upf: UpfPseudopotential, *, offset: float = 1.0e-3, step: float = 6.0e-3
+    upf: UpfPseudopotential, *, offset: float = 1.0e-3, step: float = 6.0e-3, coulomb_tolerance: float = 1.0e-5
 ) -> OncvPseudopotential:
-    """Resample a UPF potential onto a PARSEC logarithmic grid (cubic splines of the tables of the file)."""
+    """Resample a UPF potential onto a PARSEC logarithmic grid (cubic splines of the tables of the file).
+
+    ``coulomb_tolerance`` (Ry bohr): the local potential is set to ``-2 Z/r`` from the radius after which ``r V`` stays
+    within it of ``-2 Z`` (the files print the tail to 6 to 7 digits).
+    """
 
     radii, a, b = parsec_logarithmic_grid(float(upf.mesh[-1]), offset=offset, step=step)
     local = _resample(upf.mesh, upf.local_potential, radii)
     # beyond the last mesh point the file ends in the Coulomb tail
     outside = radii > upf.mesh[-1]
     local[outside] = -2.0 * upf.z_valence / radii[outside]
+    # Inside the mesh the file reaches the Coulomb tail only to the digits it prints (r V = -2Z + 3e-6 at the end of
+    # the PseudoDojo oxygen).  From the radius after which r V stays within `coulomb_tolerance` of -2Z the table is
+    # set to -2Z/r exactly: the periodic sums then find the Coulomb onset instead of summing the images out to the
+    # end of the table, where the cubic spline of the table adds its own error (Cubic_Spline).
+    two_z = 2.0 * upf.z_valence
+    deviating = np.flatnonzero(np.abs(radii * local + two_z) > coulomb_tolerance)
+    first_exact = 0 if deviating.size == 0 else int(deviating[-1]) + 1
+    if first_exact < radii.size:
+        local[first_exact:] = -two_z / radii[first_exact:]
 
     channels = tuple(
         KleinmanBylanderChannel(

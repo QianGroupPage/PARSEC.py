@@ -583,7 +583,7 @@ def complete_input_text(
             "Pseudopot_File  "
             + _path_text(species.path, translation.source.parent, f"Pseudopot_File of {symbol}", unreadable),
         ]
-        if pseudo_format != "martins_wang":
+        if pseudo_format not in ("martins_wang", "upf"):
             lines.append(f"Local_Component  {_LOCAL_LABELS[int(species.local_angular_momentum)]}")
         if pseudo_format in ("martins_old", "fhipp"):
             lines.append(f"Potential_Num  {int(species.number_of_channels)}")

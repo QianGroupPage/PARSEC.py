@@ -165,7 +165,7 @@ def valence_density_table(
 
 
 def radial_projector_with_derivative(
-    potential: ParsecPseudopotential, angular_momentum: int, local_l: int
+    potential: ParsecPseudopotential, angular_momentum: int, local_l: int, index: int = 0
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Normalized KB radial projector, its radial derivative and its sign.
 
@@ -182,6 +182,17 @@ def radial_projector_with_derivative(
     slope as well, a bug 1.5 fixed).
     """
 
+    if getattr(potential, "projectors_are_tabulated", False):
+        # a potential given as projectors (a UPF file): the table is the projector and its derivative is that of
+        # the table, by the same stencil that differentiates the projectors of a Martins file
+        projector, sign = potential.radial_projector(angular_momentum, local_l, index)
+        constant_through = 2 * DERIVATIVE_HALF_WIDTH - 2
+        derivative = log_grid_derivative(potential, projector, first=constant_through)
+        if derivative.size > constant_through:
+            derivative[:constant_through] = derivative[constant_through]
+        return projector, derivative, sign
+    if index != 0:
+        raise ValueError(f"a semilocal potential has one projector per angular momentum (index {index} requested)")
     if angular_momentum in potential.filtered_projectors:
         projector, sign = potential.radial_projector(angular_momentum, local_l)
         slopes = potential.filtered_projector_slopes

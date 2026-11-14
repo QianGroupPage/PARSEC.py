@@ -639,12 +639,10 @@ def build_periodic_projector_gradients(
                 images.append((support_rows, relative, radius, phase))
         if not images:
             continue
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            if angular_momentum == local_l:
-                continue
-            radial_grid, sign = potential.radial_projector(angular_momentum, local_l)
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
+            radial_grid, sign = potential.radial_projector(angular_momentum, local_l, projector_index)
             slope_table = (
-                radial_projector_with_derivative(potential, angular_momentum, local_l)[1]
+                radial_projector_with_derivative(potential, angular_momentum, local_l, projector_index)[1]
                 if tabulated
                 else None
             )
@@ -659,7 +657,7 @@ def build_periodic_projector_gradients(
             column += len(channel_columns)
             for harmonic_index in range(len(channel_columns)):
                 signs.append(sign)
-                labels.append((atom_index, angular_momentum, harmonic_index))
+                labels.append((atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index))
             for support_rows, relative, radius, phase in images:
                 if tabulated:
                     # nonloc.F90: rnorm = max(|d|, rs(2)) in w, w' and d/|d|.
@@ -783,12 +781,10 @@ def _double_grid_periodic_gradients(
                 images.append((support, phase))
         if not images:
             continue
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            if angular_momentum == local_l:
-                continue
-            radial_grid, sign = potential.radial_projector(angular_momentum, local_l)
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
+            radial_grid, sign = potential.radial_projector(angular_momentum, local_l, projector_index)
             slope_table = (
-                radial_projector_with_derivative(potential, angular_momentum, local_l)[1]
+                radial_projector_with_derivative(potential, angular_momentum, local_l, projector_index)[1]
                 if tabulated
                 else None
             )
@@ -804,7 +800,7 @@ def _double_grid_periodic_gradients(
             column += width
             for harmonic_index in range(width):
                 signs.append(sign)
-                labels.append((atom_index, angular_momentum, harmonic_index))
+                labels.append((atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index))
             for support, phase in images:
                 points, fine = support.radius.shape
                 radius = support.radius.reshape(-1)

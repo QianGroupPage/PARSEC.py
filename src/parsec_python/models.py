@@ -320,7 +320,11 @@ class SpeciesPotential:
 
     def __post_init__(self) -> None:
         local_l = int(self.local_angular_momentum)
-        if local_l != self.local_angular_momentum or not 0 <= local_l <= 3:
+        if str(self.pseudopotential_format).strip().lower() == "upf":
+            # a UPF file holds a local potential of its own, which belongs to no angular momentum
+            if local_l != self.local_angular_momentum or local_l != -1:
+                raise ValueError("a upf pseudopotential has a local potential of its own: local angular momentum -1")
+        elif local_l != self.local_angular_momentum or not 0 <= local_l <= 3:
             raise ValueError("local angular momentum must be 0 (s) through 3 (f)")
         self._check_format_input(local_l)
         element = self.element_symbol
@@ -378,10 +382,10 @@ class SpeciesPotential:
         """Validate what the input adds to a pseudopotential file."""
 
         pseudo_format = str(self.pseudopotential_format).strip().lower()
-        if pseudo_format not in {"martins_new", "martins_old", "martins_wang", "fhipp"}:
+        if pseudo_format not in {"martins_new", "martins_old", "martins_wang", "fhipp", "upf"}:
             raise ValueError(
                 "pseudopotential_format must be 'martins_new', 'martins_old', "
-                "'martins_wang' or 'fhipp'"
+                "'martins_wang', 'fhipp' or 'upf'"
             )
         object.__setattr__(self, "pseudopotential_format", pseudo_format)
         if self.nonlinear_core_correction and pseudo_format != "fhipp":
@@ -394,6 +398,12 @@ class SpeciesPotential:
             self.electrons_per_orbital,
             self.core_cutoff_radius,
         )
+        if pseudo_format == "upf":
+            if any(value is not None for value in given):
+                raise ValueError(
+                    "a upf pseudopotential takes its channels, occupations and projector radius from its file"
+                )
+            return
         if pseudo_format == "martins_new":
             if any(value is not None for value in given):
                 raise ValueError(

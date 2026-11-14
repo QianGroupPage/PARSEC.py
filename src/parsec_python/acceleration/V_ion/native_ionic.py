@@ -283,12 +283,10 @@ class NativeIonicBuilders:
                 evaluator = native_backend._load_native().RadialGridEvaluator(
                     _values64(grid.coordinates[box_rows])
                 )
-            for angular_momentum in sorted(potential.radial_wavefunctions):
-                if angular_momentum == local_l:
-                    continue
-                key = (atom.symbol, angular_momentum)
+            for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
+                key = (atom.symbol, angular_momentum, projector_index)
                 if key not in tables:
-                    radial, denominator_sign = potential.radial_projector(angular_momentum, local_l)
+                    radial, denominator_sign = potential.radial_projector(angular_momentum, local_l, projector_index)
                     radial = _values64(radial)
                     tables[key] = (radial, denominator_sign, _spline_payload(
                         potential, radial, grid, specification.use_spline
@@ -316,7 +314,7 @@ class NativeIonicBuilders:
                     values.append(projector[keep])
                     signs.append(denominator_sign)
                     labels.append(
-                        (atom_index, angular_momentum, harmonic_index)
+                        (atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index)
                     )
                     column += 1
 

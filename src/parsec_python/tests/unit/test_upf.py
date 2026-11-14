@@ -38,10 +38,10 @@ _BETA_L = (0, 0, 1, 1, 2)
 
 def _beta(index: int, l: int) -> np.ndarray:
     r = _MESH
-    width = 0.7 + 0.15 * (index % 2)
-    values = r ** (l + 1) * np.exp(-((r / width) ** 2)) * (1.0 + 0.3 * index)
-    values[r > 2.0] = 0.0
-    return values
+    width = 1.1 + 0.2 * (index % 2)
+    # a smooth taper to zero at the cutoff radius 2.6: a jump there would make the energy non-smooth in the position
+    taper = np.where(r < 2.6, (1.0 - (r / 2.6) ** 2) ** 3, 0.0)
+    return r ** (l + 1) * np.exp(-((r / width) ** 2)) * (1.0 + 0.3 * index) * taper
 
 
 def _rows(values: np.ndarray) -> str:
@@ -52,22 +52,22 @@ def _local() -> np.ndarray:
     from scipy.special import erf
 
     r = np.where(_MESH > 0, _MESH, 1.0)
-    return np.where(_MESH > 0, -2.0 * _Z * erf(r / 0.8) / r, -2.0 * _Z * 2.0 / (0.8 * np.sqrt(np.pi)))
+    return np.where(_MESH > 0, -2.0 * _Z * erf(r / 1.6) / r, -2.0 * _Z * 2.0 / (1.6 * np.sqrt(np.pi)))
 
 
 def _density() -> np.ndarray:
     r = _MESH
-    shape = np.exp(-((r / 1.1) ** 2))
+    shape = np.exp(-((r / 1.5) ** 2))
     rho = shape / np.trapezoid(4.0 * np.pi * r**2 * shape, r) * _Z
     return 4.0 * np.pi * r**2 * rho
 
 
-def _upf_text(*, spin_orbit: bool = False, core: bool = True, dij: np.ndarray = _DIJ) -> str:
+def _upf_text(*, spin_orbit: bool = False, core: bool = True, dij: np.ndarray = _DIJ, element: str = "Xx") -> str:
     size = _MESH.size
     parts = [
         '<UPF version="2.0.1">',
         "<PP_INFO>\nsynthetic\n</PP_INFO>",
-        f'<PP_HEADER element="Xx" pseudo_type="NC" relativistic="scalar" has_so="{"T" if spin_orbit else "F"}" '
+        f'<PP_HEADER element="{element}" pseudo_type="NC" relativistic="scalar" has_so="{"T" if spin_orbit else "F"}" '
         f'core_correction="{"T" if core else "F"}" functional="PBE" z_valence="{_Z:.2f}" mesh_size="{size}" '
         'number_of_wfc="2" number_of_proj="5" />',
         f'<PP_MESH>\n<PP_R type="real" size="{size}" columns="4">\n{_rows(_MESH)}\n</PP_R>\n</PP_MESH>',
@@ -77,7 +77,7 @@ def _upf_text(*, spin_orbit: bool = False, core: bool = True, dij: np.ndarray = 
     for index, l in enumerate(_BETA_L, start=1):
         parts.append(
             f'<PP_BETA.{index} type="real" size="{size}" columns="4" index="{index}" angular_momentum="{l}" '
-            f'cutoff_radius_index="200" cutoff_radius="2.0">\n{_rows(_beta(index - 1, l))}\n</PP_BETA.{index}>'
+            f'cutoff_radius_index="200" cutoff_radius="2.6">\n{_rows(_beta(index - 1, l))}\n</PP_BETA.{index}>'
         )
     parts.append(f'<PP_DIJ type="real" size="25" columns="4">\n{_rows(dij.reshape(-1))}\n</PP_DIJ>')
     parts.append("</PP_NONLOCAL>")
@@ -90,7 +90,7 @@ def _upf_text(*, spin_orbit: bool = False, core: bool = True, dij: np.ndarray = 
         )
     parts.append("</PP_PSWFC>")
     if core:
-        core_density = 0.4 * np.exp(-((_MESH / 0.6) ** 2))
+        core_density = 0.4 * np.exp(-((_MESH / 1.0) ** 2))
         parts.append(f'<PP_NLCC type="real" size="{size}" columns="4">\n{_rows(core_density)}\n</PP_NLCC>')
     parts.append(f'<PP_RHOATOM type="real" size="{size}" columns="4">\n{_rows(_density())}\n</PP_RHOATOM>')
     if spin_orbit:
@@ -170,8 +170,8 @@ class SyntheticUpfTests(unittest.TestCase):
         self.assertEqual(sorted(potential.channel_potentials), [LOCAL_CHANNEL])
         self.assertAlmostEqual(4.0 * np.pi * np.trapezoid(r**2 * potential.valence_density, r), _Z, places=4)
         self.assertTrue(potential.has_nonlinear_core_correction)
-        # the Coulomb tail beyond the range of the error function
-        np.testing.assert_allclose(r[r > 6.0] * potential.channel_potentials[LOCAL_CHANNEL][r > 6.0], -2.0 * _Z, rtol=1e-9)
+        # the Coulomb tail beyond the range of the error function (erf(9/1.6) = 1 to 1e-15)
+        np.testing.assert_allclose(r[r > 9.0] * potential.channel_potentials[LOCAL_CHANNEL][r > 9.0], -2.0 * _Z, rtol=1e-9)
         # values of the file's tables on the new grid
         reference = np.interp(r[(r > 0.05) & (r < 5.0)], _MESH, _local())
         np.testing.assert_allclose(

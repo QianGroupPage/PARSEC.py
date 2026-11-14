@@ -264,8 +264,21 @@ class ParsecPseudopotential:
             result[inside] = np.interp(sample, self.radii, values, left=values[0])
         return result
 
-    def radial_projector(self, angular_momentum: int, local_l: int) -> tuple[np.ndarray, float]:
+    def nonlocal_channels(self, local_l: int) -> list[tuple[int, int]]:
+        """``(l, index)`` of every separable projector of the nonlocal operator.
+
+        A semilocal potential (every Martins/FHI/Wang file) has one Kleinman-Bylander projector per angular
+        momentum with a pseudo-wavefunction, except the local one, so ``index`` is 0.  A potential that is given as
+        projectors (:class:`~parsec_python.Pseudopotential.upf.OncvPseudopotential`) can have several per ``l``.
+        Every builder of projectors loops over this list and passes ``index`` to :meth:`radial_projector`.
+        """
+
+        return [(angular_momentum, 0) for angular_momentum in sorted(self.radial_wavefunctions) if angular_momentum != local_l]
+
+    def radial_projector(self, angular_momentum: int, local_l: int, index: int = 0) -> tuple[np.ndarray, float]:
         """Return PARSEC's normalized KB radial projector and denominator sign.
+
+        ``index`` selects among several projectors of one ``l``; a semilocal potential has only index 0.
 
         The unnormalized projector is
         ``(V_l - V_local) * u_l / r``.  PARSEC divides it by
@@ -273,6 +286,8 @@ class ParsecPseudopotential:
         denominator sign separately.
         """
         self.validate_local_channel(local_l)
+        if index != 0:
+            raise ValueError(f"a semilocal potential has one projector per angular momentum (index {index} requested)")
         if angular_momentum == local_l:
             raise ValueError("the selected local channel has no KB projector")
         if angular_momentum not in self.radial_wavefunctions:

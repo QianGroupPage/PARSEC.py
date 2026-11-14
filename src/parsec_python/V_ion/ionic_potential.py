@@ -163,7 +163,12 @@ def load_pseudopotentials(
             result[symbol] = potential
             continue
         # Files are loaded once per species, not once per atom.
-        potential = read_parsec_pseudopotential(specification.path)
+        if specification.pseudopotential_format == "upf":
+            from ..Pseudopotential.upf import read_upf_pseudopotential
+
+            potential = read_upf_pseudopotential(specification.path)
+        else:
+            potential = read_parsec_pseudopotential(specification.path)
         if potential.symbol.lower() != physical_element.lower():
             raise ValueError(
                 f"species {symbol!r} represents element {physical_element!r}, but "
@@ -1253,7 +1258,7 @@ def build_nonlocal_projectors(
         else None
     )
     # one radial table (and spline) per species and channel, shared by its atoms and their images
-    channels: dict[tuple[str, int], tuple[np.ndarray, float, ParsecRadialSpline | None]] = {}
+    channels: dict[tuple[str, int, int], tuple[np.ndarray, float, ParsecRadialSpline | None]] = {}
 
     for atom_index, atom in enumerate(atoms):
         potential = potentials[atom.symbol]
@@ -1295,18 +1300,15 @@ def build_nonlocal_projectors(
         if not images:
             continue
 
-        for angular_momentum in sorted(potential.radial_wavefunctions):
-            # V_local is handled as a diagonal potential and has no separable
-            # projector of its own.
-            if angular_momentum == local_l:
-                continue
-
+        # (l, index) of every separable projector: the local channel has none of its own (it is a diagonal
+        # potential), and a potential given as projectors can have several per l
+        for angular_momentum, projector_index in potential.nonlocal_channels(local_l):
             # radial_projector returns DeltaV_l*u_l/r/sqrt(|D_l|) together
             # with sign(D_l), which is applied by NonlocalProjectorOperator.
-            key = (atom.symbol, angular_momentum)
+            key = (atom.symbol, angular_momentum, projector_index)
             if key not in channels:
                 radial_grid, denominator_sign = potential.radial_projector(
-                    angular_momentum, local_l
+                    angular_momentum, local_l, projector_index
                 )
                 channels[key] = (
                     radial_grid,
@@ -1331,7 +1333,9 @@ def build_nonlocal_projectors(
             column += len(channel_columns)
             for harmonic_index in range(len(channel_columns)):
                 signs.append(denominator_sign)
-                labels.append((atom_index, angular_momentum, harmonic_index))
+                # (atom, l, number of the column within the channel): the 2l+1 harmonics of the first projector of
+                # this l are 0 ... 2l, those of the second 2l+1 ..., so that no two columns share a label
+                labels.append((atom_index, angular_momentum, projector_index * (2 * angular_momentum + 1) + harmonic_index))
 
             for support_rows, relative_support, radius_support, phase in images:
                 if radial_spline is not None:

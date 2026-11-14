@@ -1652,6 +1652,9 @@ POTENTIAL_FILE_SUFFIX = {
     "martins_old": "POTR",
     "martins_wang": "POTRW",
     "fhipp": "FHIPP",
+    # a UPF v2 file (ONCVPSP, PseudoDojo, SG15) is not named <Atom_Type>_<suffix>.DAT: <Atom_Type>.upf, or any name
+    # given by Pseudopot_File
+    "upf": "upf",
 }
 
 
@@ -1786,6 +1789,10 @@ def _core_cutoff_radius(
 def _has_d_channel(path: Path, format_input: dict[str, object]) -> bool:
     """Whether the pseudopotential file holds a d pseudo-wavefunction."""
 
+    if format_input.get("pseudopotential_format") == "upf":
+        from ..Pseudopotential.upf import read_upf_pseudopotential
+
+        return 2 in read_upf_pseudopotential(path).radial_wavefunctions
     if format_input:
         return int(format_input["number_of_channels"]) > 2
     from ..Pseudopotential import read_parsec_pseudopotential
@@ -1799,7 +1806,8 @@ def _find_potential(
     pseudopotential_directory: Path | None,
     extension: str = "POTRE",
 ) -> Path:
-    filename = f"{symbol}_{extension}.DAT"
+    filenames = (f"{symbol}.upf", f"{symbol}.UPF") if extension == "upf" else (f"{symbol}_{extension}.DAT",)
+    filename = filenames[0]
     directories: list[Path] = []
     if pseudopotential_directory is not None:
         directories.append(pseudopotential_directory)
@@ -1810,10 +1818,11 @@ def _find_potential(
 
     tried: list[Path] = []
     for directory in directories:
-        candidate = (directory / filename).resolve()
-        tried.append(candidate)
-        if candidate.is_file():
-            return candidate
+        for name in filenames:
+            candidate = (directory / name).resolve()
+            tried.append(candidate)
+            if candidate.is_file():
+                return candidate
     attempted = "\n  ".join(str(path) for path in tried)
     raise ParsecInputError(
         f"missing pseudopotential for Atom_Type {symbol!r}; searched:\n  {attempted}"
@@ -3637,7 +3646,7 @@ def _parse_parsec_input(
             raise ParsecInputError(
                 f"Atom_Type {symbol}: unknown Pseudopotential_Format "
                 f"{pseudo_format!r}; PARSEC reads martins_new, martins_old, "
-                "martins_wang and fhipp"
+                "martins_wang and fhipp, and PARSEC.py upf"
             )
         formats.append(pseudo_format)
         local_label = None
@@ -3674,7 +3683,15 @@ def _parse_parsec_input(
             else False
         )
         format_input: dict[str, object] = {}
-        if pseudo_format != "martins_new":
+        if pseudo_format == "upf":
+            # PARSEC.py extension: a UPF file holds the valence charge density, and a local potential of its own
+            if spin_orbit:
+                raise UnsupportedParsecOptionError(
+                    f"Atom_Type {symbol}: SO_PSP is not supported for a upf pseudopotential (scalar-relativistic files only)"
+                )
+            read_vcd = True
+            format_input = {"pseudopotential_format": "upf"}
+        elif pseudo_format != "martins_new":
             if read_vcd:
                 # usrinputfile.F90 error 234.
                 raise ParsecInputError(
@@ -3717,6 +3734,8 @@ def _parse_parsec_input(
                 local_l = read_martins_wang_header(potential_path).local_angular_momentum
             except (OSError, ValueError) as error:
                 raise ParsecInputError(f"Atom_Type {symbol}: {error}") from error
+        elif pseudo_format == "upf":
+            local_l = -1
         else:
             local_l = local_map[local_label]
         if is_periodic:
@@ -3969,8 +3988,9 @@ def _parse_parsec_input(
             "it for a periodic system"
         )
     if (
-        any(item.read_valence_density for item in specifications.values())
-        and specifications[symbols[-1]].pseudopotential_format != "martins_new"
+        # (a upf species always reads the valence density of its file: PARSEC.py's own format, no Fortran error 23)
+        any(item.read_valence_density and item.pseudopotential_format != "upf" for item in specifications.values())
+        and specifications[symbols[-1]].pseudopotential_format not in {"martins_new", "upf"}
     ):
         # pseudo.f90 tests the format of the last Atom_Type, whichever
         # species has Read_VCD, and stops with error 23.
@@ -8137,11 +8157,11 @@ def summarize_translation(translation: ParsecInputTranslation) -> str:
     for symbol, potential in problem.pseudopotentials.items():
         lines.append(
             f"PP {symbol}: {potential.path} "
-            f"(local l={potential.local_angular_momentum}, "
+            f"({'upf, local potential of the file' if potential.pseudopotential_format == 'upf' else f'local l={potential.local_angular_momentum}'}, "
             f"Read_VCD={potential.read_valence_density}"
             + (
                 ""
-                if potential.pseudopotential_format == "martins_new"
+                if potential.pseudopotential_format in {"martins_new", "upf"}
                 else (
                     f", {potential.pseudopotential_format}: "
                     f"Core_Cutoff_Radius={potential.core_cutoff_radius:.6g} bohr"

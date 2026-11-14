@@ -496,7 +496,7 @@ class SpeciesInputTests(unittest.TestCase):
             SpeciesPotential("Si_POTR.DAT", 1, pseudopotential_format="martins_old")
         with self.assertRaisesRegex(ValueError, "belong to a martins_old"):
             SpeciesPotential("H_POTRE.DAT", 0, core_cutoff_radius=2.5)
-        with self.assertRaisesRegex(ValueError, "'martins_wang' or 'fhipp'"):
+        with self.assertRaisesRegex(ValueError, "'martins_wang', 'fhipp' or 'upf'"):
             SpeciesPotential("X_POT.DAT", 0, pseudopotential_format="martins_older")
         with self.assertRaisesRegex(ValueError, "a fhipp pseudopotential needs"):
             SpeciesPotential("X_FHIPP.DAT", 0, pseudopotential_format="fhipp")

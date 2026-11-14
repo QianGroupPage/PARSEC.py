@@ -287,6 +287,9 @@ class OncvPseudopotential(ParsecPseudopotential):
 
     kb_channels: tuple[KleinmanBylanderChannel, ...] = ()
 
+    #: the projectors are tables of the file, not derived from semilocal potentials (``radial_derivatives``)
+    projectors_are_tabulated = True
+
     def nonlocal_channels(self, local_l: int) -> list[tuple[int, int]]:
         """``(l, index)`` of every separable projector, in the order of ``kb_channels``."""
 

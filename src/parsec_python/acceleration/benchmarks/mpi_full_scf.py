@@ -826,7 +826,9 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         raise ValueError('--serial-control requires exactly one MPI rank')
     hosts = comm.allgather(socket.gethostname())
     # One rank per node divides the symmetry sectors among the nodes; several ranks per node, one GPU each,
-    # share the basis of the single sector of a run without symmetry (Eigensolvers/mpi_shared_basis.py).
+    # share the basis of the single sector of a run without symmetry, or, more ranks than sectors, the sectors
+    # of a symmetric run in groups of ranks that may span nodes (Eigensolvers/mpi_shared_basis.py,
+    # experimental/mpi_scf.sector_rank_groups).
     per_node = {host: hosts.count(host) for host in hosts}
     shared_ranks = size > 1 and max(per_node.values()) > 1
     if shared_ranks and len(set(per_node.values())) != 1:
@@ -901,10 +903,6 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                          + (f' ({symmetry_note})' if symmetry_note else '')
                          + ', so its sectors cannot be divided among ranks: run it with one rank (one node), '
                          'with one rank per GPU, or on one node with --serial-control')
-    if shared_ranks and symmetry != 'off' and not hybrid:
-        # Several ranks per node share one sector; the sectors of a symmetric run go to one rank per node.
-        raise ValueError('several ranks per node share the basis of a run without symmetry; this run uses its '
-                         'point group: launch it with one rank per node')
     # As in acceleration.cli: none unless --symmetry-cache names its directory.
     cache = _symmetry_cache_directory(args)
     output = args.output_dir.resolve()
@@ -942,10 +940,13 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         translation = with_positions(translation, outcome[1])
         restart_notes = [*restart_notes, *outcome[2]]
     context = None if args.serial_control else MPISectorContext(comm, exchange=hybrid)
-    if context is not None and periodic:
-        # A bulk cell shares a basis of a size that only the Ritz step with one row block holds
-        # (mpi_shared_basis.shared_ritz_route); clusters keep the two row blocks and their bits.
-        context.shared_ritz_route = 'rounds'
+    if context is not None:
+        # A basis that the ranks share takes the Ritz step with each rank's row block in the memory of its columns
+        # (mpi_shared_basis.shared_ritz_route, block): one share of the basis per rank, where the rounds of a cell
+        # held two and the row blocks of a cluster three. PARSEC_MPI_SHARED_RITZ=rounds or rows restores those.
+        context.shared_ritz_route = 'block'
+        # One GPU per rank: more ranks than the sectors of a symmetric run share them in groups.
+        context.gpu_per_rank = shared_ranks
     if context is not None and comm.size > 1:
         # An error of some ranks inside a step of a shared basis leaves the others in a collective that no
         # command of the context reaches: report it here and end the job (mpi_shared_basis.set_failure_handler).
@@ -986,6 +987,7 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                 log.write('BENCHMARK: Output_All_States overridden false; no full orbital materialization/archive.')
             mode = ('serial production control' if args.serial_control
                     else 'MPI symmetry sectors and the exchange of a hybrid on every GPU' if hybrid
+                    else 'MPI symmetry sectors shared by groups of ranks' if shared_ranks and symmetry != 'off'
                     else 'one sector shared by the ranks' if shared_ranks else 'MPI symmetry sectors')
             if periodic and not args.serial_control:
                 mode = ('one sector of the identity of a periodic cell at the Gamma point'
@@ -1239,6 +1241,7 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
             shared_state.append(dict(sector=sector, ranks=group.size, device=group.device,
                                      transport=group.transport, ritz_passes=group.passes,
                                      ritz_route=shared_ritz_route(group.ritz_route),
+                                     separate_row_blocks=int(getattr(group, 'separate_row_blocks', 0)),
                                      seconds=dict(group.seconds), exchanged_bytes=group.exchanged_bytes))
     # What became of the host thread that made the estimates of the radius search beside the SCF of the root
     # (PARSEC_DOMAIN_REPORT_THREAD): a dict, and none for a rank or a run without that thread.
@@ -1382,6 +1385,10 @@ def _build_parser():
 
 def main(argv=None):
     args = _build_parser().parse_args(argv)
+    if os.environ.get('PARSEC_MEMORY_CENSUS'):
+        # A diagnostic: count the device arrays of every thread from the start (memory_census.py).
+        from parsec_python.acceleration.benchmarks import memory_census
+        memory_census.install()
     # Read the launcher's mask before any OpenMP-linked import can narrow it.
     initial_affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None
     initialization_started = time.perf_counter()

@@ -58,6 +58,7 @@ from .chebff_spinor import (
     SpinorEigvalState,
     _chain,
     _CountingOperator,
+    START_COLUMNS,
     _filter_columns,
     _filter_group,
     _lanczos_upper_bound,
@@ -67,6 +68,136 @@ from .chebff_spinor import (
     _Stats,
 )
 from .mpi_shared_basis import exchange_bytes, row_edges, shared_transport
+
+# Columns per chunk of the filter, of H X and of the residuals of a pool where PARSEC_SPINOR_FILTER_COLUMNS names
+# none.  The recurrence holds five chunks at once (the three of the recurrence, the projector product and its
+# contiguous copy).  Measured on 16 A100 (bulk diamond, same nodes, 32 against 64, the start basis the same):
+# 1,000 atoms 2x2x2 69.7 / 67.7 s and 23.0 / 25.1 GiB, 4x4x4 138.3 / 162.1 s and 25.8 / 27.9 GiB; 1,728 atoms
+# 197.4 / 216.6 s and 26.9 / 33.1 GiB (16 columns: 195.4 s, 26.9 GiB); 2,744 atoms 606.6 / 622.6 s and
+# 54.8 / 63.5 GiB; the energies the same to the ten digits printed.
+POOL_FILTER_COLUMNS = 32
+
+
+def kpoint_ritz_route() -> str:
+    """``PARSEC_KPOINT_RITZ``: ``auto`` (the default), ``rows`` or ``block``, how a pool holds the basis of a task.
+
+    ``rows`` keeps this rank's columns in row-major order, as before: the filter writes a second
+    block, and a Rayleigh-Ritz pass holds the rows of ``X``, its columns and the rows of ``H X``, three
+    shares of the basis.  ``block`` keeps the columns column-major in an allocation with room for the
+    rows (:class:`_ColumnRounds`): the filter writes into its own block, the moves to rows and back lay
+    one layout over the other in place, ``H X`` goes to rows a round at a time and is projected as it
+    arrives, and the residuals of the requested pairs come from ``H`` applied to the rotated columns
+    (one more product per measured pass): one share of the basis and the buffers of a round
+    (:func:`_orthonormal_ritz_block`).  The eigenvalues agree with ``rows`` to round-off; the block route
+    moves the basis between the layouts five times per pass where ``rows`` moves it four.
+
+    ``auto`` lets the pools choose at their set-up (:func:`..SCF.kpoint_pools.choose_route`): ``block``
+    where the plan of ``rows`` needs more than half of a device or is worse (fewer pools, subspaces on the
+    host, or no fit), ``rows`` otherwise; a solve called without a route takes ``rows``.  Measured on 16
+    A100, bulk diamond, same nodes: 1,000 atoms (2x2x2 and 4x4x4 meshes) rows 60.7 and 140.6 s, block 64.2
+    and 151.4 s; 1,728 atoms 2x2x2 rows 215 s at 52.5 GiB of arrays per rank, block 205 s at 25.9; 2,744
+    atoms 2x2x2 rows in one pool 860 s, block in four pools 621 s; the energies the same to the digits
+    printed.
+    """
+    value = os.environ.get("PARSEC_KPOINT_RITZ", "auto").strip().lower() or "auto"
+    if value not in ("auto", "rows", "block"):
+        raise ValueError("PARSEC_KPOINT_RITZ must be auto, rows or block")
+    return value
+
+
+class _ColumnRounds:
+    """The rounds in which a pool moves column-major columns to column-major rows and back, in place.
+
+    Round ``j`` moves the local columns ``j * width`` onwards of every rank (``width`` the same on
+    every rank, so that all of them take part in every round).  The rows of round ``j`` arrive as one
+    contiguous column-major block of the row block (its columns in round order, :meth:`round_order`).
+    The layout of the memory is that of :class:`.mpi_shared_basis._RowExchange` for real bases:
+    the columns fill the allocation from its start, the row block starts :meth:`block_storage` elements
+    in, the move to rows runs the rounds in decreasing order and the move back in increasing order.
+    """
+
+    def __init__(self, layout: "ColumnLayout", rank: int, size: int, rows: int, width: int) -> None:
+        self.layout = layout
+        self.rank, self.size, self.rows = int(rank), int(size), int(rows)
+        self.edges = row_edges(self.rows, self.size)
+        self.own = self.edges[self.rank + 1] - self.edges[self.rank]
+        self.width = max(1, int(width))
+        widest = max(layout.widths) if layout.widths else 0
+        self.rounds = -(-widest // self.width) if widest else 0
+
+    def counts(self, step: int) -> list[int]:
+        first = step * self.width
+        return [max(0, min(self.width, w - first)) for w in self.layout.widths]
+
+    def heights(self) -> list[int]:
+        return [self.edges[q + 1] - self.edges[q] for q in range(self.size)]
+
+    def round_order(self) -> tuple[np.ndarray, list[int]]:
+        """The global column of every column of the row block, and where each round starts in it."""
+        pieces, starts = [], [0]
+        for step in range(self.rounds):
+            first = step * self.width
+            counts = self.counts(step)
+            for rank, count in enumerate(counts):
+                if count:
+                    pieces.append(self.layout.global_columns(rank)[first : first + count])
+            starts.append(starts[-1] + sum(counts))
+        order = np.concatenate(pieces).astype(np.int64) if pieces else np.zeros(0, dtype=np.int64)
+        return order, starts
+
+    def block_storage(self) -> tuple[int, int]:
+        """``(offset, capacity)`` in complex elements: see :meth:`.mpi_shared_basis._RowExchange.block_storage`."""
+        offset, starts = 0, 0
+        mine = self.layout.widths[self.rank]
+        for step in range(self.rounds + 1):
+            offset = max(offset, self.rows * min(mine, step * self.width) - self.own * starts)
+            if step < self.rounds:
+                starts += sum(self.counts(step))
+        return offset, max(self.rows * mine, offset + self.own * self.layout.columns)
+
+    def sizes(self) -> tuple[int, int]:
+        """The most complex elements a round sends (columns) and receives (rows), and the widest round."""
+        sent = received = 1
+        for step in range(self.rounds):
+            counts = self.counts(step)
+            sent = max(sent, self.rows * counts[self.rank])
+            received = max(received, self.own * sum(counts))
+        return sent, received
+
+    def pack(self, xp, local, step: int, send, start: int | None = None):
+        """Round ``step`` of this rank's columns (``local`` from its column ``start`` on) into ``send``."""
+        counts = self.counts(step)
+        mine = counts[self.rank]
+        first = step * self.width if start is None else int(start)
+        send_counts = [height * mine for height in self.heights()]
+        buffer = send[: max(1, sum(send_counts))]
+        offset = 0
+        for q, height in enumerate(self.heights()):
+            if height and mine:
+                buffer[offset : offset + height * mine].reshape((mine, height)).T[...] = local[
+                    self.edges[q] : self.edges[q + 1], first : first + mine
+                ]
+            offset += height * mine
+        return buffer, send_counts, [self.own * count for count in counts]
+
+    def unpack(self, receive, step: int, target) -> None:
+        """The rows of round ``step`` that came back into this rank's columns ``target``."""
+        counts = self.counts(step)
+        mine = counts[self.rank]
+        first = step * self.width
+        offset = 0
+        for q, height in enumerate(self.heights()):
+            if height and mine:
+                target[self.edges[q] : self.edges[q + 1], first : first + mine] = receive[
+                    offset : offset + height * mine
+                ].reshape((mine, height)).T
+            offset += height * mine
+
+    @staticmethod
+    def region(xp, row_block, starts, step):
+        """The columns of round ``step`` of the column-major row block: one contiguous buffer."""
+        piece = row_block.T[starts[step] : starts[step + 1]]
+        return piece.reshape(-1) if piece.size else xp.empty(1, dtype=xp.complex128)
 
 
 # --------------------------------------------------------------------------- layout
@@ -175,6 +306,11 @@ class ColumnGroup:
         # what the collectives cost this rank: seconds by kind and the bytes this rank sent
         self.seconds = {"to_rows": 0.0, "to_columns": 0.0, "reduce": 0.0, "broadcast": 0.0}
         self.sent_bytes = 0
+        # the round buffers of the block route, one allocation each for the run (see _round_buffer)
+        self._buffers: dict = {}
+        # the route of the solves of this group (kpoint_ritz_route; a pool sets it at its set-up)
+        self.route = "block" if kpoint_ritz_route() == "block" else "rows"
+        self.separate_row_blocks = 0
 
     @property
     def is_root(self) -> bool:
@@ -272,7 +408,14 @@ class ColumnGroup:
         self._sync()
         started = time.perf_counter()
         xp = self.xp
-        if self.transport == "cuda":
+        if self.transport == "cuda" and np.dtype(dtype) == np.complex128 and self.route == "block":
+            # one allocation for the run (see _round_buffer): the factors and rotations of every pass
+            buffer = self._round_buffer("bcast", int(np.prod(shape))).reshape(shape)
+            if self.is_root:
+                buffer[...] = xp.asarray(array, dtype=dtype)
+            self._sync()
+            self.comm.Bcast(buffer, root=self.root)
+        elif self.transport == "cuda":
             buffer = (
                 xp.ascontiguousarray(xp.asarray(array, dtype=dtype))
                 if self.is_root
@@ -417,6 +560,94 @@ class ColumnGroup:
         self.seconds["to_columns"] += time.perf_counter() - started
         return target
 
+    # ----- the block route (PARSEC_KPOINT_RITZ=block) ----------------------------
+    def block_rounds(self, layout: ColumnLayout, dimension: int) -> _ColumnRounds:
+        """The rounds of the block route for ``layout``: buffers of at most :func:`exchange_bytes`."""
+        width = max(1, exchange_bytes() // (16 * max(int(dimension), 1)))
+        return _ColumnRounds(layout, self.rank, self.size, dimension, width)
+
+    def allocate_block(self, layout: ColumnLayout, dimension: int):
+        """This rank's columns, column-major, in an allocation with room for its rows (complex128)."""
+        xp = self.xp
+        width = layout.widths[self.rank]
+        _offset, capacity = self.block_rounds(layout, dimension).block_storage()
+        backing = xp.empty(max(int(capacity), int(dimension) * width, 1), dtype=xp.complex128)
+        return backing[: int(dimension) * width].reshape((width, int(dimension))).T
+
+    def has_block_room(self, block, layout: ColumnLayout, dimension: int) -> bool:
+        """Whether ``block`` is column-major and its allocation holds the rows of the block route."""
+        if self.size == 1:
+            return bool(block.flags.f_contiguous)
+        _offset, capacity = self.block_rounds(layout, dimension).block_storage()
+        return bool(block.flags.f_contiguous) and _room(self.xp, block) >= capacity
+
+    def _round_buffer(self, name: str, elements: int):
+        """A flat complex buffer of at least ``elements``, the same allocation in every round and solve.
+
+        As for the real shared basis (:meth:`.mpi_shared_basis.MPIShardGroup._round_buffer`): buffers
+        taken anew in every round stay resident under the CUDA IPC handles that GPU-aware MPI keeps.
+        """
+        elements = max(1, int(elements))
+        buffer = self._buffers.get(name)
+        if buffer is None or buffer.size < elements:
+            self._buffers.pop(name, None)
+            del buffer
+            buffer = self.xp.empty(elements, dtype=self.xp.complex128)
+            self._buffers[name] = buffer
+        return buffer[:elements]
+
+    def row_block_in(self, columns, plan: _ColumnRounds):
+        """The column-major row block in the allocation of ``columns`` (or a new one, counted)."""
+        xp = self.xp
+        if self.size == 1:
+            return columns, False
+        offset, capacity = plan.block_storage()
+        if columns.flags.f_contiguous and _room(xp, columns) >= capacity:
+            shape = (plan.layout.columns, plan.own)
+            if xp is np:
+                base = _base(xp, columns)
+                skip = columns.__array_interface__["data"][0] - base.__array_interface__["data"][0]
+                rows = np.ndarray(shape, dtype=np.complex128, buffer=base, offset=skip + 16 * offset)
+            else:
+                rows = xp.ndarray(shape, dtype=xp.complex128, memptr=columns.data + 16 * offset)
+            return rows.T, False
+        self.separate_row_blocks += 1
+        return xp.empty((plan.layout.columns, plan.own), dtype=xp.complex128).T, True
+
+    def columns_to_rows_block(self, columns, row_block, plan: _ColumnRounds, starts) -> None:
+        """This rank's columns to its rows of the block route, rounds in decreasing order (no ``H``)."""
+        if self.size == 1:
+            return
+        xp = self.xp
+        self._sync()
+        started = time.perf_counter()
+        sent, _received = plan.sizes()
+        send = self._round_buffer("send", sent)
+        for step in reversed(range(plan.rounds)):
+            buffer, send_counts, receive_counts = plan.pack(xp, columns, step, send)
+            self._exchange(buffer, send_counts, plan.region(xp, row_block, starts, step), receive_counts)
+        self._sync()
+        self.seconds["to_rows"] += time.perf_counter() - started
+
+    def rows_to_columns_block(self, row_block, columns, plan: _ColumnRounds, starts) -> None:
+        """The way back: rounds in increasing order, each sent from where its rows lie."""
+        if self.size == 1:
+            return
+        xp = self.xp
+        self._sync()
+        started = time.perf_counter()
+        sent, _received = plan.sizes()
+        receive = self._round_buffer("receive", max(sent, _received))
+        for step in range(plan.rounds):
+            counts = plan.counts(step)
+            receive_counts = [height * counts[self.rank] for height in plan.heights()]
+            piece = receive[: max(1, sum(receive_counts))]
+            self._exchange(plan.region(xp, row_block, starts, step), [plan.own * c for c in counts], piece,
+                           receive_counts)
+            plan.unpack(piece, step, columns)
+        self._sync()
+        self.seconds["to_columns"] += time.perf_counter() - started
+
     def statistics(self) -> dict[str, float]:
         values = {f"pool_{name}_seconds": value for name, value in self.seconds.items()}
         values["pool_sent_bytes"] = float(self.sent_bytes)
@@ -514,6 +745,170 @@ def _cholesky_qr_rows(xp, rows, group: ColumnGroup, dimension: int) -> None:
         del factor
 
 
+def _base(xp, array):
+    """The array that owns the memory of ``array`` (itself where it owns it)."""
+    base = array
+    while getattr(base, "base", None) is not None:
+        base = base.base
+    return base
+
+
+def _room(xp, block) -> int:
+    """Complex elements from the first one of ``block`` to the end of its allocation."""
+    if xp is np:
+        base = _base(xp, block)
+        start = block.__array_interface__["data"][0]
+        end = base.__array_interface__["data"][0] + base.nbytes
+        return max(0, end - start) // 16
+    memory = getattr(block.data, "mem", None)
+    if memory is None:
+        return 0
+    return max(0, int(memory.ptr) + int(memory.size) - int(block.data.ptr)) // 16
+
+
+def _conjugate_product(xp, left, right):
+    """``left^H @ right`` for column-major operands, without a conjugated copy on the device."""
+    if xp is np:
+        return left.conj().T @ right
+    from cupy import cublas
+
+    return cublas.gemm("H", "N", xp.asfortranarray(left), xp.asfortranarray(right))
+
+
+def _rotate_rows_in_place(xp, rows, rotations, tile: int) -> None:
+    """``rows <- rows @ rotations`` a tile of rows at a time (a tile of workspace)."""
+    own = int(rows.shape[0])
+    for r0 in range(0, own, max(1, int(tile))):
+        r1 = min(own, r0 + max(1, int(tile)))
+        rows[r0:r1] = rows[r0:r1] @ rotations
+
+
+def _orthonormal_ritz_block(
+    xp,
+    operator,
+    holder: list,
+    group: ColumnGroup,
+    layout: ColumnLayout,
+    dimension: int,
+    requested: int,
+    residuals: bool,
+    chunk: int,
+    stats: _Stats,
+):
+    """:func:`_orthonormal_ritz` with this rank's column-major columns and rows in one allocation.
+
+    The columns move to rows in place (:meth:`ColumnGroup.columns_to_rows_block`, the row block in the
+    order of the rounds) for the shifted Cholesky QR and back.  The Rayleigh-Ritz step then runs the
+    rounds in decreasing order: ``H`` times the columns of a round, the columns to rows in place, ``H``
+    times them to a round buffer, and ``A[s_j:, s_j:s_j + n_j] = X[:, s_j:]^H (H X)_j`` from the rows
+    that are there by then, the lower triangle of ``X^H H X`` in round order, which the pool root
+    diagonalizes.  The coefficients come back with their columns put in round order
+    (``V[:, order]``), so that the rows rotated in place go back to the columns with every Ritz vector
+    in its place.  The residuals of the ``requested`` lowest pairs, where asked for, are
+    ``||H x_j - e_j x_j||`` on the rotated columns (``H (X V)`` where :func:`_orthonormal_ritz` takes
+    ``(H X) V``).  Returns what :func:`_orthonormal_ritz` returns.
+    """
+    columns = holder.pop()
+    count = int(layout.columns)
+    plan = group.block_rounds(layout, dimension)
+    if group.size == 1:
+        order, starts = np.arange(count, dtype=np.int64), [0, count]
+        rounds = 1
+    else:
+        order, starts = plan.round_order()
+        rounds = plan.rounds
+    row_block, _separate = group.row_block_in(columns, plan)
+    with stats.timed("orthonormalize_seconds"):
+        group.columns_to_rows_block(columns, row_block, plan, starts)
+        _cholesky_qr_rows(xp, row_block, group, dimension)
+        group.rows_to_columns_block(row_block, columns, plan, starts)
+    with stats.timed("ritz_seconds"):
+        projection = xp.zeros((count, count), dtype=xp.complex128)
+        widest = max(plan.counts(0)[group.rank], 1) if group.size > 1 else 1
+        sent, received = plan.sizes()
+        applied_buffer = group._round_buffer("applied", int(dimension) * widest) if group.size > 1 else None
+        send_buffer = group._round_buffer("send", sent) if group.size > 1 else None
+        receive_buffer = group._round_buffer("receive", max(sent, received)) if group.size > 1 else None
+        if group.size == 1:
+            # one rank: the columns are the rows; H X a chunk at a time, projected as it comes
+            for c0 in range(0, count, chunk):
+                c1 = min(c0 + chunk, count)
+                applied = operator.apply(xp.ascontiguousarray(columns[:, c0:c1]))
+                projection[c0:, c0:c1] = _conjugate_product(xp, columns[:, c0:], applied)
+                del applied
+            rounds = 0
+        for step in reversed(range(rounds)):
+            first, last = starts[step], starts[step + 1]
+            mine = plan.counts(step)[group.rank]
+            local_first = step * plan.width
+            applied = applied_buffer[: int(dimension) * mine].reshape((mine, int(dimension))).T
+            for c0 in range(0, mine, chunk):  # H X of the round, chunk by chunk
+                c1 = min(c0 + chunk, mine)
+                applied[:, c0:c1] = operator.apply(xp.ascontiguousarray(columns[:, local_first + c0 : local_first + c1]))
+            group._sync()
+            started = time.perf_counter()
+            buffer, send_counts, receive_counts = plan.pack(xp, columns, step, send_buffer)
+            group._exchange(buffer, send_counts, plan.region(xp, row_block, starts, step), receive_counts)
+            buffer, send_counts, receive_counts = plan.pack(xp, applied, step, send_buffer, start=0)
+            arrived = receive_buffer[: max(1, sum(receive_counts))]
+            group._exchange(buffer, send_counts, arrived, receive_counts)
+            group._sync()
+            group.seconds["to_rows"] += time.perf_counter() - started
+            piece = arrived[: plan.own * (last - first)].reshape((last - first, plan.own)).T
+            if last > first:
+                projection[first:, first:last] = _conjugate_product(xp, row_block[:, first:], piece)
+            del applied, piece
+        del applied_buffer, send_buffer, receive_buffer
+        lower = group.lower_sum_to_root(projection)  # the root diagonalizes it
+        del projection
+        values = rotations = None
+        if group.is_root:
+            hermitian = lower + xp.tril(lower, -1).conj().T
+            values, rotations = xp.linalg.eigh(hermitian)
+            del hermitian
+            values = np.ascontiguousarray(group._host(values), dtype=np.float64)
+            if group.size > 1:
+                rotations = xp.ascontiguousarray(rotations[:, order if xp is np else xp.asarray(order)])
+        del lower
+        values = group.bcast(values)
+        rotations = group.bcast_array(rotations, (count, count), np.complex128)
+        tile = max(1, exchange_bytes() // (16 * max(count, 1)))
+        _rotate_rows_in_place(xp, row_block, rotations, tile)
+        del rotations
+        group.rows_to_columns_block(row_block, columns, plan, starts)
+        del row_block
+    norms = None
+    if residuals:
+        with stats.timed("residual_seconds"):
+            levels = np.asarray(values, dtype=np.float64)
+            squares = xp.zeros(int(requested), dtype=xp.float64)
+            for g0, l0, width in requested_spans(layout, group.rank, int(requested)):
+                for c0 in range(0, width, chunk):
+                    c1 = min(c0 + chunk, width)
+                    block = xp.ascontiguousarray(columns[:, l0 + c0 : l0 + c1])
+                    difference = operator.apply(block)
+                    difference -= block * xp.asarray(levels[g0 + c0 : g0 + c1])[None, :]
+                    squares[g0 + c0 : g0 + c1] = (difference.real * difference.real
+                                                  + difference.imag * difference.imag).sum(axis=0)
+                    del block, difference
+            norms = np.sqrt(np.asarray(group._host(group.sum(squares)), dtype=np.float64))
+    return columns, np.asarray(values, dtype=np.float64), norms
+
+
+def _block_columns(xp, vectors, group: ColumnGroup, layout: ColumnLayout, dimension: int):
+    """``vectors`` (a saved basis, on the device or a host copy) as columns with the room of the block route."""
+    on_device = not isinstance(vectors, np.ndarray) or xp is np
+    if on_device and group.has_block_room(vectors, layout, dimension):
+        return vectors
+    block = group.allocate_block(layout, dimension) if group.size > 1 else xp.empty(
+        (int(dimension), layout.widths[group.rank]), dtype=xp.complex128, order="F")
+    if isinstance(vectors, np.ndarray) and xp is not np:
+        block.set(np.asfortranarray(vectors))
+    else:
+        block[...] = vectors
+    return block
+
+
 def _orthonormal_ritz(
     xp,
     operator,
@@ -601,14 +996,24 @@ def _bounds(
     return group.bcast(tuple(float(value) for value in found))
 
 
-def _random_columns(xp, seed: int, dimension: int, working: int, layout: ColumnLayout, rank: int, chunk: int):
+def _random_columns(xp, seed: int, dimension: int, working: int, layout: ColumnLayout, rank: int, chunk: int,
+                    group: ColumnGroup | None = None):
     """This rank's columns of the start basis of :func:`.chebff_spinor._first_solve`: the same stream
-    (``default_rng(seed)``, real then imaginary parts, ``chunk`` columns at a time), replayed in full."""
+    (``default_rng(seed)``, real then imaginary parts, :data:`.chebff_spinor.START_COLUMNS` columns at a
+    time, whatever ``chunk`` is), replayed in full.
+
+    With ``group`` (the block route) the columns are column-major in an allocation with room for the rows.
+    """
     rng = xp.random.default_rng(seed)
-    local = xp.empty((dimension, layout.widths[rank]), dtype=xp.complex128)
+    if group is None:
+        local = xp.empty((dimension, layout.widths[rank]), dtype=xp.complex128)
+    elif group.size > 1:
+        local = group.allocate_block(layout, dimension)
+    else:
+        local = xp.empty((dimension, layout.widths[rank]), dtype=xp.complex128, order="F")
     spans = layout.spans(rank)
-    for c0 in range(0, working, chunk):
-        c1 = min(c0 + chunk, working)
+    for c0 in range(0, working, START_COLUMNS):
+        c1 = min(c0 + START_COLUMNS, working)
         real = rng.uniform(-1.0, 1.0, (dimension, c1 - c0))
         imaginary = rng.uniform(-1.0, 1.0, (dimension, c1 - c0))
         for g0, l0, count in spans:
@@ -652,13 +1057,16 @@ def _filter_group_fused(
 
 
 def _filter_local(
-    xp, operator, source, layout: ColumnLayout, rank: int, groups, center, half_span, sigma_one, chunk, stats=None
+    xp, operator, source, layout: ColumnLayout, rank: int, groups, center, half_span, sigma_one, chunk, stats=None,
+    in_place: bool = False,
 ):
     """Filter this rank's columns of every degree group ``(start, stop, degree, entering, produced)``.
 
     An operator with :attr:`fused_recurrence` takes every step of the recurrence in its stencil kernel.
+    With ``in_place`` the filtered columns are written over ``source`` (every chunk is copied before its
+    recurrence, so no chunk reads what another wrote), which then holds them.
     """
-    out = xp.empty_like(source)
+    out = source if in_place else xp.empty_like(source)
     fused = bool(getattr(operator, "fused_recurrence", False)) and stats is not None
     for start, stop, degree, entering, produced in groups:
         for g0, l0, count in layout.spans(rank):
@@ -696,6 +1104,7 @@ def solve_column_eigval(
     tolerance: float | None = None,
     max_extra_cycles: int | None = None,
     residual_period: int | None = None,
+    route: str | None = None,
 ) -> SpinorEigvalResult:
     """One eigensolve of the SCF loop with the basis shared by the ranks of ``group``.
 
@@ -713,9 +1122,11 @@ def solve_column_eigval(
     working = min(int(requested_states) + int(settings.safety_buffer), dimension)
     if not 1 <= requested_states <= dimension:
         raise ValueError(f"requested_states must be between 1 and {dimension}, got {requested_states}")
-    chunk = _filter_columns()
+    chunk = _filter_columns(POOL_FILTER_COLUMNS)
     period = _residual_period() if residual_period is None else int(residual_period)
     layout = ColumnLayout(working, settings.subspace.block_size, group.size)
+    block_route = (group.route if route is None else route) == "block"
+    ritz_pass = _orthonormal_ritz_block if block_route else _orthonormal_ritz
     before = group.statistics()
     reusable = (
         state is not None
@@ -734,7 +1145,9 @@ def solve_column_eigval(
                 env = os.environ.get("PARSEC_KPOINT_EXTRA_CYCLES", "").strip()
                 max_extra_cycles = int(env) if env.isdigit() else 24
             extra = int(max_extra_cycles)
-        vectors = _random_columns(xp, chebff.random_seed, dimension, working, layout, group.rank, chunk)
+        vectors = _random_columns(
+            xp, chebff.random_seed, dimension, working, layout, group.rank, chunk, group if block_route else None
+        )
         bound_rule, bound_steps = bound_request(chebff)
         upper_bound, smallest_ritz = _bounds(
             xp, counted, dimension, bound_steps, chebff.random_seed + 1, group, stats, rule=bound_rule
@@ -767,14 +1180,15 @@ def solve_column_eigval(
                 # the filtered block lives only in ``holder``: the Rayleigh-Ritz pass releases it
                 holder = [
                     _filter_local(
-                        xp, counted, vectors, layout, group.rank, one_degree, center, half_span, sigma_one, chunk, stats
+                        xp, counted, vectors, layout, group.rank, one_degree, center, half_span, sigma_one, chunk, stats,
+                        in_place=block_route,
                     )
                 ]
                 del vectors
             _check_finite_columns(xp, holder[0], group)
             last = cycle + 1 == total_cycles
             measure = (converge_first and cycle + 1 >= chebff.filter_cycles) or (last and period > 0)
-            vectors, eigenvalues, residuals = _orthonormal_ritz(
+            vectors, eigenvalues, residuals = ritz_pass(
                 xp, counted, holder, group, layout, dimension, int(requested_states), measure, chunk, stats
             )
             smallest_ritz = float(eigenvalues[0])
@@ -858,16 +1272,19 @@ def solve_column_eigval(
                 )
             )
         with stats.timed("filter_seconds"):
+            source = _block_columns(xp, state.vectors, group, layout, dimension) if block_route else state.vectors
+            state.vectors = None  # consumed
             holder = [
                 _filter_local(
-                    xp, counted, state.vectors, layout, group.rank, groups, center, half_span, sigma_one, chunk, stats
+                    xp, counted, source, layout, group.rank, groups, center, half_span, sigma_one, chunk, stats,
+                    in_place=block_route,
                 )
             ]
-            state.vectors = None  # consumed
+            del source
         _check_finite_columns(xp, holder[0], group)
         completed = state.filters_completed + 1
         measure = period > 0 and completed % period == 0
-        vectors, eigenvalues, residuals = _orthonormal_ritz(
+        vectors, eigenvalues, residuals = ritz_pass(
             xp, counted, holder, group, layout, dimension, int(requested_states), measure, chunk, stats
         )
         if eigenvalues.shape != (working,):

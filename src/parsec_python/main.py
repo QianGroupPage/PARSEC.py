@@ -131,4 +131,9 @@ from parsec_python.acceleration.cli import main  # noqa: E402
 
 
 if __name__ == "__main__":
+    if os.environ.get("PARSEC_MEMORY_CENSUS"):
+        # A diagnostic: count the device arrays of every thread from the start (acceleration/benchmarks/memory_census.py).
+        from parsec_python.acceleration.benchmarks import memory_census
+
+        memory_census.install()
     raise SystemExit(main())

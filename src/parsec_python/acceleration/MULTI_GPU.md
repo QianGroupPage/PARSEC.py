@@ -172,6 +172,23 @@ on the GPUs of one node, or one rank per GPU on several nodes
 (`Eigensolvers/mpi_shared_basis.py`; numbers in
 `../FORCES_AND_RELAXATION.md`, "On GPUs and several nodes").
 
+A symmetric cluster with fewer sectors than nodes (one rank per node leaves
+the other nodes idle, and the runner refuses more ranks than sectors) runs
+with one rank per GPU as well: the ranks are divided into one group of
+consecutive ranks per sector (`experimental/mpi_scf.sector_rank_groups`,
+balanced counts, a group may span nodes), and each group shares the basis of
+its sector as above, in a communicator of its own; the commands of the SCF,
+the density and the forces stay on the world communicator, and only the
+first rank of a group reports the Ritz values of its sector. One rank per
+node keeps the node-local route of before, which is the faster one where it
+can use all the nodes. Measured on A100 nodes (CA-LDA, first runs), a
+nanodiamond of 5,589 atoms made C2 (two hydrogens moved by 0.02 Å, two
+sectors): one rank per node on 2 nodes, the most it can use, 212.0 s and
+59.8 GiB at the fullest GPU; groups of eight ranks on 4 nodes 166.3 s and
+35.3 GiB; groups on the same 2 nodes 266.2 s and 61.4 GiB. The four sectors
+of the k14 nanodiamond (16 GPUs): one rank per node 208.6 s and 59.7 GiB, groups of
+four 268.9 s and 60.4 GiB. The energies agree to 2e-10 Ry.
+
 Measured for C795H300 on A100 nodes (seven structures to 0.01 Ry/bohr with
 the inputs of the series above): 47 s on 4 GPUs, 35 s on 8 and 30 s on 16,
 with identical trajectories; a later structure costs 2.3 s of SCF, 0.5 s of
@@ -386,9 +403,49 @@ every rank and runs the runner, `summarize_timing.py` reads `timing.json`):
   root, which needs a Ritz step that holds two shares (the rows of `H X` formed
   and projected a round of columns at a time) or more ranks. Host memory: 6.7
   GiB on the root and 4.7 on the other ranks at 4,096 atoms.
-- That Ritz step is the default of a cell (`PARSEC_MPI_SHARED_RITZ`, `auto`:
-  `rounds` for a cell, whose runner names it, `rows` for clusters, which keep
-  their bits; `MPIShardGroup._ritz_in_rounds`). It keeps the row block of the
+- Since 2026-11-15 the default of every shared basis (cells and clusters) is
+  the block route (`PARSEC_MPI_SHARED_RITZ=block`, `MPIShardGroup._ritz_one_block`):
+  each rank's row block lies in the allocation of its columns, which
+  `random_basis` pads by the round or two that uneven widths need. The rounds
+  to rows run in decreasing order (H applied to the columns of a round, the
+  columns sent to rows that land where columns of that round and later rounds
+  lay, H times them sent to a round buffer and projected as they arrive), the
+  rows are rotated in place a tile at a time and go back in increasing rounds;
+  the QR fallback moves in place too. The send, receive and H buffers, the
+  summed pair and the broadcast matrices are one allocation each for the run:
+  GPU-aware MPI keeps CUDA IPC handles of the device buffers it moved (Cray
+  MPICH, `MPICH_GPU_IPC_CACHE_MAX_SIZE` = 50), and buffers freed under an open
+  handle stay resident, which with new buffers in every round ran 5,832 atoms
+  out of memory with 29 GiB of arrays on the device. Measured on 16 A100 (bulk
+  diamond): 4,096 atoms 35.3 -> 23.8 GiB on the fullest GPU, 137.8 -> 137.3 s
+  (same nodes); 5,832 atoms 67.8 -> 40.4 GiB, 306.3 -> 312.0 s; the energies
+  within 1e-11 Ry of `rounds`, whose Ritz values the block route reproduces
+  bit for bit (the rotated vectors differ by round-off). A cluster of 7,120
+  electrons without symmetry on 16 ranks: 36.6 -> 18.8 GiB against `rows`.
+  The device small solve mirrors the summed pair in place, forms the
+  whitening in it (both triangular solves in place, the transposed copy
+  between them a transposition in place) and releases its intermediates; the
+  eigensolve runs on the rank after the condition helper, in the memory of
+  that rank's summed pair, and the helper estimates on its own summed overlap
+  (`PARSEC_MPI_SHARED_EIGH_HELPER`, the same bits). 8,000 atoms (16,006
+  states) then hold 60.5 GiB of arrays at the fullest GPU instead of 70.1
+  (the root held the eigensolver's copy and work, the whitened matrix of the
+  previous step and the Cholesky factor beside its share). The planner
+  counts the block route as one share, the buffers and eleven `m x m` arrays
+  (it counted four shares, which sent 5,832 atoms to the direct allocator);
+  with the pool it then keeps, same nodes against the head before: 4,096
+  atoms 23.5 -> 21.5 GiB, 136.8 -> 136.7 s; 5,832 atoms 40.4 -> 38.3 GiB,
+  306.9 -> 302.7 s (the direct allocator: 35.3 GiB, 306.6 s); 8,000 atoms
+  71.6 -> 68.1 GiB, 657.9 -> 651.5 s; the energies identical.
+  These figures come from `PARSEC_MEMORY_CENSUS=<folder>`
+  (`benchmarks/memory_census.py`, a diagnostic, off by default): it wraps the
+  CuPy allocator in force (the pool, or direct allocation after
+  `set_allocator(None)`), counts the arrays of every thread on every device and
+  writes per process, at the exit, every 30 s and when an allocation fails,
+  the largest total of each device with the arrays that made it, grouped by
+  where they were allocated, and the resident host memory.
+- The rounds Ritz step was the default of a cell before (`PARSEC_MPI_SHARED_RITZ=rounds`;
+  `rows` the default of clusters; `MPIShardGroup._ritz_in_rounds`). It keeps the row block of the
   filtered basis and the columns, forms `H X` a round of exchange columns at a
   time, projects each round as it arrives and sends the rotated rows back in
   the same rounds; the overlap and the projection are the lower triangles of

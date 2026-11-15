@@ -53,7 +53,14 @@ from parsec_python.SCF.kpoint_solver import (
     residual_max,
 )
 
-from ..Eigensolvers.chebff_columns import ColumnGroup, ColumnLayout, requested_spans, solve_column_eigval
+from ..Eigensolvers.chebff_columns import (
+    ColumnGroup,
+    POOL_FILTER_COLUMNS,
+    ColumnLayout,
+    kpoint_ritz_route,
+    requested_spans,
+    solve_column_eigval,
+)
 from ..Eigensolvers.chebff_spinor import _filter_columns
 from ..Eigensolvers.mpi_shared_basis import exchange_bytes
 from ..Parallel import mpi
@@ -74,6 +81,11 @@ _TASK_BYTES_PER_POINT = 2 * 8 * 20
 _SPARSE_FIXED_BYTES_PER_POINT = 37 * 12
 _SPARSE_TASK_BYTES_PER_POINT = 36 * 12
 _CONTEXT_BYTES = 3 << 29  # CUDA context, cuBLAS/cuSOLVER work spaces
+
+
+def _round_width(dimension: int) -> int:
+    """Columns per rank in a round of the block route (:meth:`.chebff_columns.ColumnGroup.block_rounds`)."""
+    return max(1, exchange_bytes() // (16 * max(int(dimension), 1)))
 
 
 def requested_pools() -> int | None:
@@ -102,30 +114,61 @@ def pool_memory_bytes(
     *,
     resident: int | None = None,
     fused: bool = True,
+    route: str | None = None,
 ) -> int:
     """Device bytes one rank of a pool of ``ranks`` ranks needs for ``tasks`` tasks.
 
     The Ritz subspaces of the pool's tasks (this rank's columns of each, ``dimension x width``
     complex; ``resident`` of them on the device, all by default, one when the others stay on the
-    host), the working copies of the task in hand (the rows, the columns and the rows of ``H X`` of a
-    Rayleigh-Ritz step: three of its share in all; on one rank, where rows and columns are the same
-    arrays, two), the exchange buffers of a round, the dense
+    host), the working copies of the task in hand (under ``PARSEC_KPOINT_RITZ=block``, the default,
+    its one share with a round of padding and the send, receive and ``H X`` buffers of a round;
+    under ``rows`` the rows, the columns and the rows of ``H X`` of a Rayleigh-Ritz step: three of
+    its share in all, on one rank, where rows and columns are the same arrays, two, and the exchange
+    buffers of a round), the dense
     ``m x m`` matrices of the Rayleigh-Ritz step, the blocks of columns of the filter recurrence and of
-    the products of the operator (eight blocks of ``PARSEC_SPINOR_FILTER_COLUMNS`` columns, 64 by default)
+    the products of the operator (eight blocks of ``PARSEC_SPINOR_FILTER_COLUMNS`` columns, 32 by default)
     and the static data (:data:`_FIXED_BYTES_PER_POINT`, :data:`_TASK_BYTES_PER_POINT`).
     """
     dimension, working, tasks, ranks = int(dimension), int(working), int(tasks), int(ranks)
     width = max(ColumnLayout(working, block_size, ranks).widths) if ranks > 1 else working
     share = dimension * width * 16
     resident = tasks if resident is None else max(1, min(int(resident), tasks))
-    subspaces = (resident - 1) * share + (3 if ranks > 1 else 2) * share
-    buffers = 2 * exchange_bytes() if ranks > 1 else 0
+    route = kpoint_ritz_route() if route is None else route
+    if route == "block":
+        # one share in hand (and a round of padding where the widths differ), the send, receive and
+        # H X buffers of a round (PARSEC_KPOINT_RITZ=block)
+        subspaces = (resident - 1) * share + share + (dimension * 16 * _round_width(dimension) if ranks > 1 else 0)
+        buffers = 3 * exchange_bytes() if ranks > 1 else 0
+    else:
+        subspaces = (resident - 1) * share + (3 if ranks > 1 else 2) * share
+        buffers = 2 * exchange_bytes() if ranks > 1 else 0
     dense = 6 * working * working * 16
-    transient = 8 * dimension * min(_filter_columns(), working) * 16
+    transient = 8 * dimension * min(_filter_columns(POOL_FILTER_COLUMNS), working) * 16
     fixed = _FIXED_BYTES_PER_POINT + (0 if fused else _SPARSE_FIXED_BYTES_PER_POINT)
     per_task = _TASK_BYTES_PER_POINT + (0 if fused else _SPARSE_TASK_BYTES_PER_POINT)
     static = dimension * (fixed + tasks * per_task)
     return int(subspaces + buffers + dense + transient + static + _CONTEXT_BYTES)
+
+
+# The share of a device above which the pools take the block route under PARSEC_KPOINT_RITZ=auto although
+# the rows route fits as well: measured on 16 A100 (bulk diamond), rows was faster where it needed a third of
+# a device (1,000 atoms, 6-8 %) and slower where it needed nearly all of it (1,728 atoms, 5 %).
+_BLOCK_ABOVE = 0.5
+
+
+def choose_route(rows_plan: "PoolPlan | None", block_plan: "PoolPlan", usable: float) -> str:
+    """The route of the pools under ``PARSEC_KPOINT_RITZ=auto`` from the plans of both routes.
+
+    ``block`` where ``rows`` has no plan that fits, a worse one (by the order of :func:`plan_pools`:
+    balance, subspaces on the host, fewer pools) or one that needs more than half of ``usable``;
+    ``rows`` otherwise (its four moves of the basis per pass against five).
+    """
+    if rows_plan is None:
+        return "block"
+    order = lambda plan: (round(plan.balance, 12), plan.host_storage, -plan.pools)  # noqa: E731
+    if order(block_plan) < order(rows_plan):
+        return "block"
+    return "block" if rows_plan.bytes_per_rank > _BLOCK_ABOVE * float(usable) else "rows"
 
 
 @dataclass(frozen=True)
@@ -312,23 +355,38 @@ class MPIPoolKPointSolver:
         block = int(settings.subspace.block_size)
         plan = None
         failure = None
+        route = None
         if context.is_root:
             try:
                 usable = self._usable_bytes()
-                plan = plan_pools(
-                    self.job.n_tasks,
-                    context.size,
-                    lambda tasks, ranks, resident: pool_memory_bytes(
-                        self.problem_size, working, tasks, ranks, block, resident=resident
-                    ),
-                    usable,
-                    self._requested_pools,
-                    storage_mode() if self.xp is not np else "device",
-                    limit=usable / _USABLE_FRACTION,
-                )
+
+                def plan_of(name):
+                    return plan_pools(
+                        self.job.n_tasks,
+                        context.size,
+                        lambda tasks, ranks, resident: pool_memory_bytes(
+                            self.problem_size, working, tasks, ranks, block, resident=resident, route=name
+                        ),
+                        usable,
+                        self._requested_pools,
+                        storage_mode() if self.xp is not np else "device",
+                        limit=usable / _USABLE_FRACTION,
+                    )
+
+                setting = kpoint_ritz_route()
+                if setting == "auto":
+                    try:
+                        rows_plan = plan_of("rows")
+                    except MemoryError:
+                        rows_plan = None
+                    block_plan = plan_of("block")
+                    route = choose_route(rows_plan, block_plan, usable)
+                    plan = block_plan if route == "block" else rows_plan
+                else:
+                    route, plan = setting, plan_of(setting)
             except (MemoryError, ValueError) as error:
                 failure = (type(error).__name__, str(error))
-        plan, failure = context.bcast((plan, failure), root=0)
+        plan, route, failure = context.bcast((plan, route, failure), root=0)
         if failure is not None:
             kind, message = failure
             raise (MemoryError if kind == "MemoryError" else ValueError)(message)
@@ -340,6 +398,8 @@ class MPIPoolKPointSolver:
         self._pool_comm = comm
         sync = self.backend.synchronize if self.xp is not np else None
         self.group = ColumnGroup(comm, self.xp, sync=sync, mpi=getattr(context, "MPI", None))
+        self.route = route
+        self.group.route = route
 
     # ------------------------------------------------------------------- steps
     def solve(self, potentials: dict, filter_degree: int, tolerance: float | None = None) -> list[np.ndarray]:
@@ -385,6 +445,7 @@ class MPIPoolKPointSolver:
                 xp=self.xp,
                 sync=backend.synchronize,
                 converge_first=settings.initial_method == "chebdav",
+                route=self.route,
             )
             del state
             self._tick("solve", start)
@@ -521,8 +582,13 @@ class MPIPoolKPointSolver:
         self._note_host()
 
     def _resident(self, state) -> None:
-        """Bring the subspace of ``state`` back to the device before its solve."""
+        """Bring the subspace of ``state`` back to the device before its solve.
+
+        Under the block route the solve lays a host copy into an allocation with room for its rows itself.
+        """
         if state is None or not isinstance(state.vectors, np.ndarray) or self.xp is np:
+            return
+        if getattr(self, "route", None) == "block":
             return
         start = time.perf_counter()
         state.vectors = self.backend.asarray(state.vectors)
@@ -626,6 +692,7 @@ class MPIPoolKPointSolver:
             stats["pool_host_setup_bytes"] = float(getattr(self, "host_at_setup_bytes", 0.0))
             stats["pool_host_peak_bytes"] = float(getattr(self, "host_peak_bytes", 0.0))
             stats["pool_reserved_bytes"] = float(getattr(self, "reserved_bytes", 0.0))
+            stats["pool_block_route"] = float(getattr(self, "route", None) == "block")
         return stats
 
     def residuals(self) -> list[float]:
@@ -637,7 +704,8 @@ class MPIPoolKPointSolver:
             return ""
         return (
             f"{self.plan.pools} pool(s) of {'/'.join(str(size) for size in sorted(set(self.plan.sizes), reverse=True))} "
-            f"rank(s), {self.job.n_tasks} task(s); about {self.plan.bytes_per_rank / 1e9:.1f} GB per GPU"
+            f"rank(s), {self.job.n_tasks} task(s); about {self.plan.bytes_per_rank / 1e9:.1f} GB per GPU; "
+            f"{getattr(self, 'route', None) or 'rows'} route"
         )
 
     def close(self) -> None:

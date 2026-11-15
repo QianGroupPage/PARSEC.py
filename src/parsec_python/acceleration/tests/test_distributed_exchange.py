@@ -3529,7 +3529,7 @@ class RitzStandInTests(unittest.TestCase):
             run.solution = solve(raw_overlap, raw_projection)
             return run.solution
 
-        def device_solve(raw_overlap, raw_projection, condition=None):
+        def device_solve(raw_overlap, raw_projection, condition=None, overwrite_grams=False):
             # Stands for the small solve on the device: the host solve of the pair that the current device
             # holds once its stream has done the work queued before, and the results as arrays of that device.
             # A ``condition`` is given the mirrored overlap as an array of the device, complete, before that

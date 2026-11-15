@@ -757,12 +757,13 @@ class CuPySymmetrySCFEigensolver:
                 if mpi_context is not None:
                     operator.distributed_filter_devices = self.sector_device_groups[representation]
                     if getattr(mpi_context, "shared", False):
-                        # The ranks share this sector's basis, one device each.
+                        # The ranks of this sector's group share its basis, one device each (all ranks for
+                        # the one sector of a run without symmetry).
                         from .mpi_shared_basis import attach_shared_group
 
                         attach_shared_group(
                             operator,
-                            mpi_context.comm,
+                            getattr(mpi_context, "sector_comm", mpi_context.comm),
                             ritz_route=getattr(mpi_context, "shared_ritz_route", "rows"),
                         )
                 if neighbors_are_shared and device_id not in shared_device_neighbors:
@@ -1642,7 +1643,25 @@ class CuPySymmetrySCFEigensolver:
                 from .mpi_shared_basis import exchange_bytes, shared_ritz_route
 
                 share = -(-int(count) // group.size)
-                if shared_ritz_route(group.ritz_route) == "rounds":
+                route = shared_ritz_route(group.ritz_route)
+                if route == "block":
+                    # The block route (the default): this rank's columns in an allocation with the room of
+                    # its row block (at most a round of padding, which is at most a buffer), the three
+                    # buffers of a round, the summed pair and the coefficients' buffer (three m x m) and
+                    # the work of the small solve on the root, the condition helper or the eigh helper
+                    # (four more), and four more that CuPy's pool keeps beside them where the work arrays
+                    # find no block it has freed.  Measured on 16 A100 (bulk diamond at the Gamma point,
+                    # pool): 8,000 atoms 60.5 GiB of arrays at the fullest device and 68.1 GiB sampled,
+                    # 69.1 GiB counted; 5,832 atoms 38.3 sampled, 38.7 counted.  Counted as the four shares
+                    # of the row blocks, those 5,832 atoms counted 101.9 GB a rank and were sent to the
+                    # direct allocator (35.3 GiB sampled, 1.3 % slower than the pool), their states to the
+                    # host spill (which a shared basis does not take).
+                    states[owner] += (
+                        rows * share * np.dtype(np.float64).itemsize
+                        + 4 * exchange_bytes()
+                        + 11 * int(count) ** 2 * np.dtype(np.float64).itemsize
+                    )
+                elif route == "rounds":
                     # The Ritz step in rounds (a periodic cell): this rank's
                     # columns and the row block of the basis, the three
                     # buffers of a round (H X, send, receive) and the summed

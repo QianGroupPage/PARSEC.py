@@ -755,10 +755,17 @@ class DistributedStateTests(unittest.TestCase):
             pointers = [int(block.data.ptr) for block in columns.blocks]
             on_device = module.dense_solve_on_device()
             solver = 'solve_whitened_ritz_on_device' if on_device else 'solve_whitened_ritz'
-            with patch.object(module, solver, wraps=getattr(module, solver)) as solve:
+            real, given = getattr(module, solver), []
+
+            def entered(*arguments, **options):
+                # The pair as the step formed it: the device solve may write the symmetric matrices into it.
+                given.append([cp.asnumpy(part) if on_device else np.array(part) for part in arguments[:2]])
+                return real(*arguments, **options)
+
+            with patch.object(module, solver, side_effect=entered) as solve:
                 values, rotated, _whitened = group.ritz(group._operator(group.owner), columns, stages=False)
         solve.assert_called_once()
-        gram = [cp.asnumpy(part) if on_device else np.array(part) for part in solve.call_args.args]
+        gram = given[0]
         # The rotated basis lies in the blocks that held the filtered one.
         self.assertEqual([int(block.data.ptr) for block in rotated.blocks], pointers)
         return values, cp.asnumpy(group.gather(rotated)), gram
@@ -950,10 +957,10 @@ class DistributedStateTests(unittest.TestCase):
 
         given = []
 
-        def recorded(raw_overlap, raw_projection):
+        def recorded(raw_overlap, raw_projection, **options):
             # Host copies: a reference to the Gram pair would keep its pool block from the rest of the step.
             given[:] = cp.asnumpy(raw_overlap), cp.asnumpy(raw_projection)
-            return solve_whitened_ritz_on_device(raw_overlap, raw_projection)
+            return solve_whitened_ritz_on_device(raw_overlap, raw_projection, **options)
 
         _whitened = None
         try:
@@ -1213,10 +1220,10 @@ class DistributedStateTests(unittest.TestCase):
 
         given = []
 
-        def recorded(raw_overlap, raw_projection):
+        def recorded(raw_overlap, raw_projection, **options):
             # Host copies: a reference to the Gram pair would keep its pool block from the rest of the step.
             given[:] = cp.asnumpy(raw_overlap), cp.asnumpy(raw_projection)
-            return solve_whitened_ritz_on_device(raw_overlap, raw_projection)
+            return solve_whitened_ritz_on_device(raw_overlap, raw_projection, **options)
 
         # A tall block of the step with two holds the widest column block and the tallest row block.
         tall = max(rows*max(stop - start for start, stop in ranges), tallest*states)

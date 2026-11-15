@@ -175,6 +175,10 @@ def check_projectors(ranks: int) -> dict:
 
 
 def main() -> None:
+    # "route=<rows|block>" anywhere: the PARSEC_KPOINT_RITZ of the run
+    for argument in [a for a in sys.argv[1:] if a.startswith("route=")]:
+        os.environ["PARSEC_KPOINT_RITZ"] = argument.split("=", 1)[1]
+        sys.argv.remove(argument)
     mode = sys.argv[1]
     if mode == "eigensolver":
         exchange = sys.argv[5] if len(sys.argv) > 5 else None

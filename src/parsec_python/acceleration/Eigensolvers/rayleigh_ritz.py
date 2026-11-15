@@ -1021,10 +1021,116 @@ def _judge_condition(estimate, *arguments) -> float:
     return float(condition)
 
 
+_MIRROR_KERNEL = None
+
+
+def _mirror_lower_in_place(matrix: Any) -> Any:
+    """Copy the lower triangle of a C-ordered square float64 device matrix onto its upper one; returns it.
+
+    The values of ``tril(A) + tril(A, -1).T`` without the two ``m x m``
+    arrays that expression takes (they agree bit for bit but for the sign
+    of a zero).
+    """
+
+    global _MIRROR_KERNEL
+    cp, _ = require_cupy()
+    if _MIRROR_KERNEL is None:
+        _MIRROR_KERNEL = cp.RawKernel(
+            r"""
+extern "C" __global__ void parsec_mirror_lower(double* a, const long long n) {
+    const long long j = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    const long long i = blockIdx.y * (long long)blockDim.y + threadIdx.y;
+    if (i < n && j < n && j > i) a[i * n + j] = a[j * n + i];
+}
+""",
+            "parsec_mirror_lower",
+        )
+    size = int(matrix.shape[0])
+    if size:
+        _MIRROR_KERNEL(((size + 31) // 32, (size + 7) // 8), (32, 8), (matrix, np.int64(size)))
+    return matrix
+
+
+def _mirrorable(matrix: Any) -> bool:
+    cp, _ = require_cupy()
+    return (
+        isinstance(matrix, cp.ndarray)
+        and matrix.ndim == 2
+        and matrix.shape[0] == matrix.shape[1]
+        and matrix.dtype == cp.float64
+        and matrix.flags.c_contiguous
+    )
+
+
+_TRANSPOSE_KERNEL = None
+
+
+def _transpose_in_place(matrix: Any) -> Any:
+    """Transpose the memory of a contiguous square float64 device matrix in place; returns the array.
+
+    The array keeps its shape and order, so it then holds the transposed
+    matrix: an F-ordered ``B`` becomes the F-ordered copy of ``B.T`` that
+    ``cupy.array(B.T, order="F")`` would make, value for value.
+    """
+
+    global _TRANSPOSE_KERNEL
+    cp, _ = require_cupy()
+    if _TRANSPOSE_KERNEL is None:
+        _TRANSPOSE_KERNEL = cp.RawKernel(
+            r"""
+extern "C" __global__ void parsec_transpose_square(double* a, const long long n) {
+    const long long j = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    const long long i = blockIdx.y * (long long)blockDim.y + threadIdx.y;
+    if (i < n && j < n && j > i) {
+        const double upper = a[i * n + j];
+        a[i * n + j] = a[j * n + i];
+        a[j * n + i] = upper;
+    }
+}
+""",
+            "parsec_transpose_square",
+        )
+    size = int(matrix.shape[0])
+    if size:
+        _TRANSPOSE_KERNEL(((size + 31) // 32, (size + 7) // 8), (32, 8), (matrix, np.int64(size)))
+    return matrix
+
+
+def eigh_in_place(matrix: Any, *, vectors: bool = True):
+    """``cupy.linalg.eigh`` (or ``eigvalsh``) of an F-ordered float64 device matrix in its own memory.
+
+    CuPy's eigensolver copies its matrix before cuSOLVER's ``syevd`` and
+    returns the copy as the eigenvectors; here ``syevd`` works on
+    ``matrix`` itself, the same routine on the same values, so the results
+    are the same bit for bit and the copy (``m x m``) is not made.
+    ``matrix`` then holds the eigenvectors (or what ``syevd`` left there).
+    Returns ``(eigenvalues, matrix)``, or the eigenvalues alone.
+    """
+
+    cp, _ = require_cupy()
+    if not (matrix.flags.f_contiguous and matrix.dtype == cp.float64 and matrix.ndim == 2):
+        raise ValueError("eigh_in_place needs an F-ordered float64 square matrix")
+    try:
+        from cupy.linalg._eigenvalue import _syevd
+    except ImportError:  # a CuPy without the private routine: the copy of before
+        if vectors:
+            values, result = cp.linalg.eigh(matrix)
+            matrix[...] = result
+            return values, matrix
+        return cp.linalg.eigvalsh(matrix)
+    values, result = _syevd(matrix, "L", vectors, overwrite_a=True)
+    if result.data.ptr != matrix.data.ptr:
+        matrix[...] = result
+    return (values, matrix) if vectors else values
+
+
 def solve_whitened_ritz_on_device(
     raw_overlap: Any,
     raw_projection: Any,
     condition: Any | None = None,
+    *,
+    overwrite_grams: bool = False,
+    eigensolver: Any | None = None,
 ) -> tuple[Any, Any, Any]:
     """Solve the small generalized Ritz problem on the current device.
 
@@ -1051,17 +1157,46 @@ def solve_whitened_ritz_on_device(
     is new is work that an unsafe overlap would have spared: the
     factorization of an overlap that is not finite, which cuSOLVER
     completes, while its eigensolver is still given finite matrices only.
+
+    ``overwrite_grams`` lets the symmetric matrices be formed in the given
+    arrays (C-ordered ``m x m`` ones; others are copied as before), whose
+    caller has no further use for them.  The intermediates of the whitening
+    are released as soon as they are consumed.  Neither changes a value:
+    the device holds about nine ``m x m`` arrays at the eigensolve instead
+    of twelve (``cupy.linalg.eigh`` copies its matrix and takes a work space
+    of four more).  Where the given arrays take the symmetric matrices, the
+    whitening is formed in the second of them, too: both triangular solves
+    overwrite it (cuBLAS solves in place what CuPy would copy first; the
+    transposed copy between them is a transposition in place), so the
+    returned whitened matrix is that array, F-ordered, and the coefficients
+    are formed in the eigenvectors; the audit subtracts the identity on the
+    diagonal in place.  The same operations on the same values: the same
+    bits, with three ``m x m`` arrays fewer at the eigensolve and two fewer
+    at the audit.
+
+    ``eigensolver``, given, replaces ``cupy.linalg.eigh`` of the whitened
+    matrix (an F-ordered device array that it must leave intact): it
+    returns the eigenvalues and an F-ordered device array of the
+    eigenvectors, which this function may overwrite, or raises
+    ``numpy.linalg.LinAlgError``.  The shared basis of several MPI ranks
+    solves it on another rank that way (:meth:`.mpi_shared_basis.MPIShardGroup._small_solve`).
     """
 
     import cupyx
     from cupyx.scipy.linalg import solve_triangular as device_solve_triangular
 
     cp, _ = require_cupy()
-    lower = cp.tril(raw_overlap)
-    overlap = lower + cp.tril(lower, -1).T
-    lower = cp.tril(raw_projection)
-    projected = lower + cp.tril(lower, -1).T
-    del lower
+    in_place = bool(overwrite_grams and _mirrorable(raw_overlap) and _mirrorable(raw_projection))
+    if in_place:
+        overlap = _mirror_lower_in_place(raw_overlap)
+        projected = _mirror_lower_in_place(raw_projection)
+    else:
+        lower = cp.tril(raw_overlap)
+        overlap = lower + cp.tril(lower, -1).T
+        lower = cp.tril(raw_projection)
+        projected = lower + cp.tril(lower, -1).T
+        del lower
+    del raw_overlap, raw_projection
     # What waits for a number that is estimated elsewhere.  It is taken out
     # before it is called: an error of the estimate holds this frame in its
     # traceback, as it does that of :func:`_judge_condition`.
@@ -1078,28 +1213,57 @@ def solve_whitened_ritz_on_device(
         with cupyx.errstate(linalg="raise"):
             # Column-major factors are passed to cuBLAS where they lie.
             cholesky = cp.asfortranarray(cp.linalg.cholesky(overlap))
-            left_projected = device_solve_triangular(
-                cholesky,
-                projected,
-                lower=True,
-            )
-            whitened = device_solve_triangular(
-                cholesky,
-                left_projected.T,
-                lower=True,
-            ).T
+            if in_place:
+                # The F-ordered copy that the solve below makes of the
+                # symmetric projection is its own memory read F-ordered.
+                block = projected.T
+                del projected
+                _solved_in_place(device_solve_triangular(cholesky, block, lower=True, overwrite_b=True), block)
+                # The second solve copies the transpose of the first result,
+                # F-ordered: the same memory transposed in place.
+                _transpose_in_place(block)
+                _solved_in_place(device_solve_triangular(cholesky, block, lower=True, overwrite_b=True), block)
+                # ``.T`` of that result, made F-ordered as the eigensolver
+                # copies it: once more transposed in place.
+                whitened = _transpose_in_place(block)
+                del block
+            else:
+                left_projected = device_solve_triangular(
+                    cholesky,
+                    projected,
+                    lower=True,
+                )
+                del projected
+                whitened = device_solve_triangular(
+                    cholesky,
+                    left_projected.T,
+                    lower=True,
+                ).T
+                del left_projected
             # The triangular solves report nothing.  A non-finite whitened
             # matrix is rejected here, before cuSOLVER, as the host
             # eigensolver or the audit rejects it.
             if not bool(cp.isfinite(whitened).all().item()):
                 raise np.linalg.LinAlgError("whitened projection is not finite")
             # cuSOLVER reads the lower triangle of the whitened matrix only.
-            eigenvalues, whitened_vectors = cp.linalg.eigh(whitened)
-            coefficients = device_solve_triangular(
-                cp.asfortranarray(cholesky.T),
-                whitened_vectors,
-                lower=False,
-            )
+            if eigensolver is not None:
+                eigenvalues, whitened_vectors = eigensolver(whitened)
+            else:
+                eigenvalues, whitened_vectors = cp.linalg.eigh(whitened)
+            if in_place:
+                # The eigenvectors are this function's to overwrite.
+                coefficients = whitened_vectors
+                _solved_in_place(
+                    device_solve_triangular(cp.asfortranarray(cholesky.T), coefficients, lower=False, overwrite_b=True),
+                    coefficients,
+                )
+            else:
+                coefficients = device_solve_triangular(
+                    cp.asfortranarray(cholesky.T),
+                    whitened_vectors,
+                    lower=False,
+                )
+            del whitened_vectors, cholesky
     except np.linalg.LinAlgError as error:
         if waiting:
             _judge_condition(waiting.pop())
@@ -1116,18 +1280,34 @@ def solve_whitened_ritz_on_device(
         _judge_condition(waiting.pop())
 
     coefficient_overlap = coefficients.T @ overlap @ coefficients
-    audit_error = float(
-        cp.abs(
-            coefficient_overlap
-            - cp.eye(coefficient_overlap.shape[0], dtype=cp.float64)
-        ).max().item()
-    )
+    if in_place:
+        # |C^T S C - I| with the identity subtracted on the diagonal: the same
+        # differences (off the diagonal x - 0 = x), without two more arrays.
+        diagonal = cp.arange(int(coefficient_overlap.shape[0]))
+        coefficient_overlap[diagonal, diagonal] -= 1.0
+        del diagonal
+        audit_error = float(cp.abs(coefficient_overlap, out=coefficient_overlap).max().item())
+    else:
+        audit_error = float(
+            cp.abs(
+                coefficient_overlap
+                - cp.eye(coefficient_overlap.shape[0], dtype=cp.float64)
+            ).max().item()
+        )
+    del coefficient_overlap
     if not np.isfinite(audit_error) or audit_error > 5.0e-10:
         raise GeneralizedRitzStabilityError(
             f"generalized Ritz orthogonality audit failed ({audit_error:.3e})"
         )
 
     return eigenvalues, coefficients, whitened
+
+
+def _solved_in_place(result: Any, block: Any) -> None:
+    """Keep a triangular solve with ``overwrite_b`` in ``block`` (a CuPy that copied anyway: copy it back)."""
+
+    if result.data.ptr != block.data.ptr:
+        block[...] = result
 
 
 @dataclass(frozen=True)

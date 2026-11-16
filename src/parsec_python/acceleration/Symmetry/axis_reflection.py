@@ -18,7 +18,7 @@ valid for both PARSEC's half-grid shift and zero-shift diagnostic grids.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import combinations, permutations, product
 import os
 from typing import Sequence
@@ -841,10 +841,226 @@ class SignedPermutationReduction(AxisReflectionReduction):
         )
 
 
+def orbital_group_policy() -> str:
+    """``PARSEC_ORBITAL_GROUP``: ``auto`` (the default) or ``abelian``.
+
+    ``auto`` lets the orbitals use the one-dimensional sectors of the subgroup of the full point group that
+    :func:`.orbital_groups.orbital_group_plan` chooses (:class:`PointGroupReduction`) where that solves less
+    than the abelian group of before, for a calculation that the sectors with weights serve (see the driver);
+    ``abelian`` keeps the reflection or commuting signed-permutation group of before, bit for bit.
+    """
+
+    value = os.environ.get("PARSEC_ORBITAL_GROUP", "auto").strip().lower() or "auto"
+    if value not in ("auto", "abelian"):
+        raise ValueError("PARSEC_ORBITAL_GROUP must be auto or abelian")
+    return value
+
+
+@dataclass(frozen=True)
+class PointGroupReduction(SignedPermutationReduction):
+    """Orbits of a subgroup ``H`` of the full point group ``G`` whose orbitals use only the 1-D sectors of ``H``.
+
+    ``operations`` are the signed permutations of ``H``; ``full_operations`` those of ``G``;
+    ``sector_characters[s, h]`` the real one-dimensional character of solved sector ``s`` at operation ``h``
+    of ``H``; ``sector_weights[s]`` how many states each state of sector ``s`` counts for (its degeneracy in
+    ``G`` over the number of solved sectors that hold the level, :mod:`.orbital_groups`); ``coset_images[c,
+    w]`` the orbit of ``c r_w`` for the right coset representatives ``c`` of ``G`` (``G`` = union of ``H c``,
+    the identity first), which average an ``H``-invariant field over ``G``:
+
+    ``f_G(w) = (1 / [G:H]) sum_c f[coset_images[c, w]]``.
+
+    The scalar fields (density, potentials) keep one value per orbit of ``H`` as before.  ``generator_bits``
+    is empty: ``H`` need not be abelian or of order two per element.
+    """
+
+    full_operations: np.ndarray = None
+    sector_characters: np.ndarray = None
+    sector_weights: np.ndarray = None
+    coset_images: np.ndarray = None
+    # the right coset representatives as matrices (the identity first) and the grid, which give the partner
+    # states of a weighted one (:meth:`partner_states`)
+    coset_operations: np.ndarray = None
+    grid: object = field(default=None, compare=False, repr=False)
+
+    @property
+    def coset_count(self) -> int:
+        return int(self.coset_images.shape[0])
+
+    def partner_states(self, vectors: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        """Full-grid states with the partners of every weighted one: ``sum(weights)`` columns.
+
+        ``vectors`` (full grid x states) are solved sector states; a state of weight ``w > 1`` stands for
+        ``w`` degenerate partners, which lie in the span of its images ``psi(g^-1 r)`` under the operations
+        ``g`` of the full group (one per left coset ``g H`` suffices: ``psi`` is an eigenfunction of every
+        operation of ``H``).  The images are orthonormalized after the state itself, which stays the first
+        partner, in the order of the operations, until ``w`` independent ones are found; the row map of an
+        operation is built once.  A state of weight 1 is copied.
+        """
+
+        vectors = np.asarray(vectors, dtype=np.float64)
+        weights = np.asarray(weights, dtype=np.int64)
+        if vectors.ndim != 2 or vectors.shape[1] != weights.size:
+            raise ValueError("one weight per state is needed")
+        if np.all(weights == 1):
+            return vectors.copy()
+        if self.grid is None or self.full_operations is None:
+            raise RuntimeError("the partner states need the grid and the operations of the full group")
+        identity = np.eye(3, dtype=np.int8)
+        operations = [op for op in np.asarray(self.full_operations, dtype=np.int8) if not np.array_equal(op, identity)]
+        cache: dict[int, np.ndarray] = {}
+
+        def row_map(index: int) -> np.ndarray:
+            if index not in cache:
+                mapping = _grid_row_mapping_operation(self.grid, operations[index], 1.0e-10)
+                if mapping is None:
+                    raise RuntimeError("an operation of the full group no longer maps the grid")
+                cache[index] = mapping
+            return cache[index]
+
+        out = np.empty((vectors.shape[0], int(weights.sum())), dtype=np.float64)
+        column = 0
+        for index, weight in enumerate(weights):
+            state = vectors[:, index]
+            out[:, column] = state
+            if weight == 1:
+                column += 1
+                continue
+            kept = [state / np.linalg.norm(state)]
+            for operation in range(len(operations)):
+                if len(kept) == weight:
+                    break
+                image = np.empty_like(state)
+                image[row_map(operation)] = state
+                for basis in kept:
+                    image -= np.dot(basis, image) * basis
+                norm = np.linalg.norm(image)
+                if norm > 1.0e-6 * np.linalg.norm(state):
+                    kept.append(image / norm)
+            if len(kept) != weight:
+                raise RuntimeError("the images of a weighted state give too few partners")
+            scale = np.linalg.norm(state)
+            for offset, basis in enumerate(kept[1:], start=1):
+                out[:, column + offset] = basis * scale
+            column += int(weight)
+        return out
+
+    def symmetrize_values(self, values: np.ndarray) -> np.ndarray:
+        """The average over ``G`` of an ``H``-invariant field given by its orbit values."""
+
+        values = np.asarray(values, dtype=np.float64)
+        if self.coset_count <= 1:
+            return values.copy()
+        total = values[self.coset_images[0]].copy()
+        for images in self.coset_images[1:]:
+            total += values[images]
+        return total / float(self.coset_count)
+
+
+def _point_group_operations(
+    grid: RealSpaceGrid,
+    atoms: Sequence[Atom],
+    atom_tolerance: float,
+    lattice_tolerance: float,
+    table,
+) -> list[np.ndarray]:
+    """The signed permutations that map the atoms onto themselves and the lattice onto itself (the identity first).
+
+    Whether one maps the active grid onto itself is decided by its row map, which is built for the operations
+    of the chosen subgroup and the coset representatives only (every other one is a product of those).
+    """
+
+    species = _positions_by_species(atoms)
+    identity = np.eye(3, dtype=np.int8)
+    found = [identity]
+    for operation in _signed_permutation_operations():
+        if np.array_equal(operation, identity):
+            continue
+        if not _atoms_are_invariant_operation(species, operation, atom_tolerance):
+            continue
+        if _integer_signed_permutation_parameters(grid, operation, lattice_tolerance) is None:
+            continue
+        found.append(operation)
+    return found
+
+
+def detect_point_group_reduction(
+    grid: RealSpaceGrid,
+    atoms: Sequence[Atom],
+    abelian: AxisReflectionReduction,
+    *,
+    atom_tolerance: float = 1.0e-7,
+    lattice_tolerance: float = 1.0e-10,
+) -> AxisReflectionReduction:
+    """``abelian`` (the reduction of before), or a :class:`PointGroupReduction` where that solves less.
+
+    The full group ``G`` is every signed permutation that maps the atoms (species by species) and the active
+    grid (row by row, exactly) onto themselves; :func:`.orbital_groups.orbital_group_plan` chooses ``H`` and
+    its sectors.  ``abelian`` is returned unchanged where ``G`` is no group (an atom tolerance that accepts
+    two operations and refuses their product), where the plan solves no less than ``abelian`` does
+    (``1/|abelian|`` of the rows times states), or under ``PARSEC_ORBITAL_GROUP=abelian``.
+    """
+
+    if orbital_group_policy() == "abelian" or not atoms:
+        return abelian
+    from .orbital_groups import multiplication_table, orbital_group_plan
+
+    table = _RowOrderTable(grid) if _fast_maps_requested() else None
+    candidates = _point_group_operations(grid, atoms, atom_tolerance, lattice_tolerance, table)
+    if len(candidates) <= abelian.group_order:
+        return abelian
+    try:
+        multiplication_table(candidates)
+    except ValueError:
+        return abelian
+    plan = orbital_group_plan(candidates)
+    # Taken where it solves at most half of what the abelian group does (Td, Oh, T, Th: a half to a quarter);
+    # a smaller gain (D4h: three quarters) keeps the group of before.
+    if not plan.cost <= 0.5 / abelian.group_order + 1.0e-12:
+        return abelian
+    subgroup = [candidates[index] for index in plan.subgroup]
+    mappings = []
+    for operation in subgroup:
+        mapping = _grid_row_mapping_operation(grid, operation, lattice_tolerance, table=table)
+        if mapping is None:
+            return abelian
+        mappings.append(mapping)
+    representative_rows, full_to_wedge, multiplicities = _orbit_labels(mappings)
+    if np.any(multiplicities <= 0):
+        raise RuntimeError("invalid empty symmetry orbit")
+    characters = np.array(
+        [[character[index] for index in plan.subgroup] for character in plan.characters], dtype=np.int8
+    )
+    coset_images = np.empty((len(plan.cosets), representative_rows.size), dtype=np.int64)
+    for c, index in enumerate(plan.cosets):
+        # The whole map: with those of H it shows that every operation of G maps the active grid onto itself.
+        mapping = _grid_row_mapping_operation(grid, candidates[index], lattice_tolerance, table=table)
+        if mapping is None:
+            return abelian
+        coset_images[c] = full_to_wedge[mapping[representative_rows]]
+    order = len(subgroup)
+    return PointGroupReduction(
+        signs=np.ones((order, 3), dtype=np.int8),
+        representative_rows=np.ascontiguousarray(representative_rows, dtype=np.int64),
+        full_to_wedge=np.ascontiguousarray(full_to_wedge, dtype=np.int64),
+        multiplicities=np.ascontiguousarray(multiplicities, dtype=np.int64),
+        operations=np.ascontiguousarray(subgroup, dtype=np.int8),
+        generator_bits=np.zeros((order, 0), dtype=np.int8),
+        full_operations=np.ascontiguousarray(candidates, dtype=np.int8),
+        sector_characters=np.ascontiguousarray(characters),
+        sector_weights=np.asarray(plan.weights, dtype=np.int64),
+        coset_images=np.ascontiguousarray(coset_images),
+        coset_operations=np.ascontiguousarray([candidates[index] for index in plan.cosets], dtype=np.int8),
+        grid=grid,
+    )
+
+
 __all__ = [
     "AxisReflectionReduction",
+    "PointGroupReduction",
     "SignedPermutationReduction",
     "_RowOrderTable",
     "_fast_maps_requested",
     "_grid_row_mapping_operation",
+    "detect_point_group_reduction",
+    "orbital_group_policy",
 ]

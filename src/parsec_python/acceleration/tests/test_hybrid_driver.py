@@ -4196,6 +4196,13 @@ class HartreeDevicePlacementTests(unittest.TestCase):
     "both parsec_accelerated_native and CuPy/CUDA are required",
 )
 class RealHybridAccuracyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests check the reflection sectors of the hydrogen smoke input, whose full group (Oh) takes the
+        # weighted sectors of a larger subgroup by default (Symmetry/orbital_groups.py): the group of before.
+        guard = patch.dict(os.environ, {"PARSEC_ORBITAL_GROUP": "abelian"})
+        guard.start()
+        self.addCleanup(guard.stop)
+
     def tearDown(self) -> None:
         # Prepared systems that a test left in a reference cycle are destroyed
         # here, between the tests, and not by a collection inside the next one.

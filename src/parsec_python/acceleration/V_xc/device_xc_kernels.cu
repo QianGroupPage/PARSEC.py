@@ -16,7 +16,10 @@
 // own box, and its stencil wraps around.  ``flips`` (bit a set where the
 // reflection that carries the representative onto the box point reverses
 // axis a) carries the components of a vector field, the GGA flux, from the
-// representative to the other points of its orbit.
+// representative to the other points of its orbit.  With ``use_flips`` 2 the byte of a box point is
+// instead the index of the operation (a signed permutation) that carries the representative onto it, and
+// ``table`` holds per operation the source axis and the sign of each component (6 bytes): component a of
+// the image is sign[a] * component perm[a] of the vector at the representative.
 //
 // A module holds the kernels named by -DKERNEL_<name> options only (each
 // functional compiles what it launches).
@@ -123,14 +126,18 @@ static __device__ __forceinline__ double scalar_sample(const double* values, con
     return value < 0 ? 0.0 : values[value];
 }
 
-// Component ``axis`` of a vector field stored at the representatives.
-static __device__ __forceinline__ double vector_sample(const double* component, const int* value_of_box,
-                                                const unsigned char* flips, int use_flips, index_t box,
-                                                int axis) {
+// Component ``axis`` of a vector field stored at the representatives (``flux``: 3 x count).
+static __device__ __forceinline__ double vector_sample(const double* flux, index_t count, const int* value_of_box,
+                                                const unsigned char* flips, int use_flips,
+                                                const signed char* table, index_t box, int axis) {
     if (box < 0) return 0.0;
     int value = value_of_box[box];
     if (value < 0) return 0.0;
-    double sample = component[value];
+    if (use_flips == 2) {
+        const signed char* operation = table + 6 * (int)flips[box];
+        return (double)operation[3 + axis] * flux[(index_t)operation[axis] * count + value];
+    }
+    double sample = flux[(index_t)axis * count + value];
     if (use_flips && ((flips[box] >> axis) & 1)) sample = -sample;
     return sample;
 }
@@ -165,7 +172,7 @@ extern "C" __global__ void xc_gradient(
 #ifdef KERNEL_xc_adjoint
 extern "C" __global__ void xc_adjoint(
     index_t count, const double* flux, const int* value_of_box, const unsigned char* flips,
-    int use_flips, const int* positions, int n0, int n1, int n2, int periodic, int width,
+    int use_flips, const signed char* table, const int* positions, int n0, int n1, int n2, int periodic, int width,
     const double* negated_weights, const double* base, double scale, double* out) {
     index_t w = (index_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (w >= count) return;
@@ -177,9 +184,9 @@ extern "C" __global__ void xc_adjoint(
         const double* component = flux + axis * count;
         double sum = component[w] * negated_weights[width];
         for (int j = -width; j < 0; ++j) {
-            double left = vector_sample(component, value_of_box, flips, use_flips,
+            double left = vector_sample(flux, count, value_of_box, flips, use_flips, table,
                                         box_neighbor(point, axis, j, lengths, strides, periodic), axis);
-            double right = vector_sample(component, value_of_box, flips, use_flips,
+            double right = vector_sample(flux, count, value_of_box, flips, use_flips, table,
                                          box_neighbor(point, axis, -j, lengths, strides, periodic), axis);
             sum += (left - right) * negated_weights[width + j];
         }

@@ -107,6 +107,9 @@ class CuPySymmetryEigvalResult:
     # ``(nec, maxmvs)`` of an ARPACK solve of every sector, each a tuple of
     # one count per representation (eigval.F90 lists them so); else None.
     iterative_counts: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    # How many states each returned state counts for (the weight of its sector, Symmetry/orbital_groups.py),
+    # or None where every state counts once (the groups of before).
+    state_weights: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +149,13 @@ class CuPySymmetryOrbitals:
     # (PARSEC_CUPY_RITZ_HANDOVER).  The density reads it; an export takes
     # the Ritz vectors that ensure_ritz_vectors of the solver formed first.
     sector_handovers: tuple[Any, ...] | None = None
+    # A reduction whose sectors are the one-dimensional ones of a subgroup of the full point group
+    # (Symmetry.PointGroupReduction): their weighted density is averaged over the full group, which adds the
+    # partners of degenerate levels that no solved sector holds.  ``None`` for the groups of before.
+    point_group: Any = None
+    # Set on the orbitals of a result (not those the SCF loop reads): the weight of every selected state,
+    # whose partners :meth:`to_full_host` adds and :attr:`shape` counts.
+    state_weights: np.ndarray | None = None
 
     def to_full_host(self, block_states: int = 8) -> np.ndarray:
         """Export orbitals in bounded host blocks, without a primary-GPU gather.
@@ -162,7 +172,8 @@ class CuPySymmetryOrbitals:
             raise RuntimeError("a sector basis shared by several devices cannot be exported as one host array here")
         self._require_ritz_vectors()
         cp, _ = require_cupy()
-        full = np.empty(self.shape, dtype=np.float64, order="F")
+        # The solved states first; the partners of weighted ones are added below.
+        full = np.empty(self.solved_shape, dtype=np.float64, order="F")
         for representation in range(int(self.phases.shape[0])):
             output_columns = np.flatnonzero(self.representations == representation)
             if not output_columns.size:
@@ -192,10 +203,21 @@ class CuPySymmetryOrbitals:
                         selected * self.sector_scales[representation][:, None]
                     )
                 full[:, columns] = wedge[self.full_to_wedge, :] * phases[:, None]
+        if self.state_weights is not None:
+            # Every partner of a weighted state, from its images under the coset representatives.
+            return self.point_group.partner_states(full, self.state_weights)
         return full
 
     @property
     def shape(self) -> tuple[int, int]:
+        if self.state_weights is not None:
+            return self.full_size, int(np.sum(self.state_weights))
+        return self.solved_shape
+
+    @property
+    def solved_shape(self) -> tuple[int, int]:
+        """Full grid x the states the sectors solved (without the partners of weighted ones)."""
+
         if self.scaled_wedge_vectors is not None:
             count = int(self.scaled_wedge_vectors.shape[1])
         else:
@@ -264,7 +286,7 @@ class CuPySymmetryOrbitals:
                     )[:, None],
                     cp.asarray(output_columns, dtype=cp.int64)[None, :],
                 ] = selected
-        full = cp.empty(self.shape, dtype=cp.float64, order="F")
+        full = cp.empty(self.solved_shape, dtype=cp.float64, order="F")
         # Maps kept on the host are uploaded here, one phase row at a time;
         # ``cp.asarray`` returns an already matching device array unchanged.
         device_full_to_wedge = cp.asarray(
@@ -286,6 +308,11 @@ class CuPySymmetryOrbitals:
                 self.phases[representation], dtype=cp.float64
             )[:, None]
             full[:, output_columns] = expanded
+        if self.state_weights is not None:
+            # The partners of weighted states are formed on the host (as in to_full_host).
+            return cp.asfortranarray(
+                cp.asarray(self.point_group.partner_states(cp.asnumpy(full), self.state_weights))
+            )
         return full
 
 
@@ -409,6 +436,11 @@ def fixed_state_count_requested(reference) -> bool:
 
     eigensolver = getattr(getattr(reference, "input", None), "eigensolver", None)
     return bool(getattr(eigensolver, "fixed_state_count", False))
+
+
+# The margin of the initial state count of every weighted sector over its even share (see
+# CuPySymmetrySCFEigensolver._initial_sector_count).
+_WEIGHTED_SECTOR_MARGIN = 0.10
 
 
 class CuPySymmetrySCFEigensolver:
@@ -1973,12 +2005,52 @@ class CuPySymmetrySCFEigensolver:
         # PARSEC initeigval: nadd + nstate/nrep (integer division).  The ceil
         # guard matters only for an unusual user choice nadd=0 and ensures the
         # union contains at least the globally requested number of states.
+        # With weighted sectors (a subgroup's one-dimensional sectors) every sector holds about
+        # requested / sum(weights) of the states: the sum is the count of sectors of before.
+        shares = self._weight_total
+        if self._weighted:
+            # The sectors of a non-abelian subgroup hold different kinds of levels (Td in D2d: A1 with one
+            # partner of E, A2 with E, and one partner of T1 or T2), not equal shares of the lowest ones: on
+            # 16 A100 the A1 and T2 sectors of the nanodiamonds k14 and k15 needed 4 % more than the even
+            # share, failed the spectral bracket of the first solve and were solved again with half as many
+            # columns more, the first basis still held (k15: 55 GiB at the fullest GPU instead of about 25).
+            # Each starts with a margin instead.
+            share = -(-int(requested_states * (1.0 + _WEIGHTED_SECTOR_MARGIN)) // shares)
+            return min(self.decomposition.sector_size(representation), max(1, share + safety_buffer))
         count = max(
-            (requested_states + self.representation_count - 1)
-            // self.representation_count,
-            requested_states // self.representation_count + safety_buffer,
+            (requested_states + shares - 1) // shares,
+            requested_states // shares + safety_buffer,
         )
         return min(self.decomposition.sector_size(representation), max(1, count))
+
+    @property
+    def _sector_weight_array(self) -> np.ndarray:
+        weights = getattr(self, "_sector_weights_cache", None)
+        if weights is None:
+            weights = np.asarray(getattr(self.decomposition, "sector_weights", None)
+                                 if getattr(self.decomposition, "sector_weights", None) is not None
+                                 else np.ones(self.representation_count), dtype=np.int64)
+            self._sector_weights_cache = weights
+        return weights
+
+    @property
+    def _weight_total(self) -> int:
+        return int(np.sum(self._sector_weight_array))
+
+    @property
+    def _weighted(self) -> bool:
+        return bool(np.any(self._sector_weight_array != 1))
+
+    def _leading_states(self, representations: np.ndarray, requested: int) -> int:
+        """How many of the globally sorted states hold ``requested`` states counted with their weights."""
+
+        requested = int(requested)
+        if not self._weighted or requested <= 0:
+            return max(0, requested)
+        cumulative = np.cumsum(self._sector_weight_array[np.asarray(representations, dtype=np.int64)])
+        if cumulative.size == 0 or cumulative[-1] < requested:
+            return int(cumulative.size) + 1
+        return int(np.searchsorted(cumulative, requested)) + 1
 
     def _update_local_potential(self, full_potential) -> None:
         """Upload one shared invariant wedge field for all sector operators."""
@@ -2566,9 +2638,10 @@ class CuPySymmetrySCFEigensolver:
         reasons: list[str] = []
         for _ in range(8):
             values, representations, _ = self._global_order(results)
-            if values.size < requested_states:
+            leading = self._leading_states(representations, requested_states)
+            if values.size < leading:
                 raise RuntimeError("symmetry sectors returned too few eigenvalues")
-            cutoff = float(values[requested_states - 1])
+            cutoff = float(values[leading - 1])
             grow: list[int] = []
             for representation, result in enumerate(results):
                 sector_size = self.decomposition.sector_size(representation)
@@ -2626,12 +2699,13 @@ class CuPySymmetrySCFEigensolver:
         if safety_buffer < 1:
             return
         _, representations, _ = self._global_order(results)
+        leading = self._leading_states(representations, max(0, requested_states - 1))
         base = np.bincount(
-            representations[: max(0, requested_states - 1)],
+            representations[:leading],
             minlength=self.representation_count,
         )
         extra = np.zeros(self.representation_count, dtype=np.int64)
-        for representation in representations[max(0, requested_states - 1) :]:
+        for representation in representations[leading:]:
             index = int(representation)
             if extra[index] < safety_buffer:
                 extra[index] += 1
@@ -2681,7 +2755,8 @@ class CuPySymmetrySCFEigensolver:
 
         _, representations, _ = self._global_order(results)
         share = np.bincount(
-            representations[:requested_states], minlength=self.representation_count
+            representations[: self._leading_states(representations, requested_states)],
+            minlength=self.representation_count,
         )
         desired = np.maximum(1, share)
         context = getattr(self, "mpi_context", None)
@@ -2743,6 +2818,11 @@ class CuPySymmetrySCFEigensolver:
             sector_orbits=self._sector_orbits,
             sector_scales=self._sector_scales,
             wedge_size=self.decomposition.wedge_size,
+            point_group=(
+                self.decomposition.reduction
+                if hasattr(self.decomposition.reduction, "coset_images")
+                else None
+            ),
             remote_sectors=(getattr(self, "mpi_context", None) is not None
                             and self.mpi_context.size > 1),
             spin_channel=(
@@ -2823,9 +2903,11 @@ class CuPySymmetrySCFEigensolver:
         reasons.extend(bracket_reasons)
 
         values, representations, columns = self._global_order(results)
-        selected_values = np.asarray(values[:requested_states], dtype=np.float64)
-        selected_representations = representations[:requested_states]
-        selected_columns = columns[:requested_states]
+        # With weighted sectors the leading states that hold the requested ones counted with their weights.
+        leading = self._leading_states(representations, requested_states)
+        selected_values = np.asarray(values[:leading], dtype=np.float64)
+        selected_representations = representations[:leading]
+        selected_columns = columns[:leading]
         vectors = self._pack_selected_wedge_vectors(
             results, selected_representations, selected_columns
         )
@@ -2885,6 +2967,12 @@ class CuPySymmetrySCFEigensolver:
             representations=np.asarray(selected_representations, dtype=np.int32),
             representation_columns=np.asarray(selected_columns, dtype=np.int32),
             iterative_counts=iterative_counts,
+            state_weights=(
+                np.asarray(self._sector_weight_array[np.asarray(selected_representations, dtype=np.int64)],
+                           dtype=np.float64)
+                if self._weighted
+                else None
+            ),
         )
 
 

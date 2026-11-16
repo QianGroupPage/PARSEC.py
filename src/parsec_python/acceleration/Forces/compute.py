@@ -29,6 +29,7 @@ from parsec_python.Forces import (
     nonlocal_forces,
     point_charge_forces,
 )
+from parsec_python.Forces.symmetry import symmetrize_forces
 from parsec_python.Forces.total import embedding_force_fields
 
 
@@ -68,10 +69,15 @@ def _nonlocal_forces(system, result, clock: dict) -> np.ndarray:
     if channels is not None:
         return _spin_nonlocal_forces(system, channels, operator, atom_count)
 
-    sectors = getattr(system.backend, "symmetry_eigensolver", None)
+    sectors = getattr(getattr(system, "backend", None), "symmetry_eigensolver", None)
     if sectors is not None:
         # Sector labels of the reference result are PARSEC's, from one.
         representations = np.asarray(result.representations, dtype=np.int32) - 1
+        solved = getattr(result, "sector_states", None)
+        if solved is not None:
+            # Weighted sectors: the states they solved, each with its occupation times its weight.
+            representations = np.asarray(solved[0], dtype=np.int32) - 1
+            occupations = np.asarray(solved[1], dtype=np.float64)
         terms = sectors.projector_force_terms(
             representations, sector_columns(representations), occupations
         )
@@ -338,6 +344,14 @@ def compute_forces(
     clock["local"] = perf_counter() - mark
     mark = perf_counter()
     separable = _nonlocal_forces(system, result, clock)
+    sectors = getattr(getattr(system, "backend", None), "symmetry_eigensolver", None)
+    if symmetrize and hasattr(getattr(getattr(sectors, "decomposition", None), "reduction", None), "coset_images"):
+        # The one-dimensional sectors of a subgroup of the point group solve one partner of some degenerate
+        # levels (weighted in the occupations): the nonlocal term of all partners is its average over the
+        # full point group, which the total gets below in any case and its report gets here.
+        if operations is None:
+            operations = atom_symmetry_operations(atoms)
+        separable = symmetrize_forces(separable, operations)
     clock["nonlocal"] = perf_counter() - mark
     mark = perf_counter()
     corrections = correction_forces(system, result)

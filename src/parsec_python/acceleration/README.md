@@ -43,8 +43,11 @@ Hartree system, while CuPy keeps the Hamiltonian and eigensolver work on the
 GPU. Exact commuting Cartesian signed permutations are detected automatically
 for scalar fields and Hartree. The CuPy eigensolver uses all real
 one-dimensional representations of the proved diagonal-reflection subgroup,
-as PARSEC does. Fixed-point orbits are admitted by their exact stabilizer
-characters, so representation dimensions may differ. All operations,
+as PARSEC does, or, where the full point group of signed permutations is
+larger and that solves less (a tetrahedral or cubic cluster), the
+one-dimensional representations of a larger subgroup with weights (below,
+"Weighted sectors of a larger subgroup"). Fixed-point orbits are admitted by
+their exact stabilizer characters, so representation dimensions may differ. All operations,
 dimensions, device assignments, and fallback decisions are reported.
 
 The canonical launcher accepts the same supported `parsec.in` and adjacent
@@ -912,6 +915,7 @@ a setting that selects the former one:
 | `PARSEC_CUPY_RITZ_CONDITION_HELPER` | `auto`: beside that solve on the owner of a shared basis, another device of the sector estimates the condition number of the overlap, never the device that holds the Hartree objects. `any` asks that device too where the sector has no other and the sharing rule counts the room for the estimate; it was the default for a while (below); ranks that share a basis over MPI (`Eigensolvers/mpi_shared_basis.py`): rank 1 estimates it for the root (same bits) | `off`: the owner estimates it first |
 | `PARSEC_MPI_SHARED_RITZ` | `auto`: a basis that MPI ranks share takes the Ritz step with each rank's row block in the memory of its columns (`block`: one share of the basis per rank and the buffers of a round, the exchanges of the rounds; cells and clusters) | `rounds`: one row block beside the columns, `H X` formed and projected a round at a time (two shares; the former default of a cell); `rows`: the two row blocks (three shares; the former default of a cluster) |
 | `PARSEC_KPOINT_RITZ` | `auto`: the pools take `block` (each rank's columns column-major in an allocation with room for its rows; filter, moves and Rayleigh-Ritz in place, one share of the basis, five moves of it per pass, residuals from `H` on the rotated columns) where `rows` would need more than half of a device or plan worse (fewer pools, subspaces on the host, no fit), else `rows` | `rows`: row-major columns, the filter into a second block, three shares in a Rayleigh-Ritz pass, four moves (the former route, bit for bit); `block` always |
+| `PARSEC_ORBITAL_GROUP` | `auto`: where the full point group of signed permutations is larger than its abelian subgroup and that solves less, the orbitals use the one-dimensional sectors of the subgroup that `Symmetry/orbital_groups.py` chooses, with weights (Td: D2d, sectors of about a quarter of the D2 basis; see "Weighted sectors of a larger subgroup"); spin, spin-orbit, hybrids, meta-GGAs, libxc, LDA+U and `occup.in` keep the abelian group | `abelian`: the reflection or commuting signed-permutation group of before, bit for bit |
 | `PARSEC_MPI_SHARED_EIGH_HELPER` | `on`: under the block route the root of a basis that three or more ranks share hands the eigensolve of its small solve to another rank (the whitened matrix there and the eigenvectors back, solved in that rank's summed pair), and the condition helper estimates on its own summed overlap instead of a copy; the same bits (bulk diamond on 16 A100, Gamma point, 5,832 atoms: 41.9 -> 38.3 GiB at the fullest GPU, 303.4 and 302.7 s). The block route forms the whitening in the summed pair either way; with both and the pool that the planner now chooses, 8,000 atoms took 71.6 -> 68.1 GiB and 657.9 -> 651.5 s on the same nodes | `off`: the eigensolve and a copy of the overlap on the root and the helper, as before |
 | `PARSEC_SPINOR_FILTER_COLUMNS` | `32` in the k-point pools, `64` on one device: columns per chunk of the filter recurrence, of `H X` and of the residuals; the random start basis is drawn 64 columns at a time whatever the chunk (bulk diamond on 16 A100, same nodes, energies the same to the digits printed: 1,728 atoms 33.1 -> 26.9 GiB, 216.6 -> 197.4 s; 2,744 atoms 63.5 -> 54.8 GiB, 622.6 -> 606.6 s; 1,000 atoms with a 4x4x4 mesh 162.1 -> 138.3 s) | `64`: the chunk of the pools before (their start basis was drawn by chunks, so another chunk started from another basis) |
 | `PARSEC_CUPY_STREAMING_RITZ` | `auto`: a symmetry sector whose basis lies on one device keeps one `N x m` array; `H X` is projected a slab of columns at a time and the basis is rotated in place | `0`: two arrays |
@@ -2650,6 +2654,59 @@ Static operators and saved subspaces stay on their assigned GPUs. Each sector
 forms its density on that same GPU, including non-contiguous orbital views,
 then downloads only a grid-length density vector. Global eigenvalue ordering,
 occupation assignment, and the FP64 scalar SCF remain shared and unchanged.
+
+#### Weighted sectors of a larger subgroup
+
+PARSEC solves the orbitals in the one-dimensional representations of an
+abelian subgroup of the point group (D2 for the nanodiamonds, whose full group
+is Td with 24 operations). Its two- and three-dimensional representations
+then repeat in several sectors: the three partners of a T level lie in B1, B2
+and B3 of D2, the two of an E level both in A. `Symmetry/orbital_groups.py`
+chooses instead, from the full group `G` of signed permutations that maps the
+atoms and the grid onto themselves (its characters by Burnside's method, its
+subgroups by enumeration), the subgroup `H` whose real one-dimensional
+characters cover every representation of `G` at the least cost (rows times
+states). Only those sectors are solved; a state of sector `lambda` counts
+`w_lambda = d_Gamma / n1(Gamma)` times for every `G`-representation `Gamma` it
+holds (`n1` the number of one-dimensional components of `Gamma` restricted to
+`H`), and a subgroup is admitted only where that weight is the same for every
+`Gamma` of the sector. Sectors exchanged by the normalizer of `H` are solved
+once. For Td it is D2d (S4 along a coordinate axis): sectors A1, B1, A2, B2 of
+about `N/8` rows and `M/8` states each, weights 1, 1, 3, 3 (A2 and B2 hold one
+partner of every T1 and T2 level, the two others lie in the E of D2d, the
+threefold image of these), a quarter of the basis of D2; for Oh it is D4h.
+The sectors are built from orbits of `H` with the same expansion `U_Gamma` as
+above (`Symmetry.PointGroupReduction`). The eigensolver counts states by
+weight, the Fermi level takes the weights (`N = 2 sum w f`), the density of
+the solved sectors is averaged over the right cosets of `G` (which adds the
+partners that no sector holds), the forces are averaged over `G` as before
+and their nonlocal term before it is reported, and the SCF record lists every
+partner of a weighted state, as do the eigenvalues, occupations and orbitals of
+the result. A calculation that reads every partner of every
+state keeps the abelian group: spin polarization and spin-orbit coupling,
+hybrid functionals, meta-GGAs, libxc functionals, LDA+U, `occup.in`, and a
+fixed number of eigenvalues (`Fix_Number_Eigenvalues`).
+`PARSEC_ORBITAL_GROUP=abelian` keeps it everywhere, bit for bit; the symmetry
+caches keep no entry of the weighted sectors. GGA fluxes reach the points of
+an orbit through the permutation and signs of the operation that carries the
+representative there (`V_xc/device_xc_kernels.cu`).
+
+Measured on A100 (first runs): ten Td molecules (CH4, SiH4, CF4, CCl4, P4,
+neopentane, adamantane; PBE and CA; 0.2 A, SCF to 1e-7) give the total energy
+of the run without symmetry within 3e-12 Ry and its distinct levels within
+3e-7 Ry; with positions stretched by 3 % the forces agree to the six digits
+printed. The nanodiamond k06 (1 GPU, SCF to 1e-7): 4.4e-9 Ry from the run
+without symmetry (D2: 9.3e-10), 14.3 s and 7.25 GiB against 31.6 s and 11.2
+GiB with D2 and 145.2 s and 39.5 GiB without symmetry. On 16 A100 (one rank per
+node, the benchmark inputs, same nodes): k12 73.9 -> 29.5 s and 25.5 -> 10.6
+GiB at the fullest GPU, k13 111.1 -> 37.3 s and 33.9 -> 12.6 GiB, k14 207.5 ->
+63.6 s and 59.7 -> 20.5 GiB (its eigensolves 180.4 -> 38.9 s); k15
+(C11487H1804, 13,291 atoms, 47,752 electrons), which D2 does not fit on 16 A100
+(about 79 GiB of basis per GPU), 94.9 s and 28.7 GiB in 10 steps; the energies
+within the scatter of that SCF criterion (2e-4 Ry: up to 1.3e-4 Ry between the
+two routes). The sectors of D2d do not hold even shares of the lowest levels
+(the A1 and T2 sectors of k14 about 4 % more): each starts 10 % above its share,
+where an even start failed the spectral bracket and solved two of them again.
 
 Requested final host wavefunctions are expanded in bounded column blocks on
 the CPU, without gathering all orbitals into one GPU's memory. The final host

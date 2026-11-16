@@ -380,6 +380,54 @@ def _orbit_flips(grid, reduction) -> np.ndarray:
     return flips
 
 
+def _orbit_operations(grid, reduction) -> tuple[np.ndarray, np.ndarray]:
+    """Per grid row, the operation (a signed permutation) carrying its representative onto it, and their table.
+
+    The counterpart of :func:`_orbit_flips` for a group whose operations permute the axes
+    (:class:`..Symmetry.PointGroupReduction`, :class:`..Symmetry.SignedPermutationReduction`): row ``i``
+    gets the index of the first operation (the identity first) that maps its representative onto it, and
+    ``table[g] = (perm_0, perm_1, perm_2, sign_0, sign_1, sign_2)`` with ``R_g[a, perm_a] = sign_a``, so that
+    component ``a`` of the image of a vector is ``sign_a`` times its component ``perm_a``.  Where two
+    operations carry the representative onto the same row, an invariant vector field takes the same value
+    either way.
+    """
+
+    from ..Symmetry.axis_reflection import _grid_row_mapping_operation
+
+    rows = np.asarray(reduction.representative_rows, dtype=np.int64)
+    full_to_wedge = np.asarray(reduction.full_to_wedge)
+    operations = np.asarray(reduction.operations, dtype=np.int64)
+    if operations.shape[0] > 255:
+        raise ValueError("too many symmetry operations for a byte per row")
+    order = sorted(range(operations.shape[0]), key=lambda g: not np.array_equal(operations[g], np.eye(3)))
+    unset = np.uint8(255)
+    codes = np.full(reduction.full_size, unset, dtype=np.uint8)
+    table = np.zeros((operations.shape[0], 6), dtype=np.int8)
+    for g in range(operations.shape[0]):
+        permutation = np.argmax(np.abs(operations[g]), axis=1)
+        table[g, :3] = permutation
+        table[g, 3:] = operations[g][np.arange(3), permutation]
+    for g in order:
+        images = _grid_row_mapping_operation(grid, operations[g].astype(np.int8), 1.0e-10, selected_rows=rows)
+        if images is None or not np.array_equal(full_to_wedge[images], np.arange(rows.size)):
+            raise RuntimeError(
+                "the symmetry operations do not map the orbit representatives onto their orbits"
+            )
+        images = images[codes[images] == unset]
+        codes[images] = np.uint8(g)
+    if np.any(codes == unset):
+        raise RuntimeError("a grid row is the image of no orbit representative")
+    return codes, table
+
+
+def _permutes_axes(reduction) -> bool:
+    operations = getattr(reduction, "operations", None)
+    if operations is None:
+        return False
+    operations = np.asarray(operations)
+    return bool(np.any(np.abs(operations) != np.eye(3, dtype=operations.dtype)[None]))
+
+
 def _grid_order_identity(reduction, size: int) -> bool:
     """Whether ``reduction`` is the identity alone with orbit ``w`` the grid row ``w`` (``size`` rows)."""
 
@@ -408,6 +456,9 @@ class _StencilGeometry:
         self.weights = cp.asarray(weights)
         self.negated_weights = cp.asarray(-weights)
         self.flips = None
+        # 1: ``flips`` holds axis reversals; 2: operation indices into ``table`` (see device_xc_kernels.cu).
+        self.flip_mode = 1
+        self.table = cp.zeros(6, dtype=np.int8)
         if self.periodic:
             if reduction is not None and not _grid_order_identity(reduction, box_size):
                 raise ValueError("a periodic grid has no symmetry reduction here")
@@ -432,7 +483,16 @@ class _StencilGeometry:
                 positions = row_positions[
                     np.asarray(reduction.representative_rows, dtype=np.int64)
                 ].astype(np.int32)
-                if flips and reduction.group_order > 1:
+                if flips and reduction.group_order > 1 and getattr(reduction, "operations", None) is not None:
+                    # A group given by its operations (those that permute the axes, or a subgroup whose
+                    # ``signs`` are placeholders): an operation index per point and their table.
+                    row_codes, table = _orbit_operations(grid, reduction)
+                    box_codes = np.zeros(box_size, dtype=np.uint8)
+                    box_codes[active] = row_codes[lookup[active]]
+                    self.flips = cp.asarray(box_codes)
+                    self.table = cp.asarray(table.reshape(-1))
+                    self.flip_mode = 2
+                elif flips and reduction.group_order > 1:
                     row_flips = _orbit_flips(grid, reduction)
                     box_flips = np.zeros(box_size, dtype=np.uint8)
                     box_flips[active] = row_flips[lookup[active]]
@@ -485,7 +545,8 @@ class _StencilGeometry:
             flux,
             self.value_of_box,
             flips,
-            np.int32(0 if self.flips is None else 1),
+            np.int32(0 if self.flips is None else self.flip_mode),
+            self.table,
             self.positions,
             *self._box_arguments(),
             self.negated_weights,

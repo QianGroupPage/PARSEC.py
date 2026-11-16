@@ -37,6 +37,7 @@ from parsec_python.V_ion import NonlocalProjectorOperator
 
 from .axis_reflection import (
     AxisReflectionReduction,
+    PointGroupReduction,
     SignedPermutationReduction,
     _RowOrderTable,
     _fast_maps_requested,
@@ -161,6 +162,20 @@ class ReflectionRepresentationDecomposition:
         return self.reduction.full_size
 
     @property
+    def sector_weights(self) -> np.ndarray:
+        """How many states each state of every sector counts for: 1 for the groups of before.
+
+        A :class:`.axis_reflection.PointGroupReduction` solves the one-dimensional sectors of a subgroup of
+        the full point group only; a state of one counts for the partners of its level that no solved
+        sector holds (:mod:`.orbital_groups`).
+        """
+
+        weights = getattr(self.reduction, "sector_weights", None)
+        if weights is None:
+            return np.ones(self.representation_count, dtype=np.int64)
+        return np.asarray(weights, dtype=np.int64)
+
+    @property
     def wedge_size(self) -> int:
         """Return the scalar-field orbit count shared with Hartree and SCF."""
 
@@ -221,7 +236,11 @@ class ReflectionRepresentationDecomposition:
         # (AxisReflectionReduction.identity, PARSEC_CUPY_SINGLE_SECTOR).
         character_rows: list[np.ndarray] = []
         seen: set[bytes] = set()
-        if isinstance(reduction, SignedPermutationReduction):
+        if isinstance(reduction, PointGroupReduction):
+            # The real one-dimensional characters of the chosen subgroup that are solved
+            # (orbital_groups.orbital_group_plan): fewer than its order where it is not abelian.
+            character_rows = list(np.asarray(reduction.sector_characters, dtype=np.int8))
+        elif isinstance(reduction, SignedPermutationReduction):
             # For C2^k, chi_p(g_b)=(-1)^(p dot b).  These are all |G|
             # mutually orthogonal real one-dimensional characters.
             rank = int(reduction.generator_bits.shape[1])
@@ -247,10 +266,11 @@ class ReflectionRepresentationDecomposition:
                     seen.add(key)
                     character_rows.append(character)
         characters = np.ascontiguousarray(np.vstack(character_rows), dtype=np.int8)
-        if characters.shape != (order, order):
+        rows = order if not isinstance(reduction, PointGroupReduction) else characters.shape[0]
+        if characters.shape != (rows, order):
             raise RuntimeError("failed to construct the reflection character table")
         gram = characters.astype(np.int64) @ characters.astype(np.int64).T
-        if not np.array_equal(gram, order * np.eye(order, dtype=np.int64)):
+        if not np.array_equal(gram, order * np.eye(rows, dtype=np.int64)):
             raise RuntimeError("reflection characters are not orthogonal")
 
         representatives = reduction.representative_rows

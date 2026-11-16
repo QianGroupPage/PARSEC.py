@@ -387,6 +387,11 @@ def load_or_build_reduced_operators(
     both caches off it is not computed and is reported as ``None``.
     """
 
+    from .axis_reflection import PointGroupReduction
+
+    if isinstance(decomposition.reduction, PointGroupReduction):
+        # The weighted sectors of a subgroup keep no disk entry (geometry_cache does not keep them either).
+        cache_directory = None
     partial = None
     if representations is not None and cache_directory is None:
         partial = tuple(sorted({int(index) for index in representations}))

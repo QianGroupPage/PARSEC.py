@@ -2896,6 +2896,11 @@ class SinglePointResult:
     """A hybrid functional: the :class:`parsec_python.SCF.hybrid.FockLoopSummary` of the Fock
     loop (its outer iterations and what an ionic step needs to start the next structure);
     ``None`` otherwise.  ``xc_potential`` is then the semilocal part only."""
+    sector_states: tuple | None = None
+    """Symmetry sectors of a subgroup of the point group with weights (acceleration/Symmetry/orbital_groups.py):
+    ``(representations, occupations, weights)`` of the states that the sectors solved, one per state, the
+    occupations times the weights.  ``eigenvalues``, ``occupations``, ``representations`` and the columns of
+    ``wavefunctions`` list every partner of a weighted state as the full grid does.  ``None`` otherwise."""
     meta_gga: object | None = None
     """A meta-GGA: the :class:`parsec_python.SCF.meta_gga.MetaGGARecord` of the loop (``vtau`` of the
     last eigenproblem, the mixed ``vtau`` a next structure starts from, ``tau``); ``None`` otherwise.

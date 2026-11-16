@@ -364,6 +364,12 @@ def load_or_build_reflection_decomposition(
 
     key = None
     hash_seconds = 0.0
+    from .axis_reflection import PointGroupReduction
+
+    if isinstance(reduction, PointGroupReduction):
+        # The weighted sectors of a subgroup are built where they are used: the cache format holds the
+        # complete character tables of the groups of before.
+        cache_directory = None
     if cache_directory is not None:
         if reduction_key is None:
             raise ValueError(

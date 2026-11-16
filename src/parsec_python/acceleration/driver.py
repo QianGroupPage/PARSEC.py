@@ -491,6 +491,37 @@ def periodic_sector_refusal(problem) -> str | None:
     return None
 
 
+def _orbital_group_refusal(problem, spin_polarized: bool, mpi_context) -> str | None:
+    """Why the orbitals keep the abelian group of before, or ``None`` where the weighted sectors serve.
+
+    The sectors of a subgroup with weights (:class:`.Symmetry.PointGroupReduction`) solve one partner of a
+    degenerate level where others exist: what reads every partner of every occupied state is refused here
+    (exact exchange, LDA+U, the meta-GGA kinetic density, the spin sectors), as is ``occup.in``, whose list
+    names states one by one, and a functional whose device kernels have not been built for it (libxc).
+    """
+
+    from parsec_python.V_xc.libxc import is_libxc_functional
+
+    scf = getattr(problem, "scf", None)
+    if scf is None:
+        return "no SCF settings"
+    if spin_polarized or getattr(scf, "noncollinear", False) or getattr(scf, "self_consistent_spin_orbit", False):
+        return "spin polarization or spin-orbit coupling"
+    if getattr(scf, "is_hybrid", False) or bool(getattr(mpi_context, "exchange", False)):
+        return "a hybrid functional"
+    if getattr(scf, "is_meta_gga", False):
+        return "a meta-GGA functional"
+    if is_libxc_functional(getattr(scf, "xc_functional", "ca")):
+        return "a libxc functional"
+    if getattr(scf, "fixed_occupations", None) is not None:
+        return "occupations from occup.in"
+    if any(getattr(item, "has_hubbard", False) for item in getattr(problem, "pseudopotentials", {}).values()):
+        return "LDA+U"
+    if getattr(getattr(problem, "eigensolver", None), "fixed_state_count", False):
+        return "Fix_Number_Eigenvalues (the state counts of a restart file, sector by sector)"
+    return None
+
+
 def _orbital_reduction(symmetry_reduction, stabilizer_disabled: bool):
     """Return the reduction the orbitals take of a detected one, or ``None``.
 
@@ -3368,12 +3399,26 @@ def _prepare_single_point(
             )
         else:
             detected_group_order = candidate.group_order
+            refusal = _orbital_group_refusal(problem, spin_polarized, mpi_context)
+            if candidate.group_order > 1 and refusal is None:
+                # The one-dimensional sectors of a larger subgroup of the full point group, with weights,
+                # where they solve less (Symmetry/orbital_groups.py; PARSEC_ORBITAL_GROUP=abelian keeps
+                # the group of before).
+                from .Symmetry import detect_point_group_reduction
+
+                candidate = stages.timed("orbital_group", detect_point_group_reduction)(
+                    reference.grid, getattr(reference, "atoms", ()), candidate
+                )
             if candidate.group_order > 1:
                 symmetry_reduction = candidate
-                from .Symmetry import SignedPermutationReduction
+                from .Symmetry import PointGroupReduction, SignedPermutationReduction
 
                 symmetry_detection = (
-                    "exact commuting signed-permutation subgroup detected"
+                    f"exact point group of {candidate.full_operations.shape[0]} signed permutations detected; the "
+                    f"orbitals use the one-dimensional sectors of a subgroup of {candidate.group_order} (weights "
+                    f"{', '.join(str(int(w)) for w in candidate.sector_weights)})"
+                    if isinstance(candidate, PointGroupReduction)
+                    else "exact commuting signed-permutation subgroup detected"
                     if isinstance(candidate, SignedPermutationReduction)
                     else "exact Cartesian axis-reflection subgroup detected"
                 )

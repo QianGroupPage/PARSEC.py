@@ -3337,16 +3337,30 @@ def _prepare_single_point(
     if ionic_fields is not None:
         preparation.join_on_exit(ionic_fields.close)
     symmetry_mode = _normalize_symmetry_mode(symmetry)
-    if is_periodic and symmetry_mode == "on":
-        raise ValueError(
-            "symmetry='on' is not supported for periodic problems: exact "
-            "space-group symmetry detection is not implemented for the "
-            "accelerated periodic path"
-        )
+    from .Symmetry import periodic_symmetry_setting
+
+    # Read in every run, so that a value it does not know is refused.
+    periodic_symmetry_mode = periodic_symmetry_setting()
     # A periodic cell in an MPI sector context: one sector of the identity
     # whose basis the ranks share (a bulk cell at Gamma; see
     # periodic_sector_refusal for what that route does not take).
     periodic_refusal = periodic_sector_refusal(problem) if is_periodic else None
+    # The cell that route takes may use its point group about the origin of
+    # the cell: the sectors of that group instead of the one of the identity
+    # (PARSEC_PERIODIC_SYMMETRY=off keeps the identity).
+    periodic_symmetry = (
+        is_periodic
+        and periodic_refusal is None
+        and symmetry_mode != "off"
+        and periodic_symmetry_mode == "auto"
+    )
+    if is_periodic and symmetry_mode == "on" and not periodic_symmetry:
+        raise ValueError(
+            "symmetry='on' needs a periodic cell whose point group the route of the sectors takes (a bulk "
+            "orthorhombic cell at the Gamma point, unpolarized, native LDA or GGA) and "
+            "PARSEC_PERIODIC_SYMMETRY=auto"
+            + ("" if periodic_refusal is None else f"; this calculation has {periodic_refusal}")
+        )
     if periodic_refusal is not None and mpi_context is not None:
         raise ValueError(
             f"{periodic_refusal} of a periodic cell does not run as an MPI SCF, whose "
@@ -3381,7 +3395,9 @@ def _prepare_single_point(
     shared_ritz_pipeline = ritz_pipeline()
     shared_exchange_copies = "strided" if strided_exchange_requested() else "packed"
     if is_periodic or symmetry_mode == "off":
-        # No symmetry is looked for: nobody waits for a reduction.
+        # No symmetry is looked for: nobody waits for a reduction.  (A
+        # periodic cell detects its point group in line below; its ionic
+        # fields keep the sums over the whole cell.)
         preparation.symmetry_reduction.publish(None)
     elif _symmetry_overlap_requested():
         # The reference stage starts it at the grid where it may.
@@ -3424,10 +3440,29 @@ def _prepare_single_point(
     symmetry_detection = "disabled by option"
     symmetry_maps = preparation.symmetry_maps
     maps_beside = False
-    if is_periodic:
+    periodic_on_host = periodic_symmetry and selection.selected != "cupy"
+    if periodic_on_host:
+        # The sectors of a point group are a route of the CuPy backend: the
+        # full grid of another backend keeps no orbits of the cell.
+        if symmetry_mode == "on":
+            raise ValueError(
+                "symmetry='on' needs the CuPy backend for the point group of a periodic cell "
+                f"(backend {selection.selected})"
+            )
+        periodic_symmetry = False
+    if is_periodic and not periodic_symmetry:
         symmetry_detection = (
-            "skipped: periodic cell (space-group symmetry detection is not "
-            "implemented for the accelerated path; the full grid is used)"
+            "skipped: periodic cell ("
+            + (
+                "PARSEC_PERIODIC_SYMMETRY=off"
+                if periodic_symmetry_mode == "off"
+                else "disabled by option"
+                if symmetry_mode == "off"
+                else f"the sectors of its point group are a route of the CuPy backend, not of {selection.selected}"
+                if periodic_on_host
+                else f"the route of the sectors does not take {periodic_refusal}"
+            )
+            + "; the full grid is used)"
         )
     elif symmetry_mode != "off":
         from .Symmetry import load_or_detect_reflection_reduction
@@ -3519,9 +3554,10 @@ def _prepare_single_point(
         and not spin_polarized
         and selection.selected == "cupy"
     )
-    if is_periodic and mpi_context is not None and not single_sector:
+    if is_periodic and mpi_context is not None and not single_sector and symmetry_reduction is None:
         raise ValueError(
-            "the MPI SCF of a periodic cell solves it as one sector of the identity, which this run "
+            "the MPI SCF of a periodic cell solves it in the sectors of its point group or as one sector "
+            "of the identity, which this run "
             + (
                 "cannot take on Fortran's general periodic grid (Use_Fortran_Routines with sides "
                 "of different grid steps)"
@@ -3611,6 +3647,17 @@ def _prepare_single_point(
         # decomposition was asked for or not: before the sector operators
         # are built and long before the first graph capture.
         symmetry_maps.close()
+    if is_periodic and symmetry_reduction is not None and orbital_decomposition is None:
+        if mpi_context is not None:
+            # The ranks of a periodic cell divide the sectors of its group:
+            # without them there is no route for this run.
+            raise ValueError(
+                f"the point group of this periodic cell was found but its orbitals stay on the {orbital_symmetry}, "
+                "which the MPI SCF of a periodic cell does not solve: run it with PARSEC_PERIODIC_SYMMETRY=off"
+            )
+        # The full grid of one device, as before the point group of a cell:
+        # no field of this calculation keeps the orbits of the group.
+        symmetry_reduction = None
     # Spin_Symmetry_Sectors: both channels in the sectors of this
     # decomposition, with the symmetry guard of SCF/spin_sectors.py.
     spin_sectors = spin_polarized and orbital_decomposition is not None
@@ -4805,7 +4852,7 @@ def _prepare_single_point(
             # PARSEC_SYMMETRY_FAST_MAPS, where symmetry maps were built.
             "symmetry_fast_maps",
             "not used"
-            if symmetry_mode == "off" or is_periodic
+            if symmetry_mode == "off" or (is_periodic and not periodic_symmetry)
             else "on" if _fast_maps_requested() else "off",
         ),
         # PARSEC_OVERLAP_SYMMETRY_SETUP: where the symmetry maps were built,
@@ -4813,7 +4860,7 @@ def _prepare_single_point(
         # joins.
         *(
             (("symmetry_setup", "not used"),)
-            if symmetry_mode == "off" or is_periodic
+            if symmetry_mode == "off" or (is_periodic and not periodic_symmetry)
             else (("symmetry_setup", "inline"),)
             if symmetry_maps is None
             else symmetry_maps.details()
@@ -4825,7 +4872,7 @@ def _prepare_single_point(
             "disabled"
             if symmetry_cache_directory is None
             else "not used"
-            if symmetry_mode == "off" or is_periodic
+            if symmetry_mode == "off" or (is_periodic and not periodic_symmetry)
             else str(Path(symmetry_cache_directory).resolve()),
         ),
         ("orbital_symmetry", orbital_symmetry),
@@ -5585,6 +5632,13 @@ def _prepare_single_point(
             replace(atom, position=position)
             for atom, position in zip(reference.atoms, positions)
         )
+        if is_periodic and symmetry_reduction is not None and symmetry_reduction.group_order > 1:
+            # Its sector operators were built for the first structure; the
+            # periodic geometry updates replace the full-grid ones only.
+            raise NotImplementedError(
+                "the atoms of a periodic cell solved in the sectors of its point group do not move here: "
+                "prepare it with symmetry='off' or PARSEC_PERIODIC_SYMMETRY=off"
+            )
         if is_periodic and not uses_fortran_routines(reference.grid):
             # Andrew Grieder's routines.
             # No Hartree boundary, symmetry sectors or native XC evaluator: the projectors are replaced on the device

@@ -1184,7 +1184,11 @@ def _run(
     except (OSError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
-    if arguments.symmetry == "on" and not keeps_group:
+    # A cell keeps no group in the parser (its forces are not symmetrized):
+    # whether its SCF may take the point group of the cell is decided below
+    # and by the driver.
+    periodic_cell = translation.problem.periodic_cell is not None
+    if arguments.symmetry == "on" and not keeps_group and not periodic_cell:
         print(
             "Input error: --symmetry on cannot be used here: "
             + (
@@ -1372,6 +1376,46 @@ def _run(
             "NOTE: Restart_Run of a spin-polarized calculation: both channels on the full grid "
             "(Spin_Symmetry_Sectors: off for the restart)",
         ]
+    if translation.problem.periodic_cell is not None:
+        # The parser keeps no point group for a cell on the default routines
+        # (use_symmetry: its forces are not symmetrized).  The SCF of a bulk
+        # cell at the Gamma point may still solve in the sectors of its point
+        # group about the origin of the cell, which the driver looks for
+        # (PARSEC_PERIODIC_SYMMETRY); the forces, the moved atoms, the bands
+        # and the non-self-consistent runs of a cell read the full grid.
+        periodic_full_grid = (
+            "a relaxation or molecular dynamics"
+            if translation.relaxation is not None or translation.molecular_dynamics is not None
+            else "forces"
+            if translation.compute_forces
+            else "a band structure"
+            if translation.problem.bands is not None
+            else "a non-self-consistent run"
+            if getattr(translation, "nscf", None) is not None
+            else None
+        )
+        wfndat_restart = translation.restart_run and getattr(translation, "restart_from_wfndat", False)
+        if arguments.symmetry == "on" and (
+            periodic_full_grid is not None or wfndat_restart or translation.problem.point_charges
+        ):
+            print(
+                "Input error: --symmetry on cannot be used with "
+                + (
+                    f"{periodic_full_grid} of a periodic cell, which the point-group sectors of a cell do not compute"
+                    if periodic_full_grid is not None
+                    else "Restart_From_Wfndat"
+                    if wfndat_restart
+                    else "point charges (Add_Point_Charges): the calculation uses no point group"
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        if periodic_full_grid is not None:
+            solver_symmetry_mode = "off"
+        elif not wfndat_restart and not translation.problem.point_charges and (
+            arguments.symmetry == "on" or (arguments.symmetry is None and not translation.ignore_symmetry)
+        ):
+            solver_symmetry_mode = arguments.symmetry or "auto"
 
     summary = summarize_translation(translation)
     if arguments.dry_run:

@@ -199,6 +199,151 @@ class TdSpectrumTests(unittest.TestCase):
         self.assertIs(detect_point_group_reduction(grid, atoms, abelian), abelian)
 
 
+_FCC = [(0.0, 0.0, 0.0), (0.0, 0.5, 0.5), (0.5, 0.0, 0.5), (0.5, 0.5, 0.0)]
+
+
+def _periodic_model(sides, points, shift, atoms, depths):
+    """A periodic grid and a model Hamiltonian on it: the Laplacian and Gaussian wells with their nearest images."""
+
+    import scipy.sparse as sp
+
+    from parsec_python.Grid.pbc import build_periodic_grid
+    from parsec_python.Laplacian import build_negative_laplacian
+    from parsec_python.models import PeriodicCell, PeriodicGridSettings
+
+    sides = np.asarray(sides, dtype=float)
+    cell = PeriodicCell(lattice_vectors=np.diag(sides))
+    grid = build_periodic_grid(
+        cell, PeriodicGridSettings(spacing=float(sides[0]) / points, expansion_order=4, shift=(shift,) * 3)
+    )
+    coordinates = np.asarray(grid.coordinates)
+    potential = np.zeros(coordinates.shape[0])
+    for atom in atoms:
+        difference = coordinates - np.asarray(atom.position)
+        difference -= sides * np.rint(difference / sides)
+        potential -= depths[atom.symbol] * np.exp(-np.sum(difference * difference, axis=1) / 0.9)
+    return grid, (0.5 * build_negative_laplacian(grid) + sp.diags(potential)).tocsr()
+
+
+def _weighted_spectrum(decomposition, hamiltonian, count):
+    weighted = []
+    for index, matrix in enumerate(decomposition.reduce_operators(hamiltonian)):
+        values = np.linalg.eigvalsh(matrix.toarray())[:count]
+        weighted += [(value, int(decomposition.sector_weights[index])) for value in values]
+    return np.array([value for value, weight in sorted(weighted) for _ in range(weight)][:count])
+
+
+class PeriodicPointGroupTests(unittest.TestCase):
+    """The point group of a bulk orthorhombic cell about its origin: atoms modulo the lattice, row maps that wrap."""
+
+    def test_diamond_cell_weighted_sector_spectra_are_the_full_spectrum(self):
+        from parsec_python.acceleration.Symmetry import (
+            PointGroupReduction,
+            ReflectionRepresentationDecomposition,
+            SignedPermutationReduction,
+            detect_point_group_reduction,
+        )
+        from parsec_python.models import Atom
+
+        side = 6.0
+        atoms = [Atom("C", tuple(side * (np.array(b) + s))) for s in (0.0, 0.25) for b in _FCC]
+        # the same crystal written with atoms outside the cell
+        moved = [Atom("C", tuple(np.asarray(atom.position) + side * np.array((1.0, 0.0, -2.0)))) for atom in atoms]
+        for shift in (0.5, 0.0):
+            with self.subTest(shift=shift):
+                grid, hamiltonian = _periodic_model((side,) * 3, 12, shift, atoms, {"C": 2.0})
+                abelian = SignedPermutationReduction.detect(grid, atoms)
+                reduction = detect_point_group_reduction(grid, atoms, abelian)
+                self.assertIsInstance(reduction, PointGroupReduction)
+                self.assertEqual((abelian.group_order, reduction.group_order), (4, 8))
+                self.assertEqual(reduction.full_operations.shape[0], 24)
+                other = detect_point_group_reduction(grid, moved, SignedPermutationReduction.detect(grid, moved))
+                np.testing.assert_array_equal(other.full_to_wedge, reduction.full_to_wedge)
+                decomposition = ReflectionRepresentationDecomposition.build(grid, reduction)
+                self.assertEqual(sorted(decomposition.sector_weights.tolist()), [1, 1, 3, 3])
+                # the dense spectrum: the translations of the conventional cell add degeneracies that a
+                # Lanczos solve of the full operator may not resolve
+                count = 40
+                full = np.linalg.eigvalsh(hamiltonian.toarray())[:count]
+                np.testing.assert_allclose(
+                    _weighted_spectrum(decomposition, hamiltonian, count), full, rtol=0.0, atol=1e-11
+                )
+                weighted = int(np.flatnonzero(decomposition.sector_weights == 3)[0])
+                values, vectors = np.linalg.eigh(decomposition.reduce_operators(hamiltonian)[weighted].toarray())
+                state = decomposition.expand_vector(vectors[:, 0], weighted)
+                partners = reduction.partner_states(state[:, None], np.array([3]))
+                residual = hamiltonian @ partners - values[0] * partners
+                self.assertLess(float(np.max(np.abs(residual))), 1e-10)
+
+    def test_rocksalt_takes_the_whole_cubic_group(self):
+        from parsec_python.acceleration.Symmetry import (
+            PointGroupReduction,
+            ReflectionRepresentationDecomposition,
+            SignedPermutationReduction,
+            detect_point_group_reduction,
+        )
+        from parsec_python.models import Atom
+
+        side = 6.0
+        atoms = [Atom("Na", tuple(side * np.array(b))) for b in _FCC] + [
+            Atom("Cl", tuple(side * (np.array(b) + np.array((0.5, 0.0, 0.0))))) for b in _FCC
+        ]
+        grid, hamiltonian = _periodic_model((side,) * 3, 12, 0.5, atoms, {"Na": 1.0, "Cl": 2.5})
+        reduction = detect_point_group_reduction(grid, atoms, SignedPermutationReduction.detect(grid, atoms))
+        self.assertIsInstance(reduction, PointGroupReduction)
+        self.assertEqual((reduction.full_operations.shape[0], reduction.group_order), (48, 16))
+        decomposition = ReflectionRepresentationDecomposition.build(grid, reduction)
+        self.assertEqual(sorted(decomposition.sector_weights.tolist()), [1, 1, 1, 1, 3, 3, 3, 3])
+        count = 40
+        full = np.linalg.eigvalsh(hamiltonian.toarray())[:count]
+        np.testing.assert_allclose(_weighted_spectrum(decomposition, hamiltonian, count), full, rtol=0.0, atol=1e-11)
+
+    def test_a_tetragonal_cell_does_not_carry_z_onto_x(self):
+        from parsec_python.acceleration.Symmetry.axis_reflection import (
+            _RowOrderTable,
+            _point_group_operations,
+        )
+        from parsec_python.models import Atom
+
+        # a simple tetragonal cell (sides a, a, 1.5 a) with one atom at the origin: D4h, not Oh
+        grid, _ = _periodic_model((4.0, 4.0, 6.0), 8, 0.5, [Atom("C", (0.0, 0.0, 0.0))], {"C": 1.0})
+        operations = _point_group_operations(grid, [Atom("C", (0.0, 0.0, 0.0))], 1.0e-7, 1.0e-10, _RowOrderTable(grid))
+        self.assertEqual(len(operations), 16)
+        for operation in operations:
+            self.assertEqual(abs(int(operation[2, 2])), 1)
+
+    def test_the_row_maps_of_a_cell_are_the_wrapped_gather(self):
+        from parsec_python.acceleration.Symmetry.axis_reflection import (
+            _grid_row_mapping_operation,
+            _periodic_row_major,
+            _signed_permutation_operations,
+        )
+        from parsec_python.models import Atom
+
+        for sides, points, shift in (((5.0, 5.0, 5.0), 10, 0.5), ((4.0, 4.0, 6.0), 8, 0.0)):
+            grid, _ = _periodic_model(sides, points, shift, [Atom("C", (0.0, 0.0, 0.0))], {"C": 1.0})
+            self.assertTrue(_periodic_row_major(grid))
+            every = np.arange(grid.size)
+            for operation in _signed_permutation_operations():
+                fast = _grid_row_mapping_operation(grid, operation, 1.0e-10)
+                gathered = _grid_row_mapping_operation(grid, operation, 1.0e-10, selected_rows=every)
+                if gathered is None:
+                    self.assertIsNone(fast)
+                    continue
+                np.testing.assert_array_equal(fast, gathered)
+                self.assertEqual(np.unique(fast).size, grid.size)
+
+    def test_the_switch(self):
+        from parsec_python.acceleration.Symmetry import periodic_symmetry_setting
+
+        for value, expected in (("", "auto"), ("AUTO", "auto"), ("off", "off")):
+            with patch.dict(os.environ, {"PARSEC_PERIODIC_SYMMETRY": value}):
+                self.assertEqual(periodic_symmetry_setting(), expected)
+        with patch.dict(os.environ, {"PARSEC_PERIODIC_SYMMETRY": "on"}):
+            with self.assertRaises(ValueError):
+                periodic_symmetry_setting()
+
+
 class DiagonalSubgroupTests(unittest.TestCase):
     def test_the_diagonal_members_of_d2d_are_the_reflection_group_of_the_structure(self):
         from parsec_python.Grid import build_cluster_grid

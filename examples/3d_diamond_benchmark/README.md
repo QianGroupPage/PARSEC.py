@@ -1,9 +1,10 @@
 # Bulk diamond on many GPUs
 
-Supercells of bulk diamond from 8 to 5,832 atoms, at the Gamma point and with Gamma-centred Monkhorst-Pack meshes,
+Supercells of bulk diamond from 8 to 32,768 atoms, at the Gamma point and with Gamma-centred Monkhorst-Pack meshes,
 computed on 16 NVIDIA A100 80 GB GPUs (four Perlmutter nodes). The series measures how large a periodic cell this
-code can treat: the orbitals of one cell are shared by all ranks (one rank per GPU, any number of nodes), and with
-k-points the ranks form pools of k-points.
+code can treat: the orbitals of one cell are shared by all ranks (one rank per GPU, any number of nodes), or, where
+the cell has a point group about its origin, divided into its symmetry sectors; with k-points the ranks form pools
+of k-points.
 
 ## Settings
 
@@ -72,6 +73,35 @@ k3 n = 7; the two differ in no code path these runs take).
 9 x 9 x 10 (6,480 atoms, 12,966 states) does not fit: the root GPU, which also holds the m x m matrices of the
 Rayleigh-Ritz step, runs out at 75.6 GB plus a 5.4 GB request; the run stops with `FULL_SCF_FAILED` after 69 s.
 The other GPUs of n = 9 held 51-52 GiB of arrays (the root 61 GiB).
+(These rows are the one sector of the identity; the memory round of 2026-11-15 brought n = 10, 8,000 atoms, to
+651.5 s and 68.1 GB.)
+
+### Gamma point in the sectors of the point group (2026-11-16)
+
+With an atom at the origin and 18 points per cubic edge, the cell keeps Td about that atom, and the orbitals take
+the weighted sectors of D2d (`PARSEC_PERIODIC_SYMMETRY=auto`, the default; `src/parsec_python/acceleration/README.md`,
+"Point groups of periodic cells"): 1/16 of the grid times the states of the one sector of the identity. Four nodes,
+one process per node on its four GPUs (`scripts/run_multi_gpu_scf.sh --nodes 4 parsec.in out`, the launch of the
+nanodiamond series), first runs, code 51b2e6b0 of the round; GPU memory as reported by the runner for the fullest
+GPU:
+
+| n | atoms | electrons | grid points | states | SCF iterations | program (s) | SCF (s) | setup (s) | later step (s) | GPU (GiB) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 6 | 1,728 | 6,912 | 1,259,712 | 3,462 | 9 | 18.4 | 10.4 | 7.9 | 0.32 | 1.4 |
+| 8 | 4,096 | 16,384 | 2,985,984 | 8,198 | 9 | 29.7 | 11.4 | 18.2 | 0.94 | 3.5 |
+| 10 | 8,000 | 32,000 | 5,832,000 | 16,006 | 9 | 71.2 | 31.6 | 39.4 | 2.63 | 8.3 |
+| 12 | 13,824 | 55,296 | 10,077,696 | 27,654 | 10 | 173.8 | 99.2 | 74.4 | 8.24 | 18.0 |
+| 14 | 21,952 | 87,808 | 16,003,008 | 43,910 | 10 | 347.8 | 211.0 | 136.8 | 16.29 | 37.2 |
+| 15 | 27,000 | 108,000 | 19,683,000 | 54,006 | 9 | 479.4 | 297.8 | 181.5 | 25.10 | 52.7 |
+| 16 | 32,768 | 131,072 | 23,887,872 | 65,542 | 9 | 690.7 | 450.9 | 239.6 | 37.57 | 74.0 |
+
+n = 16 is the largest cube that fits (n = 17 would need about 1.4 times the memory). The energy per atom is
+-11.4039349 Ry from n = 10 on. SCF to 1e-7 Ry, the sectors give the energy of the one sector of the identity within
+4e-14 Ry (n = 1), 5e-13 Ry (n = 2) and 9e-13 Ry (n = 3). Of the setup of n = 16, 153 s are the local ionic potential
+of the root (the periodic reference preparation on the host) and 30 s the finite differences; of its SCF, 355 s are
+eigensolves (133 s the first) and 84 s the periodic Hartree solves on the full grid (CG on the GPU). With one rank
+per GPU (`--rank-per-gpu`, sector groups of four ranks) n = 10 took 73.4 s and 11.5 GiB, n = 12 181.3 s and
+19.9 GiB.
 
 ### k-points (irreducible wedge of a Gamma-centred mesh)
 

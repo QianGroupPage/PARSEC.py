@@ -261,6 +261,50 @@ class DeviceGridTests(unittest.TestCase):
             value = device_xc.DeviceSpinXCEvaluator(functional, grid)(0.7 * density, 0.3 * density)
             self.assert_same(reference, value, f"periodic spin {functional}")
 
+    def test_periodic_cell_on_the_orbits_of_its_point_group(self) -> None:
+        """The orbits of the point group of a cell about its origin: the stencils wrap, the flux turns with them."""
+
+        from parsec_python.Grid.pbc import build_periodic_grid
+        from parsec_python.acceleration.SCF.symmetry_fields import SymmetrySCFReducer
+        from parsec_python.acceleration.Symmetry import SignedPermutationReduction, detect_point_group_reduction
+        from parsec_python.models import PeriodicCell, PeriodicGridSettings
+
+        side = 6.0
+        fcc = [(0.0, 0.0, 0.0), (0.0, 0.5, 0.5), (0.5, 0.0, 0.5), (0.5, 0.5, 0.0)]
+        structures = {
+            # diamond about an atom (Td, the orbitals in D2d), rocksalt about Na (Oh, in D4h)
+            "diamond": [Atom("C", tuple(side * (np.array(b) + s))) for s in (0.0, 0.25) for b in fcc],
+            "rocksalt": [Atom("Na", tuple(side * np.array(b))) for b in fcc]
+            + [Atom("Cl", tuple(side * (np.array(b) + np.array((0.5, 0.0, 0.0))))) for b in fcc],
+        }
+        for shift in (0.5, 0.0):
+            grid = build_periodic_grid(
+                PeriodicCell(np.eye(3) * side),
+                PeriodicGridSettings(spacing=side / 16, expansion_order=12, shift=(shift,) * 3),
+            )
+            for name, atoms in structures.items():
+                reduction = detect_point_group_reduction(grid, atoms, SignedPermutationReduction.detect(grid, atoms))
+                self.assertGreater(reduction.group_order, 4, name)
+                for sub in (reduction, SignedPermutationReduction.detect(grid, atoms)):
+                    reducer = SymmetrySCFReducer(sub)
+                    density = np.full(grid.size, 1.0e-3)
+                    for atom in atoms:
+                        difference = grid.coordinates - np.asarray(atom.position)
+                        difference -= np.round(difference / side) * side
+                        density += np.exp(-np.sum(difference * difference, axis=1) / 1.1)
+                    wedge = reducer.from_full(density)
+                    for functional in ("pbe", "pw91", "pw92"):
+                        label = f"{functional} {name} order {sub.group_order} shift {shift}"
+                        reference = evaluate_unpolarized_xc(functional, reducer.to_full(wedge), grid, None)
+                        value = device_xc.DeviceXCEvaluator(functional, grid, reducer=reducer)(wedge)
+                        self.assertLess(
+                            _relative(reducer.wedge_values(reference.potential), value.potential), FIELD_TOLERANCE, label
+                        )
+                        self.assertAlmostEqual(
+                            value.total_energy, reference.total_energy,
+                            delta=FIELD_TOLERANCE * abs(reference.total_energy), msg=label,
+                        )
+
     def test_core_density_of_the_present_structure(self) -> None:
         present = [self.core]
         evaluator = device_xc.DeviceXCEvaluator("pw91", self.grid, core_density=lambda: present[0])
@@ -484,7 +528,8 @@ class DeviceSCFTests(unittest.TestCase):
         base = periodic_hydrogen()
         for functional in ("pw92", "pw91", "lb94"):
             problem = replace(base, scf=replace(base.scf, xc_functional=functional))
-            with warnings.catch_warnings():
+            # The full grid, step for step as the reference (the point group of the cell: test_periodic_point_group.py).
+            with warnings.catch_warnings(), mock.patch.dict(os.environ, {"PARSEC_PERIODIC_SYMMETRY": "off"}):
                 warnings.simplefilter("ignore")
                 reference = run_reference(prepare_periodic_single_point(problem))
                 result = driver.run_scf(driver.prepare_single_point(problem, backend="cupy"))

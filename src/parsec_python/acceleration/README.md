@@ -918,6 +918,7 @@ a setting that selects the former one:
 | `PARSEC_HARTREE_DIAGONAL_BOUNDARY` | `auto`: a Hartree problem whose group permutes the axes (the weighted sectors of a tetrahedral or cubic cluster) builds its GPU boundary on the wedge of the diagonal members of the group, D2 for D2d (see "Weighted sectors of a larger subgroup") | `off`: the kernels under the identity on the full grid |
 | `PARSEC_CUPY_SECTOR_MARGIN` | `auto`: the margin of the first counts of weighted sectors (10 %) is cut where the devices cannot hold it, to the largest share whose counted states after one growth take at most `PARSEC_CUPY_SECTOR_MARGIN_BUDGET` (0.82) of a device; a sector so cut that misses states grows by its estimated deficit, at most 2 % a step, from a new start | `fixed`: the full margin and the growth by half of before everywhere; a run whose devices hold the full margin is the same either way |
 | `PARSEC_ORBITAL_GROUP` | `auto`: where the full point group of signed permutations is larger than its abelian subgroup and that solves less, the orbitals use the one-dimensional sectors of the subgroup that `Symmetry/orbital_groups.py` chooses, with weights (Td: D2d, sectors of about a quarter of the D2 basis; see "Weighted sectors of a larger subgroup"); spin, spin-orbit, hybrids, meta-GGAs, libxc, LDA+U and `occup.in` keep the abelian group | `abelian`: the reflection or commuting signed-permutation group of before, bit for bit |
+| `PARSEC_PERIODIC_SYMMETRY` | `auto`: a bulk orthorhombic cell at the Gamma point that the route of the sectors takes solves its orbitals in the sectors of its point group about the origin of the cell (atoms modulo the lattice, row maps that wrap; Td of diamond: 1/16 of the basis of the one sector of the identity; see "Point groups of periodic cells") | `off`: one sector of the identity, or the full grid of one GPU, bit for bit |
 | `PARSEC_MPI_SHARED_EIGH_HELPER` | `on`: under the block route the root of a basis that three or more ranks share hands the eigensolve of its small solve to another rank (the whitened matrix there and the eigenvectors back, solved in that rank's summed pair), and the condition helper estimates on its own summed overlap instead of a copy; the same bits (bulk diamond on 16 A100, Gamma point, 5,832 atoms: 41.9 -> 38.3 GiB at the fullest GPU, 303.4 and 302.7 s). The block route forms the whitening in the summed pair either way; with both and the pool that the planner now chooses, 8,000 atoms took 71.6 -> 68.1 GiB and 657.9 -> 651.5 s on the same nodes | `off`: the eigensolve and a copy of the overlap on the root and the helper, as before |
 | `PARSEC_SPINOR_FILTER_COLUMNS` | `32` in the k-point pools, `64` on one device: columns per chunk of the filter recurrence, of `H X` and of the residuals; the random start basis is drawn 64 columns at a time whatever the chunk (bulk diamond on 16 A100, same nodes, energies the same to the digits printed: 1,728 atoms 33.1 -> 26.9 GiB, 216.6 -> 197.4 s; 2,744 atoms 63.5 -> 54.8 GiB, 622.6 -> 606.6 s; 1,000 atoms with a 4x4x4 mesh 162.1 -> 138.3 s) | `64`: the chunk of the pools before (their start basis was drawn by chunks, so another chunk started from another basis) |
 | `PARSEC_CUPY_STREAMING_RITZ` | `auto`: a symmetry sector whose basis lies on one device keeps one `N x m` array; `H X` is projected a slab of columns at a time and the basis is rotated in place | `0`: two arrays |
@@ -2879,6 +2880,56 @@ batching can reduce launch count, but the measured GPU was bandwidth limited
 and ran faster with PARSEC's ordinary block traversal. It is therefore opt-in
 with `PARSEC_CUPY_BATCH_FILTERS=1`, not the default.
 
+#### Point groups of periodic cells
+
+A bulk cell at the Gamma point that the route of the sectors takes
+(`driver.periodic_sector_refusal`: orthorhombic, unpolarized, a native LDA or
+GGA; the CuPy backend) looks for its point group about the origin of the cell
+(`PARSEC_PERIODIC_SYMMETRY=auto`, since 2026-11-16): the Cartesian signed
+permutations that map the atoms, species by species and modulo the lattice
+(nearest images, a periodic k-d tree), and the periodic grid onto themselves.
+The grid points of a cell are `(i + shift) h` from its corner, and its row maps
+wrap around the cell, so no image falls outside it; an operation that carries
+one axis onto another needs their point counts and sides to agree. The eight
+points of half lattice vectors give the same maps as the origin, so a
+structure whose symmetric site is at the corner or at the centre of the cell
+keeps its group (diamond with an atom at the origin: Td, with the 18 points per
+cubic edge of the benchmark grid; rocksalt about Na: Oh). The orbitals then take
+the sectors of that group, with the weighted sectors of a larger subgroup
+where they solve less (above): Td in D2d solves 1/16 of the grid times the
+states of the one sector of the identity, Oh in D4h 1/32. Their kinetic and
+nonlocal operators are reduced from the full-grid matrices of the cell (the
+wrap-around rows of the Laplacian, the projectors with their lattice images);
+the density, the potentials and the mixer keep one value per orbit; the
+Hartree potential is solved on the full grid of the cell
+(`Hartree/periodic_device.py`, expanded and reduced again); the device XC
+evaluators take the orbits with wrapped stencils (`V_xc/device_xc.py`); the
+ionic sums keep the whole cell. A cell without a group, another backend, or
+`PARSEC_PERIODIC_SYMMETRY=off` keeps the route of before (one sector of the
+identity, or the full grid of one GPU), bit for bit. The point group of a cell
+serves its SCF alone: the forces, relaxation and molecular dynamics, band
+structures and `nscf` runs of a cell keep the full grid (`main.py`; the driver
+refuses to move the atoms or form the forces of a cell prepared in these
+sectors and names the switch). The parser keeps no space group for a cell on
+the default routines (`use_symmetry`: its forces are not symmetrized); both
+runners let a Gamma-point SCF look for its point group unless `Ignore_Symmetry`
+or `--symmetry off` says otherwise.
+
+Measured on A100 (bulk diamond of `examples/3d_diamond_benchmark`, first runs):
+SCF to 1e-7 Ry, the sectors of Td give the total energy of the one sector of
+the identity within 4e-14 (8 atoms), 5e-13 (64) and 9e-13 Ry (216), one rank
+per GPU or one process on the four GPUs of a node. With the settings of the
+benchmark (2e-4 Ry) on 16 A100 (four nodes, one process each): 1,728 atoms
+18.4 s and 1.37 GiB at the fullest GPU (one rank per GPU: 11.9 s and 1.91 GiB;
+the identity 28-36 s and 8.0 GiB), 4,096 atoms 29.7 s and 3.49 GiB (published
+136.7 s and 21.5 GiB), 8,000 atoms 71.2 s and 8.34 GiB (published 651.5 s and
+68.1 GiB, the largest cell of the one sector of the identity), and up to 32,768
+atoms (131,072 electrons, 23.9 M grid points, 65,542 states): 690.7 s, 9 SCF
+steps, 74.0 GiB at the fullest GPU, the largest cube on 16 A100
+(`examples/3d_diamond_benchmark/README.md`). Its setup (240 s) is mostly the
+local ionic potential of the periodic reference preparation on the host of the
+root (153 s), its SCF mostly eigensolves (355 s of 451 s).
+
 #### ARPACK, Dynamic_Diag_Tol, Fix_Number_Eigenvalues and the TEST mode
 
 These PARSEC controls (the reports of the
@@ -3327,12 +3378,15 @@ device paths:
   `evaluate_xc` does (`potshift`); on the orbit fields of the symmetry
   sectors it weighs every orbit by its size.
 - A bulk orthorhombic cell at the Gamma point (unpolarized, native LDA or
-  GGA) runs on several GPUs and nodes as one sector of the identity whose
-  orbitals the MPI ranks share: `scripts/run_multi_gpu_scf.sh --rank-per-gpu`
-  (`MULTI_GPU.md`, "Periodic cells at the Gamma point on several nodes";
-  `driver.periodic_sector_refusal` names what it does not take). In one
-  process `PARSEC_CUPY_SINGLE_SECTOR=on` takes the same route; unset, a cell
-  keeps the full grid of one GPU.
+  GGA) solves its orbitals in the sectors of its point group about the origin
+  of the cell (`PARSEC_PERIODIC_SYMMETRY`, "Point groups of periodic cells"
+  below), or else runs on several GPUs and nodes as one sector of the
+  identity whose orbitals the MPI ranks share:
+  `scripts/run_multi_gpu_scf.sh --rank-per-gpu` (`MULTI_GPU.md`, "Periodic
+  cells at the Gamma point on several nodes"; `driver.periodic_sector_refusal`
+  names what it does not take). In one process `PARSEC_CUPY_SINGLE_SECTOR=on`
+  takes that sector; unset, a cell without a point group keeps the full grid
+  of one GPU.
 - `V_xc/periodic_xc.py` evaluates the spin functionals of a periodic cell in
   the reference spin drivers on the device, by `PARSEC_CUPY_XC`: the
   functionals added for Fortran parity by default, PBE only with `on`

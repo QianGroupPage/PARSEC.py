@@ -314,10 +314,18 @@ result to the last bit.
 The same runner and launch script run the SCF of a bulk periodic cell
 (`Boundary_Conditions: bulk`) at the Gamma point: real orbitals, an
 orthorhombic cell, no spin, a native LDA or GGA (`ca`, `pbe` and the other
-functionals of `V_xc/device_xc.py`). The accelerated path detects no space
-group, so the cell is one sector of the identity (every grid point an orbit,
-`AxisReflectionReduction.identity`), the sector of a molecular dynamics run:
-on several nodes one rank per GPU shares its orbitals
+functionals of `V_xc/device_xc.py`). The driver looks for the point group of
+the cell about its origin (`PARSEC_PERIODIC_SYMMETRY=auto`, since 2026-11-16):
+the Cartesian signed permutations that map the atoms modulo the lattice and the
+periodic grid onto themselves (the row maps wrap around the cell). Where it
+finds one, the orbitals take its sectors as a cluster's do, with the weighted
+sectors of a larger subgroup where they solve less (Td of diamond about an
+atom: D2d, 1/16 of the grid times the states; Oh of rocksalt: D4h, 1/32), and
+the ranks divide the sectors as for a cluster (above). Without
+one, or with `PARSEC_PERIODIC_SYMMETRY=off`, the cell is one sector of the
+identity (every grid point an orbit, `AxisReflectionReduction.identity`), the
+sector of a molecular dynamics run: on several nodes one rank per GPU shares
+its orbitals
 (`Eigensolvers/mpi_shared_basis.py`), on one node one rank shares them among
 the GPUs of its node (`Eigensolvers/distributed_state.py`) or one rank per
 GPU does. Inside the allocation of `N` nodes with four GPUs each:
@@ -348,11 +356,12 @@ runner): k-points beyond Gamma (`parsec_python/main.py --mpi`, whose ranks
 take the k-points), spin, spin-orbit and non-collinear runs, hybrids,
 meta-GGAs, libxc functionals, oblique cells, wires and slabs, LDA+U, the TS
 correction, forces, relaxation and molecular dynamics of a cell, the band
-structure and `nscf` runs (all `parsec_python/main.py`), Fortran's general
-grid (`Use_Fortran_Routines` with sides of different steps) and
-`--symmetry on`. A single process takes the same route with
+structure and `nscf` runs (all `parsec_python/main.py`, where these keep the
+full grid of a cell) and Fortran's general grid (`Use_Fortran_Routines` with
+sides of different steps). A single process takes the sectors of the point
+group of the cell where it has one; one sector of the identity with
 `PARSEC_CUPY_SINGLE_SECTOR=on` (the GPUs of the process share the sector);
-without it a cell keeps the full grid of one GPU, as before.
+otherwise a cell keeps the full grid of one GPU, as before.
 
 Measured on A100 nodes (2026-11-08, bulk diamond `examples/3d_diamond_benchmark`,
 18 points per cubic edge, PBE, the eigensolver and mixing of the nanodiamond

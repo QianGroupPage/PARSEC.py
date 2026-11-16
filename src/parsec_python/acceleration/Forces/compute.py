@@ -280,6 +280,14 @@ def compute_forces(
     """
 
     if getattr(system.input, "periodic_cell", None) is not None:
+        sectors = getattr(getattr(system, "backend", None), "symmetry_eigensolver", None)
+        decomposition = getattr(sectors, "decomposition", None)
+        if decomposition is not None and int(decomposition.reduction.group_order) > 1:
+            # The forces of a cell read its orbitals and density on the full grid.
+            raise NotImplementedError(
+                "the forces of a periodic cell solved in the sectors of its point group are not implemented: "
+                "prepare it with symmetry='off' or PARSEC_PERIODIC_SYMMETRY=off"
+            )
         if uses_fortran_routines(system.grid):
             # The Fortran-derived routines (Use_Fortran_Routines): the device builders of
             # their Ewald terms and projectors with their lattice images.

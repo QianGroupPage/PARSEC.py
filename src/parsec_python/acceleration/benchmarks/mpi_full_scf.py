@@ -201,8 +201,10 @@ _SERIAL_CONTROL_SETTINGS = {
 
 # Notes of the record of a periodic cell (none for a cluster, whose record is as it was).
 _PERIODIC_NOTES = [
-    'A periodic cell (Boundary_Conditions: bulk) at the Gamma point: one sector of the identity, every grid point an '
-    'orbit, whose basis the ranks share (one GPU each, --rank-per-gpu) or the GPUs of one rank. Its grid is the '
+    'A periodic cell (Boundary_Conditions: bulk) at the Gamma point: the sectors of its point group about the origin '
+    'of the cell (PARSEC_PERIODIC_SYMMETRY=auto, symmetry_detection of the backend details), or one sector of the '
+    'identity, every grid point an orbit, whose basis the ranks share (one GPU each, --rank-per-gpu) or the GPUs of '
+    'one rank. Its grid is the '
     'periodic grid of the input on every rank (checked: lattice vectors, spacing, order, shift, point counts); the '
     'root solves the periodic Hartree potential (Hartree/periodic_device.py, on its GPU) and the XC functional of '
     'the full grid, with the SCF fields in the order of the grid. result.domain and result.hartree_boundary are '
@@ -841,7 +843,8 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
     if args.mlff is not None:
         from parsec_python.MLFF import apply_mlff_option
         translation = apply_mlff_option(translation, args.mlff)
-    # A bulk cell at the Gamma point runs as one sector of the identity shared by the ranks; every other periodic
+    # A bulk cell at the Gamma point runs in the sectors of its point group or as one sector of the identity shared
+    # by the ranks; every other periodic
     # calculation is refused here by name, on every rank alike, before anything is prepared.
     periodic = translation.problem.periodic_cell is not None
     _refuse_unsupported_periodic(translation)
@@ -884,17 +887,17 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
     # Whether the atoms stay in the point group of the first structure, which Ignore_Symmetry does not tell.
     # The command line may overrule that keyword, but not a run that leaves the group.
     keeps_group, group_note = symmetry_decision(replace(translation, ignore_symmetry=False))
-    if args.symmetry == 'on' and not keeps_group:
+    if args.symmetry == 'on' and not keeps_group and not periodic:
         raise ValueError('--symmetry on cannot be used here: '
                          + (group_note or 'manual movements and molecular dynamics use no symmetry'))
     symmetry = (args.symmetry if args.symmetry is not None and (keeps_group or args.symmetry == 'off')
                 else ('auto' if use_symmetry else 'off'))
-    if periodic:
-        # The accelerated path detects no space group: a cell is the one sector of the identity.
-        if args.symmetry == 'on':
-            raise ValueError('--symmetry on cannot be used for a periodic cell: the accelerated path detects no space '
-                             'group, and the ranks share the basis of one sector of the identity')
-        symmetry = 'off'
+    # A periodic cell (a bulk cell at Gamma, the rest was refused above): the parser keeps no point group for a cell
+    # (use_symmetry: its forces are not symmetrized), but the driver looks for the point group of the cell about its
+    # origin (PARSEC_PERIODIC_SYMMETRY) and solves its sectors, or one sector of the identity.
+    if periodic and not translation.problem.point_charges and (
+            args.symmetry == 'on' or (args.symmetry is None and not translation.ignore_symmetry)):
+        symmetry = args.symmetry or 'auto'
     # Forces are symmetrized where the calculation itself uses the group.
     symmetrize_forces = keeps_group and symmetry != 'off'
     if symmetry == 'off' and not args.serial_control and not one_sector:
@@ -990,8 +993,8 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                     else 'MPI symmetry sectors shared by groups of ranks' if shared_ranks and symmetry != 'off'
                     else 'one sector shared by the ranks' if shared_ranks else 'MPI symmetry sectors')
             if periodic and not args.serial_control:
-                mode = ('one sector of the identity of a periodic cell at the Gamma point'
-                        + (', shared by the ranks' if shared_ranks else ''))
+                mode = ('a periodic cell at the Gamma point: the sectors of its point group or one sector of the '
+                        'identity' + (', shared by the ranks' if shared_ranks else ''))
             if hybrid and not args.serial_control:
                 from parsec_python.acceleration.SCF.hybrid_mpi import exchange_transport
                 transport = ('host-fields and ' + ('device' if exchange_transport() == 'cuda' else 'host-staged')

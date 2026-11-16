@@ -7,6 +7,7 @@ from .axis_reflection import (
     detect_point_group_reduction,
     diagonal_subgroup_reduction,
     orbital_group_policy,
+    periodic_symmetry_setting,
 )
 from .geometry_cache import (
     SymmetryCacheInfo,
@@ -30,4 +31,5 @@ __all__ = [
     "load_or_detect_reflection_reduction",
     "operator_build_workers",
     "orbital_group_policy",
+    "periodic_symmetry_setting",
 ]

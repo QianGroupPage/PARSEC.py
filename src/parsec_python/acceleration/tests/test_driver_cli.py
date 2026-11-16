@@ -350,9 +350,8 @@ class PeriodicDriverTests(unittest.TestCase):
         self.assertIs(driver_module._selection_for_problem(hybrid, cluster), hybrid)
 
     def test_what_a_periodic_cell_cannot_have_is_refused_by_name(self) -> None:
-        with self.assertRaisesRegex(
-            ValueError, "symmetry='on' is not supported for periodic problems"
-        ):
+        # The point group of a cell is a route of the CuPy backend (PARSEC_PERIODIC_SYMMETRY).
+        with self.assertRaisesRegex(ValueError, "symmetry='on' needs"):
             prepare_single_point(self.problem, backend="scipy", symmetry="on")
         # A periodic cell that one sector of the identity does not take is refused
         # in an MPI run before a rank prepares anything, by name.
@@ -408,6 +407,9 @@ class PeriodicDriverTests(unittest.TestCase):
 
     @unittest.skipUnless(cupy_available(), "CuPy and a CUDA device are required")
     def test_a_cell_as_one_sector_of_the_identity_gives_the_energy_of_the_full_grid(self) -> None:
+        # This cell has Oh about its origin: the identity is the route of PARSEC_PERIODIC_SYMMETRY=off
+        # (test_periodic_point_group.py runs its point group).
+        os.environ["PARSEC_PERIODIC_SYMMETRY"] = "off"
         full = run_scf(prepare_single_point(self.problem, backend="cupy"))
         os.environ["PARSEC_CUPY_SINGLE_SECTOR"] = "on"
         system = prepare_single_point(self.problem, backend="cupy")
@@ -551,6 +553,9 @@ class PeriodicDriverTests(unittest.TestCase):
         self.assertEqual(raised.input.hartree.multipole_order, 20)
 
     def test_periodic_scf_through_the_driver_agrees_with_the_reference_solver(self) -> None:
+        # The full grid of every backend, step for step as the reference solver; the sectors of the point
+        # group of this cell (Oh) are compared with that grid in test_periodic_point_group.py.
+        os.environ["PARSEC_PERIODIC_SYMMETRY"] = "off"
         reference_system = prepare_periodic_single_point(self.problem)
         reference = run_reference_scf(reference_system)
         # Every execution backend applies the Hamiltonian of the periodic

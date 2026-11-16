@@ -459,14 +459,26 @@ class _StencilGeometry:
         # 1: ``flips`` holds axis reversals; 2: operation indices into ``table`` (see device_xc_kernels.cu).
         self.flip_mode = 1
         self.table = cp.zeros(6, dtype=np.int8)
-        if self.periodic:
-            if reduction is not None and not _grid_order_identity(reduction, box_size):
-                raise ValueError("a periodic grid has no symmetry reduction here")
+        if self.periodic and (reduction is None or _grid_order_identity(reduction, box_size)):
             # (The identity alone, one orbit per point in the order of the
             # grid, as one sector of the identity has it: the box itself.)
             # pbe.py _to_box: the rows of a periodic cell are its box, row-major.
             positions = np.arange(box_size, dtype=np.int32)
             value_of_box = positions
+        elif self.periodic:
+            # The orbits of the point group of the cell: its rows are its box,
+            # row-major, every point of it active, and the stencil wraps.
+            if int(reduction.full_size) != box_size:
+                raise ValueError("the symmetry orbits do not cover the periodic grid")
+            value_of_box = np.asarray(reduction.full_to_wedge).astype(np.int32)
+            positions = np.asarray(reduction.representative_rows).astype(np.int32)
+            if flips and reduction.group_order > 1 and getattr(reduction, "operations", None) is not None:
+                row_codes, table = _orbit_operations(grid, reduction)
+                self.flips = cp.asarray(row_codes)
+                self.table = cp.asarray(table.reshape(-1))
+                self.flip_mode = 2
+            elif flips and reduction.group_order > 1:
+                self.flips = cp.asarray(_orbit_flips(grid, reduction))
         else:
             lookup = np.asarray(grid.lookup).reshape(-1)
             local = np.asarray(grid.integer_coordinates, dtype=np.int64) - np.asarray(

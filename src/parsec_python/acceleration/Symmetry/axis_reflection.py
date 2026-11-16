@@ -53,10 +53,56 @@ def _fast_maps_requested() -> bool:
     }
 
 
+def _lattice_period(grid) -> np.ndarray | None:
+    """The side lengths of the cell of a periodic grid, or ``None`` for a cluster grid.
+
+    The atoms of a periodic cell match their images modulo the lattice.  The Cartesian signed permutations
+    about the origin are operations of the lattice only for an orthorhombic cell with its sides along the axes,
+    periodic along all three (a bulk cell); any other periodic grid is refused here, and the caller keeps the
+    full grid.
+    """
+
+    if not (hasattr(grid, "cell") and hasattr(grid, "points_per_axis")):
+        return None
+    if tuple(getattr(grid, "boundary_modes", ())) != ("wrap", "wrap", "wrap"):
+        raise ValueError("point-group sectors of a periodic grid need a bulk cell (periodic along three axes)")
+    lattice = np.asarray(grid.cell.lattice_vectors, dtype=np.float64)
+    if not getattr(grid, "is_orthorhombic", False) or np.any(np.abs(lattice - np.diag(np.diag(lattice))) > 1.0e-10):
+        raise ValueError(
+            "point-group sectors of a periodic grid need an orthorhombic cell with its sides along the axes "
+            "and one grid step"
+        )
+    return np.ascontiguousarray(np.diag(lattice), dtype=np.float64)
+
+
+def _minimum_image(difference: np.ndarray, period: np.ndarray | None) -> np.ndarray:
+    """``difference`` moved by whole cell sides to its shortest form (unchanged without a period)."""
+
+    if period is None:
+        return difference
+    return difference - period * np.rint(difference / period)
+
+
+def _folded(points: np.ndarray, period: np.ndarray) -> np.ndarray:
+    """``points`` moved into ``[0, period)`` along every axis, as a periodic k-d tree wants them."""
+
+    folded = points - period * np.floor(points / period)
+    return np.where(folded >= period, folded - period, folded)
+
+
+def _matching_tree(candidates: np.ndarray, period: np.ndarray | None):
+    from scipy.spatial import cKDTree
+
+    if period is None:
+        return cKDTree(candidates)
+    return cKDTree(_folded(candidates, period), boxsize=period)
+
+
 def _threshold_neighbours(
     transformed: np.ndarray,
     candidates: np.ndarray,
     tolerance: float,
+    period: np.ndarray | None = None,
 ) -> list[list[int]]:
     """Rows of the distance-threshold graph without the dense distance matrix.
 
@@ -64,18 +110,19 @@ def _threshold_neighbours(
     norm and comparison as the dense construction then decide every proposed
     pair, so the graph, and with it the matching, is the same.  The dense
     matrix of a few thousand atoms of one species costs a quarter of a second
-    per symmetry operation; this costs a few milliseconds.
+    per symmetry operation; this costs a few milliseconds.  With ``period``
+    (the sides of a periodic cell) the distances are those of the nearest
+    images.
     """
 
-    from scipy.spatial import cKDTree
-
     radius = tolerance * (1.0 + 1.0e-9) + 1.0e-12
-    proposals = cKDTree(candidates).query_ball_point(transformed, radius)
+    queries = transformed if period is None else _folded(transformed, period)
+    proposals = _matching_tree(candidates, period).query_ball_point(queries, radius)
     adjacency = []
     for row, proposed in enumerate(proposals):
         columns = np.sort(np.asarray(proposed, dtype=np.int64))
         distances = np.linalg.norm(
-            transformed[row][None, :] - candidates[columns], axis=1
+            _minimum_image(transformed[row][None, :] - candidates[columns], period), axis=1
         )
         adjacency.append(columns[distances <= tolerance].tolist())
     return adjacency
@@ -85,6 +132,7 @@ def _single_partner_matching(
     transformed: np.ndarray,
     candidates: np.ndarray,
     tolerance: float,
+    period: np.ndarray | None = None,
 ) -> bool | None:
     """Decide the matching of a species whose atoms have at most one proposal.
 
@@ -97,20 +145,19 @@ def _single_partner_matching(
     radius: the augmenting paths decide such a graph.
     """
 
-    from scipy.spatial import cKDTree
-
     count = int(transformed.shape[0])
     radius = tolerance * (1.0 + 1.0e-9) + 1.0e-12
+    queries = transformed if period is None else _folded(transformed, period)
     # A neighbour that does not exist inside the radius has infinite distance.
-    proposed, nearest = cKDTree(candidates).query(
-        transformed, k=2, distance_upper_bound=radius
+    proposed, nearest = _matching_tree(candidates, period).query(
+        queries, k=2, distance_upper_bound=radius
     )
     if np.any(np.isfinite(proposed[:, 1])):
         return None
     if not np.all(np.isfinite(proposed[:, 0])):
         return False
     columns = nearest[:, 0]
-    distances = np.linalg.norm(transformed - candidates[columns], axis=1)
+    distances = np.linalg.norm(_minimum_image(transformed - candidates[columns], period), axis=1)
     if not np.all(distances <= tolerance):
         return False
     return bool(np.all(np.bincount(columns, minlength=count) == 1))
@@ -120,6 +167,7 @@ def _has_tolerance_perfect_matching(
     transformed: np.ndarray,
     candidates: np.ndarray,
     tolerance: float,
+    period: np.ndarray | None = None,
 ) -> bool:
     """Test exact one-to-one atom matching on a distance-threshold graph.
 
@@ -131,6 +179,8 @@ def _has_tolerance_perfect_matching(
     solve the intended bipartite feasibility problem directly, and avoid
     importing the large ``scipy.optimize`` package at startup.  Large species
     groups take their threshold graph from :func:`_threshold_neighbours`.
+    ``period`` (the sides of an orthorhombic periodic cell) matches every
+    atom with the nearest image of its partner.
     """
 
     transformed = np.asarray(transformed, dtype=np.float64)
@@ -144,13 +194,13 @@ def _has_tolerance_perfect_matching(
         return True
     if count > _DENSE_MATCHING_LIMIT:
         if _fast_maps_requested():
-            decided = _single_partner_matching(transformed, candidates, tolerance)
+            decided = _single_partner_matching(transformed, candidates, tolerance, period)
             if decided is not None:
                 return decided
-        adjacency = _threshold_neighbours(transformed, candidates, tolerance)
+        adjacency = _threshold_neighbours(transformed, candidates, tolerance, period)
     else:
         distances = np.linalg.norm(
-            transformed[:, None, :] - candidates[None, :, :], axis=2
+            _minimum_image(transformed[:, None, :] - candidates[None, :, :], period), axis=2
         )
         adjacency = [
             np.flatnonzero(distances[row] <= tolerance).tolist()
@@ -197,17 +247,20 @@ def _atoms_are_invariant(
     atoms: Sequence[Atom] | dict[str, np.ndarray],
     signs: np.ndarray,
     tolerance: float,
+    period: np.ndarray | None = None,
 ) -> bool:
     """Return whether one diagonal sign operation preserves labeled atoms.
 
     ``atoms`` may be the positions already grouped by
     :func:`_positions_by_species`; the sign products are then formed for a
-    whole species at once and are the per-atom products.
+    whole species at once and are the per-atom products.  ``period`` (the
+    sides of a periodic cell, :func:`_lattice_period`) matches the atoms
+    modulo the lattice.
     """
 
     if isinstance(atoms, dict):
         return all(
-            _has_tolerance_perfect_matching(candidates * signs, candidates, tolerance)
+            _has_tolerance_perfect_matching(candidates * signs, candidates, tolerance, period)
             for candidates in atoms.values()
         )
     by_species: dict[str, np.ndarray] = {}
@@ -225,7 +278,7 @@ def _atoms_are_invariant(
             ]
         )
         if not _has_tolerance_perfect_matching(
-            transformed, candidates, tolerance
+            transformed, candidates, tolerance, period
         ):
             return False
     return True
@@ -382,6 +435,17 @@ def _integer_signed_permutation_parameters(
         return None
     sources = np.argmax(absolute, axis=1)
     factors = matrix[np.arange(3), sources].astype(np.int64, copy=False)
+    counts = getattr(grid, "points_per_axis", None)
+    if counts is not None and hasattr(grid, "cell"):
+        # A periodic grid wraps every image into the cell, so no image falls
+        # outside it: an operation that carries one axis onto another needs
+        # their counts and sides to agree.
+        counts = np.asarray(counts, dtype=np.int64)
+        sides = np.diag(np.asarray(grid.cell.lattice_vectors, dtype=np.float64))
+        if np.any(counts[sources] != counts) or not np.allclose(
+            sides[sources], sides, rtol=1.0e-12, atol=0.0
+        ):
+            return None
     shift = np.asarray(grid.settings.shift, dtype=np.float64)
     floating_offset = shift @ matrix.T - shift
     offset = np.rint(floating_offset).astype(np.int64)
@@ -397,11 +461,13 @@ def _atoms_are_invariant_operation(
     atoms: Sequence[Atom] | dict[str, np.ndarray],
     operation: np.ndarray,
     tolerance: float,
+    period: np.ndarray | None = None,
 ) -> bool:
     """Return whether an orthogonal signed permutation preserves the atoms.
 
     ``atoms`` may be the positions already grouped by
-    :func:`_positions_by_species`.
+    :func:`_positions_by_species`; ``period`` matches them modulo the lattice
+    of a periodic cell.
     """
 
     by_species: dict[str, np.ndarray] = {}
@@ -416,7 +482,7 @@ def _atoms_are_invariant_operation(
     for candidates in by_species.values():
         transformed = candidates @ matrix.T
         if not _has_tolerance_perfect_matching(
-            transformed, candidates, tolerance
+            transformed, candidates, tolerance, period
         ):
             return False
     return True
@@ -455,12 +521,40 @@ def _grid_row_mapping_operation(
     sources, factors, offset = parameters
     if table is not None and selected_rows is None and table.in_row_order:
         return table.row_mapping(sources, factors, offset)
+    if selected_rows is None and _periodic_row_major(grid):
+        # A periodic cell numbers its points row-major over the whole box and
+        # wraps: the map is ``(R n + offset) mod counts``, from three index
+        # vectors broadcast along the axes, the rows of the gather below.
+        from parsec_python.Grid.space_group import affine_grid_images
+
+        return affine_grid_images(
+            np.asarray(operation, dtype=np.int64), offset, grid.points_per_axis, np.int64
+        )
     points = grid.integer_coordinates
     if selected_rows is not None:
         points = points[selected_rows]
     transformed = points[:, sources] * factors + offset
     rows = grid.rows_for_integer_coordinates(transformed)
     return None if np.any(rows < 0) else rows
+
+
+def _periodic_row_major(grid) -> bool:
+    """Whether ``grid`` is a periodic cell whose rows are its points in row-major order (every point active)."""
+
+    from parsec_python.Grid.pbc import PeriodicRealSpaceGrid
+
+    if type(grid) is not PeriodicRealSpaceGrid:
+        return False
+    counts = np.asarray(grid.points_per_axis, dtype=np.int64)
+    lookup = np.asarray(grid.lookup)
+    size = int(np.prod(counts))
+    return (
+        lookup.shape == tuple(int(value) for value in counts)
+        and int(grid.size) == size
+        and int(lookup.reshape(-1)[0]) == 0
+        and int(lookup.reshape(-1)[-1]) == size - 1
+        and int(lookup.reshape(-1)[min(size - 1, int(counts[2]))]) == min(size - 1, int(counts[2]))
+    )
 
 
 def _signed_permutation_operations() -> tuple[np.ndarray, ...]:
@@ -574,6 +668,9 @@ class AxisReflectionReduction:
 
         if not atoms:
             raise ValueError("axis-reflection detection requires at least one atom")
+        # A periodic cell: the atoms match modulo its lattice, and the row
+        # maps wrap into the cell.
+        period = _lattice_period(grid)
         fast = _fast_maps_requested()
         species = _positions_by_species(atoms) if fast else atoms
         table = _RowOrderTable(grid) if fast else None
@@ -581,7 +678,7 @@ class AxisReflectionReduction:
         mappings: list[np.ndarray] = []
         for values in product((-1, 1), repeat=3):
             signs = np.asarray(values, dtype=np.int8)
-            if not _atoms_are_invariant(species, signs, atom_tolerance):
+            if not _atoms_are_invariant(species, signs, atom_tolerance, period):
                 continue
             mapping = _grid_row_mapping(grid, signs, lattice_tolerance, table)
             if mapping is None:
@@ -746,6 +843,7 @@ class SignedPermutationReduction(AxisReflectionReduction):
         # their atom images differ from the sign products it matched at most
         # in the sign of a zero, and their row maps are the ones it built.
         diagonal = {signs.tobytes() for signs in axis.signs}
+        period = _lattice_period(grid)
         fast = _fast_maps_requested()
         species = _positions_by_species(atoms) if fast else atoms
         table = _RowOrderTable(grid) if fast else None
@@ -758,7 +856,7 @@ class SignedPermutationReduction(AxisReflectionReduction):
                 if np.diag(operation).tobytes() not in diagonal:
                     continue
             elif not _atoms_are_invariant_operation(
-                species, operation, atom_tolerance
+                species, operation, atom_tolerance, period
             ):
                 continue
             preserving[operation.tobytes()] = operation
@@ -853,6 +951,22 @@ def orbital_group_policy() -> str:
     value = os.environ.get("PARSEC_ORBITAL_GROUP", "auto").strip().lower() or "auto"
     if value not in ("auto", "abelian"):
         raise ValueError("PARSEC_ORBITAL_GROUP must be auto or abelian")
+    return value
+
+
+def periodic_symmetry_setting() -> str:
+    """``PARSEC_PERIODIC_SYMMETRY``: ``auto`` (the default) or ``off``.
+
+    ``auto`` looks for the point group of a bulk orthorhombic cell at the Gamma point that the route of the
+    sectors takes (``driver.periodic_sector_refusal``): the Cartesian signed permutations about the origin of
+    the cell that map its atoms modulo the lattice and its periodic grid onto themselves.  The orbitals then
+    use the sectors of that group, as for a cluster.  ``off`` keeps the one sector of the identity of before,
+    bit for bit.
+    """
+
+    value = os.environ.get("PARSEC_PERIODIC_SYMMETRY", "auto").strip().lower() or "auto"
+    if value not in ("auto", "off"):
+        raise ValueError("PARSEC_PERIODIC_SYMMETRY must be auto or off")
     return value
 
 
@@ -970,12 +1084,13 @@ def _point_group_operations(
     """
 
     species = _positions_by_species(atoms)
+    period = _lattice_period(grid)
     identity = np.eye(3, dtype=np.int8)
     found = [identity]
     for operation in _signed_permutation_operations():
         if np.array_equal(operation, identity):
             continue
-        if not _atoms_are_invariant_operation(species, operation, atom_tolerance):
+        if not _atoms_are_invariant_operation(species, operation, atom_tolerance, period):
             continue
         if _integer_signed_permutation_parameters(grid, operation, lattice_tolerance) is None:
             continue
@@ -1111,4 +1226,5 @@ __all__ = [
     "detect_point_group_reduction",
     "diagonal_subgroup_reduction",
     "orbital_group_policy",
+    "periodic_symmetry_setting",
 ]

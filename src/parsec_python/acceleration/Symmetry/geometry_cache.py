@@ -78,6 +78,10 @@ def _geometry_key(
     _update_array(digest, "integer_coordinates", grid.integer_coordinates)
     _update_array(digest, "physical_coordinates", grid.coordinates)
     _update_array(digest, "grid_shift", np.asarray(grid.settings.shift, dtype=np.float64))
+    cell = getattr(grid, "cell", None)
+    if cell is not None:
+        # A periodic cell matches the atoms modulo its lattice.
+        _update_array(digest, "lattice_vectors", np.asarray(cell.lattice_vectors, dtype=np.float64))
     for index, atom in enumerate(atoms):
         digest.update(f"atom:{index}:".encode())
         digest.update(str(atom.symbol).encode("utf-8"))

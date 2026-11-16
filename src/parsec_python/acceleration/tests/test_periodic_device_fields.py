@@ -141,11 +141,20 @@ class ModeTests(unittest.TestCase):
         if cupy_available():
             for mode in ("auto", "device"):
                 with mock.patch.dict(os.environ, {periodic_device.MODE_ENV: mode, "PARSEC_KPOINT_BACKEND": "cupy"}):
+                    # the FFT of the stencil symbol by default since 2026-11-16, the CG with ``cg``
                     self.assertEqual(
                         periodic_device.describe_periodic_hartree(system, "old text"),
-                        "periodic conjugate-gradient solve, CuPy float64 on the device "
-                        f"({periodic_device.MODE_ENV}={mode}; SCF.pbc.solve_periodic_hartree)",
+                        "periodic finite-difference solve by the FFT of its stencil symbol, CuPy float64 on the "
+                        f"device ({periodic_device.MODE_ENV}={mode}, {periodic_device.METHOD_ENV}=fft; "
+                        "SCF.pbc.solve_periodic_hartree)",
                     )
+                    with mock.patch.dict(os.environ, {periodic_device.METHOD_ENV: "cg"}):
+                        self.assertEqual(
+                            periodic_device.describe_periodic_hartree(system, "old text"),
+                            "periodic conjugate-gradient solve, CuPy float64 on the device "
+                            f"({periodic_device.MODE_ENV}={mode}, {periodic_device.METHOD_ENV}=cg; "
+                            "SCF.pbc.solve_periodic_hartree)",
+                        )
         general = SimpleNamespace(
             grid=SimpleNamespace(is_general_periodic=True),
             input=SimpleNamespace(hartree=HartreeSettings()),
@@ -268,11 +277,46 @@ class DeviceSolveTests(unittest.TestCase):
         settings = HartreeSettings(relative_tolerance=1.0e-12)
         with mock.patch.dict(os.environ, {periodic_device.MODE_ENV: "host"}):
             host = solve_periodic_hartree(density, grid, laplacian, settings, None)
-        with mock.patch.dict(os.environ, {**_DEVICE, periodic_device.MODE_ENV: "device"}):
-            self.assertIsNotNone(periodic_device.periodic_device_solver(grid, laplacian, settings))
-            device = solve_periodic_hartree(density, grid, laplacian, settings, 0.3 * density)
-        np.testing.assert_allclose(device.potential, host.potential, rtol=0, atol=1.0e-10 * np.max(np.abs(host.potential)))
-        self.assertAlmostEqual(float(np.mean(device.potential)), 0.0, places=12)
+        for method in ("fft", "cg"):
+            periodic_device.clear_cache()
+            with self.subTest(method=method), mock.patch.dict(
+                os.environ, {**_DEVICE, periodic_device.MODE_ENV: "device", periodic_device.METHOD_ENV: method}
+            ):
+                solver = periodic_device.periodic_device_solver(grid, laplacian, settings)
+                self.assertEqual(solver.method, method)
+                device = solve_periodic_hartree(density, grid, laplacian, settings, 0.3 * density)
+                np.testing.assert_allclose(
+                    device.potential, host.potential, rtol=0, atol=1.0e-10 * np.max(np.abs(host.potential))
+                )
+                self.assertAlmostEqual(float(np.mean(device.potential)), 0.0, places=12)
+                self.assertTrue(device.converged)
+                self.assertEqual(device.iterations == 0, method == "fft")
+
+    def test_the_stencil_symbol_solves_the_finite_difference_equation(self) -> None:
+        """The FFT of the stencil symbol: the exact solution of the CG's linear system, to round-off."""
+
+        from parsec_python.Hartree.pbc import _solve_by_fourier_transform
+
+        for sides, order in (((5.0, 6.0, 7.0), 4), ((7.5, 7.5, 9.5), 12)):
+            grid = build_periodic_grid(PeriodicCell(np.diag(sides)), PeriodicGridSettings(spacing=0.5, expansion_order=order))
+            laplacian = build_negative_laplacian(grid)
+            density = _gaussian(grid, grid.coordinates[grid.size // 5]) + 0.01
+            settings = HartreeSettings()
+            exact = _solve_by_fourier_transform(density, grid, laplacian, settings, None, raise_on_nonconvergence=True)
+            periodic_device.clear_cache()
+            with self.subTest(shape=tuple(grid.points_per_axis)), mock.patch.dict(os.environ, _DEVICE):
+                device = solve_periodic_hartree(density, grid, laplacian, settings, 0.2 * density)
+                np.testing.assert_allclose(
+                    device.potential, exact.potential, rtol=0, atol=1.0e-12 * np.max(np.abs(exact.potential))
+                )
+                rhs = 8.0 * np.pi * (density - np.mean(density))
+                residual = np.linalg.norm(rhs - laplacian @ device.potential)
+                self.assertLess(residual, 1.0e-11 * np.linalg.norm(rhs))
+                self.assertAlmostEqual(device.residual_norm, residual, delta=1.0e-11 * np.linalg.norm(rhs))
+                self.assertEqual((device.iterations, device.matrix_vector_products), (0, 0))
+        with mock.patch.dict(os.environ, {periodic_device.METHOD_ENV: "jacobi"}):
+            with self.assertRaises(ValueError):
+                periodic_device.periodic_hartree_method()
 
 
 def _write_input(folder: Path, text: str) -> Path:

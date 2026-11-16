@@ -195,6 +195,8 @@ def build_negative_laplacian(grid: RealSpaceGrid) -> sp.csr_matrix:
         return build_general_negative_laplacian(grid)
     if _is_oblique(grid):
         return _build_oblique_negative_laplacian(grid)
+    if _wrapped_box(grid):
+        return _build_wrapped_negative_laplacian(grid)
     coeff = second_derivative_coefficients(grid.settings.expansion_order)
     width = grid.settings.stencil_half_width
     inv_h2 = 1.0 / grid.spacing**2
@@ -228,6 +230,91 @@ def build_negative_laplacian(grid: RealSpaceGrid) -> sp.csr_matrix:
         shape=(n, n),
     ).tocsr()
     matrix.sum_duplicates()
+    return matrix
+
+
+def _wrapped_box(grid) -> bool:
+    """Whether ``grid`` is an orthorhombic bulk cell whose rows are its whole box in row-major order (every
+    neighbour wraps around and none is missing): the case of :func:`_build_wrapped_negative_laplacian`."""
+
+    from ..Grid.pbc import PeriodicRealSpaceGrid
+
+    if type(grid) is not PeriodicRealSpaceGrid or not grid.is_orthorhombic:
+        return False
+    if tuple(getattr(grid, "boundary_modes", ())) != ("wrap", "wrap", "wrap"):
+        return False
+    shape = tuple(int(value) for value in grid.points_per_axis)
+    lookup = np.asarray(grid.lookup)
+    width = grid.settings.stencil_half_width
+    return (
+        lookup.shape == shape
+        and int(grid.size) == int(np.prod(shape))
+        and min(shape) > 2 * width
+        and int(lookup.reshape(-1)[0]) == 0
+        and int(lookup.reshape(-1)[-1]) == int(grid.size) - 1
+    )
+
+
+def _build_wrapped_negative_laplacian(grid) -> sp.csr_matrix:
+    """The matrix of :func:`build_negative_laplacian` for a periodic box, written directly in CSR.
+
+    Every row holds its point and the ``2 M`` neighbours along each axis, all of them (they wrap), so the rows
+    are of equal length and the matrix of the COO route is known entry by entry: the columns of a row in
+    ascending order, the value of each its stencil weight.  Away from the faces the order is the same for every
+    row (axis 0 backwards, axis 1 backwards, axis 2 backwards, the point, then forwards); only rows within ``M``
+    of a face, whose wrapped neighbours change it, are sorted.  The same arrays as the COO route's (``tocsr``,
+    ``sum_duplicates``: sorted columns, no duplicates since every axis holds more than ``2 M`` points) without
+    its sort of all the entries.
+    """
+
+    coeff = second_derivative_coefficients(grid.settings.expansion_order)
+    width = grid.settings.stencil_half_width
+    inv_h2 = 1.0 / grid.spacing**2
+    shape = tuple(int(value) for value in grid.points_per_axis)
+    n = int(np.prod(shape))
+    strides = (shape[1] * shape[2], shape[2], 1)
+    # (axis, signed shift) in ascending column order for a row away from the faces
+    order = (
+        [(0, -s) for s in range(width, 0, -1)]
+        + [(1, -s) for s in range(width, 0, -1)]
+        + [(2, -s) for s in range(width, 0, -1)]
+        + [(None, 0)]
+        + [(2, s) for s in range(1, width + 1)]
+        + [(1, s) for s in range(1, width + 1)]
+        + [(0, s) for s in range(1, width + 1)]
+    )
+    count = len(order)
+    index_type = np.int32 if n * count < 2**31 else np.int64
+    weights = np.array(
+        [-3.0 * coeff[width] * inv_h2 if axis is None else -coeff[width + abs(shift)] * inv_h2 for axis, shift in order]
+    )
+    rows = np.arange(n, dtype=index_type).reshape(shape)
+    coordinates = [np.arange(extent, dtype=index_type) for extent in shape]
+    columns = np.empty((n, count), dtype=index_type)
+    for slot, (axis, shift) in enumerate(order):
+        if axis is None:
+            columns[:, slot] = rows.reshape(-1)
+            continue
+        # column of the neighbour (i + shift) mod n along the axis: the row plus the change of that index
+        change = ((coordinates[axis] + shift) % shape[axis] - coordinates[axis]) * strides[axis]
+        view = [1, 1, 1]
+        view[axis] = shape[axis]
+        columns[:, slot] = (rows + change.reshape(view)).reshape(-1)
+    data = np.broadcast_to(weights, (n, count)).copy()
+    near = np.zeros(shape, dtype=bool)
+    for axis, extent in enumerate(shape):
+        edge = (coordinates[axis] < width) | (coordinates[axis] >= extent - width)
+        view = [1, 1, 1]
+        view[axis] = extent
+        near |= edge.reshape(view)
+    near = np.flatnonzero(near.reshape(-1))
+    if near.size:
+        permutation = np.argsort(columns[near], axis=1, kind="stable")
+        columns[near] = np.take_along_axis(columns[near], permutation, axis=1)
+        data[near] = weights[permutation]
+    indptr = np.arange(0, n * count + 1, count, dtype=index_type)
+    matrix = sp.csr_matrix((data.reshape(-1), columns.reshape(-1), indptr), shape=(n, n))
+    matrix.has_sorted_indices = True
     return matrix
 
 

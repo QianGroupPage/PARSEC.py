@@ -273,6 +273,12 @@ def fft_local_ionic_potential(
         )
     if not _is_full_periodic(grid):
         return None
+    # The same sums on a GPU where the run has one (PARSEC_PERIODIC_SETUP_DEVICE; round-off).
+    from .periodic_local_device import device_fft_local_ionic_potential
+
+    on_device = device_fft_local_ionic_potential(grid, atoms, potentials, specifications, lattice_vectors, eta, tolerance)
+    if on_device is not None:
+        return on_device
     n, lattice, _ = _cell_geometry(grid, lattice_vectors)
     volume = abs(float(np.linalg.det(lattice)))
     reference_eta, _, _ = _ewald._ewald_cutoffs(volume, eta, tolerance)

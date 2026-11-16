@@ -82,26 +82,38 @@ With an atom at the origin and 18 points per cubic edge, the cell keeps Td about
 the weighted sectors of D2d (`PARSEC_PERIODIC_SYMMETRY=auto`, the default; `src/parsec_python/acceleration/README.md`,
 "Point groups of periodic cells"): 1/16 of the grid times the states of the one sector of the identity. Four nodes,
 one process per node on its four GPUs (`scripts/run_multi_gpu_scf.sh --nodes 4 parsec.in out`, the launch of the
-nanodiamond series), first runs, code 51b2e6b0 of the round; GPU memory as reported by the runner for the fullest
-GPU:
+nanodiamond series), first runs; GPU memory as reported by the runner for the fullest GPU. The times are those of
+the code with the periodic Hartree solve by the FFT of the stencil symbol and the local ionic potential on the GPU
+(below); "before" is the program time of the same runs on code 51b2e6b0, which had neither:
 
-| n | atoms | electrons | grid points | states | SCF iterations | program (s) | SCF (s) | setup (s) | later step (s) | GPU (GiB) |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 6 | 1,728 | 6,912 | 1,259,712 | 3,462 | 9 | 18.4 | 10.4 | 7.9 | 0.32 | 1.4 |
-| 8 | 4,096 | 16,384 | 2,985,984 | 8,198 | 9 | 29.7 | 11.4 | 18.2 | 0.94 | 3.5 |
-| 10 | 8,000 | 32,000 | 5,832,000 | 16,006 | 9 | 71.2 | 31.6 | 39.4 | 2.63 | 8.3 |
-| 12 | 13,824 | 55,296 | 10,077,696 | 27,654 | 10 | 173.8 | 99.2 | 74.4 | 8.24 | 18.0 |
-| 14 | 21,952 | 87,808 | 16,003,008 | 43,910 | 10 | 347.8 | 211.0 | 136.8 | 16.29 | 37.2 |
-| 15 | 27,000 | 108,000 | 19,683,000 | 54,006 | 9 | 479.4 | 297.8 | 181.5 | 25.10 | 52.7 |
-| 16 | 32,768 | 131,072 | 23,887,872 | 65,542 | 9 | 690.7 | 450.9 | 239.6 | 37.57 | 74.0 |
+| n | atoms | electrons | grid points | states | SCF iterations | program (s) | SCF (s) | setup (s) | later step (s) | GPU (GiB) | before (s) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 6 | 1,728 | 6,912 | 1,259,712 | 3,462 | 9 | 5.7 | 1.9 | 3.7 | 0.12 | 1.0 | 18.4 |
+| 8 | 4,096 | 16,384 | 2,985,984 | 8,198 | 9 | 12.4 | 5.4 | 6.8 | 0.37 | 2.5 | 29.7 |
+| 10 | 8,000 | 32,000 | 5,832,000 | 16,006 | 9 | 36.2 | 19.5 | 16.6 | 1.25 | 6.5 | 71.2 |
+| 12 | 13,824 | 55,296 | 10,077,696 | 27,654 | 10 | 106.8 | 78.1 | 28.5 | 5.40 | 14.8 | 173.8 |
+| 14 | 21,952 | 87,808 | 16,003,008 | 43,910 | 10 | 193.0 | 152.9 | 39.9 | 10.85 | 32.1 | 347.8 |
+| 15 | 27,000 | 108,000 | 19,683,000 | 54,006 | 9 | 280.5 | 229.9 | 50.5 | 17.87 | 46.4 | 479.4 |
+| 16 | 32,768 | 131,072 | 23,887,872 | 65,542 | 9 | 424.8 | 361.7 | 62.9 | 28.35 | 66.3 | 690.7 |
 
 n = 16 is the largest cube that fits (n = 17 would need about 1.4 times the memory). The energy per atom is
--11.4039349 Ry from n = 10 on. SCF to 1e-7 Ry, the sectors give the energy of the one sector of the identity within
-4e-14 Ry (n = 1), 5e-13 Ry (n = 2) and 9e-13 Ry (n = 3). Of the setup of n = 16, 153 s are the local ionic potential
-of the root (the periodic reference preparation on the host) and 30 s the finite differences; of its SCF, 355 s are
-eigensolves (133 s the first) and 84 s the periodic Hartree solves on the full grid (CG on the GPU). With one rank
-per GPU (`--rank-per-gpu`, sector groups of four ranks) n = 10 took 73.4 s and 11.5 GiB, n = 12 181.3 s and
-19.9 GiB.
+-11.4039349 Ry from n = 10 on; the energies of the two codes agree within 3e-10 Ry. SCF to 1e-7 Ry, the sectors
+give the energy of the one sector of the identity within 4e-14 Ry (n = 1), 5e-13 Ry (n = 2) and 9e-13 Ry (n = 3).
+
+Of the 690.7 s of n = 16 on code 51b2e6b0, the setup took 239.6 s (153 s the local ionic potential of the root,
+on the host; 30 s the finite differences) and the periodic Hartree solves 84 s (CG on the GPU, about 9 s a step).
+Three changes, each exact or with a switch that restores the former bits (`src/parsec_python/acceleration/README.md`):
+
+- The Hartree solve divides by the eigenvalues of the wrapped finite-difference Laplacian, the FFT of its stencil
+  (`PARSEC_PERIODIC_HARTREE_METHOD=fft`, the default; `cg` the former solve): 0.26 s a step at n = 16, 2.5 s for
+  the whole SCF, and the GPU of the solve no longer holds the matrix.
+- The local ionic potential (the structure-factor series and the short-ranged terms of every image) is summed on
+  the GPU (`PARSEC_PERIODIC_SETUP_DEVICE=auto`, the default; `off` the host): 1.0 s at n = 16.
+- The finite-difference matrix of the wrapped box is written directly in its final order (the same arrays): 5.3 s.
+
+The setup of n = 16 is now 62.9 s, of which 23 s are the projectors and 11 s the initial density; of its SCF,
+355 s are eigensolves (133 s the first). The host memory of the root fell from 34.1 to 14.6 GiB. With one rank
+per GPU (`--rank-per-gpu`, sector groups of four ranks) n = 10 took 33.8 s and 10.2 GiB.
 
 ### k-points (irreducible wedge of a Gamma-centred mesh)
 

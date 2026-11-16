@@ -2711,7 +2711,10 @@ def _selection_for_problem(
 
     The native C++ finite-difference/ionic construction kernels and the
     native/CuPy multipole-boundary Hartree solve are both isolated-cluster
-    specific -- neither is periodic-wraparound aware. Forcing
+    specific -- neither is periodic-wraparound aware.  The periodic routes
+    have their own device paths (``V_ion/periodic_local_device.py`` and
+    ``Hartree/periodic_device.py``), chosen inside the reference preparation
+    and the periodic Hartree branch, not by these two fields.  Forcing
     ``finite_difference_builder``/``hartree_backend`` to the reference/scipy
     values here means every downstream branch keyed on those two fields
     (native boundary setup, native XC, the diagnostic implementation
@@ -2742,10 +2745,11 @@ def _selection_for_problem(
         hartree_backend="scipy",
         fallback_reasons=selection.fallback_reasons
         + (
-            "periodic cell: finite-difference/ionic construction and the "
-            "Hartree solve are routed to the reference (Python) "
-            "implementation -- native/CuPy construction and boundary "
-            "kernels are isolated-cluster only",
+            "periodic cell: the cluster construction and multipole-boundary "
+            "Hartree kernels (native/CuPy) are not used -- the periodic routes "
+            "build the wrapped finite differences on the host and, where a GPU "
+            "is present, the local ionic potential and the Hartree solve on "
+            "the device (hartree_implementation names the solve)",
         ),
     )
 

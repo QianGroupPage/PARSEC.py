@@ -919,6 +919,8 @@ a setting that selects the former one:
 | `PARSEC_CUPY_SECTOR_MARGIN` | `auto`: the margin of the first counts of weighted sectors (10 %) is cut where the devices cannot hold it, to the largest share whose counted states after one growth take at most `PARSEC_CUPY_SECTOR_MARGIN_BUDGET` (0.82) of a device; a sector so cut that misses states grows by its estimated deficit, at most 2 % a step, from a new start | `fixed`: the full margin and the growth by half of before everywhere; a run whose devices hold the full margin is the same either way |
 | `PARSEC_ORBITAL_GROUP` | `auto`: where the full point group of signed permutations is larger than its abelian subgroup and that solves less, the orbitals use the one-dimensional sectors of the subgroup that `Symmetry/orbital_groups.py` chooses, with weights (Td: D2d, sectors of about a quarter of the D2 basis; see "Weighted sectors of a larger subgroup"); spin, spin-orbit, hybrids, meta-GGAs, libxc, LDA+U and `occup.in` keep the abelian group | `abelian`: the reflection or commuting signed-permutation group of before, bit for bit |
 | `PARSEC_PERIODIC_SYMMETRY` | `auto`: a bulk orthorhombic cell at the Gamma point that the route of the sectors takes solves its orbitals in the sectors of its point group about the origin of the cell (atoms modulo the lattice, row maps that wrap; Td of diamond: 1/16 of the basis of the one sector of the identity; see "Point groups of periodic cells") | `off`: one sector of the identity, or the full grid of one GPU, bit for bit |
+| `PARSEC_PERIODIC_HARTREE_METHOD` | `fft` (since 2026-11-16): the finite-difference Poisson equation of an orthorhombic 3-D cell on the device by dividing by the FFT of its stencil symbol (the wrapped `-nabla^2` is circulant): the exact solution of the linear system the CG iterates on, two real FFTs per solve and no matrix on the device (bulk diamond, 23.9 M points: about 9 s per SCF step before) | `cg`: the conjugate gradients of before, bit for bit (the two differ by the CG tolerance) |
+| `PARSEC_PERIODIC_SETUP_DEVICE` | `auto` (since 2026-11-16): the local ionic potential of a bulk cell of the default routines with diagonal lattice vectors on the device where the run has one: the structure-factor series as the same blocked product and FFT, the short-ranged terms gathered per grid point from the images in the neighbouring bins (`V_ion/periodic_local_device.py`; the host sums to round-off) | `off`: the host sums, bit for bit |
 | `PARSEC_MPI_SHARED_EIGH_HELPER` | `on`: under the block route the root of a basis that three or more ranks share hands the eigensolve of its small solve to another rank (the whitened matrix there and the eigenvectors back, solved in that rank's summed pair), and the condition helper estimates on its own summed overlap instead of a copy; the same bits (bulk diamond on 16 A100, Gamma point, 5,832 atoms: 41.9 -> 38.3 GiB at the fullest GPU, 303.4 and 302.7 s). The block route forms the whitening in the summed pair either way; with both and the pool that the planner now chooses, 8,000 atoms took 71.6 -> 68.1 GiB and 657.9 -> 651.5 s on the same nodes | `off`: the eigensolve and a copy of the overlap on the root and the helper, as before |
 | `PARSEC_SPINOR_FILTER_COLUMNS` | `32` in the k-point pools, `64` on one device: columns per chunk of the filter recurrence, of `H X` and of the residuals; the random start basis is drawn 64 columns at a time whatever the chunk (bulk diamond on 16 A100, same nodes, energies the same to the digits printed: 1,728 atoms 33.1 -> 26.9 GiB, 216.6 -> 197.4 s; 2,744 atoms 63.5 -> 54.8 GiB, 622.6 -> 606.6 s; 1,000 atoms with a 4x4x4 mesh 162.1 -> 138.3 s) | `64`: the chunk of the pools before (their start basis was drawn by chunks, so another chunk started from another basis) |
 | `PARSEC_CUPY_STREAMING_RITZ` | `auto`: a symmetry sector whose basis lies on one device keeps one `N x m` array; `H X` is projected a slab of columns at a time and the basis is rotated in place | `0`: two arrays |
@@ -2919,16 +2921,20 @@ Measured on A100 (bulk diamond of `examples/3d_diamond_benchmark`, first runs):
 SCF to 1e-7 Ry, the sectors of Td give the total energy of the one sector of
 the identity within 4e-14 (8 atoms), 5e-13 (64) and 9e-13 Ry (216), one rank
 per GPU or one process on the four GPUs of a node. With the settings of the
-benchmark (2e-4 Ry) on 16 A100 (four nodes, one process each): 1,728 atoms
-18.4 s and 1.37 GiB at the fullest GPU (one rank per GPU: 11.9 s and 1.91 GiB;
-the identity 28-36 s and 8.0 GiB), 4,096 atoms 29.7 s and 3.49 GiB (published
-136.7 s and 21.5 GiB), 8,000 atoms 71.2 s and 8.34 GiB (published 651.5 s and
-68.1 GiB, the largest cell of the one sector of the identity), and up to 32,768
-atoms (131,072 electrons, 23.9 M grid points, 65,542 states): 690.7 s, 9 SCF
-steps, 74.0 GiB at the fullest GPU, the largest cube on 16 A100
-(`examples/3d_diamond_benchmark/README.md`). Its setup (240 s) is mostly the
-local ionic potential of the periodic reference preparation on the host of the
-root (153 s), its SCF mostly eigensolves (355 s of 451 s).
+benchmark (2e-4 Ry) on 16 A100 (four nodes, one process each), with the
+Hartree solve by the stencil symbol and the local ionic potential on the GPU
+(`PARSEC_PERIODIC_HARTREE_METHOD`, `PARSEC_PERIODIC_SETUP_DEVICE` in the table
+of switches): 1,728 atoms 5.7 s and 0.98 GiB at the fullest GPU, 4,096 atoms
+12.4 s and 2.54 GiB (published 136.7 s and 21.5 GiB, the one sector of the
+identity), 8,000 atoms 36.2 s and 6.48 GiB (published 651.5 s and 68.1 GiB,
+the largest cell of the one sector of the identity), and up to 32,768 atoms
+(131,072 electrons, 23.9 M grid points, 65,542 states): 424.8 s, 9 SCF steps,
+66.3 GiB at the fullest GPU, the largest cube on 16 A100
+(`examples/3d_diamond_benchmark/README.md`). Its SCF is mostly eigensolves
+(355 s of 362 s), its setup (63 s) mostly the projectors (23 s) and the
+initial density (11 s). Before these two device paths the same cell took
+690.7 s and 74.0 GiB: a setup of 240 s, 153 s of it the local ionic potential
+on the host of the root, and 84 s of CG Hartree solves.
 
 #### ARPACK, Dynamic_Diag_Tol, Fix_Number_Eigenvalues and the TEST mode
 

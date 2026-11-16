@@ -296,15 +296,16 @@ class PeriodicDriverTests(unittest.TestCase):
         )
         self.assertEqual(details["detected_symmetry_group_order"], "1")
         self.assertIn("periodic-wraparound", details["finite_difference_builder"])
-        # The readable periodic CG, on the host or (since 2026-10-30 by default) through the device
-        # hook where the k-point plan has a GPU; up to then this test asserted the host text alone.
+        # The readable periodic CG on the host, or (since 2026-10-30 by default) the device hook where the
+        # k-point plan has a GPU: since 2026-11-16 the FFT of the stencil symbol there
+        # (PARSEC_PERIODIC_HARTREE_METHOD=cg: the CG). Up to 2026-10-30 this test asserted the host text alone.
         from parsec_python.acceleration.Hartree.periodic_device import hartree_device_id
 
         self.assertTrue(
             details["hartree_implementation"].startswith(
                 "periodic Ewald-consistent"
                 if hartree_device_id() is None
-                else "periodic conjugate-gradient solve, CuPy float64 on the device"
+                else "periodic finite-difference solve by the FFT of its stencil symbol, CuPy float64 on the device"
             ),
             details["hartree_implementation"],
         )

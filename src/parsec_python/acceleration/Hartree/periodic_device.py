@@ -99,6 +99,28 @@ def hartree_device_mode() -> str:
     return _MODES[value]
 
 
+METHOD_ENV = "PARSEC_PERIODIC_HARTREE_METHOD"  # fft (default) | cg
+
+
+def periodic_hartree_method() -> str:
+    """``fft`` or ``cg`` from ``PARSEC_PERIODIC_HARTREE_METHOD``: how the device solves the finite-difference
+    Poisson equation of an orthorhombic 3-D cell.
+
+    ``fft`` (the default since 2026-11-16): the wrapped finite-difference ``-nabla^2`` of the cell is circulant,
+    so the plane waves of the grid are its eigenvectors and its eigenvalues are the FFT of its first row (the
+    stencil symbol, :func:`parsec_python.Hartree.pbc.finite_difference_symbol`); dividing the transformed source
+    by them, with the ``G = 0`` term set to zero, solves the linear system the conjugate gradients iterate on
+    exactly, as the general grid's solve does on the host.  Two real FFTs per solve; no matrix on the device.
+    ``cg``: the conjugate gradients of before (:class:`FusedConjugateGradient`), bit for bit; the two differ by
+    the CG tolerance.
+    """
+
+    value = os.environ.get(METHOD_ENV, "fft").strip().lower() or "fft"
+    if value not in ("fft", "cg"):
+        raise ValueError(f"{METHOD_ENV} must be fft or cg, not {value!r}")
+    return value
+
+
 def hartree_device_id() -> int | None:
     """The CUDA device of the solves, or ``None`` when the reference drivers run on the CPU.
 
@@ -562,15 +584,18 @@ class DeviceConfinedHartree:
 
 
 class DevicePeriodicHartree:
-    """The Hartree solve of a 3-D cell on a device: ``Calc_Hartree_G`` or the FD conjugate gradients."""
+    """The Hartree solve of a 3-D cell on a device: ``Calc_Hartree_G``, or the finite-difference equation by the
+    FFT of its stencil symbol (:func:`periodic_hartree_method`) or by conjugate gradients."""
 
-    def __init__(self, grid, negative_laplacian, device_id: int, *, g_space: bool) -> None:
+    def __init__(self, grid, negative_laplacian, device_id: int, *, g_space: bool, method: str = "cg") -> None:
         cp, cpsparse = _cupy()
         self.cp = cp
         self.device_id = int(device_id)
         self.size = int(grid.size)
         self.g_space = bool(g_space)
         self.shape = tuple(int(value) for value in grid.points_per_axis)
+        self.symbol = None
+        self.method = "g_space" if self.g_space else str(method)
         with cp.cuda.Device(self.device_id):
             if self.g_space:
                 from parsec_python.Hartree.gspace import g_squared
@@ -581,6 +606,24 @@ class DevicePeriodicHartree:
                 factor[0, 0, 0] = 0.0
                 self.factor = cp.asarray(factor)
                 self.cg = None
+            elif self.method == "fft":
+                # The eigenvalues of the circulant operator on the half spectrum of a real FFT: the transform of
+                # its first row, real for a symmetric stencil (Hartree.pbc.finite_difference_symbol).
+                row = np.asarray(sp.csr_matrix(negative_laplacian).getrow(0).toarray(), dtype=np.float64)
+                symbol = cp.fft.rfftn(cp.asarray(row.reshape(self.shape))).real
+                magnitude = cp.abs(symbol)
+                largest = float(magnitude.max())
+                magnitude[0, 0, 0] = cp.inf
+                if not float(magnitude.min()) > 1.0e-12 * largest:
+                    raise RuntimeError(
+                        "the finite-difference Laplacian of this periodic grid is singular beyond the constant mode"
+                    )
+                symbol[0, 0, 0] = 1.0
+                self.factor = (8.0 * np.pi) / symbol
+                self.factor[0, 0, 0] = 0.0
+                symbol[0, 0, 0] = 0.0
+                self.symbol = symbol
+                self.cg = None
             else:
                 self.factor = None
                 self.cg = FusedConjugateGradient(cp, negative_laplacian, self.device_id, self.size)
@@ -588,8 +631,33 @@ class DevicePeriodicHartree:
     @property
     def device_bytes(self) -> int:
         if self.factor is not None:
-            return int(self.factor.nbytes)
+            return int(self.factor.nbytes) + (0 if self.symbol is None else int(self.symbol.nbytes))
         return int(self.cg.device_bytes)
+
+    def _spectral_residual(self, rhs, potential) -> float:
+        """``||rhs - A potential||`` with ``A`` applied by its symbol (two real FFTs)."""
+
+        cp = self.cp
+        applied = cp.fft.irfftn(
+            cp.fft.rfftn(potential.reshape(self.shape)) * self.symbol, s=self.shape, axes=(0, 1, 2)
+        )
+        return float(np.sqrt(_device_scalar(cp.vdot(rhs - applied.reshape(-1), rhs - applied.reshape(-1)))))
+
+    def _solve_by_symbol(self, rhs, initial_potential):
+        """``A V = rhs`` (``rhs`` of zero mean) by dividing by the stencil symbol; ``V`` of zero mean."""
+
+        cp = self.cp
+        transform = cp.fft.rfftn(rhs.reshape(self.shape))
+        transform *= self.factor / (8.0 * np.pi)
+        potential = cp.fft.irfftn(transform, s=self.shape, axes=(0, 1, 2)).reshape(-1)
+        potential -= cp.mean(potential)
+        if initial_potential is None:
+            initial_residual = float(np.sqrt(_device_scalar(cp.vdot(rhs, rhs))))
+        else:
+            initial = cp.asarray(np.asarray(initial_potential, dtype=np.float64))
+            initial = initial - cp.mean(initial)
+            initial_residual = self._spectral_residual(rhs, initial)
+        return potential, self._spectral_residual(rhs, potential), initial_residual
 
     def solve(self, density, settings, initial_potential, *, raise_on_nonconvergence: bool):
         cp = self.cp
@@ -618,6 +686,18 @@ class DevicePeriodicHartree:
                     initial_residual_norm=_device_scalar(cp.linalg.norm(rhs)),
                 )
                 return result
+
+            if self.method == "fft":
+                potential, residual, initial_residual = self._solve_by_symbol(rhs, initial_potential)
+                return PeriodicHartreeResult(
+                    potential=cp.asnumpy(potential),
+                    right_hand_side=cp.asnumpy(rhs),
+                    converged=True,
+                    iterations=0,
+                    matrix_vector_products=0,
+                    residual_norm=residual,
+                    initial_residual_norm=initial_residual,
+                )
 
             if initial_potential is None:
                 initial = cp.zeros(self.size, dtype=cp.float64)
@@ -723,10 +803,11 @@ def periodic_device_solver(grid, negative_laplacian, settings):
     device_id = hartree_device_id()
     if device_id is None:
         return None
+    method = "g_space" if g_space else periodic_hartree_method()
     return _CACHE.get(
         (grid, negative_laplacian),
-        ("g_space" if g_space else "cg", device_id),
-        lambda: DevicePeriodicHartree(grid, negative_laplacian, device_id, g_space=g_space),
+        (method, device_id),
+        lambda: DevicePeriodicHartree(grid, negative_laplacian, device_id, g_space=g_space, method=method),
     )
 
 
@@ -789,9 +870,14 @@ def describe_periodic_hartree(system, default: str) -> str:
         where = "CuPy FFT on the device" if device else "NumPy FFT on the host"
         return f"reciprocal-space solve of Calc_Hartree_G, {where} (Hartree.gspace)"
     if device and not getattr(grid, "is_general_periodic", False):
+        if periodic_hartree_method() == "fft":
+            return (
+                "periodic finite-difference solve by the FFT of its stencil symbol, CuPy float64 on the device "
+                f"({MODE_ENV}={hartree_device_mode()}, {METHOD_ENV}=fft; SCF.pbc.solve_periodic_hartree)"
+            )
         return (
             "periodic conjugate-gradient solve, CuPy float64 on the device "
-            f"({MODE_ENV}={hartree_device_mode()}; SCF.pbc.solve_periodic_hartree)"
+            f"({MODE_ENV}={hartree_device_mode()}, {METHOD_ENV}=cg; SCF.pbc.solve_periodic_hartree)"
         )
     return default
 

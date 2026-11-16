@@ -341,8 +341,10 @@ periodic Laplacian, projectors with their lattice images); the Ritz step
 moves them to row blocks and back (three `Alltoallv` per step, GPU-aware MPI)
 and the root solves the small eigenproblem on its GPU. The root alone holds
 the SCF loop: the periodic Hartree solve (`Hartree/periodic_device.py`, the
-finite-difference CG or `Calc_Hartree_G` on its GPU), the XC functional on
-its GPU, the local ionic potential, densities and Ewald terms of the
+finite-difference equation by the FFT of its stencil symbol, or the CG with
+`PARSEC_PERIODIC_HARTREE_METHOD=cg`, or `Calc_Hartree_G`, on its GPU), the XC functional on
+its GPU, the local ionic potential (on its GPU unless
+`PARSEC_PERIODIC_SETUP_DEVICE=off`), densities and Ewald terms of the
 reference preparation, and the mixer. The other ranks build the grid, the
 Laplacian and the projectors only (`driver._prepare_periodic_orbital_operators`,
 the same arrays element for element). The ranks compare the lattice vectors,

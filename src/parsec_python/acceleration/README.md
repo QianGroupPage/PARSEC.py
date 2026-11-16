@@ -915,6 +915,8 @@ a setting that selects the former one:
 | `PARSEC_CUPY_RITZ_CONDITION_HELPER` | `auto`: beside that solve on the owner of a shared basis, another device of the sector estimates the condition number of the overlap, never the device that holds the Hartree objects. `any` asks that device too where the sector has no other and the sharing rule counts the room for the estimate; it was the default for a while (below); ranks that share a basis over MPI (`Eigensolvers/mpi_shared_basis.py`): rank 1 estimates it for the root (same bits) | `off`: the owner estimates it first |
 | `PARSEC_MPI_SHARED_RITZ` | `auto`: a basis that MPI ranks share takes the Ritz step with each rank's row block in the memory of its columns (`block`: one share of the basis per rank and the buffers of a round, the exchanges of the rounds; cells and clusters) | `rounds`: one row block beside the columns, `H X` formed and projected a round at a time (two shares; the former default of a cell); `rows`: the two row blocks (three shares; the former default of a cluster) |
 | `PARSEC_KPOINT_RITZ` | `auto`: the pools take `block` (each rank's columns column-major in an allocation with room for its rows; filter, moves and Rayleigh-Ritz in place, one share of the basis, five moves of it per pass, residuals from `H` on the rotated columns) where `rows` would need more than half of a device or plan worse (fewer pools, subspaces on the host, no fit), else `rows` | `rows`: row-major columns, the filter into a second block, three shares in a Rayleigh-Ritz pass, four moves (the former route, bit for bit); `block` always |
+| `PARSEC_HARTREE_DIAGONAL_BOUNDARY` | `auto`: a Hartree problem whose group permutes the axes (the weighted sectors of a tetrahedral or cubic cluster) builds its GPU boundary on the wedge of the diagonal members of the group, D2 for D2d (see "Weighted sectors of a larger subgroup") | `off`: the kernels under the identity on the full grid |
+| `PARSEC_CUPY_SECTOR_MARGIN` | `auto`: the margin of the first counts of weighted sectors (10 %) is cut where the devices cannot hold it, to the largest share whose counted states after one growth take at most `PARSEC_CUPY_SECTOR_MARGIN_BUDGET` (0.82) of a device; a sector so cut that misses states grows by its estimated deficit, at most 2 % a step, from a new start | `fixed`: the full margin and the growth by half of before everywhere; a run whose devices hold the full margin is the same either way |
 | `PARSEC_ORBITAL_GROUP` | `auto`: where the full point group of signed permutations is larger than its abelian subgroup and that solves less, the orbitals use the one-dimensional sectors of the subgroup that `Symmetry/orbital_groups.py` chooses, with weights (Td: D2d, sectors of about a quarter of the D2 basis; see "Weighted sectors of a larger subgroup"); spin, spin-orbit, hybrids, meta-GGAs, libxc, LDA+U and `occup.in` keep the abelian group | `abelian`: the reflection or commuting signed-permutation group of before, bit for bit |
 | `PARSEC_MPI_SHARED_EIGH_HELPER` | `on`: under the block route the root of a basis that three or more ranks share hands the eigensolve of its small solve to another rank (the whitened matrix there and the eigenvectors back, solved in that rank's summed pair), and the condition helper estimates on its own summed overlap instead of a copy; the same bits (bulk diamond on 16 A100, Gamma point, 5,832 atoms: 41.9 -> 38.3 GiB at the fullest GPU, 303.4 and 302.7 s). The block route forms the whitening in the summed pair either way; with both and the pool that the planner now chooses, 8,000 atoms took 71.6 -> 68.1 GiB and 657.9 -> 651.5 s on the same nodes | `off`: the eigensolve and a copy of the overlap on the root and the helper, as before |
 | `PARSEC_SPINOR_FILTER_COLUMNS` | `32` in the k-point pools, `64` on one device: columns per chunk of the filter recurrence, of `H X` and of the residuals; the random start basis is drawn 64 columns at a time whatever the chunk (bulk diamond on 16 A100, same nodes, energies the same to the digits printed: 1,728 atoms 33.1 -> 26.9 GiB, 216.6 -> 197.4 s; 2,744 atoms 63.5 -> 54.8 GiB, 622.6 -> 606.6 s; 1,000 atoms with a 4x4x4 mesh 162.1 -> 138.3 s) | `64`: the chunk of the pools before (their start basis was drawn by chunks, so another chunk started from another basis) |
@@ -2707,6 +2709,50 @@ within the scatter of that SCF criterion (2e-4 Ry: up to 1.3e-4 Ry between the
 two routes). The sectors of D2d do not hold even shares of the lowest levels
 (the A1 and T2 sectors of k14 about 4 % more): each starts 10 % above its share,
 where an even start failed the spectral bracket and solved two of them again.
+
+The Hartree problem of these sectors has the group of the orbitals, whose
+operations permute the axes, and the GPU kernels of the boundary take only
+axis reflections. The boundary is therefore built on the wedge of the diagonal
+members of the group (`Symmetry.diagonal_subgroup_reduction`; D2 for D2d, the
+wedge of the abelian route): the density per orbit of the group is gathered
+onto that wedge, the multipoles and the right-hand side come from the wedge
+kernels, and the right-hand side of the group is `sqrt(m) b` at its own
+representative rows (`Hartree.cupy_boundary.CuPySubgroupMultipoleBoundaryBuilder`).
+Before, these sectors took the kernels under the identity on the full grid
+with the full-grid maps of the resident chain, about 100 bytes per grid
+point on the device of the Hartree objects: at C19395H2556 (21,951 atoms,
+80,136 electrons, sphere 44.9 Angstrom) on 16 A100 that device ran out of memory
+in the first Ritz step. On the wedge its boundary arrays take 0.44 GiB, and the
+run took 279.4 s, 18.8 s of it in the Hartree solves, at 70.0 GiB on the
+fullest GPU (with `PARSEC_HARTREE_BOUNDARY_BACKEND=native` it had taken 709.1 s,
+449.8 s in the Hartree solves, which repeated the full-grid recurrences there).
+The right-hand side equals the projected one of the full grid to round-off
+(test); `PARSEC_HARTREE_DIAGONAL_BOUNDARY=off` keeps the full-grid kernels.
+
+The margin of the first counts is weighed against the devices
+(`PARSEC_CUPY_SECTOR_MARGIN=auto`): every process finds, for the sectors it
+solves, the largest share of the margin whose counted states
+(`_state_fit_bytes`, after one growth of 2 %) take at most
+`PARSEC_CUPY_SECTOR_MARGIN_BUDGET` (0.82) of each device, and the root takes the
+least share of the ranks of a sector. Where the full margin fits, nothing
+changes. A sector whose margin was cut and which then misses states grows by
+its estimated deficit, at most 2 % a step, from a new start: its basis and the
+cached blocks of the memory pool are given back first, where the growth of
+before held the basis beside half as many columns more. The deficit comes from
+the sector's density of states between the values at a half and at four fifths
+of its count, which a first solve has converged, carried to the cutoff at which
+the weighted counts of all sectors reach the requested states. With the margin
+cut to nothing on purpose (`PARSEC_CUPY_SECTOR_MARGIN_BUDGET=0.000001`): k06 on
+one A100 to 1e-7 Ry gave the energy of the run with the margin within 2.8e-9 Ry
+(4.64 against 4.79 GiB), k10 on 16 A100 within 3.2e-5 Ry at the benchmark
+criterion of 2e-4 Ry (14 steps against 10; 22.1 against 14.0 s, 5.35 against
+5.47 GiB). On 16 A100 of 80 GB the cluster cut at 1.03 times the radius of
+C19395H2556 (C21003H2700, 86,712 electrons, the same domain, 8 % more basis) got
+through the first solve with its margin cut, but its A1 sector, which
+holds about 3.5 % more than an even share of the lowest levels, could not grow
+within the devices (the rule that shares a basis refused the second step, and with
+`PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION=0.88` a Ritz step ran out of memory):
+C19395H2556 stays the largest of the series there.
 
 Requested final host wavefunctions are expanded in bounded column blocks on
 the CPU, without gathering all orbitals into one GPU's memory. The final host

@@ -199,5 +199,130 @@ class TdSpectrumTests(unittest.TestCase):
         self.assertIs(detect_point_group_reduction(grid, atoms, abelian), abelian)
 
 
+class DiagonalSubgroupTests(unittest.TestCase):
+    def test_the_diagonal_members_of_d2d_are_the_reflection_group_of_the_structure(self):
+        from parsec_python.Grid import build_cluster_grid
+        from parsec_python.acceleration.Symmetry import (
+            AxisReflectionReduction,
+            SignedPermutationReduction,
+            detect_point_group_reduction,
+            diagonal_subgroup_reduction,
+        )
+        from parsec_python.models import Atom, GridSettings
+
+        a = 1.2
+        atoms = [Atom("C", (0.0, 0.0, 0.0))] + [
+            Atom("H", tuple(a * np.array(signs, dtype=float)))
+            for signs in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1))
+        ]
+        for shift in (0.5, 0.0):
+            with self.subTest(shift=shift):
+                grid = build_cluster_grid(GridSettings(spacing=0.5, radius=3.8, expansion_order=4, shift=(shift,) * 3))
+                reduction = detect_point_group_reduction(grid, atoms, SignedPermutationReduction.detect(grid, atoms))
+                diagonal = diagonal_subgroup_reduction(grid, reduction.operations)
+                reference = AxisReflectionReduction.detect(grid, atoms)
+                np.testing.assert_array_equal(diagonal.signs, reference.signs)
+                np.testing.assert_array_equal(diagonal.representative_rows, reference.representative_rows)
+                np.testing.assert_array_equal(diagonal.full_to_wedge, reference.full_to_wedge)
+                np.testing.assert_array_equal(diagonal.multiplicities, reference.multiplicities)
+                # every field on the wedge of D2d is invariant under the subgroup
+                field = np.random.default_rng(2).standard_normal(reduction.wedge_size)
+                full = field[reduction.full_to_wedge]
+                for orbit in range(0, diagonal.wedge_size, 37):
+                    members = np.flatnonzero(diagonal.full_to_wedge == orbit)
+                    self.assertEqual(np.ptp(full[members]), 0.0)
+
+    def test_a_group_without_diagonal_members_has_none(self):
+        from parsec_python.Grid import build_cluster_grid
+        from parsec_python.acceleration.Symmetry import diagonal_subgroup_reduction
+        from parsec_python.models import GridSettings
+
+        grid = build_cluster_grid(GridSettings(spacing=0.5, radius=3.0, expansion_order=4, shift=(0.5,) * 3))
+        cyclic = np.array([[[0, 0, 1], [1, 0, 0], [0, 1, 0]], [[0, 1, 0], [0, 0, 1], [1, 0, 0]]])
+        operations = np.concatenate([np.eye(3, dtype=np.int64)[None], cyclic])
+        self.assertIsNone(diagonal_subgroup_reduction(grid, operations))
+
+
+class SectorMarginTests(unittest.TestCase):
+    """The margin of the first counts of weighted sectors, weighed against the devices."""
+
+    def test_the_largest_fraction_that_fits(self):
+        from parsec_python.acceleration.Eigensolvers.symmetry import largest_fitting_fraction
+
+        rows = 1000
+
+        def fit(counts):
+            # two devices, one sector each, 8 bytes per row and column
+            return {0: 8 * rows * counts[0], 1: 8 * rows * counts[1]}
+
+        totals = {0: 8 * rows * 1000, 1: 8 * rows * 1000}
+        low, high = [800, 760], [880, 836]
+        self.assertEqual(largest_fitting_fraction(fit, totals, 1.0, low, high), 1.0)
+        self.assertEqual(largest_fitting_fraction(fit, totals, 0.5, low, high), 0.0)
+        fraction = largest_fitting_fraction(fit, totals, 0.84, low, high)
+        # sector 0 limits: 800 + f 80 <= 840 -> f <= 0.5
+        self.assertLessEqual(fraction, 0.5)
+        self.assertGreater(fraction, 0.5 - 1.0 / 64)
+        # weighed after one growth (2 % and the increment): sector 0 grown must fit 840
+        from parsec_python.acceleration.Eigensolvers.symmetry import regrown_count
+
+        grown = largest_fitting_fraction(fit, totals, 0.84, low, high, increment=6)
+        self.assertLessEqual(regrown_count(800 + int(grown * 80), 6), 840)
+        self.assertGreater(regrown_count(800 + int((grown + 1.0 / 64) * 80), 6), 840)
+        # the full margin that fits is taken as it is
+        self.assertEqual(largest_fitting_fraction(fit, totals, 1.0, low, high, increment=6), 1.0)
+
+    def test_the_deficit_of_a_sector_cut_short(self):
+        from parsec_python.acceleration.Eigensolvers.symmetry import bracket_deficits
+
+        rng = np.random.default_rng(3)
+        # three sectors with even level densities of different size, weights 1, 1, 3
+        full = [np.sort(rng.uniform(0.0, 10.0, size)) for size in (1100, 950, 1000)]
+        weights = [1, 1, 3]
+        requested = 4000
+        # the true cutoff and the true count of each sector below it
+        merged = sorted((value, w) for values, w in zip(full, weights) for value in values)
+        total, cutoff = 0, None
+        for value, w in merged:
+            total += w
+            if total >= requested:
+                cutoff = value
+                break
+        truth = [int(np.sum(values <= cutoff)) for values in full]
+        # sector 0 was given 85 % of what it needs, the others all they need and more
+        computed = [full[0][: int(0.85 * truth[0])], full[1][: truth[1] + 40], full[2][: truth[2] + 15]]
+        deficits = bracket_deficits(computed, weights, requested, [0])
+        missing = truth[0] - computed[0].size
+        self.assertGreater(deficits[0], 0.6 * missing)
+        self.assertLess(deficits[0], 1.6 * missing)
+        # Ritz values of a first solve: the uppermost tenth lies above its levels and closer together;
+        # the estimate takes the density of the converged middle and is not raised by them.
+        squeezed = computed[0].copy()
+        top = squeezed.size // 10
+        squeezed[-top:] = np.linspace(squeezed[-top], squeezed[-top] + 0.2 * (squeezed[-1] - squeezed[-top]), top)
+        squeezed[-top:] += 0.8 * (squeezed[-1] - squeezed[-top])
+        squeezed.sort()
+        raised = bracket_deficits([squeezed, computed[1], computed[2]], weights, requested, [0])
+        self.assertLess(raised[0], 1.6 * missing)
+        # a sector that holds its states has no deficit
+        self.assertEqual(bracket_deficits(full, weights, requested, [1])[1], 0)
+
+    def test_switches(self):
+        from parsec_python.acceleration.Eigensolvers.symmetry import sector_margin_budget, sector_margin_policy
+
+        with patch.dict(os.environ, {"PARSEC_CUPY_SECTOR_MARGIN": ""}):
+            self.assertEqual(sector_margin_policy(), "auto")
+        with patch.dict(os.environ, {"PARSEC_CUPY_SECTOR_MARGIN": "fixed"}):
+            self.assertEqual(sector_margin_policy(), "fixed")
+        with patch.dict(os.environ, {"PARSEC_CUPY_SECTOR_MARGIN": "none"}):
+            with self.assertRaises(ValueError):
+                sector_margin_policy()
+        with patch.dict(os.environ, {"PARSEC_CUPY_SECTOR_MARGIN_BUDGET": "0.5"}):
+            self.assertEqual(sector_margin_budget(), 0.5)
+        with patch.dict(os.environ, {"PARSEC_CUPY_SECTOR_MARGIN_BUDGET": "1.5"}):
+            with self.assertRaises(ValueError):
+                sector_margin_budget()
+
+
 if __name__ == "__main__":
     unittest.main()

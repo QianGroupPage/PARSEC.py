@@ -12,9 +12,13 @@ axis-reflection group, where the angular work of a high multipole order
 shrinks with the group: it serves the boundary whose order is raised.
 ``CuPyPointMultipoleBoundaryBuilder`` runs its kernels under the identity
 alone, for a raised order where no such group reduces the Hartree problem.
+``CuPySubgroupMultipoleBoundaryBuilder`` serves a group with permutations
+(the orbitals of a tetrahedral or cubic cluster): the wedge kernels on the
+wedge of its diagonal subgroup, the fields on the wedge of the group.
 """
 from __future__ import annotations
 
+import os
 from time import perf_counter
 
 import numpy as np
@@ -739,6 +743,145 @@ class CuPySymmetryMultipoleBoundaryBuilder:
                 moments[l, m] = value
                 if m: moments[l, -m] = (-1)**m*np.conjugate(value)
         return self.rhs, FastMultipoleExpansion(order=self.order, moments=moments)
+
+
+def diagonal_boundary_requested() -> bool:
+    """Whether ``PARSEC_HARTREE_DIAGONAL_BOUNDARY`` (``auto``, the default, or ``off``) allows the subgroup builder.
+
+    ``auto`` gives a Hartree reduction with permutations, whose group the
+    wedge kernels cannot take, the wedge of its diagonal subgroup
+    (:class:`CuPySubgroupMultipoleBoundaryBuilder`); ``off`` keeps the
+    builder of before, the kernels under the identity on the full grid.
+    """
+
+    raw = os.environ.get("PARSEC_HARTREE_DIAGONAL_BOUNDARY", "auto").strip().lower()
+    if raw in {"", "auto"}:
+        return True
+    if raw == "off":
+        return False
+    raise ValueError("PARSEC_HARTREE_DIAGONAL_BOUNDARY must be auto or off")
+
+
+class CuPySubgroupMultipoleBoundaryBuilder:
+    """Boundary of a group with permutations on the wedge of its diagonal subgroup.
+
+    ``reduction`` is the group of the Hartree problem (a
+    :class:`SignedPermutationReduction` whose operations permute the axes,
+    such as the subgroup D2d of the orbitals of a tetrahedral cluster), which
+    the wedge kernels cannot take; ``diagonal`` is the axis-reflection
+    reduction of its diagonal members
+    (:func:`..Symmetry.diagonal_subgroup_reduction`, D2 there).  A field on
+    the wedge of ``reduction`` is invariant under ``diagonal``: its value per
+    orbit of ``diagonal`` is that of the orbit of ``reduction`` holding the
+    representative row, the kernels of
+    :class:`CuPySymmetryMultipoleBoundaryBuilder` give the multipoles and the
+    right-hand side ``rhs_D = sqrt(m_D) b`` there, and the right-hand side of
+    ``reduction`` is ``sqrt(m) b`` at its own representative rows, ``b`` being
+    the value of the orbit of ``diagonal`` that holds the row.  The interface
+    is that of the wedge builder on ``reduction``; the device holds the arrays
+    of the wedge of ``diagonal`` (a quarter of the grid for D2) and two maps
+    instead of the full-grid arrays of :class:`CuPyPointMultipoleBoundaryBuilder`.
+    The results differ from that builder at round-off.
+    """
+
+    def __init__(self, grid, reduction, diagonal, multipole_order=9, device_id=None):
+        cp, _ = require_cupy()
+        if reduction.full_size != grid.size or diagonal.full_size != grid.size:
+            raise ValueError("symmetry reductions do not match the Hartree grid")
+        self._wedge = CuPySymmetryMultipoleBoundaryBuilder(
+            grid, diagonal, multipole_order, device_id=device_id)
+        self.grid, self.reduction, self.diagonal = grid, reduction, diagonal
+        self.order = self._wedge.order
+        self.device_id = self._wedge.device_id
+        self.boundary_term_count = self._wedge.boundary_term_count
+        self.exterior_point_count = self._wedge.exterior_point_count
+        full_to_wedge = np.asarray(reduction.full_to_wedge, dtype=np.int64)
+        # The orbit of the group that holds each representative row of the
+        # diagonal subgroup, and the orbit of the subgroup that holds each of
+        # the group.
+        to_group = full_to_wedge[np.asarray(diagonal.representative_rows, dtype=np.int64)]
+        to_diagonal = np.asarray(diagonal.full_to_wedge, dtype=np.int64)[
+            np.asarray(reduction.representative_rows, dtype=np.int64)]
+        index = np.int32 if max(reduction.wedge_size, diagonal.wedge_size) < np.iinfo(np.int32).max else np.int64
+        with cp.cuda.Device(self.device_id):
+            self.to_group = cp.asarray(to_group.astype(index))
+            self.to_diagonal = cp.asarray(to_diagonal.astype(index))
+            self.diagonal_root = cp.asarray(np.sqrt(np.asarray(diagonal.multiplicities, dtype=np.float64))[to_diagonal])
+            self.root = cp.asarray(np.sqrt(np.asarray(reduction.multiplicities, dtype=np.float64)))
+            self.density = cp.empty(diagonal.wedge_size, dtype=cp.float64)
+            self.rhs = cp.empty(reduction.wedge_size, dtype=cp.float64)
+
+    @property
+    def device_storage_bytes(self):
+        return self._wedge.device_storage_bytes + sum(a.nbytes for a in (
+            self.to_group, self.to_diagonal, self.diagonal_root, self.root, self.density, self.rhs))
+
+    @property
+    def atomic_tail_maximum(self):
+        return self._wedge.atomic_tail_maximum
+
+    @property
+    def atomic_tail_seconds(self):
+        return self._wedge.atomic_tail_seconds
+
+    @property
+    def atomic_tail_values(self):
+        return self._wedge.atomic_tail_values
+
+    def exterior_points_device(self):
+        return self._wedge.exterior_points_device()
+
+    def set_atomic_tail(self, positions, charges, tail_values=None):
+        """Fold the static atomic tail of these point charges into the values."""
+        self._wedge.set_atomic_tail(positions, charges, tail_values)
+
+    def _diagonal_density(self, wedge_density):
+        """The physical density per orbit of the diagonal subgroup, on the device."""
+        cp, _ = require_cupy()
+        with cp.cuda.Device(self.device_id):
+            density = cp.asarray(wedge_density, dtype=cp.float64)
+            if density.shape != (self.reduction.wedge_size,):
+                raise ValueError("density must match the symmetry wedge")
+            cp.take(density, self.to_group, out=self.density)
+        return self.density
+
+    def boundary_check(self, wedge_density, count, minimum_order=None, seed=0, positions=None):
+        """The check of the wedge builder of the diagonal subgroup."""
+        return self._wedge.boundary_check(
+            self._diagonal_density(wedge_density), count, minimum_order=minimum_order, seed=seed,
+            positions=positions)
+
+    def build_reduced(self, density):
+        """Host interface: normalized wedge RHS and the multipole expansion."""
+        cp, _ = require_cupy()
+        if isinstance(density, SymmetryScalarField):
+            if density.reduction is self.reduction:
+                wedge_density = density.values
+            else:
+                wedge_density = self.reduction.reduce_vector(np.ascontiguousarray(
+                    density.values[density.reduction.full_to_wedge]))/np.sqrt(self.reduction.multiplicities)
+        else:
+            density = np.asarray(density, dtype=np.float64)
+            if density.shape != (self.grid.size,):
+                raise ValueError("density does not match the active grid")
+            wedge_density = self.reduction.reduce_vector(density)/np.sqrt(self.reduction.multiplicities)
+        rhs, boundary = self.build_reduced_device(wedge_density)
+        with cp.cuda.Device(self.device_id):
+            return cp.asnumpy(rhs), boundary
+
+    def build_reduced_device(self, wedge_density):
+        """Borrowed device RHS of the wedge of the group, valid until the next build."""
+        cp, _ = require_cupy()
+        with cp.cuda.Device(self.device_id):
+            finite = (bool(cp.isfinite(wedge_density).all().get()) if isinstance(wedge_density, cp.ndarray)
+                      else bool(np.isfinite(wedge_density).all()))
+            if not finite:
+                raise ValueError("density must be finite and match the symmetry wedge")
+            rhs, boundary = self._wedge.build_reduced_device(self._diagonal_density(wedge_density))
+            cp.take(rhs, self.to_diagonal, out=self.rhs)
+            self.rhs /= self.diagonal_root
+            self.rhs *= self.root
+        return self.rhs, boundary
 
 
 def identity_reduction(size):

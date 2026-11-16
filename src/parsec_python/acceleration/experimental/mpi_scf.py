@@ -298,6 +298,16 @@ class MPISectorContext:
             # rank goes on: the root to its Hartree solve, a worker to the next command.
             self._release_joined(density_builder)
             return total
+        if command == 'sector_margin':
+            # Every sector takes the least share of the ranks that solve it.
+            records = self.comm.allgather((tuple(self.owned_sectors), value))
+            if self.rank != self.root:
+                return None
+            fractions = {}
+            for sectors, fraction in records:
+                for sector in sectors:
+                    fractions[sector] = min(fractions.get(sector, 1.0), fraction)
+            return fractions
         if command in ('forces', 'spin_forces'):
             # One row per projector on every rank: the ranks hold the same atoms.
             total = np.empty_like(value)
@@ -336,6 +346,9 @@ class MPISectorContext:
             solver._mpi_retained_results = {}
         elif command == 'configure_memory':
             solver._configure_large_problem_allocator(payload)
+        elif command == 'sector_margin':
+            # The share of the margin of the first counts that the devices of this rank hold.
+            return float(solver._margin_fraction_local(*payload))
         elif command == 'potential':
             from ..SCF.symmetry_fields import SymmetryScalarField
             solver._update_local_potential(SymmetryScalarField(solver.decomposition.reduction, payload))

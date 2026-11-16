@@ -2478,5 +2478,104 @@ class CuPyAtomicTailTests(unittest.TestCase):
                 grid, SYMMETRIC_POSITIONS, SYMMETRIC_CHARGES, 4))
 
 
+def _tetrahedral_problem(shift):
+    """A CH4-like Td structure, its group of the orbitals (D2d) and a density invariant under Td."""
+
+    from parsec_python.acceleration.Symmetry import (
+        SignedPermutationReduction,
+        detect_point_group_reduction,
+    )
+
+    grid = sphere_grid(shift, spacing=0.5, radius=3.8)
+    a = 1.2
+    positions = np.array([[0.0, 0.0, 0.0]] + [
+        [a * sx, a * sy, a * sz] for sx, sy, sz in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1))])
+    atoms = (Atom("C", positions[0]),) + tuple(Atom("H", p) for p in positions[1:])
+    reduction = detect_point_group_reduction(
+        grid, atoms, SignedPermutationReduction.detect(grid, atoms))
+    xyz = grid.coordinates
+    density = np.zeros(grid.size)
+    for position, depth in zip(positions, (3.0, 1.0, 1.0, 1.0, 1.0)):
+        density += depth * np.exp(-np.sum((xyz - position) ** 2, axis=1) / 0.8)
+    density *= 8.0 / grid.integrate(density)
+    return grid, atoms, positions, reduction, density
+
+
+@unittest.skipUnless(
+    cupy_available() and native_order_ready(9),
+    "needs a CUDA device and the native boundary geometry of this tree",
+)
+class CuPySubgroupBoundaryTests(unittest.TestCase):
+    """The boundary of a group with permutations on the wedge of its diagonal subgroup."""
+
+    def test_the_subgroup_builder_gives_the_projected_rhs_of_the_full_grid(self) -> None:
+        from parsec_python.acceleration.Hartree.cupy_boundary import (
+            CuPyPointMultipoleBoundaryBuilder,
+            CuPySubgroupMultipoleBoundaryBuilder,
+        )
+        from parsec_python.acceleration.SCF.symmetry_fields import SymmetryScalarField
+        from parsec_python.acceleration.Symmetry import PointGroupReduction, diagonal_subgroup_reduction
+
+        cp, _ = require_cupy()
+        for shift in ((0.5, 0.5, 0.5), (0.0, 0.0, 0.0)):
+            grid, atoms, positions, reduction, density = _tetrahedral_problem(shift)
+            self.assertIsInstance(reduction, PointGroupReduction)
+            diagonal = diagonal_subgroup_reduction(grid, reduction.operations)
+            self.assertEqual(diagonal.group_order, 4)
+            charges = np.array([4.0, 1.0, 1.0, 1.0, 1.0])
+            for order, tail in ((9, False), (9, True), (16, True)):
+                if not native_order_ready(order):
+                    continue
+                with self.subTest(shift=shift, order=order, tail=tail):
+                    point = CuPyPointMultipoleBoundaryBuilder(grid, order)
+                    builder = CuPySubgroupMultipoleBoundaryBuilder(grid, reduction, diagonal, order)
+                    if tail:
+                        point.set_atomic_tail(positions, charges)
+                        builder.set_atomic_tail(positions, charges)
+                        self.assertAlmostEqual(
+                            builder.atomic_tail_maximum, point.atomic_tail_maximum, places=10)
+                    full_rhs, full_boundary = point.build(density)
+                    expected = reduction.reduce_vector(full_rhs)
+                    actual, boundary = builder.build_reduced(density)
+                    np.testing.assert_allclose(actual, expected, rtol=3.0e-12, atol=3.0e-12)
+                    weight = np.abs(density) * grid.volume_element
+                    radius = np.linalg.norm(grid.coordinates, axis=1)
+                    for key, value in full_boundary.moments.items():
+                        self.assertLess(
+                            abs(boundary.moments[key] - value),
+                            1.0e-11 * np.sum(weight * radius ** key[0]) + 1.0e-300)
+                    # The same values from a wedge field and from a device array, the same
+                    # bits from a second build.
+                    wedge = density[reduction.representative_rows]
+                    from_field = builder.build_reduced(SymmetryScalarField(reduction, wedge))[0].copy()
+                    np.testing.assert_allclose(from_field, actual, rtol=1.0e-12, atol=1.0e-12)
+                    device_rhs, _ = builder.build_reduced_device(cp.asarray(wedge))
+                    np.testing.assert_array_equal(cp.asnumpy(device_rhs), from_field)
+                    np.testing.assert_array_equal(builder.build_reduced(density)[0], actual)
+                    # A quarter of the grid in place of all of it.
+                    self.assertLess(builder.device_storage_bytes, 0.5 * point.device_storage_bytes)
+                    with self.assertRaises(ValueError):
+                        builder.build_reduced_device(np.full(reduction.wedge_size, np.nan))
+                    # The direct sum of the check: the density of the wedge of D2 with its
+                    # multiplicities is the full density.
+                    from parsec_python.Hartree import DirectCoulombBoundary
+
+                    check = builder.boundary_check(wedge, 20, minimum_order=4, positions=positions)
+                    self.assertEqual(check["points"].shape, (20, 3))
+                    direct = DirectCoulombBoundary(
+                        grid.coordinates, density * grid.volume_element).potential(check["points"])
+                    np.testing.assert_allclose(check["direct"], direct, rtol=1.0e-12)
+
+    def test_switch_parses_auto_and_off(self) -> None:
+        from parsec_python.acceleration.Hartree.cupy_boundary import diagonal_boundary_requested
+
+        for value, expected in (("", True), ("auto", True), ("off", False)):
+            with patch.dict(os.environ, {"PARSEC_HARTREE_DIAGONAL_BOUNDARY": value}):
+                self.assertIs(diagonal_boundary_requested(), expected)
+        with patch.dict(os.environ, {"PARSEC_HARTREE_DIAGONAL_BOUNDARY": "on"}):
+            with self.assertRaises(ValueError):
+                diagonal_boundary_requested()
+
+
 if __name__ == "__main__":
     unittest.main()

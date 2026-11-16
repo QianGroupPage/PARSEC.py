@@ -66,6 +66,7 @@ _GPU_BOUNDARY_BUILDERS = frozenset(
         "CuPyMultipoleBoundaryBuilder",
         "CuPySymmetryMultipoleBoundaryBuilder",
         "CuPyPointMultipoleBoundaryBuilder",
+        "CuPySubgroupMultipoleBoundaryBuilder",
     }
 )
 # The boundary of the resident chain on an axis-reflection wedge takes the
@@ -2283,7 +2284,7 @@ def _hartree_boundary_check(system, result) -> tuple[tuple[str, str], ...]:
     positions, charges = valence_point_charges(
         reference.atoms, reference.pseudopotentials, reference.electron_count
     )
-    if kind == "CuPySymmetryMultipoleBoundaryBuilder":
+    if kind in {"CuPySymmetryMultipoleBoundaryBuilder", "CuPySubgroupMultipoleBoundaryBuilder"}:
         check = builder.boundary_check(
             density[builder.reduction.representative_rows],
             count,
@@ -2531,11 +2532,29 @@ def _build_native_boundary_builder(
         from .Hartree.cupy_boundary import (
             CuPyMultipoleBoundaryBuilder,
             CuPyPointMultipoleBoundaryBuilder,
+            CuPySubgroupMultipoleBoundaryBuilder,
             CuPySymmetryMultipoleBoundaryBuilder,
+            diagonal_boundary_requested,
             wedge_kernels_supported,
         )
 
         wedge = wedge_kernels_supported(hartree_reduction)
+        # A group with permutations (the orbitals of a tetrahedral or cubic
+        # cluster): the wedge kernels on its diagonal subgroup, the fields on
+        # its own wedge (PARSEC_HARTREE_DIAGONAL_BOUNDARY=off keeps the
+        # kernels under the identity on the full grid).
+        diagonal = None
+        if (
+            not wedge
+            and hartree_reduction is not None
+            and getattr(hartree_reduction, "operations", None) is not None
+            and diagonal_boundary_requested()
+        ):
+            from .Symmetry import diagonal_subgroup_reduction
+
+            diagonal = diagonal_subgroup_reduction(reference.grid, hartree_reduction.operations)
+        if diagonal is not None:
+            wedge = True
         if kernel == "wedge" and not wedge:
             raise ValueError(
                 "PARSEC_HARTREE_BOUNDARY_KERNEL=wedge needs an axis-reflection "
@@ -2549,7 +2568,11 @@ def _build_native_boundary_builder(
                 reference.grid, order, device_id=device_id
             )
             return with_tail(builder), False
-        if wedge:
+        if diagonal is not None:
+            builder = CuPySubgroupMultipoleBoundaryBuilder(
+                reference.grid, hartree_reduction, diagonal, order, device_id=device_id
+            )
+        elif wedge:
             builder = CuPySymmetryMultipoleBoundaryBuilder(
                 reference.grid, hartree_reduction, order, device_id=device_id
             )
@@ -4648,9 +4671,10 @@ def _prepare_single_point(
     stages.add("hartree_solver", hartree_started)
 
     boundary_on_gpu = type(native_boundary_builder).__name__ in _GPU_BOUNDARY_BUILDERS
-    boundary_on_wedge_gpu = (
-        type(native_boundary_builder).__name__ == "CuPySymmetryMultipoleBoundaryBuilder"
-    )
+    boundary_on_wedge_gpu = type(native_boundary_builder).__name__ in {
+        "CuPySymmetryMultipoleBoundaryBuilder",
+        "CuPySubgroupMultipoleBoundaryBuilder",
+    }
     boundary_on_point_gpu = (
         type(native_boundary_builder).__name__ == "CuPyPointMultipoleBoundaryBuilder"
     )
@@ -5437,6 +5461,7 @@ def _prepare_single_point(
             if type(native_boundary_builder).__name__ in {
                 "CuPySymmetryMultipoleBoundaryBuilder",
                 "CuPyPointMultipoleBoundaryBuilder",
+                "CuPySubgroupMultipoleBoundaryBuilder",
             }
             else None
         )

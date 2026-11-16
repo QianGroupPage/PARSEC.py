@@ -1054,6 +1054,53 @@ def detect_point_group_reduction(
     )
 
 
+def diagonal_subgroup_reduction(
+    grid: RealSpaceGrid,
+    operations: np.ndarray,
+    *,
+    lattice_tolerance: float = 1.0e-10,
+) -> AxisReflectionReduction | None:
+    """The axis-reflection reduction of the diagonal operations among ``operations``.
+
+    ``operations`` are the signed permutation matrices of a group that maps
+    the grid onto itself (``SignedPermutationReduction.operations``, the
+    group of the orbitals and of the SCF fields).  Its diagonal members
+    (sign changes of the axes alone) form a subgroup, so every field on the
+    wedge of the group is invariant under them, and the kernels of an
+    axis-reflection wedge apply to it.  The signs are taken in the order of
+    :meth:`AxisReflectionReduction.detect`, which gives the same orbits for
+    the same signs.  ``None`` where the identity is the only diagonal member.
+    """
+
+    matrices = np.asarray(operations, dtype=np.int64).reshape(-1, 3, 3)
+    diagonal = {
+        tuple(int(value) for value in np.diag(matrix))
+        for matrix in matrices
+        if not np.any(matrix - np.diag(np.diag(matrix)))
+    }
+    ordered = [
+        np.asarray(values, dtype=np.int8)
+        for values in product((-1, 1), repeat=3)
+        if values in diagonal
+    ]
+    if len(ordered) <= 1:
+        return None
+    table = _RowOrderTable(grid) if _fast_maps_requested() else None
+    mappings = []
+    for signs in ordered:
+        mapping = _grid_row_mapping(grid, signs, lattice_tolerance, table)
+        if mapping is None:
+            raise RuntimeError(f"the diagonal operation {signs.tolist()} does not map the grid")
+        mappings.append(mapping)
+    representative_rows, full_to_wedge, multiplicities = _orbit_labels(mappings)
+    return AxisReflectionReduction(
+        signs=np.ascontiguousarray(np.vstack(ordered), dtype=np.int8),
+        representative_rows=np.ascontiguousarray(representative_rows, dtype=np.int64),
+        full_to_wedge=np.ascontiguousarray(full_to_wedge, dtype=np.int64),
+        multiplicities=np.ascontiguousarray(multiplicities, dtype=np.int64),
+    )
+
+
 __all__ = [
     "AxisReflectionReduction",
     "PointGroupReduction",
@@ -1062,5 +1109,6 @@ __all__ = [
     "_fast_maps_requested",
     "_grid_row_mapping_operation",
     "detect_point_group_reduction",
+    "diagonal_subgroup_reduction",
     "orbital_group_policy",
 ]

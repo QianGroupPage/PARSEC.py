@@ -1295,6 +1295,9 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
         ritz_handover=dict(solver=getattr(solver, 'ritz_handover_record', None),
                            density=getattr(density_builder, 'handover_record', None)),
         sector_state_fit_bytes=getattr(solver, 'state_fit_bytes', None),
+        # The margin of the first counts of weighted sectors, where PARSEC_CUPY_SECTOR_MARGIN=auto weighed it
+        # against the devices (the root's record: share, count, counts with and without the margin).
+        sector_margin=getattr(solver, 'sector_margin_record', None),
         # How sector states that the rank keeps on the host went there and back (PARSEC_CUPY_SPILL_BUFFERS);
         # None where they stay on their devices.
         spill_staging=getattr(solver, 'spill_staging', None),

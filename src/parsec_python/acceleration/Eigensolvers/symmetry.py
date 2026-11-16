@@ -441,6 +441,140 @@ def fixed_state_count_requested(reference) -> bool:
 # The margin of the initial state count of every weighted sector over its even share (see
 # CuPySymmetrySCFEigensolver._initial_sector_count).
 _WEIGHTED_SECTOR_MARGIN = 0.10
+# The share of a device that the count of the state storage (CuPySymmetrySCFEigensolver._state_fit_bytes)
+# may take before the margin is cut (PARSEC_CUPY_SECTOR_MARGIN_BUDGET).  On 16 A100 of 80 GB the
+# nanodiamond C19395H2556 counted 0.805 of a device with the full margin and peaked at 0.875 of it
+# (nvidia-smi), and 8 % more basis in the same domain stopped for memory in the first Ritz step, where it
+# counted about 0.87.
+_SECTOR_MARGIN_BUDGET = "0.82"
+
+
+def sector_margin_policy() -> str:
+    """``PARSEC_CUPY_SECTOR_MARGIN``: ``auto`` (the default) or ``fixed``.
+
+    ``auto`` cuts the margin of the first state counts of weighted sectors
+    where the full margin would take more than the budget of a device
+    (:func:`sector_margin_budget`), down to none, and lets a sector so cut
+    that misses states grow by its estimated deficit from a new start
+    (:func:`bracket_deficits`).  ``fixed`` keeps the full margin and the
+    growth of before everywhere.  A run whose devices hold the full margin
+    is the same under both.
+    """
+
+    value = os.environ.get("PARSEC_CUPY_SECTOR_MARGIN", "auto").strip().lower() or "auto"
+    if value not in {"auto", "fixed"}:
+        raise ValueError("PARSEC_CUPY_SECTOR_MARGIN must be auto or fixed")
+    return value
+
+
+def sector_margin_budget() -> float:
+    """``PARSEC_CUPY_SECTOR_MARGIN_BUDGET``: the share of a device for the counted states, in (0, 1]."""
+
+    value = float(os.environ.get("PARSEC_CUPY_SECTOR_MARGIN_BUDGET", _SECTOR_MARGIN_BUDGET))
+    if not 0.0 < value <= 1.0:
+        raise ValueError("PARSEC_CUPY_SECTOR_MARGIN_BUDGET must be in (0, 1]")
+    return value
+
+
+def regrown_count(count: int, increment: int) -> int:
+    """The count of a sector after one growth from a new start at most (:meth:`_ensure_spectral_bracket`)."""
+
+    return int(count) + int(increment) + -(-2 * int(count) // 100)
+
+
+def largest_fitting_fraction(fit_bytes, totals, budget, low, high, steps=64, increment=None) -> float:
+    """The largest ``f`` in ``[0, 1]`` (to ``1/steps``) whose counts fit the budget on every device.
+
+    ``low`` and ``high`` are the counts without and with the full margin;
+    the counts of ``f`` are ``low + floor(f (high - low))``.
+    ``fit_bytes(counts)`` returns the counted bytes per device, ``totals``
+    the memory per device.  With ``increment`` the counts are weighed after
+    one growth (:func:`regrown_count`): a sector cut short that grows once
+    still fits.  1 where the full margin fits, 0 where not even the counts
+    without margin fit.
+    """
+
+    def counts(fraction):
+        chosen = [int(a) + int(fraction * (int(b) - int(a))) for a, b in zip(low, high)]
+        if increment is None or fraction >= 1.0:
+            return chosen
+        return [regrown_count(count, increment) for count in chosen]
+
+    def fits(fraction):
+        used = fit_bytes(counts(fraction))
+        return all(used[device] <= budget * totals[device] for device in used)
+
+    if fits(1.0):
+        return 1.0
+    if not fits(0.0):
+        return 0.0
+    lo, hi = 0, steps
+    while hi - lo > 1:
+        middle = (lo + hi) // 2
+        if fits(middle / steps):
+            lo = middle
+        else:
+            hi = middle
+    return lo / steps
+
+
+def bracket_deficits(values, weights, requested, failing) -> dict[int, int]:
+    """Estimated states that each failing sector lacks below the cutoff of all sectors.
+
+    ``values[s]`` are the ascending computed values of sector ``s``, which
+    counts ``weights[s]`` times; ``requested`` is the weighted count of the
+    lowest states asked for.  A sector that brackets the cutoff holds every
+    state of its own below its last value.  A failing sector (its last value
+    at or below the cutoff of the union) is continued past its last value
+    with its density of states between the values at a half and at four
+    fifths of its count, which a first solve has converged: its uppermost
+    Ritz values lie above the levels they stand for and closer together, and
+    their density would overstate the deficit.  The cutoff is the lowest
+    energy at which the weighted counts reach ``requested``: every missing
+    state of a failing sector lies below the cutoff of the union and lowers
+    it.  The deficit of a failing sector is its continued count there less
+    what it holds.
+    """
+
+    arrays = [np.sort(np.asarray(v, dtype=np.float64)) for v in values]
+    weights = [int(w) for w in weights]
+    failing = [int(s) for s in failing]
+    slopes = {}
+    for sector in failing:
+        array = arrays[sector]
+        if array.size >= 16:
+            first, last = array.size // 2, (4 * array.size) // 5
+        else:
+            first, last = 0, array.size - 1
+        span = float(array[last] - array[first]) if last > first else 0.0
+        slopes[sector] = (last - first) / span if span > 0 else float(max(1, last - first))
+
+    def count(energy):
+        total = 0.0
+        for sector, array in enumerate(arrays):
+            held = int(np.searchsorted(array, energy, side="right"))
+            if sector in slopes and energy > array[-1]:
+                held = array.size + slopes[sector] * (energy - float(array[-1]))
+            total += weights[sector] * held
+        return total
+
+    union = np.sort(np.concatenate(arrays))
+    high = float(union[-1])
+    low = min(float(arrays[sector][-1]) for sector in failing)
+    if count(low) >= requested:
+        cutoff = low
+    else:
+        for _ in range(100):
+            middle = 0.5 * (low + high)
+            if count(middle) >= requested:
+                high = middle
+            else:
+                low = middle
+        cutoff = high
+    return {
+        sector: int(np.ceil(max(0.0, slopes[sector] * (cutoff - float(arrays[sector][-1])))))
+        for sector in failing
+    }
 
 
 class CuPySymmetrySCFEigensolver:
@@ -2001,6 +2135,7 @@ class CuPySymmetrySCFEigensolver:
         representation: int,
         requested_states: int,
         safety_buffer: int,
+        margin: float = _WEIGHTED_SECTOR_MARGIN,
     ) -> int:
         # PARSEC initeigval: nadd + nstate/nrep (integer division).  The ceil
         # guard matters only for an unusual user choice nadd=0 and ensures the
@@ -2015,13 +2150,65 @@ class CuPySymmetrySCFEigensolver:
             # share, failed the spectral bracket of the first solve and were solved again with half as many
             # columns more, the first basis still held (k15: 55 GiB at the fullest GPU instead of about 25).
             # Each starts with a margin instead.
-            share = -(-int(requested_states * (1.0 + _WEIGHTED_SECTOR_MARGIN)) // shares)
+            share = -(-int(requested_states * (1.0 + margin)) // shares)
             return min(self.decomposition.sector_size(representation), max(1, share + safety_buffer))
         count = max(
             (requested_states + shares - 1) // shares,
             requested_states // shares + safety_buffer,
         )
         return min(self.decomposition.sector_size(representation), max(1, count))
+
+    def _fit_sector_margins(self, requested_states: int, safety_buffer: int) -> None:
+        """Cut the margin of the first counts of weighted sectors where the devices cannot hold it.
+
+        Every process finds, for the sectors it solves, the largest share of
+        the margin whose counted states (:meth:`_state_fit_bytes`) fit the
+        budget of each of its devices (:func:`sector_margin_budget`); the
+        counts of the run take that share.  A share of 1 leaves the counts as
+        they are.  The sectors cut grow from a new start if they miss states
+        (:meth:`_ensure_spectral_bracket`).
+        """
+
+        low = [
+            self._initial_sector_count(representation, requested_states, safety_buffer, margin=0.0)
+            for representation in range(self.representation_count)
+        ]
+        high = list(self._sector_counts)
+        increment = max(1, int(safety_buffer))
+        if self.mpi_context is None:
+            fractions = {
+                representation: self._margin_fraction_local(low, high, increment)
+                for representation in self._owned_representations
+            }
+        else:
+            fractions = self.mpi_context.execute(self, "sector_margin", (low, high, increment))
+        counts = list(high)
+        for representation, fraction in fractions.items():
+            if fraction < 1.0:
+                counts[representation] = low[representation] + int(
+                    fraction * (high[representation] - low[representation]))
+                self._margin_cut[representation] = fraction
+        self._sector_counts = counts
+        self.sector_margin_record = {
+            str(representation): dict(fraction=float(fractions.get(representation, 1.0)),
+                                      count=int(counts[representation]), full=int(high[representation]),
+                                      without=int(low[representation]))
+            for representation in range(self.representation_count)
+        }
+
+    def _margin_fraction_local(self, low: list[int], high: list[int], increment: int | None = None) -> float:
+        """The largest share of the margin that the devices of this process hold (``largest_fitting_fraction``).
+
+        A share below 1 is weighed after one growth of the sectors (``increment``, :func:`regrown_count`).
+        """
+
+        cp, _ = require_cupy()
+        totals = {}
+        for device_id in self.device_ids:
+            with cp.cuda.Device(device_id):
+                totals[device_id] = int(cp.cuda.runtime.memGetInfo()[1])
+        return largest_fitting_fraction(
+            self._state_fit_bytes, totals, sector_margin_budget(), low, high, increment=increment)
 
     @property
     def _sector_weight_array(self) -> np.ndarray:
@@ -2333,7 +2520,20 @@ class CuPySymmetrySCFEigensolver:
             with self._streams[representation]:
                 solver = self._solvers[representation]
                 if reset:
+                    held = (getattr(solver, "_state", None) is not None
+                            or getattr(solver, "device_state", None) is not None)
                     solver.reset()
+                    if held and not spilled:
+                        # A sector that starts again with more states (a growth from a new start,
+                        # _ensure_spectral_bracket): the cached blocks of its former basis go back to the
+                        # driver, where the larger basis, and the rule that shares it over the devices,
+                        # find them.  A first solve resets solvers that hold nothing; states spilled to
+                        # the host leave no basis in the pool (_release_sector_blocks).
+                        devices = getattr(self, "device_ids", None) or (
+                            self._sector_device_ids[representation],)
+                        for device_id in devices:
+                            with cp.cuda.Device(device_id):
+                                cp.get_default_memory_pool().free_all_blocks()
                 elif spilled:
                     moved = _vectors_on_host(solver)
                     started = perf_counter()
@@ -2655,20 +2855,42 @@ class CuPySymmetrySCFEigensolver:
 
             increment = max(1, settings.safety_buffer)
             sector_settings = replace(settings, safety_buffer=0)
+            # A sector whose margin was cut for memory (_fit_sector_margins) grows by its estimated
+            # deficit (bracket_deficits), at most 2 % per step, from a new start: its basis is given back
+            # first, where the growth of the others holds it beside half as many columns more.
+            cut = getattr(self, "_margin_cut", None) or {}
+            fresh = tuple(representation for representation in grow if representation in cut)
+            kept = tuple(representation for representation in grow if representation not in cut)
+            deficits = (
+                bracket_deficits(
+                    [result.eigenvalues for result in results], self._sector_weight_array,
+                    requested_states, fresh)
+                if fresh else {}
+            )
             for representation in grow:
                 old_count = counts[representation]
+                if representation in deficits:
+                    # At most 2 % more per new start (regrown_count): the devices were too small for the
+                    # full margin, and the cut count was weighed with that growth.
+                    wanted = min(old_count + increment + deficits[representation],
+                                 regrown_count(old_count, increment))
+                else:
+                    wanted = max(old_count + increment, (3 * old_count + 1) // 2)
                 counts[representation] = min(
-                    self.decomposition.sector_size(representation),
-                    max(old_count + increment, (3 * old_count + 1) // 2),
-                )
+                    self.decomposition.sector_size(representation), wanted)
                 restarted = True
                 reasons.append(
                     f"representation {representation + 1}: spectral bracket "
                     f"grew {old_count}->{counts[representation]}"
+                    + (" from a new start" if representation in deficits else "")
                 )
-            grown = self._run_sector_jobs(
-                tuple(grow), counts, sector_settings, reset=False
-            )
+            grown = {}
+            if fresh:
+                for representation in fresh:
+                    results[representation] = None
+                grown.update(self._run_sector_jobs(fresh, counts, sector_settings, reset=True))
+            if kept:
+                grown.update(self._run_sector_jobs(kept, counts, sector_settings, reset=False))
             for representation in grow:
                 results[representation] = grown[representation]
                 self._record_filter_precision(
@@ -2861,6 +3083,10 @@ class CuPySymmetrySCFEigensolver:
                 )
                 for representation in range(self.representation_count)
             ]
+            self._margin_cut = {}
+            self.sector_margin_record = None
+            if self._weighted and sector_margin_policy() == "auto":
+                self._fit_sector_margins(requested_states, settings.safety_buffer)
         counts = self._sector_counts
         if self.mpi_context is None:
             self._configure_large_problem_allocator(counts)

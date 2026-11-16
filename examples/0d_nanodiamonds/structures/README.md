@@ -15,6 +15,7 @@ Coordinates are in Angstrom, centred at the origin, carbons first.
 | k06 | C795H300 | GFN2-xTB optimized, symmetrized | `k06_C795H300/optimized_symmetrized/structure_gfn2.xyz` | `fortran_comparison/`, `gpu_benchmark/` |
 | k07 | C1213H412 | GFN2-xTB optimized, symmetrized | `k07_C1213H412/optimized_symmetrized/structure_gfn2.xyz` | `gpu_benchmark/` |
 | k08 to k14 | C1653H508 to C9449H1572 | ideal, not relaxed | none; regenerate as below | `gpu_benchmark/` |
+| k15 to k18 | C11487H1804 to C19395H2556 | ideal, not relaxed | none; regenerate as below | the largest clusters of `src/parsec_python/acceleration/README.md` |
 
 The coordinates of every published input (`parsec.in`, and `parsec_fortran.in`
 of the Fortran comparison) equal these geometries, for k08 to k14 the
@@ -36,6 +37,15 @@ The clusters are cut with ASE from a cubic diamond lattice with
 4. Carbons come first, ordered by distance from the centre, then by x, y and
    z. The hydrogens follow in the order of the carbons they cap.
 
+The lattice is an ASE supercell two bonds wider than the largest seed
+(`--maximum-multiplier`). The surface completion can reach several bonds
+beyond the seed; where it reaches the edge of the supercell, whose sites lack
+neighbours there, the generator builds a supercell half as large again and
+cuts that cluster again. A larger supercell holds the same sites. Every
+cluster is mapped onto itself by the 24 operations of its point group T_d
+about the central carbon (the axes permuted, an even number of their signs
+changed); the audit checks it.
+
 | k | Seed cutoff (Angstrom) | Seed C | Added surface C | Cluster |
 |---:|---:|---:|---:|---|
 | 0 | 0.000000 | 1 | 0 | C1H4 |
@@ -53,6 +63,10 @@ The clusters are cut with ASE from a cubic diamond lattice with
 | 12 | 18.534676 | 4687 | 972 | C5659H1132 |
 | 13 | 20.079232 | 6047 | 1020 | C7067H1308 |
 | 14 | 21.623788 | 7565 | 1884 | C9449H1572 |
+| 15 | 23.168345 | 9249 | 2238 | C11487H1804 |
+| 16 | 24.712901 | 11057 | 2610 | C13667H2020 |
+| 17 | 26.257457 | 13407 | 2850 | C16257H2268 |
+| 18 | 27.802014 | 15927 | 3468 | C19395H2556 |
 
 ## Optimization (k00 to k07)
 
@@ -139,6 +153,12 @@ python generate_nanodiamonds.py --output-root DIR [options]
 | `--maximum-carbon-atoms 1001 --maximum-multiplier 12 --include-first-at-or-above-limit` | k05 to k07: the same files, and `cluster_manifest.csv` and `generation_summary.json`, byte for byte |
 | `--maximum-carbon-atoms 5659 --maximum-multiplier 12 --include-first-at-or-above-limit` | k08 to k12: the coordinates of `../gpu_benchmark/kNN_<formula>/parsec.in` |
 | `--maximum-carbon-atoms 9449 --maximum-multiplier 40 --include-first-at-or-above-limit` | k13 and k14: the coordinates of `../gpu_benchmark/kNN_<formula>/parsec.in` |
+| `--maximum-carbon-atoms 19395 --maximum-multiplier 18 --include-first-at-or-above-limit` | k00 to k18, the supercell grown where the completion reached its edge (16 s on a laptop) |
+
+The first four rows reproduce the same with ASE 3.29.0, NumPy 2.5.5 and SciPy
+1.18.1 as well. The atoms of k00 to k18 (not their order) are also those of
+the same rule on the integer coordinates of the diamond lattice, without a
+supercell.
 
 `--maximum-multiplier` sets the size of the reference lattice. Another value
 gives the same atoms at the same positions, but the round-off of the

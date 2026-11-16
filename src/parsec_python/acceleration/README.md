@@ -930,6 +930,7 @@ a setting that selects the former one:
 | `PARSEC_CUPY_RITZ_PIPELINE` | `p2`: in the one-block Ritz step of a shared basis the exchanges of a round run on a second stream of each device, beside the apply of `H` and beside the slabs of the overlap (below, with the recurrence kernel of the filter) | `off` |
 | `PARSEC_CUPY_EXCHANGE_STRIDED` | `1`: the pieces between the devices of a shared basis go as pitched copies, with no pack kernel and no exchange buffer, which the sharing rule then does not count (below) | `0` |
 | `PARSEC_HARTREE_DEVICE` | `auto`: see `Hartree/GPU_HARTREE.md` | `off` |
+| `PARSEC_HARTREE_CG_DEVICES` | `auto`: the GPU CG of an operator of 2,097,152 rows or more takes every device of the process, the values of one device bit for bit (`Hartree/GPU_HARTREE.md`, "The CG on several devices") | `1`: the CG on the Hartree device alone; a number takes that many |
 
 The overlap condition number of the small problem follows its solve: the
 device solve reads the symmetric spectrum and the host solve keeps the SVD,
@@ -2753,6 +2754,15 @@ holds about 3.5 % more than an even share of the lowest levels, could not grow
 within the devices (the rule that shares a basis refused the second step, and with
 `PARSEC_CUPY_DISTRIBUTED_STATE_AUTO_FRACTION=0.88` a Ritz step ran out of memory):
 C19395H2556 stays the largest of the series there.
+
+The larger group of these sectors is detected, and its representations
+decomposed, on the thread of the symmetry maps beside the reference
+preparation (`PARSEC_OVERLAP_SYMMETRY_SETUP`), where the group of the abelian
+route was decomposed before and the larger one then in line: the same
+reduction and decomposition, 1.3 s less set-up for C13667H2020 on 16 A100 and
+2.0 s for C19395H2556. The backend summary of the output names
+the weighted sectors beside the symmetry block of the reference, which lists
+PARSEC's Abelian subgroup.
 
 Requested final host wavefunctions are expanded in bounded column blocks on
 the CPU, without gathering all orbitals into one GPU's memory. The final host

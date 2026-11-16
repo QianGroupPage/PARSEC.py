@@ -519,5 +519,119 @@ class DevicePoissonTests(unittest.TestCase):
         np.testing.assert_allclose(solution, spla.spsolve(a.tocsc(), rhs), rtol=1e-10, atol=1e-10)
 
 
+
+def _device_count():
+    if not cupy_available():
+        return 0
+    cp, _ = require_cupy()
+    return int(cp.cuda.runtime.getDeviceCount())
+
+
+class CGDeviceRuleTests(unittest.TestCase):
+    def test_auto_takes_every_device_of_a_large_operator_and_one_of_a_small_one(self):
+        from parsec_python.acceleration.Hartree.cupy_prepared import MULTI_DEVICE_MIN_ROWS, cg_devices
+
+        with patch.dict(os.environ, {"PARSEC_HARTREE_CG_DEVICES": "auto"}):
+            self.assertEqual(cg_devices(MULTI_DEVICE_MIN_ROWS, (0, 1, 2, 3), 3), (3, 0, 1, 2))
+            self.assertEqual(cg_devices(MULTI_DEVICE_MIN_ROWS - 1, (0, 1, 2, 3), 3), (3,))
+        with patch.dict(os.environ, {"PARSEC_HARTREE_CG_DEVICES": "1"}):
+            self.assertEqual(cg_devices(10 ** 8, (0, 1, 2, 3), 0), (0,))
+        with patch.dict(os.environ, {"PARSEC_HARTREE_CG_DEVICES": "2"}):
+            self.assertEqual(cg_devices(1000, (0, 1, 2, 3), 1), (1, 0))
+            # every device holds a block of 256 rows at least
+            self.assertEqual(cg_devices(200, (0, 1, 2, 3), 1), (1,))
+        with patch.dict(os.environ, {"PARSEC_HARTREE_CG_DEVICES": "0"}):
+            with self.assertRaises(ValueError):
+                cg_devices(1000, (0, 1), 0)
+
+
+def larger_symmetric_sector():
+    """The stencil of the totally symmetric sector of a grid with several blocks of 256 rows."""
+    grid = build_cluster_grid(GridSettings(spacing=.45, radius=6.0, expansion_order=4, shift=(0., 0., 0.)))
+    a = build_negative_laplacian(grid)
+    reduction = AxisReflectionReduction.detect(grid, (Atom("H", (0., 0., 0.)),))
+    decomposition = ReflectionRepresentationDecomposition.build(grid, reduction)
+    symmetric = int(np.flatnonzero(np.all(decomposition.characters == 1, axis=1))[0])
+    projectors = NonlocalProjectorOperator(
+        projectors=sp.csc_matrix(np.random.default_rng(3).normal(size=(grid.size, 2))),
+        signs=np.array([1., -1.]), labels=((0, 0, 0), (0, 0, 1)))
+    bundle = load_or_build_reduced_operators(decomposition, a, projectors, cache_directory=None,
+                                             representations=(symmetric,))
+    return bundle.stencil_metadata[symmetric]
+
+
+@unittest.skipUnless(_device_count() >= 2, "two or more CUDA devices are required")
+class MultiDevicePoissonTests(unittest.TestCase):
+    """The CG with its rows on several devices: the values of the CG on one, bit for bit."""
+
+    def tearDown(self):
+        gc.collect()
+
+    def compare(self, a, rhs, initial, budget=1000, steps=8, rtol=1e-12, atol=1e-14):
+        from parsec_python.acceleration.Hartree.cupy_prepared import CuPyMultiDeviceConjugateGradientBackend
+
+        one = CuPyPreparedConjugateGradientBackend(a, device_id=0, graph_iterations=steps)
+        expected = one.solve(rhs, initial, relative_tolerance=rtol, absolute_tolerance=atol, max_iterations=budget)
+        for count in range(2, min(4, _device_count()) + 1):
+            with self.subTest(devices=count, budget=budget):
+                many = CuPyMultiDeviceConjugateGradientBackend(
+                    a, device_ids=tuple(range(count)), graph_iterations=steps)
+                actual = many.solve(rhs, initial, relative_tolerance=rtol, absolute_tolerance=atol,
+                                    max_iterations=budget)
+                np.testing.assert_array_equal(actual["solution"], expected["solution"])
+                self.assertEqual({k: v for k, v in actual.items() if k != "solution"},
+                                 {k: v for k, v in expected.items() if k != "solution"})
+                # the groups of iterations were captured as graphs
+                self.assertIsNone(many.graph_error)
+        return expected
+
+    def test_a_sector_stencil_takes_the_values_of_one_device(self):
+        metadata = larger_symmetric_sector()
+        n = int(metadata.shape[0])
+        self.assertGreater(n, 4 * 256)
+        rhs = np.random.default_rng(41).normal(size=n)
+        result = self.compare(metadata, rhs, np.zeros(n))
+        self.assertTrue(result["converged"])
+
+    def test_a_last_block_in_part_a_budget_tail_and_a_warm_start(self):
+        n = 3 * 256 * 5 + 77
+        a = sp.diags((-np.ones(n - 1), 2.1 * np.ones(n), -np.ones(n - 1)), (-1, 0, 1), format="csr")
+        rhs = np.random.default_rng(23).normal(size=n)
+        for budget in (1, 7, 1000):
+            self.compare(a, rhs, np.zeros(n), budget=budget)
+        warm = spla.spsolve(a.tocsc(), rhs)
+        self.compare(a, rhs, warm)
+        self.compare(a, np.zeros(n), np.zeros(n))
+
+    def test_device_arrays_in_and_a_device_solution_out(self):
+        from parsec_python.acceleration.Hartree.cupy_prepared import CuPyMultiDeviceConjugateGradientBackend
+
+        cp, _ = require_cupy()
+        n = 4096 + 300
+        a = sp.diags(np.linspace(1., 9., n), format="csr")
+        rhs = np.random.default_rng(5).normal(size=n)
+        one = CuPyPreparedConjugateGradientBackend(a, device_id=1)
+        many = CuPyMultiDeviceConjugateGradientBackend(a, device_ids=(1, 0))
+        with cp.cuda.Device(1):
+            expected = one.solve(cp.asarray(rhs), cp.zeros(n), relative_tolerance=1e-12, absolute_tolerance=0.0,
+                                 max_iterations=500, device_result=True)
+            actual = many.solve(cp.asarray(rhs), cp.zeros(n), relative_tolerance=1e-12, absolute_tolerance=0.0,
+                                max_iterations=500, device_result=True)
+            self.assertEqual(actual["solution"].device.id, 1)
+            np.testing.assert_array_equal(cp.asnumpy(actual["solution"]), cp.asnumpy(expected["solution"]))
+        self.assertEqual(many.device_id, 1)
+
+    def test_the_poisson_solver_takes_several_devices_where_the_rule_says_so(self):
+        from parsec_python.acceleration.Hartree.cupy_prepared import CuPyMultiDeviceConjugateGradientBackend
+
+        metadata = larger_symmetric_sector()
+        with patch.dict(os.environ, {"PARSEC_HARTREE_CG_DEVICES": "2"}):
+            solver = CuPyPreparedPoissonSolver(metadata, device_id=0, device_ids=(0, 1))
+        self.assertIsInstance(solver.backend, CuPyMultiDeviceConjugateGradientBackend)
+        with patch.dict(os.environ, {"PARSEC_HARTREE_CG_DEVICES": "auto"}):
+            solver = CuPyPreparedPoissonSolver(metadata, device_id=0, device_ids=(0, 1))
+        self.assertIsInstance(solver.backend, CuPyPreparedConjugateGradientBackend)
+
+
 if __name__ == "__main__":
     unittest.main()

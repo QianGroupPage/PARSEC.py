@@ -644,6 +644,12 @@ class _OverlappedSymmetryMaps:
         self._atoms = None
         self._reduction: Future = Future()
         self._decomposition: Future = Future()
+        # The weighted sectors of a larger subgroup (``detect_point_group_reduction``), where the caller
+        # asks for them (:meth:`start`): detected here after the reduction, and decomposed in its place.
+        self._point_group: Future = Future()
+        # Set by the caller where the weighted sectors serve the orbitals (no refusal of
+        # ``_orbital_group_refusal``): :meth:`start` then detects them on this thread.
+        self.point_group_wanted = False
         self.seconds = 0.0
         self.wait_seconds = 0.0
 
@@ -651,16 +657,22 @@ class _OverlappedSymmetryMaps:
     def started(self) -> bool:
         return self._executor is not None
 
-    def start(self, grid, atoms, *, decompose: bool) -> None:
+    def start(self, grid, atoms, *, decompose: bool, point_group: bool = False) -> None:
         """Begin the maps of ``grid`` and ``atoms``.
 
         With ``decompose`` the representation phases follow the detection
         where the calling thread would build them: for a group with an
-        operation beside the identity that the orbitals take.
+        operation beside the identity that the orbitals take.  With
+        ``point_group`` the larger group of the weighted sectors is detected
+        after the reduction (``detect_point_group_reduction``, which returns
+        the reduction itself where it gains nothing), and the phases are
+        those of what it returns: the calling thread would detect it and
+        decompose it in line, after the reference preparation.
         """
 
         if self._executor is not None:
             raise RuntimeError("the symmetry maps of a preparation start once")
+        point_group = bool(point_group or self.point_group_wanted)
         # Imported by the calling thread, as it imports them in line.
         from .Symmetry import (
             load_or_build_reflection_decomposition,
@@ -685,6 +697,18 @@ class _OverlappedSymmetryMaps:
                 self._reduction.set_result(found)
                 candidate, cache_info = found
                 self._published.publish(candidate)
+                if point_group and candidate.group_order > 1:
+                    from .Symmetry import detect_point_group_reduction
+
+                    mark = perf_counter()
+                    try:
+                        candidate = detect_point_group_reduction(grid, atoms, candidate)
+                    except BaseException as error:
+                        self._point_group.set_exception(error)
+                        return
+                    finally:
+                        stages.add("orbital_group", mark)
+                    self._point_group.set_result(candidate)
                 if not decompose or candidate.group_order <= 1:
                     return
                 try:
@@ -712,7 +736,7 @@ class _OverlappedSymmetryMaps:
                 self.seconds = perf_counter() - started
                 # Whatever happened, nobody is left waiting.
                 self._published.publish(None)
-                for future in (self._reduction, self._decomposition):
+                for future in (self._reduction, self._decomposition, self._point_group):
                     if not future.done():
                         future.set_result(None)
 
@@ -742,6 +766,16 @@ class _OverlappedSymmetryMaps:
         finally:
             self.wait_seconds += perf_counter() - started
             self._stages.add("symmetry_reduction_wait", started)
+
+    def point_group(self):
+        """Wait for the detection of the weighted sectors; ``None`` where the thread was not asked for it."""
+
+        started = perf_counter()
+        try:
+            return self._point_group.result()
+        finally:
+            self.wait_seconds += perf_counter() - started
+            self._stages.add("orbital_group_wait", started)
 
     def decomposition(self, reduction):
         """Join the thread; return the decomposition it built of ``reduction``.
@@ -1219,7 +1253,7 @@ def _timed_builders(options: dict, stages: _PreparationStages) -> dict:
     return timed
 
 
-def _grid_builder_starting_the_maps(build, problem, selection, symmetry_maps):
+def _grid_builder_starting_the_maps(build, problem, selection, symmetry_maps, point_group=False):
     """Return ``build`` followed by the start of the symmetry maps of its grid.
 
     The reference preparation calls its grid builder once the atoms are
@@ -1241,7 +1275,8 @@ def _grid_builder_starting_the_maps(build, problem, selection, symmetry_maps):
                 else tuple(problem.atoms)
             )
             symmetry_maps.start(
-                grid, atoms, decompose=selection.selected == "cupy"
+                grid, atoms, decompose=selection.selected == "cupy",
+                point_group=point_group and selection.selected == "cupy",
             )
         return grid
 
@@ -3355,6 +3390,9 @@ def _prepare_single_point(
             reduction_known=preparation.symmetry_reduction,
             stages=stages,
         )
+        preparation.symmetry_maps.point_group_wanted = (
+            _orbital_group_refusal(problem, spin_polarized, mpi_context) is None
+        )
         preparation.join_on_exit(preparation.symmetry_maps.close)
     selection, reference, preparation_overlap = _resolve_and_prepare_reference(
         problem,
@@ -3426,12 +3464,17 @@ def _prepare_single_point(
             if candidate.group_order > 1 and refusal is None:
                 # The one-dimensional sectors of a larger subgroup of the full point group, with weights,
                 # where they solve less (Symmetry/orbital_groups.py; PARSEC_ORBITAL_GROUP=abelian keeps
-                # the group of before).
-                from .Symmetry import detect_point_group_reduction
+                # the group of before): detected by the thread of the maps where it was asked to
+                # (PARSEC_OVERLAP_SYMMETRY_SETUP), in line otherwise.
+                found = symmetry_maps.point_group() if maps_beside else None
+                if found is not None:
+                    candidate = found
+                else:
+                    from .Symmetry import detect_point_group_reduction
 
-                candidate = stages.timed("orbital_group", detect_point_group_reduction)(
-                    reference.grid, getattr(reference, "atoms", ()), candidate
-                )
+                    candidate = stages.timed("orbital_group", detect_point_group_reduction)(
+                        reference.grid, getattr(reference, "atoms", ()), candidate
+                    )
             if candidate.group_order > 1:
                 symmetry_reduction = candidate
                 from .Symmetry import PointGroupReduction, SignedPermutationReduction
@@ -4177,6 +4220,12 @@ def _prepare_single_point(
                         hartree_device
                         if hartree_device is not None
                         else symmetry_eigensolver.device_ids[0]
+                        if symmetry_eigensolver is not None else None
+                    ),
+                    # A large wedge takes the CG to every device of the process
+                    # (PARSEC_HARTREE_CG_DEVICES), the Hartree device first.
+                    device_ids=(
+                        tuple(symmetry_eigensolver.device_ids)
                         if symmetry_eigensolver is not None else None
                     ),
                 )

@@ -838,7 +838,7 @@ class HybridHartreeWiringTests(unittest.TestCase):
 
     def test_default_gpu_cg_gives_way_to_the_host_cg_where_it_does_not_fit(self) -> None:
         system, solver_type, gpu_type, operator = self._prepare_with_gpu_cg_failing({})
-        gpu_type.assert_called_once_with(operator, device_id=None)
+        gpu_type.assert_called_once_with(operator, device_id=None, device_ids=None)
         solver_type.assert_called_once_with(operator)
         details = dict(system.backend_info.details)
         self.assertEqual(details["hartree_backend"], "native")
@@ -1432,7 +1432,8 @@ class MPIRolePreparationTests(unittest.TestCase):
                 # The CG goes to the least loaded of the four devices, the
                 # last one in both layouts.
                 self.assertEqual(
-                    gpu_call.kwargs["solver_factory"].keywords, {"device_id": 3}
+                    gpu_call.kwargs["solver_factory"].keywords,
+                    {"device_id": 3, "device_ids": (0, 1, 2, 3)},
                 )
 
     def test_filter_precision_detail_is_the_statement_of_the_sector_eigensolver(
@@ -4109,9 +4110,10 @@ class HartreeDevicePlacementTests(unittest.TestCase):
                 prepared.boundary_builder_type.assert_called_once()
         # Either of them on a GPU is placed.
         prepared = self.prepare(rank_of_four, linear_backend="cupy")
+        # The CG may take every device of the process (PARSEC_HARTREE_CG_DEVICES), the Hartree device first.
         self.assertEqual(
             prepared.poisson_solver_type.call_args.kwargs["solver_factory"].keywords,
-            {"device_id": 3},
+            {"device_id": 3, "device_ids": (0, 1, 2, 3)},
         )
         prepared = self.prepare(
             rank_of_four, environment={"PARSEC_HARTREE_BOUNDARY_BACKEND": "cupy"}

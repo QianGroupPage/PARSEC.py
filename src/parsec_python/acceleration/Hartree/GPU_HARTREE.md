@@ -282,6 +282,32 @@ Hartree object, chooses no device. The kernels and their inputs are the same
 on every device of one model, so the results do not change in any bit;
 `hartree_cg_device` and `hartree_boundary_device` report the placement.
 
+### The CG on several devices (`PARSEC_HARTREE_CG_DEVICES`)
+
+From 2,097,152 rows of the Hartree operator on (`auto`) the CG takes every
+device of the process, the Hartree device first
+(`Hartree.cupy_prepared.CuPyMultiDeviceConjugateGradientBackend`). The rows are
+cut at the blocks of 256 rows of the reductions: every device holds the stencil
+of its rows, their parts of `x`, `r`, `A p` and `b`, and the whole vector `p`;
+it forms `A p` of its rows and the block partials, the first device sums the
+partials of all blocks in their order with the kernels of the CG on one device
+and the others take its state, and every device sends the new `p` of its rows
+to the others. The values are those of the CG on one device bit for bit (tests
+with two, three and four devices, a last block in part, a budget tail and a
+warm start). A group of eight iterations is captured as one CUDA graph across
+the devices, the streams of the others forked from and joined to that of the
+first; the copies are ordinary asynchronous copies of kind default, since a
+capture refuses peer copies (`cudaErrorStreamCaptureUnsupported`), and without
+the graph the forty launches of an iteration from the host made the solve
+slower than on one device. Where a capture fails the iterations are launched
+one by one (`graph_error` of the backend). Measured on 16 A100 (one rank per
+node, its four devices; the D2d wedges of the nanodiamonds): C13667H2020
+(3.8 million rows) 7.4 -> 6.4 s of linear solves in 11 solves, C19395H2556
+(5.9 million) 13.5 -> 10.7 s; the fullest GPU of the first rose from 33.08 to
+33.25 GiB, that of the second stayed at 69.99 GiB.
+`PARSEC_HARTREE_CG_DEVICES=1` keeps the CG on the Hartree device; a number
+takes that many devices.
+
 ## Boundary values
 
 The right-hand side of every Hartree solve is `8 pi rho - A_IB V_B` with the

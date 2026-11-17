@@ -2583,6 +2583,8 @@ def _build_native_boundary_builder(
             not wedge
             and hartree_reduction is not None
             and getattr(hartree_reduction, "operations", None) is not None
+            # (a cluster's: no translations)
+            and getattr(hartree_reduction, "translations", None) is None
             and diagonal_boundary_requested()
         ):
             from .Symmetry import diagonal_subgroup_reduction
@@ -3519,9 +3521,16 @@ def _prepare_single_point(
                 from .Symmetry import PointGroupReduction, SignedPermutationReduction
 
                 symmetry_detection = (
-                    f"exact point group of {candidate.full_operations.shape[0]} signed permutations detected; the "
-                    f"orbitals use the one-dimensional sectors of a subgroup of {candidate.group_order} (weights "
-                    f"{', '.join(str(int(w)) for w in candidate.sector_weights)})"
+                    (
+                        f"exact group of {candidate.full_operations.shape[0]} operations detected (signed "
+                        f"permutations, "
+                        f"{int(np.count_nonzero(np.any(np.asarray(candidate.full_translations) != 0, axis=1)))}"
+                        f" of them with a translation by half the cell; PARSEC_PERIODIC_TRANSLATIONS)"
+                        if getattr(candidate, "full_translations", None) is not None
+                        else f"exact point group of {candidate.full_operations.shape[0]} signed permutations detected"
+                    )
+                    + f"; the orbitals use the one-dimensional sectors of a subgroup of {candidate.group_order} "
+                    f"(weights {', '.join(str(int(w)) for w in candidate.sector_weights)})"
                     if isinstance(candidate, PointGroupReduction)
                     else "exact commuting signed-permutation subgroup detected"
                     if isinstance(candidate, SignedPermutationReduction)

@@ -462,12 +462,14 @@ def _atoms_are_invariant_operation(
     operation: np.ndarray,
     tolerance: float,
     period: np.ndarray | None = None,
+    translation: np.ndarray | None = None,
 ) -> bool:
     """Return whether an orthogonal signed permutation preserves the atoms.
 
     ``atoms`` may be the positions already grouped by
     :func:`_positions_by_species`; ``period`` matches them modulo the lattice
-    of a periodic cell.
+    of a periodic cell; ``translation`` (Cartesian, bohr) follows the
+    operation, ``r -> R r + t``.
     """
 
     by_species: dict[str, np.ndarray] = {}
@@ -481,6 +483,8 @@ def _atoms_are_invariant_operation(
     matrix = np.asarray(operation, dtype=np.float64)
     for candidates in by_species.values():
         transformed = candidates @ matrix.T
+        if translation is not None:
+            transformed = transformed + np.asarray(translation, dtype=np.float64)
         if not _has_tolerance_perfect_matching(
             transformed, candidates, tolerance, period
         ):
@@ -494,6 +498,7 @@ def _grid_row_mapping_operation(
     lattice_tolerance: float,
     selected_rows: np.ndarray | None = None,
     table: _RowOrderTable | None = None,
+    translation: np.ndarray | None = None,
 ) -> np.ndarray | None:
     """Map rows under one signed permutation, using exact lattice rounding.
 
@@ -504,6 +509,10 @@ def _grid_row_mapping_operation(
 
     ``table`` reads a whole-grid map out of the lookup table in the order of
     the rows where the grid allows it; the map is the same.
+
+    ``translation`` (grid steps along each axis, periodic cells only) follows
+    the operation: ``r -> R r + t``, a lattice translation of a smaller cell
+    that the cell repeats (:func:`_half_cell_translations`).
     """
 
     parameters = _integer_signed_permutation_parameters(
@@ -511,6 +520,22 @@ def _grid_row_mapping_operation(
     )
     if parameters is None:
         return None
+    if translation is not None and np.any(np.asarray(translation) != 0):
+        if _lattice_period(grid) is None:
+            return None
+        sources, factors, offset = parameters
+        offset = offset + np.asarray(translation, dtype=np.int64)
+        if selected_rows is None and _periodic_row_major(grid):
+            from parsec_python.Grid.space_group import affine_grid_images
+
+            return affine_grid_images(
+                np.asarray(operation, dtype=np.int64), offset, grid.points_per_axis, np.int64
+            )
+        points = grid.integer_coordinates
+        if selected_rows is not None:
+            points = points[selected_rows]
+        rows = grid.rows_for_integer_coordinates(points[:, sources] * factors + offset)
+        return None if np.any(rows < 0) else rows
     if np.array_equal(operation, np.eye(3)):
         # The identity keeps every row.  ``build_cluster_grid`` stores each
         # row in the lookup table at its own point, so the gather would
@@ -995,6 +1020,16 @@ class PointGroupReduction(SignedPermutationReduction):
     # states of a weighted one (:meth:`partner_states`)
     coset_operations: np.ndarray = None
     grid: object = field(default=None, compare=False, repr=False)
+    # The translations (grid steps) that follow ``operations``, ``full_operations`` and ``coset_operations``
+    # (``r -> R r + t``) in a cell that repeats a smaller one; ``None``: none (the point group about the origin).
+    translations: np.ndarray = None
+    full_translations: np.ndarray = None
+    coset_translations: np.ndarray = None
+
+    def operation_translation(self, index: int) -> np.ndarray | None:
+        """The translation of ``operations[index]`` (grid steps), ``None`` without translations."""
+
+        return None if self.translations is None else np.asarray(self.translations[index], dtype=np.int64)
 
     @property
     def coset_count(self) -> int:
@@ -1020,12 +1055,25 @@ class PointGroupReduction(SignedPermutationReduction):
         if self.grid is None or self.full_operations is None:
             raise RuntimeError("the partner states need the grid and the operations of the full group")
         identity = np.eye(3, dtype=np.int8)
-        operations = [op for op in np.asarray(self.full_operations, dtype=np.int8) if not np.array_equal(op, identity)]
+        full = np.asarray(self.full_operations, dtype=np.int8)
+        shifts = (
+            np.zeros((full.shape[0], 3), dtype=np.int64)
+            if self.full_translations is None
+            else np.asarray(self.full_translations, dtype=np.int64)
+        )
+        kept = [
+            index for index in range(full.shape[0])
+            if not (np.array_equal(full[index], identity) and not np.any(shifts[index]))
+        ]
+        operations = [full[index] for index in kept]
+        operation_shifts = [shifts[index] for index in kept]
         cache: dict[int, np.ndarray] = {}
 
         def row_map(index: int) -> np.ndarray:
             if index not in cache:
-                mapping = _grid_row_mapping_operation(self.grid, operations[index], 1.0e-10)
+                mapping = _grid_row_mapping_operation(
+                    self.grid, operations[index], 1.0e-10, translation=operation_shifts[index]
+                )
                 if mapping is None:
                     raise RuntimeError("an operation of the full group no longer maps the grid")
                 cache[index] = mapping
@@ -1098,6 +1146,144 @@ def _point_group_operations(
     return found
 
 
+_TRANSLATIONS_SWITCH = "PARSEC_PERIODIC_TRANSLATIONS"
+
+
+def periodic_translation_setting() -> str:
+    """``PARSEC_PERIODIC_TRANSLATIONS``: ``auto`` (default) adds the half-cell translations of a cell that repeats
+    a smaller one to its group (:func:`_half_cell_translations`); ``off`` keeps the point group about the origin
+    alone, bit for bit as before."""
+
+    value = os.environ.get(_TRANSLATIONS_SWITCH, "auto").strip().lower() or "auto"
+    if value not in {"auto", "off"}:
+        raise ValueError(f"{_TRANSLATIONS_SWITCH} must be auto or off, not {value!r}")
+    return value
+
+
+def _half_cell_translations(
+    grid: RealSpaceGrid, species: dict, atom_tolerance: float, trees: dict | None = None
+) -> list[np.ndarray]:
+    """The translations by half the cell along a set of its axes that map the atoms onto themselves (grid steps).
+
+    A cell that repeats a smaller one twice along an axis is invariant under the translation by half of that
+    axis; the grid maps onto itself where the axis has an even number of points.  These translations form a
+    group of order two per element (the time-reversal-invariant k-points of the smaller cell are its real
+    characters).  Only a bulk orthorhombic cell whose rows are its box takes them; the zero translation first.
+    """
+
+    zero = np.zeros(3, dtype=np.int64)
+    period = _lattice_period(grid)
+    if period is None or not _periodic_row_major(grid) or periodic_translation_setting() == "off":
+        return [zero]
+    counts = np.asarray(grid.points_per_axis, dtype=np.int64)
+    found = [zero]
+    for bits in product((0, 1), repeat=3):
+        bits = np.asarray(bits, dtype=np.int64)
+        if not np.any(bits) or np.any((bits == 1) & (counts % 2 == 1)):
+            continue
+        steps = bits * (counts // 2)
+        shift = bits * period / 2.0
+        if _plausible(species, {} if trees is None else trees, np.eye(3), shift, atom_tolerance, period) and all(
+            _has_tolerance_perfect_matching(positions + shift, positions, atom_tolerance, period)
+            for positions in species.values()
+        ):
+            found.append(steps)
+    return found
+
+
+_SAMPLE_ATOMS = 64
+
+
+def _plausible(species: dict, trees: dict, operation, translation, tolerance: float, period) -> bool:
+    """Whether the first atoms of every species land near an atom of it under ``r -> R r + t`` (bohr).
+
+    A necessary condition of :func:`_atoms_are_invariant_operation`, from one k-d tree query of a few atoms: the
+    candidates it refuses are refused there too, so the group found is the same; it spares the full matching
+    of a large cell for the operations that fail.  ``trees`` (the caller's) keeps the k-d tree of each species.
+    """
+
+    from scipy.spatial import cKDTree
+
+    radius = 2.0 * (tolerance * (1.0 + 1.0e-9) + 1.0e-12)
+    matrix = np.asarray(operation, dtype=np.float64)
+    for symbol, positions in species.items():
+        tree = trees.get(symbol)
+        if tree is None:
+            tree = trees[symbol] = _matching_tree(positions, period)
+        sample = positions[:_SAMPLE_ATOMS] @ matrix.T
+        if translation is not None:
+            sample = sample + np.asarray(translation, dtype=np.float64)
+        queries = sample if period is None else _folded(sample, period)
+        distances, _ = tree.query(queries, k=1, distance_upper_bound=radius)
+        if not np.all(np.isfinite(distances)):
+            return False
+    return True
+
+
+
+def _space_group_operations(grid, atoms, atom_tolerance, lattice_tolerance):
+    """``(matrices, translations)`` of the operations ``r -> R r + t`` of a periodic cell, the identity first.
+
+    ``R`` a signed permutation that maps the lattice of the grid onto itself, ``t`` one of the half-cell
+    translations ``T`` of :func:`_half_cell_translations`.  The ``t`` that go with one ``R`` form a coset of
+    ``T``: one is searched (the zero first), the others follow.  With ``T`` the zero translation alone these are
+    the operations of :func:`_point_group_operations`, in its order.
+    """
+
+    species = _positions_by_species(atoms)
+    period = _lattice_period(grid)
+    trees: dict = {}
+    translations = _half_cell_translations(grid, species, atom_tolerance, trees)
+    counts = np.asarray(grid.points_per_axis, dtype=np.int64)
+    steps = np.diag(np.asarray(grid.cell.lattice_vectors, dtype=np.float64)) / counts if len(translations) > 1 else None
+    identity = np.eye(3, dtype=np.int8)
+    matrices = [identity]
+    shifts = [translations[0]]
+    for translation in translations[1:]:
+        matrices.append(identity)
+        shifts.append(translation)
+    for operation in _signed_permutation_operations():
+        if np.array_equal(operation, identity):
+            continue
+        if _integer_signed_permutation_parameters(grid, operation, lattice_tolerance) is None:
+            continue
+        found = None
+        for candidate in ([translations[0]] if len(translations) == 1 else _all_half_cell_steps(counts)):
+            cartesian = None if steps is None else candidate * steps
+            if _plausible(species, trees, operation, cartesian, atom_tolerance, period) and _atoms_are_invariant_operation(
+                species, operation, atom_tolerance, period, cartesian
+            ):
+                found = candidate
+                break
+        if found is None:
+            continue
+        for translation in translations:
+            matrices.append(operation)
+            shifts.append((found + translation) % counts)
+    return matrices, shifts
+
+
+def _affine_matrix(operation: np.ndarray, translation: np.ndarray) -> np.ndarray:
+    """``[[R, t], [0, 1]]`` (``t`` in grid steps): the element of the group table of ``r -> R r + t``."""
+
+    matrix = np.eye(4, dtype=np.int64)
+    matrix[:3, :3] = np.asarray(operation, dtype=np.int64)
+    matrix[:3, 3] = np.asarray(translation, dtype=np.int64)
+    return matrix
+
+
+def _all_half_cell_steps(counts: np.ndarray) -> list[np.ndarray]:
+    """The translations by half the cell along any set of the axes with an even count (grid steps), zero first."""
+
+    found = []
+    for bits in product((0, 1), repeat=3):
+        bits = np.asarray(bits, dtype=np.int64)
+        if np.any((bits == 1) & (counts % 2 == 1)):
+            continue
+        found.append(bits * (counts // 2))
+    return found
+
+
 def detect_point_group_reduction(
     grid: RealSpaceGrid,
     atoms: Sequence[Atom],
@@ -1120,22 +1306,50 @@ def detect_point_group_reduction(
     from .orbital_groups import multiplication_table, orbital_group_plan
 
     table = _RowOrderTable(grid) if _fast_maps_requested() else None
-    candidates = _point_group_operations(grid, atoms, atom_tolerance, lattice_tolerance, table)
-    if len(candidates) <= abelian.group_order:
+    # A cell that repeats a smaller one: its half-cell translations join the group (the operations r -> R r + t;
+    # PARSEC_PERIODIC_TRANSLATIONS=off keeps the point group about the origin alone).
+    repeats = (
+        _lattice_period(grid) is not None
+        and len(_half_cell_translations(grid, _positions_by_species(atoms), atom_tolerance)) > 1
+    )
+    if repeats:
+        candidates, shifts = _space_group_operations(grid, atoms, atom_tolerance, lattice_tolerance)
+        modulus = np.asarray(grid.points_per_axis, dtype=np.int64)
+        elements = [_affine_matrix(operation, shift) for operation, shift in zip(candidates, shifts)]
+    else:
+        candidates = _point_group_operations(grid, atoms, atom_tolerance, lattice_tolerance, table)
+        shifts = None
+        modulus = None
+        elements = candidates
+
+    def shift_of(index: int):
+        return None if shifts is None else shifts[index]
+
+    if len(elements) <= abelian.group_order:
         return abelian
     try:
-        multiplication_table(candidates)
+        multiplication_table(elements, modulus=modulus)
     except ValueError:
         return abelian
-    plan = orbital_group_plan(candidates)
+    # the pure translations, in every candidate subgroup (orbital_group_plan, ``required``)
+    required = (
+        ()
+        if shifts is None
+        else tuple(
+            index for index, operation in enumerate(candidates) if np.array_equal(operation, np.eye(3))
+        )
+    )
+    plan = orbital_group_plan(elements, modulus=modulus, required=required)
     # Taken where it solves at most half of what the abelian group does (Td, Oh, T, Th: a half to a quarter);
     # a smaller gain (D4h: three quarters) keeps the group of before.
     if not plan.cost <= 0.5 / abelian.group_order + 1.0e-12:
         return abelian
     subgroup = [candidates[index] for index in plan.subgroup]
     mappings = []
-    for operation in subgroup:
-        mapping = _grid_row_mapping_operation(grid, operation, lattice_tolerance, table=table)
+    for index in plan.subgroup:
+        mapping = _grid_row_mapping_operation(
+            grid, candidates[index], lattice_tolerance, table=table, translation=shift_of(index)
+        )
         if mapping is None:
             return abelian
         mappings.append(mapping)
@@ -1148,12 +1362,24 @@ def detect_point_group_reduction(
     coset_images = np.empty((len(plan.cosets), representative_rows.size), dtype=np.int64)
     for c, index in enumerate(plan.cosets):
         # The whole map: with those of H it shows that every operation of G maps the active grid onto itself.
-        mapping = _grid_row_mapping_operation(grid, candidates[index], lattice_tolerance, table=table)
+        mapping = _grid_row_mapping_operation(
+            grid, candidates[index], lattice_tolerance, table=table, translation=shift_of(index)
+        )
         if mapping is None:
             return abelian
         coset_images[c] = full_to_wedge[mapping[representative_rows]]
     order = len(subgroup)
+    translation_fields = (
+        {}
+        if shifts is None
+        else {
+            "translations": np.ascontiguousarray([shifts[index] for index in plan.subgroup], dtype=np.int64),
+            "full_translations": np.ascontiguousarray(shifts, dtype=np.int64),
+            "coset_translations": np.ascontiguousarray([shifts[index] for index in plan.cosets], dtype=np.int64),
+        }
+    )
     return PointGroupReduction(
+        **translation_fields,
         signs=np.ones((order, 3), dtype=np.int8),
         representative_rows=np.ascontiguousarray(representative_rows, dtype=np.int64),
         full_to_wedge=np.ascontiguousarray(full_to_wedge, dtype=np.int64),

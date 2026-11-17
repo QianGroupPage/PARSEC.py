@@ -121,18 +121,21 @@ def _representative_images(
         # Nothing to read off: a whole-grid map would be gathered through the
         # coordinates of every point instead of the representatives.
         table = None
+    translations = getattr(reduction, "translations", None)
     for index, operation in enumerate(operations):
         mapping = None
+        # r -> R r + t in a cell that repeats a smaller one (PointGroupReduction.translations)
+        translation = None if translations is None else translations[index]
         # The identity is its own shortcut: the representatives themselves.
         if table is not None and not np.array_equal(operation, np.eye(3)):
             whole = _grid_row_mapping_operation(
-                grid, operation, 1.0e-10, table=table
+                grid, operation, 1.0e-10, table=table, translation=translation
             )
             if whole is not None:
                 mapping = whole[reduction.representative_rows]
         if mapping is None:
             mapping = _grid_row_mapping_operation(
-                grid, operation, 1.0e-10, reduction.representative_rows
+                grid, operation, 1.0e-10, reduction.representative_rows, translation=translation
             )
         if mapping is None:
             raise RuntimeError("accepted symmetry operation no longer maps the grid")

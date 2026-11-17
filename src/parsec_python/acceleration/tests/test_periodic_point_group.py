@@ -54,8 +54,9 @@ def silicon(functional: str, spacing: float = 0.57) -> object:
         return parse_parsec_input(path).problem
 
 
-def _solve(problem, setting: str):
-    with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_SYMMETRY": setting}), warnings.catch_warnings():
+def _solve(problem, setting: str, translations: str = "auto"):
+    environment = {"PARSEC_PERIODIC_SYMMETRY": setting, "PARSEC_PERIODIC_TRANSLATIONS": translations}
+    with mock.patch.dict(os.environ, environment), warnings.catch_warnings():
         warnings.simplefilter("ignore")
         system = driver.prepare_single_point(problem, backend="cupy")
         result = driver.run_scf(system)
@@ -80,7 +81,9 @@ class PeriodicPointGroupSCFTests(unittest.TestCase):
     def test_silicon_in_the_sectors_of_td(self) -> None:
         for functional in ("ca", "pbe"):
             problem = silicon(functional)
-            sectors, details = _solve(problem, "auto")
+            # the point group alone (the face-centred cube also has the translations by half the cell:
+            # test_periodic_translations)
+            sectors, details = _solve(problem, "auto", translations="off")
             self.assertIn("24 signed permutations", details["symmetry_detection"], functional)
             self.assertIn("weights 1, 1, 3, 3", details["symmetry_detection"], functional)
             full, full_details = _solve(problem, "off")

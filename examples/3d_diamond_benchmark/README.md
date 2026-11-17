@@ -1,6 +1,6 @@
 # Bulk diamond on many GPUs
 
-Supercells of bulk diamond from 8 to 32,768 atoms, at the Gamma point and with Gamma-centred Monkhorst-Pack meshes,
+Supercells of bulk diamond from 8 to 64,000 atoms, at the Gamma point and with Gamma-centred Monkhorst-Pack meshes,
 computed on 16 NVIDIA A100 80 GB GPUs (four Perlmutter nodes). The series measures how large a periodic cell this
 code can treat: the orbitals of one cell are shared by all ranks (one rank per GPU, any number of nodes), or, where
 the cell has a point group about its origin, divided into its symmetry sectors; with k-points the ranks form pools
@@ -96,7 +96,8 @@ the code with the periodic Hartree solve by the FFT of the stencil symbol and th
 | 15 | 27,000 | 108,000 | 19,683,000 | 54,006 | 9 | 280.5 | 229.9 | 50.5 | 17.87 | 46.4 | 479.4 |
 | 16 | 32,768 | 131,072 | 23,887,872 | 65,542 | 9 | 424.8 | 361.7 | 62.9 | 28.35 | 66.3 | 690.7 |
 
-n = 16 is the largest cube that fits (n = 17 would need about 1.4 times the memory). The energy per atom is
+n = 16 was the largest cube that fits with the point group alone (n = 17 would need about 1.4 times the memory;
+with the translations below n = 20 fits). The energy per atom is
 -11.4039349 Ry from n = 10 on; the energies of the two codes agree within 3e-10 Ry. SCF to 1e-7 Ry, the sectors
 give the energy of the one sector of the identity within 4e-14 Ry (n = 1), 5e-13 Ry (n = 2) and 9e-13 Ry (n = 3).
 
@@ -114,6 +115,38 @@ Three changes, each exact or with a switch that restores the former bits (`src/p
 The setup of n = 16 is now 62.9 s, of which 23 s are the projectors and 11 s the initial density; of its SCF,
 355 s are eigensolves (133 s the first). The host memory of the root fell from 34.1 to 14.6 GiB. With one rank
 per GPU (`--rank-per-gpu`, sector groups of four ranks) n = 10 took 33.8 s and 10.2 GiB.
+
+### Gamma point with the translations by half the cell (2026-11-16)
+
+A supercell of n cubes repeats a smaller cell, and its grid of 18 n points per edge maps onto itself under the
+translations by half the cell: for an even n all seven (the cell is 2 x 2 x 2 cells of n/2 cubes), for an odd n the
+three face-centring ones `(0, a/2, a/2) n` of the fcc lattice. With Td about the origin they give a group of 192 or 96
+operations, whose real characters are the time-reversal invariant k-points of the smaller cell, and the orbitals take
+10 or 5 weighted sectors of a subgroup of 32 or 16 (`PARSEC_PERIODIC_TRANSLATIONS=auto`, the default;
+`src/parsec_python/acceleration/README.md`, "Translations by half the cell"): about 1/102 of the rows times states
+of the one sector of the identity, against 1/16 with Td alone. The projectors of a cell are also built for all atoms
+at once (`acceleration/V_ion/periodic_projectors.py`; the same arrays, 23.0 s -> 1.5 s at n = 16). The same launch
+and settings as above, first runs; "before" is the program time of the table above (code d50bf3d0):
+
+| n | atoms | electrons | grid points | states | SCF iterations | program (s) | SCF (s) | setup (s) | later step (s) | GPU (GiB) | before (s) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 6 | 1,728 | 6,912 | 1,259,712 | 3,462 | 7 | 4.4 | 1.3 | 3.0 | 0.08 | 0.7 | 5.7 |
+| 8 | 4,096 | 16,384 | 2,985,984 | 8,198 | 8 | 9.2 | 4.0 | 5.0 | 0.30 | 1.2 | 12.4 |
+| 10 | 8,000 | 32,000 | 5,832,000 | 16,006 | 7 | 19.8 | 10.6 | 9.2 | 0.90 | 2.4 | 36.2 |
+| 12 | 13,824 | 55,296 | 10,077,696 | 27,654 | 7 | 43.7 | 27.2 | 16.4 | 2.29 | 4.4 | 106.8 |
+| 14 | 21,952 | 87,808 | 16,003,008 | 43,910 | 7 | 92.5 | 64.6 | 27.7 | 5.33 | 8.0 | 193.0 |
+| 15 | 27,000 | 108,000 | 19,683,000 | 54,006 | 8 | 170.7 | 135.6 | 35.0 | 10.73 | 23.9 | 280.5 |
+| 16 | 32,768 | 131,072 | 23,887,872 | 65,542 | 7 | 187.8 | 142.9 | 44.7 | 11.81 | 16.1 | 424.8 |
+| 18 | 46,656 | 186,624 | 34,012,224 | 93,318 | 7 | 362.1 | 292.3 | 69.7 | 24.25 | 30.1 | - |
+| 20 | 64,000 | 256,000 | 46,656,000 | 128,006 | 7 | 668.1 | 561.7 | 106.3 | 46.66 | 53.8 | - |
+
+n = 20 is the largest cube that fits (n = 22 would need about 1.8 times the memory; an odd n has the three
+translations only, so n = 15 takes more time and memory than n = 16). The energy per atom is -11.4039349 Ry from
+n = 10 on, as above. SCF to 1e-7 Ry, the translations give the energy of the point group alone within 1e-14 Ry
+(n = 1, 96 operations), 2e-13 Ry (n = 2), 2e-12 Ry (n = 3) and 2e-12 Ry (n = 4); at the 2e-4 Ry of the series the
+two SCFs take different paths (7 to 8 steps instead of 9 to 10) and their energies differ by up to 5e-4 Ry for
+32,768 atoms (1.5e-8 Ry per atom). The ten sectors of n = 16 hold 2,054 states each, on 16 GPUs six of them on two
+GPUs and four on one; its first eigensolve takes 71 s and a later SCF step 12 s.
 
 ### k-points (irreducible wedge of a Gamma-centred mesh)
 

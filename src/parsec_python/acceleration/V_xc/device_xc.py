@@ -407,8 +407,13 @@ def _orbit_operations(grid, reduction) -> tuple[np.ndarray, np.ndarray]:
         permutation = np.argmax(np.abs(operations[g]), axis=1)
         table[g, :3] = permutation
         table[g, 3:] = operations[g][np.arange(3), permutation]
+    # r -> R r + t in a cell that repeats a smaller one: the translation moves the row, the vector turns by R alone
+    translations = getattr(reduction, "translations", None)
     for g in order:
-        images = _grid_row_mapping_operation(grid, operations[g].astype(np.int8), 1.0e-10, selected_rows=rows)
+        images = _grid_row_mapping_operation(
+            grid, operations[g].astype(np.int8), 1.0e-10, selected_rows=rows,
+            translation=None if translations is None else translations[g],
+        )
         if images is None or not np.array_equal(full_to_wedge[images], np.arange(rows.size)):
             raise RuntimeError(
                 "the symmetry operations do not map the orbit representatives onto their orbits"

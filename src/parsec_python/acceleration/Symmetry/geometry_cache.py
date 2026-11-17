@@ -107,6 +107,10 @@ def _representation_key(
     if isinstance(reduction, SignedPermutationReduction):
         _update_array(digest, "operations", reduction.operations)
         _update_array(digest, "generator_bits", reduction.generator_bits)
+    translations = getattr(reduction, "translations", None)
+    if translations is not None:
+        # the half-cell translations of a cell that repeats a smaller one (absent: the key of before)
+        _update_array(digest, "translations", translations)
     _update_array(digest, "representative_rows", reduction.representative_rows)
     _update_array(digest, "full_to_wedge", reduction.full_to_wedge)
     _update_array(digest, "multiplicities", reduction.multiplicities)

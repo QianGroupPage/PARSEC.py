@@ -233,8 +233,13 @@ def _weighted_spectrum(decomposition, hamiltonian, count):
     return np.array([value for value, weight in sorted(weighted) for _ in range(weight)][:count])
 
 
+@patch.dict(os.environ, {"PARSEC_PERIODIC_TRANSLATIONS": "off"})
 class PeriodicPointGroupTests(unittest.TestCase):
-    """The point group of a bulk orthorhombic cell about its origin: atoms modulo the lattice, row maps that wrap."""
+    """The point group of a bulk orthorhombic cell about its origin: atoms modulo the lattice, row maps that wrap.
+
+    The point group alone (``PARSEC_PERIODIC_TRANSLATIONS=off``): the face-centred cubes here also have the
+    translations by half the cell, which ``test_periodic_translations`` takes.
+    """
 
     def test_diamond_cell_weighted_sector_spectra_are_the_full_spectrum(self):
         from parsec_python.acceleration.Symmetry import (

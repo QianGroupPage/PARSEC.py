@@ -920,6 +920,7 @@ a setting that selects the former one:
 | `PARSEC_ORBITAL_GROUP` | `auto`: where the full point group of signed permutations is larger than its abelian subgroup and that solves less, the orbitals use the one-dimensional sectors of the subgroup that `Symmetry/orbital_groups.py` chooses, with weights (Td: D2d, sectors of about a quarter of the D2 basis; see "Weighted sectors of a larger subgroup"); spin, spin-orbit, hybrids, meta-GGAs, libxc, LDA+U and `occup.in` keep the abelian group | `abelian`: the reflection or commuting signed-permutation group of before, bit for bit |
 | `PARSEC_PERIODIC_SYMMETRY` | `auto`: a bulk orthorhombic cell at the Gamma point that the route of the sectors takes solves its orbitals in the sectors of its point group about the origin of the cell (atoms modulo the lattice, row maps that wrap; Td of diamond: 1/16 of the basis of the one sector of the identity; see "Point groups of periodic cells") | `off`: one sector of the identity, or the full grid of one GPU, bit for bit |
 | `PARSEC_PERIODIC_HARTREE_METHOD` | `fft` (since 2026-11-16): the finite-difference Poisson equation of an orthorhombic 3-D cell on the device by dividing by the FFT of its stencil symbol (the wrapped `-nabla^2` is circulant): the exact solution of the linear system the CG iterates on, two real FFTs per solve and no matrix on the device (bulk diamond, 23.9 M points: about 9 s per SCF step before) | `cg`: the conjugate gradients of before, bit for bit (the two differ by the CG tolerance) |
+| `PARSEC_PERIODIC_TRANSLATIONS` | `auto` (since 2026-11-16): a periodic cell that repeats a smaller one twice along some axes adds the translations by half of those axes to the group of its sectors (the time-reversal invariant k-points of the smaller cell are their real characters; see "Translations by half the cell") | `off`: the point group about the origin alone, bit for bit |
 | `PARSEC_PERIODIC_SETUP_DEVICE` | `auto` (since 2026-11-16): the local ionic potential of a bulk cell of the default routines with diagonal lattice vectors on the device where the run has one: the structure-factor series as the same blocked product and FFT, the short-ranged terms gathered per grid point from the images in the neighbouring bins (`V_ion/periodic_local_device.py`; the host sums to round-off) | `off`: the host sums, bit for bit |
 | `PARSEC_MPI_SHARED_EIGH_HELPER` | `on`: under the block route the root of a basis that three or more ranks share hands the eigensolve of its small solve to another rank (the whitened matrix there and the eigenvectors back, solved in that rank's summed pair), and the condition helper estimates on its own summed overlap instead of a copy; the same bits (bulk diamond on 16 A100, Gamma point, 5,832 atoms: 41.9 -> 38.3 GiB at the fullest GPU, 303.4 and 302.7 s). The block route forms the whitening in the summed pair either way; with both and the pool that the planner now chooses, 8,000 atoms took 71.6 -> 68.1 GiB and 657.9 -> 651.5 s on the same nodes | `off`: the eigensolve and a copy of the overlap on the root and the helper, as before |
 | `PARSEC_SPINOR_FILTER_COLUMNS` | `32` in the k-point pools, `64` on one device: columns per chunk of the filter recurrence, of `H X` and of the residuals; the random start basis is drawn 64 columns at a time whatever the chunk (bulk diamond on 16 A100, same nodes, energies the same to the digits printed: 1,728 atoms 33.1 -> 26.9 GiB, 216.6 -> 197.4 s; 2,744 atoms 63.5 -> 54.8 GiB, 622.6 -> 606.6 s; 1,000 atoms with a 4x4x4 mesh 162.1 -> 138.3 s) | `64`: the chunk of the pools before (their start basis was drawn by chunks, so another chunk started from another basis) |
@@ -2931,10 +2932,62 @@ the largest cell of the one sector of the identity), and up to 32,768 atoms
 (131,072 electrons, 23.9 M grid points, 65,542 states): 424.8 s, 9 SCF steps,
 66.3 GiB at the fullest GPU, the largest cube on 16 A100
 (`examples/3d_diamond_benchmark/README.md`). Its SCF is mostly eigensolves
-(355 s of 362 s), its setup (63 s) mostly the projectors (23 s) and the
-initial density (11 s). Before these two device paths the same cell took
+(355 s of 362 s), its setup (63 s) mostly the projectors (23 s; since built for
+all atoms at once, `V_ion/periodic_projectors.py`, 1.5 s with the same arrays)
+and the initial density (11 s); with the translations by half the cell (below)
+the same cell takes 187.8 s. Before these two device paths the same cell took
 690.7 s and 74.0 GiB: a setup of 240 s, 153 s of it the local ionic potential
 on the host of the root, and 84 s of CG Hartree solves.
+
+#### Translations by half the cell
+
+A cell that repeats a smaller one twice along some of its axes is invariant
+under the translations by half of those axes, and so is its grid where those
+axes have an even number of points: exact symmetries of the discretized
+Hamiltonian at the Gamma point (`PARSEC_PERIODIC_TRANSLATIONS=auto`, since
+2026-11-16; `Symmetry/axis_reflection.py`, `_half_cell_translations`). They form
+a group of order two per element; its real characters are the time-reversal
+invariant k-points of the smaller cell, whose Bloch functions are real (periodic
+or antiperiodic along each axis), so a Gamma calculation of the cell becomes
+the calculation of those k-points of the smaller cell with the discretization
+of the cell itself: the energies are those of the point group alone, not those
+of a k-point mesh (whose kinetic term discretizes `-nabla^2 - 2ik.nabla + k^2`
+on the periodic part). With the signed permutations about the origin they make
+the operations `r -> R r + t` of the cell; the `t` that go with an `R` form a
+coset of the translations, so one is searched among the eight half-cell steps
+(a k-d tree of a few atoms refuses the rest first). The orbitals take the
+weighted sectors of this group as of a point group (above); its multiplication
+table counts the translations modulo the grid, and the search for the solved
+subgroup runs over the subgroups that contain the pure translations (a normal
+subgroup of real characters, in the chosen subgroup of every cell measured).
+
+Every supercell of a face-centred structure has them: the face-centring
+translations `(0, a/2, a/2)` are half-cell translations of its conventional
+cube and of every cube of an odd number of cubes; a cube of an even number has
+all seven. Diamond with an atom at the origin then has 96 (one cube, or an odd
+number) or 192 operations instead of the 24 of Td, and its orbitals use 5 or 10
+weighted sectors of a subgroup of 16 or 32 (`1/32` of the grid each, about
+`1/102` of the rows times states of the one sector of the identity, against
+`1/16` with Td alone). The translations change only the row maps: the density,
+the potentials and the mixer keep one value per orbit of the larger group, the
+Hartree potential is solved on the full grid, the device XC
+evaluators turn vectors by `R` alone, and the partner states of a weighted sector
+are its images under the operations with their translations.
+`PARSEC_PERIODIC_TRANSLATIONS=off` keeps the point group about the origin, bit
+for bit; a cell that does not repeat has the zero translation alone and the
+group of before.
+
+Measured on A100 (bulk diamond of `examples/3d_diamond_benchmark`, first runs):
+SCF to 1e-7 Ry, the translations give the total energy of the point group
+alone within 1e-14 (8 atoms, 96 operations), 2e-13 (64), 2e-12 (216) and
+2e-12 Ry (512 atoms, 192 operations), four ranks on one node. With the settings
+of the benchmark on 16 A100 (four nodes, one process each): 8,000 atoms 19.8 s
+and 2.38 GiB at the fullest GPU (36.2 s and 6.48 GiB with Td alone), 32,768
+atoms 187.8 s and 16.1 GiB (424.8 s and 66.3 GiB), and up to 64,000 atoms
+(256,000 electrons, 46.7 M grid points, 128,006 states): 668.1 s, 7 SCF steps,
+53.8 GiB, the largest cube on 16 A100. The ten sectors of 32,768 atoms hold
+2,054 states each; its SCF took 142.9 s (the first eigensolve 71 s, a later
+step 12 s, against 133 s and 28 s), its setup 44.7 s.
 
 #### ARPACK, Dynamic_Diag_Tol, Fix_Number_Eigenvalues and the TEST mode
 

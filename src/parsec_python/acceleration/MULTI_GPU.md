@@ -321,7 +321,11 @@ periodic grid onto themselves (the row maps wrap around the cell). Where it
 finds one, the orbitals take its sectors as a cluster's do, with the weighted
 sectors of a larger subgroup where they solve less (Td of diamond about an
 atom: D2d, 1/16 of the grid times the states; Oh of rocksalt: D4h, 1/32), and
-the ranks divide the sectors as for a cluster (above). Without
+the ranks divide the sectors as for a cluster (above). A cell that repeats a
+smaller one adds the translations by half the cell to that group
+(`PARSEC_PERIODIC_TRANSLATIONS=auto`; diamond supercells: 96 or 192 operations,
+5 or 10 sectors of a subgroup of 16 or 32; README "Translations by half the
+cell"). Without
 one, or with `PARSEC_PERIODIC_SYMMETRY=off`, the cell is one sector of the
 identity (every grid point an orbit, `AxisReflectionReduction.identity`), the
 sector of a molecular dynamics run: on several nodes one rank per GPU shares

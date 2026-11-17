@@ -352,7 +352,11 @@ def install() -> None:
     from ..Forces.periodic_spline import spline_periodic_local_forces
     from . import periodic_setup_fortran as _fortran
 
+    from .periodic_projectors import batched_nonlocal_projectors
+
     _ionic.set_support_finder(grid_ball)
+    # the projectors of a bulk orthorhombic cell at Gamma, all atoms at once (the same arrays)
+    _ionic.set_projector_provider(batched_nonlocal_projectors)
     _ewald.set_local_potential_provider(fft_local_ionic_potential, converged_for=_fortran_converged)
     _force_sums.set_local_force_provider(local_force_provider)
     _fortran_force_sums.set_local_force_provider(spline_periodic_local_forces)

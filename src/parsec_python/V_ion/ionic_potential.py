@@ -1075,6 +1075,22 @@ def set_atomic_density_provider(provider=None) -> None:
     _atomic_density_provider = provider
 
 
+_projector_provider = None
+
+
+def set_projector_provider(provider=None) -> None:
+    """Install (or, with ``None``, remove) a builder of the projectors of :func:`build_nonlocal_projectors`.
+
+    ``provider(grid, atoms, potentials, specifications, lattice_vectors, k_point, periodic_dimensions)`` returns
+    the operator of :func:`build_nonlocal_projectors`, array for array, or ``None`` for an input it does not take
+    (the loop below then runs).  Importing :mod:`parsec_python.acceleration` installs the builder of
+    ``parsec_python.acceleration.V_ion.periodic_projectors`` (bulk orthorhombic cells at the Gamma point, all atoms
+    at once).
+    """
+    global _projector_provider
+    _projector_provider = provider
+
+
 def _periodic_image_translations(
     lattice_vectors: np.ndarray, support_radius: float, dimensions: int = 3
 ) -> np.ndarray:
@@ -1231,6 +1247,12 @@ def build_nonlocal_projectors(
         return build_double_grid_projectors(
             grid, atoms, potentials, specifications, lattice_vectors, k_point
         )
+    if _projector_provider is not None:
+        built = _projector_provider(
+            grid, atoms, potentials, specifications, lattice_vectors, k_point, periodic_dimensions
+        )
+        if built is not None:
+            return built
     rows: list[np.ndarray] = []
     columns: list[np.ndarray] = []
     values: list[np.ndarray] = []

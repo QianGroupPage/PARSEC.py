@@ -77,6 +77,34 @@ class DeviceLocalPotentialTests(unittest.TestCase):
         with mock.patch.object(ewald, "LOCAL_POTENTIAL_USES_CUBIC_SPLINE", False):
             self.assert_same(grid, _silicon_atoms(side), {"Si": _SILICON}, lattice, "linear")
 
+    def test_the_binned_atomic_density_is_the_host_sum(self) -> None:
+        # periodic_device.device_bulk_atomic_density sums the images gathered from bins
+        # (PARSEC_PERIODIC_DENSITY_BINS=auto): the host's image blocks to round-off; off: bit for bit
+        from parsec_python.acceleration.V_ion import periodic_setup_fortran
+
+        side = 10.26
+        cases = []
+        lattice = side * np.eye(3)
+        grid = build_periodic_grid(
+            PeriodicCell(lattice), PeriodicGridSettings(spacing=side / 18, expansion_order=8, shift=(0.5,) * 3)
+        )
+        cases.append((grid, _silicon_atoms(side, (0.3, -0.2, 0.1)), {"Si": _SILICON}, lattice))
+        small = np.diag([5.6, 5.6, 7.0])
+        small_grid = build_periodic_grid(PeriodicCell(small), PeriodicGridSettings(spacing=0.35, expansion_order=6))
+        atoms = [Atom("Si", (0.4, 0.5, 0.6)), Atom("H", (2.9, 3.1, 1.2)), Atom("H", (5.1, 0.2, 6.6))]
+        cases.append((small_grid, atoms, {"Si": _SILICON, "H": _HYDROGEN}, small))
+        for grid, atoms, specifications, lattice in cases:
+            potentials = load_pseudopotentials(specifications, xc_functional="ca")
+            with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_DENSITY_BINS": "auto"}):
+                binned = periodic_setup_fortran._density_provider(grid, atoms, potentials, specifications, lattice, False)
+            with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_DENSITY_BINS": "off"}):
+                every = periodic_setup_fortran._density_provider(grid, atoms, potentials, specifications, lattice, False)
+            with mock.patch.dict(os.environ, {"PARSEC_DEVICE": "cpu"}):
+                host = periodic_setup_fortran._density_provider(grid, atoms, potentials, specifications, lattice, False)
+            self.assertIsNotNone(binned)
+            np.testing.assert_array_equal(every, host)
+            np.testing.assert_allclose(binned, host, rtol=0, atol=1.0e-13 * float(np.max(np.abs(host))))
+
     def test_the_switch(self) -> None:
         for value, expected in (("", "auto"), ("OFF", "off")):
             with mock.patch.dict(os.environ, {periodic_local_device.SWITCH: value}):

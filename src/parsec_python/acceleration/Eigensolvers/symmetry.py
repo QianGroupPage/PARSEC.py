@@ -802,10 +802,13 @@ class CuPySymmetrySCFEigensolver:
             mpi_context is None or mpi_context.rank == mpi_context.root
         )
         if prepares_poisson or self._owned_representations:
+            from ..Symmetry.axis_reflection import compress_projectors_for_sectors
+
             static_operators = load_or_build_reduced_operators(
                 decomposition,
                 negative_laplacian,
-                nonlocal_operator,
+                # one atom per orbit of the group of the sectors (the same sector operators)
+                compress_projectors_for_sectors(nonlocal_operator, decomposition.reduction),
                 cache_directory=operator_cache_directory,
                 kinetic_key_seed=kinetic_cache_key,
                 decomposition_key_seed=decomposition_cache_key,
@@ -1527,8 +1530,11 @@ class CuPySymmetrySCFEigensolver:
 
         if not self._owned_representations:
             return  # (a rank of a hybrid's MPI run without sectors)
+        from ..Symmetry.axis_reflection import compress_projectors_for_sectors
+
         reduced = self.decomposition.reduce_nonlocal_operators(
-            nonlocal_operator, self._owned_representations
+            compress_projectors_for_sectors(nonlocal_operator, self.decomposition.reduction),
+            self._owned_representations,
         )
         for representation in self._owned_representations:
             replace_operator_projectors(

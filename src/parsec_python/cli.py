@@ -2173,6 +2173,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Input error: {error}", file=sys.stderr)
             return 2
 
+    # PARSEC_SUPERCELL_KPOINTS=auto: a Gamma-point cell that repeats a smaller one, solved as that cell with the
+    # Gamma-centred k-point mesh of the repeats (SCF/kpoint_supercell.py; the same energies, the Bloch kinetic term)
+    import dataclasses as _dataclasses
+
+    from .SCF.kpoint_supercell import describe as _describe_bloch_cells, kpoints_of_supercell as _bloch_cells
+
+    _found_cells = _bloch_cells(translation.problem)
+    if _found_cells is not None:
+        translation = _dataclasses.replace(translation, problem=_found_cells[0])
+        # the mesh reproduces the supercell with the Bloch kinetic term
+        import os as _os
+
+        _os.environ["PARSEC_KPOINT_KINETIC"] = "bloch"
+        print(_describe_bloch_cells("cell", _found_cells[1]))
+
     is_periodic = translation.problem.periodic_cell is not None
     if (
         getattr(translation, "polarizability_field", None) is not None

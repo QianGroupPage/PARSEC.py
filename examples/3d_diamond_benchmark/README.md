@@ -148,6 +148,34 @@ two SCFs take different paths (7 to 8 steps instead of 9 to 10) and their energi
 32,768 atoms (1.5e-8 Ry per atom). The ten sectors of n = 16 hold 2,054 states each, on 16 GPUs six of them on two
 GPUs and four on one; its first eigensolve takes 71 s and a later SCF step 12 s.
 
+### Gamma point: projectors of one atom per orbit, binned densities (2026-11-16)
+
+The sectors of a group take the projectors of one atom per orbit of the group, scaled by the square root of the
+orbit size (`PARSEC_SECTOR_PROJECTOR_ORBITS=auto`: the same sector operators to round-off, a 32nd of the columns
+for the subgroup of 32 of these cells), and the superposed atomic density of the first SCF step is summed on the GPU
+from bins of the atom images (`PARSEC_PERIODIC_DENSITY_BINS=auto`: the same terms in another order). The same launch
+and settings as above, first runs on one allocation from small to large; "before" is the program time of the table
+above (code 6275754b):
+
+| n | atoms | SCF iterations | program (s) | SCF (s) | setup (s) | later step (s) | GPU (GiB) | before (s) |
+|---|---|---|---|---|---|---|---|---|
+| 6 | 1,728 | 7 | 22.6 (*) | 14.8 | 7.8 | 0.06 | 0.8 | 4.4 |
+| 8 | 4,096 | 8 | 7.0 | 2.1 | 4.8 | 0.16 | 1.1 | 9.2 |
+| 10 | 8,000 | 7 | 12.2 | 3.7 | 8.4 | 0.34 | 2.1 | 19.8 |
+| 12 | 13,824 | 7 | 22.5 | 7.5 | 14.8 | 0.69 | 3.9 | 43.7 |
+| 14 | 21,952 | 7 | 37.0 | 14.5 | 22.4 | 1.32 | 7.5 | 92.5 |
+| 15 | 27,000 | 8 | 77.8 | 50.2 | 27.4 | 4.22 | 23.2 | 170.7 |
+| 16 | 32,768 | 7 | 64.3 | 30.2 | 33.9 | 2.84 | 15.2 | 187.8 |
+| 18 | 46,656 | 7 | 112.9 | 63.4 | 49.3 | 6.03 | 29.0 | 362.1 |
+| 20 | 64,000 | 7 | 195.5 | 125.2 | 70.2 | 11.90 | 52.2 | 668.1 |
+
+(*) the first item of the allocation: its first eigensolve (13.4 s) compiles the GPU kernels of the code; the same
+cell took 4.1 s after another one. The energies are those of the table above within 2e-9 Ry; SCF to 1e-7 Ry the
+projectors of one atom per orbit give those of every atom within 1e-14 (8 and 64 atoms), 5e-11 (216) and 1.2e-10 Ry
+(512). At n = 16 the SCF is 30.2 s instead of 142.9 s (the first eigensolve 11.7 s instead of 70.7, a later step
+2.8 s instead of 11.8): the projectors of every atom in each of the ten sectors had cost more than the stencil. The
+setup is now the larger part (n = 20: 70.2 s of 195.5, of it 8.2 s the density instead of 36.4).
+
 ### k-points (irreducible wedge of a Gamma-centred mesh)
 
 Program time in seconds, SCF iterations in brackets; P is the number of k-point pools the code chose.

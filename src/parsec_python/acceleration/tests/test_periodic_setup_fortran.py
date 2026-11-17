@@ -51,6 +51,19 @@ _TABLE_REACH = mock.patch.dict(os.environ, {"PARSEC_PERIODIC_SETUP_REACH": "tabl
 _SIDES = (6.0, 7.2, 8.4)  # spacing 0.6 on all three axes
 
 
+# The comparisons of the device density with the host's bit for bit take the kernel of every atom: the bins of
+# PARSEC_PERIODIC_DENSITY_BINS=auto sum the same terms in another order (test_periodic_local_device compares them).
+_DENSITY_BINS = mock.patch.dict(os.environ, {"PARSEC_PERIODIC_DENSITY_BINS": "off"})
+
+
+def setUpModule() -> None:
+    _DENSITY_BINS.start()
+
+
+def tearDownModule() -> None:
+    _DENSITY_BINS.stop()
+
+
 @functools.lru_cache(maxsize=None)
 def _system():
     problem = SinglePointInput(

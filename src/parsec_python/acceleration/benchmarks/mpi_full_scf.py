@@ -840,6 +840,18 @@ def execute(args, cp, comm, MPI, initialization_seconds, initial_affinity=None):
                          'CUDA_VISIBLE_DEVICES set per rank (scripts/run_multi_gpu_scf.sh --rank-per-gpu)')
 
     translation = parse_parsec_input(args.input, pseudopotential_directory=args.pp_dir)
+    # PARSEC_KPOINT_SUPERCELL=auto: a mesh of the time-reversal invariant k-points as the Gamma point of the
+    # supercell (parsec_python/SCF/kpoint_supercell.py; the same energies with the Bloch kinetic term)
+    from parsec_python.SCF.kpoint_supercell import describe as _describe_kpoint_cells, supercell_of_trim_mesh
+    from parsec_python.acceleration.driver import periodic_sector_refusal as _sector_refusal
+
+    _found_supercell = supercell_of_trim_mesh(translation.problem, refusal=_sector_refusal)
+    if _found_supercell is not None:
+        from dataclasses import replace as _replace
+
+        translation = _replace(translation, problem=_found_supercell[0])
+        if rank == 0:
+            print(_describe_kpoint_cells("supercell", _found_supercell[1]), flush=True)
     if args.mlff is not None:
         from parsec_python.MLFF import apply_mlff_option
         translation = apply_mlff_option(translation, args.mlff)

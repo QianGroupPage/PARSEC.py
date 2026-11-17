@@ -1025,6 +1025,11 @@ class PointGroupReduction(SignedPermutationReduction):
     translations: np.ndarray = None
     full_translations: np.ndarray = None
     coset_translations: np.ndarray = None
+    # The orbits of the atoms under ``operations`` (with their translations): the smallest atom index of the
+    # orbit of every atom and the orbit size (:func:`_atom_orbits`; ``None``: not known).  Atoms of one orbit
+    # give the same nonlocal operator in every sector (:func:`compress_projectors_for_sectors`).
+    atom_representatives: np.ndarray = None
+    atom_orbit_sizes: np.ndarray = None
 
     def operation_translation(self, index: int) -> np.ndarray | None:
         """The translation of ``operations[index]`` (grid steps), ``None`` without translations."""
@@ -1151,12 +1156,13 @@ _TRANSLATIONS_SWITCH = "PARSEC_PERIODIC_TRANSLATIONS"
 
 def periodic_translation_setting() -> str:
     """``PARSEC_PERIODIC_TRANSLATIONS``: ``auto`` (default) adds the half-cell translations of a cell that repeats
-    a smaller one to its group (:func:`_half_cell_translations`); ``off`` keeps the point group about the origin
-    alone, bit for bit as before."""
+    a smaller one to its group (:func:`_half_cell_translations`) and, where the group closes, the operations whose
+    translation is a fraction of the cell (non-symmorphic, :func:`_fractional_translation`); ``half`` the half-cell
+    translations alone; ``off`` keeps the point group about the origin alone, bit for bit as before."""
 
     value = os.environ.get(_TRANSLATIONS_SWITCH, "auto").strip().lower() or "auto"
-    if value not in {"auto", "off"}:
-        raise ValueError(f"{_TRANSLATIONS_SWITCH} must be auto or off, not {value!r}")
+    if value not in {"auto", "half", "off"}:
+        raise ValueError(f"{_TRANSLATIONS_SWITCH} must be auto, half or off, not {value!r}")
     return value
 
 
@@ -1221,7 +1227,72 @@ def _plausible(species: dict, trees: dict, operation, translation, tolerance: fl
 
 
 
-def _space_group_operations(grid, atoms, atom_tolerance, lattice_tolerance):
+_FRACTIONAL_SAMPLES = 8
+# Candidates matched in full at most: more of them after the sampled atoms (a crystal of many cells, whose lattice
+# translations all pass, or one whose translations a defect alone breaks) end the search as undecided.
+_FRACTIONAL_BUDGET = 32
+_UNDECIDED = "undecided"
+
+
+def _translations_mapping(species: dict, trees: dict, operation, period, steps, counts, tolerance,
+                          excluded=(), first: bool = True):
+    """The translations ``t`` (whole grid steps, ascending) with which ``r -> R r + t`` maps the atoms onto
+    themselves, apart from ``excluded``.
+
+    A valid ``t`` carries the first atom of the smallest species onto an atom of that species, so the candidates
+    are ``x_j - R x_0``; those that are whole grid steps are kept, then those that carry the next few atoms of
+    every species onto atoms of it (one k-d tree query of all candidates per atom), and the survivors are
+    matched in full (:func:`_atoms_are_invariant_operation`); with ``first`` (the default) the search stops at the
+    first one, which is all the callers need (whether one exists, and one of a coset).  More than
+    ``_FRACTIONAL_BUDGET`` candidates after the sampled atoms return ``_UNDECIDED``.
+    """
+
+    matrix = np.asarray(operation, dtype=np.float64)
+    symbol = min(species, key=lambda name: (len(species[name]), name))
+    positions = species[symbol]
+    candidates = positions - positions[0] @ matrix.T
+    candidates = candidates - period * np.floor(candidates / period)
+    in_steps = candidates / steps
+    rounded = np.rint(in_steps)
+    keep = np.all(np.abs(in_steps - rounded) <= 1.0e-6, axis=1)
+    whole = np.unique(np.mod(rounded[keep].astype(np.int64), counts), axis=0)
+    if excluded:
+        drop = {tuple(int(v) for v in np.mod(np.asarray(step, dtype=np.int64), counts)) for step in excluded}
+        whole = np.array([row for row in whole if tuple(int(v) for v in row) not in drop], dtype=np.int64).reshape(-1, 3)
+    radius = 2.0 * (tolerance * (1.0 + 1.0e-9) + 1.0e-12)
+    for name, atoms_of in species.items():
+        if whole.size == 0:
+            return []
+        tree = trees.get(name)
+        if tree is None:
+            tree = trees[name] = _matching_tree(atoms_of, period)
+        # atoms spread over the list (the first one of the smallest species made the candidates)
+        picks = np.unique(np.linspace(1 if name == symbol else 0, len(atoms_of) - 1, _FRACTIONAL_SAMPLES).astype(int))
+        for atom in atoms_of[picks] if picks.size and picks[-1] >= picks[0] else atoms_of[:0]:
+            images = atom @ matrix.T + whole * steps
+            distances, _ = tree.query(_folded(images, period), k=1, distance_upper_bound=radius)
+            whole = whole[np.isfinite(distances)]
+            if whole.size == 0:
+                return []
+    if whole.shape[0] > _FRACTIONAL_BUDGET:
+        return _UNDECIDED
+    valid = []
+    for row in whole:
+        if _atoms_are_invariant_operation(species, operation, tolerance, period, row * steps):
+            valid.append(row)
+            if first:
+                break
+    return valid
+
+
+def _fractional_translation(species, trees, operation, period, steps, counts, tolerance):
+    """One translation (grid steps) that makes ``r -> R r + t`` a symmetry of the atoms, or ``None``."""
+
+    found = _translations_mapping(species, trees, operation, period, steps, counts, tolerance)
+    return found[0] if found and found is not _UNDECIDED else None
+
+
+def _space_group_operations(grid, atoms, atom_tolerance, lattice_tolerance, *, fractional: bool = True):
     """``(matrices, translations)`` of the operations ``r -> R r + t`` of a periodic cell, the identity first.
 
     ``R`` a signed permutation that maps the lattice of the grid onto itself, ``t`` one of the half-cell
@@ -1242,6 +1313,21 @@ def _space_group_operations(grid, atoms, atom_tolerance, lattice_tolerance):
     for translation in translations[1:]:
         matrices.append(identity)
         shifts.append(translation)
+    # Operations with a fraction of the cell as translation (non-symmorphic) close into a group with the
+    # half-cell translations only where these are all the pure translations of the crystal modulo the cell; a
+    # crystal with more (a supercell of n > 1 cubes of diamond) would need all of them, of complex characters.
+    fractional = (
+        fractional
+        and periodic_translation_setting() == "auto"
+        and period is not None
+        # no pure translation besides the half-cell ones (undecided counts as some)
+        and _translations_mapping(
+            species, trees, identity, period, np.diag(np.asarray(grid.cell.lattice_vectors, dtype=np.float64)) / counts,
+            counts, atom_tolerance, excluded=translations,
+        ) == []
+    )
+    if fractional and steps is None:
+        steps = np.diag(np.asarray(grid.cell.lattice_vectors, dtype=np.float64)) / counts
     for operation in _signed_permutation_operations():
         if np.array_equal(operation, identity):
             continue
@@ -1249,12 +1335,14 @@ def _space_group_operations(grid, atoms, atom_tolerance, lattice_tolerance):
             continue
         found = None
         for candidate in ([translations[0]] if len(translations) == 1 else _all_half_cell_steps(counts)):
-            cartesian = None if steps is None else candidate * steps
+            cartesian = None if len(translations) == 1 else candidate * steps
             if _plausible(species, trees, operation, cartesian, atom_tolerance, period) and _atoms_are_invariant_operation(
                 species, operation, atom_tolerance, period, cartesian
             ):
                 found = candidate
                 break
+        if found is None and fractional:
+            found = _fractional_translation(species, trees, operation, period, steps, counts, atom_tolerance)
         if found is None:
             continue
         for translation in translations:
@@ -1284,6 +1372,99 @@ def _all_half_cell_steps(counts: np.ndarray) -> list[np.ndarray]:
     return found
 
 
+_PROJECTOR_ORBITS_SWITCH = "PARSEC_SECTOR_PROJECTOR_ORBITS"
+
+
+def sector_projector_orbits_setting() -> str:
+    """``PARSEC_SECTOR_PROJECTOR_ORBITS``: ``auto`` (default) gives the sectors of a point-group reduction the
+    projectors of one atom per orbit (:func:`compress_projectors_for_sectors`); ``off`` those of every atom, bit
+    for bit as before."""
+
+    value = os.environ.get(_PROJECTOR_ORBITS_SWITCH, "auto").strip().lower() or "auto"
+    if value not in {"auto", "off"}:
+        raise ValueError(f"{_PROJECTOR_ORBITS_SWITCH} must be auto or off, not {value!r}")
+    return value
+
+
+def _atom_orbits(atoms, operations, translations, grid, tolerance: float):
+    """``(representatives, sizes)``: the smallest index in the orbit of every atom under the operations
+    ``r -> R r + t`` and the number of atoms in it, or ``None`` where an image matches no atom of its species.
+
+    The operations form a group, so the orbit of an atom is the set of its images (the identity among them).
+    """
+
+    if not atoms:
+        return None
+    positions = np.asarray([atom.position for atom in atoms], dtype=np.float64)
+    symbols = np.asarray([atom.symbol for atom in atoms])
+    period = _lattice_period(grid)
+    steps = None
+    if translations is not None:
+        counts = np.asarray(grid.points_per_axis, dtype=np.float64)
+        steps = np.diag(np.asarray(grid.cell.lattice_vectors, dtype=np.float64)) / counts
+    radius = 2.0 * (tolerance * (1.0 + 1.0e-9) + 1.0e-12)
+    images = np.empty((len(operations), positions.shape[0]), dtype=np.int64)
+    for symbol in np.unique(symbols):
+        members = np.flatnonzero(symbols == symbol)
+        points = positions[members]
+        tree = _matching_tree(points, period)
+        for g, operation in enumerate(operations):
+            image = points @ np.asarray(operation, dtype=np.float64).T
+            if translations is not None:
+                image = image + np.asarray(translations[g], dtype=np.float64) * steps
+            queries = image if period is None else _folded(image, period)
+            distances, nearest = tree.query(queries, k=1, distance_upper_bound=radius)
+            if not np.all(np.isfinite(distances)):
+                return None
+            images[g, members] = members[nearest]
+    representatives = images.min(axis=0)
+    ordered = np.sort(images, axis=0)
+    sizes = 1 + np.count_nonzero(np.diff(ordered, axis=0), axis=0)
+    return representatives, sizes.astype(np.int64)
+
+
+def compress_projectors_for_sectors(operator, reduction):
+    """The projectors that give every sector of ``reduction`` its nonlocal operator, one atom per orbit.
+
+    For an operation ``h`` of the group that carries atom ``a`` onto ``h a``, the projectors of ``h a`` are those
+    of ``a`` moved by ``h`` with their ``2l + 1`` real harmonics turned by ``R_h`` (orthogonal within a channel,
+    of one sign ``D_l``), so ``B_ha D B_ha^T = P_h B_a D B_a^T P_h^T``; the sector basis ``U`` of a real
+    one-dimensional character satisfies ``U^T P_h = chi(h) U^T``, and ``chi(h)^2 = 1``.  Every atom of an orbit
+    therefore gives the sector the same ``U^T B_a D B_a^T U``, and the columns of the representative scaled by
+    the square root of the orbit size give their sum: ``1/|orbit|`` of the columns, the same operator up to
+    round-off.  ``operator`` unchanged where the reduction knows no orbits, ``PARSEC_SECTOR_PROJECTOR_ORBITS=off``,
+    or every atom is its own orbit.  Only for the Hamiltonian of the sectors: the projector gradients of the forces
+    keep every atom.
+    """
+
+    representatives = getattr(reduction, "atom_representatives", None)
+    sizes = getattr(reduction, "atom_orbit_sizes", None)
+    if representatives is None or sizes is None or sector_projector_orbits_setting() == "off":
+        return operator
+    labels = tuple(operator.labels)
+    if not labels:
+        return operator
+    atom_of_column = np.fromiter((int(label[0]) for label in labels), dtype=np.int64, count=len(labels))
+    if atom_of_column.max() >= representatives.size or atom_of_column.min() < 0:
+        return operator
+    keep = representatives[atom_of_column] == atom_of_column
+    if np.all(keep):
+        return operator
+    import scipy.sparse as _sparse
+
+    from parsec_python.V_ion.ionic_potential import NonlocalProjectorOperator
+
+    columns = np.flatnonzero(keep)
+    scale = np.sqrt(sizes[atom_of_column[columns]].astype(np.float64))
+    projectors = _sparse.csc_matrix(_sparse.csc_matrix(operator.projectors)[:, columns] @ _sparse.diags(scale))
+    projectors.sort_indices()
+    return NonlocalProjectorOperator(
+        projectors=projectors,
+        signs=np.asarray(operator.signs, dtype=np.float64)[columns],
+        labels=tuple(labels[index] for index in columns),
+    )
+
+
 def detect_point_group_reduction(
     grid: RealSpaceGrid,
     atoms: Sequence[Atom],
@@ -1306,21 +1487,38 @@ def detect_point_group_reduction(
     from .orbital_groups import multiplication_table, orbital_group_plan
 
     table = _RowOrderTable(grid) if _fast_maps_requested() else None
-    # A cell that repeats a smaller one: its half-cell translations join the group (the operations r -> R r + t;
-    # PARSEC_PERIODIC_TRANSLATIONS=off keeps the point group about the origin alone).
-    repeats = (
+    # A periodic cell: the half-cell translations of a cell that repeats a smaller one, and the operations whose
+    # translation is a fraction of the cell where they close into a group, join the point group (the operations
+    # r -> R r + t; PARSEC_PERIODIC_TRANSLATIONS=off keeps the point group about the origin alone, half the
+    # half-cell translations alone).  Without any translation the operations are those of the point group.
+    candidates = shifts = modulus = None
+    if (
         _lattice_period(grid) is not None
-        and len(_half_cell_translations(grid, _positions_by_species(atoms), atom_tolerance)) > 1
-    )
-    if repeats:
-        candidates, shifts = _space_group_operations(grid, atoms, atom_tolerance, lattice_tolerance)
-        modulus = np.asarray(grid.points_per_axis, dtype=np.int64)
-        elements = [_affine_matrix(operation, shift) for operation, shift in zip(candidates, shifts)]
-    else:
+        and _periodic_row_major(grid)
+        and periodic_translation_setting() != "off"
+    ):
+        for fractional in (True, False):
+            found, found_shifts = _space_group_operations(
+                grid, atoms, atom_tolerance, lattice_tolerance, fractional=fractional
+            )
+            if not any(np.any(np.asarray(shift) != 0) for shift in found_shifts):
+                candidates = found
+                break
+            counts = np.asarray(grid.points_per_axis, dtype=np.int64)
+            try:
+                multiplication_table([_affine_matrix(op, shift) for op, shift in zip(found, found_shifts)], modulus=counts)
+            except ValueError:
+                # operations with a fraction of the cell that do not close: the half-cell translations alone
+                continue
+            candidates, shifts, modulus = found, found_shifts, counts
+            break
+    if candidates is None:
         candidates = _point_group_operations(grid, atoms, atom_tolerance, lattice_tolerance, table)
-        shifts = None
-        modulus = None
-        elements = candidates
+    elements = (
+        candidates
+        if shifts is None
+        else [_affine_matrix(operation, shift) for operation, shift in zip(candidates, shifts)]
+    )
 
     def shift_of(index: int):
         return None if shifts is None else shifts[index]
@@ -1378,6 +1576,11 @@ def detect_point_group_reduction(
             "coset_translations": np.ascontiguousarray([shifts[index] for index in plan.cosets], dtype=np.int64),
         }
     )
+    orbits = _atom_orbits(
+        atoms, subgroup, None if shifts is None else [shifts[index] for index in plan.subgroup], grid, atom_tolerance
+    )
+    if orbits is not None:
+        translation_fields = dict(translation_fields, atom_representatives=orbits[0], atom_orbit_sizes=orbits[1])
     return PointGroupReduction(
         **translation_fields,
         signs=np.ones((order, 3), dtype=np.int8),
@@ -1449,6 +1652,7 @@ __all__ = [
     "_RowOrderTable",
     "_fast_maps_requested",
     "_grid_row_mapping_operation",
+    "compress_projectors_for_sectors",
     "detect_point_group_reduction",
     "diagonal_subgroup_reduction",
     "orbital_group_policy",

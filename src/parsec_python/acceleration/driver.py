@@ -3525,7 +3525,8 @@ def _prepare_single_point(
                         f"exact group of {candidate.full_operations.shape[0]} operations detected (signed "
                         f"permutations, "
                         f"{int(np.count_nonzero(np.any(np.asarray(candidate.full_translations) != 0, axis=1)))}"
-                        f" of them with a translation by half the cell; PARSEC_PERIODIC_TRANSLATIONS)"
+                        f" of them with a translation, by half the cell or, non-symmorphic, a fraction of it; "
+                        f"PARSEC_PERIODIC_TRANSLATIONS)"
                         if getattr(candidate, "full_translations", None) is not None
                         else f"exact point group of {candidate.full_operations.shape[0]} signed permutations detected"
                     )

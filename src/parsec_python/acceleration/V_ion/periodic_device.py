@@ -335,6 +335,163 @@ void bulk_atomic_density(
 }
 """
 
+_DENSITY_BINS_SWITCH = "PARSEC_PERIODIC_DENSITY_BINS"
+
+
+def density_bins_setting() -> str:
+    """``PARSEC_PERIODIC_DENSITY_BINS``: ``auto`` (default) sums the superposed atomic density of a bulk cell from
+    bins of the atom images (:func:`_binned_bulk_density`: the same terms in another order, the host's sum to
+    round-off); ``off`` the kernel of every atom per point, the host's sum bit for bit."""
+
+    import os
+
+    value = os.environ.get(_DENSITY_BINS_SWITCH, "auto").strip().lower() or "auto"
+    if value not in {"auto", "off"}:
+        raise ValueError(f"{_DENSITY_BINS_SWITCH} must be auto or off, not {value!r}")
+    return value
+
+
+_BINNED_DENSITY_KERNEL = r"""
+__device__ __forceinline__ double numpy_interp(
+    const double r, const double* xp, const double* fp, const double* slopes, const int n, const double left)
+{
+    if (r < xp[0]) return left;
+    if (r >= xp[n - 1]) return fp[n - 1];
+    int low = 0, high = n - 1;  // xp[low] <= r < xp[high]
+    while (high - low > 1) {
+        const int middle = (low + high) >> 1;
+        if (xp[middle] <= r) low = middle; else high = middle;
+    }
+    if (xp[low] == r) return fp[low];
+    return __dadd_rn(__dmul_rn(slopes[low], __dsub_rn(r, xp[low])), fp[low]);
+}
+
+// The density of bulk_atomic_density: the images of the atoms binned by their centres; a point gathers the entries
+// of its 27 neighbouring bins (in the order of the bins, each bin in the order of its entries) and adds the terms
+// that kernel adds: the same terms, summed in another order.
+extern "C" __global__
+void binned_atomic_density(
+    const long long nx, const long long ny, const long long nz,
+    const double* xs, const double* ys, const double* zs,
+    const double* centres, const int* kinds,
+    const double* radii, const double* tables, const double* slopes, const int* offsets, const int* counts,
+    const double* reaches, const double* bounds,
+    const double* origin, const double bin, const int bx, const int by, const int bz,
+    const int* bin_start, const int* bin_entries,
+    double* density)
+{
+    const long long point = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (point >= nx * ny * nz) return;
+    const double px = xs[point / (ny * nz)];
+    const double py = ys[(point / nz) % ny];
+    const double pz = zs[point % nz];
+    double total = 0.0;
+    const int cx = (int)floor((px - origin[0]) / bin);
+    const int cy = (int)floor((py - origin[1]) / bin);
+    const int cz = (int)floor((pz - origin[2]) / bin);
+    for (int ox = cx - 1; ox <= cx + 1; ++ox) {
+        if (ox < 0 || ox >= bx) continue;
+        for (int oy = cy - 1; oy <= cy + 1; ++oy) {
+            if (oy < 0 || oy >= by) continue;
+            for (int oz = cz - 1; oz <= cz + 1; ++oz) {
+                if (oz < 0 || oz >= bz) continue;
+                const int cell = (ox * by + oy) * bz + oz;
+                for (int slot = bin_start[cell]; slot < bin_start[cell + 1]; ++slot) {
+                    const int entry = bin_entries[slot];
+                    const int kind = kinds[entry];
+                    const double bound = bounds[kind];
+                    const double dx = __dsub_rn(px, centres[3 * entry + 0]);
+                    const double sx = __dmul_rn(dx, dx);
+                    if (sx > bound) continue;
+                    const double dy = __dsub_rn(py, centres[3 * entry + 1]);
+                    const double planar = __dadd_rn(sx, __dmul_rn(dy, dy));
+                    if (planar > bound) continue;
+                    const double dz = __dsub_rn(pz, centres[3 * entry + 2]);
+                    const double square = __dadd_rn(planar, __dmul_rn(dz, dz));
+                    if (square > bound) continue;
+                    const double r = __dsqrt_rn(square);
+                    if (!(r < reaches[kind])) continue;
+                    total = __dadd_rn(total, numpy_interp(r, radii + offsets[kind], tables + offsets[kind],
+                                                         slopes + offsets[kind], counts[kind], tables[offsets[kind]]));
+                }
+            }
+        }
+    }
+    density[point] = total;
+}
+"""
+
+_COMPILED_BINNED: dict[int, object] = {}
+
+
+def _binned_density_kernel(cp):
+    device = int(cp.cuda.Device().id)
+    if device not in _COMPILED_BINNED:
+        kernel = cp.RawKernel(_BINNED_DENSITY_KERNEL, "binned_atomic_density", options=("--std=c++11",))
+        kernel.compile()
+        _COMPILED_BINNED[device] = kernel
+    return _COMPILED_BINNED[device]
+
+
+def _binned_bulk_density(cp, axes, sides, positions, kinds, images, reaches, bounds, tables_on_device):
+    """The density of ``bulk_atomic_density`` from bins of the atom images (the same terms in the order of the
+    bins: the sum of every atom to round-off)."""
+
+    atom_count = int(kinds.size)
+    lows = np.array([float(np.min(axis)) for axis in axes])
+    highs = np.array([float(np.max(axis)) for axis in axes])
+    reach = float(np.max(reaches)) if len(reaches) else 0.0
+    centres, entry_kinds = [], []
+    for atom in range(atom_count):
+        kind = int(kinds[atom])
+        m = images[3 * kind : 3 * kind + 3]
+        grids = np.meshgrid(
+            np.arange(-m[0], m[0] + 1), np.arange(-m[1], m[1] + 1), np.arange(-m[2], m[2] + 1), indexing="ij"
+        )
+        steps = np.column_stack([grid.reshape(-1) for grid in grids]).astype(np.float64)
+        # the centres of the kernel of every atom: positions[a] + m * side, the same roundings
+        centre = positions[3 * atom : 3 * atom + 3][None, :] + steps * sides[None, :]
+        near = np.all((centre + reaches[kind] >= lows) & (centre - reaches[kind] <= highs), axis=1)
+        centres.append(centre[near])
+        entry_kinds.append(np.full(int(np.count_nonzero(near)), kind, dtype=np.int32))
+    centres = np.concatenate(centres) if centres else np.empty((0, 3))
+    entry_kinds = np.concatenate(entry_kinds) if entry_kinds else np.empty(0, dtype=np.int32)
+    bin_size = max(reach * (1.0 + 1.0e-9), 1.0e-6)
+    origin = lows - reach
+    shape = np.maximum(np.ceil((highs + reach - origin) / bin_size).astype(np.int64), 1)
+    cells = np.clip(np.floor((centres - origin) / bin_size).astype(np.int64), 0, shape - 1)
+    flat = (cells[:, 0] * shape[1] + cells[:, 1]) * shape[2] + cells[:, 2]
+    order = np.argsort(flat, kind="stable")
+    start = np.zeros(int(np.prod(shape)) + 1, dtype=np.int32)
+    np.cumsum(np.bincount(flat, minlength=int(np.prod(shape))), out=start[1:])
+    n = [int(len(axis)) for axis in axes]
+    points = n[0] * n[1] * n[2]
+    field = cp.zeros(points, dtype=cp.float64)
+    radii, values, slopes, offsets, counts = tables_on_device
+    _binned_density_kernel(cp)(
+        ((points + _THREADS - 1) // _THREADS,),
+        (_THREADS,),
+        (
+            np.int64(n[0]), np.int64(n[1]), np.int64(n[2]),
+            cp.asarray(np.asarray(axes[0], dtype=np.float64)),
+            cp.asarray(np.asarray(axes[1], dtype=np.float64)),
+            cp.asarray(np.asarray(axes[2], dtype=np.float64)),
+            cp.asarray(np.ascontiguousarray(centres.reshape(-1))),
+            cp.asarray(entry_kinds),
+            radii, values, slopes, offsets, counts,
+            cp.asarray(np.asarray(reaches, dtype=np.float64)),
+            cp.asarray(np.asarray(bounds, dtype=np.float64)),
+            cp.asarray(origin),
+            np.float64(bin_size),
+            np.int32(shape[0]), np.int32(shape[1]), np.int32(shape[2]),
+            cp.asarray(start),
+            cp.asarray(order.astype(np.int32)),
+            field,
+        ),
+    )
+    return np.asarray(cp.asnumpy(field), dtype=np.float64)
+
+
 _COMPILED_BULK: dict[int, object] = {}
 
 
@@ -385,6 +542,20 @@ def device_bulk_atomic_density(axes, sides, atoms, potentials, tables) -> np.nda
     n = [int(len(axis)) for axis in axes]
     points = n[0] * n[1] * n[2]
     with cp.cuda.Device(device_id(cp)):
+        # the images binned by their centres (PARSEC_PERIODIC_DENSITY_BINS=auto: the same terms in another order);
+        # off: every atom per point, the host's order
+        tables_on_device = (
+            cp.asarray(np.concatenate(radii)),
+            cp.asarray(np.concatenate(values)),
+            cp.asarray(np.concatenate(slopes)),
+            cp.asarray(np.asarray(offsets, dtype=np.int32)),
+            cp.asarray(np.asarray(counts, dtype=np.int32)),
+        )
+        if density_bins_setting() == "auto":
+            return _binned_bulk_density(
+                cp, axes, sides, positions, kinds, np.asarray(images, dtype=np.int64),
+                np.asarray(reaches, dtype=np.float64), np.asarray(bounds, dtype=np.float64), tables_on_device,
+            )
         field = cp.zeros(points, dtype=cp.float64)
         _bulk_density_kernel(cp)(
             ((points + _THREADS - 1) // _THREADS,),

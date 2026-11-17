@@ -97,23 +97,68 @@ class HalfCellTranslationTests(unittest.TestCase):
         side = 6.0
         atoms = [Atom("C", tuple(side * (np.array(b) + s))) for s in (0.0, 0.25) for b in fcc]
         grid, hamiltonian = _periodic_model((side,) * 3, 12, 0.5, atoms, {"C": 2.0})
-        reduction = _reduction(grid, atoms, "auto")
-        # Td about an atom with the three face-centring translations (0, a/2, a/2), ...
-        self.assertEqual(reduction.full_operations.shape[0], 96)
-        decomposition = ReflectionRepresentationDecomposition.build(grid, reduction)
-        count = 40
-        full = np.linalg.eigvalsh(hamiltonian.toarray())[:count]
-        np.testing.assert_allclose(_weighted_spectrum(decomposition, hamiltonian, count), full, rtol=0.0, atol=1e-11)
-        reduced = decomposition.reduce_operators(hamiltonian)
-        for sector, weight in enumerate(decomposition.sector_weights):
-            if weight == 1:
-                continue
-            values, vectors = np.linalg.eigh(reduced[sector].toarray())
-            state = decomposition.expand_vector(vectors[:, 0], sector)
-            partners = reduction.partner_states(state[:, None], np.array([int(weight)]))
-            self.assertEqual(partners.shape[1], int(weight))
-            residual = hamiltonian @ partners - values[0] * partners
-            self.assertLess(float(np.max(np.abs(residual))), 1e-10, f"sector {sector} weight {weight}")
+        full = np.linalg.eigvalsh(hamiltonian.toarray())[:40]
+        # Td about an atom with the three face-centring translations (0, a/2, a/2), ... (half: 96 operations);
+        # with 12 points per edge a/4 is three steps, and the operations of Oh outside Td with the translation
+        # a/4 (1, 1, 1) close the group: Fd-3m modulo the cube, 192 operations (auto)
+        for setting, operations in (("half", 96), ("auto", 192)):
+            reduction = _reduction(grid, atoms, setting)
+            self.assertEqual(reduction.full_operations.shape[0], operations, setting)
+            decomposition = ReflectionRepresentationDecomposition.build(grid, reduction)
+            np.testing.assert_allclose(
+                _weighted_spectrum(decomposition, hamiltonian, 40), full, rtol=0.0, atol=1e-11, err_msg=setting
+            )
+            reduced = decomposition.reduce_operators(hamiltonian)
+            for sector, weight in enumerate(decomposition.sector_weights):
+                if weight == 1:
+                    continue
+                values, vectors = np.linalg.eigh(reduced[sector].toarray())
+                state = decomposition.expand_vector(vectors[:, 0], sector)
+                partners = reduction.partner_states(state[:, None], np.array([int(weight)]))
+                self.assertEqual(partners.shape[1], int(weight))
+                residual = hamiltonian @ partners - values[0] * partners
+                self.assertLess(float(np.max(np.abs(residual))), 1e-10, f"{setting} sector {sector} weight {weight}")
+
+    def test_the_sectors_take_the_projectors_of_one_atom_per_orbit(self) -> None:
+        from pathlib import Path
+
+        from parsec_python.V_ion.ionic_potential import build_nonlocal_projectors, load_pseudopotentials
+        from parsec_python.acceleration.Symmetry.axis_reflection import compress_projectors_for_sectors
+        from parsec_python.models import SpeciesPotential
+
+        carbon = Path(__file__).resolve().parents[4] / "examples" / "3d_diamond_benchmark" / "C_POTRE.DAT"
+        specifications = {"C": SpeciesPotential(carbon, 2, use_spline=True)}
+        potentials = load_pseudopotentials(specifications, xc_functional="pbe")
+        side = 3.567 / 0.529177210903
+        for repeats, points, setting in (((1, 1, 1), 12, "auto"), ((2, 2, 2), 10, "auto"), ((2, 2, 2), 10, "off")):
+            cells = np.array(
+                [(i, j, k) for i in range(repeats[0]) for j in range(repeats[1]) for k in range(repeats[2])], float
+            )
+            atoms = [Atom("C", tuple(s)) for s in (cells[:, None, :] + _BASIS[None]).reshape(-1, 3) * side]
+            lattice = np.diag(side * np.asarray(repeats, dtype=float))
+            grid = build_periodic_grid(PeriodicCell(lattice), PeriodicGridSettings(spacing=side / points, expansion_order=8))
+            reduction = _reduction(grid, atoms, setting)
+            decomposition = ReflectionRepresentationDecomposition.build(grid, reduction)
+            operator = build_nonlocal_projectors(grid, atoms, potentials, specifications, lattice)
+            compressed = compress_projectors_for_sectors(operator, reduction)
+            label = f"{repeats} {setting}"
+            # the columns of one atom per orbit of the group of the sectors
+            orbits = int(np.unique(reduction.atom_representatives).size)
+            self.assertEqual(compressed.projectors.shape[1] * len(atoms), operator.projectors.shape[1] * orbits, label)
+            every = decomposition.reduce_nonlocal_operators(operator)
+            orbit = decomposition.reduce_nonlocal_operators(compressed)
+            matrices = [
+                (
+                    left.projectors @ np.diag(left.signs) @ left.projectors.T.toarray(),
+                    right.projectors @ np.diag(right.signs) @ right.projectors.T.toarray(),
+                )
+                for left, right in zip(every, orbit)
+            ]
+            scale = max(float(np.max(np.abs(left))) for left, _ in matrices)
+            for sector, (left, right) in enumerate(matrices):
+                self.assertLess(float(np.max(np.abs(left - right))), 1.0e-12 * scale, f"{label} sector {sector}")
+        with mock.patch.dict(os.environ, {"PARSEC_SECTOR_PROJECTOR_ORBITS": "off"}):
+            self.assertIs(compress_projectors_for_sectors(operator, reduction), operator)
 
     def test_a_cell_that_does_not_repeat(self) -> None:
         grid, atoms = _supercell((2, 1, 1))
@@ -139,7 +184,7 @@ class HalfCellTranslationTests(unittest.TestCase):
     def test_the_switch(self) -> None:
         from parsec_python.acceleration.Symmetry.axis_reflection import periodic_translation_setting
 
-        for value, expected in (("", "auto"), ("OFF", "off")):
+        for value, expected in (("", "auto"), ("OFF", "off"), ("Half", "half")):
             with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_TRANSLATIONS": value}):
                 self.assertEqual(periodic_translation_setting(), expected)
         with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_TRANSLATIONS": "on"}):
@@ -183,12 +228,17 @@ class HalfCellTranslationSCFTests(unittest.TestCase):
             problem = _silicon_supercell(repeats)
             label = "x".join(str(value) for value in repeats)
             sectors, details = self._solve(problem, {"PARSEC_PERIODIC_TRANSLATIONS": "auto"})
-            self.assertIn("translation by half the cell", details["symmetry_detection"], label)
+            self.assertIn("with a translation", details["symmetry_detection"], label)
             full, full_details = self._solve(problem, {"PARSEC_PERIODIC_SYMMETRY": "off"})
             self.assertTrue(sectors.converged and full.converged, label)
             for field in ("total", "exchange_correlation", "hartree", "eigenvalue"):
-                # the sum of the levels: 1e-8 Ry for the states of each conventional cube (Diag_Tolerance 1e-10)
-                delta = 1.0e-8 * (int(np.prod(repeats)) if field == "eigenvalue" else 1)
+                # the total to 1e-8 Ry; its parts to 1e-7 (the SCF to 1e-9 converges the total, not each part:
+                # another starting density moves them by 1e-8); the sum of the levels 1e-8 Ry per cube
+                delta = (
+                    1.0e-8 if field == "total"
+                    else 1.0e-8 * int(np.prod(repeats)) if field == "eigenvalue"
+                    else 1.0e-7
+                )
                 self.assertAlmostEqual(
                     getattr(sectors.energies, field), getattr(full.energies, field), delta=delta, msg=f"{label} {field}"
                 )
@@ -197,6 +247,24 @@ class HalfCellTranslationSCFTests(unittest.TestCase):
                 np.sort(sectors.eigenvalues)[:occupied], np.sort(full.eigenvalues)[:occupied], rtol=0, atol=1.0e-7,
                 err_msg=label,
             )
+
+    def test_the_non_symmorphic_operations_of_a_silicon_cube(self) -> None:
+        # 16 points per edge: a/4 is four grid steps, and the operations of Oh outside Td with the translation
+        # a/4 (1, 1, 1) are symmetries of the grid: Fd-3m modulo the cube, 192 operations
+        from parsec_python.acceleration.tests.test_periodic_point_group import silicon
+
+        problem = silicon("pbe", spacing=10.26 / 16)
+        sectors, details = self._solve(problem, {"PARSEC_PERIODIC_TRANSLATIONS": "auto"})
+        self.assertIn("exact group of 192 operations", details["symmetry_detection"])
+        half, half_details = self._solve(problem, {"PARSEC_PERIODIC_TRANSLATIONS": "half"})
+        self.assertIn("exact group of 96 operations", half_details["symmetry_detection"])
+        full, _ = self._solve(problem, {"PARSEC_PERIODIC_SYMMETRY": "off"})
+        for result, label in ((sectors, "Fd-3m"), (half, "half-cell translations")):
+            self.assertTrue(result.converged, label)
+            for field in ("total", "exchange_correlation", "hartree", "eigenvalue"):
+                self.assertAlmostEqual(
+                    getattr(result.energies, field), getattr(full.energies, field), delta=1.0e-8, msg=f"{label} {field}"
+                )
 
 
 if __name__ == "__main__":

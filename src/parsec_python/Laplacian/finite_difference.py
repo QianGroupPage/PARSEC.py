@@ -255,7 +255,80 @@ def _wrapped_box(grid) -> bool:
     )
 
 
-def _build_wrapped_negative_laplacian(grid) -> sp.csr_matrix:
+_KINETIC_SWITCH = "PARSEC_KPOINT_KINETIC"
+
+
+def kpoint_kinetic_setting() -> str:
+    """``PARSEC_KPOINT_KINETIC``: the kinetic term of a k-point.  ``gradient`` (default): ``-nabla^2 - 2ik.nabla +
+    k^2`` with the gradient discretized on its own; ``bloch``: the Bloch block of the finite-difference Laplacian
+    (:func:`build_bloch_negative_laplacian`), whose mesh of ``m`` points along an axis gives the Gamma point of the
+    supercell of ``m`` cells exactly; ``auto``: ``bloch`` where it applies, ``gradient`` elsewhere.
+
+    Both forms converge to the same energies.  Neither is closer at every spacing: on silicon (2 x 2 x 2 and
+    3 x 3 x 3 meshes, 12 to 28 points per cubic edge) the total energy of ``bloch`` is as close or closer to the
+    converged one, but on a gold cell at 0.6 bohr its lowest band dips below Gamma at k = 1/4 (-1.2 mRy, +5.3
+    with ``gradient``; +3.7 and +4.4 at 0.45 bohr, +10.4 and +10.9 at 0.35): the form of before stays the default.
+    """
+
+    import os
+
+    value = os.environ.get(_KINETIC_SWITCH, "gradient").strip().lower() or "gradient"
+    if value not in {"auto", "gradient", "bloch"}:
+        raise ValueError(f"{_KINETIC_SWITCH} must be gradient, bloch or auto, not {value!r}")
+    return value
+
+
+def bloch_laplacian_or_none(grid, k_point, cache: dict | None = None, key=None, *, meta_gga: bool = False):
+    """The u-gauge Bloch Laplacian of ``k_point`` (kept in ``cache`` by ``key``), or ``None`` for the gradient form.
+
+    It applies to a scalar (not spinor) Hamiltonian without a meta-GGA on a bulk orthorhombic cell of the default
+    routines (:func:`_wrapped_box`): ``auto`` takes it there and the gradient form elsewhere, ``bloch`` refuses
+    the others, ``gradient`` never takes it.
+    """
+
+    setting = kpoint_kinetic_setting()
+    if setting == "gradient":
+        return None
+    applies = _wrapped_box(grid) and not meta_gga
+    if not applies:
+        if setting == "auto":
+            return None
+        raise ValueError(
+            "PARSEC_KPOINT_KINETIC=bloch needs a bulk orthorhombic cell of the default routines (an orthorhombic "
+            "periodic box whose rows are its points) and a functional without a kinetic-energy density"
+        )
+    if cache is not None and key in cache:
+        return cache[key]
+    matrix = build_bloch_negative_laplacian(grid, k_point, "u")
+    if cache is not None:
+        cache[key] = matrix
+    return matrix
+
+
+def build_bloch_negative_laplacian(grid, k_point, gauge: str = "u") -> sp.csr_matrix:
+    """The Bloch block of the finite-difference ``-nabla^2`` of a periodic box at ``k_point`` (Cartesian, 1/bohr).
+
+    A supercell of ``m`` copies of the box along an axis has the finite-difference Laplacian of the box in each
+    copy, and its eigenfunctions of the translation by the box are ``psi(r + L) = e^{ik.L} psi(r)``: on the box
+    they solve the box's stencil with every wrapped neighbour taken times ``e^{ik.L}`` (``gauge="psi"``: the
+    twisted Laplacian, real, ``+-1`` on the wrapped entries, at a time-reversal invariant ``k``).  The periodic
+    factor ``u = e^{-ik.r} psi`` solves the stencil whose weight of the neighbour ``delta`` away is multiplied by
+    ``e^{ik.delta}`` (``gauge="u"``, the default, complex): ``sum_delta c_delta e^{ik.delta} u(r + delta)``.
+    Both are the exact Bloch block of the supercell's matrix, so a mesh of ``m`` points along an axis gives the
+    eigenvalues of the supercell of ``m`` boxes at the Gamma point.  (``-nabla^2 - 2ik.nabla + k^2`` with the
+    gradient discretized on its own, :class:`~parsec_python.Hamiltonian.KPointKohnShamHamiltonian` without
+    ``bloch_laplacian``, is another discretization of the same operator.)  An orthorhombic box of the default
+    routines (:func:`_wrapped_box`) only.
+    """
+
+    if not _wrapped_box(grid):
+        raise ValueError("the Bloch Laplacian needs an orthorhombic periodic box whose rows are its points")
+    if gauge not in {"u", "psi"}:
+        raise ValueError(f"gauge must be 'u' or 'psi', not {gauge!r}")
+    return _build_wrapped_negative_laplacian(grid, k_point=np.asarray(k_point, dtype=np.float64), gauge=gauge)
+
+
+def _build_wrapped_negative_laplacian(grid, *, k_point=None, gauge: str = "u") -> sp.csr_matrix:
     """The matrix of :func:`build_negative_laplacian` for a periodic box, written directly in CSR.
 
     Every row holds its point and the ``2 M`` neighbours along each axis, all of them (they wrap), so the rows
@@ -300,7 +373,31 @@ def _build_wrapped_negative_laplacian(grid) -> sp.csr_matrix:
         view = [1, 1, 1]
         view[axis] = shape[axis]
         columns[:, slot] = (rows + change.reshape(view)).reshape(-1)
-    data = np.broadcast_to(weights, (n, count)).copy()
+    if k_point is None:
+        data = np.broadcast_to(weights, (n, count)).copy()
+    else:
+        # the Bloch block (build_bloch_negative_laplacian): a phase per slot (u gauge) or per wrapped entry (psi)
+        sides = np.diag(np.asarray(grid.cell.lattice_vectors, dtype=np.float64))
+        steps = sides / np.asarray(shape, dtype=np.float64)
+        if gauge == "u":
+            phases = np.array(
+                [1.0 if axis is None else np.exp(1j * k_point[axis] * shift * steps[axis]) for axis, shift in order]
+            )
+            data = np.broadcast_to(weights * phases, (n, count)).copy()
+        else:
+            data = np.empty((n, count), dtype=np.complex128)
+            for slot, (axis, shift) in enumerate(order):
+                if axis is None:
+                    data[:, slot] = weights[slot]
+                    continue
+                wraps = (coordinates[axis] + shift) // shape[axis]
+                phase = np.exp(1j * k_point[axis] * sides[axis] * wraps.astype(np.float64))
+                view = [1, 1, 1]
+                view[axis] = shape[axis]
+                data[:, slot] = np.broadcast_to(weights[slot] * phase.reshape(view), shape).reshape(-1)
+            if np.max(np.abs(data.imag)) <= 1.0e-12 * np.max(np.abs(data.real)):
+                # a time-reversal invariant k: the twisted Laplacian is real
+                data = np.ascontiguousarray(np.rint(data.real / weights[None, :]) * weights[None, :])
     near = np.zeros(shape, dtype=bool)
     for axis, extent in enumerate(shape):
         edge = (coordinates[axis] < width) | (coordinates[axis] >= extent - width)
@@ -311,7 +408,10 @@ def _build_wrapped_negative_laplacian(grid) -> sp.csr_matrix:
     if near.size:
         permutation = np.argsort(columns[near], axis=1, kind="stable")
         columns[near] = np.take_along_axis(columns[near], permutation, axis=1)
-        data[near] = weights[permutation]
+        if k_point is None:
+            data[near] = weights[permutation]
+        else:
+            data[near] = np.take_along_axis(data[near], permutation, axis=1)
     indptr = np.arange(0, n * count + 1, count, dtype=index_type)
     matrix = sp.csr_matrix((data.reshape(-1), columns.reshape(-1), indptr), shape=(n, n))
     matrix.has_sorted_indices = True

@@ -1144,6 +1144,24 @@ def _run(
         except ValueError as error:
             print(f"Input error: {error}", file=sys.stderr)
             return 2
+    # A k-point mesh of the time-reversal invariant points as the Gamma point of the supercell
+    # (PARSEC_KPOINT_SUPERCELL=auto), and a repeating Gamma-point cell as its smaller cell with a mesh
+    # (PARSEC_SUPERCELL_KPOINTS=auto, a k-point run of the reference CLI, which makes the same cell):
+    # parsec_python/SCF/kpoint_supercell.py, the same energies with the Bloch kinetic term.
+    from parsec_python.SCF.kpoint_supercell import (
+        describe as _describe_kpoint_cells,
+        kpoints_of_supercell as _bloch_cells,
+        supercell_of_trim_mesh as _trim_supercell,
+    )
+
+    from .driver import periodic_sector_refusal as _sector_refusal
+
+    _found_supercell = _trim_supercell(translation.problem, refusal=_sector_refusal)
+    if _found_supercell is not None:
+        translation = replace(translation, problem=_found_supercell[0])
+        print(_describe_kpoint_cells("supercell", _found_supercell[1]))
+    elif _bloch_cells(translation.problem) is not None:
+        return reference_main(_reference_argv(arguments))
 
     from parsec_python.MLFF import MLFFError, relax_initial_structure
 

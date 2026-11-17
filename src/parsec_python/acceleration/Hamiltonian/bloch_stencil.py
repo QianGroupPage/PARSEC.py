@@ -276,6 +276,13 @@ def _same(given: sp.spmatrix, rebuilt: sp.csr_matrix) -> bool:
     return difference.nnz == 0
 
 
+def _same_complex(left: sp.spmatrix, right: sp.spmatrix) -> bool:
+    """Whether two complex matrices agree entry by entry to round-off of their largest entry."""
+    difference = sp.csr_matrix(left) - sp.csr_matrix(right)
+    scale = float(np.max(np.abs(sp.csr_matrix(left).data))) if sp.csr_matrix(left).nnz else 1.0
+    return difference.nnz == 0 or float(np.max(np.abs(difference.data))) <= 1.0e-13 * scale
+
+
 @dataclass(frozen=True)
 class AxialStencils:
     """The ``-nabla^2`` and the three first derivatives of an orthorhombic periodic grid as stencils."""
@@ -335,6 +342,48 @@ class BlochStencil:
         self.laplacian = cp.asarray(np.ascontiguousarray(stencils.laplacian.reshape(-1)))
         self.gradient = cp.asarray(np.ascontiguousarray((2.0 * k[:, None] * stencils.gradient).reshape(-1)))
         self.kernel = _kernel(cp, stencils.half_width)
+
+    @classmethod
+    def from_bloch(cls, cp, stencils: AxialStencils, bloch_laplacian) -> "BlochStencil | None":
+        """The kernel of the Bloch block of the Laplacian (``PARSEC_KPOINT_KINETIC=bloch``), or ``None``.
+
+        Its neighbour ``s`` steps along axis ``a`` has the weight ``v = c_{a,s} e^{i k_a s h_a}`` (and ``conj(v)``
+        at ``-s``), so the local term is ``sum Re(v) (u+ + u-) + i Im(v) (u+ - u-)``: the kernel's even
+        coefficients ``Re(v)`` and its odd ones ``q = -Im(v)`` (it adds ``-i q (u+ - u-)``), read off row 0.  The
+        rows are checked to be those of the stencil (every row the translate of row 0); ``None`` otherwise.
+        """
+        matrix = sp.csr_matrix(bloch_laplacian, dtype=np.complex128)
+        shape = stencils.shape
+        width = stencils.half_width
+        strides = (shape[1] * shape[2], shape[2], 1)
+        row = slice(matrix.indptr[0], matrix.indptr[1])
+        values = dict(zip(matrix.indices[row].tolist(), matrix.data[row].tolist()))
+        even = np.zeros((3, width))
+        odd = np.zeros((3, width))
+        for axis in range(3):
+            for s in range(1, width + 1):
+                forward = values.get((s % shape[axis]) * strides[axis])
+                backward = values.get(((-s) % shape[axis]) * strides[axis])
+                if forward is None or backward is None or abs(backward - np.conj(forward)) > 1e-12 * abs(forward):
+                    return None
+                even[axis, s - 1] = forward.real
+                odd[axis, s - 1] = -forward.imag
+        centre = values.get(0)
+        if centre is None or abs(centre.imag) > 0.0 or abs(centre.real - stencils.centre) > 1e-12 * abs(stencils.centre):
+            return None
+        # the stencil at every row: the matrix rebuilt from the coefficients
+        rebuilt = _rebuilt(shape, width, stencils.centre, even, True).astype(np.complex128)
+        if np.any(odd != 0.0):
+            rebuilt = rebuilt - 1j * _rebuilt(shape, width, 0.0, odd, False)
+        if not _same_complex(matrix, rebuilt):
+            return None
+        kernel = cls.__new__(cls)
+        kernel.cp = cp
+        kernel.stencils = stencils
+        kernel.laplacian = cp.asarray(np.ascontiguousarray(even.reshape(-1)))
+        kernel.gradient = cp.asarray(np.ascontiguousarray(odd.reshape(-1)))
+        kernel.kernel = _kernel(cp, width)
+        return kernel
 
     @property
     def device_bytes(self) -> int:

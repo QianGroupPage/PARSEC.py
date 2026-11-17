@@ -56,6 +56,7 @@ from ..Energy import total_energy, total_energy_no_degeneracy_spin_polarized
 from ..Occupations import fixed_occupations, spin_fixed_occupations
 from ..Grid.point_group import symmetrize_density
 from ..Hamiltonian.kpoint_operator import KPointExchangeHamiltonian, KPointKohnShamHamiltonian
+from ..Laplacian.finite_difference import bloch_laplacian_or_none
 from ..Mixer import make_mixer, potential_residual_metrics, preconditioned_mixer
 from ..SCF.pbc import PeriodicPreparedSinglePointSystem
 from ..SCF.spin_polarized import (
@@ -319,6 +320,8 @@ def run_scf_kpoints(
     projector_cache: dict[int, object] = {} if projector_cache is None else projector_cache
     # sum_c k_c G_c of each k-point, built where the task is solved and only if read (not by a device kernel)
     k_gradients: dict[int, dict] = {}
+    # the Bloch Laplacian of each k-point under PARSEC_KPOINT_KINETIC=bloch (Laplacian.finite_difference)
+    bloch_laplacians: dict[int, object] = {}
     # the k-point solver, once made: the MPI k-point pools build a k-point's projectors with the atoms dealt
     # over the ranks of the pool (solver.projector_builder, the same matrix)
     owner: dict = {}
@@ -343,6 +346,10 @@ def run_scf_kpoints(
             kinetic_potential=potentials.get("vtau"),
             gradient_flux=potentials.get("gradient_flux"),
             k_gradient_cache=k_gradients.setdefault(task, {}),
+            # PARSEC_KPOINT_KINETIC=bloch: the Bloch block of the finite-difference Laplacian
+            bloch_laplacian=bloch_laplacian_or_none(
+                system.grid, k_points[task], bloch_laplacians, task, meta_gga=potentials.get("vtau") is not None
+            ),
         )
         if exchange_term is not None:
             # A hybrid functional: a_x V_ACE of this k-point (built where the worker solves it).
@@ -921,6 +928,8 @@ def run_scf_kpoints_spin_polarized(
     projector_cache: dict[int, object] = {} if projector_cache is None else projector_cache
     # sum_c k_c G_c of each k-point, shared by its two channels (built only if read)
     k_gradients: dict[int, dict] = {}
+    # the Bloch Laplacian of each k-point under PARSEC_KPOINT_KINETIC=bloch (Laplacian.finite_difference)
+    bloch_laplacians: dict[int, object] = {}
     owner: dict = {}  # the k-point solver, once made (see run_scf_kpoints)
 
     def make_hamiltonian(task, potentials):
@@ -944,6 +953,10 @@ def run_scf_kpoints_spin_polarized(
             kinetic_potential=potentials.get("vtau_up" if spin_index == 0 else "vtau_down"),
             gradient_flux=potentials.get("gradient_flux_up" if spin_index == 0 else "gradient_flux_down"),
             k_gradient_cache=k_gradients.setdefault(k_index, {}),
+            bloch_laplacian=bloch_laplacian_or_none(
+                system.grid, k_points[k_index], bloch_laplacians, k_index,
+                meta_gga=potentials.get("vtau_up" if spin_index == 0 else "vtau_down") is not None,
+            ),
         )
         if exchange_term is not None:
             # A hybrid functional: a_x V_ACE of this channel and k-point.

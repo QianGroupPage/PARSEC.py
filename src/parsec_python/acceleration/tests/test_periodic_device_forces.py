@@ -56,6 +56,19 @@ from ..V_ion import periodic_device as device_fields
 from ..V_ion import periodic_setup_fortran as periodic_setup
 from ..backends.cupy import cupy_available
 
+# The comparisons of the device density with the host's bit for bit take the kernel of every atom: the bins of
+# PARSEC_PERIODIC_DENSITY_BINS=auto sum the same terms in another order (test_periodic_local_device compares them).
+_DENSITY_BINS = mock.patch.dict(os.environ, {"PARSEC_PERIODIC_DENSITY_BINS": "off"})
+
+
+def setUpModule() -> None:
+    _DENSITY_BINS.start()
+
+
+def tearDownModule() -> None:
+    _DENSITY_BINS.stop()
+
+
 DATA = Path(__file__).resolve().parents[2] / "tests" / "data"
 STEP = 1.0e-6
 

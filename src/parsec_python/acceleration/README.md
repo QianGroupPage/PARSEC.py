@@ -920,7 +920,12 @@ a setting that selects the former one:
 | `PARSEC_ORBITAL_GROUP` | `auto`: where the full point group of signed permutations is larger than its abelian subgroup and that solves less, the orbitals use the one-dimensional sectors of the subgroup that `Symmetry/orbital_groups.py` chooses, with weights (Td: D2d, sectors of about a quarter of the D2 basis; see "Weighted sectors of a larger subgroup"); spin, spin-orbit, hybrids, meta-GGAs, libxc, LDA+U and `occup.in` keep the abelian group | `abelian`: the reflection or commuting signed-permutation group of before, bit for bit |
 | `PARSEC_PERIODIC_SYMMETRY` | `auto`: a bulk orthorhombic cell at the Gamma point that the route of the sectors takes solves its orbitals in the sectors of its point group about the origin of the cell (atoms modulo the lattice, row maps that wrap; Td of diamond: 1/16 of the basis of the one sector of the identity; see "Point groups of periodic cells") | `off`: one sector of the identity, or the full grid of one GPU, bit for bit |
 | `PARSEC_PERIODIC_HARTREE_METHOD` | `fft` (since 2026-11-16): the finite-difference Poisson equation of an orthorhombic 3-D cell on the device by dividing by the FFT of its stencil symbol (the wrapped `-nabla^2` is circulant): the exact solution of the linear system the CG iterates on, two real FFTs per solve and no matrix on the device (bulk diamond, 23.9 M points: about 9 s per SCF step before) | `cg`: the conjugate gradients of before, bit for bit (the two differ by the CG tolerance) |
-| `PARSEC_PERIODIC_TRANSLATIONS` | `auto` (since 2026-11-16): a periodic cell that repeats a smaller one twice along some axes adds the translations by half of those axes to the group of its sectors (the time-reversal invariant k-points of the smaller cell are their real characters; see "Translations by half the cell") | `off`: the point group about the origin alone, bit for bit |
+| `PARSEC_PERIODIC_TRANSLATIONS` | `auto` (since 2026-11-16): a periodic cell that repeats a smaller one twice along some axes adds the translations by half of those axes to the group of its sectors (the time-reversal invariant k-points of the smaller cell are their real characters), and a cell whose only pure translations are those also the operations whose translation is a fraction of the cell on whole grid steps (non-symmorphic: Fd-3m of the diamond cube where a/4 is a whole number of steps); see "Translations by half the cell" | `half`: the half-cell translations alone; `off`: the point group about the origin alone, bit for bit |
+| `PARSEC_PERIODIC_DENSITY_BINS` | `auto` (since 2026-11-16): the superposed atomic density of a bulk cell on the device from bins of the atom images (`V_ion/periodic_device.py`, `_binned_bulk_density`: each point the images of its 27 neighbouring bins, the same terms in another order, the host's sum to round-off) | `off`: every atom per point, the host's sum bit for bit |
+| `PARSEC_SECTOR_PROJECTOR_ORBITS` | `auto` (since 2026-11-16): the sectors of a point-group reduction take the projectors of one atom per orbit of their group, the columns scaled by the square root of the orbit size (the same sector operators to round-off; `Symmetry/axis_reflection.py`, `compress_projectors_for_sectors`) | `off`: the projectors of every atom, bit for bit |
+| `PARSEC_KPOINT_KINETIC` | `gradient` (default): `-nabla^2 - 2ik.nabla + k^2` with the gradient discretized on its own, as before | `bloch` (since 2026-11-16): the Bloch block of the finite-difference Laplacian (`Laplacian/finite_difference.py`, `build_bloch_negative_laplacian`; a scalar Hamiltonian without a meta-GGA on a bulk orthorhombic cell of the default routines), the discretization of the Gamma point of the supercell; `auto`: `bloch` where it applies; see "The kinetic term of a k-point" |
+| `PARSEC_KPOINT_SUPERCELL` | `auto`: a Gamma-centred mesh of one or two points per axis (`Monkhorst_Pack_Shift` zero) is solved as the Gamma point of its supercell (`SCF/kpoint_supercell.py`; the energies of the mesh with the Bloch kinetic term) | `off` (default) |
+| `PARSEC_SUPERCELL_KPOINTS` | `auto`: a Gamma-point cell that repeats a smaller orthorhombic one is solved as that cell with the Gamma-centred mesh of the repeats (`SCF/kpoint_supercell.py`; the same energies) | `off` (default) |
 | `PARSEC_PERIODIC_SETUP_DEVICE` | `auto` (since 2026-11-16): the local ionic potential of a bulk cell of the default routines with diagonal lattice vectors on the device where the run has one: the structure-factor series as the same blocked product and FFT, the short-ranged terms gathered per grid point from the images in the neighbouring bins (`V_ion/periodic_local_device.py`; the host sums to round-off) | `off`: the host sums, bit for bit |
 | `PARSEC_MPI_SHARED_EIGH_HELPER` | `on`: under the block route the root of a basis that three or more ranks share hands the eigensolve of its small solve to another rank (the whitened matrix there and the eigenvectors back, solved in that rank's summed pair), and the condition helper estimates on its own summed overlap instead of a copy; the same bits (bulk diamond on 16 A100, Gamma point, 5,832 atoms: 41.9 -> 38.3 GiB at the fullest GPU, 303.4 and 302.7 s). The block route forms the whitening in the summed pair either way; with both and the pool that the planner now chooses, 8,000 atoms took 71.6 -> 68.1 GiB and 657.9 -> 651.5 s on the same nodes | `off`: the eigensolve and a copy of the overlap on the root and the helper, as before |
 | `PARSEC_SPINOR_FILTER_COLUMNS` | `32` in the k-point pools, `64` on one device: columns per chunk of the filter recurrence, of `H X` and of the residuals; the random start basis is drawn 64 columns at a time whatever the chunk (bulk diamond on 16 A100, same nodes, energies the same to the digits printed: 1,728 atoms 33.1 -> 26.9 GiB, 216.6 -> 197.4 s; 2,744 atoms 63.5 -> 54.8 GiB, 622.6 -> 606.6 s; 1,000 atoms with a 4x4x4 mesh 162.1 -> 138.3 s) | `64`: the chunk of the pools before (their start basis was drawn by chunks, so another chunk started from another basis) |
@@ -2988,6 +2993,82 @@ atoms 187.8 s and 16.1 GiB (424.8 s and 66.3 GiB), and up to 64,000 atoms
 53.8 GiB, the largest cube on 16 A100. The ten sectors of 32,768 atoms hold
 2,054 states each; its SCF took 142.9 s (the first eigensolve 71 s, a later
 step 12 s, against 133 s and 28 s), its setup 44.7 s.
+
+Operations whose translation is a fraction of the cell (non-symmorphic, the
+other half of Oh for diamond: `R` outside Td with `t = a/4 (1, 1, 1)`) join
+the group where they close with the half-cell translations, which happens
+where those are all the pure translations of the crystal modulo the cell (the
+conventional cube of diamond, not a supercell of several cubes, where the
+products of such operations give the face-centring vectors of the crystal,
+translations of complex characters) and `t` is a whole number of grid steps
+(16 or 20 points per edge of the diamond cube, not the 18 of the benchmark):
+the translations are searched from the atoms (`x_j - R x_0` on whole grid
+steps, a k-d tree of a few atoms first, at most 32 full matchings), and a set
+that does not close keeps the half-cell translations alone. The diamond cube
+then has Fd-3m modulo the cube, 192 operations, 10 sectors of a subgroup of 32
+(1.65 times fewer orbits than its 96 operations). `PARSEC_PERIODIC_TRANSLATIONS=half`
+keeps the half-cell translations alone.
+
+The sectors of such a group take the projectors of one atom per orbit
+(`PARSEC_SECTOR_PROJECTOR_ORBITS=auto`): the projectors of an atom carried
+onto another by an operation of the group are its own moved by the operation,
+their harmonics turned within each channel of one sign, so every atom of an
+orbit gives a sector the same `U^T B_a D B_a^T U`, and the representative's
+columns scaled by the square root of the orbit size give the sum. The sector
+operators are the same to round-off (1e-13 of the largest), with up to the
+group order fewer columns: the cost of the projectors no longer grows with the
+number of sectors. The forces keep the projectors of every atom. On 16 A100,
+with the binned atomic density of the first step as well
+(`PARSEC_PERIODIC_DENSITY_BINS`), the 32,768-atom diamond took 64.3 s (187.8 s
+with the projectors of every atom: its SCF 30.2 s instead of 142.9 s) and the
+64,000-atom one 195.5 s (668.1 s), the same energies to 2e-9 Ry
+(`examples/3d_diamond_benchmark/README.md`); a Td nanodiamond cluster of 15,687
+atoms (D2d sectors) 106.0 s instead of 111.2 s.
+
+#### The kinetic term of a k-point
+
+A supercell of `m` cells along an axis has the finite-difference Laplacian of
+the cell in each copy; its eigenfunctions of the translation by the cell
+satisfy `psi(r + L) = e^{ik.L} psi(r)`, so on the cell they solve the cell's
+stencil with every wrapped neighbour taken times `e^{ik.L}`, and the periodic
+factor `u = e^{-ik.r} psi` solves the stencil whose weight of the neighbour
+`delta` away is multiplied by `e^{ik.delta}` (`build_bloch_negative_laplacian`
+of `Laplacian/finite_difference.py`, the u gauge used by the k-point
+Hamiltonian; the psi gauge is real at a time-reversal invariant k). That is
+the exact Bloch block of the supercell's matrix: the spectra of a mesh of `m`
+points along each axis are together the spectrum of the supercell, and the SCF
+of a silicon cube with the 2 x 2 x 2 mesh is the Gamma-point SCF of the cube of
+eight cubes within 6e-13 Ry. The form before (`-nabla^2 - 2ik.nabla + k^2`
+with the gradient discretized on its own, `PARSEC_KPOINT_KINETIC=gradient`) is
+another discretization of the same operator, 1.2 mRy per atom from it at 0.86
+bohr; both converge to the same energy, and neither is closer at every
+spacing. On silicon with 2 x 2 x 2 and 3 x 3 x 3 meshes the total energy of the
+Bloch form is as close or closer to the converged one at every spacing
+measured (12, 16, 20, 24 and 28 points per cubic edge; at 16 points 6e-5
+against 1.2e-4 and 5.6e-5 against 2.5e-4 Ry per atom); on the gold cell of the
+band-structure tests at 0.6 bohr its lowest band dips 1.2 mRy below Gamma at
+k = 1/4, where the gradient form rises 5.3 mRy (3.7 and 4.4 mRy at 0.45 bohr,
+10.4 and 10.9 at 0.35). The gradient form therefore stays the default;
+`PARSEC_KPOINT_KINETIC=bloch` takes the Bloch form (a scalar Hamiltonian
+without a meta-GGA on a bulk orthorhombic cell of the default routines), `auto`
+where it applies. The band structure takes the kinetic term of the SCF. On the
+device the sparse route applies the complex matrix, and the stencil kernel of
+the k-point pools takes its weights `Re(v)` and `-Im(v)` of
+`v = c e^{ik.delta}` (`Hamiltonian/bloch_stencil.py`, `BlochStencil.from_bloch`);
+the row-distributed k-point solver of the forces refuses it.
+
+With the Bloch form the two calculations are one, and either can stand for
+the other (`SCF/kpoint_supercell.py`, both `off` by default): with
+`PARSEC_KPOINT_SUPERCELL=auto` a Gamma-centred mesh of one or two points per
+axis (`Monkhorst_Pack_Shift` zero: the time-reversal invariant k-points) runs
+as the Gamma point of its supercell, whose real orbitals take the translations
+by half the cell with the point group (the little groups of the k-points); with
+`PARSEC_SUPERCELL_KPOINTS=auto` a Gamma-point cell that repeats a smaller
+orthorhombic cell runs as that cell with the Gamma-centred mesh of the repeats
+and the Bloch form (an explicit `PARSEC_KPOINT_KINETIC=gradient` refuses it).
+The output reports what was solved, and a note gives the factor between the
+two total energies; a mesh run as its supercell gives the energies of the Bloch
+form, not those of the default gradient form.
 
 #### ARPACK, Dynamic_Diag_Tol, Fix_Number_Eigenvalues and the TEST mode
 

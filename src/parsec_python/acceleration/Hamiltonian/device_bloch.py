@@ -289,6 +289,11 @@ class DeviceBlochOperator:
         if self.stencil is not None and pending is None:
             # -nabla^2 - 2i k.grad + V + |k|^2 in one kernel (orthorhombic periodic grid)
             result = self.stencil.apply(block, self.stencil_diagonal)
+        elif self.laplacian.dtype == xp.complex128:
+            # the Bloch block of the finite-difference Laplacian (PARSEC_KPOINT_KINETIC=bloch): one complex
+            # product, no k.grad term, V without |k|^2 (rows of the whole grid: the row-distributed solver refuses it)
+            result = xp.ascontiguousarray(self.laplacian @ block)
+            result += self.diagonal[:, None] * block
         else:
             real = block.view(xp.float64)
             # cuSPARSE returns a column-major product; the complex view below needs
@@ -721,8 +726,20 @@ class DeviceBlochConverter:
         return np.asarray(host_array)
 
     def _derivative_parts(self, hamiltonian):
-        """Device ``(laplacian, k_gradient)``: the stencil matrices, ``k_gradient`` None without Bloch term."""
+        """Device ``(laplacian, k_gradient)``: the stencil matrices, ``k_gradient`` None without Bloch term.
+
+        A Hamiltonian with ``bloch_laplacian`` (``PARSEC_KPOINT_KINETIC=bloch``) gives that complex matrix and no
+        ``k_gradient``; the row-distributed converter does not take it.
+        """
         backend = self.backend
+        bloch = getattr(hamiltonian, "bloch_laplacian", None)
+        if bloch is not None:
+            if self._rows(bloch) is not bloch:
+                raise NotImplementedError(
+                    "PARSEC_KPOINT_KINETIC=bloch is not implemented for the row-distributed MPI k-point solver "
+                    "(the forces of a k-point run); PARSEC_KPOINT_KINETIC=gradient takes it"
+                )
+            return self._cached(bloch, lambda: backend.matrix(bloch, dtype=np.complex128)), None
         laplacian = self._cached(
             hamiltonian.negative_laplacian,
             lambda: backend.matrix(hamiltonian.negative_laplacian, dtype=np.float64),
@@ -771,6 +788,7 @@ class DeviceBlochConverter:
             return None
         from .bloch_stencil import AxialStencils, BlochStencil, grid_shape_of
 
+        bloch = getattr(hamiltonian, "bloch_laplacian", None)
         anchors = (laplacian, *tuple(gradient))
         key = ("stencils",) + tuple(id(item) for item in anchors)
         entry = self._stencils.get(key)
@@ -785,6 +803,15 @@ class DeviceBlochConverter:
         k_point = tuple(
             float(value) for value in np.asarray(getattr(hamiltonian, "k_point", np.zeros(3)), dtype=float).reshape(3)
         )
+        if bloch is not None:
+            # the phase-weighted stencil of the Bloch Laplacian, read off its row 0 (BlochStencil.from_bloch)
+            found = by_k.get(("bloch", k_point))
+            if found is None:
+                found = BlochStencil.from_bloch(self.backend.cp, stencils, bloch)
+                if found is None:
+                    return None
+                by_k[("bloch", k_point)] = found
+            return found
         found = by_k.get(k_point)
         if found is None:
             found = by_k[k_point] = BlochStencil(self.backend.cp, stencils, k_point)

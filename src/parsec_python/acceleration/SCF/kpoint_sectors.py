@@ -519,7 +519,7 @@ class SectorKPointSolver:
 
     The tasks of the inner solver (made by ``make_solver``, the solver the job would have had) are the pairs
     ``(k-point, sector)``, ``(k-point, None)`` for a k-point that stays whole, in the order of their work (rows
-    times states squared, the largest first: the MPI pools deal the tasks round-robin).  The driver sees one
+    times states squared, the largest first: the MPI pools take them in this order, by their sizes).  The driver sees one
     task per k-point as before: the lowest levels of the union of its sectors, their occupations sent back to
     the sectors that hold them.
     """
@@ -565,6 +565,8 @@ class SectorKPointSolver:
             self._make_hamiltonian,
             self._accumulate,
             states_per_task=counts,
+            rows_per_task=tuple(self._rows(item) for item in self._items),
+            grid_points=self._grid_size,
         )
         options = dict(self._options)
         options["problem_size"] = max(self._rows(item) for item in self._items)

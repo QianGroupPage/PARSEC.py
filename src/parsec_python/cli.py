@@ -2868,9 +2868,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.debug:
             raise
         message = f"Calculation failed: {type(error).__name__}: {error}"
-        if not getattr(run_log, "failure_reported", False):
+        rank = _mpi_rank()
+        if rank is not None:
+            # an MPI run (the k-point pools): the ranks other than 0 write no log, and a rank that fails alone
+            # ends the others: every failed rank tells why, with its traceback, on the standard error
+            import traceback
+
+            text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            print(f"MPI rank {rank}: calculation failed:\n{text}", file=sys.stderr, end="", flush=True)
+        elif not getattr(run_log, "failure_reported", False):
             print(message, file=sys.stderr)
         return 1
+
+
+def _mpi_rank() -> int | None:
+    """The rank of this process in an MPI run of several ranks (``PARSEC_MPI``), else ``None``."""
+    if os.environ.get("PARSEC_MPI", "").strip() != "1":
+        return None
+    try:
+        from parsec_python.acceleration.Parallel import mpi
+
+        context = mpi.context()
+    except Exception:  # noqa: BLE001 - no mpi4py: not an MPI run
+        return None
+    return None if context is None or context.size == 1 else int(context.rank)
 
 
 __all__ = ["main", "refinement_progress", "save_result_archive"]

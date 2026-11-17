@@ -7,7 +7,8 @@ so the checks run without MPI or a GPU:
 * the eigensolver of a basis shared by columns (:func:`..Eigensolvers.chebff_columns.solve_column_eigval`)
   gives the eigenvalues and residuals of the one-device solver to round-off, on 1, 2 and 3 ranks, with
   exchanges in many rounds, through a first solve and SUBSPACE steps, and for a converged first solve;
-* the pools (:func:`..SCF.kpoint_pools.plan_pools`) are balanced and fit the memory;
+* the pools (:func:`..SCF.kpoint_pools.plan_pools`, :func:`..SCF.kpoint_pools.plan_pools_by_size` for tasks
+  of different sizes) are balanced and fit the memory of the devices and of the nodes;
 * the scalar and the collinear-spin k-point SCF on pools of one and of several ranks give the energy,
   eigenvalues and density of the one-process run, and so do the sectors of the k-points
   (:mod:`..SCF.kpoint_sectors`) as the tasks of the pools.
@@ -276,6 +277,98 @@ class AutoRouteTests(unittest.TestCase):
                 kpoint_ritz_route()
 
 
+class SizePlanTests(unittest.TestCase):
+    """Tasks of different sizes (the sectors of the k-points) planned by their sizes."""
+
+    usable = 0.9 * 80e9
+
+    def setUp(self) -> None:
+        from unittest.mock import patch
+
+        guard = patch.dict(os.environ, {"PARSEC_KPOINT_RITZ": "block", "PARSEC_SPINOR_FILTER_COLUMNS": ""})
+        guard.start()
+        self.addCleanup(guard.stop)
+
+    def test_tasks_of_one_size_take_the_bytes_of_the_round_robin_plan(self) -> None:
+        from parsec_python.acceleration.SCF.kpoint_pools import pool_task_bytes
+
+        for route in ("block", "rows"):
+            for ranks in (1, 2, 3):
+                for count in (1, 2, 4):
+                    for resident in range(1, count + 1):
+                        uniform = pool_memory_bytes(1_000_000, 2000, count, ranks, 1, resident=resident, route=route)
+                        device, host = pool_task_bytes([(1_000_000, 2000)] * count, ranks, 1, resident=resident, route=route)
+                        self.assertEqual(device, uniform)
+                        share = 1_000_000 * max(ColumnLayout(2000, 1, ranks).widths if ranks > 1 else [2000]) * 16
+                        self.assertEqual(host, (count - resident) * share if resident < count else 0)
+
+    def test_large_sectors_get_pools_of_their_own(self) -> None:
+        from parsec_python.acceleration.SCF.kpoint_pools import plan_pools_by_size, pool_task_bytes
+
+        # the 32 sectors of diamond 9 x 9 x 9 with a 2 x 2 x 2 mesh (162^3 points): rows and states + 6
+        tasks = (
+            [(1_062_882, 3805)] * 8 + [(531_522, 1909)] * 4 + [(531_360, 1909)] * 4
+            + [(265_842, 961)] * 4 + [(265_680, 961)] * 12
+        )
+        bytes_of = lambda shapes, ranks, resident: pool_task_bytes(  # noqa: E731
+            shapes, ranks, 1, resident=resident, grid_points=162**3
+        )
+        nodes = [rank // 4 for rank in range(16)]
+        budget = {node: 0.8 * 200e9 for node in range(4)}
+        plan = plan_pools_by_size(tasks, 16, bytes_of, self.usable, nodes=nodes, host_budget=budget)
+        # eight pools of two ranks, one large sector each, every subspace on the device
+        self.assertEqual((plan.pools, plan.sizes, plan.host_storage), (8, (2,) * 8, False))
+        self.assertEqual(sorted(plan.tasks_of_pool(pool)[0] for pool in range(8)), list(range(8)))
+        self.assertEqual(sorted(task for pool in range(8) for task in plan.tasks_of_pool(pool)), list(range(32)))
+        self.assertLess(plan.bytes_per_rank, self.usable)
+        self.assertAlmostEqual(plan.balance, (8 + 8 / 8 + 16 / 64) / 16, delta=1.0e-3)
+        self.assertFalse(any(plan.spills(pool) for pool in range(8)))
+        # one large sector alone on a rank needs more than 90 % of the device: sixteen pools when asked for
+        asked = plan_pools_by_size(
+            tasks, 16, bytes_of, self.usable, requested=16, limit=80e9, nodes=nodes, host_budget=budget
+        )
+        self.assertEqual([len(asked.tasks_of_pool(pool)) for pool in range(8)], [1] * 8)
+        self.assertGreater(asked.bytes_per_rank, self.usable)
+
+    def test_the_host_memory_of_a_node_steers_the_plan(self) -> None:
+        from parsec_python.acceleration.SCF.kpoint_pools import plan_pools_by_size
+
+        def bytes_of(shapes, ranks, resident):  # a share of rows / ranks per task, the moving ones on the host
+            shares = [rows / ranks for rows, _ in shapes]
+            kept = len(shares) if resident is None else resident
+            return sum(shares[:kept]), sum(shares[kept:])
+
+        tasks = [(4, 1), (3, 1), (2, 1)]
+        # one pool of both ranks keeps one subspace on the host (balance 9 / 2 / 4); two pools are worse
+        plan = plan_pools_by_size(tasks, 2, bytes_of, 4.0)
+        self.assertEqual((plan.pools, plan.host_storage, plan.residents), (1, True, (2,)))
+        self.assertAlmostEqual(plan.balance, 1.125)
+        self.assertEqual(plan.host_bytes_per_node, 2.0)  # 1 per rank, both ranks on one node
+        self.assertEqual(plan_pools_by_size(tasks, 2, bytes_of, 4.0, nodes=[0, 0], host_budget={0: 2.0}).pools, 1)
+        self.assertEqual(plan_pools_by_size(tasks, 2, bytes_of, 4.0, nodes=[0, 1], host_budget={0: 1.5, 1: 1.5}).pools, 1)
+        with self.assertRaisesRegex(MemoryError, "on the host"):
+            plan_pools_by_size(tasks, 2, bytes_of, 4.0, nodes=[0, 0], host_budget={0: 1.5})
+        # a requested count is refused for the device only
+        self.assertTrue(
+            plan_pools_by_size(tasks, 2, bytes_of, 4.0, requested=1, nodes=[0, 0], host_budget={0: 1.5}).host_storage
+        )
+        with self.assertRaises(MemoryError):
+            plan_pools_by_size(tasks, 2, bytes_of, 4.0, storage="device")
+
+    def test_the_setting(self) -> None:
+        from unittest.mock import patch
+
+        from parsec_python.acceleration.SCF.kpoint_pools import assignment_mode
+
+        with patch.dict(os.environ, {"PARSEC_KPOINT_POOL_ASSIGN": ""}):
+            self.assertEqual(assignment_mode(), "auto")
+        with patch.dict(os.environ, {"PARSEC_KPOINT_POOL_ASSIGN": "Cyclic"}):
+            self.assertEqual(assignment_mode(), "cyclic")
+        with patch.dict(os.environ, {"PARSEC_KPOINT_POOL_ASSIGN": "size"}):
+            with self.assertRaises(ValueError):
+                assignment_mode()
+
+
 class SpillLayoutTests(unittest.TestCase):
     def test_a_column_major_basis_goes_to_the_host_without_a_row_major_copy(self) -> None:
         # the copy to the host asks for row-major data: a column-major basis is given as its transpose
@@ -333,9 +426,9 @@ class PooledSCFTests(unittest.TestCase):
 
     def test_sectors_of_the_k_points_on_pools(self) -> None:
         # the 56 sectors of the eight k-points of the silicon cube as the tasks of three pools of one rank and of
-        # one pool of two ranks (every basis shared by columns)
-        for ranks, pools in ((3, 3), (2, 1)):
-            report = _check("sectors", str(ranks), str(pools))
+        # one pool of two ranks (every basis shared by columns), planned by their sizes and round-robin
+        for ranks, pools, assign in ((3, 3, "auto"), (2, 1, "auto"), (3, 3, "cyclic")):
+            report = _check("sectors", str(ranks), str(pools), f"assign={assign}")
             serial = report["serial"]
             self.assertGreater(serial["tasks"], 8.0)
             for result in report["pooled"]:

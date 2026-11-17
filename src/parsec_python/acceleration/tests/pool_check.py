@@ -220,6 +220,10 @@ def main() -> None:
     for argument in [a for a in sys.argv[1:] if a.startswith("route=")]:
         os.environ["PARSEC_KPOINT_RITZ"] = argument.split("=", 1)[1]
         sys.argv.remove(argument)
+    # "assign=<auto|cyclic>": the PARSEC_KPOINT_POOL_ASSIGN of the run (tasks of different sizes)
+    for argument in [a for a in sys.argv[1:] if a.startswith("assign=")]:
+        os.environ["PARSEC_KPOINT_POOL_ASSIGN"] = argument.split("=", 1)[1]
+        sys.argv.remove(argument)
     mode = sys.argv[1]
     if mode == "eigensolver":
         exchange = sys.argv[5] if len(sys.argv) > 5 else None

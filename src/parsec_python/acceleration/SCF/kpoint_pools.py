@@ -34,6 +34,17 @@ memory between their solves and back for the solve and for the density, three co
 complex numbers per task and SCF iteration over PCIe.  The host then holds the idle ones (about
 ``(tasks - resident) N m / p`` complex numbers per rank, times the ranks of a node).  A plan that needs no
 such storage is preferred to one of the same balance that does.
+
+Tasks of different sizes (the sectors of the k-points, :mod:`.kpoint_sectors`: ``rows_per_task`` and
+``states_per_task`` of the job) are planned by their own sizes (:func:`plan_pools_by_size`): the tasks, the
+largest work (rows times states squared) first, go each to the pool that would finish it first, among those
+whose devices hold it (with the subspaces not in hand on the host where they must) and whose nodes hold what
+their ranks keep on the host (a fraction of the memory the node has free when the pools are formed); the
+balance is the time of the slowest pool in units of the largest task.  So a few large sectors get pools of
+their own (diamond 9 x 9 x 9 with a 2 x 2 x 2 mesh: eight sectors of 1.06 million rows and 3,799 states, 65 GB
+each, and 24 smaller ones), where dealing every task round-robin as if it were the largest had put two large
+ones in the pools of 8 of the 16 ranks, their idle subspaces on the host, 260 GB of a node of 256.
+``PARSEC_KPOINT_POOL_ASSIGN=cyclic`` restores that rule (the plan of the largest task, round-robin).
 """
 
 from __future__ import annotations
@@ -51,6 +62,7 @@ from parsec_python.SCF.kpoint_solver import (
     device_solver_supports,
     job_eigval_settings,
     residual_max,
+    task_rows,
     task_states,
 )
 
@@ -67,6 +79,12 @@ from ..Eigensolvers.mpi_shared_basis import exchange_bytes
 from ..Parallel import mpi
 
 POOLS_ENV = "PARSEC_KPOINT_POOLS"
+ASSIGN_ENV = "PARSEC_KPOINT_POOL_ASSIGN"
+# The share of the memory a node has free when the pools are formed (``MemAvailable``, after every rank has
+# prepared its system) that the subspaces its ranks keep on the host may take.
+_HOST_FRACTION = 0.8
+# Balances of plans by size closer than this (relative) count as equal.
+_BALANCE_TIE = 0.02
 # The share of a device the estimate may take.  Measured on A100 (diamond, 2026-11-08): n = 4 to 6 used 83 to
 # 100 % of the estimate (CuPy's pool, nvidia-smi); n = 6 in four pools of 16 A100, estimated at 69 GB, ran and
 # was 15 % faster than two pools of eight ranks (the choice of 85 %).
@@ -97,6 +115,14 @@ def requested_pools() -> int | None:
     if not text.isdigit() or int(text) < 1:
         raise ValueError(f"{POOLS_ENV} (--kpoint-pools) must be a positive number or auto, not {text!r}")
     return int(text)
+
+
+def assignment_mode() -> str:
+    """``PARSEC_KPOINT_POOL_ASSIGN``: ``auto`` (tasks of different sizes planned by their sizes) or ``cyclic``."""
+    text = os.environ.get(ASSIGN_ENV, "").strip().lower() or "auto"
+    if text not in ("auto", "cyclic"):
+        raise ValueError(f"{ASSIGN_ENV} must be auto or cyclic, not {text!r}")
+    return text
 
 
 def storage_mode() -> str:
@@ -131,24 +157,84 @@ def pool_memory_bytes(
     and the static data (:data:`_FIXED_BYTES_PER_POINT`, :data:`_TASK_BYTES_PER_POINT`).
     """
     dimension, working, tasks, ranks = int(dimension), int(working), int(tasks), int(ranks)
-    width = max(ColumnLayout(working, block_size, ranks).widths) if ranks > 1 else working
-    share = dimension * width * 16
+    share = _share_bytes(dimension, working, ranks, block_size)
     resident = tasks if resident is None else max(1, min(int(resident), tasks))
     route = kpoint_ritz_route() if route is None else route
-    if route == "block":
-        # one share in hand (and a round of padding where the widths differ), the send, receive and
-        # H X buffers of a round (PARSEC_KPOINT_RITZ=block)
-        subspaces = (resident - 1) * share + share + (dimension * 16 * _round_width(dimension) if ranks > 1 else 0)
-        buffers = 3 * exchange_bytes() if ranks > 1 else 0
-    else:
-        subspaces = (resident - 1) * share + (3 if ranks > 1 else 2) * share
-        buffers = 2 * exchange_bytes() if ranks > 1 else 0
-    dense = 6 * working * working * 16
-    transient = 8 * dimension * min(_filter_columns(POOL_FILTER_COLUMNS), working) * 16
+    hand = _hand_bytes(dimension, working, ranks, block_size, route)
     fixed = _FIXED_BYTES_PER_POINT + (0 if fused else _SPARSE_FIXED_BYTES_PER_POINT)
     per_task = _TASK_BYTES_PER_POINT + (0 if fused else _SPARSE_TASK_BYTES_PER_POINT)
     static = dimension * (fixed + tasks * per_task)
-    return int(subspaces + buffers + dense + transient + static + _CONTEXT_BYTES)
+    return int((resident - 1) * share + hand + static + _CONTEXT_BYTES)
+
+
+def _share_bytes(dimension: int, working: int, ranks: int, block_size: int) -> int:
+    """Bytes of one rank's columns of a subspace of ``dimension`` rows and ``working`` columns."""
+    width = max(ColumnLayout(working, block_size, ranks).widths) if ranks > 1 else working
+    return int(dimension) * int(width) * 16
+
+
+def _hand_bytes(dimension: int, working: int, ranks: int, block_size: int, route: str) -> int:
+    """Device bytes of the task in hand on one rank: its subspace in the working arrays of the route, the
+    exchange buffers, the dense ``m x m`` matrices and the blocks of the filter (:func:`pool_memory_bytes`)."""
+    dimension, working = int(dimension), int(working)
+    share = _share_bytes(dimension, working, ranks, block_size)
+    if route == "block":
+        # one share in hand (and a round of padding where the widths differ), the send, receive and
+        # H X buffers of a round (PARSEC_KPOINT_RITZ=block)
+        subspace = share + (dimension * 16 * _round_width(dimension) if ranks > 1 else 0)
+        buffers = 3 * exchange_bytes() if ranks > 1 else 0
+    else:
+        subspace = (3 if ranks > 1 else 2) * share
+        buffers = 2 * exchange_bytes() if ranks > 1 else 0
+    dense = 6 * working * working * 16
+    transient = 8 * dimension * min(_filter_columns(POOL_FILTER_COLUMNS), working) * 16
+    return int(subspace + buffers + dense + transient)
+
+
+def pool_task_bytes(
+    tasks,
+    ranks: int,
+    block_size: int = 1,
+    *,
+    resident: int | None = None,
+    grid_points: int | None = None,
+    fused: bool = True,
+    route: str | None = None,
+) -> tuple[int, int]:
+    """``(device, host)`` bytes of one rank of a pool of ``ranks`` ranks whose tasks have the sizes ``tasks``.
+
+    ``tasks`` holds ``(rows, working columns)`` of each task in the order of the pool; the first
+    ``resident - 1`` keep their subspaces on the device, the others move theirs to the host between their
+    solves (all stay on the device where ``resident`` is ``None`` or covers them), as :class:`MPIPoolKPointSolver`
+    does.  The device holds the subspaces kept, the task in hand (:func:`_hand_bytes`; while a kept one is in
+    hand, the moving one the last solve left there as well), the fields of the grid of ``grid_points`` points
+    and the operators of every task; the host the moving subspaces but one.  For tasks of one size it is
+    :func:`pool_memory_bytes`.
+    """
+    sizes = [(int(rows), int(working)) for rows, working in tasks]
+    count, ranks = len(sizes), int(ranks)
+    resident = count if resident is None else max(1, min(int(resident), count))
+    route = kpoint_ritz_route() if route is None else route
+    shares = [_share_bytes(rows, working, ranks, block_size) for rows, working in sizes]
+    hands = [_hand_bytes(rows, working, ranks, block_size, route) for rows, working in sizes]
+    largest = max(rows for rows, _ in sizes)
+    points = largest if grid_points is None else max(int(grid_points), largest)
+    fixed = _FIXED_BYTES_PER_POINT + (0 if fused else _SPARSE_FIXED_BYTES_PER_POINT)
+    per_task = _TASK_BYTES_PER_POINT + (0 if fused else _SPARSE_TASK_BYTES_PER_POINT)
+    static = points * fixed + sum(rows for rows, _ in sizes) * per_task
+    if resident >= count:
+        total = sum(shares)
+        device = max(total - share + hand for share, hand in zip(shares, hands))
+        host = 0
+    else:
+        kept = sum(shares[: resident - 1])
+        moving = shares[resident - 1 :]
+        in_hand = max(hands[resident - 1 :])
+        if resident > 1:
+            in_hand = max(in_hand, max(hand - share for share, hand in zip(shares[: resident - 1], hands[: resident - 1])) + max(moving))
+        device = kept + in_hand
+        host = sum(moving) - min(moving)
+    return int(device + static + _CONTEXT_BYTES), int(host)
 
 
 # The share of a device above which the pools take the block route under PARSEC_KPOINT_RITZ=auto although
@@ -184,6 +270,10 @@ class PoolPlan:
     balance: float
     host_storage: bool = False
     resident: int = 0  # subspaces a rank of the fullest pool keeps on the device (0: all of its tasks)
+    # the tasks of every pool where they were planned by their sizes (plan_pools_by_size); None: round-robin
+    assignment: tuple[tuple[int, ...], ...] | None = None
+    residents: tuple[int, ...] | None = None  # the subspaces each pool keeps on the device (with assignment)
+    host_bytes_per_node: float = 0.0  # the estimate of the node whose ranks keep the most on the host
 
     @property
     def starts(self) -> tuple[int, ...]:
@@ -193,7 +283,21 @@ class PoolPlan:
         return int(np.searchsorted(np.cumsum(self.sizes), rank, side="right"))
 
     def tasks_of_pool(self, pool: int) -> list[int]:
+        if self.assignment is not None:
+            return list(self.assignment[pool])
         return list(range(pool, self.tasks, self.pools))
+
+    def resident_of(self, pool: int) -> int:
+        """The subspaces the ranks of ``pool`` keep on the device while they move the others to the host."""
+        return int(self.resident if self.residents is None else self.residents[pool])
+
+    def spills(self, pool: int) -> bool:
+        """Whether ``pool`` moves the subspaces of the tasks not in hand to the host."""
+        if not self.host_storage:
+            return False
+        if self.residents is None:
+            return True
+        return self.residents[pool] < len(self.tasks_of_pool(pool))
 
 
 def plan_pools(
@@ -258,6 +362,164 @@ def plan_pools(
             "(GPUs) are needed"
         )
     return min(fitting, key=lambda plan: (round(plan.balance, 12), plan.host_storage, -plan.pools))
+
+
+def plan_pools_by_size(
+    tasks,
+    n_ranks: int,
+    bytes_of,
+    usable: float,
+    requested: int | None = None,
+    storage: str = "auto",
+    limit: float | None = None,
+    nodes=None,
+    host_budget=None,
+) -> PoolPlan:
+    """The pools of tasks of different sizes (see the module text).
+
+    ``tasks`` holds ``(rows, working columns)`` of every task; ``bytes_of(sizes, ranks, resident)`` gives the
+    ``(device, host)`` bytes of one rank of a pool of ``ranks`` ranks with tasks of the sizes ``sizes`` (in
+    the order of the pool) and ``resident`` subspaces on the device (``None``: all), as
+    :func:`pool_task_bytes`; ``nodes`` the node of every rank and ``host_budget`` the host bytes the ranks of
+    each node may keep (no check where ``None``).  ``usable``, ``requested``, ``storage`` and ``limit`` as in
+    :func:`plan_pools`.  Every pool gets a task (a count of pools that leaves one idle is not taken).
+    """
+    sizes = [(int(rows), int(working)) for rows, working in tasks]
+    n_tasks, n_ranks = len(sizes), int(n_ranks)
+    works = [float(rows) * float(working) * float(working) for rows, working in sizes]
+    order = sorted(range(n_tasks), key=lambda task: (-works[task], task))
+    largest = max(works)
+    nodes = [0] * n_ranks if nodes is None else [int(node) for node in nodes]
+
+    def fit(members, ranks, ceiling):
+        """``(resident, device, host)`` of a pool of ``ranks`` ranks with ``members``, ``None`` if it cannot hold them."""
+        shapes = [sizes[task] for task in members]
+        device, host = bytes_of(shapes, ranks, None)
+        if storage != "host" or len(members) == 1:
+            if device <= ceiling:
+                return len(members), device, host
+            if storage == "device":
+                return None
+        for resident in range(len(members) - 1, 0, -1):  # as many on the device as fit, the fewest on the host
+            if storage == "host" and resident > 1:
+                continue
+            device, host = bytes_of(shapes, ranks, resident)
+            if device <= ceiling:
+                return resident, device, host
+        return None
+
+    def assign(count, ceiling, check_host):
+        pool_sizes = tuple(n_ranks // count + (1 if j < n_ranks % count else 0) for j in range(count))
+        starts = np.concatenate(([0], np.cumsum(pool_sizes)))
+        ranks_of = [range(int(starts[j]), int(starts[j + 1])) for j in range(count)]
+        members: list[list[int]] = [[] for _ in range(count)]
+        loads = [0.0] * count
+        fits = [(0, 0, 0)] * count
+        node_host: dict[int, float] = {}
+
+        def host_after(pool, host):
+            """The host bytes of every node of ``pool`` with ``host`` per rank of it."""
+            change: dict[int, float] = {}
+            for rank in ranks_of[pool]:
+                change[nodes[rank]] = change.get(nodes[rank], 0.0) + float(host) - float(fits[pool][2])
+            return {node: node_host.get(node, 0.0) + delta for node, delta in change.items()}
+
+        for task in order:
+            candidates = sorted(range(count), key=lambda j: ((loads[j] + works[task]) / pool_sizes[j], j))
+            for pool in candidates:
+                found = fit(members[pool] + [task], pool_sizes[pool], ceiling)
+                if found is None:
+                    continue
+                after = host_after(pool, found[2])
+                if check_host and host_budget is not None and any(
+                    amount > float(host_budget.get(node, float("inf"))) for node, amount in after.items() if amount > 0
+                ):
+                    continue
+                members[pool].append(task)
+                loads[pool] += works[task]
+                fits[pool] = found
+                node_host.update(after)
+                break
+            else:
+                return None
+        if any(not tasks_of for tasks_of in members):
+            return None
+        residents = tuple(found[0] for found in fits)
+        spill = any(resident < len(tasks_of) for resident, tasks_of in zip(residents, members))
+        return PoolPlan(
+            count,
+            pool_sizes,
+            n_tasks,
+            max(found[1] for found in fits),
+            max(load / size for load, size in zip(loads, pool_sizes)) / largest,
+            spill,
+            min(resident for resident, tasks_of in zip(residents, members) if resident < len(tasks_of)) if spill else 0,
+            tuple(tuple(tasks_of) for tasks_of in members),
+            residents,
+            max(node_host.values(), default=0.0),
+        )
+
+    counts = range(1, min(n_tasks, n_ranks) + 1)
+    if requested is not None:
+        if requested > min(n_tasks, n_ranks):
+            raise ValueError(
+                f"--kpoint-pools {requested}: at most {min(n_tasks, n_ranks)} pools for {n_tasks} tasks "
+                f"(k-points and spin channels) on {n_ranks} ranks"
+            )
+        ceiling = usable if limit is None else max(float(limit), usable)
+        # a requested count is refused only where the devices cannot hold it (the host estimate steers only)
+        plan = assign(requested, usable, True) or assign(requested, ceiling, True) or assign(requested, ceiling, False)
+        if plan is None:
+            raise MemoryError(
+                f"--kpoint-pools {requested}: the tasks do not fit {ceiling / 1e9:.1f} GB per GPU in {requested} "
+                "pools (or leave a pool without a task); fewer pools share each basis over more ranks"
+            )
+        return plan
+    plans = [plan for plan in (assign(count, usable, True) for count in counts) if plan is not None]
+    if not plans:
+        unchecked = [plan for plan in (assign(count, usable, False) for count in counts) if plan is not None]
+        if unchecked:
+            least = min(plan.host_bytes_per_node for plan in unchecked)
+            budget = min(float(value) for value in host_budget.values()) if host_budget else float("inf")
+            raise MemoryError(
+                f"the k-point subspaces kept on the host need about {least / 1e9:.1f} GB on a node, and "
+                f"{budget / 1e9:.1f} GB are free there; more nodes (or --kpoint-pools to take a count anyway)"
+            )
+        raise MemoryError(
+            f"the k-point tasks do not fit {usable / 1e9:.1f} GB per GPU on {n_ranks} ranks in any number of pools: "
+            "more ranks (GPUs) are needed"
+        )
+    # balances within a few per cent are equal (tasks of nearly equal sizes): then no subspaces on the host,
+    # then the most pools (fewer ranks per pool, less exchange)
+    best = min(plan.balance for plan in plans)
+    near = [plan for plan in plans if plan.balance <= best * (1.0 + _BALANCE_TIE)]
+    return min(near, key=lambda plan: (plan.host_storage, -plan.pools, plan.balance))
+
+
+def node_layout(context) -> tuple[list[int], dict[int, float]]:
+    """The node of every rank of ``context`` and the host bytes the pools may keep on each node
+    (:data:`_HOST_FRACTION` of the least ``MemAvailable`` its ranks see; collective)."""
+    import socket
+
+    gathered = context.comm.allgather((socket.gethostname(), available_host_bytes()))
+    names: dict[str, int] = {}
+    nodes = [names.setdefault(name, len(names)) for name, _ in gathered]
+    budget: dict[int, float] = {}
+    for node, (_, free) in zip(nodes, gathered):
+        budget[node] = min(budget.get(node, float("inf")), _HOST_FRACTION * float(free))
+    return nodes, budget
+
+
+def available_host_bytes() -> float:
+    """``MemAvailable`` of ``/proc/meminfo`` in bytes (infinite where there is none)."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as info:
+            for line in info:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) * 1024.0
+    except OSError:
+        pass
+    return float("inf")
 
 
 def host_memory_bytes() -> tuple[float, float]:
@@ -375,6 +637,15 @@ class MPIPoolKPointSolver:
         most = max(task_states(self.job, task) for task in range(self.job.n_tasks))
         working = min(most + int(settings.safety_buffer), self.problem_size)
         block = int(settings.subspace.block_size)
+        sizes = [
+            (rows, min(task_states(self.job, task) + int(settings.safety_buffer), rows))
+            for task, rows in ((task, task_rows(self.job, task, self.problem_size)) for task in range(self.job.n_tasks))
+        ]
+        # tasks of different sizes are planned by their sizes (collective: the nodes of the ranks and their memory)
+        by_size = len(set(sizes)) > 1 and assignment_mode() == "auto"
+        nodes, host_budget = node_layout(context) if by_size else (None, None)
+        if self.xp is np:
+            host_budget = None  # ranks on the CPU keep no subspaces on the host
         plan = None
         failure = None
         route = None
@@ -383,6 +654,20 @@ class MPIPoolKPointSolver:
                 usable = self._usable_bytes()
 
                 def plan_of(name):
+                    if by_size:
+                        return plan_pools_by_size(
+                            sizes,
+                            context.size,
+                            lambda shapes, ranks, resident: pool_task_bytes(
+                                shapes, ranks, block, resident=resident, grid_points=self.job.grid_points, route=name
+                            ),
+                            usable,
+                            self._requested_pools,
+                            storage_mode() if self.xp is not np else "device",
+                            limit=usable / _USABLE_FRACTION,
+                            nodes=nodes,
+                            host_budget=host_budget,
+                        )
                     return plan_pools(
                         self.job.n_tasks,
                         context.size,
@@ -567,7 +852,13 @@ class MPIPoolKPointSolver:
     @property
     def host_storage(self) -> bool:
         """Whether the subspaces of the tasks not in hand stay on the host (:attr:`PoolPlan.host_storage`)."""
-        return bool(self.plan is not None and self.plan.host_storage and len(self.tasks) > 1 and self.xp is not np)
+        return bool(
+            self.plan is not None
+            and self.plan.host_storage
+            and self.plan.spills(self.pool)
+            and len(self.tasks) > 1
+            and self.xp is not np
+        )
 
     def _solve_order(self) -> list[int]:
         """The tasks of this rank in the order of the next solve.
@@ -588,7 +879,7 @@ class MPIPoolKPointSolver:
 
     def _stays_on_device(self, task: int) -> bool:
         """The first ``resident - 1`` tasks of the pool keep their subspaces on the device."""
-        return self.tasks.index(task) < max(int(self.plan.resident) - 1, 0)
+        return self.tasks.index(task) < max(self.plan.resident_of(self.pool) - 1, 0)
 
     def _spill(self, task: int, state) -> None:
         """Move the subspace of ``state`` to pageable host memory where the plan keeps it there.
@@ -612,8 +903,14 @@ class MPIPoolKPointSolver:
         and while they live the block cannot be given back, so a subspace as large coming back from the host needs
         a second block, which a subspace of more than half the device does not find.  Released before every solve
         and every density of a task, each subspace takes a block of its own (the same numbers).
+
+        Only in a pool of one rank: with four ranks per pool, diamond 9 x 9 x 9 ran out of device memory after five
+        to seven SCF steps (CuPy's pool held 43.8 GB, and 4 GB more were not to be had on the 80 GB device): the
+        blocks given back did not return to the device, most likely because the ranks of a larger pool exchange
+        device buffers that MPI keeps mapped between the ranks of a node (CUDA IPC).  Without the release that run
+        took all its steps.
         """
-        if self.xp is np or not self.host_storage:
+        if self.xp is np or not self.host_storage or self.group is None or self.group.size > 1:
             return
         self.backend.cp.get_default_memory_pool().free_all_blocks()
 
@@ -726,7 +1023,11 @@ class MPIPoolKPointSolver:
             stats["pool_estimate_bytes"] = float(self.plan.bytes_per_rank)
             stats["pool_static_bytes"] = float(self.static_bytes)
             stats["pool_host_storage"] = float(self.host_storage)
-            stats["pool_resident"] = float(self.plan.resident or len(self.tasks))
+            stats["pool_resident"] = float(
+                self.plan.resident_of(self.pool) if self.host_storage else len(self.tasks)
+            )
+            stats["pool_host_node_estimate_bytes"] = float(self.plan.host_bytes_per_node)
+            stats["pool_assignment_by_size"] = float(self.plan.assignment is not None)
             stats["pool_host_setup_bytes"] = float(getattr(self, "host_at_setup_bytes", 0.0))
             stats["pool_host_peak_bytes"] = float(getattr(self, "host_peak_bytes", 0.0))
             stats["pool_reserved_bytes"] = float(getattr(self, "reserved_bytes", 0.0))
@@ -778,10 +1079,14 @@ def _static_device_bytes(operator) -> int:
 
 
 __all__ = [
+    "ASSIGN_ENV",
     "MPIPoolKPointSolver",
     "POOLS_ENV",
     "PoolPlan",
+    "assignment_mode",
     "plan_pools",
+    "plan_pools_by_size",
     "pool_memory_bytes",
+    "pool_task_bytes",
     "requested_pools",
 ]

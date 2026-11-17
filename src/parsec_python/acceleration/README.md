@@ -929,6 +929,7 @@ a setting that selects the former one:
 | `PARSEC_KPOINT_SECTORS` | `auto` (default, since 2026-11-16): the k-points of a scalar periodic SCF on a bulk orthorhombic cell are split into the sectors of the commuting involutions of their little groups (`SCF/kpoint_sectors.py`): each k-point becomes several eigenproblems of a fraction of its rows and states, the same spectrum; a k-point whose basis holds fewer than 2^24 entries (rows times states) or whose sectors would not halve its work stays whole; see "The sectors of a k-point" | `off`: one task per k-point, bit for bit as before |
 | `PARSEC_KPOINT_SECTOR_MARGIN` | `1.3` (default): the states of a sector over its share `M n_s / N` of the states of its k-point (plus six); a sector that does not reach the highest level the k-point keeps gets 1.5 times its states and the step is solved again | a number of at least 1 |
 | `PARSEC_SECTOR_DEVICE_POOL` | `auto` (default, since 2026-11-16, experimental runner): where the sectors of a rank do not divide its devices evenly (three sectors on four GPUs), every sector of the rank spreads over all its devices, one after another, instead of disjoint groups that leave a whole sector on one device (diamond n = 20 on 16 A100: 176.6 s and 50.1 GiB per GPU instead of 195.5 s and 52.2 GiB; n = 16 61.8 s / 17.9 GiB instead of 64.1 / 15.2) | `off`: disjoint groups, as before |
+| `PARSEC_KPOINT_POOL_ASSIGN` | `auto` (default, since 2026-11-17): tasks of the k-point pools of different sizes (the sectors of the k-points) are planned by their sizes (`SCF/kpoint_pools.py`, `plan_pools_by_size`): the largest work (rows times states squared) first, each task to the pool that finishes it first among those whose GPUs hold it and whose nodes hold what their ranks keep on the host (80 % of the memory a node has free when the pools are formed); balances within 2 % count as equal, then no subspaces on the host, then the most pools; tasks of one size keep the round-robin plan | `cyclic`: every task planned as the largest one and dealt round-robin (the plan of before) |
 | `PARSEC_PERIODIC_SETUP_DEVICE` | `auto` (since 2026-11-16): the local ionic potential of a bulk cell of the default routines with diagonal lattice vectors on the device where the run has one: the structure-factor series as the same blocked product and FFT, the short-ranged terms gathered per grid point from the images in the neighbouring bins (`V_ion/periodic_local_device.py`; the host sums to round-off) | `off`: the host sums, bit for bit |
 | `PARSEC_MPI_SHARED_EIGH_HELPER` | `on`: under the block route the root of a basis that three or more ranks share hands the eigensolve of its small solve to another rank (the whitened matrix there and the eigenvectors back, solved in that rank's summed pair), and the condition helper estimates on its own summed overlap instead of a copy; the same bits (bulk diamond on 16 A100, Gamma point, 5,832 atoms: 41.9 -> 38.3 GiB at the fullest GPU, 303.4 and 302.7 s). The block route forms the whitening in the summed pair either way; with both and the pool that the planner now chooses, 8,000 atoms took 71.6 -> 68.1 GiB and 657.9 -> 651.5 s on the same nodes | `off`: the eigensolve and a copy of the overlap on the root and the helper, as before |
 | `PARSEC_SPINOR_FILTER_COLUMNS` | `32` in the k-point pools, `64` on one device: columns per chunk of the filter recurrence, of `H X` and of the residuals; the random start basis is drawn 64 columns at a time whatever the chunk (bulk diamond on 16 A100, same nodes, energies the same to the digits printed: 1,728 atoms 33.1 -> 26.9 GiB, 216.6 -> 197.4 s; 2,744 atoms 63.5 -> 54.8 GiB, 622.6 -> 606.6 s; 1,000 atoms with a 4x4x4 mesh 162.1 -> 138.3 s) | `64`: the chunk of the pools before (their start basis was drawn by chunks, so another chunk started from another basis) |
@@ -3122,7 +3123,15 @@ reach the `M`-th level of the union, else it gets 1.5 times its states and the
 step is solved again. The density of a sector, `|U v|^2`, is expanded on the
 host and summed by the job of the driver. The scalar k-point SCF takes the split
 (no spin, hybrid, meta-GGA, LDA+U, forces, fixed occupations or kept orbitals);
-the tasks of the k-point pools are then the sectors, the largest first.
+the tasks of the k-point pools are then the sectors, the largest first, and the
+pools are planned by the size of each task (`PARSEC_KPOINT_POOL_ASSIGN=auto`):
+each sector goes to the pool that would finish it first among those whose GPUs
+hold it and whose nodes hold what their ranks keep on the host, so that a few
+large sectors get pools of their own. Planned as if every sector were the
+largest one and dealt round-robin (`cyclic`, the rule of before), the eight
+65 GB sectors of diamond 9 x 9 x 9 with the 2 x 2 x 2 mesh went to one-rank
+pools beside smaller ones, their bases moved to host memory, 260 GB on a node
+of 256.
 
 On the device the complex matrices of a sector (its reduced kinetic term, with
 `|k|^2` and the potential in the same pass, and its reduced projectors) are of
@@ -3133,13 +3142,14 @@ result per thread along the columns of a row (`Hamiltonian/complex_csr_device.py
 rows of many entries, the adjoint of the projectors, split over 32 lanes summed
 in a fixed tree). Only the operators of the sectors take it; every other operator
 keeps the products of before. On 16 A100 (diamond, Gamma-centred meshes reduced
-by Td and time reversal, the density symmetrized): 6 x 6 x 6 cubes with the
-3 x 3 x 3 mesh 18.0 s instead of 195.7 s (6.0 instead of 26.5 GiB per GPU),
-7 x 7 x 7 cubes with the 2 x 2 x 2 mesh 119.6 s instead of 586.1 s (20.3 instead
-of 54.1 GiB), total energies within 8e-6 Ry of the runs without sectors (the
-convergence criterion of these inputs is 2e-4 Ry); with the 2 x 2 x 2 mesh
-8 x 8 x 8 cubes (4,096 atoms) take 105.6 s and 10 x 10 x 10 cubes (8,000 atoms)
-404.7 s (51.0 GiB per GPU; `examples/3d_diamond_benchmark/README.md`).
+by Td and time reversal, the density symmetrized, the pools planned by the
+sizes of the sectors): 6 x 6 x 6 cubes with the 3 x 3 x 3 mesh 18.3 s instead of
+195.7 s (6.0 instead of 26.5 GiB per GPU), 7 x 7 x 7 cubes with the 2 x 2 x 2 mesh
+87.7 s instead of 586.1 s (33.6 instead of 54.1 GiB), total energies within 8e-6 Ry
+of the runs without sectors (the convergence criterion of these inputs is
+2e-4 Ry); with the 2 x 2 x 2 mesh 8 x 8 x 8 cubes (4,096 atoms) take 85.9 s,
+9 x 9 x 9 cubes (5,832 atoms) 477.1 s (58.1 GiB per GPU) and 10 x 10 x 10 cubes
+(8,000 atoms) 374.1 s (49.5 GiB; `examples/3d_diamond_benchmark/README.md`).
 
 #### ARPACK, Dynamic_Diag_Tol, Fix_Number_Eigenvalues and the TEST mode
 

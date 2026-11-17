@@ -1059,8 +1059,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     with resources.applied(), ExitStack() as scope:
         try:
             status = _run(arguments, resources, scope)
-        except BaseException:
-            _abort_mpi(1)
+        except BaseException as error:
+            _abort_mpi(1, error)
             raise
     if status not in (0, 3):
         _abort_mpi(status)
@@ -1099,13 +1099,22 @@ def shared_vector_seed(translation, context=None):
     )
 
 
-def _abort_mpi(status: int) -> None:
+def _abort_mpi(status: int, error: BaseException | None = None) -> None:
     """A rank that failed must not leave the others waiting in a collective (the interpreter's exit
-    would wait for them in MPI_Finalize): end the whole MPI job."""
+    would wait for them in MPI_Finalize): end the whole MPI job.
+
+    The traceback of ``error`` goes to the standard error first, with the rank: the abort ends the
+    process before the interpreter would print it, and the ranks other than 0 write no log.
+    """
     from .Parallel import mpi
 
     context = mpi.context()
     if context is not None and context.size > 1:
+        if error is not None and not isinstance(error, SystemExit):
+            import traceback
+
+            text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            print(f"MPI rank {context.rank} failed:\n{text}", file=sys.stderr, end="")
         sys.stdout.flush()
         sys.stderr.flush()
         context.comm.Abort(int(status))
@@ -1925,7 +1934,15 @@ def _run(
     except Exception as error:
         if arguments.debug:
             raise
-        if not getattr(run_log, "failure_reported", False):
+        rank = getattr(arguments, "mpi_rank", None)
+        if rank is not None:
+            # an MPI run: the ranks other than 0 write no log, and a rank that fails alone ends the others
+            # (the abort of main): every failed rank tells why, with its traceback, on the standard error
+            import traceback
+
+            text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            print(f"MPI rank {rank}: calculation failed:\n{text}", file=sys.stderr, end="", flush=True)
+        elif not getattr(run_log, "failure_reported", False):
             print(
                 f"Calculation failed: {type(error).__name__}: {error}",
                 file=sys.stderr,

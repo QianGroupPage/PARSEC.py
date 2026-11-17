@@ -3191,7 +3191,8 @@ class ParsecTextReporter:
         if "pools" in detail:
             lines.append(
                 f" {'MPI k-point pools':30s} : {int(detail['pools']):12d}"
-                f"   ({int(detail.get('pool_ranks', 0))} rank(s), {int(detail.get('pool_tasks', 0))} task(s) on rank 0)"
+                f"   ({int(detail.get('pool_ranks', 0))} rank(s), {int(detail.get('pool_tasks', 0))} task(s) on rank 0"
+                + ("; tasks dealt by their sizes)" if detail.get("pool_assignment_by_size") else ")")
             )
             lines.append(
                 f" {'Estimate per GPU [GB]':30s} : {detail.get('pool_estimate_bytes', 0.0) / 1e9:12.3f}"
@@ -3211,6 +3212,11 @@ class ParsecTextReporter:
                 lines.append(
                     f" {'Host memory (rank 0) [GB]':30s} : {detail['pool_host_peak_bytes'] / 1e9:12.3f}"
                     f"   (peak; {detail.get('pool_host_setup_bytes', 0.0) / 1e9:.3f} GB after the preparation)"
+                )
+            if detail.get("pool_host_node_estimate_bytes"):
+                lines.append(
+                    f" {'Host estimate per node [GB]':30s} : {detail['pool_host_node_estimate_bytes'] / 1e9:12.3f}"
+                    "   (subspaces kept on the host by the ranks of the fullest node)"
                 )
         counters = (
             ("first_solves", "First solves"),

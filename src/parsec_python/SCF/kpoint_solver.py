@@ -48,6 +48,10 @@ class KPointJob:
     # The number of states of every task where they differ (the sectors of the k-points,
     # parsec_python.acceleration.SCF.kpoint_sectors); None: number_of_states for every task.
     states_per_task: tuple[int, ...] | None = None
+    # The grid rows of every task where they differ (the sectors again); None: the whole grid for every task.
+    rows_per_task: tuple[int, ...] | None = None
+    # The points of the whole grid where the tasks have fewer rows (the fields of the SCF step live on it).
+    grid_points: int | None = None
     # What a solver that splits the k-points into the sectors of their little groups needs: a dict with the grid,
     # the atoms of the cell, the Cartesian k-points and whether the density is the only part of ``accumulate``
     # (set by the scalar k-point SCF); None: no such splitting.
@@ -59,6 +63,13 @@ def task_states(job: "KPointJob", task: int) -> int:
     if job.states_per_task is not None:
         return int(job.states_per_task[task])
     return int(job.number_of_states)
+
+
+def task_rows(job: "KPointJob", task: int, default: int) -> int:
+    """The grid rows of ``task``: ``rows_per_task[task]`` where given, else ``default`` (the whole grid)."""
+    if job.rows_per_task is not None:
+        return int(job.rows_per_task[task])
+    return int(default)
 
 
 class SerialKPointSolver:

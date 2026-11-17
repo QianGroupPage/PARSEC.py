@@ -194,31 +194,38 @@ others in host memory (51 GB per rank at the peak), and all 16 ranks share every
 n = 6 (P = 4): 74.6 GB by nvidia-smi, the estimate of the code 69 GB per GPU. The first k-point run of an allocation
 compiles the device kernels of the Bloch operator (2x2x2 n = 2: 38 s the first time, 2.3 s warm).
 
-### k-points in the sectors of their little groups (2026-11-16)
+### k-points in the sectors of their little groups (2026-11-17)
 
 Each k-point of the wedge is split into the sectors of the commuting involutions of its little group: the
 translations by half the cell (all seven for an even n, the three face-centring ones for an odd n), the twofold
 axes and mirrors of Td that fix k (`PARSEC_KPOINT_SECTORS=auto`, the default; `src/parsec_python/acceleration/README.md`,
-"The sectors of a k-point"). The sectors of all k-points are the tasks of the k-point pools, the largest first; their
-complex matrices run in a CSR kernel of their own on the device. The same inputs and launch as the table above (the
-default routines, 18 points per cubic edge, the mesh reduced by Td and time reversal, the density symmetrized), first
-runs; "before" is the code before the sectors (the path of `PARSEC_KPOINT_SECTORS=off`):
+"The sectors of a k-point"). The sectors of all k-points are the tasks of the k-point pools, which are planned by
+the size of each task (`PARSEC_KPOINT_POOL_ASSIGN=auto`); their complex matrices run in a CSR kernel of their own on
+the device. The same inputs and launch as the table above (the default routines, 18 points per cubic edge, the mesh
+reduced by Td and time reversal, the density symmetrized), first runs; "before" is the code before the sectors (the
+path of `PARSEC_KPOINT_SECTORS=off`):
 
-| n | atoms | mesh (k) | SCF iterations | program (s) | first step (s) | later step (s) | GPU (GiB) | before (s) | before, GPU (GiB) | E/atom (Ry) |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 6 | 1,728 | 3x3x3 (4) | 8 | 18.0 | 7.7 | 1.05 | 6.0 | 195.7 | 26.5 | -11.4039207 |
-| 7 | 2,744 | 2x2x2 (4) | 8 | 119.6 | 45.6 | 10.2 | 20.3 | 586.1 | 54.1 | -11.4039172 |
-| 8 | 4,096 | 2x2x2 (4) | 8 | 105.6 | 46.7 | 6.8 | 14.8 | - | - | -11.4039214 |
-| 10 | 8,000 | 2x2x2 (4) | 8 | 404.7 | 144.2 | 35.8 | 51.0 | - | - | -11.4039262 |
+| n | atoms | mesh (k) | sectors | pools | SCF iterations | program (s) | first step (s) | later step (s) | GPU (GiB) | before (s) | before, GPU (GiB) | E/atom (Ry) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 6 | 1,728 | 3x3x3 (4) | 64 | 16 x 1 | 8 | 18.3 | 7.9 | 1.1 | 6.0 | 195.7 | 26.5 | -11.4039207 |
+| 7 | 2,744 | 2x2x2 (4) | 32 | 8 x 2 | 8 | 87.7 | 37.1 | 6.8 | 33.6 | 586.1 | 54.1 | -11.4039172 |
+| 8 | 4,096 | 2x2x2 (4) | 64 | 16 x 1 | 8 | 85.9 | 37.6 | 6.2 | 25.9 | - | - | -11.4039214 |
+| 9 | 5,832 | 2x2x2 (4) | 32 | 8 x 2 | 8 | 477.1 | 172.8 | 42.8 | 58.1 | - | - | -11.4039242 |
+| 10 | 8,000 | 2x2x2 (4) | 64 | 16 x 1 | 8 | 374.1 | 143.3 | 31.0 | 49.5 | - | - | -11.4039262 |
 
+"pools" is the number of k-point pools times their ranks; "later step" the median of the steps after the first.
 The energies of the first two rows are those without sectors within 8e-6 Ry in total (the convergence criterion of
-these inputs is 2e-4 Ry). An even n is faster than the odd n below it: its seven translations give each k-point
-twice the sectors. n = 10 keeps two of the four subspaces of a rank on its GPU and the others in host memory (37 GiB
-per rank). n = 9 (5,832 atoms) does not run yet: an odd n has the three face-centring translations only, so two of its
-k-points have four sectors each, of 1.06 million rows and 3,805 states (65 GB a basis). The pools plan every task as
-large as the largest one, so with one rank per pool those bases had to leave the GPU for host memory, four of them
-on one node, more than it has; with four ranks per pool (`--kpoint-pools 4`) the SCF ran five steps (207 s, then
-51 s each) before a rank stopped. Planning the pools by the size of each task is the next step.
+these inputs is 2e-4 Ry). An even n is faster than the odd n below it: its seven translations give each k-point twice
+the sectors. An odd n has the three face-centring translations only, so two of the four k-points of n = 9 have four
+sectors each, of 1.06 million rows and 3,805 states (65 GB a basis), besides 8 of half and 16 of a quarter of that
+size. Planned by their sizes, each of the eight largest sectors gets a pool of two ranks with one medium and two small
+ones (every subspace on the GPUs, about 60 GB of estimate per GPU). Planned as before (`PARSEC_KPOINT_POOL_ASSIGN=cyclic`:
+every task as large as the largest, dealt round-robin), n = 9 did not run: with one rank per pool the large bases went to
+host memory beside small tasks, four of them on one node, more than its 256 GB; with four ranks per pool
+(`--kpoint-pools 4`) a pool stopped after five to seven steps. The plan by sizes changed n = 7 from 119.6 s
+(20.3 GiB) to 87.7 s, n = 8 from 105.6 s (14.8 GiB) to 85.9 s and n = 10 from 404.7 s (51.0 GiB, two subspaces of each
+rank in host memory, 37 GiB per rank) to 374.1 s with every subspace on the GPU; it keeps the same total energies to
+the last digit. n = 6 has the same plan either way.
 
 ### Scaling on one size
 

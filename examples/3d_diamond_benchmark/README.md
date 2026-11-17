@@ -231,15 +231,16 @@ The other drivers of k-points take the sectors too (2026-11-17; the same inputs 
 
 | run | GPUs | with sectors | without | GPU, with/without (GiB) | total energy apart (Ry) |
 |---|---|---|---|---|---|
-| n = 6, 3x3x3, `Spin_Polarization: true` | 16 (MPI pools) | 89.4 s | 392.2 s | 8.2 / 41.8 | 2.9e-6 |
+| n = 6, 3x3x3, `Spin_Polarization: true` | 16 (MPI pools) | 50.9 s (89.4 s with the spin PBE on the host) | 392.2 s | 8.9 / 41.8 | 2.9e-6 |
 | n = 3, 2x2x2, one relaxation step (`Minimization: bfgs`, `Movement_Num: 1`) | 4 (one process) | 83.1 s | 97.9 s | 1.7 / 6.2 | 2.3e-7 |
 | n = 3, 1x1x2, `Correlation_Type: pbe0` | 4 (one process) | 53.5 s | 69.4 s | 14.6 / 15.7 | 1.3e-6 |
 
 The two channels of a spin-polarized k-point share its sectors; the forces of a relaxation come from the orbitals of
 the sectors expanded to the whole grid (in one process: the MPI pools gather no orbitals); the exchange of PBE0 is
 reduced to the sectors, which keep their plans and Ritz states from one loop of the Fock loop to the next (the inner
-SCF steps 0.7 instead of 2.1 s). The spin-polarized run spends 37 of its 81 s of SCF in the exchange-correlation of the
-two channels on the host.
+SCF steps 0.7 instead of 2.1 s). The spin-polarized PBE of these drivers ran on the host of every rank, 37 of the 81 s
+of SCF; on the GPU (the formula of the host with forward derivatives, `src/parsec_python/acceleration/V_xc/dual.py`)
+it takes 0.5 s and the run 50.9 s (later steps 2.1 instead of 6.8 s), the same total energy to the digits printed.
 
 ### Scaling on one size
 

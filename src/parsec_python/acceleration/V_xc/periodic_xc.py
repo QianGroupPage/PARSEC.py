@@ -15,15 +15,20 @@ the functionals that :func:`periodic_spin_device_selected` names:
   parity (PW92, PW91, LB94, Casida-Salahub): their ``evaluate_spin_xc``
   semantics are those of the readable path of both methods, so the results
   equal the host ones to round-off;
-* PBE only with ``PARSEC_CUPY_XC=on``: the device kernel is ``pbe_spin``
-  (analytic partials), which :meth:`~parsec_python.SCF.pbc.PeriodicPreparedSinglePointSystem.evaluate_spin_xc`
-  uses, while ``evaluate_xc_spin_polarized`` (the k-point and Gamma spin
-  drivers) uses ``pbe_spin_polarized`` (complex-step partials); the two readable
-  forms differ by about 5e-10 Ry in the potential (bcc Fe), so the opt-in moves
-  those drivers' PBE numbers by that much.  The accelerated driver puts PBE on
-  the device by default since 2026-10-30 (its host form is ``pbe_spin`` as
-  well, so the device changes it by round-off only); these drivers do not
-  follow that default (:data:`HOST_UNLESS_ASKED`);
+* PBE of ``evaluate_xc_spin_polarized`` (the k-point and Gamma spin drivers,
+  ``pbe_spin_polarized``: the variables ``s_ab = D n_a . D n_b``, complex-step
+  partials) by default since 2026-11-17: its formula on the device with forward
+  derivatives (the ``"ab"`` form of :class:`~parsec_python.acceleration.V_xc.device_xc.DeviceSpinXCEvaluator`,
+  :mod:`.dual`), the host's numbers to round-off (diamond, 6 x 6 x 6 cubes
+  spin-polarized: 37 of the 81 s of SCF on 16 A100 were this functional on the
+  host of every rank);
+* PBE of :meth:`~parsec_python.SCF.pbc.PeriodicPreparedSinglePointSystem.evaluate_spin_xc`
+  only with ``PARSEC_CUPY_XC=on``: the device kernel is ``pbe_spin`` (analytic
+  partials), the readable form of that method; the two readable forms differ
+  by about 5e-10 Ry in the potential (bcc Fe).  The accelerated driver puts PBE
+  on the device by default since 2026-10-30 (its host form is ``pbe_spin`` as
+  well); ``evaluate_spin_xc`` of these drivers does not follow that default
+  (:data:`HOST_UNLESS_ASKED`);
 * CA-LSD stays on the host (as in the accelerated driver).
 
 Not taken: the orthorhombic grid only (Fortran's general grid and the
@@ -68,18 +73,27 @@ _CAPACITY = 4
 HOST_UNLESS_ASKED = frozenset({"pbe"})
 
 
-def periodic_spin_device_selected(functional: str, *, mode: str | None = None) -> bool:
+def periodic_spin_device_selected(functional: str, *, mode: str | None = None, kind: str = "spin") -> bool:
     """Whether the periodic spin drivers evaluate ``functional`` on the device under ``mode``.
 
     :func:`~parsec_python.acceleration.V_xc.device_xc.device_xc_selected`
     for the spin form, except that a functional of :data:`HOST_UNLESS_ASKED`
-    needs ``on``.
+    needs ``on`` for ``evaluate_spin_xc`` (``kind="spin"``); PBE of
+    ``evaluate_xc_spin_polarized`` (``kind="spin_polarized"``) has its own form
+    on the device (``"ab"``) and follows ``PARSEC_CUPY_XC`` as the other
+    functionals do.
     """
 
     mode = device_xc_mode() if mode is None else mode
-    if functional in HOST_UNLESS_ASKED and mode != "on":
+    if functional in HOST_UNLESS_ASKED and mode != "on" and not (kind == "spin_polarized" and functional == "pbe"):
         return False
     return device_xc_selected(functional, spin_polarized=True, mode=mode)
+
+
+def _form(functional: str, kind: str) -> str:
+    """The form of the device evaluator: ``"ab"`` for PBE of ``evaluate_xc_spin_polarized``."""
+
+    return "ab" if functional == "pbe" and kind == "spin_polarized" else "pbe_spin"
 
 
 class _Evaluators:
@@ -89,9 +103,9 @@ class _Evaluators:
         self._entries: OrderedDict[tuple, tuple] = OrderedDict()
         self._lock = threading.Lock()
 
-    def get(self, system, functional: str, device_id: int, *, spin: bool = True):
+    def get(self, system, functional: str, device_id: int, *, spin: bool = True, form: str = "pbe_spin"):
         grid = system.grid
-        key = (id(grid), functional, device_id, float(system.input.scf.ionization_energy_difference), spin)
+        key = (id(grid), functional, device_id, float(system.input.scf.ionization_energy_difference), spin, form)
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None:
@@ -105,6 +119,8 @@ class _Evaluators:
                 device_id=device_id,
                 ionization_energy_difference=float(system.input.scf.ionization_energy_difference),
             )
+            if spin:
+                evaluator.form = form
             entry = (grid, holder, evaluator)
             with self._lock:
                 self._entries[key] = entry
@@ -129,14 +145,15 @@ def clear_cache() -> None:
     _EVALUATORS.clear()
 
 
-def device_spin_evaluator(system):
-    """The device evaluator of ``system``'s spin functional, or ``None`` where the host evaluates."""
+def device_spin_evaluator(system, kind: str = "spin"):
+    """The device evaluator of ``system``'s spin functional for ``evaluate_spin_xc`` (``kind="spin"``) or
+    ``evaluate_xc_spin_polarized`` (``"spin_polarized"``), or ``None`` where the host evaluates."""
 
     scf = system.input.scf
     if getattr(scf, "noncollinear", False) or getattr(scf, "self_consistent_spin_orbit", False):
         return None
     functional = scf.xc_functional
-    if not periodic_spin_device_selected(functional):
+    if not periodic_spin_device_selected(functional, kind=kind):
         return None
     grid = system.grid
     if not (hasattr(grid, "cell") and device_grid_supported(grid)):
@@ -146,7 +163,7 @@ def device_spin_evaluator(system):
     device_id = hartree_device_id()
     if device_id is None:
         return None
-    return _EVALUATORS.get(system, functional, device_id)
+    return _EVALUATORS.get(system, functional, device_id, form=_form(functional, kind))
 
 
 def device_unpolarized_evaluator(system):
@@ -196,7 +213,7 @@ def provide_xc(system, density):
 def provide_spin_xc(system, kind: str, density_up, density_down):
     """The hook of :mod:`parsec_python.SCF.pbc` (``set_periodic_spin_xc_provider``)."""
 
-    evaluator = device_spin_evaluator(system)
+    evaluator = device_spin_evaluator(system, kind)
     if evaluator is None:
         return None
     result = evaluator(density_up, density_down)

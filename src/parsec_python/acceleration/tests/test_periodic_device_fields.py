@@ -630,6 +630,28 @@ class PeriodicSpinXCTests(unittest.TestCase):
         with mock.patch.dict(os.environ, _DEVICE):
             self.assertIsNone(periodic_xc.device_spin_evaluator(spinor))
 
+    def test_pbe_of_the_spin_drivers_on_the_device(self) -> None:
+        # evaluate_xc_spin_polarized (the k-point and Gamma spin drivers): pbe_spin_polarized on the device by
+        # default, its numbers to round-off, also where a channel is empty (its limit, on the host)
+        from parsec_python.acceleration.V_xc import periodic_xc
+
+        periodic_xc.clear_cache()
+        pbe = self.system("pb")
+        density = np.asarray(pbe.initial_density)
+        with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "auto"}):
+            self.assertIsNotNone(periodic_xc.device_spin_evaluator(pbe, "spin_polarized"))
+            self.assertIsNone(periodic_xc.device_spin_evaluator(pbe, "spin"))
+        for up, down in ((0.6 * density, 0.4 * density), (density, 0.0 * density)):
+            with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "auto"}):
+                device = pbe.evaluate_xc_spin_polarized(up, down)
+            with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "off"}):
+                self.assertIsNone(periodic_xc.device_spin_evaluator(pbe, "spin_polarized"))
+                host = pbe.evaluate_xc_spin_polarized(up, down)
+            for left, right in ((device.potential_up, host.potential_up), (device.potential_down, host.potential_down)):
+                np.testing.assert_allclose(left, right, rtol=0, atol=1.0e-12 * max(1.0, float(np.max(np.abs(right)))))
+            np.testing.assert_allclose(device.energy_density, host.energy_density, rtol=0, atol=1.0e-13)
+            self.assertAlmostEqual(device.total_energy, host.total_energy, delta=1.0e-11 * abs(host.total_energy))
+
     def test_the_hook_is_installed(self) -> None:
         import parsec_python.acceleration  # noqa: F401
         from parsec_python.acceleration.V_xc import periodic_xc

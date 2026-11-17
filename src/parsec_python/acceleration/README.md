@@ -3140,8 +3140,9 @@ solvers change the states of some tasks (`resize_tasks`) and keep the Ritz
 states of the others, a new solver is made only where the pools could not hold
 the grown task. On A100 (diamond, first runs): spin-polarized 6 x 6 x 6 cubes with
 the 3 x 3 x 3 mesh on 16 GPUs 89.4 s instead of 392.2 s (8.2 instead of 41.8 GiB per
-GPU; the spin-polarized exchange-correlation on the host is now 37 of the 81 s of
-the SCF); PBE0 3 x 3 x 3 cubes (216 atoms) with the 1 x 1 x 2 mesh in one process
+GPU), of which 37 s were the spin-polarized PBE on the host of every rank; with it
+on the GPU (`V_xc/periodic_xc.py`, since the same day) 50.9 s (0.5 s of XC, 8.9 GiB),
+the same total energy to the digits printed; PBE0 3 x 3 x 3 cubes (216 atoms) with the 1 x 1 x 2 mesh in one process
 on four GPUs 53.5 s instead of 69.4 s (the inner SCF steps of the Fock loop 0.7
 instead of 2.1 s; the plans of the sectors and their static operators are kept in
 the projector cache for every loop of the structure, and `U^H xi` is formed on
@@ -3634,17 +3635,21 @@ device paths:
   of one GPU.
 - `V_xc/periodic_xc.py` evaluates the spin functionals of a periodic cell in
   the reference spin drivers on the device, by `PARSEC_CUPY_XC`: the
-  functionals added for Fortran parity by default, PBE only with `on`
-  (`HOST_UNLESS_ASKED`: the accelerated driver takes PBE to the device by
-  default since 2026-10-30, these drivers do not follow it), CA on the
-  host.
+  functionals added for Fortran parity by default; PBE of
+  `evaluate_xc_spin_polarized` (the k-point and Gamma spin drivers) by default
+  since 2026-11-17, as the formula of `pbe_spin_polarized` (the variables
+  `s_ab = D n_a . D n_b`) with forward derivatives in place of its complex
+  step (`V_xc/dual.py`; the energy density the host's bit for bit on the host,
+  the partials to 4e-14 relative), the `"ab"` form of `DeviceSpinXCEvaluator`;
+  PBE of `evaluate_spin_xc` only with `on` (`HOST_UNLESS_ASKED`: the kernel of
+  `pbe_spin`); CA on the host.
 - A Gamma-only spin run of a wire or slab takes the 1x1x1 k-point driver on
   the device, as a 3-D cell does (`cli.py::_gamma_spin_on_kpoint_driver`).
 
 | switch | values |
 | --- | --- |
 | `PARSEC_PERIODIC_HARTREE` | `auto` (default) and `device`: wire, slab and `Calc_Hartree_G` solves and the finite-difference CG of an orthorhombic 3-D cell on the device (the CG of a cell by default since 2026-10-30, `device` only before; it changes periodic results by the CG tolerance); `host`: every solve on the host (for a plain 3-D cell the former default, bit for bit) |
-| `PARSEC_CUPY_XC` | `on` also puts the spin PBE of a periodic cell on the device (not the default, also since PBE takes the device in the accelerated driver): the kernel of `pbe_spin`, which differs from the complex-step `pbe_spin_polarized` of the k-point and Gamma spin drivers by about 5e-10 Ry (bcc Fe) |
+| `PARSEC_CUPY_XC` | `auto` (default): the spin PBE of the k-point and Gamma spin drivers of a periodic cell (`evaluate_xc_spin_polarized`) on the device since 2026-11-17, the formula of `pbe_spin_polarized` with forward derivatives (the host's numbers to round-off); `on` also puts the PBE of `evaluate_spin_xc` there (the kernel of `pbe_spin`); `off`: the host for every functional (the former path of the spin drivers' PBE, bit for bit) |
 | `PARSEC_PERIODIC_HARTREE_BATCH` | CG iterations per batch without a host synchronization (default 8) |
 | `PARSEC_WIRE_SLAB_GAMMA_SPIN` | `gamma` keeps the Gamma-only spin run of a wire or slab on the Gamma driver |
 

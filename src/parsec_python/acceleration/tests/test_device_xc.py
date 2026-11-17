@@ -101,6 +101,10 @@ class SelectionTests(unittest.TestCase):
         selected = periodic_xc.periodic_spin_device_selected
         self.assertEqual(periodic_xc.HOST_UNLESS_ASKED, frozenset({"pbe"}))
         self.assertEqual([selected("pbe", mode=mode) for mode in ("auto", "on", "off")], [False, True, False])
+        # since 2026-11-17 PBE of evaluate_xc_spin_polarized has its own form on the device (its formula)
+        self.assertEqual(
+            [selected("pbe", mode=mode, kind="spin_polarized") for mode in ("auto", "on", "off")], [True, True, False]
+        )
         for functional in ("pw92", "pw91", "lb94", "casida_salahub"):
             self.assertEqual([selected(functional, mode=mode) for mode in ("auto", "on", "off")], [True, True, False])
         for mode in ("auto", "on", "off"):
@@ -130,6 +134,31 @@ class SelectionTests(unittest.TestCase):
         source = device_xc.kernel_source()
         self.assertIn(f"#define PBE_GAMMA ({_GAMMA!r})", source)
         self.assertIn("#define PW_GAM (0.5198421)", source)
+
+
+class ForwardDerivativeTests(unittest.TestCase):
+    """acceleration/V_xc/dual.py: the formula of spin-polarized PBE with forward derivatives gives the partials of
+    its complex step (pbe_spin_polarized_partials) to round-off, and its energy bit for bit."""
+
+    def test_the_partials_of_spin_polarized_pbe(self) -> None:
+        from parsec_python.V_xc.pbe import _pbe_spin_energy_density, pbe_spin_polarized_partials
+        from parsec_python.acceleration.V_xc.dual import partials
+
+        rng = np.random.default_rng(3)
+        up, down = rng.uniform(1.0e-6, 0.5, 4000), rng.uniform(1.0e-6, 0.5, 4000)
+        gradient_up, gradient_down = rng.normal(size=(3, 4000)) * up, rng.normal(size=(3, 4000)) * down
+        arguments = (
+            up,
+            down,
+            np.sum(gradient_up * gradient_up, axis=0),
+            np.sum(gradient_up * gradient_down, axis=0),
+            np.sum(gradient_down * gradient_down, axis=0),
+        )
+        host = pbe_spin_polarized_partials(*arguments)
+        forward = partials(_pbe_spin_energy_density, arguments, np)
+        np.testing.assert_array_equal(forward[0], host[0])
+        for got, expected in zip(forward[1:], host[1:]):
+            np.testing.assert_allclose(got, expected, rtol=0, atol=1.0e-13 * float(np.max(np.abs(expected))))
 
 
 @unittest.skipUnless(cupy_available(), "CUDA runtime is unavailable")

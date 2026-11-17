@@ -538,18 +538,22 @@ _COMPLEX_STEP = 1.0e-30
 _SPIN_DENSITY_FLOOR = 1.0e-16
 
 
-def _pw92_g_complex(rs, parameters):
-    """PW92 ``G(rs)`` (their Eq. 10); safe for complex-step arguments."""
+def _pw92_g_complex(rs, parameters, math=np):
+    """PW92 ``G(rs)`` (their Eq. 10); safe for complex-step arguments.
+
+    ``math`` gives ``log1p`` (NumPy; the forward derivatives of the device,
+    :mod:`parsec_python.acceleration.V_xc.dual`, pass their own).
+    """
 
     a, alpha1, beta1, beta2, beta3, beta4 = parameters
     sqrt_rs = rs ** 0.5
     polynomial = (
         beta1 * sqrt_rs + beta2 * rs + beta3 * rs * sqrt_rs + beta4 * rs * rs
     )
-    return -2.0 * a * (1.0 + alpha1 * rs) * np.log1p(1.0 / (2.0 * a * polynomial))
+    return -2.0 * a * (1.0 + alpha1 * rs) * math.log1p(1.0 / (2.0 * a * polynomial))
 
 
-def _pbe_spin_energy_density(n_up, n_down, s_uu, s_ud, s_dd):
+def _pbe_spin_energy_density(n_up, n_down, s_uu, s_ud, s_dd, math=np):
     """Spin-polarized PBE energy per volume in Hartree.
 
     ``s_uu, s_ud, s_dd`` are ``grad n_a . grad n_b``.  Exchange follows the
@@ -558,6 +562,9 @@ def _pbe_spin_energy_density(n_up, n_down, s_uu, s_ud, s_dd):
     gradient term ``H(rs, zeta, t)`` with the ``phi(zeta)`` spin scaling.
     Written with operations that are analytic in complex arguments so that
     the partial derivatives can be taken by complex-step differentiation.
+    ``math`` gives ``log1p`` and ``expm1`` (NumPy; the device passes the
+    forward derivatives of :mod:`parsec_python.acceleration.V_xc.dual`, the
+    same formula with its partials to round-off).
     """
 
     total = n_up + n_down
@@ -577,9 +584,9 @@ def _pbe_spin_energy_density(n_up, n_down, s_uu, s_ud, s_dd):
         (1.0 + zeta) ** (4.0 / 3.0) + (1.0 - zeta) ** (4.0 / 3.0) - 2.0
     ) / _FZ_DENOMINATOR
     zeta4 = zeta ** 4
-    epsilon_0 = _pw92_g_complex(rs, _PW92_SETS["unpolarized"])
-    epsilon_1 = _pw92_g_complex(rs, _PW92_SETS["polarized"])
-    alpha_c = -_pw92_g_complex(rs, _PW92_SETS["stiffness"])
+    epsilon_0 = _pw92_g_complex(rs, _PW92_SETS["unpolarized"], math)
+    epsilon_1 = _pw92_g_complex(rs, _PW92_SETS["polarized"], math)
+    alpha_c = -_pw92_g_complex(rs, _PW92_SETS["stiffness"], math)
     epsilon_lda = (
         epsilon_0
         + alpha_c * f_zeta / _FZ_SECOND_DERIVATIVE * (1.0 - zeta4)
@@ -593,10 +600,10 @@ def _pbe_spin_energy_density(n_up, n_down, s_uu, s_ud, s_dd):
     sigma_total = s_uu + 2.0 * s_ud + s_dd
     t2 = sigma_total / (4.0 * phi * phi * ks2 * total * total)
     beta_over_gamma = _BETA / _GAMMA
-    a_parameter = beta_over_gamma / np.expm1(-epsilon_lda / (_GAMMA * phi3))
+    a_parameter = beta_over_gamma / math.expm1(-epsilon_lda / (_GAMMA * phi3))
     at = a_parameter * t2
     q = beta_over_gamma * t2 * (1.0 + at) / (1.0 + at + at * at)
-    h = _GAMMA * phi3 * np.log1p(q)
+    h = _GAMMA * phi3 * math.log1p(q)
     return exchange + total * (epsilon_lda + h)
 
 

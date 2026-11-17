@@ -803,8 +803,17 @@ class DeviceSpinXCEvaluator(_DeviceEvaluatorBase):
     """
 
     spin_polarized = True
+    #: The form of PBE: ``"pbe_spin"``, the kernel of :func:`parsec_python.V_xc.pbe_spin.pbe_spin`
+    #: (``evaluate_spin_xc``), or ``"ab"``, :func:`parsec_python.V_xc.pbe.pbe_spin_polarized` in the variables
+    #: ``s_ab = D n_a . D n_b`` (``evaluate_xc_spin_polarized`` of the periodic spin drivers): its formula on the
+    #: device with forward derivatives in place of the complex step (:mod:`.dual`), the same partials to round-off.
+    form = "pbe_spin"
+    #: points of one pass of the ``"ab"`` form (its temporaries are a few dozen fields of this length)
+    ab_chunk = 1 << 20
 
     def __call__(self, valence_up, valence_down) -> SpinXCResult:
+        if self.functional == "pbe" and self.form == "ab" and self.reducer is None:
+            return self._pbe_ab(valence_up, valence_down)
         cp = self._cp
         functional = self.functional
         name = XC_DISPLAY_NAMES.get(functional, functional)
@@ -882,6 +891,96 @@ class DeviceSpinXCEvaluator(_DeviceEvaluatorBase):
                 potential_down=self._field(potential_down),
                 energy_density=self._field(energy_density),
                 total_energy=total_energy,
+            )
+
+
+    def _pbe_ab(self, valence_up, valence_down) -> SpinXCResult:
+        """:func:`parsec_python.V_xc.pbe.pbe_spin_polarized` on the device (the ``"ab"`` form).
+
+        The steps of :func:`~parsec_python.V_xc.pbe.discrete_spin_gga_ab`: the gradients of the two channels
+        (each with half the core density), ``s_ab``, the energy and its five partials at the points with density
+        (:func:`~parsec_python.V_xc.pbe.pbe_spin_polarized_partials`: the same floors; the points of an empty
+        channel take its limit, on the host, as there), the fluxes ``2 f_aa D n_a + f_ab D n_b`` and the exact
+        transpose of the gradient.
+        """
+
+        from parsec_python.V_xc.pbe import (
+            _DENSITY_THRESHOLD,
+            _SPIN_DENSITY_FLOOR,
+            _pbe_spin_energy_density,
+        )
+        from parsec_python.V_xc.pbe_spin import pbe_spin_energy_partials
+
+        from .dual import partials
+
+        cp = self._cp
+        with cp.cuda.Device(self.device_id):
+            up = cp.asarray(self._values(valence_up))
+            down = cp.asarray(self._values(valence_down))
+            core = self._core()
+            if core is not None:
+                half = 0.5 * core
+                up = up + half
+                down = down + half
+            message = "PBE requires nonnegative spin densities"
+            self._check(up, message)
+            self._check(down, message)
+            kernels = self._kernels
+            gradient_up = self.geometry.gradient(cp, kernels, up)
+            gradient_down = self.geometry.gradient(cp, kernels, down)
+            s_uu = gradient_up[0] * gradient_up[0] + gradient_up[1] * gradient_up[1] + gradient_up[2] * gradient_up[2]
+            s_dd = (
+                gradient_down[0] * gradient_down[0]
+                + gradient_down[1] * gradient_down[1]
+                + gradient_down[2] * gradient_down[2]
+            )
+            s_ud = gradient_up[0] * gradient_down[0] + gradient_up[1] * gradient_down[1] + gradient_up[2] * gradient_down[2]
+            outputs = [cp.zeros(self.size, dtype=np.float64) for _ in range(6)]
+            total = up + down
+            active = cp.flatnonzero(total > _DENSITY_THRESHOLD)
+            for start in range(0, int(active.size), int(self.ab_chunk)):
+                rows = active[start : start + int(self.ab_chunk)]
+                found = partials(
+                    _pbe_spin_energy_density,
+                    (
+                        cp.maximum(up[rows], _SPIN_DENSITY_FLOOR),
+                        cp.maximum(down[rows], _SPIN_DENSITY_FLOOR),
+                        cp.maximum(s_uu[rows], 0.0),
+                        s_ud[rows],
+                        cp.maximum(s_dd[rows], 0.0),
+                    ),
+                    cp,
+                )
+                for output, value in zip(outputs, found):
+                    output[rows] = value
+                del found
+            empty = cp.flatnonzero((total > _DENSITY_THRESHOLD) & ((up <= 0.0) | (down <= 0.0)))
+            del total, active
+            if int(empty.size):
+                # the fully polarized limit with the regularized phi of pbe_spin (pbe_spin_polarized_partials)
+                host = [cp.asnumpy(field[empty]) for field in (up, down, s_uu, s_ud, s_dd)]
+                suu, sud, sdd = np.maximum(host[2], 0.0), host[3], np.maximum(host[4], 0.0)
+                f, d_up, d_down, d_sigma_up, d_sigma_down, d_sigma_total = pbe_spin_energy_partials(
+                    np.maximum(host[0], 0.0), np.maximum(host[1], 0.0), suu, sdd, np.maximum(suu + 2.0 * sud + sdd, 0.0)
+                )
+                for output, value in zip(
+                    outputs,
+                    (f, d_up, d_down, d_sigma_up + d_sigma_total, 2.0 * d_sigma_total, d_sigma_down + d_sigma_total),
+                ):
+                    output[empty] = cp.asarray(value)
+            f, f_up, f_down, f_uu, f_ud, f_dd = outputs
+            del s_uu, s_ud, s_dd
+            flux_up = 2.0 * f_uu * gradient_up + f_ud * gradient_down
+            flux_down = 2.0 * f_dd * gradient_down + f_ud * gradient_up
+            del gradient_up, gradient_down
+            potential_up = self.geometry.adjoint(cp, kernels, flux_up, f_up, 2.0)
+            potential_down = self.geometry.adjoint(cp, kernels, flux_down, f_down, 2.0)
+            energy_density = 2.0 * f
+            return SpinXCResult(
+                potential_up=self._field(potential_up),
+                potential_down=self._field(potential_down),
+                energy_density=self._field(energy_density),
+                total_energy=self._integral(energy_density),
             )
 
 

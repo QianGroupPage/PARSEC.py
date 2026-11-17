@@ -926,7 +926,7 @@ a setting that selects the former one:
 | `PARSEC_KPOINT_KINETIC` | `gradient` (default): `-nabla^2 - 2ik.nabla + k^2` with the gradient discretized on its own, as before | `bloch` (since 2026-11-16): the Bloch block of the finite-difference Laplacian (`Laplacian/finite_difference.py`, `build_bloch_negative_laplacian`; a scalar Hamiltonian without a meta-GGA on a bulk orthorhombic cell of the default routines), the discretization of the Gamma point of the supercell; `auto`: `bloch` where it applies; see "The kinetic term of a k-point" |
 | `PARSEC_KPOINT_SUPERCELL` | `auto`: a Gamma-centred mesh of one or two points per axis (`Monkhorst_Pack_Shift` zero) is solved as the Gamma point of its supercell (`SCF/kpoint_supercell.py`; the energies of the mesh with the Bloch kinetic term) | `off` (default) |
 | `PARSEC_SUPERCELL_KPOINTS` | `auto`: a Gamma-point cell that repeats a smaller orthorhombic one is solved as that cell with the Gamma-centred mesh of the repeats (`SCF/kpoint_supercell.py`; the same energies) | `off` (default) |
-| `PARSEC_KPOINT_SECTORS` | `auto` (default, since 2026-11-16): the k-points of a scalar periodic SCF on a bulk orthorhombic cell are split into the sectors of the commuting involutions of their little groups (`SCF/kpoint_sectors.py`): each k-point becomes several eigenproblems of a fraction of its rows and states, the same spectrum; a k-point whose basis holds fewer than 2^24 entries (rows times states) or whose sectors would not halve its work stays whole; see "The sectors of a k-point" | `off`: one task per k-point, bit for bit as before |
+| `PARSEC_KPOINT_SECTORS` | `auto` (default, since 2026-11-16): the k-points of a scalar or collinear-spin periodic SCF on a bulk orthorhombic cell (also with forces in one process and with hybrid functionals, since 2026-11-17) are split into the sectors of the commuting involutions of their little groups (`SCF/kpoint_sectors.py`): each k-point becomes several eigenproblems of a fraction of its rows and states, the same spectrum; a k-point whose basis holds fewer than 2^24 entries (rows times states) or whose sectors would not halve its work stays whole; see "The sectors of a k-point" | `off`: one task per k-point, bit for bit as before |
 | `PARSEC_KPOINT_SECTOR_MARGIN` | `1.3` (default): the states of a sector over its share `M n_s / N` of the states of its k-point (plus six); a sector that does not reach the highest level the k-point keeps gets 1.5 times its states and the step is solved again | a number of at least 1 |
 | `PARSEC_SECTOR_DEVICE_POOL` | `auto` (default, since 2026-11-16, experimental runner): where the sectors of a rank do not divide its devices evenly (three sectors on four GPUs), every sector of the rank spreads over all its devices, one after another, instead of disjoint groups that leave a whole sector on one device (diamond n = 20 on 16 A100: 176.6 s and 50.1 GiB per GPU instead of 195.5 s and 52.2 GiB; n = 16 61.8 s / 17.9 GiB instead of 64.1 / 15.2) | `off`: disjoint groups, as before |
 | `PARSEC_KPOINT_POOL_ASSIGN` | `auto` (default, since 2026-11-17): tasks of the k-point pools of different sizes (the sectors of the k-points) are planned by their sizes (`SCF/kpoint_pools.py`, `plan_pools_by_size`): the largest work (rows times states squared) first, each task to the pool that finishes it first among those whose GPUs hold it and whose nodes hold what their ranks keep on the host (80 % of the memory a node has free when the pools are formed); balances within 2 % count as equal, then no subspaces on the host, then the most pools; tasks of one size keep the round-robin plan | `cyclic`: every task planned as the largest one and dealt round-robin (the plan of before) |
@@ -3121,9 +3121,33 @@ orbit (its invariant part). A sector of `n_s` of the `N` rows solves
 of the union; after each solve every sector with fewer states than rows must
 reach the `M`-th level of the union, else it gets 1.5 times its states and the
 step is solved again. The density of a sector, `|U v|^2`, is expanded on the
-host and summed by the job of the driver. The scalar k-point SCF takes the split
-(no spin, hybrid, meta-GGA, LDA+U, forces, fixed occupations or kept orbitals);
-the tasks of the k-point pools are then the sectors, the largest first, and the
+host and summed by the job of the driver. The scalar and the collinear-spin
+k-point SCF take the split (not with a meta-GGA, LDA+U, fixed occupations or
+refined levels); the two channels of a k-point share its sectors (both spin
+densities are symmetrized over the same group, the static operators are built
+once). The forces (in one process: the MPI k-point pools gather no orbitals, and
+their forces stay with the row-distributed solver) and the kept orbitals come
+from the orbitals of the sectors expanded to the whole grid, `U v`, in the order
+of the levels of the k-point. The exchange of a hybrid functional,
+`-a_x xi xi^H` of a k-point, joins the Hamiltonian of a sector as
+`-a_x (U^H xi)(U^H xi)^H` (it commutes with the group where the occupied orbitals
+of every k-point are symmetry adapted, as those of the sectors are), and its
+energy `sum f <v|U^H V U|v>` is taken on the sector; the states of the sectors
+go from one loop to the next (the Fock loop, the next structure) with their
+layout and numbers of states, and a solver of other sectors starts afresh. A
+sector that misses a level gets more states and is solved again alone: the
+solvers change the states of some tasks (`resize_tasks`) and keep the Ritz
+states of the others, a new solver is made only where the pools could not hold
+the grown task. On A100 (diamond, first runs): spin-polarized 6 x 6 x 6 cubes with
+the 3 x 3 x 3 mesh on 16 GPUs 89.4 s instead of 392.2 s (8.2 instead of 41.8 GiB per
+GPU; the spin-polarized exchange-correlation on the host is now 37 of the 81 s of
+the SCF); PBE0 3 x 3 x 3 cubes (216 atoms) with the 1 x 1 x 2 mesh in one process
+on four GPUs 53.5 s instead of 69.4 s (the inner SCF steps of the Fock loop 0.7
+instead of 2.1 s; the plans of the sectors and their static operators are kept in
+the projector cache for every loop of the structure, and `U^H xi` is formed on
+the GPU of `xi`); one relaxation step of 3 x 3 x 3 cubes with the 2 x 2 x 2 mesh in
+one process 83.1 s instead of 97.9 s.
+The tasks of the k-point pools are then the sectors, the largest first, and the
 pools are planned by the size of each task (`PARSEC_KPOINT_POOL_ASSIGN=auto`):
 each sector goes to the pool that would finish it first among those whose GPUs
 hold it and whose nodes hold what their ranks keep on the host, so that a few

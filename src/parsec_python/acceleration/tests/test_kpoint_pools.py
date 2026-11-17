@@ -439,6 +439,23 @@ class PooledSCFTests(unittest.TestCase):
             for result in report["pooled"][1:]:
                 self.assertEqual(result["energy"], report["pooled"][0]["energy"])
 
+    def test_sectors_that_grow_keep_the_others_on_pools(self) -> None:
+        # without margin some sectors miss levels: they get more states and are solved again alone, the pools and
+        # the Ritz states of the other sectors kept (no new solver)
+        for ranks, pools in ((3, 3), (2, 1)):
+            report = _check("sectors", str(ranks), str(pools), "grow")
+            serial = report["serial"]
+            self.assertGreaterEqual(serial["regrowths"], 1.0)
+            self.assertEqual(serial["rebuilds"], 0.0)
+            for result in report["pooled"]:
+                self.assertTrue(result["converged"])
+                self.assertGreaterEqual(result["regrowths"], 1.0)
+                self.assertGreaterEqual(result["regrown_tasks"], result["regrowths"])
+                self.assertEqual(result["rebuilds"], 0.0)
+                self.assertAlmostEqual(result["energy"], serial["energy"], delta=1.0e-8)
+            for result in report["pooled"][1:]:
+                self.assertEqual(result["energy"], report["pooled"][0]["energy"])
+
 
 if __name__ == "__main__":
     unittest.main()

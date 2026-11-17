@@ -43,6 +43,7 @@ from parsec_python.SCF.kpoint_solver import (
     device_solver_supports,
     job_eigval_settings,
     residual_max,
+    resized_job,
     set_parallel_backend,
     task_states,
 )
@@ -239,14 +240,15 @@ class _SolveWorker:
         return np.asarray(self._to_host(self.vectors[task]))
 
     # ------------------------------------------------------------- SCF steps
-    def solve(self, potentials: dict, filter_degree: int, tolerance: float | None = None):
+    def solve(self, potentials: dict, filter_degree: int, tolerance: float | None = None, only=None):
         # ``tolerance``: the eigensolver tolerance of this SCF iteration
-        # (Dynamic_Diag_Tol); None keeps the job's Diag_Tolerance.
+        # (Dynamic_Diag_Tol); None keeps the job's Diag_Tolerance.  ``only``: the tasks to solve (all of
+        # this worker's where None).
         settings = job_eigval_settings(self.job, filter_degree, tolerance)
         # ARPACK and DIAGLA are host eigensolvers: the host route below, with the
         # device Hamiltonian as their operator.
         on_device = self.device_solver and device_solver_supports(settings)
-        for task in self.tasks:
+        for task in self.tasks if only is None else [task for task in self.tasks if task in only]:
             start = time.perf_counter()
             hamiltonian = self.job.make_hamiltonian(task, potentials)
             self._tick("hamiltonian", start)  # builds the Bloch projectors of a k-point on first use
@@ -298,6 +300,16 @@ class _SolveWorker:
                 else:
                     total[name] = np.array(value, copy=True)
         yield None, total
+
+    def resize_tasks(self, counts: dict):
+        """New numbers of states of some tasks (:meth:`PooledKPointSolver.resize_tasks`): their Ritz states and
+        orbitals are dropped here."""
+        self.job = resized_job(self.job, counts)
+        for task in counts:
+            if task in self.tasks:
+                self.states.pop(task, None)
+                self.vectors.pop(task, None)
+        yield None, None
 
     def keep_device_states(self):
         """Hand the device subspaces as they are from now on (no host copy in :meth:`export_states`)."""
@@ -372,6 +384,7 @@ class PooledKPointSolver:
         if plan is not None:
             workers = device_worker_count(plan, job.n_tasks)
         self.backend = plan.name if plan is not None else "cpu"
+        self._values: dict[int, np.ndarray] = {}
         self.pool = make_pool(
             range(job.n_tasks),
             lambda tasks, index: _SolveWorker(job, tasks, index, plan),
@@ -384,19 +397,31 @@ class PooledKPointSolver:
         return self.pool.n_workers
 
     def solve(
-        self, potentials: dict, filter_degree: int, tolerance: float | None = None
+        self, potentials: dict, filter_degree: int, tolerance: float | None = None, tasks=None
     ) -> list[np.ndarray]:
         """One eigenvalue array per task (task order), vectors kept in the workers.
 
         ``tolerance`` replaces ``Diag_Tolerance`` for this call
         (``Dynamic_Diag_Tol``); the job's ``eigval_settings`` then takes it
-        as a second argument.
+        as a second argument.  ``tasks`` solves those only, the others keep the
+        eigenvalues of their last solve.
         """
-        if tolerance is None:
+        if tasks is not None:
+            by_task = self.pool.by_task("solve", potentials, filter_degree, tolerance, frozenset(int(t) for t in tasks))
+        elif tolerance is None:
             by_task = self.pool.by_task("solve", potentials, filter_degree)
         else:
             by_task = self.pool.by_task("solve", potentials, filter_degree, tolerance)
-        return [by_task[task] for task in range(self.job.n_tasks)]
+        self._values.update(by_task)
+        return [self._values[task] for task in range(self.job.n_tasks)]
+
+    def resize_tasks(self, counts: dict) -> bool:
+        """New numbers of states for the tasks of ``counts`` (task -> states); the workers drop their Ritz states and
+        keep those of the other tasks.  ``True``: the next :meth:`solve` of those tasks takes them."""
+        counts = {int(task): int(count) for task, count in counts.items()}
+        self.job = resized_job(self.job, counts)
+        self.pool.results("resize_tasks", counts)
+        return True
 
     def accumulate(self, occupations: list[np.ndarray]) -> dict[str, np.ndarray]:
         """Sum of every task's density contribution for the given occupations."""

@@ -161,14 +161,23 @@ def check_sectors(ranks: int, pools: int) -> dict:
 
     os.environ["PARSEC_KPOINT_SECTORS"] = "auto"
     kpoint_sectors._MINIMUM_ENTRIES = 0  # the small cube is split all the same
+    if os.environ.get("POOL_CHECK_GROW"):
+        # no margin and no extra states: sectors miss levels, get more states and are solved again
+        kpoint_sectors._EXTRA_STATES = 0
+        os.environ["PARSEC_KPOINT_SECTOR_MARGIN"] = "1.0"
     base = silicon("pbe", spacing=0.855)
     base = replace(base, scf=replace(base.scf, convergence_criterion=1.0e-7))
     system = prepare_periodic_single_point(base)
     side = float(np.asarray(base.periodic_cell.lattice_vectors)[0, 0])
     k_points = np.array([np.array(bits, dtype=float) * np.pi / side for bits in np.ndindex(2, 2, 2)])
     weights = np.full(8, 0.125)
+    def counters(found) -> dict:
+        detail = found.timings.detail
+        names = ("tasks", "regrowths", "regrown_tasks", "rebuilds")
+        return {name: float(detail.get(f"kpoint_sector_{name}", 0.0)) for name in names}
+
     result = run_scf_kpoints(system, k_points, weights)
-    serial = dict(_summary(result), tasks=float(result.timings.detail.get("kpoint_sector_tasks", 0.0)))
+    serial = dict(_summary(result), **counters(result))
 
     def solver(job, **options):
         made = sector_solver(job, _thread_solver, **options)
@@ -177,7 +186,7 @@ def check_sectors(ranks: int, pools: int) -> dict:
     def rank(context):
         _LOCAL.context, _LOCAL.pools = context, pools
         found = run_scf_kpoints(system, k_points, weights)
-        return dict(_summary(found), tasks=float(found.timings.detail.get("kpoint_sector_tasks", 0.0)))
+        return dict(_summary(found), **counters(found))
 
     with mock.patch("parsec_python.SCF.kpoints.make_kpoint_solver", solver):
         pooled = run_ranks(ranks, rank)
@@ -220,6 +229,10 @@ def main() -> None:
     for argument in [a for a in sys.argv[1:] if a.startswith("route=")]:
         os.environ["PARSEC_KPOINT_RITZ"] = argument.split("=", 1)[1]
         sys.argv.remove(argument)
+    # "grow": sectors without margin (check_sectors), so that they get more states and are solved again
+    if "grow" in sys.argv[1:]:
+        os.environ["POOL_CHECK_GROW"] = "1"
+        sys.argv.remove("grow")
     # "assign=<auto|cyclic>": the PARSEC_KPOINT_POOL_ASSIGN of the run (tasks of different sizes)
     for argument in [a for a in sys.argv[1:] if a.startswith("assign=")]:
         os.environ["PARSEC_KPOINT_POOL_ASSIGN"] = argument.split("=", 1)[1]

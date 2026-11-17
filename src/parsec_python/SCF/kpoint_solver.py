@@ -65,6 +65,16 @@ def task_states(job: "KPointJob", task: int) -> int:
     return int(job.number_of_states)
 
 
+def resized_job(job: "KPointJob", counts: dict) -> "KPointJob":
+    """``job`` with the numbers of states of the tasks in ``counts`` (task -> states) replaced."""
+    from dataclasses import replace
+
+    states = [task_states(job, task) for task in range(job.n_tasks)]
+    for task, count in counts.items():
+        states[int(task)] = int(count)
+    return replace(job, states_per_task=tuple(states), number_of_states=max(states))
+
+
 def task_rows(job: "KPointJob", task: int, default: int) -> int:
     """The grid rows of ``task``: ``rows_per_task[task]`` where given, else ``default`` (the whole grid)."""
     if job.rows_per_task is not None:
@@ -83,19 +93,21 @@ class SerialKPointSolver:
         self.states: dict[int, Any] = {}
         self._vectors: dict[int, np.ndarray] = {}
         self._residuals: dict[int, float] = {}
+        self._values: dict[int, np.ndarray] = {}
 
     def solve(
-        self, potentials: dict, filter_degree: int, tolerance: float | None = None
+        self, potentials: dict, filter_degree: int, tolerance: float | None = None, tasks=None
     ) -> list[np.ndarray]:
         """One eigenvalue array per task (task order), vectors kept in the solver.
 
         ``tolerance`` replaces ``Diag_Tolerance`` for this call
         (``Dynamic_Diag_Tol``); the job's ``eigval_settings`` then takes it as
-        a second argument.
+        a second argument.  ``tasks`` solves those only, the others keep the
+        eigenvalues of their last solve.
         """
         settings = job_eigval_settings(self.job, filter_degree, tolerance)
-        eigenvalues = []
-        for task in range(self.job.n_tasks):
+        wanted = range(self.job.n_tasks) if tasks is None else sorted(int(task) for task in tasks)
+        for task in wanted:
             operator = self.job.make_hamiltonian(task, potentials).as_linear_operator()
             solution = solve_eigval(
                 operator,
@@ -106,8 +118,16 @@ class SerialKPointSolver:
             self.states[task] = solution.state
             self._vectors[task] = np.asarray(solution.vectors)
             self._residuals[task] = residual_max(solution.residual_norms)
-            eigenvalues.append(np.asarray(solution.eigenvalues, dtype=float))
-        return eigenvalues
+            self._values[task] = np.asarray(solution.eigenvalues, dtype=float)
+        return [self._values[task] for task in range(self.job.n_tasks)]
+
+    def resize_tasks(self, counts: dict) -> bool:
+        """New numbers of states for the tasks of ``counts`` (task -> states); their Ritz states are dropped, those
+        of the other tasks kept.  ``True``: the next :meth:`solve` of those tasks takes them."""
+        self.job = resized_job(self.job, counts)
+        for task in counts:
+            self.states.pop(int(task), None)
+        return True
 
     def residuals(self) -> list[float]:
         """Largest eigenpair residual of each task's last solve (NaN where none was measured)."""

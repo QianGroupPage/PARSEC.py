@@ -83,6 +83,10 @@ from ..Symmetry.orbital_groups import multiplication_table
 from ..Symmetry.representations import ReflectionRepresentationDecomposition
 
 _SWITCH = "PARSEC_KPOINT_SECTORS"
+# the key of the states of the sectors in what export_states hands to the next loop
+_STATES_KEY = "kpoint_sectors"
+# the key of the plans of the sectors in a caller's cache of the structure (the projector cache of the k-point loops)
+_CACHE_KEY = "kpoint_sector_plans"
 _MARGIN_SWITCH = "PARSEC_KPOINT_SECTOR_MARGIN"
 _EXTRA_STATES = 6
 _GROWTH = 1.5
@@ -374,10 +378,80 @@ class KPointSectors:
         # by sector: (kinetic, projectors, empty stand-in of the real stencils), built for the sectors asked for
         self._static: dict[int, tuple] = {}
         self._potential: tuple[Any, np.ndarray | None] = (None, None)
+        self._exchange: dict[int, tuple] = {}  # by sector: (exchange term of the whole grid, its reduction)
+        self._gathers: dict[int, sp.csr_matrix] = {}  # by sector: U^H (shared by the tasks of the k-point)
 
     @property
     def order(self) -> int:
         return self.decomposition.representation_count
+
+    def twin(self, k_index: int) -> "KPointSectors":
+        """The sectors of the same k-point for another task (the other channel of a spin-polarized run): the bases
+        and the static operators shared, the numbers of states and the potential of its own."""
+
+        other = object.__new__(KPointSectors)
+        other.__dict__.update(self.__dict__)
+        other.k_index = int(k_index)
+        other.counts = list(self.counts)
+        other._potential = (None, None)
+        other._exchange = {}
+        return other
+
+    def _gather(self, sector: int) -> sp.csr_matrix:
+        """``U^H`` of ``sector`` as a sparse matrix (its rows by the whole grid's), made once."""
+
+        found = self._gathers.get(sector)
+        if found is None:
+            decomposition = self.decomposition
+            rows = decomposition.reduction.full_to_wedge.shape[0]
+            phases = decomposition.phases[sector].astype(np.float64)
+            gather = sp.csr_matrix(
+                (phases, (np.asarray(decomposition.reduction.full_to_wedge, dtype=np.int64), np.arange(rows))),
+                shape=(decomposition.wedge_size, rows),
+            )
+            orbits = decomposition.sector_orbit_indices(sector)
+            scale = sp.diags(1.0 / np.sqrt(self._multiplicities[orbits]))
+            found = self._gathers[sector] = (scale @ gather[orbits]).tocsr().astype(np.complex128)
+        return found
+
+    def reduce(self, sector: int, block):
+        """``U^H x`` on the rows of ``sector`` for the columns of ``block`` (rows of the whole grid): the adjoint
+        of :meth:`orbitals`.  A block on a device (the exchange operator of a hybrid, built where its k-point is
+        solved) is reduced there, and the result stays there."""
+
+        gather = self._gather(sector)
+        get = getattr(block, "get", None)
+        if get is not None and not isinstance(block, np.ndarray):
+            import cupy as cp
+            import cupyx.scipy.sparse as csp
+
+            with cp.cuda.Device(int(block.device.id)):
+                device = csp.csr_matrix(gather)
+                source = block[:, None] if block.ndim == 1 else block
+                return cp.asfortranarray(device @ cp.ascontiguousarray(source, dtype=cp.complex128))
+        block = np.asarray(block, dtype=np.complex128)
+        block = block[:, None] if block.ndim == 1 else block
+        return np.asarray(gather @ block)
+
+    def _reduced_exchange(self, sector: int, exchange):
+        """The compressed exchange ``-a_x xi xi^H`` of the whole grid on the rows of ``sector``: ``U^H xi`` (made
+        once per term and sector)."""
+
+        from parsec_python.V_xc.bloch_exchange import BlochCompressedExchange
+
+        cached = self._exchange.get(sector)
+        if cached is not None and cached[0] is exchange:
+            return cached[1]
+        projectors = getattr(exchange, "projectors", None)
+        if projectors is None or getattr(exchange, "released", False):
+            raise RuntimeError("the exchange operator of this Hamiltonian was released")
+        reduced = BlochCompressedExchange(
+            self.reduce(sector, projectors),
+            fraction=float(exchange.fraction),
+            asymmetry=float(getattr(exchange, "asymmetry", 0.0)),
+        )
+        self._exchange[sector] = (exchange, reduced)
+        return reduced
 
     def _build_static(self, full, sectors) -> None:
         """The kinetic matrices (with ``|k|^2``), projectors and empty stand-ins of the real stencils of ``sectors``
@@ -421,9 +495,18 @@ class KPointSectors:
         """The Hamiltonian of ``sector`` from the Bloch Hamiltonian ``full`` of the whole grid.
 
         The static operators of the sectors in ``wanted`` (those this process solves; all where ``None``) are built
-        with those of ``sector`` the first time.
+        with those of ``sector`` the first time.  The exact exchange of a hybrid functional
+        (``KPointExchangeHamiltonian``: ``base`` and ``exchange``) joins as ``-a_x (U^H xi)(U^H xi)^H``.
         """
 
+        exchange = getattr(full, "exchange", None)
+        if exchange is not None and getattr(full, "base", None) is not None:
+            from parsec_python.Hamiltonian.kpoint_operator import KPointExchangeHamiltonian
+
+            base = self.hamiltonian(sector, full.base, wanted)
+            with self._lock:
+                reduced = self._reduced_exchange(sector, exchange)
+            return KPointExchangeHamiltonian(base, reduced)
         with self._lock:
             if sector not in self._static:
                 self._build_static(full, range(self.order) if wanted is None else set(wanted) | {sector})
@@ -471,7 +554,9 @@ def plan_sectors(job: KPointJob) -> list[KPointSectors | None] | None:
     except ValueError:  # not a bulk orthorhombic cell
         return None
     k_points = np.asarray(geometry["k_points"], dtype=np.float64).reshape(-1, 3)
-    if k_points.shape[0] != job.n_tasks:
+    # the k-point of every task (the channels of a spin-polarized run share the k-points: tasks spin * n_k + k)
+    k_of_task = np.asarray(geometry.get("k_of_task", np.arange(k_points.shape[0])), dtype=np.int64).reshape(-1)
+    if k_of_task.shape[0] != job.n_tasks or k_of_task.size == 0 or int(k_of_task.max()) >= k_points.shape[0]:
         return None
     states, rows = int(job.number_of_states), int(grid.size)
     if rows * states < _MINIMUM_ENTRIES:  # before any search of the group: a small cell stays as it was
@@ -483,6 +568,15 @@ def plan_sectors(job: KPointJob) -> list[KPointSectors | None] | None:
         cell, geometry.get("density_symmetry"), k_points, geometry["weights"], geometry["lattice"]
     )
     margin = sector_margin()
+    cache = geometry.get("cache")
+    signature = (
+        int(job.n_tasks), states, rows, margin, _EXTRA_STATES, tuple(int(value) for value in k_of_task),
+        tuple(np.round(k_points, 12).ravel().tolist()),
+    )
+    if isinstance(cache, dict):
+        found = cache.get(_CACHE_KEY)
+        if found is not None and found[0] == signature:
+            return found[1]
     decompositions: dict[tuple[int, ...], ReflectionRepresentationDecomposition | None] = {}
     plans: list[KPointSectors | None] = []
     for index, k_point in enumerate(k_points):
@@ -511,7 +605,25 @@ def plan_sectors(job: KPointJob) -> list[KPointSectors | None] | None:
             plans.append(None)
             continue
         plans.append(KPointSectors(index, k_point, decomposition, counts))
-    return plans if any(plan is not None for plan in plans) else None
+    if not any(plan is not None for plan in plans):
+        return None
+    # the tasks of one k-point share its bases and static operators (KPointSectors.twin)
+    by_task: list[KPointSectors | None] = []
+    taken: set[int] = set()
+    for task, k_index in enumerate(int(value) for value in k_of_task):
+        plan = plans[k_index]
+        if plan is None:
+            by_task.append(None)
+        elif k_index in taken:
+            by_task.append(plan.twin(task))
+        else:
+            taken.add(k_index)
+            plan.k_index = task
+            by_task.append(plan)
+    if isinstance(cache, dict):
+        # the next loops of this structure (the Fock loop of a hybrid) take these plans and their static operators
+        cache[_CACHE_KEY] = (signature, by_task)
+    return by_task
 
 
 class SectorKPointSolver:
@@ -544,6 +656,8 @@ class SectorKPointSolver:
         self._kept: dict[int, tuple[np.ndarray, np.ndarray] | None] = {}
         self._returned: dict[int, int] = {}
         self._regrowths = 0
+        self._regrown_tasks = 0  # sectors solved again alone (their solver kept the others)
+        self._rebuilds = 0  # growths that made a new inner solver
         self._inner = None
         self._inner = self._new_inner()
 
@@ -597,8 +711,40 @@ class SectorKPointSolver:
             return self.job.accumulate(k_index, vectors, occupations, xp=xp)
         sums = _host(weighted_square_sum(vectors, occupations, xp))
         whole = self._plans[k_index].density(sector, sums)
-        # the job's own density of the k-point (its weight and normalization) from one column |U v|
-        return self.job.accumulate(k_index, np.sqrt(whole)[:, None], np.ones(1))
+        # the job's own density of the k-point (its weight and normalization) from one column |U v|; a job that sums
+        # more (the exchange energy of a hybrid) gives its density part apart
+        geometry = self.job.geometry
+        parts = geometry.get("density_part", self.job.accumulate)(k_index, np.sqrt(whole)[:, None], np.ones(1))
+        scale = geometry.get("exchange_cross_scale")
+        if scale is not None:
+            parts = dict(parts)
+            parts["exchange_cross"] = self._exchange_cross(k_index, sector, vectors, occupations, scale)
+        return parts
+
+    def _exchange_cross(self, k_index: int, sector: int, vectors, occupations, scale) -> np.ndarray:
+        """``(s/2) w_k sum_n f_n <v_n|U^H V_ACE U|v_n>`` of a sector (unscaled): the exchange term reduced to it
+        (made with its Hamiltonian, :meth:`KPointSectors.hamiltonian`), on the host."""
+
+        from parsec_python.V_xc.exact_exchange import OCCUPATION_THRESHOLD
+
+        cached = self._plans[k_index]._exchange.get(sector)
+        values = np.asarray(_host(occupations), dtype=np.float64).reshape(-1)
+        occupied = np.flatnonzero(values > OCCUPATION_THRESHOLD)
+        if cached is None or not occupied.size:
+            return np.zeros(1)
+        block = np.asarray(_host(vectors))[:, occupied]
+        reduced = cached[1]
+        projectors = reduced.projectors
+        if isinstance(projectors, np.ndarray):
+            expectation = reduced.expectation_values(block, scaled=False)
+        else:  # the reduction of a device exchange stays on its device: the overlaps are formed there
+            import cupy as cp
+
+            with cp.cuda.Device(int(projectors.device.id)):
+                overlaps = projectors.conj().T @ cp.asarray(block)
+                expectation = cp.asnumpy(cp.sum(cp.abs(overlaps) ** 2, axis=0))
+            expectation = -expectation
+        return np.asarray([float(scale(k_index)) * float(np.dot(values[occupied], expectation))])
 
     # ------------------------------------------------------------------- steps
     def _short_sectors(self, values) -> list[tuple[int, int]]:
@@ -618,25 +764,39 @@ class SectorKPointSolver:
                     short.append((k_index, sector))
         return short
 
-    def _grow(self, short) -> None:
+    def _grow(self, short, potentials: dict, filter_degree: int, tolerance) -> list[np.ndarray]:
+        """More states for the sectors ``short``, and the step solved again.
+
+        Only those sectors are solved again where the inner solver can change the states of some tasks
+        (``resize_tasks``: the others keep their Ritz states and levels); else a new inner solver solves every
+        sector from the start.
+        """
+        counts = {}
         for k_index, sector in short:
             plan = self._plans[k_index]
             count = plan.counts[sector]
             plan.counts[sector] = min(plan.sizes[sector], max(math.ceil(_GROWTH * count), count + _EXTRA_STATES))
+            counts[self._position[(k_index, sector)]] = plan.counts[sector]
         self._regrowths += 1
+        resize = getattr(self._inner, "resize_tasks", None)
+        if resize is not None and resize(counts):
+            self._regrown_tasks += len(counts)
+            return self._inner.solve(potentials, filter_degree, tolerance, tasks=sorted(counts))
+        self._rebuilds += 1
         self._inner.close()
         self._inner = None
         self._inner = self._new_inner()
+        return self._inner.solve(potentials, filter_degree, tolerance)
 
     def solve(self, potentials: dict, filter_degree: int, tolerance: float | None = None) -> list[np.ndarray]:
         """The lowest ``number_of_states`` levels of every k-point (task order)."""
 
+        values = self._inner.solve(potentials, filter_degree, tolerance)
         for _ in range(_ATTEMPTS):
-            values = self._inner.solve(potentials, filter_degree, tolerance)
             short = self._short_sectors(values)
             if not short:
                 return self._union(values)
-            self._grow(short)
+            values = self._grow(short, potentials, filter_degree, tolerance)
         raise RuntimeError(
             f"the sectors of the k-points did not hold the lowest levels after {_ATTEMPTS} attempts; "
             f"{_SWITCH}=off solves each k-point whole"
@@ -711,13 +871,54 @@ class SectorKPointSolver:
         return columns
 
     def extras(self) -> list[Any]:
-        raise NotImplementedError("the sectors of the k-points compute no per-state extras")
+        """The job's extras (the nonlocal forces) of every k-point from its kept orbitals on the whole grid."""
 
-    def export_states(self) -> dict[int, Any]:
-        return self._inner.export_states()
+        if self.job.extras is None:
+            raise NotImplementedError("the job computes no per-state extras")
+        found = []
+        for task in range(self.job.n_tasks):
+            vectors = _host(self.vectors(task))
+            if vectors.ndim != 2 or vectors.shape[1] == 0:
+                raise NotImplementedError(
+                    "the extras of the k-point sectors (the forces) need the orbitals, which the MPI k-point pools "
+                    "do not gather"
+                )
+            found.append(self.job.extras(task, vectors))
+        return found
 
-    def import_states(self, states: dict[int, Any]) -> None:
-        self._inner.import_states(states)
+    def _layout(self) -> list[tuple[int, int, int]]:
+        return [(int(k), -1 if sector is None else int(sector), self._rows((k, sector))) for k, sector in self._items]
+
+    def export_states(self) -> dict:
+        """The Ritz states of the sectors with their layout and numbers of states (for the next loop of the same
+        structure or of a moved one: :meth:`import_states`)."""
+
+        counts = [self._states(item) for item in self._items]
+        return {_STATES_KEY: {"layout": self._layout(), "counts": counts, "states": self._inner.export_states()}}
+
+    def import_states(self, states: dict) -> None:
+        """Start from the states of :meth:`export_states`: those of sectors of the same layout (k-points, sectors,
+        rows), with their numbers of states; anything else (the states of a solver without sectors, or of other
+        sectors) is not taken, and the sectors start afresh."""
+
+        carried = states.get(_STATES_KEY) if isinstance(states, dict) else None
+        if not isinstance(carried, dict) or [tuple(item) for item in carried.get("layout", ())] != self._layout():
+            return
+        counts = [int(count) for count in carried["counts"]]
+        if counts != [self._states(item) for item in self._items]:
+            for (k_index, sector), count in zip(self._items, counts):
+                if sector is not None:
+                    self._plans[k_index].counts[sector] = count
+            self._inner.close()
+            self._inner = None
+            self._inner = self._new_inner()
+        self._inner.import_states(carried["states"])
+
+    def device_vectors(self, task: int) -> np.ndarray:
+        """The kept orbitals of k-point ``task`` on the whole grid (host), for a driver that asks for them where the
+        solver keeps them (the Fock loop of a hybrid)."""
+
+        return self.vectors(task)
 
     def stats(self) -> dict[str, float]:
         inner = getattr(self._inner, "stats", None)
@@ -733,6 +934,8 @@ class SectorKPointSolver:
                 "kpoint_sector_largest_group": float(max(plan.order for plan in split)),
                 "kpoint_sector_work_fraction": float(work) / whole_work,
                 "kpoint_sector_regrowths": float(self._regrowths),
+                "kpoint_sector_regrown_tasks": float(self._regrown_tasks),
+                "kpoint_sector_rebuilds": float(self._rebuilds),
             }
         )
         return stats
@@ -763,11 +966,17 @@ class SectorKPointSolver:
 
 
 def sector_solver(job: KPointJob, make_solver: Callable[..., Any], **options):
-    """A :class:`SectorKPointSolver` for ``job`` where its k-points split, else ``None``."""
+    """A :class:`SectorKPointSolver` for ``job`` where its k-points split, else ``None``.
+
+    A job with extras (the forces) takes the sectors in one process only: the MPI k-point pools gather no orbitals,
+    and their forces stay with the row-distributed solver.
+    """
+
+    from ..Parallel import mpi
 
     if (
         getattr(job, "geometry", None) is None
-        or job.extras is not None
+        or (job.extras is not None and mpi.context() is not None)
         or job.states_per_task is not None
         or kpoint_sectors_setting() == "off"
     ):

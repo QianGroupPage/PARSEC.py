@@ -99,6 +99,11 @@ from ..models import (
 )
 
 
+def level_tolerance_of(warm_start) -> float | None:
+    """The tolerance of the refined levels a warm start asks for (``None`` without)."""
+    return getattr(warm_start, "level_tolerance", None)
+
+
 def _number_of_states(system: PeriodicPreparedSinglePointSystem) -> int:
     requested = system.input.scf.number_of_states
     if requested is None:
@@ -359,13 +364,16 @@ def run_scf_kpoints(
             return base
         return hubbard.hamiltonian(base, task, potentials.get("hubbard"))
 
-    def accumulate(task, vectors, occupations, xp=np):
+    def density_part(task, vectors, occupations, xp=np):
         # rho(r) = sum_k w_k*(2/dV)*sum_n f_nk*|u_nk(r)|**2.  u_nk is complex
         # even though the resulting density is real.
-        parts = {
+        return {
             "density": (weighting.of_k(task) * 2.0 / system.grid.volume_element)
             * weighted_square_sum(vectors, occupations, xp)
         }
+
+    def accumulate(task, vectors, occupations, xp=np):
+        parts = density_part(task, vectors, occupations, xp)
         if exchange_term is not None:
             # (s/2) w_k sum_n f_nk <u_nk|V_ACE|u_nk>: this k-point's share of E_x(P, P0).
             parts["exchange_cross"] = exchange_term.task_cross(
@@ -425,19 +433,14 @@ def run_scf_kpoints(
         )
 
     # What a solver that splits the k-points into the sectors of their little groups needs
-    # (acceleration/SCF/kpoint_sectors.py): a loop whose job forms the density alone and keeps no orbitals.
+    # (acceleration/SCF/kpoint_sectors.py): a loop without LDA+U, meta-GGA, fixed occupations or refined levels
+    # (the forces, kept orbitals and states and the exchange of a hybrid go through its orbitals on the whole grid).
     sector_geometry = None
     if (
-        exchange_term is None
-        and hubbard is None
+        hubbard is None
         and meta is None
-        and not compute_forces
-        and not keep_wavefunctions
-        and not keep_states
-        and keep_vectors is None
         and settings.fixed_occupations is None
         and getattr(warm_start, "level_tolerance", None) is None
-        and not getattr(warm_start, "eigensolver_state", None)
     ):
         sector_geometry = {
             "grid": system.grid,
@@ -446,6 +449,13 @@ def run_scf_kpoints(
             "weights": np.asarray([weighting.of_k(task) for task in range(n_kpoints)], dtype=np.float64),
             "lattice": np.asarray(lattice_vectors, dtype=np.float64),
             "density_symmetry": density_symmetry,
+            # the sectors of the k-points and their static operators, kept for the next loops of this structure
+            "cache": projector_cache,
+            # the density alone (the sectors sum the exchange energy of a hybrid from its reduction to them)
+            "density_part": density_part,
+            "exchange_cross_scale": None
+            if exchange_term is None
+            else (lambda task: 0.5 * float(exchange_term.spin_weight) * weighting.of_k(task)),
         }
     with timer.stage("solver_setup"):
         solver = make_kpoint_solver(
@@ -993,15 +1003,17 @@ def run_scf_kpoints_spin_polarized(
             base, k_index, None if matrices is None else matrices[spin_index]
         )
 
+    def density_part(task, vectors, occupations, xp=np):
+        spin_index, k_index = divmod(task, n_kpoints)
+        name = "up" if spin_index == 0 else "down"
+        return {
+            name: (weighting.of_k(k_index) / system.grid.volume_element) * weighted_square_sum(vectors, occupations, xp)
+        }
+
     def accumulate(task, vectors, occupations, xp=np):
         spin_index, k_index = divmod(task, n_kpoints)
         name = "up" if spin_index == 0 else "down"
-        parts = {
-            name: (
-                weighting.of_k(k_index) / system.grid.volume_element
-            )
-            * weighted_square_sum(vectors, occupations, xp)
-        }
+        parts = density_part(task, vectors, occupations, xp)
         if meta is not None:
             fields = bloch_orbital_fields(
                 system, k_points[k_index], vectors, occupations, weighting.of_k(k_index), 1.0, xp,
@@ -1021,6 +1033,24 @@ def run_scf_kpoints_spin_polarized(
             )
         return parts
 
+    # The sectors of the k-points (acceleration/SCF/kpoint_sectors.py), as run_scf_kpoints: both channels of a
+    # k-point share its sectors (both spin densities are symmetrized over the same group).
+    sector_geometry = None
+    if hubbard is None and meta is None and level_tolerance_of(warm_start) is None:
+        sector_geometry = {
+            "grid": system.grid,
+            "atoms": tuple(system.atoms),
+            "k_points": np.asarray(k_points, dtype=np.float64),
+            "weights": np.asarray([weighting.of_k(k) for k in range(n_kpoints)], dtype=np.float64),
+            "lattice": np.asarray(lattice_vectors, dtype=np.float64),
+            "density_symmetry": density_symmetry,
+            "cache": projector_cache,
+            "density_part": density_part,
+            "exchange_cross_scale": None
+            if exchange_term is None
+            else (lambda task: 0.5 * float(exchange_term.spin_weight) * weighting.of_k(task % n_kpoints)),
+            "k_of_task": np.tile(np.arange(n_kpoints, dtype=np.int64), 2),
+        }
     with timer.stage("solver_setup"):
         solver = make_kpoint_solver(
             KPointJob(
@@ -1029,6 +1059,7 @@ def run_scf_kpoints_spin_polarized(
                 lambda degree, tolerance=None: _eigval_settings(system, degree, tolerance),
                 make_hamiltonian,
                 accumulate,
+                geometry=sector_geometry,
             ),
             problem_size=system.grid.size,
             backend=kpoint_backend(system) if backend is None else backend,

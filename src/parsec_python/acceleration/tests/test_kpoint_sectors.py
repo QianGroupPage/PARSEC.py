@@ -244,6 +244,11 @@ class SectorSCFTests(unittest.TestCase):
                 base, k_points, np.array([0.5, 0.5]), environment={"PARSEC_KPOINT_SECTOR_MARGIN": "1.0"}
             )
         self.assertGreaterEqual(auto.timings.detail["kpoint_sector_regrowths"], 1.0)
+        # the grown sectors were solved again alone: the solver and the Ritz states of the others were kept
+        self.assertEqual(auto.timings.detail["kpoint_sector_rebuilds"], 0.0)
+        self.assertGreaterEqual(
+            auto.timings.detail["kpoint_sector_regrown_tasks"], auto.timings.detail["kpoint_sector_regrowths"]
+        )
 
     @unittest.skipUnless((_DIAMOND / "make_diamond.py").exists(), "the diamond example is not in this checkout")
     def test_reduced_mesh_with_the_symmetrized_density(self) -> None:
@@ -271,6 +276,151 @@ class SectorSCFTests(unittest.TestCase):
         self.assertTrue(problem.scf.symmetrize_density)
         auto = self.assert_same_scf(problem)
         self.assertEqual(auto.timings.detail["kpoint_sector_largest_group"], 16.0)
+
+
+class SectorDriverTests(unittest.TestCase):
+    """The sectors in the other drivers of k-points: both spin channels, the forces from the orbitals of the sectors,
+    the exchange of a hybrid functional reduced to the sectors and the states carried from loop to loop."""
+
+    def _silicon(self, **scf):
+        base = SectorSCFTests._silicon(self)
+        return replace(base, scf=replace(base.scf, **scf)) if scf else base
+
+    def _gamma_and_x(self, problem):
+        side = float(np.asarray(problem.periodic_cell.lattice_vectors)[0, 0])
+        return np.array([np.zeros(3), np.pi / side * np.array([1.0, 0.0, 0.0])]), np.array([0.5, 0.5])
+
+    def _both(self, run, problem):
+        from parsec_python.SCF.pbc import prepare_periodic_single_point
+
+        results = {}
+        for setting in ("off", "auto"):
+            with mock.patch.dict(os.environ, {"PARSEC_KPOINT_SECTORS": setting}), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                results[setting] = run(prepare_periodic_single_point(problem))
+        off, auto = results["off"], results["auto"]
+        self.assertTrue(off.converged and auto.converged)
+        self.assertNotIn("kpoint_sector_tasks", off.timings.detail)
+        return off, auto
+
+    def test_spin_channels_share_the_sectors_of_their_k_point(self) -> None:
+        from parsec_python.SCF.kpoints import run_scf_kpoints_spin_polarized
+
+        problem = self._silicon(spin_polarized=True)
+        k_points, weights = self._gamma_and_x(problem)
+        off, auto = self._both(lambda system: run_scf_kpoints_spin_polarized(system, k_points, weights), problem)
+        self.assertAlmostEqual(auto.energies.total, off.energies.total, delta=1.0e-9)
+        self.assertGreater(auto.timings.detail["kpoint_sector_tasks"], 4.0)
+        np.testing.assert_allclose(auto.eigenvalues_up, off.eigenvalues_up, atol=1.0e-8)
+        np.testing.assert_allclose(auto.eigenvalues_down, off.eigenvalues_down, atol=1.0e-8)
+
+    def test_forces_from_the_orbitals_of_the_sectors(self) -> None:
+        # one atom moved along x: C2x and the two mirrors through x keep the cell, the sectors of Gamma and X
+        from parsec_python.SCF.kpoints import run_scf_kpoints
+
+        problem = self._silicon()
+        atoms = list(problem.atoms)
+        atoms[0] = replace(atoms[0], position=np.asarray(atoms[0].position, dtype=float) + np.array([0.1, 0.0, 0.0]))
+        problem = replace(problem, atoms=atoms)
+        k_points, weights = self._gamma_and_x(problem)
+        off, auto = self._both(lambda system: run_scf_kpoints(system, k_points, weights, compute_forces=True), problem)
+        self.assertAlmostEqual(auto.energies.total, off.energies.total, delta=1.0e-9)
+        self.assertGreater(auto.timings.detail["kpoint_sector_tasks"], 2.0)
+        self.assertGreater(float(np.max(np.abs(off.nonlocal_forces))), 1.0e-3)
+        np.testing.assert_allclose(auto.nonlocal_forces, off.nonlocal_forces, rtol=0.0, atol=1.0e-7)
+
+    def test_hybrid_exchange_reduced_to_the_sectors(self) -> None:
+        # PBE0 at the eight time-reversal invariant k-points: the Fock loop carries the states of the sectors from
+        # one SCF loop to the next and builds its operator from their orbitals on the whole grid
+        from parsec_python.models import ExactExchangeSettings
+        from parsec_python.SCF.hybrid_periodic import run_periodic_hybrid_scf
+
+        problem = self._silicon(
+            xc_functional="pbe0", exact_exchange=ExactExchangeSettings(tolerance=1.0e-8), convergence_criterion=1.0e-8
+        )
+        side = float(np.asarray(problem.periodic_cell.lattice_vectors)[0, 0])
+        k_points = np.array([np.array(bits, dtype=float) * np.pi / side for bits in np.ndindex(2, 2, 2)])
+        weights = np.full(8, 0.125)
+        off, auto = self._both(lambda system: run_periodic_hybrid_scf(system, k_points, weights), problem)
+        self.assertAlmostEqual(auto.energies.total, off.energies.total, delta=2.0e-8)
+        # The estimate the Fock loop stops on is an energy, second order in the orbitals: E_x, first order, is
+        # converged to about its square root, and the two loops take other paths (without sectors, on the host, E_x
+        # still moved by 3.8e-6 Ry between the outer steps with estimates 2e-10 and 4e-12; stopped at 1e-10 the
+        # two runs were 7.7e-7 Ry apart in E_x and 2e-11 Ry in the total energy; on A100 at 1e-8, 5e-8 to 1.6e-7)
+        self.assertAlmostEqual(
+            auto.exact_exchange.exchange_energy, off.exact_exchange.exchange_energy, delta=1.0e-6
+        )
+        self.assertGreater(auto.timings.detail["kpoint_sector_tasks"], 8.0)
+
+    def test_the_loops_of_one_structure_share_the_plans(self) -> None:
+        # a caller's cache (the projector cache of the Fock loop): the next loop takes the plans and their static
+        # operators; another layout of the job (other k-points) makes its own
+        problem, system = _silicon_system()
+        cache: dict = {}
+        geometry = {
+            "grid": system.grid,
+            "atoms": tuple(system.cell_atoms),
+            "k_points": np.zeros((1, 3)),
+            "weights": np.ones(1),
+            "lattice": np.asarray(problem.periodic_cell.lattice_vectors, dtype=float),
+            "density_symmetry": None,
+            "cache": cache,
+        }
+        job = KPointJob(1, 22, lambda *args: None, lambda *args: None, lambda *args, **kw: {}, geometry=geometry)
+        first = sectors.plan_sectors(job)
+        self.assertIsNotNone(first)
+        self.assertIs(sectors.plan_sectors(job)[0], first[0])
+        moved = dict(geometry, k_points=np.array([[0.1, 0.0, 0.0]]))
+        other = sectors.plan_sectors(KPointJob(1, 22, None, None, None, geometry=moved))
+        self.assertIsNot(other[0], first[0])
+
+    def test_the_reduction_is_the_adjoint_of_the_expansion(self) -> None:
+        problem, system = _silicon_system()
+        cell = sectors.CellGroup(system.grid, system.cell_atoms)
+        _, _, decomposition = _decomposition(cell, np.zeros(3))
+        split = sectors.KPointSectors(0, np.zeros(3), decomposition, [4] * decomposition.representation_count)
+        rng = np.random.default_rng(7)
+        whole = rng.normal(size=(system.grid.size, 3)) + 1j * rng.normal(size=(system.grid.size, 3))
+        for sector in range(decomposition.representation_count):
+            block = rng.normal(size=(split.sizes[sector], 3)) + 1j * rng.normal(size=(split.sizes[sector], 3))
+            # <U v, x> = <v, U^H x>
+            left = np.vdot(split.orbitals(sector, block), whole)
+            right = np.vdot(block, split.reduce(sector, whole))
+            self.assertAlmostEqual(left, right, delta=1.0e-10 * abs(left))
+            np.testing.assert_allclose(split.reduce(sector, split.orbitals(sector, block)), block, atol=1.0e-12)
+
+    def test_states_of_other_sectors_are_not_taken(self) -> None:
+        from parsec_python.SCF.kpoints import run_scf_kpoints
+        from parsec_python.SCF.pbc import prepare_periodic_single_point
+
+        problem = self._silicon()
+        k_points, weights = self._gamma_and_x(problem)
+        with mock.patch.dict(os.environ, {"PARSEC_KPOINT_SECTORS": "auto"}), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            system = prepare_periodic_single_point(problem)
+            result = run_scf_kpoints(system, k_points, weights, keep_states=True)
+        carried = result.eigensolver_state
+        self.assertIn(sectors._STATES_KEY, carried)
+        layout = carried[sectors._STATES_KEY]["layout"]
+        self.assertGreater(len(layout), 2)
+
+        class Inner:
+            imported = None
+
+            def import_states(self, states):
+                Inner.imported = states
+
+        solver = object.__new__(sectors.SectorKPointSolver)
+        solver.__dict__.update(_items=[(k, None if s < 0 else s) for k, s, _ in layout], _inner=Inner())
+        solver._layout = lambda: [tuple(item) for item in layout]
+        solver.import_states({0: "a state of a solver without sectors"})
+        self.assertIsNone(Inner.imported)
+        solver.import_states({sectors._STATES_KEY: dict(carried[sectors._STATES_KEY], layout=layout[:-1])})
+        self.assertIsNone(Inner.imported)
+        solver._states = lambda item: dict(zip([(k, None if s < 0 else s) for k, s, _ in layout],
+                                                carried[sectors._STATES_KEY]["counts"]))[item]
+        solver.import_states(carried)
+        self.assertIs(Inner.imported, carried[sectors._STATES_KEY]["states"])
 
 
 @unittest.skipUnless(cupy_available(), "CUDA runtime is unavailable")
@@ -304,6 +454,20 @@ class DeviceSectorTests(unittest.TestCase):
                 np.testing.assert_allclose(cp.asnumpy(target), block + expected, rtol=0, atol=1.0e-14 * scale)
             else:
                 self.assertEqual(device.long_rows, rows < columns)
+
+    def test_the_reduction_of_a_device_block(self) -> None:
+        import cupy as cp
+
+        problem, system = _silicon_system()
+        cell = sectors.CellGroup(system.grid, system.cell_atoms)
+        _, _, decomposition = _decomposition(cell, np.array([0.11, 0.0, 0.0]))
+        split = sectors.KPointSectors(0, np.zeros(3), decomposition, [4] * decomposition.representation_count)
+        rng = np.random.default_rng(9)
+        whole = rng.normal(size=(system.grid.size, 5)) + 1j * rng.normal(size=(system.grid.size, 5))
+        for sector in range(decomposition.representation_count):
+            device = split.reduce(sector, cp.asarray(whole))
+            self.assertIsInstance(device, cp.ndarray)
+            np.testing.assert_allclose(cp.asnumpy(device), split.reduce(sector, whole), rtol=0, atol=1.0e-12)
 
     def test_the_device_operator_of_a_sector(self) -> None:
         import cupy as cp
@@ -361,7 +525,14 @@ class DeclineTests(unittest.TestCase):
 
         self.assertIsInstance(sectors.sector_solver(job(), plain, problem_size=system.grid.size), sectors.SectorKPointSolver)
         self.assertIsNone(sectors.sector_solver(job(geometry=None), plain))
-        self.assertIsNone(sectors.sector_solver(job(extras=lambda task, vectors: 0.0), plain))
+        # the forces (extras) take the sectors in one process; the MPI k-point pools gather no orbitals
+        self.assertIsNotNone(
+            sectors.sector_solver(job(extras=lambda task, vectors: 0.0), plain, problem_size=system.grid.size)
+        )
+        from parsec_python.acceleration.Parallel import mpi
+
+        with mock.patch.object(mpi, "context", lambda: object()):
+            self.assertIsNone(sectors.sector_solver(job(extras=lambda task, vectors: 0.0), plain))
         with mock.patch.dict(os.environ, {"PARSEC_KPOINT_SECTORS": "off"}):
             self.assertIsNone(sectors.sector_solver(job(), plain))
         # a k-point whose sectors would not halve the work stays one task: with one state, the six extra states

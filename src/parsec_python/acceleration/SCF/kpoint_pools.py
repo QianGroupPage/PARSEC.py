@@ -62,6 +62,7 @@ from parsec_python.SCF.kpoint_solver import (
     device_solver_supports,
     job_eigval_settings,
     residual_max,
+    resized_job,
     task_rows,
     task_states,
 )
@@ -637,6 +638,7 @@ class MPIPoolKPointSolver:
         most = max(task_states(self.job, task) for task in range(self.job.n_tasks))
         working = min(most + int(settings.safety_buffer), self.problem_size)
         block = int(settings.subspace.block_size)
+        self._block, self._buffer = block, int(settings.safety_buffer)  # for resize_tasks
         sizes = [
             (rows, min(task_states(self.job, task) + int(settings.safety_buffer), rows))
             for task, rows in ((task, task_rows(self.job, task, self.problem_size)) for task in range(self.job.n_tasks))
@@ -709,10 +711,13 @@ class MPIPoolKPointSolver:
         self.group.route = route
 
     # ------------------------------------------------------------------- steps
-    def solve(self, potentials: dict, filter_degree: int, tolerance: float | None = None) -> list[np.ndarray]:
+    def solve(
+        self, potentials: dict, filter_degree: int, tolerance: float | None = None, tasks=None
+    ) -> list[np.ndarray]:
         """One eigenvalue array per task, the same on every rank.
 
-        ``tolerance`` replaces ``Diag_Tolerance`` for this call (``Dynamic_Diag_Tol``).
+        ``tolerance`` replaces ``Diag_Tolerance`` for this call (``Dynamic_Diag_Tol``); ``tasks`` solves those only
+        (collective: every rank names the same), the others keep the eigenvalues of their last solve.
         """
         settings = job_eigval_settings(self.job, filter_degree, tolerance)
         if not device_solver_supports(settings):
@@ -730,6 +735,12 @@ class MPIPoolKPointSolver:
         found: dict[int, np.ndarray] = {}
         residuals: dict[int, float] = {}
         order = self._solve_order()
+        if tasks is not None:
+            wanted = {int(task) for task in tasks}
+            order = [task for task in order if task in wanted]
+            kept = getattr(self, "_kept", None)
+            if kept is not None and kept not in wanted and kept in self.states:
+                self._spill(kept, self.states[kept])  # host storage keeps one subspace on the device: the next
         for task in order:
             requested = task_states(self.job, task)
             start = time.perf_counter()
@@ -767,11 +778,14 @@ class MPIPoolKPointSolver:
             self._note_reserved()
             if task != order[-1]:
                 self._spill(task, self.states[task])  # the last one stays for the density and the next solve
-        self._kept = order[-1]
+        if order:
+            self._kept = order[-1]
         start = time.perf_counter()
         gathered = self.context.comm.allgather((found, residuals))
         self._tick("pool_wait", start)  # the eigenvalues of the other pools: waiting for the slowest
-        eigenvalues: dict[int, np.ndarray] = {}
+        eigenvalues = getattr(self, "_values", None)
+        if eigenvalues is None:
+            eigenvalues = self._values = {}
         for values, norms in gathered:
             eigenvalues.update(values)
             self._residual.update(norms)
@@ -779,6 +793,58 @@ class MPIPoolKPointSolver:
         if missing:
             raise RuntimeError(f"no pool returned the eigenvalues of tasks {missing}")
         return [eigenvalues[task] for task in range(self.job.n_tasks)]
+
+    def resize_tasks(self, counts: dict) -> bool:
+        """New numbers of states for the tasks of ``counts`` (task -> states), collective.
+
+        The tasks keep their pools: where the plan still holds them on the devices (and the nodes) their Ritz
+        states are dropped, those of the other tasks kept, and ``True`` is returned; ``False`` where it does not
+        (the caller makes a new solver).
+        """
+        counts = {int(task): int(count) for task, count in counts.items()}
+        job = resized_job(self.job, counts)
+        if self.plan is not None:
+            fits = None
+            if self.context.is_root:
+                fits = self._plan_holds(job)
+            if not bool(self.context.bcast(fits, root=0)):
+                return False
+        self.job = job
+        for task in counts:
+            self.states.pop(task, None)
+            if getattr(self, "_kept", None) == task:
+                self._kept = None
+        return True
+
+    def _plan_holds(self, job) -> bool:
+        """Whether the pools of :attr:`plan` hold the tasks of ``job`` (their new numbers of states)."""
+        plan = self.plan
+        block, buffer = self._block, self._buffer
+        usable = self._usable_bytes()
+        ceiling = max(float(plan.bytes_per_rank), usable)
+        if plan.assignment is None:
+            most = max(task_states(job, task) for task in range(job.n_tasks))
+            working = min(most + buffer, self.problem_size)
+            resident = plan.resident if plan.host_storage else None
+            return max(
+                pool_memory_bytes(
+                    self.problem_size, working, len(plan.tasks_of_pool(pool)), plan.sizes[pool], block,
+                    resident=resident, route=self.route,
+                )
+                for pool in range(plan.pools)
+            ) <= ceiling
+        for pool in range(plan.pools):
+            shapes = []
+            for task in plan.tasks_of_pool(pool):
+                rows = task_rows(job, task, self.problem_size)
+                shapes.append((rows, min(task_states(job, task) + buffer, rows)))
+            resident = plan.resident_of(pool) if plan.spills(pool) else None
+            device, _ = pool_task_bytes(
+                shapes, plan.sizes[pool], block, resident=resident, grid_points=job.grid_points, route=self.route
+            )
+            if device > ceiling:
+                return False
+        return True
 
     def accumulate(self, occupations: list[np.ndarray]) -> dict[str, np.ndarray]:
         """Sum of the tasks' density contributions over the whole grid, the same on every rank."""

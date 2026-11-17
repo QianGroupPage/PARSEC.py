@@ -91,16 +91,32 @@ class BatchedProjectorTests(unittest.TestCase):
         }
         self.assert_same(grid, atoms, specifications, lattice, "two species")
 
+    def test_bloch_projectors_of_k_points(self) -> None:
+        # the Bloch projectors of a k-point (each image times exp(-ik.(r - T))): the reference's arrays
+        carbon = {"C": SpeciesPotential(_CARBON, 2, use_spline=True)}
+        potentials = ionic_potential.load_pseudopotentials(carbon, xc_functional="pbe")
+        lattice = 2 * _SIDE * np.eye(3)
+        grid = build_periodic_grid(
+            PeriodicCell(lattice), PeriodicGridSettings(spacing=_SIDE / 18, expansion_order=8, shift=(0.5,) * 3)
+        )
+        atoms = _diamond(2, (0.11, -0.07, 0.23))
+        for k_point in (np.array([0.21, -0.13, 0.08]), np.pi / (2 * _SIDE) * np.array([1.0, 0.0, 1.0])):
+            batched = batched_nonlocal_projectors(grid, atoms, potentials, carbon, lattice, k_point=k_point)
+            reference = _reference(grid, atoms, potentials, carbon, lattice, k_point=k_point)
+            mine, theirs = batched.projectors, reference.projectors
+            self.assertEqual(mine.dtype, theirs.dtype)
+            for name in ("indptr", "indices"):
+                np.testing.assert_array_equal(getattr(mine, name), getattr(theirs, name))
+            np.testing.assert_allclose(mine.data, theirs.data, rtol=0, atol=1.0e-15 * float(np.max(np.abs(theirs.data))))
+            self.assertEqual(batched.labels, reference.labels)
+
     def test_what_it_declines(self) -> None:
         carbon = {"C": SpeciesPotential(_CARBON, 2, use_spline=True)}
         potentials = ionic_potential.load_pseudopotentials(carbon, xc_functional="pbe")
         lattice = 2 * _SIDE * np.eye(3)
         grid = build_periodic_grid(PeriodicCell(lattice), PeriodicGridSettings(spacing=_SIDE / 12, expansion_order=4))
         atoms = _diamond(2)
-        # a k-point (Bloch phases) and an isolated grid keep the reference
-        self.assertIsNone(
-            batched_nonlocal_projectors(grid, atoms, potentials, carbon, lattice, k_point=np.array([0.1, 0.0, 0.0]))
-        )
+        # an isolated grid keeps the reference
         self.assertIsNone(batched_nonlocal_projectors(grid, atoms, potentials, carbon, None))
         # a cell less than two support radii wide: two images of an atom can meet on a grid point
         small = np.diag([3.0, 3.0, 3.0])

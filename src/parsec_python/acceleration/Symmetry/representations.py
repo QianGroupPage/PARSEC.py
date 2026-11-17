@@ -494,6 +494,49 @@ class ReflectionRepresentationDecomposition:
                 assembled[index] = reduced
         return tuple(assembled)
 
+    def reduce_hermitian_operators(
+        self,
+        operator: sp.spmatrix,
+        representations: Sequence[int] | None = None,
+    ) -> tuple[sp.csr_matrix | None, ...]:
+        """``U_Gamma.T A U_Gamma`` of a complex Hermitian ``A`` that commutes with the operations.
+
+        The basis ``U_Gamma`` of a sector is real (the characters are +-1), so the projection of a complex operator
+        is that of :meth:`reduce_operators` on its complex entries: the same rows, phases and normalization, a
+        Hermitian sector matrix (checked).  The operators of a k-point (:mod:`..SCF.kpoint_sectors`).
+        """
+
+        wanted = self._selected_representations(representations)
+        matrix = sp.csr_matrix(operator, dtype=np.complex128)
+        if matrix.shape != (self.full_size, self.full_size):
+            raise ValueError("operator does not match the representation grid")
+        matrix.sum_duplicates()
+        matrix.sort_indices()
+        selected = matrix[self.reduction.representative_rows, :].tocoo(copy=False)
+        sectors: list[sp.csr_matrix | None] = [None] * self.representation_count
+        for index in wanted:
+            row_orbits = selected.row
+            sector_rows = self.orbit_to_sector[index, row_orbits]
+            column_orbits = self.reduction.full_to_wedge[selected.col]
+            sector_columns = self.orbit_to_sector[index, column_orbits]
+            keep = (sector_rows >= 0) & (sector_columns >= 0)
+            normalization = np.sqrt(
+                self.reduction.multiplicities[row_orbits[keep]] / self.reduction.multiplicities[column_orbits[keep]]
+            )
+            data = selected.data[keep] * self.phases[index, selected.col[keep]] * normalization
+            size = self.sector_size(index)
+            reduced = sp.coo_matrix((data, (sector_rows[keep], sector_columns[keep])), shape=(size, size)).tocsr()
+            reduced.sum_duplicates()
+            reduced.eliminate_zeros()
+            reduced.sort_indices()
+            difference = reduced - reduced.conj().T
+            maximum = float(np.max(np.abs(difference.data))) if difference.nnz else 0.0
+            scale = float(np.max(np.abs(reduced.data), initial=1.0))
+            if maximum > 5.0e-13 * scale:
+                raise ValueError(f"representation operator is not Hermitian: maximum asymmetry {maximum:.3e}")
+            sectors[index] = reduced
+        return tuple(sectors)
+
     def _assemble_reduced_operator(
         self,
         selected: sp.coo_matrix,
@@ -576,7 +619,10 @@ class ReflectionRepresentationDecomposition:
         """
 
         wanted = self._selected_representations(representations)
-        projectors = sp.coo_matrix(operator.projectors, dtype=np.float64)
+        # (complex where the projectors are those of a k-point: the real basis of a sector keeps their phases)
+        projectors = sp.coo_matrix(
+            operator.projectors, dtype=np.result_type(operator.projectors.dtype, np.float64)
+        )
         projectors.sum_duplicates()
         workers = operator_build_workers(len(wanted))
 

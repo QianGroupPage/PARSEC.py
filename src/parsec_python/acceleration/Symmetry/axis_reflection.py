@@ -1266,9 +1266,15 @@ def _translations_mapping(species: dict, trees: dict, operation, period, steps, 
         tree = trees.get(name)
         if tree is None:
             tree = trees[name] = _matching_tree(atoms_of, period)
-        # atoms spread over the list (the first one of the smallest species made the candidates)
-        picks = np.unique(np.linspace(1 if name == symbol else 0, len(atoms_of) - 1, _FRACTIONAL_SAMPLES).astype(int))
-        for atom in atoms_of[picks] if picks.size and picks[-1] >= picks[0] else atoms_of[:0]:
+        # atoms spread over the list (the first one of the smallest species made the candidates; a species of that
+        # one atom alone has none to sample)
+        first = 1 if name == symbol else 0
+        picks = (
+            np.unique(np.linspace(first, len(atoms_of) - 1, _FRACTIONAL_SAMPLES).astype(int))
+            if len(atoms_of) > first
+            else np.zeros(0, dtype=int)
+        )
+        for atom in atoms_of[picks]:
             images = atom @ matrix.T + whole * steps
             distances, _ = tree.query(_folded(images, period), k=1, distance_upper_bound=radius)
             whole = whole[np.isfinite(distances)]

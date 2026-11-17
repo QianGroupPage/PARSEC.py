@@ -924,9 +924,19 @@ class ExchangePlanTests(unittest.TestCase):
                                                   if device is None]
                 self.assertEqual(without[sectors, ranks, count],
                                  [devices for devices in shared if devices[1:] == (busy,)])
+            # (4, 2, 3): the two sectors of a rank on three devices spread over all three
+            # (PARSEC_SECTOR_DEVICE_POOL=auto, the default), so a helper is free; disjoint groups (off) give the
+            # first sector two devices whose second holds the Hartree objects, without a helper
             self.assertEqual({layout: sectors for layout, sectors in without.items() if sectors},
-                             {(4, 2, 4): [(2, 3)], (4, 1, 8): [(6, 7)], (4, 4, 2): [(0, 1)], (4, 2, 3): [(0, 1)],
+                             {(4, 2, 4): [(2, 3)], (4, 1, 8): [(6, 7)], (4, 4, 2): [(0, 1)],
                               (8, 4, 4): [(2, 3)], (8, 2, 8): [(6, 7)], (2, 1, 4): [(2, 3)], (2, 2, 2): [(0, 1)]})
+            self.assertEqual(sector_device_groups(4, 2, 0, (0, 1, 2)), {0: (0, 1, 2), 2: (0, 1, 2)})
+            os.environ.pop('PARSEC_CUPY_RITZ_CONDITION_HELPER', None)
+            with patch.dict(os.environ, {'PARSEC_SECTOR_DEVICE_POOL': 'off'}):
+                groups = sector_device_groups(4, 2, 0, (0, 1, 2))
+                self.assertEqual(groups, {0: (0, 1), 2: (2,)})
+                busy = driver._select_hartree_device('auto', (0, 1, 2), groups)
+                self.assertEqual([helper(devices, busy) for devices in groups.values() if len(devices) > 1], [None])
             os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = 'any'
             # The Ritz step on real devices (test_ritz_dense) expects these devices, of a group of two, three
             # and four: a node gives it as many as it has, up to four.

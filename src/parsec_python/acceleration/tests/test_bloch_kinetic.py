@@ -129,6 +129,7 @@ class MeshAndSupercellTests(unittest.TestCase):
             cell, back = transforms.kpoints_of_supercell(supercell)
             self.assertEqual(back, (2, 2, 2))
             self.assertEqual(len(cell.atoms), len(base.atoms))
+            self.assertEqual(cell.scf.number_of_states, base.scf.number_of_states + 6)
             np.testing.assert_allclose(cell.periodic_cell.lattice_vectors, base.periodic_cell.lattice_vectors)
             self.assertEqual((cell.monkhorst_pack_dimensions, cell.monkhorst_pack_shift), ((2, 2, 2), (0.0, 0.0, 0.0)))
             # the face-centred cube itself repeats no smaller orthorhombic cell

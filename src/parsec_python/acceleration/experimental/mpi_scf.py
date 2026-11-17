@@ -74,8 +74,26 @@ def sector_device_groups(representations, size, rank, devices, shared=False, exc
     if len(devices) < len(owned):
         return {sector: (devices[index % len(devices)],)
                 for index, sector in enumerate(owned)}
+    groups = np.array_split(devices, len(owned))
+    if (len(owned) > 1 and len(devices) % len(owned) and sector_device_pool_setting() == 'auto'
+            and len(owned) / len(devices) < 1.0 / min(len(group) for group in groups)):
+        # Sectors that do not divide the devices evenly (3 on 4: groups of 2, 1 and 1 device) leave a device with
+        # a whole sector; every sector over all the devices instead (solved one after another, their bases split
+        # over every device) holds len(owned)/len(devices) of a sector per device (PARSEC_SECTOR_DEVICE_POOL).
+        return {sector: tuple(int(x) for x in devices) for sector in owned}
     return {sector: tuple(int(x) for x in group)
-            for sector, group in zip(owned, np.array_split(devices, len(owned)), strict=True)}
+            for sector, group in zip(owned, groups, strict=True)}
+
+
+def sector_device_pool_setting():
+    """``PARSEC_SECTOR_DEVICE_POOL``: ``auto`` (default) spreads every sector of a rank over all its devices where
+    the sectors do not divide them evenly (:func:`sector_device_groups`); ``off`` keeps disjoint groups, as before."""
+    import os
+
+    value = os.environ.get('PARSEC_SECTOR_DEVICE_POOL', 'auto').strip().lower() or 'auto'
+    if value not in {'auto', 'off'}:
+        raise ValueError(f'PARSEC_SECTOR_DEVICE_POOL must be auto or off, not {value!r}')
+    return value
 
 
 class MPISectorContext:

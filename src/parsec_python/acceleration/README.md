@@ -926,6 +926,9 @@ a setting that selects the former one:
 | `PARSEC_KPOINT_KINETIC` | `gradient` (default): `-nabla^2 - 2ik.nabla + k^2` with the gradient discretized on its own, as before | `bloch` (since 2026-11-16): the Bloch block of the finite-difference Laplacian (`Laplacian/finite_difference.py`, `build_bloch_negative_laplacian`; a scalar Hamiltonian without a meta-GGA on a bulk orthorhombic cell of the default routines), the discretization of the Gamma point of the supercell; `auto`: `bloch` where it applies; see "The kinetic term of a k-point" |
 | `PARSEC_KPOINT_SUPERCELL` | `auto`: a Gamma-centred mesh of one or two points per axis (`Monkhorst_Pack_Shift` zero) is solved as the Gamma point of its supercell (`SCF/kpoint_supercell.py`; the energies of the mesh with the Bloch kinetic term) | `off` (default) |
 | `PARSEC_SUPERCELL_KPOINTS` | `auto`: a Gamma-point cell that repeats a smaller orthorhombic one is solved as that cell with the Gamma-centred mesh of the repeats (`SCF/kpoint_supercell.py`; the same energies) | `off` (default) |
+| `PARSEC_KPOINT_SECTORS` | `auto` (default, since 2026-11-16): the k-points of a scalar periodic SCF on a bulk orthorhombic cell are split into the sectors of the commuting involutions of their little groups (`SCF/kpoint_sectors.py`): each k-point becomes several eigenproblems of a fraction of its rows and states, the same spectrum; a k-point whose basis holds fewer than 2^24 entries (rows times states) or whose sectors would not halve its work stays whole; see "The sectors of a k-point" | `off`: one task per k-point, bit for bit as before |
+| `PARSEC_KPOINT_SECTOR_MARGIN` | `1.3` (default): the states of a sector over its share `M n_s / N` of the states of its k-point (plus six); a sector that does not reach the highest level the k-point keeps gets 1.5 times its states and the step is solved again | a number of at least 1 |
+| `PARSEC_SECTOR_DEVICE_POOL` | `auto` (default, since 2026-11-16, experimental runner): where the sectors of a rank do not divide its devices evenly (three sectors on four GPUs), every sector of the rank spreads over all its devices, one after another, instead of disjoint groups that leave a whole sector on one device (diamond n = 20 on 16 A100: 176.6 s and 50.1 GiB per GPU instead of 195.5 s and 52.2 GiB; n = 16 61.8 s / 17.9 GiB instead of 64.1 / 15.2) | `off`: disjoint groups, as before |
 | `PARSEC_PERIODIC_SETUP_DEVICE` | `auto` (since 2026-11-16): the local ionic potential of a bulk cell of the default routines with diagonal lattice vectors on the device where the run has one: the structure-factor series as the same blocked product and FFT, the short-ranged terms gathered per grid point from the images in the neighbouring bins (`V_ion/periodic_local_device.py`; the host sums to round-off) | `off`: the host sums, bit for bit |
 | `PARSEC_MPI_SHARED_EIGH_HELPER` | `on`: under the block route the root of a basis that three or more ranks share hands the eigensolve of its small solve to another rank (the whitened matrix there and the eigenvectors back, solved in that rank's summed pair), and the condition helper estimates on its own summed overlap instead of a copy; the same bits (bulk diamond on 16 A100, Gamma point, 5,832 atoms: 41.9 -> 38.3 GiB at the fullest GPU, 303.4 and 302.7 s). The block route forms the whitening in the summed pair either way; with both and the pool that the planner now chooses, 8,000 atoms took 71.6 -> 68.1 GiB and 657.9 -> 651.5 s on the same nodes | `off`: the eigensolve and a copy of the overlap on the root and the helper, as before |
 | `PARSEC_SPINOR_FILTER_COLUMNS` | `32` in the k-point pools, `64` on one device: columns per chunk of the filter recurrence, of `H X` and of the residuals; the random start basis is drawn 64 columns at a time whatever the chunk (bulk diamond on 16 A100, same nodes, energies the same to the digits printed: 1,728 atoms 33.1 -> 26.9 GiB, 216.6 -> 197.4 s; 2,744 atoms 63.5 -> 54.8 GiB, 622.6 -> 606.6 s; 1,000 atoms with a 4x4x4 mesh 162.1 -> 138.3 s) | `64`: the chunk of the pools before (their start basis was drawn by chunks, so another chunk started from another basis) |
@@ -3068,7 +3071,75 @@ orthorhombic cell runs as that cell with the Gamma-centred mesh of the repeats
 and the Bloch form (an explicit `PARSEC_KPOINT_KINETIC=gradient` refuses it).
 The output reports what was solved, and a note gives the factor between the
 two total energies; a mesh run as its supercell gives the energies of the Bloch
-form, not those of the default gradient form.
+form, not those of the default gradient form. The cell of the second route takes
+`1/M` of the supercell's states and six more per k-point, which keep the
+filters of the small eigenproblems away from the occupied levels (unoccupied:
+the energies stay those of the supercell). Diamond of 21 x 21 x 21 cubes
+(74,088 atoms) runs this way as one cube with the 21 x 21 x 21 mesh (4631
+irreducible k-points) in 1449 s on 16 A100 with 4.4 GB per GPU, at
+-11.4039349 Ry per atom; the Gamma point of that supercell does not fit 16 A100
+(an odd number of cubes along each axis gives no half-cell translations: five
+sectors, about 175 GB on the fullest GPU by the estimate).
+
+#### The sectors of a k-point
+
+The Bloch Hamiltonian of a k-point acts on the periodic factor `u` (the u
+gauge). An operation `r -> R r + t` of the cell (a signed permutation of the
+orthorhombic cell with a translation of whole grid steps: the point group about
+the origin, the half-cell translations of a cell that repeats a smaller one, and
+the operations with a fraction of the cell as translation where they close into a
+group, as at the Gamma point) permutes the grid points and commutes with `H`; it
+moves the phase `e^{ik.r}` to `e^{i(Rk).(r - t)}`, so where `R k = k` it commutes
+with `H_k` as well. `R k = k` exactly, not modulo a reciprocal lattice vector:
+neither discretization of the kinetic term of a k-point is invariant under the
+change of gauge that `R k = k + G` would need. On the grid each term commutes:
+the stencils of a uniform periodic grid are invariant under its translations and
+turn under `R` as a scalar and a vector (`k.grad` is invariant where `R^T k = k`),
+and the Bloch projectors of an atom go over into those of its image times one
+constant phase, which drops out of `B D B^H`. These operations form the little
+group `G_k`; its largest subgroup `H_k` of commuting involutions (the half-cell
+translations, the twofold axes and the mirrors that fix `k`) has the real
+characters `+-1`, so the sector bases of the Gamma point (real) reduce the complex
+Hermitian `H_k` the way they reduce a real symmetric operator, from the
+representative rows (`ReflectionRepresentationDecomposition.reduce_hermitian_operators`),
+and the projectors of one atom per orbit of `H_k` serve every sector. The spectrum
+of `H_k` is the union of the sector spectra (silicon cube, seven k-points, both
+kinetic forms: the lowest 30 levels to 1e-13 Ry): each k-point becomes `|H_k|`
+eigenproblems of about `1/|H_k|` of its rows and states, and the work of its
+eigensolver (rows times states squared) falls by about `|H_k|^2`.
+
+The potential must be invariant under the operations: an operation is taken where
+the density is symmetrized over a group that holds it (`Symmetrize_Charge_Density`,
+the wedge of a reduced mesh), where the k-point set maps onto itself under its
+`R` (with time reversal, modulo the reciprocal lattice, at equal weights), or for
+a translation of the cell (every `rho_k` is invariant under it), and the group
+those generate; the sector Hamiltonian takes the potential averaged over each
+orbit (its invariant part). A sector of `n_s` of the `N` rows solves
+`ceil(c M n_s / N) + 6` states (`M` the states of the k-point, `c` =
+`PARSEC_KPOINT_SECTOR_MARGIN`, 1.3) and the k-point keeps the lowest `M` levels
+of the union; after each solve every sector with fewer states than rows must
+reach the `M`-th level of the union, else it gets 1.5 times its states and the
+step is solved again. The density of a sector, `|U v|^2`, is expanded on the
+host and summed by the job of the driver. The scalar k-point SCF takes the split
+(no spin, hybrid, meta-GGA, LDA+U, forces, fixed occupations or kept orbitals);
+the tasks of the k-point pools are then the sectors, the largest first.
+
+On the device the complex matrices of a sector (its reduced kinetic term, with
+`|k|^2` and the potential in the same pass, and its reduced projectors) are of
+no stencil form; the CuPy product of a complex CSR matrix and a row-major block
+(cuSPARSE, with layout conversions) ran about forty times below the stencil
+kernel per row and column, so a kernel of their own forms one entry of the
+result per thread along the columns of a row (`Hamiltonian/complex_csr_device.py`;
+rows of many entries, the adjoint of the projectors, split over 32 lanes summed
+in a fixed tree). Only the operators of the sectors take it; every other operator
+keeps the products of before. On 16 A100 (diamond, Gamma-centred meshes reduced
+by Td and time reversal, the density symmetrized): 6 x 6 x 6 cubes with the
+3 x 3 x 3 mesh 18.0 s instead of 195.7 s (6.0 instead of 26.5 GiB per GPU),
+7 x 7 x 7 cubes with the 2 x 2 x 2 mesh 119.6 s instead of 586.1 s (20.3 instead
+of 54.1 GiB), total energies within 8e-6 Ry of the runs without sectors (the
+convergence criterion of these inputs is 2e-4 Ry); with the 2 x 2 x 2 mesh
+8 x 8 x 8 cubes (4,096 atoms) take 105.6 s and 10 x 10 x 10 cubes (8,000 atoms)
+404.7 s (51.0 GiB per GPU; `examples/3d_diamond_benchmark/README.md`).
 
 #### ARPACK, Dynamic_Diag_Tol, Fix_Number_Eigenvalues and the TEST mode
 

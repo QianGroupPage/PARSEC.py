@@ -51,6 +51,7 @@ from parsec_python.SCF.kpoint_solver import (
     device_solver_supports,
     job_eigval_settings,
     residual_max,
+    task_states,
 )
 
 from ..Eigensolvers.chebff_columns import (
@@ -279,6 +280,25 @@ def _host(value) -> np.ndarray:
     return np.asarray(get() if get is not None else value)
 
 
+def _column_major(array) -> bool:
+    """Whether ``array`` is column-major and not also row-major (the bases of the block route)."""
+    flags = getattr(array, "flags", None)
+    return flags is not None and bool(flags.f_contiguous) and not bool(flags.c_contiguous)
+
+
+def _download(backend, array) -> np.ndarray:
+    """A host copy of a device array in its own layout.
+
+    A copy to the host comes back row-major, so a column-major array (the basis of the block route) is first
+    copied row-major on the device: a second basis on the device at the moment the first is moved off it (a
+    sector of 1.06 million rows and 3805 states of diamond 9 x 9 x 9, 65 GB on an 80 GB A100, failed so).  Its
+    transpose is row-major already: copied as it is, and transposed back on the host (a view).
+    """
+    if _column_major(array):
+        return backend.asnumpy(array.T).T
+    return backend.asnumpy(array)
+
+
 class MPIPoolKPointSolver:
     """Solves a :class:`KPointJob` on pools of MPI ranks (see the module text).
 
@@ -351,7 +371,9 @@ class MPIPoolKPointSolver:
     def _set_up(self, settings) -> None:
         """Form the pools (collective: every rank calls it at its first solve)."""
         context = self.context
-        working = min(self.job.number_of_states + int(settings.safety_buffer), self.problem_size)
+        # the largest basis of a task (the sectors of the k-points have their own counts)
+        most = max(task_states(self.job, task) for task in range(self.job.n_tasks))
+        working = min(most + int(settings.safety_buffer), self.problem_size)
         block = int(settings.subspace.block_size)
         plan = None
         failure = None
@@ -422,9 +444,9 @@ class MPIPoolKPointSolver:
         backend.use()
         found: dict[int, np.ndarray] = {}
         residuals: dict[int, float] = {}
-        requested = self.job.number_of_states
         order = self._solve_order()
         for task in order:
+            requested = task_states(self.job, task)
             start = time.perf_counter()
             hamiltonian = self.job.make_hamiltonian(task, potentials)
             self._tick("hamiltonian", start)  # the Bloch projectors of a k-point on first use
@@ -434,6 +456,7 @@ class MPIPoolKPointSolver:
             if not self.static_bytes:
                 self.static_bytes = _static_device_bytes(operator)
             state = self.states.pop(task, None)
+            self._release_cached()
             self._resident(state)
             start = time.perf_counter()
             result = solve_column_eigval(
@@ -484,9 +507,10 @@ class MPIPoolKPointSolver:
                 host = np.array(_host(value), copy=True)
                 total[name] = total[name] + host if name in total else host
 
-        requested = self.job.number_of_states
         for task in self.tasks:
+            requested = task_states(self.job, task)
             state = self.states[task]
+            self._release_cached()
             vectors = self._device_vectors(state)
             values = np.asarray(occupations[task], dtype=np.float64)
             count = min(requested, values.size)
@@ -577,9 +601,21 @@ class MPIPoolKPointSolver:
         if self._stays_on_device(task):
             return
         start = time.perf_counter()
-        state.vectors = self.backend.asnumpy(state.vectors)
+        state.vectors = _download(self.backend, state.vectors)
         self._tick("spill", start)
         self._note_host()
+
+    def _release_cached(self) -> None:
+        """Return the unused blocks of CuPy's pool to the device before a subspace is laid out on it (host storage).
+
+        A subspace moved to the host leaves its block in the pool; the arrays of the next task are cut out of it,
+        and while they live the block cannot be given back, so a subspace as large coming back from the host needs
+        a second block, which a subspace of more than half the device does not find.  Released before every solve
+        and every density of a task, each subspace takes a block of its own (the same numbers).
+        """
+        if self.xp is np or not self.host_storage:
+            return
+        self.backend.cp.get_default_memory_pool().free_all_blocks()
 
     def _resident(self, state) -> None:
         """Bring the subspace of ``state`` back to the device before its solve.
@@ -598,7 +634,9 @@ class MPIPoolKPointSolver:
         """The subspace of ``state`` on the device (a copy of a host one, released after use)."""
         if isinstance(state.vectors, np.ndarray) and self.xp is not np:
             start = time.perf_counter()
-            vectors = self.backend.asarray(state.vectors)
+            host = state.vectors
+            # a column-major host copy goes up as it is (no row-major copy of it on the host first)
+            vectors = self.xp.asarray(host, order="F") if _column_major(host) else self.backend.asarray(host)
             self._tick("restore", start)
             return vectors
         return state.vectors

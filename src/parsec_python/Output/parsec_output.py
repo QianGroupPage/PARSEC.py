@@ -3224,6 +3224,17 @@ class ParsecTextReporter:
             lines.append(" Eigensolver counters")
             for key, label in present:
                 lines.append(f"   {label:28s} : {int(detail[key]):12d}")
+        # the k-points in the sectors of their little groups (acceleration/SCF/kpoint_sectors.py)
+        if "kpoint_sector_tasks" in detail:
+            lines.append(
+                f" {'K-point sectors':30s} : {int(detail['kpoint_sector_tasks']):12d}"
+                f"   tasks ({int(detail.get('kpoint_sector_kpoints', 0))} k-point(s) split, largest group"
+                f" {int(detail.get('kpoint_sector_largest_group', 0))})"
+            )
+            lines.append(
+                f" {'Rows x states^2 of the whole':30s} : {detail.get('kpoint_sector_work_fraction', 0.0):12.4f}"
+                f"   (states added and solved again {int(detail.get('kpoint_sector_regrowths', 0))} time(s))"
+            )
         lines.append(" --------------------------------------------------")
         return lines
 

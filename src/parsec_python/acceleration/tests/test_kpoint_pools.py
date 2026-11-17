@@ -9,7 +9,8 @@ so the checks run without MPI or a GPU:
   exchanges in many rounds, through a first solve and SUBSPACE steps, and for a converged first solve;
 * the pools (:func:`..SCF.kpoint_pools.plan_pools`) are balanced and fit the memory;
 * the scalar and the collinear-spin k-point SCF on pools of one and of several ranks give the energy,
-  eigenvalues and density of the one-process run.
+  eigenvalues and density of the one-process run, and so do the sectors of the k-points
+  (:mod:`..SCF.kpoint_sectors`) as the tasks of the pools.
 
 The same solver under MPI with CuPy runs in the diamond cases of examples/3d_diamond_benchmark/run_mpi_kpoints.py.
 """
@@ -275,6 +276,28 @@ class AutoRouteTests(unittest.TestCase):
                 kpoint_ritz_route()
 
 
+class SpillLayoutTests(unittest.TestCase):
+    def test_a_column_major_basis_goes_to_the_host_without_a_row_major_copy(self) -> None:
+        # the copy to the host asks for row-major data: a column-major basis is given as its transpose
+        from parsec_python.acceleration.SCF.kpoint_pools import _column_major, _download
+
+        seen = []
+
+        class Backend:
+            def asnumpy(self, array):
+                seen.append(bool(array.flags.c_contiguous))
+                return np.array(array, copy=True)
+
+        rng = np.random.default_rng(1)
+        basis = np.asfortranarray(rng.normal(size=(40, 7)) + 1j * rng.normal(size=(40, 7)))
+        host = _download(Backend(), basis)
+        np.testing.assert_array_equal(host, basis)
+        self.assertTrue(_column_major(host))
+        rows = np.ascontiguousarray(basis)
+        np.testing.assert_array_equal(_download(Backend(), rows), rows)
+        self.assertEqual(seen, [True, True])
+
+
 class PooledSCFTests(unittest.TestCase):
     def _check(self, name: str, ranks: int, pools: int, tolerance: float, route: str = "rows") -> None:
         report = _check("scf", name, str(ranks), str(pools), f"route={route}")
@@ -307,6 +330,21 @@ class PooledSCFTests(unittest.TestCase):
 
     def test_block_route_spin_two_pools_of_two_ranks(self) -> None:
         self._check("spin_polarized", ranks=4, pools=2, tolerance=1.0e-8, route="block")
+
+    def test_sectors_of_the_k_points_on_pools(self) -> None:
+        # the 56 sectors of the eight k-points of the silicon cube as the tasks of three pools of one rank and of
+        # one pool of two ranks (every basis shared by columns)
+        for ranks, pools in ((3, 3), (2, 1)):
+            report = _check("sectors", str(ranks), str(pools))
+            serial = report["serial"]
+            self.assertGreater(serial["tasks"], 8.0)
+            for result in report["pooled"]:
+                self.assertTrue(result["converged"])
+                self.assertEqual(result["tasks"], serial["tasks"])
+                self.assertEqual(result["iterations"], serial["iterations"])
+                self.assertAlmostEqual(result["energy"], serial["energy"], delta=1.0e-8)
+            for result in report["pooled"][1:]:
+                self.assertEqual(result["energy"], report["pooled"][0]["energy"])
 
 
 if __name__ == "__main__":

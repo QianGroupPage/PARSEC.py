@@ -12,8 +12,10 @@ translation)``, its norm, the radial table at ``max(r, r_1)``, the harmonics of 
 times both), evaluated element by element, so the matrix is the reference's array for array: the same columns and
 labels in the same order, the rows of a column ascending, the same values.  The reference sums an entry that two
 images of one atom put on the same row (COO to CSC); a cell less than twice the support radius wide, where that can
-happen, keeps the reference, as do k-points, the double grid, wires and slabs, oblique cells, the Fortran-derived
-routines and potentials other than :class:`~parsec_python.Pseudopotential.ParsecPseudopotential`.
+happen, keeps the reference, as do the double grid, wires and slabs, oblique cells, the Fortran-derived
+routines and potentials other than :class:`~parsec_python.Pseudopotential.ParsecPseudopotential`.  A k-point takes
+the reference's Bloch phase ``exp(-ik.(r - T))`` of every entry (the same expression on the same numbers; the
+matrix product of the phase may round differently with another BLAS: the tests allow 1e-15 of the largest).
 """
 
 from __future__ import annotations
@@ -140,8 +142,10 @@ def batched_nonlocal_projectors(
     :func:`~parsec_python.V_ion.ionic_potential.build_nonlocal_projectors`, or ``None`` for an input it does not
     take (the reference then runs)."""
 
-    if k_point is not None or lattice_vectors is None or periodic_dimensions != 3:
+    if lattice_vectors is None or periodic_dimensions != 3:
         return None
+    # a k-point: the Bloch projectors of the reference, each image times exp(-ik.(r - T)) (complex)
+    k = None if k_point is None else np.asarray(k_point, dtype=float)
     shape = _row_major_box(grid)
     if shape is None:
         return None
@@ -214,7 +218,8 @@ def batched_nonlocal_projectors(
             atom_of_entry = members[member_of_pair[pair]]
             # the rows of an atom ascending (its images in turn give each its own ascending run)
             order = np.argsort(atom_of_entry * size + rows, kind="stable")
-            found[symbol] = (atom_of_entry[order], rows[order], relative[order], distances[order])
+            image = None if k is None else translations[translation_of_pair[pair]][order]
+            found[symbol] = (atom_of_entry[order], rows[order], relative[order], distances[order], image)
             counts += np.bincount(atom_of_entry - block_first, minlength=block_last - block_first)
         return found, counts
 
@@ -222,7 +227,9 @@ def batched_nonlocal_projectors(
         """``(columns, rows, values)`` of the block, by column and in each column by row."""
         block_first, _ = block
         block_rows, block_columns, block_values = [], [], []
-        for symbol, (atom_of_entry, rows, relative, distances) in found.items():
+        for symbol, (atom_of_entry, rows, relative, distances, image) in found.items():
+            # the reference's phase of each entry: exp(-1j * ((r - T) @ k)) for the translation T of its image
+            phase = 1.0 if k is None else np.exp(-1j * ((coordinates[rows] - image) @ k))
             potential, _, _, channels, _ = species[symbol]
             base = first_column[atom_of_entry - block_first]
             channel_offset = 0
@@ -236,14 +243,14 @@ def batched_nonlocal_projectors(
                 )
                 for harmonic_index in range(2 * angular_momentum + 1):
                     # the reference's phase * (sqrt(dV) * radial * Y), its phase 1.0 at Gamma
-                    projector = 1.0 * (sqrt_dv * radial * harmonics[:, harmonic_index])
+                    projector = phase * (sqrt_dv * radial * harmonics[:, harmonic_index])
                     keep = np.abs(projector) > 1.0e-16
                     block_rows.append(rows[keep])
                     block_columns.append(base[keep] + channel_offset + harmonic_index)
                     block_values.append(projector[keep])
                 channel_offset += 2 * angular_momentum + 1
         if not block_rows:
-            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0)
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0, dtype=float if k is None else complex)
         columns = np.concatenate(block_columns)
         order = np.argsort(columns, kind="stable")
         return columns[order], np.concatenate(block_rows)[order], np.concatenate(block_values)[order]
@@ -280,14 +287,14 @@ def batched_nonlocal_projectors(
     pieces_values = [piece[2] for piece in pieces]
 
     if column == 0:
-        matrix = sp.csc_matrix((size, 0), dtype=float)
+        matrix = sp.csc_matrix((size, 0), dtype=float if k is None else complex)
     else:
         columns = np.concatenate(pieces_columns) if pieces_columns else np.empty(0, dtype=np.int64)
         index_type = np.int32 if max(size, columns.size, column) < 2**31 else np.int64
         indptr = np.zeros(column + 1, dtype=index_type)
         np.cumsum(np.bincount(columns, minlength=column), out=indptr[1:])
         rows = np.concatenate(pieces_rows).astype(index_type, copy=False) if pieces_rows else np.empty(0, index_type)
-        values = np.concatenate(pieces_values) if pieces_values else np.empty(0)
+        values = np.concatenate(pieces_values) if pieces_values else np.empty(0, dtype=float if k is None else complex)
         matrix = sp.csc_matrix((values, rows, indptr), shape=(size, column))
         matrix.has_canonical_format = True
     return _ionic.NonlocalProjectorOperator(

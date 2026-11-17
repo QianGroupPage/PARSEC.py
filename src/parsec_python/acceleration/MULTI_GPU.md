@@ -356,6 +356,14 @@ the settings of the grid and the prepared grid (point counts, step, shift)
 before the SCF. `timing.json` has `result.domain` and `result.hartree_boundary`
 null for a cell and a note that says so.
 
+With k-points `parsec_python/main.py --mpi` runs the cell: its ranks form
+pools of k-points, and since 2026-11-16 the k-points of a scalar SCF on a large
+bulk orthorhombic cell are split into the sectors of their little groups
+(`PARSEC_KPOINT_SECTORS=auto`, `SCF/kpoint_sectors.py`; README "The sectors of
+a k-point"), which become the tasks of the pools, the largest first (diamond
+7 x 7 x 7 cubes, 2 x 2 x 2 mesh, 16 A100: 119.6 s and 20.3 GiB per GPU instead of
+586.1 s and 54.1 GiB).
+
 What does not run there is refused by name before any rank prepares
 (`driver.periodic_sector_refusal`, `_refuse_unsupported_periodic` of the
 runner): k-points beyond Gamma (`parsec_python/main.py --mpi`, whose ranks

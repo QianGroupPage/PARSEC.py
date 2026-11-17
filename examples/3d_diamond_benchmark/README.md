@@ -194,6 +194,32 @@ others in host memory (51 GB per rank at the peak), and all 16 ranks share every
 n = 6 (P = 4): 74.6 GB by nvidia-smi, the estimate of the code 69 GB per GPU. The first k-point run of an allocation
 compiles the device kernels of the Bloch operator (2x2x2 n = 2: 38 s the first time, 2.3 s warm).
 
+### k-points in the sectors of their little groups (2026-11-16)
+
+Each k-point of the wedge is split into the sectors of the commuting involutions of its little group: the
+translations by half the cell (all seven for an even n, the three face-centring ones for an odd n), the twofold
+axes and mirrors of Td that fix k (`PARSEC_KPOINT_SECTORS=auto`, the default; `src/parsec_python/acceleration/README.md`,
+"The sectors of a k-point"). The sectors of all k-points are the tasks of the k-point pools, the largest first; their
+complex matrices run in a CSR kernel of their own on the device. The same inputs and launch as the table above (the
+default routines, 18 points per cubic edge, the mesh reduced by Td and time reversal, the density symmetrized), first
+runs; "before" is the code before the sectors (the path of `PARSEC_KPOINT_SECTORS=off`):
+
+| n | atoms | mesh (k) | SCF iterations | program (s) | first step (s) | later step (s) | GPU (GiB) | before (s) | before, GPU (GiB) | E/atom (Ry) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 6 | 1,728 | 3x3x3 (4) | 8 | 18.0 | 7.7 | 1.05 | 6.0 | 195.7 | 26.5 | -11.4039207 |
+| 7 | 2,744 | 2x2x2 (4) | 8 | 119.6 | 45.6 | 10.2 | 20.3 | 586.1 | 54.1 | -11.4039172 |
+| 8 | 4,096 | 2x2x2 (4) | 8 | 105.6 | 46.7 | 6.8 | 14.8 | - | - | -11.4039214 |
+| 10 | 8,000 | 2x2x2 (4) | 8 | 404.7 | 144.2 | 35.8 | 51.0 | - | - | -11.4039262 |
+
+The energies of the first two rows are those without sectors within 8e-6 Ry in total (the convergence criterion of
+these inputs is 2e-4 Ry). An even n is faster than the odd n below it: its seven translations give each k-point
+twice the sectors. n = 10 keeps two of the four subspaces of a rank on its GPU and the others in host memory (37 GiB
+per rank). n = 9 (5,832 atoms) does not run yet: an odd n has the three face-centring translations only, so two of its
+k-points have four sectors each, of 1.06 million rows and 3,805 states (65 GB a basis). The pools plan every task as
+large as the largest one, so with one rank per pool those bases had to leave the GPU for host memory, four of them
+on one node, more than it has; with four ranks per pool (`--kpoint-pools 4`) the SCF ran five steps (207 s, then
+51 s each) before a rank stopped. Planning the pools by the size of each task is the next step.
+
 ### Scaling on one size
 
 | case | 1 GPU | 4 GPUs (1 node) | 8 GPUs (2 nodes) | 16 GPUs (4 nodes) |

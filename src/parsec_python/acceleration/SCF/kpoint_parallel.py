@@ -44,6 +44,7 @@ from parsec_python.SCF.kpoint_solver import (
     job_eigval_settings,
     residual_max,
     set_parallel_backend,
+    task_states,
 )
 
 from ..Eigensolvers.chebff_spinor import SpinorEigvalState, solve_spinor_eigval
@@ -170,7 +171,7 @@ class _SolveWorker:
         start = time.perf_counter()
         operator = self.converter.operator(hamiltonian)
         self._tick("upload", start)
-        requested = self.job.number_of_states
+        requested = task_states(self.job, task)
         solve_start = time.perf_counter()
         state = self.states.pop(task, None)
         self.vectors.pop(task, None)  # release the previous basis before the next one is made
@@ -258,7 +259,7 @@ class _SolveWorker:
             start = time.perf_counter()
             solution = solve_eigval(
                 operator,
-                self.job.number_of_states,
+                task_states(self.job, task),
                 settings=settings,
                 state=self.states.get(task),
             )
@@ -519,7 +520,16 @@ def make_solver(job: KPointJob, **options):
     """The solver of a k-point job: in an MPI run (``PARSEC_MPI=1``) the pools of ranks
     (:class:`.kpoint_pools.MPIPoolKPointSolver`), or for a job with per-task extras (the spin-orbit and
     non-collinear drivers, forces) the basis split by rows over the ranks (:class:`.kpoint_mpi.MPIKPointSolver`);
-    else the pool of threads and devices of this process."""
+    else the pool of threads and devices of this process.  A job whose k-points split into the sectors of their
+    little groups (``PARSEC_KPOINT_SECTORS``, :mod:`.kpoint_sectors`) gets that solver of its sectors."""
+    from .kpoint_sectors import sector_solver
+
+    solver = sector_solver(job, _plain_solver, **options)
+    return _plain_solver(job, **options) if solver is None else solver
+
+
+def _plain_solver(job: KPointJob, **options):
+    """The solver of :func:`make_solver` with one task per k-point (or per task of the job)."""
     if mpi.context() is not None:
         if job.extras is None and options.get("problem_size") is not None:
             from .kpoint_pools import MPIPoolKPointSolver

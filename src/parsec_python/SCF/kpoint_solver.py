@@ -45,6 +45,20 @@ class KPointJob:
     make_hamiltonian: Callable[[int, dict], Any]
     accumulate: Callable[[int, np.ndarray, np.ndarray], dict[str, np.ndarray]]
     extras: Callable[[int, np.ndarray], Any] | None = None
+    # The number of states of every task where they differ (the sectors of the k-points,
+    # parsec_python.acceleration.SCF.kpoint_sectors); None: number_of_states for every task.
+    states_per_task: tuple[int, ...] | None = None
+    # What a solver that splits the k-points into the sectors of their little groups needs: a dict with the grid,
+    # the atoms of the cell, the Cartesian k-points and whether the density is the only part of ``accumulate``
+    # (set by the scalar k-point SCF); None: no such splitting.
+    geometry: Any = None
+
+
+def task_states(job: "KPointJob", task: int) -> int:
+    """The number of states of ``task``: ``states_per_task[task]`` where given, else ``number_of_states``."""
+    if job.states_per_task is not None:
+        return int(job.states_per_task[task])
+    return int(job.number_of_states)
 
 
 class SerialKPointSolver:
@@ -74,7 +88,7 @@ class SerialKPointSolver:
             operator = self.job.make_hamiltonian(task, potentials).as_linear_operator()
             solution = solve_eigval(
                 operator,
-                self.job.number_of_states,
+                task_states(self.job, task),
                 settings=settings,
                 state=self.states.get(task),
             )
@@ -280,6 +294,7 @@ def map_tasks(
 
 
 __all__ = [
+    "task_states",
     "DEVICE_FIRST_SOLVERS",
     "KPointJob",
     "SerialKPointSolver",

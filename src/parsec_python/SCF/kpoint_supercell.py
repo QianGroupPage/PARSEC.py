@@ -153,7 +153,7 @@ def kpoints_of_supercell(problem, tolerance: float = 1.0e-7):
 
     The repeats ``m_a`` are the largest whole divisions of each axis whose translation maps the atoms (species by
     species, modulo the cell); the smaller cell keeps the atoms in it, ``1/M`` of the states (at least as many per
-    k-point as the occupied ones need, rounded up), and the Gamma-centred mesh ``m_1 x m_2 x m_3``.  ``None``
+    k-point, rounded up, and six more for the filters), and the Gamma-centred mesh ``m_1 x m_2 x m_3``.  ``None``
     under ``PARSEC_SUPERCELL_KPOINTS=off``, with k-points already, without a repeat, where the cell's grid would not
     repeat into the supercell's, under an explicit ``PARSEC_KPOINT_KINETIC=gradient`` (the caller runs the mesh with
     ``bloch``, which reproduces the supercell), and for what :func:`supercell_of_trim_mesh` refuses besides the mesh.
@@ -189,7 +189,8 @@ def kpoints_of_supercell(problem, tolerance: float = 1.0e-7):
     ]
     if len(atoms) * count != len(problem.atoms):
         return None
-    states = int(np.ceil(int(problem.scf.number_of_states) / count))
+    # 1/M of the states and six more per k-point for the filters (unoccupied: the energies are those of the supercell)
+    states = int(np.ceil(int(problem.scf.number_of_states) / count)) + 6
     cell = replace(
         problem,
         atoms=[type(atom)(atom.symbol, tuple(np.mod(np.asarray(atom.position, float), sides))) for atom in atoms],

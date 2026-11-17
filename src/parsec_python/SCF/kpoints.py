@@ -424,6 +424,29 @@ def run_scf_kpoints(
             len(cell_atoms),
         )
 
+    # What a solver that splits the k-points into the sectors of their little groups needs
+    # (acceleration/SCF/kpoint_sectors.py): a loop whose job forms the density alone and keeps no orbitals.
+    sector_geometry = None
+    if (
+        exchange_term is None
+        and hubbard is None
+        and meta is None
+        and not compute_forces
+        and not keep_wavefunctions
+        and not keep_states
+        and keep_vectors is None
+        and settings.fixed_occupations is None
+        and getattr(warm_start, "level_tolerance", None) is None
+        and not getattr(warm_start, "eigensolver_state", None)
+    ):
+        sector_geometry = {
+            "grid": system.grid,
+            "atoms": tuple(cell_atoms),
+            "k_points": np.asarray(k_points, dtype=np.float64),
+            "weights": np.asarray([weighting.of_k(task) for task in range(n_kpoints)], dtype=np.float64),
+            "lattice": np.asarray(lattice_vectors, dtype=np.float64),
+            "density_symmetry": density_symmetry,
+        }
     with timer.stage("solver_setup"):
         solver = make_kpoint_solver(
             KPointJob(
@@ -433,6 +456,7 @@ def run_scf_kpoints(
                 make_hamiltonian,
                 accumulate,
                 extras=kpoint_nonlocal_force if compute_forces else None,
+                geometry=sector_geometry,
             ),
             problem_size=system.grid.size,
             backend=kpoint_backend(system) if backend is None else backend,

@@ -167,6 +167,18 @@ class HalfCellTranslationTests(unittest.TestCase):
         reduction = _reduction(grid, atoms, "auto")
         self.assertIsNone(getattr(reduction, "translations", None))
 
+    def test_a_species_of_one_atom_off_the_origin(self) -> None:
+        # the operations that need a translation by a fraction of the cell are searched with the atoms of the
+        # smallest species after its first one: a species of one atom has none (this indexed past it before)
+        from parsec_python.acceleration.Symmetry.axis_reflection import _space_group_operations
+
+        grid = build_periodic_grid(PeriodicCell(8.0 * np.eye(3)), PeriodicGridSettings(spacing=0.5, expansion_order=4))
+        matrices, shifts = _space_group_operations(grid, [Atom("Au", (1.0, 1.0, 1.0))], 1.0e-7, 1.0e-10)
+        self.assertEqual(len(matrices), 48)
+        inversion = next(index for index, matrix in enumerate(matrices) if np.array_equal(matrix, -np.eye(3)))
+        # r -> -r + t carries (1, 1, 1) bohr onto itself with t = (2, 2, 2) bohr: four steps of 0.5 bohr
+        np.testing.assert_array_equal(shifts[inversion], [4, 4, 4])
+
     def test_the_plan_of_the_group(self) -> None:
         # Td about an atom of diamond with the translations of a 2 x 2 x 2 supercell, as affine matrices
         grid, atoms = _supercell((2, 2, 2), points=8)

@@ -2,13 +2,16 @@
 
     python -m parsec_python.acceleration.tests.pool_check eigensolver METHOD SIZES STEPS [EXCHANGE_BYTES]
     python -m parsec_python.acceleration.tests.pool_check scf DRIVER RANKS POOLS
+    python -m parsec_python.acceleration.tests.pool_check sectors RANKS POOLS
 
 Run it with ``OPENBLAS_NUM_THREADS=1`` (test_kpoint_pools.py does): the package imports NumPy before
 this module, so the settings below come too late for the BLAS of a ``-m`` run (:mod:`.thread_mpi`).  The
 device code runs on the host (``numpy-device``).  ``eigensolver`` compares the shared-column eigensolver on each number of
 ranks of ``SIZES`` (``1,2,3``) with the one-device solver over ``STEPS`` solves; ``scf`` runs the k-point
 driver ``DRIVER`` of ``test_kpoint_parallel.DRIVERS`` on ``RANKS`` ranks in ``POOLS`` pools and in one
-process.
+process, with one task per k-point (``PARSEC_KPOINT_SECTORS=off``); ``sectors`` the scalar SCF of the silicon cube
+with the eight time-reversal invariant k-points split into the sectors of their little groups
+(:mod:`..SCF.kpoint_sectors`), the same on the pools and in one process.
 """
 
 from __future__ import annotations
@@ -22,6 +25,8 @@ for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
 os.environ["PARSEC_KPOINT_BACKEND"] = "numpy-device"
 os.environ["PARSEC_KPOINT_WORKERS"] = "1"
 os.environ.pop("PARSEC_MPI", None)
+# the checks of the pools compare one task per k-point; ``sectors`` turns the split on for its runs
+os.environ["PARSEC_KPOINT_SECTORS"] = "off"
 
 import threading  # noqa: E402
 from unittest import mock  # noqa: E402
@@ -143,6 +148,42 @@ def check_scf(name: str, ranks: int, pools: int) -> dict:
     return {"serial": serial, "pooled": pooled}
 
 
+def check_sectors(ranks: int, pools: int) -> dict:
+    """The scalar SCF of the silicon cube at the eight time-reversal invariant k-points, its k-points in the sectors
+    of their little groups: the pools (tasks: the sectors) against one process."""
+    from dataclasses import replace
+
+    from parsec_python.acceleration.SCF import kpoint_sectors
+    from parsec_python.acceleration.SCF.kpoint_sectors import sector_solver
+    from parsec_python.acceleration.tests.test_periodic_point_group import silicon
+    from parsec_python.SCF.kpoints import run_scf_kpoints
+    from parsec_python.SCF.pbc import prepare_periodic_single_point
+
+    os.environ["PARSEC_KPOINT_SECTORS"] = "auto"
+    kpoint_sectors._MINIMUM_ENTRIES = 0  # the small cube is split all the same
+    base = silicon("pbe", spacing=0.855)
+    base = replace(base, scf=replace(base.scf, convergence_criterion=1.0e-7))
+    system = prepare_periodic_single_point(base)
+    side = float(np.asarray(base.periodic_cell.lattice_vectors)[0, 0])
+    k_points = np.array([np.array(bits, dtype=float) * np.pi / side for bits in np.ndindex(2, 2, 2)])
+    weights = np.full(8, 0.125)
+    result = run_scf_kpoints(system, k_points, weights)
+    serial = dict(_summary(result), tasks=float(result.timings.detail.get("kpoint_sector_tasks", 0.0)))
+
+    def solver(job, **options):
+        made = sector_solver(job, _thread_solver, **options)
+        return _thread_solver(job, **options) if made is None else made
+
+    def rank(context):
+        _LOCAL.context, _LOCAL.pools = context, pools
+        found = run_scf_kpoints(system, k_points, weights)
+        return dict(_summary(found), tasks=float(found.timings.detail.get("kpoint_sector_tasks", 0.0)))
+
+    with mock.patch("parsec_python.SCF.kpoints.make_kpoint_solver", solver):
+        pooled = run_ranks(ranks, rank)
+    return {"serial": serial, "pooled": pooled}
+
+
 def check_projectors(ranks: int) -> dict:
     """The Bloch projectors built with the atoms dealt over a pool of ``ranks`` ranks against one build."""
     import scipy.sparse as sp
@@ -187,6 +228,8 @@ def main() -> None:
         payload = check_eigensolver(sys.argv[2], sys.argv[3], int(sys.argv[4]))
     elif mode == "scf":
         payload = check_scf(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+    elif mode == "sectors":
+        payload = check_sectors(int(sys.argv[2]), int(sys.argv[3]))
     elif mode == "projectors":
         payload = check_projectors(int(sys.argv[2]))
     else:

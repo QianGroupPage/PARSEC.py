@@ -78,6 +78,66 @@ from .mpi_shared_basis import exchange_bytes, row_edges, shared_transport
 POOL_FILTER_COLUMNS = 32
 
 
+GENERALIZED_ENV = "PARSEC_KPOINT_GENERALIZED_RITZ"
+# The largest |(R^-H S R^-1 - I)_ij| of the equilibrated overlap S = R^H R that a generalized Rayleigh-Ritz pass
+# takes (about cond(S) * eps); a pass beyond it is done again with the shifted Cholesky QR.
+_GENERALIZED_AUDIT = 1.0e-10
+
+
+def generalized_ritz_setting() -> str:
+    """``PARSEC_KPOINT_GENERALIZED_RITZ``: ``auto`` (the default) or ``off``.
+
+    ``auto``: the SUBSPACE steps of the block route take the Rayleigh-Ritz of the filtered basis itself, the
+    overlap ``S = X^H X`` and ``A = X^H H X`` formed in the same pass, the generalized problem solved on the pool
+    root with its columns equilibrated (``D S D``, ``D = diag(S)^-1/2``; a filtered basis of Ritz vectors has
+    nearly orthogonal columns of very different lengths, so the equilibrated ``S`` is well conditioned; so do
+    the cycles of the first solve after the first, which start from the Ritz vectors of the cycle before):
+    ``R^H R = D S D``, ``eigh(R^-H D A D R^-1)``, ``C = D R^-1 V``, ``X <- X C``, in place of the three passes
+    of the shifted Cholesky QR before it (one Gram matrix in place of three and their triangular solves, and
+    no move of the basis to rows and back for them).  A pass whose ``R^-H D S D R^-1`` is further than
+    :data:`_GENERALIZED_AUDIT` from the identity (or whose factor fails) is done again with the Cholesky QR,
+    from the same filtered basis.  The first cycle of the first solve (a random start, filtered bases of ``cond``
+    up to ``1e10``) keeps the Cholesky QR.  Diamond on 16 A100 (2 x 2 x 2 mesh, SUBSPACE steps only):
+    10 x 10 x 10 cubes 360.8 -> 316.0 s, the later SCF steps 30.9 -> 22.2 s; 9 x 9 x 9 cubes 476.1 -> 395.3 s;
+    the same energies to the digits printed.  ``off``: the Cholesky QR in every pass, as before (bit for bit).
+    """
+    value = os.environ.get(GENERALIZED_ENV, "auto").strip().lower() or "auto"
+    if value not in ("auto", "off"):
+        raise ValueError(f"{GENERALIZED_ENV} must be auto or off")
+    return value
+
+
+def _whitened_ritz(xp, overlap_lower, projection_lower):
+    """``(values, C)`` of the generalized problem ``A c = e S c`` from the lower triangles of ``S`` and ``A``, or
+    ``None`` where the equilibrated ``S`` is not safely positive definite (:func:`generalized_ritz_setting`)."""
+    overlap = overlap_lower + xp.tril(overlap_lower, -1).conj().T
+    projection = projection_lower + xp.tril(projection_lower, -1).conj().T
+    diagonal = xp.real(xp.diagonal(overlap)).copy()
+    if not bool(xp.all(xp.isfinite(diagonal))) or float(diagonal.min()) <= 0.0:
+        return None
+    scale = 1.0 / xp.sqrt(diagonal)
+    overlap = overlap * scale[:, None] * scale[None, :]
+    projection = projection * scale[:, None] * scale[None, :]
+    try:
+        lower = xp.linalg.cholesky(overlap)
+    except Exception:  # LinAlgError (NumPy) or the backend's equivalent: not positive definite
+        return None
+    if not bool(xp.all(xp.isfinite(lower))):
+        return None
+    inverse = _solve_triangular_inverse(xp, lower)  # R^-1, R = L^H
+    check = inverse.conj().T @ overlap @ inverse
+    count = int(check.shape[0])
+    check[xp.arange(count), xp.arange(count)] -= 1.0
+    deviation = float(xp.max(xp.abs(check)))
+    del check, overlap
+    if not np.isfinite(deviation) or deviation > _GENERALIZED_AUDIT:
+        return None
+    whitened = inverse.conj().T @ projection @ inverse
+    whitened = 0.5 * (whitened + whitened.conj().T)
+    values, vectors = xp.linalg.eigh(whitened)
+    return values, scale[:, None] * (inverse @ vectors)
+
+
 def kpoint_ritz_route() -> str:
     """``PARSEC_KPOINT_RITZ``: ``auto`` (the default), ``rows`` or ``block``, how a pool holds the basis of a task.
 
@@ -775,6 +835,34 @@ def _conjugate_product(xp, left, right):
     return cublas.gemm("H", "N", xp.asfortranarray(left), xp.asfortranarray(right))
 
 
+_RESIDUAL_SQUARES = {}
+
+
+def _residual_squares(xp, applied, block, levels):
+    """``sum_rows |h_j - e_j x_j|^2`` of every column ``j`` of ``applied`` (``H X``) and ``block`` (``X``).
+
+    On the host the arithmetic of before; on the device one reduction kernel over the rows (no temporary
+    blocks: the difference, its square and the sum in one pass), which leaves the residuals the same to
+    round-off.
+    """
+    if xp is np:
+        difference = applied - block * levels[None, :]
+        return (difference.real * difference.real + difference.imag * difference.imag).sum(axis=0)
+    kernel = _RESIDUAL_SQUARES.get("kernel")
+    if kernel is None:
+        kernel = xp.ReductionKernel(
+            "complex128 h, complex128 x, float64 e",
+            "float64 y",
+            "(real(h) - e * real(x)) * (real(h) - e * real(x)) + (imag(h) - e * imag(x)) * (imag(h) - e * imag(x))",
+            "a + b",
+            "y = a",
+            "0",
+            "kpoint_residual_squares",
+        )
+        _RESIDUAL_SQUARES["kernel"] = kernel
+    return kernel(applied, block, levels[None, :], axis=0)
+
+
 def _rotate_rows_in_place(xp, rows, rotations, tile: int) -> None:
     """``rows <- rows @ rotations`` a tile of rows at a time (a tile of workspace)."""
     own = int(rows.shape[0])
@@ -794,8 +882,12 @@ def _orthonormal_ritz_block(
     residuals: bool,
     chunk: int,
     stats: _Stats,
+    generalized: bool = False,
 ):
     """:func:`_orthonormal_ritz` with this rank's column-major columns and rows in one allocation.
+
+    ``generalized``: the Rayleigh-Ritz of the filtered basis itself (:func:`generalized_ritz_setting`), the
+    Cholesky QR only where its audit fails.
 
     The columns move to rows in place (:meth:`ColumnGroup.columns_to_rows_block`, the row block in the
     order of the rounds) for the shifted Cholesky QR and back.  The Rayleigh-Ritz step then runs the
@@ -818,10 +910,11 @@ def _orthonormal_ritz_block(
         order, starts = plan.round_order()
         rounds = plan.rounds
     row_block, _separate = group.row_block_in(columns, plan)
-    with stats.timed("orthonormalize_seconds"):
-        group.columns_to_rows_block(columns, row_block, plan, starts)
-        _cholesky_qr_rows(xp, row_block, group, dimension)
-        group.rows_to_columns_block(row_block, columns, plan, starts)
+    if not generalized:
+        with stats.timed("orthonormalize_seconds"):
+            group.columns_to_rows_block(columns, row_block, plan, starts)
+            _cholesky_qr_rows(xp, row_block, group, dimension)
+            group.rows_to_columns_block(row_block, columns, plan, starts)
     with stats.timed("ritz_seconds"):
         projection = xp.zeros((count, count), dtype=xp.complex128)
         widest = max(plan.counts(0)[group.rank], 1) if group.size > 1 else 1
@@ -861,15 +954,38 @@ def _orthonormal_ritz_block(
         del applied_buffer, send_buffer, receive_buffer
         lower = group.lower_sum_to_root(projection)  # the root diagonalizes it
         del projection
+        overlap = None
+        if generalized:
+            # the overlap of the filtered rows (every round is there now), in the round order of the projection
+            with stats.timed("overlap_seconds"):
+                overlap = group.lower_sum_to_root(_gram(xp, row_block, _row_chunk(count)))
         values = rotations = None
+        failed = False
         if group.is_root:
-            hermitian = lower + xp.tril(lower, -1).conj().T
-            values, rotations = xp.linalg.eigh(hermitian)
-            del hermitian
-            values = np.ascontiguousarray(group._host(values), dtype=np.float64)
-            if group.size > 1:
-                rotations = xp.ascontiguousarray(rotations[:, order if xp is np else xp.asarray(order)])
-        del lower
+            if generalized:
+                found = _whitened_ritz(xp, overlap, lower)
+                failed = found is None
+                if not failed:
+                    values, rotations = found
+            else:
+                hermitian = lower + xp.tril(lower, -1).conj().T
+                values, rotations = xp.linalg.eigh(hermitian)
+                del hermitian
+            if not failed:
+                values = np.ascontiguousarray(group._host(values), dtype=np.float64)
+                if group.size > 1:
+                    rotations = xp.ascontiguousarray(rotations[:, order if xp is np else xp.asarray(order)])
+        del lower, overlap
+        if generalized and bool(group.bcast(failed)):
+            # the filtered columns are as they were (the rounds read them): once more with the Cholesky QR
+            del row_block, rotations
+            stats.add("generalized_ritz_fallbacks", 1.0)
+            holder.append(columns)
+            return _orthonormal_ritz_block(
+                xp, operator, holder, group, layout, dimension, requested, residuals, chunk, stats, False
+            )
+        if generalized:
+            stats.add("generalized_ritz_passes", 1.0)
         values = group.bcast(values)
         rotations = group.bcast_array(rotations, (count, count), np.complex128)
         tile = max(1, exchange_bytes() // (16 * max(count, 1)))
@@ -886,11 +1002,11 @@ def _orthonormal_ritz_block(
                 for c0 in range(0, width, chunk):
                     c1 = min(c0 + chunk, width)
                     block = xp.ascontiguousarray(columns[:, l0 + c0 : l0 + c1])
-                    difference = operator.apply(block)
-                    difference -= block * xp.asarray(levels[g0 + c0 : g0 + c1])[None, :]
-                    squares[g0 + c0 : g0 + c1] = (difference.real * difference.real
-                                                  + difference.imag * difference.imag).sum(axis=0)
-                    del block, difference
+                    applied = operator.apply(block)
+                    squares[g0 + c0 : g0 + c1] = _residual_squares(
+                        xp, applied, block, xp.asarray(levels[g0 + c0 : g0 + c1])
+                    )
+                    del block, applied
             norms = np.sqrt(np.asarray(group._host(group.sum(squares)), dtype=np.float64))
     return columns, np.asarray(values, dtype=np.float64), norms
 
@@ -968,10 +1084,9 @@ def _orthonormal_ritz(
             squares = xp.zeros(requested, dtype=xp.float64)
             for r0 in range(0, own, row_chunk):
                 r1 = min(r0 + row_chunk, own)
-                difference = applied[r0:r1] @ wanted
-                difference -= rows[r0:r1, :requested] * levels[None, :]
-                squares += (difference.real * difference.real + difference.imag * difference.imag).sum(axis=0)
-                del difference
+                rotated = applied[r0:r1] @ wanted
+                squares += _residual_squares(xp, rotated, rows[r0:r1, :requested], levels)
+                del rotated
             norms = np.sqrt(np.asarray(group._host(group.sum(squares)), dtype=np.float64))
     del applied, rotations
     with stats.timed("ritz_seconds"):
@@ -1188,9 +1303,15 @@ def solve_column_eigval(
             _check_finite_columns(xp, holder[0], group)
             last = cycle + 1 == total_cycles
             measure = (converge_first and cycle + 1 >= chebff.filter_cycles) or (last and period > 0)
-            vectors, eigenvalues, residuals = ritz_pass(
-                xp, counted, holder, group, layout, dimension, int(requested_states), measure, chunk, stats
-            )
+            if cycle > 0 and block_route and generalized_ritz_setting() == "auto":
+                # from the second cycle on the filter starts from Ritz vectors, as a SUBSPACE step does
+                vectors, eigenvalues, residuals = ritz_pass(
+                    xp, counted, holder, group, layout, dimension, int(requested_states), measure, chunk, stats, True
+                )
+            else:
+                vectors, eigenvalues, residuals = ritz_pass(
+                    xp, counted, holder, group, layout, dimension, int(requested_states), measure, chunk, stats
+                )
             smallest_ritz = float(eigenvalues[0])
             largest_ritz = float(eigenvalues[-1])
             if largest_ritz >= upper_bound:
@@ -1284,9 +1405,14 @@ def solve_column_eigval(
         _check_finite_columns(xp, holder[0], group)
         completed = state.filters_completed + 1
         measure = period > 0 and completed % period == 0
-        vectors, eigenvalues, residuals = ritz_pass(
-            xp, counted, holder, group, layout, dimension, int(requested_states), measure, chunk, stats
-        )
+        if block_route and generalized_ritz_setting() == "auto":
+            vectors, eigenvalues, residuals = ritz_pass(
+                xp, counted, holder, group, layout, dimension, int(requested_states), measure, chunk, stats, True
+            )
+        else:
+            vectors, eigenvalues, residuals = ritz_pass(
+                xp, counted, holder, group, layout, dimension, int(requested_states), measure, chunk, stats
+            )
         if eigenvalues.shape != (working,):
             raise RuntimeError("Rayleigh-Ritz changed the filtered subspace's eigenvalue count")
         new_state = ColumnEigvalState(

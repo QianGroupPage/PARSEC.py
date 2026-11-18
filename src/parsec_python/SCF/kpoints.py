@@ -398,37 +398,50 @@ def run_scf_kpoints(
 
     # Occupations of the last SCF step by k-point, set before the force pass (the job's ``extras`` sees only vectors).
     final_occupations: dict[int, np.ndarray] = {}
+    # What one force pass computes once per k-point (the projector gradients, and their device matrices by device):
+    # the solvers may call the force of a k-point for several blocks of its states (the ranks of an MPI pool, the
+    # sectors of the k-point).  Cleared after the pass.
+    force_cache: dict = {}
 
-    def kpoint_nonlocal_force(task, vectors, xp=np):
+    def kpoint_nonlocal_force(task, vectors, xp=np, columns=None):
         if task not in projector_cache:
             make_hamiltonian(task, {"V": ionic_potential})
-        # (on the confined grid of a wire or slab: the images of its periodic directions, as the projectors)
-        gradients = bloch_projector_gradients(
-            system.grid,
-            cell_atoms,
-            system.pseudopotentials,
-            system.input.pseudopotentials,
-            lattice_vectors,
-            k_points[task],
-        )
+        gradients = force_cache.get(("gradients", task))
+        if gradients is None:
+            # (on the confined grid of a wire or slab: the images of its periodic directions, as the projectors)
+            gradients = force_cache[("gradients", task)] = bloch_projector_gradients(
+                system.grid,
+                cell_atoms,
+                system.pseudopotentials,
+                system.input.pseudopotentials,
+                lattice_vectors,
+                k_points[task],
+            )
+        # ``columns``: the states of the task these columns are (all of them, in order, where None)
+        occupations = final_occupations[task] if columns is None else final_occupations[task][np.asarray(columns)]
         if xp is not np and not isinstance(vectors, np.ndarray):
             # the orbitals of a device stay there: the overlaps are formed on it (the acceleration package, which
             # supplied the device array, supplies the contraction)
-            from ..acceleration.Forces.kpoint_nonlocal_device import device_nonlocal_forces
+            from ..acceleration.Forces.kpoint_nonlocal_device import device_nonlocal_forces, prepare_device_nonlocal
 
+            key = ("device", task, int(vectors.device.id))
+            prepared = force_cache.get(key)
+            if prepared is None:
+                prepared = force_cache[key] = prepare_device_nonlocal(xp, projector_cache[task], gradients)
             return device_nonlocal_forces(
                 xp,
                 projector_cache[task],
                 gradients,
                 vectors,
-                weighting.of_k(task) * final_occupations[task],
+                weighting.of_k(task) * occupations,
                 len(cell_atoms),
+                prepared=prepared,
             )
         return nonlocal_forces(
             projector_cache[task],
             gradients,
             np.asarray(vectors),
-            weighting.of_k(task) * final_occupations[task],
+            weighting.of_k(task) * occupations,
             len(cell_atoms),
         )
 
@@ -467,6 +480,7 @@ def run_scf_kpoints(
                 accumulate,
                 extras=kpoint_nonlocal_force if compute_forces else None,
                 geometry=sector_geometry,
+                extras_by_columns=bool(compute_forces),
             ),
             problem_size=system.grid.size,
             backend=kpoint_backend(system) if backend is None else backend,
@@ -759,6 +773,7 @@ def run_scf_kpoints(
             # the eigenvectors and occupations of the last step belong together
             final_occupations.update(enumerate(split_pooled(pooled_occupations, eigenvalues_by_k)))
             nonlocal_force = np.sum(solver.extras(), axis=0)
+            force_cache.clear()
         timings = _run_timings(system, timer, solver, started, levels)
         kept = (
             {

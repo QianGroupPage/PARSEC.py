@@ -682,3 +682,41 @@ class GammaSpinRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(cupy_available(), "CUDA runtime is unavailable")
+class IonicScopeDensityTests(unittest.TestCase):
+    def test_the_ionic_scope_keeps_the_installed_density_of_a_bulk_grid(self) -> None:
+        # the scope of forces and moving atoms (device_periodic_preparation) hands a grid its device sums do not
+        # take to the builder installed before it (the index boxes and bins of the default routines' bulk grid),
+        # not to the readable sum: the density of the single point, bit for bit
+        from parsec_python.acceleration.tests.test_periodic_point_group import silicon
+        from parsec_python.acceleration.V_ion import periodic_device as fields
+        from parsec_python.SCF import pbc
+        from parsec_python.V_ion import ionic_potential
+
+        problem = silicon("ca", spacing=0.64)
+        grid = pbc.build_periodic_grid(problem.periodic_cell, problem.grid)
+        lattice = np.asarray(problem.periodic_cell.lattice_vectors, dtype=float)
+        if fields.handles(grid, lattice):
+            self.skipTest("the device sums take this grid themselves")
+        potentials = pbc.load_pseudopotentials(problem.pseudopotentials, xc_functional=problem.scf.xc_functional)
+        atoms = tuple(problem.atoms)
+        outside = ionic_potential.superpose_atomic_density(grid, atoms, potentials, problem.pseudopotentials, lattice)
+        installed = ionic_potential._atomic_density_provider
+        self.assertIsNotNone(installed)
+        calls = []
+
+        def counted(*arguments):
+            calls.append(1)
+            return installed(*arguments)
+
+        with mock.patch.object(ionic_potential, "_atomic_density_provider", counted):
+            with fields.device_periodic_preparation() as active:
+                inside = ionic_potential.superpose_atomic_density(
+                    grid, atoms, potentials, problem.pseudopotentials, lattice
+                )
+        self.assertTrue(active)
+        self.assertEqual(len(calls), 1)
+        np.testing.assert_array_equal(inside, outside)
+        self.assertIs(ionic_potential._atomic_density_provider, installed)

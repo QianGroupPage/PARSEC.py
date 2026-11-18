@@ -369,6 +369,54 @@ class SizePlanTests(unittest.TestCase):
                 assignment_mode()
 
 
+class GeneralizedRitzTests(unittest.TestCase):
+    def test_the_whitened_problem_and_its_audit(self) -> None:
+        import scipy.linalg
+
+        from parsec_python.acceleration.Eigensolvers.chebff_columns import _whitened_ritz, generalized_ritz_setting
+
+        rng = np.random.default_rng(4)
+        rows, count = 300, 12
+        # a filtered basis: nearly orthogonal columns of lengths from 1 to 1e9
+        basis = np.linalg.qr(rng.normal(size=(rows, count)) + 1j * rng.normal(size=(rows, count)))[0]
+        basis = (basis + 1.0e-3 * rng.normal(size=(rows, count))) * np.logspace(0, 9, count)[None, :]
+        hamiltonian = rng.normal(size=(rows, rows)) + 1j * rng.normal(size=(rows, rows))
+        hamiltonian = hamiltonian + hamiltonian.conj().T
+        overlap, projection = basis.conj().T @ basis, basis.conj().T @ hamiltonian @ basis
+        values, coefficients = _whitened_ritz(np, np.tril(overlap), np.tril(projection))
+        expected = scipy.linalg.eigh(projection, overlap, eigvals_only=True)
+        np.testing.assert_allclose(values, expected, rtol=0, atol=1.0e-10 * float(np.max(np.abs(expected))))
+        np.testing.assert_allclose(coefficients.conj().T @ overlap @ coefficients, np.eye(count), atol=1.0e-9)
+        # two columns along one direction: not taken (the Cholesky QR does that pass)
+        dependent = basis.copy()
+        dependent[:, 1] = dependent[:, 0] * 3.0 + 1.0e-12 * dependent[:, 2]
+        overlap = dependent.conj().T @ dependent
+        self.assertIsNone(_whitened_ritz(np, np.tril(overlap), np.tril(dependent.conj().T @ hamiltonian @ dependent)))
+        with unittest.mock.patch.dict(os.environ, {"PARSEC_KPOINT_GENERALIZED_RITZ": "off"}):
+            self.assertEqual(generalized_ritz_setting(), "off")
+        with unittest.mock.patch.dict(os.environ, {"PARSEC_KPOINT_GENERALIZED_RITZ": "yes"}):
+            with self.assertRaises(ValueError):
+                generalized_ritz_setting()
+
+
+class ResidualKernelTests(unittest.TestCase):
+    def test_the_device_reduction_gives_the_host_sums(self) -> None:
+        from parsec_python.acceleration.backends.cupy import cupy_available
+        from parsec_python.acceleration.Eigensolvers.chebff_columns import _residual_squares
+
+        if not cupy_available():
+            self.skipTest("CUDA runtime is unavailable")
+        import cupy as cp
+
+        rng = np.random.default_rng(6)
+        applied = rng.normal(size=(5000, 7)) + 1j * rng.normal(size=(5000, 7))
+        block = rng.normal(size=(5000, 7)) + 1j * rng.normal(size=(5000, 7))
+        levels = rng.normal(size=7)
+        host = _residual_squares(np, applied, block, levels)
+        device = _residual_squares(cp, cp.asarray(applied), cp.asarray(block), cp.asarray(levels))
+        np.testing.assert_allclose(cp.asnumpy(device), host, rtol=1.0e-13, atol=0.0)
+
+
 class SpillLayoutTests(unittest.TestCase):
     def test_a_column_major_basis_goes_to_the_host_without_a_row_major_copy(self) -> None:
         # the copy to the host asks for row-major data: a column-major basis is given as its transpose
@@ -438,6 +486,23 @@ class PooledSCFTests(unittest.TestCase):
                 self.assertAlmostEqual(result["energy"], serial["energy"], delta=1.0e-8)
             for result in report["pooled"][1:]:
                 self.assertEqual(result["energy"], report["pooled"][0]["energy"])
+
+    def test_forces_on_pools(self) -> None:
+        # the nonlocal forces summed by the ranks of the pools over their columns: the k-points whole and in the
+        # sectors of their little groups, pools of one rank and one pool of several ranks
+        for sectors, layouts in (("off", ((2, 2), (3, 1))), ("auto", ((3, 3), (2, 1)))):
+            for ranks, pools in layouts:
+                report = _check("forces", str(ranks), str(pools), sectors)
+                serial = report["serial"]
+                self.assertEqual(serial["tasks"] > 2.0, sectors == "auto")
+                self.assertGreater(float(np.max(np.abs(serial["forces"]))), 1.0e-3)
+                for result in report["pooled"]:
+                    self.assertTrue(result["converged"])
+                    self.assertEqual(result["tasks"], serial["tasks"])
+                    self.assertAlmostEqual(result["energy"], serial["energy"], delta=1.0e-8)
+                    np.testing.assert_allclose(result["forces"], serial["forces"], rtol=0, atol=1.0e-8)
+                for result in report["pooled"][1:]:  # the replicated drivers agree bit for bit
+                    self.assertEqual(result["forces"], report["pooled"][0]["forces"])
 
     def test_sectors_that_grow_keep_the_others_on_pools(self) -> None:
         # without margin some sectors miss levels: they get more states and are solved again alone, the pools and

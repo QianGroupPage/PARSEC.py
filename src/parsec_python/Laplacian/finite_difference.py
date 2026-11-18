@@ -328,6 +328,28 @@ def build_bloch_negative_laplacian(grid, k_point, gauge: str = "u") -> sp.csr_ma
     return _build_wrapped_negative_laplacian(grid, k_point=np.asarray(k_point, dtype=np.float64), gauge=gauge)
 
 
+# entries of a wrapped matrix from which its slabs are filled on threads
+_THREADED_ENTRIES = 1 << 22
+
+
+def _build_threads() -> int:
+    """Threads of the wrapped builder: ``PARSEC_PERIODIC_SETUP_THREADS``, else ``OMP_NUM_THREADS``, else the CPUs
+    up to 8 (the rule of the periodic setup's image sums).  The matrix does not depend on it."""
+    import os
+
+    for name in ("PARSEC_PERIODIC_SETUP_THREADS", "OMP_NUM_THREADS"):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError as error:
+                raise ValueError(f"{name} must be a positive integer, got {raw!r}") from error
+            if value < 1:
+                raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+            return value
+    return max(1, min(8, os.cpu_count() or 1))
+
+
 def _build_wrapped_negative_laplacian(grid, *, k_point=None, gauge: str = "u") -> sp.csr_matrix:
     """The matrix of :func:`build_negative_laplacian` for a periodic box, written directly in CSR.
 
@@ -361,60 +383,104 @@ def _build_wrapped_negative_laplacian(grid, *, k_point=None, gauge: str = "u") -
     weights = np.array(
         [-3.0 * coeff[width] * inv_h2 if axis is None else -coeff[width + abs(shift)] * inv_h2 for axis, shift in order]
     )
-    rows = np.arange(n, dtype=index_type).reshape(shape)
     coordinates = [np.arange(extent, dtype=index_type) for extent in shape]
     columns = np.empty((n, count), dtype=index_type)
-    for slot, (axis, shift) in enumerate(order):
-        if axis is None:
-            columns[:, slot] = rows.reshape(-1)
-            continue
-        # column of the neighbour (i + shift) mod n along the axis: the row plus the change of that index
-        change = ((coordinates[axis] + shift) % shape[axis] - coordinates[axis]) * strides[axis]
-        view = [1, 1, 1]
-        view[axis] = shape[axis]
-        columns[:, slot] = (rows + change.reshape(view)).reshape(-1)
+    sides = steps = slot_values = None
     if k_point is None:
-        data = np.broadcast_to(weights, (n, count)).copy()
+        data = np.empty((n, count), dtype=np.float64)
+        slot_values = weights
     else:
         # the Bloch block (build_bloch_negative_laplacian): a phase per slot (u gauge) or per wrapped entry (psi)
         sides = np.diag(np.asarray(grid.cell.lattice_vectors, dtype=np.float64))
         steps = sides / np.asarray(shape, dtype=np.float64)
+        data = np.empty((n, count), dtype=np.complex128)
         if gauge == "u":
             phases = np.array(
                 [1.0 if axis is None else np.exp(1j * k_point[axis] * shift * steps[axis]) for axis, shift in order]
             )
-            data = np.broadcast_to(weights * phases, (n, count)).copy()
+            slot_values = weights * phases
+
+    psi = k_point is not None and gauge != "u"
+
+    def slab(first: int, last: int):
+        local_shape = (last - first,) + shape[1:]
+        lo, hi = first * strides[0], last * strides[0]
+        return local_shape, lo, hi, (coordinates[0][first:last], coordinates[1], coordinates[2])
+
+    def sort_near(first: int, last: int) -> None:
+        # rows within M of a face: their wrapped neighbours change the column order
+        local_shape, lo, hi, local = slab(first, last)
+        block, values = columns[lo:hi], data[lo:hi]
+        near = np.zeros(local_shape, dtype=bool)
+        for axis, extent in enumerate(shape):
+            edge = (local[axis] < width) | (local[axis] >= extent - width)
+            view = [1, 1, 1]
+            view[axis] = local_shape[axis]
+            near |= edge.reshape(view)
+        near = np.flatnonzero(near.reshape(-1))
+        if near.size:
+            permutation = np.argsort(block[near], axis=1, kind="stable")
+            block[near] = np.take_along_axis(block[near], permutation, axis=1)
+            values[near] = np.take_along_axis(values[near], permutation, axis=1)
+
+    def fill(first: int, last: int) -> None:
+        # the rows of the planes first <= i < last of axis 0 (every value as the whole-matrix expressions)
+        local_shape, lo, hi, local = slab(first, last)
+        rows = np.arange(lo, hi, dtype=index_type).reshape(local_shape)
+        block = columns[lo:hi]
+        for slot, (axis, shift) in enumerate(order):
+            if axis is None:
+                block[:, slot] = rows.reshape(-1)
+                continue
+            # column of the neighbour (i + shift) mod n along the axis: the row plus the change of that index
+            change = ((local[axis] + shift) % shape[axis] - local[axis]) * strides[axis]
+            view = [1, 1, 1]
+            view[axis] = local_shape[axis]
+            block[:, slot] = (rows + change.reshape(view)).reshape(-1)
+        values = data[lo:hi]
+        if slot_values is not None:
+            values[:] = slot_values[None, :]
         else:
-            data = np.empty((n, count), dtype=np.complex128)
             for slot, (axis, shift) in enumerate(order):
                 if axis is None:
-                    data[:, slot] = weights[slot]
+                    values[:, slot] = weights[slot]
                     continue
-                wraps = (coordinates[axis] + shift) // shape[axis]
+                wraps = (local[axis] + shift) // shape[axis]
                 phase = np.exp(1j * k_point[axis] * sides[axis] * wraps.astype(np.float64))
                 view = [1, 1, 1]
-                view[axis] = shape[axis]
-                data[:, slot] = np.broadcast_to(weights[slot] * phase.reshape(view), shape).reshape(-1)
-            if np.max(np.abs(data.imag)) <= 1.0e-12 * np.max(np.abs(data.real)):
-                # a time-reversal invariant k: the twisted Laplacian is real
-                data = np.ascontiguousarray(np.rint(data.real / weights[None, :]) * weights[None, :])
-    near = np.zeros(shape, dtype=bool)
-    for axis, extent in enumerate(shape):
-        edge = (coordinates[axis] < width) | (coordinates[axis] >= extent - width)
-        view = [1, 1, 1]
-        view[axis] = extent
-        near |= edge.reshape(view)
-    near = np.flatnonzero(near.reshape(-1))
-    if near.size:
-        permutation = np.argsort(columns[near], axis=1, kind="stable")
-        columns[near] = np.take_along_axis(columns[near], permutation, axis=1)
-        if k_point is None:
-            data[near] = weights[permutation]
+                view[axis] = local_shape[axis]
+                values[:, slot] = np.broadcast_to(weights[slot] * phase.reshape(view), local_shape).reshape(-1)
+        if not psi:
+            sort_near(first, last)
+
+    # slabs of planes of axis 0 on threads (the entries do not depend on them)
+    threads = _build_threads()
+    slabs = np.linspace(0, shape[0], min(shape[0], 4 * threads) + 1).astype(int)
+    pairs = [(int(a), int(b)) for a, b in zip(slabs[:-1], slabs[1:]) if b > a]
+
+    def run(function) -> None:
+        if threads > 1 and len(pairs) > 1 and n * count >= _THREADED_ENTRIES:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="parsec-laplacian") as pool:
+                list(pool.map(lambda pair: function(*pair), pairs))
         else:
-            data[near] = np.take_along_axis(data[near], permutation, axis=1)
+            function(0, shape[0])
+
+    run(fill)
+    if psi:
+        if np.max(np.abs(data.imag)) <= 1.0e-12 * np.max(np.abs(data.real)):
+            # a time-reversal invariant k: the twisted Laplacian is real (the columns still in slot order here)
+            data = np.ascontiguousarray(np.rint(data.real / weights[None, :]) * weights[None, :])
+        run(sort_near)
     indptr = np.arange(0, n * count + 1, count, dtype=index_type)
     matrix = sp.csr_matrix((data.reshape(-1), columns.reshape(-1), indptr), shape=(n, n))
     matrix.has_sorted_indices = True
+    if k_point is None:
+        # What the matrix is, for a reader that can build what it needs from the grid instead of reading the
+        # matrix (the sector stencils of a point-group reduction, acceleration/Symmetry/operator_cache.py); a copy
+        # or any change of the matrix drops it.
+        matrix.parsec_wrapped_stencil_of = grid
     return matrix
 
 

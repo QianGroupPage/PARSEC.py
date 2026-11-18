@@ -836,6 +836,27 @@ def _reference_only_features(
     return features
 
 
+def _forces_on_kpoint_pools(problem) -> bool:
+    """Whether an MPI run sums its forces on the ranks of the k-point pools.
+
+    That is the scalar k-point SCF (:func:`parsec_python.SCF.kpoints.run_scf_kpoints`,
+    whose nonlocal force is a sum over the states: ``KPointJob.extras_by_columns``) of a
+    cell sampled beyond the Gamma point, without spin, spinors or a hybrid functional,
+    whose forces read the orbitals of one process.
+    """
+
+    scf = problem.scf
+    return bool(
+        problem.periodic_cell is not None
+        and problem.has_kpoint_sampling
+        and not getattr(scf, "noncollinear", False)
+        and not getattr(scf, "self_consistent_spin_orbit", False)
+        and not getattr(scf, "spin_polarized", False)
+        and not getattr(scf, "is_hybrid", False)
+        and not _gamma_point_only(problem)
+    )
+
+
 def _mpi_unsupported_features(translation) -> list[str]:
     """Features of the reference drivers that an MPI run (``--mpi``) cannot carry.
 
@@ -865,14 +886,20 @@ def _mpi_unsupported_features(translation) -> list[str]:
         or problem.has_kpoint_sampling
         or problem.scf.noncollinear
     )
-    if uses_kpoint_solver and (
-        getattr(translation, "compute_forces", False)
-        or getattr(translation, "relaxation", None) is not None
-        or getattr(translation, "molecular_dynamics", None) is not None
+    if (
+        uses_kpoint_solver
+        and (
+            getattr(translation, "compute_forces", False)
+            or getattr(translation, "relaxation", None) is not None
+            or getattr(translation, "molecular_dynamics", None) is not None
+        )
+        and not _forces_on_kpoint_pools(problem)
     ):
         features.append(
-            "forces, relaxation or molecular dynamics of a periodic or non-collinear "
-            "run (they read the orbitals, which the distributed solver does not gather)"
+            "forces, relaxation or molecular dynamics of a periodic run at the Gamma point alone, "
+            "with spin, a hybrid functional or spinors (they read the orbitals, which the distributed "
+            "solver does not gather; those of the scalar k-point SCF are summed on the ranks of its "
+            "k-point pools)"
         )
     dos = getattr(translation, "dos", None)
     if dos is not None and getattr(dos, "ylm_l", -1) >= 0:

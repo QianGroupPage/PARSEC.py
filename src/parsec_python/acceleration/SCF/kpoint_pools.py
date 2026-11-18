@@ -587,9 +587,9 @@ class MPIPoolKPointSolver:
         context = mpi.context() if context is None else context
         if context is None:
             raise RuntimeError("MPIPoolKPointSolver needs PARSEC_MPI=1 (or --mpi) and mpi4py")
-        if job.extras is not None:
+        if job.extras is not None and not job.extras_by_columns:
             raise NotImplementedError(
-                "the k-point pools gather no per-state extras (forces, spin moments of spinors); "
+                "the k-point pools gather no per-state extras (spin moments of spinors); "
                 "their jobs run on the row-distributed MPI solver"
             )
         if problem_size is None:
@@ -1061,7 +1061,55 @@ class MPIPoolKPointSolver:
         )
 
     def extras(self) -> list[Any]:
-        raise NotImplementedError("the k-point pools compute no per-task extras")
+        """The job's extras of every task (``extras_by_columns``: the nonlocal forces), the same on every rank.
+
+        Every rank sums its columns of the tasks of its pool (``extras(task, columns of this rank, columns=their
+        states)``); the parts of all tasks are summed over ``COMM_WORLD``.
+        """
+        if self.job.extras is None or not self.job.extras_by_columns:
+            raise NotImplementedError("the k-point pools compute extras only where they sum over the states")
+        self.backend.use()
+        start = time.perf_counter()
+        found: dict[int, np.ndarray] = {}
+        for task in self.tasks:
+            requested = task_states(self.job, task)
+            state = self.states[task]
+            self._release_cached()
+            vectors = self._device_vectors(state)
+            count = int(requested)
+            part = None
+            if getattr(state, "layout", None) is None:
+                spans = [(0, 0, count)]
+            else:
+                spans = list(requested_spans(state.layout, self.group.rank, count))
+            for first, local, width in spans:
+                if width <= 0:
+                    continue
+                piece = np.asarray(
+                    _host(
+                        self.job.extras(
+                            task, vectors[:, local : local + width], xp=self.xp, columns=np.arange(first, first + width)
+                        )
+                    ),
+                    dtype=np.float64,
+                )
+                part = piece if part is None else part + piece
+            if part is not None:
+                found[task] = part
+            del vectors
+            if task != getattr(self, "_kept", None):
+                self._spill(task, state)
+        self._tick("extras", start)
+        shapes = {tuple(value.shape) for value in found.values()}
+        shape = self.context.comm.allgather(next(iter(shapes)) if shapes else None)
+        shape = next(value for value in shape if value is not None)
+        stacked = np.zeros((self.job.n_tasks,) + tuple(shape), dtype=np.float64)
+        for task, value in found.items():
+            stacked[task] = value
+        flat = stacked.reshape(-1)
+        self.context.allsum_host(flat)
+        stacked = flat.reshape(stacked.shape)
+        return [stacked[task] for task in range(self.job.n_tasks)]
 
     def vectors(self, task: int) -> np.ndarray:
         """Orbitals are not gathered: an empty block of the right number of rows."""

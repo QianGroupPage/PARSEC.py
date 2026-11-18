@@ -2278,6 +2278,11 @@ class SinglePointInput:
     """Sampling weights for ``kpoints`` (non-negative, normalized to sum 1 as
     PARSEC's ``init_var`` does; equal if omitted).  Unequal weights use the
     per-state weights of the Fermi level (Fortran ``flevel``)."""
+    kpoint_time_reversal: bool = False
+    """Whether the SCF runs the pairs ``k``, ``-k`` of the equal-weight mesh ``kpoints`` (one point of each with
+    twice the weight, :func:`~parsec_python.Grid.kpoints.time_reversal_reduced`): set by the input reader for the
+    whole mesh that forces and moving atoms of scalar or collinear-spin orbitals keep
+    (``PARSEC_KPOINT_TIME_REVERSAL``)."""
     bands: BandStructureSettings | None = None
     """Non-self-consistent band structure to compute after the SCF (periodic
     systems only); see :class:`BandStructureSettings`."""

@@ -771,9 +771,13 @@ waiting for halo rows and summing over the ranks.
 `acceleration/tests/test_kpoint_mpi.py` runs the distributed operator, the drivers and the command line
 on 2 and 3 ranks (the device code on the host) against the single-process solver; it has not been run on
 GPUs or on more than one node. Because no rank holds whole orbitals, `--mpi` refuses (input error) LDA+U,
-`Eigensolver: arpack`/`diagla`, forces, relaxation and molecular dynamics of periodic or non-collinear runs,
-the Ylm-projected DOS and `Output_GW`; a non-collinear cluster's `parsec.dat` is written without
-wavefunction records.
+`Eigensolver: arpack`/`diagla`, forces, relaxation and molecular dynamics of periodic runs at the Gamma point
+alone, with spin, with spinors or with a hybrid functional, the Ylm-projected DOS and `Output_GW`; a
+non-collinear cluster's `parsec.dat` is written without wavefunction records. The forces of the scalar k-point
+SCF (a cell sampled beyond the Gamma point) run with `--mpi` since 2026-11-17: the nonlocal force is a sum over
+the states, so every rank of a k-point pool adds the terms of its columns (of the sectors of its k-points, made
+whole on its GPU 32 states at a time) and the parts are summed over the ranks; relaxations and molecular dynamics
+take them, rank 0 writes their files.
 
 ## Band structures (periodic systems)
 

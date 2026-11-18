@@ -159,15 +159,33 @@ class MPIRoutingTests(unittest.TestCase):
             ),
             "Eigensolver: arpack": translation(problem(eigensolver=SimpleNamespace(method="arpack"))),
             "Eigensolver: diagla": translation(problem(eigensolver=SimpleNamespace(method="diagla"))),
-            "forces": translation(problem(), compute_forces=True),
+            "forces": translation(problem(scf=SimpleNamespace(noncollinear=False, spin_polarized=True)), compute_forces=True),
             "Ylm": translation(problem(), dos=SimpleNamespace(ylm_l=1)),
             "Output_GW": translation(problem(), gw=object()),
         }
-        for name, case in cases.items():
-            with self.subTest(feature=name):
-                found = _mpi_unsupported_features(case)
-                self.assertEqual(len(found), 1)
-                self.assertIn(name, found[0])
+        from parsec_python.acceleration import cli as accelerated_cli
+
+        with mock.patch.object(accelerated_cli, "_gamma_point_only", lambda problem: False):
+            for name, case in cases.items():
+                with self.subTest(feature=name):
+                    found = _mpi_unsupported_features(case)
+                    self.assertEqual(len(found), 1)
+                    self.assertIn(name, found[0])
+            # the forces of the scalar k-point SCF are summed on the ranks of the k-point pools; those of a Gamma
+            # point alone, spin, spinors and hybrid functionals read the orbitals of one process
+            self.assertEqual(_mpi_unsupported_features(translation(problem(), compute_forces=True)), [])
+            self.assertEqual(
+                _mpi_unsupported_features(translation(problem(), relaxation=object())), []
+            )
+            for scf in (
+                SimpleNamespace(noncollinear=True),
+                SimpleNamespace(noncollinear=False, self_consistent_spin_orbit=True),
+                SimpleNamespace(noncollinear=False, is_hybrid=True, xc_functional="pbe0"),
+            ):
+                found = _mpi_unsupported_features(translation(problem(scf=scf), compute_forces=True))
+                self.assertEqual(sum("forces" in item for item in found), 1)
+        with mock.patch.object(accelerated_cli, "_gamma_point_only", lambda problem: True):
+            self.assertEqual(len(_mpi_unsupported_features(translation(problem(), compute_forces=True))), 1)
         # a cluster's forces do not run through the distributed k-point solver
         cluster = problem(periodic_cell=None, has_kpoint_sampling=False)
         self.assertEqual(_mpi_unsupported_features(translation(cluster, compute_forces=True)), [])

@@ -52,6 +52,10 @@ class KPointJob:
     rows_per_task: tuple[int, ...] | None = None
     # The points of the whole grid where the tasks have fewer rows (the fields of the SCF step live on it).
     grid_points: int | None = None
+    # Whether ``extras`` is a sum over the states that takes any subset of them: ``extras(task, vectors, xp=...,
+    # columns=...)`` with ``columns`` the indices of the columns of ``vectors`` among the states of the task (the
+    # nonlocal forces of the scalar k-point SCF), so that the ranks of the MPI k-point pools each sum their columns.
+    extras_by_columns: bool = False
     # What a solver that splits the k-points into the sectors of their little groups needs: a dict with the grid,
     # the atoms of the cell, the Cartesian k-points and whether the density is the only part of ``accumulate``
     # (set by the scalar k-point SCF); None: no such splitting.

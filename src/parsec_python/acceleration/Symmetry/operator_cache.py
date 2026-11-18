@@ -117,6 +117,48 @@ def _canonical_kinetic(negative_laplacian: object) -> sp.csr_matrix:
     return kinetic
 
 
+def _wrapped_stencil_grid(negative_laplacian: object):
+    """The grid of a matrix that :func:`parsec_python.Laplacian.finite_difference.build_negative_laplacian` made as
+    the wrapped stencil of a periodic box, or ``None``.
+
+    The builder names the grid on the matrix; the shape, the entry count and a few rows are checked against the
+    stencil of that grid (a matrix changed in place keeps the name and goes through the matrix).
+    """
+
+    grid = getattr(negative_laplacian, "parsec_wrapped_stencil_of", None)
+    if grid is None or not sp.isspmatrix_csr(negative_laplacian):
+        return None
+    from parsec_python.Laplacian.finite_difference import second_derivative_coefficients
+
+    shape = tuple(int(value) for value in grid.points_per_axis)
+    n = int(np.prod(shape))
+    width = int(grid.settings.stencil_half_width)
+    count = 6 * width + 1
+    matrix = negative_laplacian
+    if matrix.shape != (n, n) or int(matrix.nnz) != n * count:
+        return None
+    coeff = second_derivative_coefficients(grid.settings.expansion_order)
+    inv_h2 = 1.0 / float(grid.spacing) ** 2
+    strides = (shape[1] * shape[2], shape[2], 1)
+    for row in sorted({0, 1, n // 3, n // 2, n - 2, n - 1}):
+        point = (row // strides[0], (row // strides[1]) % shape[1], row % shape[2])
+        expected = {row: -3.0 * coeff[width] * inv_h2}
+        for axis in range(3):
+            for shift in range(-width, width + 1):
+                if shift:
+                    moved = list(point)
+                    moved[axis] = (moved[axis] + shift) % shape[axis]
+                    column = moved[0] * strides[0] + moved[1] * strides[1] + moved[2]
+                    expected[column] = expected.get(column, 0.0) - coeff[width + abs(shift)] * inv_h2
+        start, stop = int(matrix.indptr[row]), int(matrix.indptr[row + 1])
+        columns = np.asarray(matrix.indices[start:stop], dtype=np.int64)
+        if not np.array_equal(columns, np.array(sorted(expected), dtype=np.int64)):
+            return None
+        if not np.array_equal(matrix.data[start:stop], np.array([expected[c] for c in sorted(expected)])):
+            return None
+    return grid
+
+
 def _direct_sector_stencils(
     decomposition: ReflectionRepresentationDecomposition,
     negative_laplacian: object,
@@ -141,6 +183,20 @@ def _direct_sector_stencils(
         sector_stencil_route,
     )
 
+    wrapped = _wrapped_stencil_grid(negative_laplacian)
+    if wrapped is not None:
+        # The matrix of a periodic box (Laplacian/finite_difference.py, the stencil wrapped on every axis): its
+        # sector stencils from the grid with a wrapped lookup, the sector rows alone (the reduction of the matrix
+        # checks every row and column of it for every sector: 5.5 s of the 64,000 atoms of a 20^3 diamond cell)
+        if sector_stencil_route() == "csr":
+            return None, "csr"
+        try:
+            metadata = build_sector_stencils(
+                wrapped, decomposition, representations, implementation="numpy", wrap=True
+            )
+        except SectorStencilUnavailable:
+            return None, "csr"
+        return metadata, "direct-numpy-wrapped"
     if not isinstance(negative_laplacian, DeferredNativeNegativeLaplacian):
         return None, "csr"
     route = sector_stencil_route()

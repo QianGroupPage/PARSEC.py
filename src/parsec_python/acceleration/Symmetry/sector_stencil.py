@@ -231,16 +231,22 @@ def _native_sector_stencil(
     )
 
 
-def _padded_lookup(grid: RealSpaceGrid, width: int) -> np.ndarray:
+def _padded_lookup(grid: RealSpaceGrid, width: int, wrap: bool = False) -> np.ndarray:
     """Row lookup with ``width`` inactive layers on every side.
 
     A stencil point of an active grid point then always has an entry, so the
-    neighbor gather needs no bounds test.
+    neighbor gather needs no bounds test.  ``wrap`` (a periodic box whose
+    stencil wraps on every axis): the layers repeat the rows of the opposite
+    faces instead, the columns of the wrapped matrix.
     """
 
     lookup = np.asarray(grid.lookup)
     if lookup.ndim != 3:
         raise ValueError("lookup must be a three-dimensional array")
+    if wrap:
+        if np.any(lookup < 0) or min(lookup.shape) <= 2 * width:
+            raise SectorStencilUnavailable("the box does not wrap on every axis")
+        return np.pad(lookup.astype(np.int64, copy=False), width, mode="wrap")
     padded = np.full(
         tuple(extent + 2 * width for extent in lookup.shape), -1, dtype=np.int64
     )
@@ -300,7 +306,8 @@ def _numpy_sector_stencil(
     phases = np.asarray(decomposition.phases[representation])
     multiplicities = np.asarray(reduction.multiplicities, dtype=np.int64)
     coordinates = np.asarray(grid.integer_coordinates)
-    origin = np.asarray(grid.index_min, dtype=np.int64) - width
+    # (a periodic cell numbers its points from 0 on every axis)
+    origin = np.asarray(getattr(grid, "index_min", np.zeros(3)), dtype=np.int64) - width
 
     # Stencil slots in the enumeration of the native builder: the center,
     # then every signed shell of each axis.
@@ -473,13 +480,16 @@ def build_sector_stencils(
     representations: Sequence[int] | None = None,
     *,
     implementation: str = "auto",
+    wrap: bool = False,
 ) -> tuple[StencilMajorHostMetadata | None, ...]:
     """Build the packed stencil of every requested sector from the grid.
 
     The result keeps one slot per representation; sectors that were not
     requested are ``None``.  ``implementation`` is ``native``, ``numpy`` or
     ``auto``, which takes the native kernel when the extension has it.
-    :class:`SectorStencilUnavailable` asks the caller for the CSR route.
+    ``wrap``: the stencil of a periodic box, whose neighbours across a face
+    are the rows of the opposite one (NumPy: the native kernel leaves them
+    out).  :class:`SectorStencilUnavailable` asks the caller for the CSR route.
     """
 
     if implementation not in {"auto", "native", "numpy"}:
@@ -487,8 +497,10 @@ def build_sector_stencils(
     if decomposition.full_size != grid.size:
         raise ValueError("grid does not match the representation decomposition")
     wanted = decomposition._selected_representations(representations)
+    if wrap and implementation == "native":
+        raise ValueError("the native kernel builds no wrapped stencil")
     native = None
-    if implementation != "numpy" and native_kernel_available():
+    if implementation != "numpy" and not wrap and native_kernel_available():
         from ..backends.native import _load_native
 
         native = _load_native()
@@ -508,7 +520,7 @@ def build_sector_stencils(
         return tuple(built)
 
     width = int(grid.settings.expansion_order) // 2
-    padded = _padded_lookup(grid, width)
+    padded = _padded_lookup(grid, width, wrap)
 
     def assemble(index: int) -> StencilMajorHostMetadata:
         return _numpy_sector_stencil(grid, decomposition, index, padded)

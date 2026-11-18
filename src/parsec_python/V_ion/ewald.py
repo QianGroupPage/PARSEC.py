@@ -161,6 +161,24 @@ def ion_ion_splitting(lattice_vectors: np.ndarray, atom_count: int, tolerance: f
     return best_eta
 
 
+def candidate_images(positions: np.ndarray, fractional: np.ndarray, lattice: np.ndarray, cutoff: float):
+    """``(image_positions, image_atoms, reach)``: the images ``r_b + n.A`` of the real-space sum (every fractional
+    coordinate in ``[-c_i, 1 + c_i]``, ``c_i = cutoff/d_i`` the ``reach``), translation-major with ``n = 0`` first, so
+    that the rows ``0..N-1`` are the atoms themselves."""
+
+    reach = cutoff / lattice_plane_spacings(lattice)
+    span = np.ceil(reach).astype(np.int64) + 1
+    axes = [np.arange(-s, s + 1, dtype=np.int64) for s in span]
+    translations = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+    origin = np.flatnonzero(np.all(translations == 0, axis=1))
+    translations = np.concatenate((translations[origin], np.delete(translations, origin, axis=0)))
+    shifted = fractional[None, :, :] + translations[:, None, :]
+    inside = np.all((shifted >= -reach) & (shifted <= 1.0 + reach), axis=2)
+    which, atom = np.nonzero(inside)  # translation-major: the translation n = 0 first, its rows the atoms
+    image_positions = positions[atom] + translations[which].astype(np.float64) @ lattice
+    return image_positions, atom, reach
+
+
 def _real_space_pairs(positions: np.ndarray, fractional: np.ndarray, lattice: np.ndarray, cutoff: float):
     """Yield ``(a, b, displacement, distance)`` of every pair term of the real-space sum, in blocks of atoms ``a``.
 
@@ -174,17 +192,7 @@ def _real_space_pairs(positions: np.ndarray, fractional: np.ndarray, lattice: np
     from scipy.spatial import cKDTree
 
     count = len(positions)
-    reach = cutoff / lattice_plane_spacings(lattice)
-    span = np.ceil(reach).astype(np.int64) + 1
-    axes = [np.arange(-s, s + 1, dtype=np.int64) for s in span]
-    translations = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
-    origin = np.flatnonzero(np.all(translations == 0, axis=1))
-    translations = np.concatenate((translations[origin], np.delete(translations, origin, axis=0)))
-    shifted = fractional[None, :, :] + translations[:, None, :]
-    inside = np.all((shifted >= -reach) & (shifted <= 1.0 + reach), axis=2)
-    which, atom = np.nonzero(inside)  # translation-major: the translation n = 0 first, its rows the atoms
-    image_atoms = atom
-    image_positions = positions[atom] + translations[which].astype(np.float64) @ lattice
+    image_positions, image_atoms, reach = candidate_images(positions, fractional, lattice, cutoff)
     tree = cKDTree(image_positions)
     neighbours = len(image_positions) / max(float(np.prod(1.0 + 2.0 * reach)), 1.0) * (4.0 / 3.0) * np.pi * (
         reach.max() ** 3
@@ -264,6 +272,24 @@ def _structure_factors(fractional: np.ndarray, charges: np.ndarray, frequencies)
     return structure.reshape(m0, m1, m2)
 
 
+_ion_ion_device = None
+
+
+def set_ion_ion_device(terms=None) -> None:
+    """Install (or, with ``None``, remove) device sums of :func:`ewald_ion_ion_terms`.
+
+    ``terms.real_space(positions, fractional, lattice, charges, cutoff, eta, forces)`` returns ``(energy, force)``:
+    the real-space energy (Hartree) of the pairs within ``cutoff`` and, with ``forces``, their ``(atoms, 3)`` force
+    (else ``None``); ``terms.reciprocal(fractional, charges, frequencies, weight, vectors, volume, forces)`` the same
+    of the reciprocal sum over the half box of :func:`_reciprocal_box` (``fractional`` in the order of its axes).
+    Either returns ``None`` for an input it does not handle, and the host sums run.  The terms are the host's (the
+    same images, cutoff and reciprocal vectors); the sums differ in round-off.  The performance counterpart lives in
+    ``parsec_python.acceleration.V_ion.ewald_device``.
+    """
+    global _ion_ion_device
+    _ion_ion_device = terms
+
+
 def ewald_ion_ion_terms(
     atoms: Sequence[Atom],
     potentials: Mapping[str, ParsecPseudopotential],
@@ -312,26 +338,41 @@ def ewald_ion_ion_terms(
         raise ValueError("eta must be positive")
     cutoff = float(erfcinv(tolerance) / eta)
     force = np.zeros((count, 3)) if forces else None
+    device = _ion_ion_device
 
-    real_space_energy = 0.0
-    for rows, others, displacement, distance in _real_space_pairs(positions, fractional, lattice, cutoff):
-        products = charges[rows] * charges[others]
-        screened = erfc(eta * distance)
-        real_space_energy += 0.5 * float(np.sum(products * screened / distance))
+    found = None if device is None else device.real_space(positions, fractional, lattice, charges, cutoff, eta, forces)
+    if found is not None:
+        real_space_energy, part = found
         if forces:
-            # -d/dd [erfc(eta d)/d], over d for the unit vector
-            radial = products * (
-                screened / distance**2 + 2.0 * eta * np.exp(-((eta * distance) ** 2)) / (np.sqrt(np.pi) * distance)
-            ) / distance
-            for component in range(3):
-                force[:, component] += np.bincount(rows, weights=radial * displacement[:, component], minlength=count)
+            force += part
+    else:
+        real_space_energy = 0.0
+        for rows, others, displacement, distance in _real_space_pairs(positions, fractional, lattice, cutoff):
+            products = charges[rows] * charges[others]
+            screened = erfc(eta * distance)
+            real_space_energy += 0.5 * float(np.sum(products * screened / distance))
+            if forces:
+                # -d/dd [erfc(eta d)/d], over d for the unit vector
+                radial = products * (
+                    screened / distance**2 + 2.0 * eta * np.exp(-((eta * distance) ** 2)) / (np.sqrt(np.pi) * distance)
+                ) / distance
+                for component in range(3):
+                    force[:, component] += np.bincount(
+                        rows, weights=radial * displacement[:, component], minlength=count
+                    )
 
     axes, frequencies, weight, vectors = _reciprocal_box(lattice, eta, tolerance)
     ordered = fractional[:, list(axes)]
-    structure = _structure_factors(ordered, charges, frequencies)
-    reciprocal_energy = (2.0 * np.pi / volume) * float(np.sum(weight * (structure.real**2 + structure.imag**2)))
-    if forces:
-        _reciprocal_forces(force, ordered, charges, frequencies, weight, vectors, structure, volume)
+    found = None if device is None else device.reciprocal(ordered, charges, frequencies, weight, vectors, volume, forces)
+    if found is not None:
+        reciprocal_energy, part = found
+        if forces:
+            force += part
+    else:
+        structure = _structure_factors(ordered, charges, frequencies)
+        reciprocal_energy = (2.0 * np.pi / volume) * float(np.sum(weight * (structure.real**2 + structure.imag**2)))
+        if forces:
+            _reciprocal_forces(force, ordered, charges, frequencies, weight, vectors, structure, volume)
 
     self_energy = -(eta / np.sqrt(np.pi)) * float(np.sum(charges**2))
     neutralizing_energy = -(np.pi / (2.0 * eta**2 * volume)) * float(np.sum(charges)) ** 2
@@ -631,5 +672,6 @@ __all__ = [
     "ion_ion_splitting",
     "local_potential_tolerance",
     "local_potential_uses_spline",
+    "set_ion_ion_device",
     "set_local_potential_provider",
 ]

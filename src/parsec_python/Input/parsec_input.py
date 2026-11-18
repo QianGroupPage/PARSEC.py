@@ -45,7 +45,7 @@ from ..models import (
 from ..models import EmbeddingSettings  # FDET of PARSEC 1.5
 from ..Grid.cell import primitive_lattice, replicate_positions, supercell_lattice
 from ..Grid.pbc import fortran_grid_shift
-from ..Grid.kpoints import explicit_kpoints, read_kpoint_file
+from ..Grid.kpoints import explicit_kpoints, kpoint_time_reversal_setting, read_kpoint_file
 from ..Grid.pbc import periodic_grid_shift, uses_general_periodic_grid
 from . import routines as _routines_module
 from .routines import RoutineChoice, UseFortranRoutines, decide_routines
@@ -4847,6 +4847,7 @@ def _parse_parsec_input(
         use_symmetry = False
     symmetrize_density = optional_bool("symmetrize_charge_density")
     space_group = None
+    kpoint_time_reversal = False
     if wire_or_slab:
         # The space group of a wire or slab (and what it decides) is found
         # below, once bandstruc and nscf_kpoints are read.
@@ -4908,6 +4909,26 @@ def _parse_parsec_input(
                 symmetrize_density=symmetrize_density,
                 warnings=warnings,
             )
+        if (
+            default_routines_mesh is not None
+            and (atoms_move or single_point_forces)
+            and explicit_kpoint_array is not None
+            and not (
+                scf.is_hybrid
+                or noncollinear
+                or self_consistent_spin_orbit
+                or any(specification.spin_orbit for specification in specifications.values())
+                or optional_bool("create_dos")
+                or optional_bool("output_gw")
+            )
+            and kpoint_time_reversal_setting() == "auto"
+        ):
+            # The forces and the moving atoms of scalar or collinear-spin orbitals keep the whole mesh (no space
+            # group: the structure may lose it); k and -k still give the same density and forces (u_-k = u_k^*),
+            # as Fortran's irrbz uses for every run that is not non-collinear: the mesh stays the list of equal
+            # weights of these routines, and kpoint_sampling runs the representatives of its pairs with twice the
+            # weight (the DOS tetrahedra and Output_GW keep the whole mesh).
+            kpoint_time_reversal = True
     elif is_periodic:
         weighted_kpoints = bool(
             explicit_kpoint_weights is not None
@@ -5797,6 +5818,7 @@ def _parse_parsec_input(
         monkhorst_pack_shift=monkhorst_pack_shift,
         space_group=space_group,
         **({} if fdet.embedding is None else {"embedding": fdet.embedding}),
+        **({"kpoint_time_reversal": True} if kpoint_time_reversal else {}),
     )
     output_all_states = optional_bool("output_all_states")
     output_level = _integer(one("output_level", "1"), label="Output_Level")
@@ -6055,6 +6077,14 @@ def _periodic_symmetry(
         symmetrize_density or fortran_kpoints or forces_of_weighted_kpoints
     ) and not failed_check
     return symmetrize_density, (group if keep else None), grid
+
+
+def _time_reversal_count(problem) -> int:
+    """The points :func:`parsec_python.Grid.kpoints.kpoint_sampling` runs for a mesh of ``kpoint_time_reversal``."""
+
+    from ..Grid.kpoints import kpoint_sampling
+
+    return int(len(kpoint_sampling(problem)[0]))
 
 
 def _default_routines_wedge(
@@ -8069,6 +8099,16 @@ def summarize_translation(translation: ParsecInputTranslation) -> str:
                 )
                 + (" without time reversal)" if problem.scf.noncollinear else " and time reversal)"),
             )
+        ),
+        # The whole mesh of forces and moving atoms run as its pairs k, -k (kpoint_time_reversal).
+        *(
+            (
+                f"K-points: the {len(problem.kpoints)} points of the mesh as their time-reversal pairs ("
+                f"{_time_reversal_count(problem)} run, the forces and the density of all of them; "
+                "PARSEC_KPOINT_TIME_REVERSAL=off runs every point)",
+            )
+            if getattr(problem, "kpoint_time_reversal", False) and problem.kpoints is not None
+            else ()
         ),
         # Only where the refinement is requested: other summaries keep their text.
         *(

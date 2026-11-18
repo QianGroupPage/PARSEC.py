@@ -629,7 +629,9 @@ class ScopeTests(unittest.TestCase):
         )
         self.assertIsInstance(device_forces.periodic_ionic_scope(cluster), nullcontext)
 
-    def test_mpi_still_refuses_periodic_forces(self) -> None:
+    def test_mpi_refuses_gamma_forces_and_takes_kpoint_forces(self) -> None:
+        # the forces of a Gamma-point cell read whole orbitals: refused under --mpi; those of the scalar k-point SCF
+        # are summed on the ranks of the k-point pools (since 2026-11-17): the input check lets them through
         from .. import cli as accelerated_cli
         from ..Parallel import mpi
 
@@ -641,12 +643,21 @@ class ScopeTests(unittest.TestCase):
                     path = directory / "parsec.in"
                     path.write_text(_CLI_INPUT + extra, encoding="utf-8")
                     errors = StringIO()
+                    # (the reference solver the k-points go to is not run here: the check is the subject)
+                    reference = mock.Mock(return_value=0)
                     with mock.patch.object(accelerated_cli, "_join_mpi", return_value=None), mock.patch.object(
                         accelerated_cli, "_abort_mpi"
                     ), mock.patch.object(
                         mpi, "requested", return_value=True
+                    ), mock.patch.object(mpi, "context", return_value=None), mock.patch.object(
+                        accelerated_cli, "reference_main", reference
                     ), redirect_stderr(errors), redirect_stdout(StringIO()):
                         code = accelerated_cli.main([str(path), "--quiet", "--no-archive"])
+                if extra.startswith("Kpoint"):
+                    self.assertNotIn("forces, relaxation or molecular dynamics of a periodic", errors.getvalue())
+                    self.assertEqual(code, 0)
+                    reference.assert_called_once()
+                    continue
                 self.assertEqual(code, 2)
                 self.assertIn("forces, relaxation or molecular dynamics of a periodic", errors.getvalue())
                 self.assertIn("--mpi", errors.getvalue())

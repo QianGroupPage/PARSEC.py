@@ -1124,11 +1124,9 @@ def _density_provider(grid, atoms, potentials, specifications, lattice_vectors, 
         if not _default_bulk_grid(grid):
             return None
         reaches = {
-            atom.symbol: _ionic.atomic_density_support_radius(
-                potentials[atom.symbol], specifications[atom.symbol], core=core
-            )
-            for atom in atoms
-            if not core or potentials[atom.symbol].has_nonlinear_core_correction
+            symbol: _ionic.atomic_density_support_radius(potentials[symbol], specifications[symbol], core=core)
+            for symbol in dict.fromkeys(atom.symbol for atom in atoms)  # once per species
+            if not core or potentials[symbol].has_nonlinear_core_correction
         }
         return periodic_atomic_density(
             grid, atoms, potentials, specifications, lattice_vectors, core, reaches=reaches

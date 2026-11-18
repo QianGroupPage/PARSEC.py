@@ -2753,7 +2753,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ionic_backend_of(translation.potential_extrapolation),
                     ionic_reporter,
                     log.write,
-                    directory=input_directory,
+                    # the ranks other than 0 of an MPI run write no files (--no-data-files), and read manual.dat
+                    directory=None if arguments.no_data_files else input_directory,
+                    input_directory=input_directory,
                     restart=relax_restart,
                     symmetrize=use_symmetry,
                 )
@@ -2766,7 +2768,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ionic_backend_of(translation.potential_extrapolation),
                     ionic_reporter,
                     log.write,
-                    directory=input_directory,
+                    directory=None if arguments.no_data_files else input_directory,
                     restart=dynamics_restart,
                 )
                 result, forces = dynamics.result, dynamics.forces

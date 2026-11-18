@@ -556,7 +556,8 @@ def make_solver(job: KPointJob, **options):
 def _plain_solver(job: KPointJob, **options):
     """The solver of :func:`make_solver` with one task per k-point (or per task of the job)."""
     if mpi.context() is not None:
-        if job.extras is None and options.get("problem_size") is not None:
+        # the pools also take extras that sum over any subset of the states (the forces of the scalar SCF)
+        if (job.extras is None or job.extras_by_columns) and options.get("problem_size") is not None:
             from .kpoint_pools import MPIPoolKPointSolver
 
             return MPIPoolKPointSolver(job, **options)

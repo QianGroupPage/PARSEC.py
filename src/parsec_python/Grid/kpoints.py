@@ -648,6 +648,22 @@ def _hybrid(problem) -> bool:
     return bool(getattr(getattr(problem, "scf", None), "is_hybrid", False))
 
 
+KPOINT_TIME_REVERSAL_ENV = "PARSEC_KPOINT_TIME_REVERSAL"
+
+
+def kpoint_time_reversal_setting() -> str:
+    """``PARSEC_KPOINT_TIME_REVERSAL``: ``auto`` (default, since 2026-11-18) reduces the whole Monkhorst-Pack mesh that
+    forces and moving atoms keep (scalar or collinear-spin orbitals, the default routines of a bulk cell) to its
+    pairs ``k``, ``-k`` (:func:`time_reversal_reduced`); ``off`` keeps the whole mesh, as before."""
+
+    import os
+
+    value = os.environ.get(KPOINT_TIME_REVERSAL_ENV, "auto").strip().lower() or "auto"
+    if value not in ("auto", "off"):
+        raise ValueError(f"{KPOINT_TIME_REVERSAL_ENV} must be auto or off, got {value!r}")
+    return value
+
+
 def time_reversal_reduced(k_points, weights, lattice_vectors) -> tuple[np.ndarray, np.ndarray]:
     """The representatives of a uniform mesh of equal weights under time reversal (``k ~ -k``).
 
@@ -692,8 +708,11 @@ def kpoint_sampling(problem) -> tuple[np.ndarray, np.ndarray] | None:
     if getattr(problem, "kpoints", None) is not None:
         k_points = np.asarray(problem.kpoints, dtype=float)
         weights = np.asarray(problem.kpoint_weights, dtype=float)
-        if _hybrid(problem) and np.allclose(weights, weights[0], rtol=1.0e-12, atol=0.0):
-            # a list of equal weights (a full mesh written out): its time-reversal representatives
+        if (_hybrid(problem) or getattr(problem, "kpoint_time_reversal", False)) and np.allclose(
+            weights, weights[0], rtol=1.0e-12, atol=0.0
+        ):
+            # a list of equal weights (a full mesh written out): its time-reversal representatives (a hybrid; the
+            # mesh of the forces and moving atoms of scalar or collinear-spin orbitals, kpoint_time_reversal)
             return time_reversal_reduced(k_points, weights, problem.periodic_cell.lattice_vectors)
         return k_points, weights
     details = kpoint_sampling_details(problem)
@@ -717,6 +736,7 @@ __all__ = [
     "irreducible_monkhorst_pack",
     "kpoint_sampling",
     "kpoint_sampling_details",
+    "kpoint_time_reversal_setting",
     "mesh_preserving_operations",
     "monkhorst_pack_grid",
     "read_kpoint_file",

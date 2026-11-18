@@ -18,9 +18,12 @@ valid for both PARSEC's half-grid shift and zero-shift diagnostic grids.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
+import hashlib
 from itertools import combinations, permutations, product
 import os
+from threading import Lock
 from typing import Sequence
 
 import numpy as np
@@ -90,12 +93,35 @@ def _folded(points: np.ndarray, period: np.ndarray) -> np.ndarray:
     return np.where(folded >= period, folded - period, folded)
 
 
+# The trees of the last few sets of candidates: the detection tests every operation against the same atoms of a
+# species, and a tree of the 64,000 atoms of a 20^3 diamond cell takes tens of milliseconds to build.
+_MATCHING_TREES: "OrderedDict[tuple, object]" = OrderedDict()
+_MATCHING_TREES_LOCK = Lock()
+_MATCHING_TREE_CAPACITY = 8
+# queries of the matching trees on every core (the answers do not depend on it)
+_QUERY_WORKERS = -1
+
+
 def _matching_tree(candidates: np.ndarray, period: np.ndarray | None):
     from scipy.spatial import cKDTree
 
-    if period is None:
-        return cKDTree(candidates)
-    return cKDTree(_folded(candidates, period), boxsize=period)
+    candidates = np.ascontiguousarray(candidates, dtype=np.float64)
+    key = (
+        hashlib.blake2b(candidates.view(np.uint8), digest_size=16).digest(),
+        candidates.shape,
+        None if period is None else tuple(float(value) for value in np.asarray(period).reshape(-1)),
+    )
+    with _MATCHING_TREES_LOCK:
+        tree = _MATCHING_TREES.get(key)
+        if tree is not None:
+            _MATCHING_TREES.move_to_end(key)
+            return tree
+    tree = cKDTree(candidates) if period is None else cKDTree(_folded(candidates, period), boxsize=period)
+    with _MATCHING_TREES_LOCK:
+        _MATCHING_TREES[key] = tree
+        while len(_MATCHING_TREES) > _MATCHING_TREE_CAPACITY:
+            _MATCHING_TREES.popitem(last=False)
+    return tree
 
 
 def _threshold_neighbours(
@@ -117,7 +143,7 @@ def _threshold_neighbours(
 
     radius = tolerance * (1.0 + 1.0e-9) + 1.0e-12
     queries = transformed if period is None else _folded(transformed, period)
-    proposals = _matching_tree(candidates, period).query_ball_point(queries, radius)
+    proposals = _matching_tree(candidates, period).query_ball_point(queries, radius, workers=_QUERY_WORKERS)
     adjacency = []
     for row, proposed in enumerate(proposals):
         columns = np.sort(np.asarray(proposed, dtype=np.int64))
@@ -150,7 +176,7 @@ def _single_partner_matching(
     queries = transformed if period is None else _folded(transformed, period)
     # A neighbour that does not exist inside the radius has infinite distance.
     proposed, nearest = _matching_tree(candidates, period).query(
-        queries, k=2, distance_upper_bound=radius
+        queries, k=2, distance_upper_bound=radius, workers=_QUERY_WORKERS
     )
     if np.any(np.isfinite(proposed[:, 1])):
         return None
@@ -1220,7 +1246,7 @@ def _plausible(species: dict, trees: dict, operation, translation, tolerance: fl
         if translation is not None:
             sample = sample + np.asarray(translation, dtype=np.float64)
         queries = sample if period is None else _folded(sample, period)
-        distances, _ = tree.query(queries, k=1, distance_upper_bound=radius)
+        distances, _ = tree.query(queries, k=1, distance_upper_bound=radius, workers=_QUERY_WORKERS)
         if not np.all(np.isfinite(distances)):
             return False
     return True
@@ -1276,7 +1302,9 @@ def _translations_mapping(species: dict, trees: dict, operation, period, steps, 
         )
         for atom in atoms_of[picks]:
             images = atom @ matrix.T + whole * steps
-            distances, _ = tree.query(_folded(images, period), k=1, distance_upper_bound=radius)
+            distances, _ = tree.query(
+                _folded(images, period), k=1, distance_upper_bound=radius, workers=_QUERY_WORKERS
+            )
             whole = whole[np.isfinite(distances)]
             if whole.size == 0:
                 return []
@@ -1419,7 +1447,7 @@ def _atom_orbits(atoms, operations, translations, grid, tolerance: float):
             if translations is not None:
                 image = image + np.asarray(translations[g], dtype=np.float64) * steps
             queries = image if period is None else _folded(image, period)
-            distances, nearest = tree.query(queries, k=1, distance_upper_bound=radius)
+            distances, nearest = tree.query(queries, k=1, distance_upper_bound=radius, workers=_QUERY_WORKERS)
             if not np.all(np.isfinite(distances)):
                 return None
             images[g, members] = members[nearest]

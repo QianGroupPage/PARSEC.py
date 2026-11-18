@@ -236,11 +236,31 @@ The other drivers of k-points take the sectors too (2026-11-17; the same inputs 
 | n = 3, 1x1x2, `Correlation_Type: pbe0` | 4 (one process) | 53.5 s | 69.4 s | 14.6 / 15.7 | 1.3e-6 |
 
 The two channels of a spin-polarized k-point share its sectors; the forces of a relaxation come from the orbitals of
-the sectors expanded to the whole grid (in one process: the MPI pools gather no orbitals); the exchange of PBE0 is
+the sectors expanded to the whole grid (in one process, or on the ranks of the MPI pools, each over its columns, since
+the evening of the same day); the exchange of PBE0 is
 reduced to the sectors, which keep their plans and Ritz states from one loop of the Fock loop to the next (the inner
 SCF steps 0.7 instead of 2.1 s). The spin-polarized PBE of these drivers ran on the host of every rank, 37 of the 81 s
 of SCF; on the GPU (the formula of the host with forward derivatives, `src/parsec_python/acceleration/V_xc/dual.py`)
 it takes 0.5 s and the run 50.9 s (later steps 2.1 instead of 6.8 s), the same total energy to the digits printed.
+
+Relaxations with k-points on the MPI pools (`--mpi`, 16 A100, `Minimization: bfgs`, `Movement_Num: 1`; no space
+group: the mesh of a relaxation is reduced by time reversal alone, `PARSEC_KPOINT_TIME_REVERSAL`, since 2026-11-18):
+n = 3 with the 2x2x2 mesh (8 points, each its own partner) 15.9 s, against 83.1 s in one process on four GPUs, the same
+total energy (-2463.22850177 Ry) and forces to the digits printed; n = 6 with the 3x3x3 mesh (14 of its 27 points)
+135.6 s, of which 118.2 s SCF, within 9e-8 Ry and 6e-6 Ry/bohr of the whole mesh (largest force 4.4e-5 Ry/bohr).
+Before the same day these took 31.1 s and 381.0 s: the whole mesh (205.4 s of SCF at n = 6) and a starting density
+from the readable sum (20.9 s and 159.3 s: the scope of the forces on the GPU had replaced the builder of the bulk
+grid, which the single points kept, 0.24 s at n = 6).
+
+The setup of large Gamma cells (2026-11-17): the Ewald ion-ion sums on the GPU (`acceleration/V_ion/ewald_device.py`:
+the images of the host in cells of the cutoff for the real-space pairs, CuPy for the structure factors;
+`PARSEC_DEVICE_EWALD=off` keeps the host sums bit for bit), the finite-difference matrix filled by slabs on threads
+and the image centres of the atomic density for all atoms of a species at once (both the same bits). n = 20 on 16
+A100, each run second in its allocation: 151.2 s instead of 176.2 s, the setup before the SCF 44.9 s instead of 70.0
+(ion-ion 0.7 instead of 16.8 s, finite differences 5.8 instead of 10.1, atomic density 3.5 instead of 8.1), the SCF
+106.3 s either way, the same total and ion-ion energies to the digits printed. With the sector stencils of the cell
+built from its grid (2026-11-18: the reduction of its full matrix checked every row and column once per sector) and the
+atom-matching trees of the symmetry detection kept: 141.9 s, the setup 35.4 s, the same energies.
 
 ### Scaling on one size
 

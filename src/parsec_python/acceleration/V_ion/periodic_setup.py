@@ -358,6 +358,10 @@ def install() -> None:
     # the projectors of a bulk orthorhombic cell at Gamma, all atoms at once (the same arrays)
     _ionic.set_projector_provider(batched_nonlocal_projectors)
     _ewald.set_local_potential_provider(fft_local_ionic_potential, converged_for=_fortran_converged)
+    # the ion-ion sums of large cells on the device (PARSEC_DEVICE_EWALD=off: the host's, bit for bit)
+    from .ewald_device import DeviceEwaldTerms
+
+    _ewald.set_ion_ion_device(DeviceEwaldTerms())
     _force_sums.set_local_force_provider(local_force_provider)
     _fortran_force_sums.set_local_force_provider(spline_periodic_local_forces)
     # the image sums of the atomic densities (None, the readable sum, for the other grids)
@@ -370,6 +374,7 @@ def uninstall() -> None:
 
     _ionic.set_support_finder(None)
     _ewald.set_local_potential_provider(None)
+    _ewald.set_ion_ion_device(None)
     _force_sums.set_local_force_provider(None)
     _fortran_force_sums.set_local_force_provider(None)
     _ionic.set_atomic_density_provider(None)

@@ -193,6 +193,50 @@ def check_sectors(ranks: int, pools: int) -> dict:
     return {"serial": serial, "pooled": pooled}
 
 
+def check_forces(ranks: int, pools: int, sectors: str) -> dict:
+    """The nonlocal forces of the scalar k-point SCF (one atom of the silicon cube moved, Gamma and X) on pools of
+    ranks against one process: the k-points whole (``sectors=off``) or in the sectors of their little groups."""
+    from dataclasses import replace
+
+    from parsec_python.acceleration.SCF import kpoint_sectors
+    from parsec_python.acceleration.SCF.kpoint_sectors import sector_solver
+    from parsec_python.acceleration.tests.test_periodic_point_group import silicon
+    from parsec_python.SCF.kpoints import run_scf_kpoints
+    from parsec_python.SCF.pbc import prepare_periodic_single_point
+
+    os.environ["PARSEC_KPOINT_SECTORS"] = sectors
+    kpoint_sectors._MINIMUM_ENTRIES = 0
+    base = silicon("pbe", spacing=0.855)
+    atoms = list(base.atoms)
+    atoms[0] = replace(atoms[0], position=np.asarray(atoms[0].position, dtype=float) + np.array([0.1, 0.0, 0.0]))
+    base = replace(base, atoms=atoms, scf=replace(base.scf, convergence_criterion=1.0e-7))
+    system = prepare_periodic_single_point(base)
+    side = float(np.asarray(base.periodic_cell.lattice_vectors)[0, 0])
+    k_points = np.array([np.zeros(3), np.pi / side * np.array([1.0, 0.0, 0.0])])
+    weights = np.array([0.5, 0.5])
+
+    def summary(found) -> dict:
+        return dict(
+            _summary(found),
+            forces=np.asarray(found.nonlocal_forces, dtype=float).tolist(),
+            tasks=float(found.timings.detail.get("kpoint_sector_tasks", 0.0)),
+        )
+
+    serial = summary(run_scf_kpoints(system, k_points, weights, compute_forces=True))
+
+    def solver(job, **options):
+        made = sector_solver(job, _thread_solver, **options)
+        return _thread_solver(job, **options) if made is None else made
+
+    def rank(context):
+        _LOCAL.context, _LOCAL.pools = context, pools
+        return summary(run_scf_kpoints(system, k_points, weights, compute_forces=True))
+
+    with mock.patch("parsec_python.SCF.kpoints.make_kpoint_solver", solver):
+        pooled = run_ranks(ranks, rank)
+    return {"serial": serial, "pooled": pooled}
+
+
 def check_projectors(ranks: int) -> dict:
     """The Bloch projectors built with the atoms dealt over a pool of ``ranks`` ranks against one build."""
     import scipy.sparse as sp
@@ -247,6 +291,8 @@ def main() -> None:
         payload = check_scf(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
     elif mode == "sectors":
         payload = check_sectors(int(sys.argv[2]), int(sys.argv[3]))
+    elif mode == "forces":
+        payload = check_forces(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
     elif mode == "projectors":
         payload = check_projectors(int(sys.argv[2]))
     else:

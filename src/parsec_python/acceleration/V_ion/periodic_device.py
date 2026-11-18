@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import math
 from contextlib import contextmanager
+from functools import partial
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -433,29 +434,48 @@ def _binned_density_kernel(cp):
     return _COMPILED_BINNED[device]
 
 
-def _binned_bulk_density(cp, axes, sides, positions, kinds, images, reaches, bounds, tables_on_device):
-    """The density of ``bulk_atomic_density`` from bins of the atom images (the same terms in the order of the
-    bins: the sum of every atom to round-off)."""
+def _image_centres(positions, kinds, images, sides, reaches, lows, highs):
+    """``(centres, kinds)`` of the images of the atoms that reach the box ``[lows, highs]``: ``positions[a] + m *
+    side`` (``|m_i| <= images[3 kind + i]``), atom after atom and in each atom the translations in the order of
+    their meshgrid.  The atoms of one kind are taken together (the values and the order of a loop over the atoms,
+    without its Python steps: 6-8 s for the 64,000 atoms of a 20^3 diamond cell before 2026-11-17)."""
 
-    atom_count = int(kinds.size)
-    lows = np.array([float(np.min(axis)) for axis in axes])
-    highs = np.array([float(np.max(axis)) for axis in axes])
-    reach = float(np.max(reaches)) if len(reaches) else 0.0
-    centres, entry_kinds = [], []
-    for atom in range(atom_count):
-        kind = int(kinds[atom])
+    kinds = np.asarray(kinds)
+    located = np.asarray(positions, dtype=np.float64).reshape(int(kinds.size), 3)
+    pieces = []
+    for kind in np.unique(kinds):
+        kind = int(kind)
+        members = np.flatnonzero(kinds == kind)
         m = images[3 * kind : 3 * kind + 3]
         grids = np.meshgrid(
             np.arange(-m[0], m[0] + 1), np.arange(-m[1], m[1] + 1), np.arange(-m[2], m[2] + 1), indexing="ij"
         )
         steps = np.column_stack([grid.reshape(-1) for grid in grids]).astype(np.float64)
-        # the centres of the kernel of every atom: positions[a] + m * side, the same roundings
-        centre = positions[3 * atom : 3 * atom + 3][None, :] + steps * sides[None, :]
-        near = np.all((centre + reaches[kind] >= lows) & (centre - reaches[kind] <= highs), axis=1)
-        centres.append(centre[near])
-        entry_kinds.append(np.full(int(np.count_nonzero(near)), kind, dtype=np.int32))
-    centres = np.concatenate(centres) if centres else np.empty((0, 3))
-    entry_kinds = np.concatenate(entry_kinds) if entry_kinds else np.empty(0, dtype=np.int32)
+        offsets = steps * sides[None, :]
+        chunk = max(1, (1 << 22) // len(steps))  # atoms of one pass (~100 MiB of centres)
+        for start in range(0, members.size, chunk):
+            chosen = members[start : start + chunk]
+            centre = located[chosen][:, None, :] + offsets[None, :, :]
+            near = np.all((centre + reaches[kind] >= lows) & (centre - reaches[kind] <= highs), axis=2)
+            member, step = np.nonzero(near)  # atom-major, then the translations: the order of one atom's loop
+            pieces.append((chosen[member], step, centre[member, step]))
+    if not pieces:
+        return np.empty((0, 3)), np.empty(0, dtype=np.int32)
+    owners = np.concatenate([piece[0] for piece in pieces])
+    steps_of = np.concatenate([piece[1] for piece in pieces])
+    centres = np.concatenate([piece[2] for piece in pieces])
+    order = np.lexsort((steps_of, owners))  # every atom's entries together, in atom order
+    return centres[order], kinds[owners[order]].astype(np.int32)
+
+
+def _binned_bulk_density(cp, axes, sides, positions, kinds, images, reaches, bounds, tables_on_device):
+    """The density of ``bulk_atomic_density`` from bins of the atom images (the same terms in the order of the
+    bins: the sum of every atom to round-off)."""
+
+    lows = np.array([float(np.min(axis)) for axis in axes])
+    highs = np.array([float(np.max(axis)) for axis in axes])
+    reach = float(np.max(reaches)) if len(reaches) else 0.0
+    centres, entry_kinds = _image_centres(positions, kinds, images, sides, reaches, lows, highs)
     bin_size = max(reach * (1.0 + 1.0e-9), 1.0e-6)
     origin = lows - reach
     shape = np.maximum(np.ceil((highs + reach - origin) / bin_size).astype(np.int64), 1)
@@ -961,8 +981,14 @@ def device_atomic_density(grid, atoms, potentials, specifications, lattice_vecto
     return _radial_field(cp, grid, atoms, symbols, potentials, tables, parameters, mode=1)
 
 
-def _device_density_provider(grid, atoms, potentials, specifications, lattice_vectors, core):
-    return device_atomic_density(grid, atoms, potentials, specifications, lattice_vectors, core=core)
+def _device_density_provider(grid, atoms, potentials, specifications, lattice_vectors, core, fallback=None):
+    found = device_atomic_density(grid, atoms, potentials, specifications, lattice_vectors, core=core)
+    if found is None and fallback is not None:
+        # a grid these sums do not take: the builder installed before the scope (the index boxes and bins of
+        # .periodic_setup_fortran for the bulk grid of the default routines), not the readable sum (159-187 s for
+        # the 1,728 atoms of a 6^3 diamond cell with forces, against 0.24 s for its single point, before 2026-11-18)
+        found = fallback(grid, atoms, potentials, specifications, lattice_vectors, core)
+    return found
 
 
 def _device_or_fft(grid, atoms, potentials, specifications, lattice_vectors, eta, tolerance):
@@ -992,7 +1018,9 @@ def device_periodic_preparation():
         yield False
         return
     _ewald.set_local_potential_provider(_device_or_fft, converged_for=_setup._fft_handles)
-    _ionic.set_atomic_density_provider(_device_density_provider)
+    _ionic.set_atomic_density_provider(
+        _device_density_provider if previous_density is None else partial(_device_density_provider, fallback=previous_density)
+    )
     try:
         yield True
     finally:

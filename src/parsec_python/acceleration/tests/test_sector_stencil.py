@@ -1217,5 +1217,63 @@ class RouteBenchmarkTests(unittest.TestCase):
         self.assertIn("PARSEC_NATIVE_SECTOR_ASSEMBLY", errors)
 
 
+
+class WrappedStencilTests(unittest.TestCase):
+    """The sector stencils of a periodic cell from its grid (a wrapped lookup) against the reduction of its matrix."""
+
+    @staticmethod
+    def _cell(translations: str):
+        from parsec_python.acceleration.Symmetry import detect_point_group_reduction, load_or_detect_reflection_reduction
+        from parsec_python.acceleration.tests.test_periodic_point_group import silicon
+        from parsec_python.Grid.pbc import build_periodic_grid
+
+        problem = silicon("ca", spacing=0.64)
+        grid = build_periodic_grid(problem.periodic_cell, problem.grid)
+        with patch.dict(os.environ, {"PARSEC_PERIODIC_TRANSLATIONS": translations}):
+            candidate, _ = load_or_detect_reflection_reduction(grid, tuple(problem.atoms), cache_directory=None)
+            reduction = detect_point_group_reduction(grid, tuple(problem.atoms), candidate)
+        return grid, ReflectionRepresentationDecomposition.build(grid, reduction)
+
+    def test_every_sector_of_a_cell_equals_the_reduced_wrapped_matrix(self) -> None:
+        for translations, order in (("auto", 32), ("off", None)):
+            grid, decomposition = self._cell(translations)
+            # with the half-cell translations 32 operations; without them the group the detection keeps
+            self.assertEqual(decomposition.reduction.group_order, order or decomposition.reduction.group_order)
+            self.assertGreater(decomposition.representation_count, 1)
+            matrix = build_negative_laplacian(grid)
+            built = build_sector_stencils(grid, decomposition, implementation="numpy", wrap=True)
+            for index in range(decomposition.representation_count):
+                with self.subTest(translations=translations, sector=index):
+                    expected = build_stencil_major_metadata(
+                        _reduced_like_the_native_route(matrix, decomposition, index)
+                    )
+                    SectorStencilTests.assert_same_stencil(self, built[index], expected)
+        with self.assertRaises(ValueError):
+            build_sector_stencils(grid, decomposition, implementation="native", wrap=True)
+
+    def test_the_bundle_of_a_cell_takes_the_grid_and_equals_the_matrix_route(self) -> None:
+        grid, decomposition = self._cell("auto")
+        matrix = build_negative_laplacian(grid)
+        operator = _nonlocal(grid)
+        with patch.dict(os.environ, {"PARSEC_ACCELERATED_RESIDENT": "0"}):
+            direct = load_or_build_reduced_operators(decomposition, matrix, operator, cache_directory=None)
+            with patch.dict(os.environ, {"PARSEC_SECTOR_STENCIL": "csr"}):
+                through_matrix = load_or_build_reduced_operators(decomposition, matrix, operator, cache_directory=None)
+            changed = matrix.copy()
+            changed.parsec_wrapped_stencil_of = grid  # a matrix changed in place keeps the name
+            changed.data[len(changed.data) // 2] *= 1.5
+            checked = load_or_build_reduced_operators(decomposition, changed, operator, cache_directory=None)
+        self.assertEqual(direct.cache_info.stencil_builder, "direct-numpy-wrapped")
+        self.assertEqual(through_matrix.cache_info.stencil_builder, "csr")
+        self.assertEqual(checked.cache_info.stencil_builder, "csr")
+        for left, right in zip(direct.stencil_metadata, through_matrix.stencil_metadata):
+            SectorStencilTests.assert_same_stencil(self, left, right)
+        # the matrix of a k-point (a Bloch block) and a copy carry no name
+        from parsec_python.Laplacian.finite_difference import build_bloch_negative_laplacian
+
+        self.assertIsNone(getattr(build_bloch_negative_laplacian(grid, np.array([0.1, 0.0, 0.0])), "parsec_wrapped_stencil_of", None))
+        self.assertIsNone(getattr(matrix.copy(), "parsec_wrapped_stencil_of", None))
+
+
 if __name__ == "__main__":
     unittest.main()

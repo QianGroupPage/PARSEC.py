@@ -16,6 +16,7 @@ from pathlib import Path
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -280,6 +281,37 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("after setting net force to zero", (folder / "parsec.out").read_text())
 
+    def test_forces_of_a_mesh_take_its_time_reversal_pairs(self) -> None:
+        # the whole Gamma-centred 3x2x1 mesh of the default routines that forces keep: its pairs k, -k (4 points of 6)
+        # give the energy and the forces of the 6 (PARSEC_KPOINT_TIME_REVERSAL=off)
+        from parsec_python.Input import parse_parsec_input
+
+        extra = (
+            "Skip_Force: .false.\nUse_Fortran_Routines: .false.\nIgnore_Symmetry: .true.\nKpoint_Method: mp\n"
+            "begin Monkhorst_Pack_Grid\n3 2 1\nend Monkhorst_Pack_Grid\n"
+            "begin Monkhorst_Pack_Shift\n0.0 0.0 0.0\nend Monkhorst_Pack_Shift"
+        )
+        found = {}
+        for setting in ("auto", "off"):
+            with mock.patch.dict(os.environ, {"PARSEC_KPOINT_TIME_REVERSAL": setting}):
+                code, _, folder = self._run(extra)
+                self.assertEqual(code, 0)
+                translation = parse_parsec_input(folder / "parsec.in")
+            text = (folder / "parsec.out").read_text()
+            energy = float(re.findall(r"Total Energy =\s+(-?\d+\.\d+)", text)[-1])
+            from parsec_python.Grid.kpoints import kpoint_sampling
+
+            points, weights = kpoint_sampling(translation.problem)
+            self.assertEqual(len(translation.problem.kpoints), 6)  # the mesh of these routines stays whole
+            self.assertFalse(translation.routines.fortran)
+            found[setting] = (len(points), np.asarray(weights), energy, self._final_forces(folder))
+        self.assertEqual(found["auto"][0], 4)
+        self.assertEqual(found["off"][0], 6)
+        self.assertAlmostEqual(float(found["auto"][1].sum()), 1.0, places=14)
+        self.assertAlmostEqual(found["auto"][2], found["off"][2], delta=1.0e-7)
+        self.assertGreater(float(np.abs(found["off"][3]).max()), 1.0e-3)
+        np.testing.assert_allclose(found["auto"][3], found["off"][3], atol=2.0e-6)
+
     @staticmethod
     def _final_forces(folder: Path) -> np.ndarray:
         """The last table of forces after the net force is removed, from ``parsec.out`` (six decimals)."""
@@ -351,6 +383,20 @@ class CommandLineTests(unittest.TestCase):
             self.assertTrue((folder / name).is_file(), name)
         frames = (folder / "relaxation.xyz").read_text().count("energy_Ry=")  # one frame per structure
         self.assertGreaterEqual(frames, 3)
+
+    def test_the_ionic_loops_write_no_files_without_data_files(self) -> None:
+        # --no-data-files (the ranks other than 0 of an MPI run share the folder of rank 0): no atom.cor,
+        # trajectory or restart of a relaxation, no md_*.dat of dynamics
+        code, _, folder = self._run("Minimization: bfgs\nMovement_Num: 1\nForce_Min: 1e-3 Ry/bohr", reference_main, "--no-data-files")
+        self.assertIn(code, (0, 4))
+        code, _, other = self._run(
+            "Molecular_Dynamics: .true.\nTinit: 300\nT_Final: 200\nT_Step: 10\nTime_Step: 20\nStep_Num: 1\nRng_Seed: 7",
+            reference_main,
+            "--no-data-files",
+        )
+        self.assertEqual(code, 0)
+        for place in (folder, other):
+            self.assertEqual(sorted(path.name for path in place.iterdir() if path.name != "parsec.out"), ["H_POTRE.DAT", "parsec.in"])
 
     def test_molecular_dynamics(self) -> None:
         code, _, folder = self._run("Molecular_Dynamics: .true.\nTinit: 300\nT_Final: 200\nT_Step: 10\nTime_Step: 20\nStep_Num: 3\nRng_Seed: 7")

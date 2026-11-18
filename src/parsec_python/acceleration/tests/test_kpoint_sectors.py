@@ -525,14 +525,14 @@ class DeclineTests(unittest.TestCase):
 
         self.assertIsInstance(sectors.sector_solver(job(), plain, problem_size=system.grid.size), sectors.SectorKPointSolver)
         self.assertIsNone(sectors.sector_solver(job(geometry=None), plain))
-        # the forces (extras) take the sectors in one process; the MPI k-point pools gather no orbitals
+        # extras that sum over any subset of the states (the forces) take the sectors, in one process or on the
+        # ranks of the MPI pools; other extras do not
         self.assertIsNotNone(
-            sectors.sector_solver(job(extras=lambda task, vectors: 0.0), plain, problem_size=system.grid.size)
+            sectors.sector_solver(
+                job(extras=lambda task, vectors: 0.0, extras_by_columns=True), plain, problem_size=system.grid.size
+            )
         )
-        from parsec_python.acceleration.Parallel import mpi
-
-        with mock.patch.object(mpi, "context", lambda: object()):
-            self.assertIsNone(sectors.sector_solver(job(extras=lambda task, vectors: 0.0), plain))
+        self.assertIsNone(sectors.sector_solver(job(extras=lambda task, vectors: 0.0), plain))
         with mock.patch.dict(os.environ, {"PARSEC_KPOINT_SECTORS": "off"}):
             self.assertIsNone(sectors.sector_solver(job(), plain))
         # a k-point whose sectors would not halve the work stays one task: with one state, the six extra states

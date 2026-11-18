@@ -308,6 +308,39 @@ class ImageBlockTests(unittest.TestCase):
                     self.assertGreater(float(host.max()), 0.0)
                     _assert_same_bits(self, device, host)
 
+    def test_the_image_centres_are_those_of_the_loop_over_the_atoms(self) -> None:
+        # periodic_device._image_centres takes the atoms of a kind at once: the centres, kinds and order of the
+        # loop over the atoms of before 2026-11-17 (the binned density sums them in that order)
+        from parsec_python.acceleration.V_ion import periodic_device
+
+        rng = np.random.default_rng(3)
+        for atom_count, kind_count, side in ((1, 1, 5.0), (9, 2, 7.5), (200, 3, 13.0)):
+            kinds = rng.integers(0, kind_count, atom_count).astype(np.int32)
+            positions = rng.uniform(-0.5, side + 0.5, (atom_count, 3)).reshape(-1)
+            sides = np.array([side, 1.1 * side, 0.9 * side])
+            reaches = np.array([3.0 + 2.5 * kind for kind in range(kind_count)])
+            images = np.array(
+                [int(np.ceil(reaches[kind] / s)) + 1 for kind in range(kind_count) for s in sides], dtype=np.int64
+            )
+            lows, highs = np.zeros(3), sides - 0.4
+            centres, entry_kinds = [], []
+            for atom in range(atom_count):
+                kind = int(kinds[atom])
+                m = images[3 * kind : 3 * kind + 3]
+                grids = np.meshgrid(
+                    np.arange(-m[0], m[0] + 1), np.arange(-m[1], m[1] + 1), np.arange(-m[2], m[2] + 1), indexing="ij"
+                )
+                steps = np.column_stack([grid.reshape(-1) for grid in grids]).astype(np.float64)
+                centre = positions[3 * atom : 3 * atom + 3][None, :] + steps * sides[None, :]
+                near = np.all((centre + reaches[kind] >= lows) & (centre - reaches[kind] <= highs), axis=1)
+                centres.append(centre[near])
+                entry_kinds.append(np.full(int(np.count_nonzero(near)), kind, dtype=np.int32))
+            found = periodic_device._image_centres(positions, kinds, images, sides, reaches, lows, highs)
+            with self.subTest(atoms=atom_count):
+                np.testing.assert_array_equal(found[0], np.concatenate(centres))
+                np.testing.assert_array_equal(found[1], np.concatenate(entry_kinds))
+                self.assertEqual(found[1].dtype, np.int32)
+
     def test_densities_equal_the_readable_sum(self) -> None:
         grid, atoms, potentials, specifications, lattice = _mixed_cell()
         for core in (False, True):

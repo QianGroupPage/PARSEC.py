@@ -256,6 +256,15 @@ def _iteration_record(item):
 
 
 def _jsonable(value):
+    # plain numbers and lists of floats first (the iteration history of a large run holds millions of them:
+    # 5.6 s of the 10.8 s of timing.json of 64,000 atoms through the general checks below); the same values
+    kind = type(value)
+    if kind is float:
+        return value if math.isfinite(value) else None
+    if value is None or kind is int or kind is str or kind is bool:
+        return value
+    if (kind is list or kind is tuple) and all(type(item) is float for item in value):
+        return [item if math.isfinite(item) else None for item in value]
     if is_dataclass(value):
         return _jsonable(asdict(value))
     if isinstance(value, dict):

@@ -87,6 +87,8 @@ _SWITCH = "PARSEC_KPOINT_SECTORS"
 _STATES_KEY = "kpoint_sectors"
 # the key of the plans of the sectors in a caller's cache of the structure (the projector cache of the k-point loops)
 _CACHE_KEY = "kpoint_sector_plans"
+# states of a sector expanded to the whole grid at once for its extras (the forces)
+_FORCE_COLUMNS = 32
 _MARGIN_SWITCH = "PARSEC_KPOINT_SECTOR_MARGIN"
 _EXTRA_STATES = 6
 _GROWTH = 1.5
@@ -380,6 +382,7 @@ class KPointSectors:
         self._potential: tuple[Any, np.ndarray | None] = (None, None)
         self._exchange: dict[int, tuple] = {}  # by sector: (exchange term of the whole grid, its reduction)
         self._gathers: dict[int, sp.csr_matrix] = {}  # by sector: U^H (shared by the tasks of the k-point)
+        self._expanders: dict[tuple, tuple] = {}  # by (sector, device): the rows and factors of U on a device
 
     @property
     def order(self) -> int:
@@ -531,6 +534,30 @@ class KPointSectors:
         wedge[orbits] = np.asarray(sums, dtype=np.float64) / self._multiplicities[orbits]
         return wedge[decomposition.reduction.full_to_wedge]
 
+    def expand(self, sector: int, block, xp=np):
+        """:meth:`orbitals` where ``block`` is: a device block becomes ``U v`` on its device (one gather with the
+        phase and orbit factor of every row, made once per sector and device)."""
+
+        if xp is np or isinstance(block, np.ndarray):
+            return self.orbitals(sector, np.asarray(block))
+        device = int(block.device.id)
+        found = self._expanders.get((sector, device))
+        if found is None:
+            decomposition = self.decomposition
+            orbits = decomposition.sector_orbit_indices(sector)
+            place = np.full(decomposition.wedge_size, -1, dtype=np.int64)
+            place[orbits] = np.arange(orbits.size, dtype=np.int64)
+            to_wedge = np.asarray(decomposition.reduction.full_to_wedge, dtype=np.int64)
+            rows = place[to_wedge]
+            factor = decomposition.phases[sector].astype(np.float64) / np.sqrt(self._multiplicities[to_wedge])
+            factor[rows < 0] = 0.0
+            rows[rows < 0] = 0
+            with xp.cuda.Device(device):
+                found = (xp.asarray(rows), xp.asarray(factor))
+            self._expanders[(sector, device)] = found
+        rows, factor = found
+        return xp.take(block, rows, axis=0) * factor[:, None]
+
     def orbitals(self, sector: int, block: np.ndarray) -> np.ndarray:
         """``U v`` on the whole grid for the columns of ``block`` (rows of ``sector``)."""
 
@@ -681,6 +708,8 @@ class SectorKPointSolver:
             states_per_task=counts,
             rows_per_task=tuple(self._rows(item) for item in self._items),
             grid_points=self._grid_size,
+            extras=None if self.job.extras is None else self._inner_extras,
+            extras_by_columns=self.job.extras is not None,
         )
         options = dict(self._options)
         options["problem_size"] = max(self._rows(item) for item in self._items)
@@ -871,20 +900,48 @@ class SectorKPointSolver:
         return columns
 
     def extras(self) -> list[Any]:
-        """The job's extras (the nonlocal forces) of every k-point from its kept orbitals on the whole grid."""
+        """The job's extras (the nonlocal forces) of every k-point: the sums of its sectors (:meth:`_inner_extras`,
+        computed by the inner solver where the orbitals are: a process, or the ranks of the MPI pools)."""
 
         if self.job.extras is None:
             raise NotImplementedError("the job computes no per-state extras")
-        found = []
-        for task in range(self.job.n_tasks):
-            vectors = _host(self.vectors(task))
-            if vectors.ndim != 2 or vectors.shape[1] == 0:
-                raise NotImplementedError(
-                    "the extras of the k-point sectors (the forces) need the orbitals, which the MPI k-point pools "
-                    "do not gather"
-                )
-            found.append(self.job.extras(task, vectors))
+        inner = self._inner.extras()
+        found: list[Any] = [None] * self.job.n_tasks
+        for position, (k_index, _sector) in enumerate(self._items):
+            value = np.asarray(_host(inner[position]), dtype=np.float64)
+            found[k_index] = value if found[k_index] is None else found[k_index] + value
         return found
+
+    def _inner_extras(self, position: int, vectors, xp=np, columns=None):
+        """The extras of the states ``columns`` of task ``position`` (a sector): its kept states, ``U v`` on the
+        whole grid a block of :data:`_FORCE_COLUMNS` at a time, with their places among the levels of the k-point
+        (the occupations the job holds)."""
+
+        k_index, sector = self._items[position]
+        count = int(vectors.shape[1])
+        columns = np.arange(count, dtype=np.int64) if columns is None else np.asarray(columns, dtype=np.int64)
+        if sector is None:
+            return self.job.extras(k_index, vectors, xp=xp, columns=columns)
+        owners, indices = self._kept[k_index]
+        mine = np.flatnonzero(owners == sector)
+        size = int(max(int(indices[mine].max()) + 1 if mine.size else 0, int(columns.max()) + 1 if columns.size else 0))
+        place = np.full(max(size, 1), -1, dtype=np.int64)
+        place[indices[mine]] = mine
+        wanted = place[columns] if columns.size else np.zeros(0, dtype=np.int64)
+        keep = np.flatnonzero(wanted >= 0)
+        plan = self._plans[k_index]
+        total = None
+        for c0 in range(0, int(keep.size), _FORCE_COLUMNS):
+            chosen = keep[c0 : c0 + _FORCE_COLUMNS]
+            block = vectors[:, chosen if xp is np else xp.asarray(chosen)]
+            piece = np.asarray(
+                _host(self.job.extras(k_index, plan.expand(sector, block, xp), xp=xp, columns=wanted[chosen])),
+                dtype=np.float64,
+            )
+            total = piece if total is None else total + piece
+        if total is None:
+            total = np.zeros((len(self.job.geometry["atoms"]), 3), dtype=np.float64)
+        return total
 
     def _layout(self) -> list[tuple[int, int, int]]:
         return [(int(k), -1 if sector is None else int(sector), self._rows((k, sector))) for k, sector in self._items]
@@ -968,15 +1025,13 @@ class SectorKPointSolver:
 def sector_solver(job: KPointJob, make_solver: Callable[..., Any], **options):
     """A :class:`SectorKPointSolver` for ``job`` where its k-points split, else ``None``.
 
-    A job with extras (the forces) takes the sectors in one process only: the MPI k-point pools gather no orbitals,
-    and their forces stay with the row-distributed solver.
+    A job with extras takes them where they sum over the states (the forces of the scalar SCF,
+    ``extras_by_columns``): each sector's part from its kept states, in one process or on the ranks of the MPI pools.
     """
-
-    from ..Parallel import mpi
 
     if (
         getattr(job, "geometry", None) is None
-        or (job.extras is not None and mpi.context() is not None)
+        or (job.extras is not None and not job.extras_by_columns)
         or job.states_per_task is not None
         or kpoint_sectors_setting() == "off"
     ):

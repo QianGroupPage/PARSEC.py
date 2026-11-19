@@ -38,10 +38,19 @@ _CANDIDATES_PER_PASS = 2_000_000  # index-box points tested together
 
 def _row_major_box(grid) -> tuple[int, int, int] | None:
     """The points per axis of a bulk orthorhombic cell of the default routines whose rows are its box in row-major
-    order (row ``(i n_1 + j) n_2 + k``, the order of :func:`.periodic_setup.lattice_ball`), else ``None``."""
+    order (row ``(i n_1 + j) n_2 + k``, the order of :func:`.periodic_setup.lattice_ball`), else ``None``.
 
-    if type(grid) is not PeriodicRealSpaceGrid or uses_fortran_routines(grid) or not grid.is_orthorhombic:
+    A cell with its sides along the axes whose steps differ (the grid of the parser for most orthorhombic and
+    tetragonal cells) has the same separable points ``(i + s) h_a`` along every axis, with its own ``h_a``: it is taken
+    under ``PARSEC_PERIODIC_UNEQUAL_STEPS=auto`` (``off``: the reference loop, as before)."""
+
+    if type(grid) is not PeriodicRealSpaceGrid or uses_fortran_routines(grid):
         return None
+    if not grid.is_orthorhombic:
+        from ..Symmetry.axis_reflection import periodic_unequal_steps_setting, unequal_step_grid
+
+        if not (unequal_step_grid(grid) and periodic_unequal_steps_setting() == "auto"):
+            return None
     if int(getattr(grid.settings, "double_grid_order", 1)) > 1 or getattr(grid, "is_confined_periodic", False):
         return None
     shape = tuple(int(value) for value in grid.points_per_axis)

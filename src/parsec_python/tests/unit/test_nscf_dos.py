@@ -744,6 +744,40 @@ class NSCFRunTests(unittest.TestCase):
             text = (directory / "parsec.out").read_text()
             self.assertIn(" Tot. number of tetrahedra :                     24", text)
 
+    def test_command_line_dos_after_a_relaxation_projects_about_the_moved_atoms(self) -> None:
+        # Create_DOS after a k-point relaxation (parsec.F90 l.2181-2189): the Ylm projections of the orbitals of the
+        # last structure about its own atoms, not those of the input
+        from unittest import mock
+
+        from parsec_python import cli as reference_cli
+
+        two_atoms = PERIODIC.replace("  3.1 2.9 3.05\n", "  3.1 2.9 3.05\n  1.6 1.4 1.55\n")
+        extra = (
+            "Kpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 2 1\nend Monkhorst_Pack_Grid\n"
+            "Create_DOS: .true.\nDOS_Pnum: 40\nYLM_DOS_L: 0\nylm_dos_cutoff: 1.2\n"
+            "Minimization: bfgs\nMovement_Num: 1\nForce_Min: 1.0e-5\n"
+        )
+        original = reference_cli._run_dos
+        handed = []
+
+        def record(system, *arguments, **keywords):
+            handed.append(np.array([atom.position for atom in system.atoms]))
+            return original(system, *arguments, **keywords)
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            directory = Path(folder)
+            path = _write(directory, two_atoms, extra)
+            with mock.patch.object(reference_cli, "_run_dos", side_effect=record):
+                code, error = _run_cli(path)
+            self.assertIn(code, (0, 4), error)
+            with np.load(directory / "parsec_python_results.npz", allow_pickle=True) as data:
+                computed = np.asarray(data["relaxation_positions"])
+            self.assertEqual(computed.shape[0], 2)
+            self.assertGreater(float(np.abs(computed[-1] - computed[0]).max()), 1.0e-4)
+            self.assertEqual(len(handed), 1)
+            np.testing.assert_allclose(handed[0], computed[-1], rtol=0, atol=1e-12)
+            self.assertIn("Graph Name : H2_s_sp1", (directory / "DOS").read_text().splitlines())
+
 
 class AcceleratedRoutingTests(unittest.TestCase):
     def test_features_go_to_the_reference_solver(self) -> None:

@@ -4,7 +4,9 @@ input parsing, and end-to-end equivalence with the Monkhorst-Pack grid."""
 from __future__ import annotations
 
 import tempfile
+import os
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -191,6 +193,10 @@ _MP = "Kpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 1 1\nend Monkhorst_Pack_G
 _K = 2.0 * np.pi / _BOX * 0.25
 
 
+# The former unreduced Monkhorst-Pack mesh of an input without Monkhorst_Pack_Shift (points at +-1/4 for even n),
+# which these checks were written on: PARSEC_MP_UNSHIFTED_MESH=port (the default is PARSEC 1.5's zero shift since
+# 2026-11-18, tests/unit/test_mp_unshifted_mesh.py).
+@mock.patch.dict(os.environ, {"PARSEC_MP_UNSHIFTED_MESH": "port"})
 class ManualKpointCliTests(unittest.TestCase):
     def _run(self, kpoints: str, *, spin: str = "", files: dict | None = None) -> dict:
         with tempfile.TemporaryDirectory() as tmp:

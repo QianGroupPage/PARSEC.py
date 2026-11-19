@@ -283,6 +283,52 @@ end Atom_Coord
         quiet = self.parse(self.CLUSTER, "Alpha_Filter: 0")
         self.assertFalse(any("periodic systems only" in note for note in quiet.warnings))
 
+    def test_a_cell_stretched_along_x_filters_with_the_first_step(self) -> None:
+        # fourier_f.f90 filters with grid%step(1), the step along the first lattice vector, which on a cell stretched
+        # along x is not the shortest one (0.667 against 0.641 bohr here).  Filtered inputs run on the Fortran-derived
+        # routines, whose grid of unequal steps already took its first step; fortran_first_step states it for every
+        # grid, also for one of the default routines, whose spacing is the shortest step (2026-11-19).
+        from parsec_python.Grid.pbc import build_periodic_grid
+        from parsec_python.SCF.pbc import prepare_periodic_single_point
+        from parsec_python.V_ion import load_pseudopotentials
+        from parsec_python.V_ion.gspace_local import fortran_first_step
+
+        stretched = self.PERIODIC.replace("10.2612  10.2612  10.2612", "12.0  10.26  10.26").replace(
+            "Grid_Spacing: 0.51306", "Grid_Spacing: 0.62"
+        )
+        translation = self.parse(stretched, "Alpha_Filter: 0.8\nBeta1_Filter: 5.0\nCore_Filter: 0.6")
+        problem = translation.problem
+        self.assertTrue(problem.grid.fortran_routines)
+        grid = build_periodic_grid(problem.periodic_cell, problem.grid)
+        steps = np.asarray(grid.spacings, dtype=np.float64)
+        self.assertGreater(steps[0], steps.min() + 1.0e-3)
+        self.assertEqual(fortran_first_step(grid), steps[0])
+        system = prepare_periodic_single_point(problem)
+        specifications = problem.pseudopotentials
+        unfiltered = load_pseudopotentials(specifications, xc_functional=problem.scf.xc_functional)
+
+        def tables(spacing):
+            filtered = apply_fourier_filters(unfiltered, specifications, spacing)["Si"]
+            return filtered.filtered_projectors, filtered.core_density
+
+        prepared = system.pseudopotentials["Si"]
+        first, shortest = tables(steps[0]), tables(steps.min())
+        for channel, values in first[0].items():
+            np.testing.assert_array_equal(prepared.filtered_projectors[channel], values)
+        np.testing.assert_array_equal(prepared.core_density, first[1])
+        self.assertTrue(
+            any(not np.array_equal(values, shortest[0][channel]) for channel, values in first[0].items())
+        )
+        # The default routines' grid of the same cell (Andrew Grieder's, points_rule fortran): its spacing is the
+        # shortest step, its first step |a_1|/n_1.
+        default = build_periodic_grid(
+            problem.periodic_cell, replace(problem.grid, fortran_routines=False, points_rule="fortran")
+        )
+        self.assertFalse(default.is_orthorhombic)
+        first_step = 12.0 / float(default.points_per_axis[0])
+        self.assertAlmostEqual(fortran_first_step(default), first_step, places=14)
+        self.assertGreater(fortran_first_step(default), default.spacing + 1.0e-3)
+
 
 if __name__ == "__main__":
     unittest.main()

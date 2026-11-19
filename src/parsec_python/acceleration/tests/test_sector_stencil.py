@@ -1274,6 +1274,48 @@ class WrappedStencilTests(unittest.TestCase):
         self.assertIsNone(getattr(build_bloch_negative_laplacian(grid, np.array([0.1, 0.0, 0.0])), "parsec_wrapped_stencil_of", None))
         self.assertIsNone(getattr(matrix.copy(), "parsec_wrapped_stencil_of", None))
 
+    def test_the_deferred_matrix_of_a_cell_is_built_only_when_read(self) -> None:
+        # PARSEC_PERIODIC_DEFER_LAPLACIAN: the accelerated preparation of a box holds a descriptor; the sector
+        # stencils and the rows of the FFT Hartree symbol come from the grid, everything else builds the same matrix
+        from parsec_python.acceleration.Laplacian import (
+            DeferredPeriodicNegativeLaplacian,
+            periodic_laplacian_builder,
+            periodic_negative_laplacian,
+        )
+
+        grid, decomposition = self._cell("auto")
+        matrix = build_negative_laplacian(grid)
+        deferred = periodic_negative_laplacian(grid)
+        self.assertIsInstance(deferred, DeferredPeriodicNegativeLaplacian)
+        self.assertEqual((deferred.shape, deferred.nnz), (matrix.shape, matrix.nnz))
+        for row in (0, 1, grid.size // 3, grid.size - 1):
+            got, expected = deferred.getrow(row), matrix.getrow(row)
+            np.testing.assert_array_equal(got.indices, expected.indices)
+            np.testing.assert_array_equal(got.data, expected.data)
+        # a report's getattr with a default, and the sector stencils, leave it unbuilt
+        self.assertEqual(getattr(deferred, "reference_static_cache_status", "disabled"), "disabled")
+        operator = _nonlocal(grid)
+        with patch.dict(os.environ, {"PARSEC_ACCELERATED_RESIDENT": "0"}):
+            direct = load_or_build_reduced_operators(decomposition, deferred, operator, cache_directory=None)
+            with patch.dict(os.environ, {"PARSEC_SECTOR_STENCIL": "csr"}):
+                # the reduction of the matrix itself
+                through_matrix = load_or_build_reduced_operators(decomposition, matrix, operator, cache_directory=None)
+        self.assertEqual(direct.cache_info.stencil_builder, "direct-numpy-wrapped")
+        self.assertEqual(through_matrix.cache_info.stencil_builder, "csr")
+        for left, right in zip(direct.stencil_metadata, through_matrix.stencil_metadata):
+            SectorStencilTests.assert_same_stencil(self, left, right)
+        self.assertFalse(deferred.materialized)
+        # a reader of the matrix builds it: the same matrix bit for bit
+        vector = np.random.default_rng(3).standard_normal(grid.size)
+        np.testing.assert_array_equal(deferred @ vector, matrix @ vector)
+        self.assertTrue(deferred.materialized)
+        np.testing.assert_array_equal(deferred.data, matrix.data)
+        np.testing.assert_array_equal(deferred.indices, matrix.indices)
+        np.testing.assert_array_equal(deferred.indptr, matrix.indptr)
+        with patch.dict(os.environ, {"PARSEC_PERIODIC_DEFER_LAPLACIAN": "off"}):
+            self.assertIsNone(periodic_laplacian_builder())
+        self.assertIs(periodic_laplacian_builder(), periodic_negative_laplacian)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,11 +18,19 @@ correction is the ball sum of the reference.
 The sums are written against an array module ``xp`` (NumPy, or CuPy for a calculation on a GPU): the balls are generated
 on the host from index ranges, their radial slopes, products and sums are formed with ``xp``, and only the ``(atoms, 3)``
 result comes back.  The numbers are those of the reference to the accuracy of the splitting (about 1e-7 Ry/bohr).
+
+The series is streamed (``PARSEC_PERIODIC_FORCE_SERIES``, :func:`periodic_force_series_setting`): the real transform
+of the density holds half of the reciprocal box, the term of ``-G`` is that of ``G`` for a real density, and the box
+is weighted and contracted slab by slab with the phases of a block of atoms, so no ``(3, M0, M1, M2)`` stack of the
+three components is formed (about 1.5 complex fields of the grid at the peak instead of about 6).  A cell whose
+density is invariant under a group of operations takes the local forces of one atom per orbit
+(:func:`orbit_periodic_local_forces`).
 """
 
 from __future__ import annotations
 
 import math
+import os
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -44,6 +52,47 @@ _SELF_CONSISTENCY_TAIL = 1.0e-10
 _POINTS_PER_CALL = 1_000_000
 #: Complex numbers of one block of the reciprocal contraction.
 _CONTRACTION_ELEMENTS = 4_000_000
+#: Complex numbers of one slab of the streamed series, and of one product of a slab with the phases of a block of atoms.
+_SLAB_ELEMENTS = 4_000_000
+#: The most atoms whose phases one contraction of the streamed series takes.
+_STREAM_ATOMS = 512
+#: Orbits of which one more atom is summed to check the equivariance of the local forces of the orbits.
+_SAMPLED_ORBITS = 8
+
+_SERIES_SWITCH = "PARSEC_PERIODIC_FORCE_SERIES"
+_SERIES_VALUES = ("stream", "stack", "host")
+_SECTOR_LOCAL_SWITCH = "PARSEC_PERIODIC_SECTOR_LOCAL_FORCES"
+_SECTOR_LOCAL_VALUES = ("orbits", "all")
+
+
+def periodic_force_series_setting() -> str:
+    """``PARSEC_PERIODIC_FORCE_SERIES``: how the reciprocal series of the local forces of a cell is summed.
+
+    ``stream`` (default): half of the reciprocal box from the real transform of the density, weighted and contracted
+    slab by slab on the device of the sums, or on the host where that device cannot hold the transform;
+    ``host``: the same sums on the host always; ``stack``: the three components as one ``(3, M0, M1, M2)`` stack on
+    the device, bit for bit as before (to 2026-11-18).  The values agree to round-off (1e-12 relative).
+    """
+
+    value = os.environ.get(_SERIES_SWITCH, "stream").strip().lower() or "stream"
+    if value not in _SERIES_VALUES:
+        raise ValueError(f"{_SERIES_SWITCH} must be one of {', '.join(_SERIES_VALUES)}, not {value!r}")
+    return value
+
+
+def periodic_sector_local_forces_setting() -> str:
+    """``PARSEC_PERIODIC_SECTOR_LOCAL_FORCES``: the local forces of a cell solved in the sectors of a point group.
+
+    ``orbits`` (default): the ball sums and the series of one atom per orbit of the full group ``G`` of the sectors,
+    turned onto the other atoms of the orbit (:func:`orbit_periodic_local_forces`; the density and the exchange-
+    correlation potential of such a run are averaged over ``G``); ``all``: the sums of every atom, as before
+    (to 2026-11-18).  The values agree to round-off.
+    """
+
+    value = os.environ.get(_SECTOR_LOCAL_SWITCH, "orbits").strip().lower() or "orbits"
+    if value not in _SECTOR_LOCAL_VALUES:
+        raise ValueError(f"{_SECTOR_LOCAL_SWITCH} must be one of {', '.join(_SECTOR_LOCAL_VALUES)}, not {value!r}")
+    return value
 
 
 class _Slope:
@@ -110,7 +159,179 @@ def _inverse(xp, radius):
 
 
 def _reciprocal_forces(xp, grid, positions, charges, density, eta, g_cutoff, lattice_vectors):
-    """``2 Z_a (4 pi/V) sum_G w(G) G Im(exp(-iG.R_a) rho~(G))`` for every atom, ``(atoms, 3)`` (no ``dv``)."""
+    """``2 Z_a (4 pi/V) sum_G w(G) G Im(exp(-iG.R_a) rho~(G))`` for every atom, ``(atoms, 3)`` (no ``dv``).
+
+    Summed as :func:`periodic_force_series_setting` says: streamed (:func:`_streamed_reciprocal_forces`) on the
+    device of ``xp`` or, where that device cannot hold the transform or an allocation fails, on the host; or as the
+    stack of the three components (:func:`_stacked_reciprocal_forces`).
+    """
+
+    setting = periodic_force_series_setting()
+    if setting == "stack":
+        return _stacked_reciprocal_forces(xp, grid, positions, charges, density, eta, g_cutoff, lattice_vectors)
+    arguments = (grid, positions, charges, density, eta, g_cutoff, lattice_vectors)
+    if setting == "host" or xp is np:
+        return _streamed_reciprocal_forces(np, *arguments)
+    if not _device_holds_series(xp, grid, g_cutoff, lattice_vectors, len(positions)):
+        return _streamed_reciprocal_forces(np, *arguments)
+    from ..Hartree.gpu_memory import allocation_failure
+
+    try:
+        return _streamed_reciprocal_forces(xp, *arguments)
+    except Exception as error:  # noqa: BLE001 - only a failed allocation falls back
+        if not allocation_failure(error):
+            raise
+    xp.get_default_memory_pool().free_all_blocks()
+    return _streamed_reciprocal_forces(np, *arguments)
+
+
+def _series_box(grid, g_cutoff, lattice_vectors):
+    """``(n, inverse, volume, half, metric)``: the grid counts, the inverse lattice, the cell volume, the largest
+    frequency of the series along every axis and the metric ``(2 pi)^2 inverse^T inverse`` of the frequencies."""
+
+    n, lattice, inverse = _cell_geometry(grid, lattice_vectors)
+    volume = abs(float(np.linalg.det(lattice)))
+    half = np.minimum(np.floor(g_cutoff * np.linalg.norm(lattice, axis=1) / (2.0 * np.pi)).astype(np.int64), (n - 1) // 2)
+    metric = (2.0 * np.pi) ** 2 * (inverse.T @ inverse)
+    return n, inverse, volume, half, metric
+
+
+def _streamed_series_bytes(grid, g_cutoff, lattice_vectors, atoms: int) -> int:
+    """The device bytes of :func:`_streamed_reciprocal_forces`: the density, its half transform (twice, for the
+    work area of the FFT), the weighted half box and the products of one slab."""
+
+    n, _, _, half, _ = _series_box(grid, g_cutoff, lattice_vectors)
+    points = int(np.prod(n))
+    transform = int(n[0]) * int(n[1]) * (int(n[2]) // 2 + 1)
+    box = int(2 * half[0] + 1) * int(2 * half[1] + 1) * int(half[2] + 1)
+    block = min(max(int(atoms), 1), _STREAM_ATOMS)
+    return 8 * points + 16 * 2 * transform + 16 * box + 16 * 4 * _SLAB_ELEMENTS + 16 * 6 * block * int(n.max())
+
+
+def _device_holds_series(xp, grid, g_cutoff, lattice_vectors, atoms: int) -> bool:
+    """Whether the device of ``xp`` has the bytes of :func:`_streamed_series_bytes` free (a module that names no
+    device always has)."""
+
+    if getattr(xp, "cuda", None) is None:
+        return True
+    from ..Hartree.gpu_memory import device_free_bytes
+
+    free = device_free_bytes()
+    return free is None or free >= _streamed_series_bytes(grid, g_cutoff, lattice_vectors, atoms)
+
+
+def _host_fft_workers() -> int:
+    """The threads of a host transform: ``OMP_NUM_THREADS`` where it is set, else every core."""
+
+    try:
+        return max(1, int(os.environ.get("OMP_NUM_THREADS", "")))
+    except ValueError:
+        return -1
+
+
+def _half_spectrum(xp, density, shape):
+    """``R(m) = sum_r rho(r) exp(-2 pi i sum_j m_j r_j/n_j)`` for ``m_2`` in ``[0, n_2//2]``, ``(n0, n1, n2//2 + 1)``:
+    the forward transform of the real density along its last axis halved, so ``rho~(G) = conj(R)``."""
+
+    if xp is np:
+        import scipy.fft
+
+        return scipy.fft.rfftn(np.asarray(density, dtype=np.float64).reshape(shape), workers=_host_fft_workers())
+    field = xp.asarray(density).reshape(shape)
+    rfftn = getattr(xp.fft, "rfftn", None)
+    if rfftn is not None:
+        return rfftn(field)
+    # a module without the real transform: the half of the inverse transform, conjugated
+    return (xp.fft.ifftn(field) * float(np.prod(shape)))[:, :, : shape[2] // 2 + 1].conj()
+
+
+def _streamed_reciprocal_forces(xp, grid, positions, charges, density, eta, g_cutoff, lattice_vectors):
+    """The series of :func:`_stacked_reciprocal_forces`, streamed over slabs of the first frequency.
+
+    For a real density ``rho~(-G) = conj(rho~(G))``, so the term of ``-G`` equals that of ``G``: the box keeps
+    ``m_2 >= 0``, with twice the weight beyond the plane ``m_2 = 0``, and reads ``rho~`` from the real transform
+    (:func:`_half_spectrum`).  With ``G = 2 pi sum_j m_j b_j`` (``b_j`` the columns of the inverse lattice) and
+    ``A(m) = c(m_2) w(G) rho~(G)`` the force is ``2 pi sum_j b_j Im S_j`` with
+    ``S_j = sum_m m_j A(m) exp(-2 pi i m.f_a)``: the separable phases of the fractional coordinates ``f_a`` of a
+    block of atoms are contracted with each slab of ``A`` by two products along ``m_2`` (one with ``m_2`` in its
+    phases), then along ``m_1`` and ``m_0``.  Only the weighted half box, one slab of products and the phases of
+    one block are held besides the transform.
+    """
+
+    n, inverse, volume, half, metric = _series_box(grid, g_cutoff, lattice_vectors)
+    count = len(positions)
+    if count == 0:
+        return np.zeros((0, 3))
+    shape = tuple(int(v) for v in n)
+    first = np.arange(-half[0], half[0] + 1, dtype=np.int64)
+    second = np.arange(-half[1], half[1] + 1, dtype=np.int64)
+    third = np.arange(0, half[2] + 1, dtype=np.int64)
+    sizes = (first.size, second.size, third.size)
+    shifts = np.asarray(grid.shift, dtype=float)
+    shifted = bool(np.any(shifts != 0.0))
+
+    spectrum = _half_spectrum(xp, density, shape)
+    second_rows = xp.asarray(np.mod(second, n[1]))[None, :, None]
+    third_rows = xp.asarray(third)[None, None, :]
+    rows_per_slab = max(1, min(sizes[0], _SLAB_ELEMENTS // (sizes[1] * sizes[2])))
+    slabs = []
+    m1, m2 = second[None, :, None], third[None, None, :]
+    for start in range(0, sizes[0], rows_per_slab):
+        m0 = first[start : start + rows_per_slab][:, None, None]
+        g_squared = (
+            metric[0, 0] * m0**2 + metric[1, 1] * m1**2 + metric[2, 2] * m2**2
+            + 2.0 * (metric[0, 1] * m0 * m1 + metric[0, 2] * m0 * m2 + metric[1, 2] * m1 * m2)
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            weight = np.exp(-g_squared / (4.0 * eta**2)) / g_squared
+        weight[g_squared == 0.0] = 0.0
+        weight[g_squared > g_cutoff**2] = 0.0
+        weight[:, :, 1:] *= 2.0  # the terms of -G
+        if shifted:
+            weight = weight * np.exp(2.0j * np.pi * (m0 * shifts[0] / n[0] + m1 * shifts[1] / n[1] + m2 * shifts[2] / n[2]))
+        first_rows = xp.asarray(np.mod(m0, n[0]))
+        slabs.append(spectrum[first_rows, second_rows, third_rows].conj() * xp.asarray(weight))
+    del spectrum
+
+    fractional = np.asarray(positions, dtype=np.float64) @ inverse
+    rows = slabs[0].shape[0]
+    block = max(1, min(count, _STREAM_ATOMS, _SLAB_ELEMENTS // (rows * sizes[1])))
+    sums = np.zeros((count, 3), dtype=np.complex128)
+    for start in range(0, count, block):
+        stop = min(start + block, count)
+        width = stop - start
+        phases = [
+            np.exp(-2.0j * np.pi * np.outer(frequencies, fractional[start:stop, axis]))
+            for axis, frequencies in enumerate((first, second, third))
+        ]
+        along_third = xp.asarray(phases[2])
+        along_third_weighted = xp.asarray(third[:, None] * phases[2])
+        along_second = xp.asarray(phases[1])
+        along_second_weighted = xp.asarray(second[:, None] * phases[1])
+        totals = [None, None, None]
+        offset = 0
+        for slab in slabs:
+            height = slab.shape[0]
+            along_first = xp.asarray(phases[0][offset : offset + height])
+            along_first_weighted = xp.asarray(first[offset : offset + height, None] * phases[0][offset : offset + height])
+            flat = slab.reshape(height * sizes[1], sizes[2])
+            plain = xp.matmul(flat, along_third).reshape(height, sizes[1], width)
+            weighted = xp.matmul(flat, along_third_weighted).reshape(height, sizes[1], width)
+            parts = (
+                xp.einsum("ia,ia->a", xp.einsum("ija,ja->ia", plain, along_second), along_first_weighted),
+                xp.einsum("ia,ia->a", xp.einsum("ija,ja->ia", plain, along_second_weighted), along_first),
+                xp.einsum("ia,ia->a", xp.einsum("ija,ja->ia", weighted, along_second), along_first),
+            )
+            totals = [part if total is None else total + part for total, part in zip(totals, parts)]
+            offset += height
+        sums[start:stop] = _to_host(xp, xp.stack(totals)).T
+    forces = 2.0 * np.pi * (sums.imag @ inverse.T)
+    return forces * (2.0 * np.asarray(charges, dtype=np.float64) * 4.0 * np.pi / volume)[:, None]
+
+
+def _stacked_reciprocal_forces(xp, grid, positions, charges, density, eta, g_cutoff, lattice_vectors):
+    """The series of :func:`_reciprocal_forces` with the three components as one ``(3, M0, M1, M2)`` stack on the
+    device of ``xp`` (``PARSEC_PERIODIC_FORCE_SERIES=stack``, the sums to 2026-11-18)."""
 
     n, lattice, inverse = _cell_geometry(grid, lattice_vectors)
     volume = abs(float(np.linalg.det(lattice)))
@@ -283,6 +504,92 @@ def fast_periodic_local_forces(
         self_consistency=np.zeros((count, 3)),
         core_correction=core_correction * volume_element,
     )
+
+
+def atom_orbits(operations, count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(images, representatives, sizes)`` of the orbits of ``count`` atoms under a group of atom operations.
+
+    ``images[g, a]`` is the atom that operation ``g`` carries atom ``a`` onto; the orbit of an atom is the column of
+    its images (the operations form a group), its representative the smallest index in it, ``representatives`` the
+    atoms that are their own representative (ascending) and ``sizes`` the number of atoms in each of their orbits.
+    """
+
+    images = np.asarray([np.asarray(operation.image, dtype=np.int64) for operation in operations], dtype=np.int64)
+    if images.ndim != 2 or images.shape[1] != count:
+        raise ValueError(f"the operations act on {images.shape[-1] if images.ndim == 2 else 0} atoms, not {count}")
+    smallest = images.min(axis=0)
+    representatives = np.flatnonzero(smallest == np.arange(count, dtype=np.int64))
+    sizes = np.bincount(smallest, minlength=count)[representatives]
+    return images, representatives, sizes
+
+
+def turn_onto_orbits(values: np.ndarray, operations, images: np.ndarray, representatives: np.ndarray, sizes, count: int):
+    """``(count, 3)``: the average over the operations of the vectors ``values`` of the representatives, each
+    counted ``sizes`` times (the other atoms zero).
+
+    ``S_G(x)_b = |G|^-1 sum_g R_g x_(g^-1 b)`` (:func:`parsec_python.Forces.symmetry.symmetrize_forces`) of that
+    ``x``: an atom ``b = g a`` of the orbit of representative ``a`` gets ``R_g F_a`` averaged over the
+    ``|G|/|orbit|`` operations that carry ``a`` onto ``b``, so an equivariant term (``F_(g a) = R_g F_a``) is
+    turned onto every atom and the representative keeps its own value averaged over its site group.  Only the rows of
+    the representatives are moved.
+    """
+
+    total = np.zeros((count, 3), dtype=np.float64)
+    weighted = np.asarray(values, dtype=np.float64) * np.asarray(sizes, dtype=np.float64)[:, None]
+    for index, operation in enumerate(operations):
+        total[images[index, representatives]] += weighted @ np.asarray(operation.matrix, dtype=np.float64).T
+    return total / float(len(operations))
+
+
+def orbit_periodic_local_forces(
+    grid,
+    atoms: Sequence[Atom],
+    potentials: Mapping[str, ParsecPseudopotential],
+    specifications: Mapping[str, SpeciesPotential],
+    lattice_vectors: np.ndarray,
+    density: np.ndarray,
+    xc_potential: np.ndarray,
+    operations,
+    *,
+    xp=np,
+    erf=None,
+    tolerance: float = 1.0e-14,
+) -> tuple[LocalForceTerms, dict]:
+    """:func:`fast_periodic_local_forces` of a cell whose density and exchange-correlation potential are invariant
+    under the group ``operations`` (atom operations with ``image`` and ``matrix``, the identity among them).
+
+    The local ionic and core-correction forces are equivariant then (``F_(g a) = R_g F_a``): they are summed for one
+    atom per orbit (:func:`atom_orbits`) and turned onto the others (:func:`turn_onto_orbits`); a diamond cell of
+    64,000 atoms with the 192 operations of its sectors sums 446 atoms.  The sums of a few other atoms (the last atom of
+    up to :data:`_SAMPLED_ORBITS` orbits, in the same call: no other transform of the density) check the
+    equivariance.  ``details``: ``representatives``, the number of orbits; ``sampled``, the number of atoms checked;
+    ``site_asymmetry`` (Ry/bohr), the largest change of the force of a representative by the average over its site
+    group, and of the force of a checked atom by its turned value: round-off where the density is invariant.
+    """
+
+    count = len(atoms)
+    images, representatives, sizes = atom_orbits(operations, count)
+    larger = representatives[sizes > 1]
+    chosen = larger[np.unique(np.linspace(0, larger.size - 1, min(larger.size, _SAMPLED_ORBITS)).astype(np.int64))]
+    sampled = images[:, chosen].max(axis=0) if chosen.size else np.zeros(0, dtype=np.int64)
+    summed = np.concatenate([representatives, sampled])
+    terms = fast_periodic_local_forces(
+        grid, [atoms[index] for index in summed], potentials, specifications, lattice_vectors, density,
+        xc_potential, xp=xp, erf=erf, tolerance=tolerance,
+    )
+    own = slice(0, representatives.size)
+    ionic = turn_onto_orbits(terms.ionic[own], operations, images, representatives, sizes, count)
+    core_correction = turn_onto_orbits(terms.core_correction[own], operations, images, representatives, sizes, count)
+    site = 0.0
+    if summed.size:
+        site = float(
+            max(
+                np.max(np.abs(ionic[summed] - terms.ionic)),
+                np.max(np.abs(core_correction[summed] - terms.core_correction)),
+            )
+        )
+    details = {"representatives": int(representatives.size), "sampled": int(sampled.size), "site_asymmetry": site}
+    return LocalForceTerms(ionic=ionic, self_consistency=np.zeros((count, 3)), core_correction=core_correction), details
 
 
 def _device_module():
@@ -504,10 +811,15 @@ def fortran_spline_local_forces(
 
 
 __all__ = [
+    "atom_orbits",
     "fast_core_correction_forces",
     "fast_periodic_local_forces",
     "fast_self_consistency_forces",
     "fortran_spline_local_forces",
     "local_force_provider",
+    "orbit_periodic_local_forces",
+    "periodic_force_series_setting",
+    "periodic_sector_local_forces_setting",
     "spline_species_takes",
+    "turn_onto_orbits",
 ]

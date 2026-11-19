@@ -29,7 +29,13 @@ the functionals that :func:`periodic_spin_device_selected` names:
   on the device by default since 2026-10-30 (its host form is ``pbe_spin`` as
   well); ``evaluate_spin_xc`` of these drivers does not follow that default
   (:data:`HOST_UNLESS_ASKED`);
-* CA-LSD stays on the host (as in the accelerated driver).
+* CA-LSD by default since 2026-11-18 (``PARSEC_PERIODIC_CA_XC=auto``, as the
+  unpolarized CA-LDA below): ``ca_lda_spin`` of ``evaluate_spin_xc`` and
+  ``ca_lda_spin_polarized`` of ``evaluate_xc_spin_polarized``, each in its own
+  operations on the device (the ``"spin_polarized"`` form of
+  :class:`~parsec_python.acceleration.V_xc.device_xc.DeviceSpinXCEvaluator`),
+  the host's numbers to round-off; ``PARSEC_PERIODIC_CA_XC=host`` keeps the
+  host, as before.
 
 Not taken: the orthorhombic grid only (Fortran's general grid and the
 wire/slab grids keep the host, :func:`~parsec_python.acceleration.V_xc.device_xc.device_grid_supported`),
@@ -44,7 +50,10 @@ the functionals ``PARSEC_CUPY_XC`` puts on the device, PBE among them): the
 kernels translate the readable functionals, so the results differ from the
 host ones by round-off (6e-14 of the energy of C795H300), and their
 fixed-order sums give every rank the same potential.  A run of one process
-keeps the readable functionals (its numbers unchanged).
+keeps the readable functionals (its numbers unchanged), except CA-LDA, the
+default functional: since 2026-11-18 the device evaluates it in one process
+and under ``--mpi`` alike (``PARSEC_PERIODIC_CA_XC=auto``; it took the host
+over the full grid at every step before, which ``host`` restores).
 """
 
 from __future__ import annotations
@@ -57,11 +66,13 @@ from parsec_python.V_xc.selection import as_spin_polarized_result
 
 from .device_xc import (
     DEVICE_XC_FUNCTIONALS,
+    PERIODIC_ONLY_XC_FUNCTIONALS,
     DeviceSpinXCEvaluator,
     DeviceXCEvaluator,
     device_grid_supported,
     device_xc_mode,
     device_xc_selected,
+    periodic_device_xc_selected,
 )
 
 _CAPACITY = 4
@@ -87,13 +98,19 @@ def periodic_spin_device_selected(functional: str, *, mode: str | None = None, k
     mode = device_xc_mode() if mode is None else mode
     if functional in HOST_UNLESS_ASKED and mode != "on" and not (kind == "spin_polarized" and functional == "pbe"):
         return False
-    return device_xc_selected(functional, spin_polarized=True, mode=mode)
+    # CA-LSD: PARSEC_PERIODIC_CA_XC (both kinds have their form on the device)
+    return periodic_device_xc_selected(functional, spin_polarized=True, mode=mode)
 
 
 def _form(functional: str, kind: str) -> str:
-    """The form of the device evaluator: ``"ab"`` for PBE of ``evaluate_xc_spin_polarized``."""
+    """The form of the device evaluator: ``"ab"`` for PBE and ``"spin_polarized"`` for CA-LSD of
+    ``evaluate_xc_spin_polarized``, ``"pbe_spin"`` (each functional's ``evaluate_spin_xc`` form) otherwise."""
 
-    return "ab" if functional == "pbe" and kind == "spin_polarized" else "pbe_spin"
+    if kind == "spin_polarized" and functional == "pbe":
+        return "ab"
+    if kind == "spin_polarized" and functional == "ca":
+        return "spin_polarized"
+    return "pbe_spin"
 
 
 class _Evaluators:
@@ -167,18 +184,19 @@ def device_spin_evaluator(system, kind: str = "spin"):
 
 
 def device_unpolarized_evaluator(system):
-    """The device evaluator of ``system``'s unpolarized functional in an MPI run, or ``None`` (the host evaluates).
+    """The device evaluator of ``system``'s unpolarized functional, or ``None`` (the host evaluates).
 
-    Only the replicated drivers of an MPI run (``--mpi``) take it, on the device of the rank
-    (:func:`~parsec_python.acceleration.Hartree.periodic_device.hartree_device_id`); meta-GGAs, hybrids,
-    spinor runs, CA-LDA (its own path) and the grids :func:`device_grid_supported` does not take stay
-    on the host.
+    The replicated drivers of an MPI run (``--mpi``) take it for every functional
+    :func:`device_xc_selected` puts on the device, on the device of the rank
+    (:func:`~parsec_python.acceleration.Hartree.periodic_device.hartree_device_id`); CA-LDA
+    (:func:`periodic_device_xc_selected`, ``PARSEC_PERIODIC_CA_XC``) in a run of one process too, on
+    the first device of its k-point plan.  Meta-GGAs, hybrids, spinor runs and the grids
+    :func:`device_grid_supported` does not take stay on the host, as does every functional where the
+    reference drivers have no device.
     """
 
     from ..Parallel import mpi
 
-    if not mpi.requested():
-        return None
     scf = system.input.scf
     if (
         getattr(scf, "is_meta_gga", False)
@@ -188,7 +206,10 @@ def device_unpolarized_evaluator(system):
     ):
         return None
     functional = scf.xc_functional
-    if functional not in DEVICE_XC_FUNCTIONALS or not device_xc_selected(functional):
+    if functional not in DEVICE_XC_FUNCTIONALS or not periodic_device_xc_selected(functional):
+        return None
+    if functional not in PERIODIC_ONLY_XC_FUNCTIONALS and not mpi.requested():
+        # one process: the readable functionals (CA-LDA aside)
         return None
     grid = system.grid
     if not (hasattr(grid, "cell") and device_grid_supported(grid)):

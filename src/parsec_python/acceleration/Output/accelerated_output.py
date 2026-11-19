@@ -368,6 +368,11 @@ class AcceleratedTextReporter:
                 "names below.\n",
             )
         for key, value in info.details:
+            if key == "symmetry_full_grid_note":
+                # What of a cluster with a point group runs on the full grid for want of the native extension
+                # (driver._cluster_full_grid_notes): at every output level.
+                lines.append(f" NOTE: {value}")
+                continue
             if detailed or key in _SUMMARY_DETAIL_KEYS or (weighted and key == "symmetry_detection"):
                 lines.append(f" {key} = {value}")
         if not detailed:

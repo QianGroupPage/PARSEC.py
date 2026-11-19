@@ -742,12 +742,34 @@ def with_periodic_operations(backend):
 
     The operations of :func:`parsec_python.Forces.periodic.periodic_force_operations` (as
     :func:`parsec_python.Relaxation.periodic_backend` at Gamma) instead of the point group of
-    the atoms of an isolated system.
+    the atoms of an isolated system.  A cell solved in the sectors of a point group
+    (:func:`.sector_symmetry.sector_force_operations` not ``None``) takes the full group ``G``
+    of its reduction with its translations instead, and a cell in Abelian sectors their group ``H``
+    (:func:`.sector_symmetry.sector_symmetry_operations`): the group its forces are averaged over
+    and its moved atoms must keep (:func:`.sector_symmetry.check_sector_atoms`).  Those are formed
+    once per structure (the system of moved atoms has another reference and other positions).
     """
 
     from parsec_python.Forces.periodic import periodic_force_operations
 
-    return replace(backend, symmetry_operations=lambda system: periodic_force_operations(system, None))
+    from .sector_symmetry import sector_symmetry_operations
+
+    kept: dict = {}
+
+    def operations(system):
+        reference = getattr(system, "reference", system)
+        positions = np.ascontiguousarray([atom.position for atom in system.atoms], dtype=np.float64)
+        if kept.get("reference") is not reference or not np.array_equal(kept.get("positions"), positions):
+            found = sector_symmetry_operations(system)
+            kept.clear()
+            kept.update(
+                reference=reference,
+                positions=positions,
+                operations=periodic_force_operations(system, None) if found is None else found,
+            )
+        return kept["operations"]
+
+    return replace(backend, symmetry_operations=operations)
 
 
 # ---------------------------------------------------------------------------

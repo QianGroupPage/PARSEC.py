@@ -125,6 +125,11 @@ def _wrapped_stencil_grid(negative_laplacian: object):
     stencil of that grid (a matrix changed in place keeps the name and goes through the matrix).
     """
 
+    from ..Laplacian import DeferredPeriodicNegativeLaplacian
+
+    if isinstance(negative_laplacian, DeferredPeriodicNegativeLaplacian):
+        # the descriptor of that matrix, not built: the grid is what it stands for
+        return negative_laplacian.grid
     grid = getattr(negative_laplacian, "parsec_wrapped_stencil_of", None)
     if grid is None or not sp.isspmatrix_csr(negative_laplacian):
         return None
@@ -173,15 +178,30 @@ def _direct_sector_stencils(
     caller through the full-grid matrix: on ``PARSEC_SECTOR_STENCIL=csr``,
     for an operator handed over as a matrix, and for an input the direct
     builder does not cover.
+
+    A stencil with more coefficients than its palette holds stops the run with :class:`PaletteOverflow` from either
+    builder (the native kernel's ValueError is turned into one), not through the CSR route, whose packing would refuse
+    the same values after forming the full-grid matrix; the driver checks the stencils of a periodic cell before
+    (``_sector_palette_check``), so that only a cluster can reach it here (none measured: at most 227 values, Td at
+    order 20 on an unshifted grid).
     """
 
     from ..Laplacian import DeferredNativeNegativeLaplacian
     from .sector_stencil import (
+        PALETTE_CAPACITY,
+        PaletteOverflow,
         SectorStencilUnavailable,
         build_sector_stencils,
         native_kernel_available,
         sector_stencil_route,
     )
+
+    def overflow(error: Exception) -> PaletteOverflow:
+        return PaletteOverflow(
+            f"{error}: the sector stencils of this calculation need more coefficients than the {PALETTE_CAPACITY} of "
+            "their palette; a lower Expansion_Order or PARSEC_ORBITAL_GROUP=abelian (PARSEC_PERIODIC_SYMMETRY=off for "
+            "a periodic cell) avoids it"
+        )
 
     wrapped = _wrapped_stencil_grid(negative_laplacian)
     if wrapped is not None:
@@ -196,6 +216,8 @@ def _direct_sector_stencils(
             )
         except SectorStencilUnavailable:
             return None, "csr"
+        except PaletteOverflow as error:
+            raise overflow(error) from error
         return metadata, "direct-numpy-wrapped"
     if not isinstance(negative_laplacian, DeferredNativeNegativeLaplacian):
         return None, "csr"
@@ -214,6 +236,11 @@ def _direct_sector_stencils(
         )
     except SectorStencilUnavailable:
         return None, "csr"
+    except ValueError as error:
+        # PaletteOverflow of NumPy's builder, std::invalid_argument of the native kernel
+        if isinstance(error, PaletteOverflow) or f"more than {PALETTE_CAPACITY} coefficients" in str(error):
+            raise overflow(error) from error
+        raise
     return metadata, f"direct-{implementation}"
 
 

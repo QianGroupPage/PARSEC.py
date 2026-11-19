@@ -2846,9 +2846,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             scan_lines_after_run(translation, outcome, log.write, input_directory)
             # The SCF archive is written first so a long band calculation cannot lose it.
-            _run_band_structure(system, translation, result, reporter, input_directory)
-            # Create_DOS (parsec.F90 l.2181-2189), of the last structure.
-            _run_dos(system, translation, result, reporter, input_directory)
+            # The bands of the last structure where the atoms moved (calc_bands after
+            # the movement loop of parsec.F90): its projectors with its potential.
+            last_system = (
+                outcome.system if outcome is not None else dynamics.system if dynamics is not None else system
+            )
+            _run_band_structure(last_system, translation, result, reporter, input_directory)
+            # Create_DOS (parsec.F90 l.2181-2189), of the last structure: the Ylm projections of its orbitals about
+            # its atoms.
+            _run_dos(last_system, translation, result, reporter, input_directory)
             total_elapsed = time.perf_counter() - start
             log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
             log.write(f"Text log: {log_path}")

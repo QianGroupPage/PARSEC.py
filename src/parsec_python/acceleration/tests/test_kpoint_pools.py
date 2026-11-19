@@ -136,6 +136,8 @@ class ProjectorBuildTests(unittest.TestCase):
             self.assertEqual(result["error"], 0.0)
             self.assertTrue(result["labels"])
             self.assertTrue(result["signs"])
+            # the ranks of the pool decide together whether they build (one of them lacking the projectors)
+            self.assertEqual(result["any"], [True, False])
 
 
 class PoolPlanTests(unittest.TestCase):
@@ -503,6 +505,26 @@ class PooledSCFTests(unittest.TestCase):
                     np.testing.assert_allclose(result["forces"], serial["forces"], rtol=0, atol=1.0e-8)
                 for result in report["pooled"][1:]:  # the replicated drivers agree bit for bit
                     self.assertEqual(result["forces"], report["pooled"][0]["forces"])
+
+    def test_the_guard_retry_on_pools_of_another_layout(self) -> None:
+        # the spin loop that leaves the sectors of its two k-points (the symmetry guard, after the start Hamiltonian)
+        # and runs again with one task per k-point: the sectors on two pools of one rank, each rank caching the
+        # projectors of its own k-point, the retry on one pool of both ranks, which build the projectors of a k-point
+        # together where one of them lacks them (before: one rank in the build's allgather, the other in the solve)
+        report = _check("guard", "2", "2", "1")
+        serial = report["serial"]
+        self.assertEqual(serial["notes"], [["the start Hamiltonian", "kpoint"]])
+        self.assertEqual(serial["abandoned"], 1.0)
+        for result in report["pooled"]:
+            self.assertTrue(result["converged"])
+            self.assertEqual(result["notes"], serial["notes"])
+            self.assertEqual(result["abandoned"], 1.0)
+            self.assertEqual(result["iterations"], serial["iterations"])
+            self.assertAlmostEqual(result["energy"], serial["energy"], delta=1.0e-8)
+            self.assertAlmostEqual(result["fermi"], serial["fermi"], delta=1.0e-8)
+        for result in report["pooled"][1:]:  # the replicated drivers agree bit for bit
+            self.assertEqual(result["energy"], report["pooled"][0]["energy"])
+            self.assertEqual(result["density"], report["pooled"][0]["density"])
 
     def test_sectors_that_grow_keep_the_others_on_pools(self) -> None:
         # without margin some sectors miss levels: they get more states and are solved again alone, the pools and

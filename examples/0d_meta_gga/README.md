@@ -96,11 +96,16 @@ QE at 300 Ry (N2, CO: 150 Ry); HOMO in eV (O2: up / down channel).
 | CH4 | -16.15718582 | -16.15718789 | 300 | +2.07e-06 | -9.4647 | -9.4644 | -0.3 |
 | NH3 | -23.46693353 | -23.46695167 | 300 | +1.81e-05 | -6.1612 | -6.1604 | -0.8 |
 | N2 | -39.83042717 | -39.83021459 | 150 | -2.13e-04 | -10.2959 | -10.2959 | +0.0 |
-| CO | -43.31671520 | -43.31651727 | 150 | -1.98e-04 | -9.0614 | -9.0616 | +0.2 |
+| CO | -43.31671520 | -43.31651727 | 150 | -1.98e-04 | -9.0615 | -9.0616 | +0.1 |
 | O2 | -63.71093108 | -63.71092564 | 300 | -5.44e-06 | -6.8729 / -11.6050 | -6.8741 / -11.6063 | +1.2 / +1.3 |
 
 The PBE inputs equal those of `../0d_hybrid_functionals` (its README explains the remaining offsets: PARSEC's
-Kleinman-Bylander quadrature and QE's cutoff at 150 Ry).
+Kleinman-Bylander quadrature and QE's cutoff at 150 Ry). The logs of the PBE inputs of CH4, N2 and CO are of
+19 November 2026: these molecules have the point groups Td, D4h and C4v on the grid, and since 15 and 18 November
+2026 a PBE run solves the weighted one-dimensional sectors of a larger subgroup (D2d for Td, a subgroup of order 8
+or 4 for D4h and C4v) instead of the abelian group of before. Their energies are those of the former logs to the
+printed digits; the CO HOMO moved by 0.02 meV (the last printed digit). The meta-GGAs and their hybrids keep the
+abelian group (`src/parsec_python/acceleration/README.md`, "Weighted sectors of a larger subgroup").
 
 ## Meta-GGAs against QE
 
@@ -226,16 +231,18 @@ at h = 0.16 bohr (H2O 1,568,208), 3 million at 0.13.
 | input | PBE | SCAN | r2SCAN | TPSS | TPSSh | r2SCAN0 |
 |---|---|---|---|---|---|---|
 | H2O, h 0.16 | 9 s / 44 / 1.2 GiB | 31 s / 45 / 3.0 GiB | 25 s / 31 / 2.7 GiB | 24 s / 43 / 2.5 GiB | 29 s / 20 + 29 / 3.0 GiB | 49 s / 20 + 48 / 3.3 GiB |
-| CH4, h 0.16 | 9 s / 36 / 1.5 GiB | 108 s / 200 (Max_Iter) / 3.6 GiB | 29 s / 29 / 3.2 GiB | 26 s / 28 / 3.0 GiB | 33 s / 13 + 46 / 3.5 GiB | 47 s / 13 + 37 / 3.8 GiB |
+| CH4, h 0.16 | 6 s / 36 / 1.0 GiB | 108 s / 200 (Max_Iter) / 3.6 GiB | 29 s / 29 / 3.2 GiB | 26 s / 28 / 3.0 GiB | 33 s / 13 + 46 / 3.5 GiB | 47 s / 13 + 37 / 3.8 GiB |
 | NH3, h 0.16 | 14 s / 41 / 2.2 GiB | 149 s / 200 (Max_Iter) / 4.5 GiB | 59 s / 62 / 3.7 GiB | 37 s / 45 / 3.7 GiB | 45 s / 19 + 33 / 4.2 GiB | 79 s / 19 + 64 / 4.4 GiB |
-| N2, h 0.16 | 6 s / 25 / 0.9 GiB | 28 s / 59 / 2.4 GiB | 22 s / 35 / 2.3 GiB | 19 s / 27 / 2.1 GiB | 22 s / 14 + 21 / 2.6 GiB | 33 s / 14 + 36 / 2.8 GiB |
-| CO, h 0.16 | 9 s / 32 / 1.1 GiB | 92 s / 200 (Max_Iter) / 2.8 GiB | 28 s / 44 / 2.5 GiB | 23 s / 43 / 2.3 GiB | 29 s / 27 + 24 / 2.8 GiB | 44 s / 27 + 53 / 3.0 GiB |
+| N2, h 0.16 | 5 s / 24 / 0.8 GiB | 28 s / 59 / 2.4 GiB | 22 s / 35 / 2.3 GiB | 19 s / 27 / 2.1 GiB | 22 s / 14 + 21 / 2.6 GiB | 33 s / 14 + 36 / 2.8 GiB |
+| CO, h 0.16 | 6 s / 36 / 1.2 GiB | 92 s / 200 (Max_Iter) / 2.8 GiB | 28 s / 44 / 2.5 GiB | 23 s / 43 / 2.3 GiB | 29 s / 27 + 24 / 2.8 GiB | 44 s / 27 + 53 / 3.0 GiB |
 | O2, h 0.16 | 12 s / 29 / 1.1 GiB | 39 s / 41 / 3.5 GiB | 32 s / 28 / 2.5 GiB | 30 s / 30 / 2.3 GiB |  |  |
 | H2O, h 0.13 | 16 s / 44 / 1.8 GiB |  | 59 s / 43 / 4.7 GiB |  |  |  |
 | O2, h 0.13 | 23 s / 37 / 1.6 GiB |  | 72 s / 35 / 4.2 GiB |  |  |  |
 | H2O distorted (forces), h 0.16 | 11 s / 28 / 2.1 GiB |  | 32 s / 27 / 3.5 GiB |  |  |  |
 
-A meta-GGA run takes 2.5 to 4.2 times the time of PBE here (the SCAN runs stopped at `Max_Iter` more). An SCF iteration costs 2 to 3 times as much (`tau` of the
+A meta-GGA run takes 2.5 to 4.2 times the time of PBE on the same route here (the SCAN runs stopped at `Max_Iter`
+more); the PBE runs of CH4, N2 and CO in their weighted sectors (above) took 5 to 6 s, against 6 to 9 s in the
+former logs on the abelian route, which the meta-GGAs keep. An SCF iteration costs 2 to 3 times as much (`tau` of the
 orbitals, the orbital term `-div(vtau grad)` in every Hamiltonian application and the wider Chebyshev interval it
 brings: H2O 0.17 s per iteration with PBE, 0.33 s with TPSS, 0.46-0.51 s with SCAN and r2SCAN), and the set-up
 before the SCF ("Pre-SCF setup/reporting wall time" of the log) takes 8 to 12 s for a meta-GGA against 1.3 to 1.7 s

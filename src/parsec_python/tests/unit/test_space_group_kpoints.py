@@ -18,10 +18,12 @@ WSL binary on the ``tests/orthorhombic`` and ``tests/hexagonal`` examples).
 # here are those of the Fortran parity round.
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -238,6 +240,36 @@ class SpaceGroupTests(unittest.TestCase):
         self.assertEqual(fortran_anint(2.5), 3.0)
         self.assertEqual(str(fortran_anint(-0.3)), "-0.0")
         self.assertEqual(fortran_anint(0.49999999999999994), 0.0)
+
+
+class AffineGridImageTests(unittest.TestCase):
+    """The row of the image of every point of a row-major grid, filled by slabs on threads for a large grid."""
+
+    def test_the_threaded_images_are_those_of_the_broadcast_sum(self) -> None:
+        import os
+        from unittest import mock
+
+        from parsec_python.Grid import space_group
+
+        counts = (170, 162, 158)  # above the threshold of the threads (2^22 points)
+        self.assertGreater(int(np.prod(counts)), space_group._THREADED_IMAGES)
+        for matrix, constant in (
+            (np.diag([-1, 1, -1]), (3, 0, 157)),
+            (np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]), (5, 7, 11)),
+            (np.eye(3, dtype=int), (0, 0, 0)),
+        ):
+            n = np.asarray(counts)
+            indices = np.indices(counts).reshape(3, -1)
+            # (M i + c) mod n, row-major: what the map stands for (axes 0 and 1 swapped have unequal counts here,
+            # and the formula takes each row modulo its own count, as the function does)
+            images = (np.asarray(matrix) @ indices + np.asarray(constant)[:, None]) % n[:, None]
+            expected = (images[0] * n[1] + images[1]) * n[2] + images[2]
+            for threads in ("1", "4"):
+                with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_SETUP_THREADS": threads}):
+                    for index_type in (np.int64, np.int32):
+                        found = space_group.affine_grid_images(matrix, constant, counts, index_type)
+                        self.assertEqual(found.dtype, np.dtype(index_type))
+                        np.testing.assert_array_equal(found, expected)
 
 
 class IrreducibleWedgeTests(unittest.TestCase):
@@ -495,8 +527,19 @@ class InputTests(unittest.TestCase):
         self.assertEqual(k_points.shape, (4, 3))
         self.assertIn("monkhorst_pack_shift", repr(problem))
 
-    def test_without_shift_nothing_changes(self) -> None:
-        problem = self._parse(shift="").problem
+    def test_without_shift_the_shift_is_zero(self) -> None:
+        # PARSEC 1.5's mpshift without the block is zero (since 2026-11-18; test_mp_unshifted_mesh)
+        translation = self._parse(shift="")
+        reference = self._parse()
+        self.assertEqual(translation.problem.monkhorst_pack_shift, (0.0, 0.0, 0.0))
+        self.assertEqual(translation.problem.space_group.order, reference.problem.space_group.order)
+        self.assertTrue(translation.problem.scf.symmetrize_density)
+        for ours, theirs in zip(kpoint_sampling(translation.problem), kpoint_sampling(reference.problem)):
+            np.testing.assert_array_equal(ours, theirs)
+
+    def test_without_shift_and_port_nothing_changes(self) -> None:
+        with mock.patch.dict(os.environ, {"PARSEC_MP_UNSHIFTED_MESH": "port"}):
+            problem = self._parse(shift="").problem
         self.assertIsNone(problem.monkhorst_pack_shift)
         self.assertIsNone(problem.space_group)
         self.assertFalse(problem.scf.symmetrize_density)

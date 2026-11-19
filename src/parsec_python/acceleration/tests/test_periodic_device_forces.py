@@ -662,6 +662,30 @@ class ScopeTests(unittest.TestCase):
                 self.assertIn("forces, relaxation or molecular dynamics of a periodic", errors.getvalue())
                 self.assertIn("--mpi", errors.getvalue())
 
+    def test_mpi_ends_a_relaxation_without_abort_when_its_movements_are_used(self) -> None:
+        # exit status 4 (Movement_Num used up) and 3 (an SCF loop not converged) are reached by every rank: the
+        # MPI job ends normally; another status (an input error) ends it with MPI_Abort
+        from .. import cli as accelerated_cli
+        from ..Parallel import mpi
+
+        for status, aborts in ((4, False), (3, False), (0, False), (5, True)):
+            with self.subTest(status=status):
+                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as name:
+                    directory = Path(name)
+                    shutil.copy(DATA / "H_POTRE.DAT", directory / "H_POTRE.DAT")
+                    path = directory / "parsec.in"
+                    path.write_text(_CLI_INPUT + _TWO_K + "Minimization: bfgs\n", encoding="utf-8")
+                    with mock.patch.object(accelerated_cli, "_join_mpi", return_value=None), mock.patch.object(
+                        accelerated_cli, "_abort_mpi"
+                    ) as abort, mock.patch.object(mpi, "requested", return_value=True), mock.patch.object(
+                        mpi, "context", return_value=None
+                    ), mock.patch.object(
+                        accelerated_cli, "reference_main", mock.Mock(return_value=status)
+                    ), redirect_stderr(StringIO()), redirect_stdout(StringIO()):
+                        code = accelerated_cli.main([str(path), "--quiet", "--no-archive"])
+                self.assertEqual(code, status)
+                self.assertEqual(abort.called, aborts)
+
 
 @unittest.skipUnless(cupy_available(), "CUDA runtime is unavailable")
 class CommandLineTests(unittest.TestCase):

@@ -4,10 +4,12 @@
 # the parameter a shifted grid of a bulk cell runs on the Fortran-derived routines, Fortran's reduced wedge).
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -69,6 +71,8 @@ class KPointSamplingCliTests(unittest.TestCase):
         path.write_text(_BASE_INPUT + extra, encoding="utf-8")
         return path
 
+    # the former unreduced 2x2x2 mesh (PARSEC_MP_UNSHIFTED_MESH=port; the default reduces it since 2026-11-18)
+    @mock.patch.dict(os.environ, {"PARSEC_MP_UNSHIFTED_MESH": "port"})
     def test_full_2x2x2_run_converges(self) -> None:
         input_path = self._write_input("parsec.in")
         exit_code = cli_main([str(input_path), "--quiet"])
@@ -134,13 +138,18 @@ class KPointSamplingCliTests(unittest.TestCase):
         fractions = k_points @ np.linalg.inv(reciprocal)
         np.testing.assert_allclose(np.unique(np.round(fractions[:, 0], 12)), [0.25])
         np.testing.assert_allclose(np.unique(np.round(fractions[:, 1], 12)), [0.0, 0.5])
-        # Moving atoms keep the full mesh of equal weights
+        # Forces take the wedge of the single point (PARSEC_KPOINT_FORCE_WEDGE); with off the full mesh of equal
+        # weights, as before
         forces = self._write_input(
             "forces.in",
             extra="begin Monkhorst_Pack_Shift\n0.5 0.0 0.0\nend Monkhorst_Pack_Shift\nUse_Fortran_Routines: .false.\n"
             "Skip_Force: .false.\n",
         )
         problem = parse_parsec_input(forces).problem
+        self.assertEqual(problem.space_group.order, 16)
+        np.testing.assert_allclose(kpoint_sampling(problem)[1] * 8, [2.0, 4.0, 2.0])
+        with mock.patch.dict(os.environ, {"PARSEC_KPOINT_FORCE_WEDGE": "off"}):
+            problem = parse_parsec_input(forces).problem
         self.assertIsNone(problem.monkhorst_pack_dimensions)
         self.assertEqual(len(problem.kpoints), 8)
         np.testing.assert_allclose(problem.kpoint_weights, 1.0 / 8)

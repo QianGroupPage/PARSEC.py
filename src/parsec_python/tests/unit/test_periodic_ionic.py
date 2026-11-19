@@ -453,5 +453,88 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("spin-polarized cell with k-points", "; ".join(routines.reasons))
 
 
+# H2 along z about the centre of the cube: the 16 operations of D4h map the atoms and the grid onto themselves, and the
+# compressed bond gives forces along z.
+_WEDGE_INPUT = _INPUT.replace(" 2.9 3.1 3.0\n 4.35 3.0 3.2\n", " 3.0 3.0 2.4\n 3.0 3.0 3.6\n")
+_WEDGE_MESH = (
+    "Use_Fortran_Routines: .false.\nKpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n3 3 1\nend Monkhorst_Pack_Grid\n"
+    "begin Monkhorst_Pack_Shift\n0.0 0.0 0.0\nend Monkhorst_Pack_Shift\n"
+)
+
+
+class ForceWedgeTests(unittest.TestCase):
+    """Forces and relaxations of the default routines on the irreducible wedge of a mesh (PARSEC_KPOINT_FORCE_WEDGE)."""
+
+    def _folder(self, extra: str, *, flag: str = "") -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        folder = Path(directory.name)
+        text = _WEDGE_INPUT.format(extra=extra, mixing="0.1")
+        if flag:
+            text = text.replace("Local_Component: s\n", f"Local_Component: s\n{flag}\n")
+        (folder / "parsec.in").write_text(text)
+        (folder / "H_POTRE.DAT").write_bytes(_H.read_bytes())
+        return folder
+
+    def _parse(self, extra: str, *, flag: str = "", setting: str = "auto"):
+        from parsec_python.Input import parse_parsec_input
+
+        with mock.patch.dict(os.environ, {"PARSEC_KPOINT_FORCE_WEDGE": setting}):
+            return parse_parsec_input(self._folder(_WEDGE_MESH + extra, flag=flag) / "parsec.in")
+
+    def _run(self, extra: str, setting: str):
+        folder = self._folder(_WEDGE_MESH + extra)
+        output, error = StringIO(), StringIO()
+        previous = os.getcwd()
+        os.chdir(folder)
+        try:
+            with mock.patch.dict(os.environ, {"PARSEC_KPOINT_FORCE_WEDGE": setting}):
+                with redirect_stdout(output), redirect_stderr(error):
+                    code = reference_main([str(folder / "parsec.in"), "--no-archive"])
+        finally:
+            os.chdir(previous)
+        self.assertEqual(code, 0, error.getvalue()[-2000:])
+        return folder
+
+    def test_forces_and_relaxations_take_the_wedge_and_dynamics_the_whole_mesh(self) -> None:
+        from parsec_python.Grid.kpoints import kpoint_sampling
+
+        for extra in ("Skip_Force: .false.\n", "Minimization: bfgs\n"):
+            problem = self._parse(extra).problem
+            self.assertIsNotNone(problem.space_group)
+            self.assertGreater(problem.space_group.order, 1)
+            self.assertIsNone(problem.kpoints)
+            self.assertFalse(problem.kpoint_time_reversal)
+            self.assertEqual(len(kpoint_sampling(problem)[0]), 3)  # 9 points; their pairs would be 5
+            off = self._parse(extra, setting="off").problem
+            self.assertTrue(off.kpoint_time_reversal)
+            self.assertEqual(len(kpoint_sampling(off)[0]), 5)
+        # the mirror z -> -z exchanges the atoms, the second of which Move_Flag 1 fixes: the pairs of the whole mesh
+        fixed = self._parse("Minimization: bfgs\n", flag="Move_Flag: 1").problem
+        self.assertTrue(fixed.kpoint_time_reversal)
+        self.assertIsNone(fixed.space_group)
+        dynamics = self._parse(
+            "Molecular_Dynamics: .true.\nTinit: 300\nT_Final: 300\nT_Step: 10\nTime_Step: 20\nStep_Num: 2\n"
+        ).problem
+        self.assertTrue(dynamics.kpoint_time_reversal)
+        self.assertIsNone(dynamics.space_group)
+
+    def test_the_forces_of_the_wedge_are_those_of_the_whole_mesh(self) -> None:
+        found = {}
+        for setting in ("auto", "off"):
+            folder = self._run("Skip_Force: .false.\n", setting)
+            text = (folder / "parsec.out").read_text()
+            found[setting] = (
+                float(re.findall(r"Total Energy =\s+(-?\d+\.\d+)", text)[-1]),
+                CommandLineTests._final_forces(folder),
+            )
+        self.assertAlmostEqual(found["auto"][0], found["off"][0], delta=1.0e-7)
+        forces = found["off"][1]
+        self.assertGreater(float(np.abs(forces[:, 2]).max()), 1.0e-2)
+        np.testing.assert_allclose(found["auto"][1], forces, atol=2.0e-6)
+        np.testing.assert_allclose(found["auto"][1][:, :2], 0.0, atol=1.0e-6)  # the group keeps them along z
+        np.testing.assert_allclose(found["auto"][1][0], -found["auto"][1][1], atol=1.0e-6)
+
+
 if __name__ == "__main__":
     unittest.main()

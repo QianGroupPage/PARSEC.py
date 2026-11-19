@@ -13,8 +13,10 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -233,7 +235,13 @@ class ParserGridTests(_ParserCase):
         self.assertIs(type(grid), PeriodicRealSpaceGrid)
         self.assertEqual(grid.points_per_axis.tolist(), [48, 48, 48])
         np.testing.assert_array_equal(grid.shift, [0.5, 0.5, 0.5])
-        self.assertIsNone(translation.problem.space_group)  # found for adjust_step, not kept
+        # found for adjust_step, kept for the irreducible wedge of the mesh (PARSEC 1.5's zero shift without the
+        # Monkhorst_Pack_Shift block, since 2026-11-18); not kept with the former unreduced mesh
+        self.assertEqual(translation.problem.space_group.order, 48)
+        with mock.patch.dict(os.environ, {"PARSEC_MP_UNSHIFTED_MESH": "port"}):
+            former = self.parse(_bulk(_MP222, h="0.2"))
+        self.assertIsNone(former.problem.space_group)
+        self.assertEqual(self.grid(former).points_per_axis.tolist(), [48, 48, 48])
         # Andrew Grieder's grid: the largest even count without translations
         his = self.parse(_bulk(_MP222, h="0.2", routines=".false."))
         self.assertEqual(self.grid(his).points_per_axis.tolist(), [50, 50, 50])

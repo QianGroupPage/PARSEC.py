@@ -13,10 +13,12 @@ SCF residual), exchange energies and levels to 1e-6.
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -199,10 +201,24 @@ class DeviceExchangeTests(_Inputs, unittest.TestCase):
         )
         from parsec_python.acceleration.driver import prepare_single_point, run_scf
 
+        from parsec_python.acceleration.Symmetry import PointGroupReduction
+
+        # H2 has the weighted sectors of D4h in a PBE run (PARSEC_ORBITAL_GROUP_MAX_COST, 0.75 since 2026-11-18);
+        # they hold one partner of the pi levels, and a hybrid run keeps the abelian D2h of the structure
+        # (driver._orbital_group_refusal): the exchange of those weighted orbitals is refused, and that of the
+        # sectors a hybrid run takes is compared with the host.
+        system = prepare_single_point(self.problem("pbe", states=6, extra=""), backend="cupy", symmetry="auto")
+        system.materialize_final_wavefunctions = False
+        weighted = run_scf(system).result.wavefunctions
+        self.assertIsInstance(weighted.point_group, PointGroupReduction)
+        with self.assertRaisesRegex(NotImplementedError, "every partner"):
+            channel_orbitals(weighted, np.ones(6), 2.0, system.grid.volume_element)
+        del system, weighted
         for symmetry in ("off", "auto"):
-            system = prepare_single_point(
-                self.problem("pbe", states=6, extra=""), backend="cupy", symmetry=symmetry
-            )
+            with mock.patch.dict(os.environ, {"PARSEC_ORBITAL_GROUP": "abelian"}):
+                system = prepare_single_point(
+                    self.problem("pbe", states=6, extra=""), backend="cupy", symmetry=symmetry
+                )
             # The orbitals stay where the eigensolver keeps them.
             system.materialize_final_wavefunctions = False
             result = run_scf(system).result
@@ -212,6 +228,7 @@ class DeviceExchangeTests(_Inputs, unittest.TestCase):
                 result.wavefunctions, occupations, 2.0, system.grid.volume_element
             )
             if symmetry == "auto":
+                self.assertIsNone(result.wavefunctions.point_group)
                 self.assertGreater(len(orbitals.sectors), 1)
             full = (
                 result.wavefunctions.to_full_host()

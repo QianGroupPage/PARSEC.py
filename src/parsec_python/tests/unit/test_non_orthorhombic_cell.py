@@ -363,11 +363,19 @@ class ObliqueSelfConsistentFieldTests(unittest.TestCase):
         self.assertTrue(cubic.converged and sheared.converged)
         self.assertAlmostEqual(sheared.energies.total, cubic.energies.total, delta=2.0e-3)
 
-    def test_atom_outside_an_oblique_cell_is_rejected(self) -> None:
+    def test_atom_outside_an_oblique_cell_is_folded_for_the_builders(self) -> None:
+        # Since 2026-11-19 an atom outside the cell is folded into it by lattice vectors for the builders (the
+        # coordinates of a restart file after an atom crossed a face), and the system keeps the coordinates as given;
+        # before, it was refused.  The folding uses fractional coordinates, so an oblique cell folds as a box does.
         lattice = CELLS["hexagonal"]
-        problem = _hydrogen(lattice, [[-1.0, 0.5, 0.5]])
-        with self.assertRaises(ValueError):
-            prepare_periodic_single_point(problem)
+        given = np.array([-1.0, 0.5, 0.5])
+        fraction = given @ np.linalg.inv(lattice)
+        inside = (fraction - np.floor(fraction)) @ lattice
+        system = prepare_periodic_single_point(_hydrogen(lattice, [given]))
+        np.testing.assert_array_equal(np.asarray(system.atoms[0].position), given)
+        np.testing.assert_allclose(np.asarray(system.cell_atoms[0].position), inside, rtol=0, atol=1e-12)
+        reference = prepare_periodic_single_point(_hydrogen(lattice, [inside]))
+        np.testing.assert_allclose(system.ionic_potential, reference.ionic_potential, rtol=0, atol=1e-10)
 
 
 _FCC_INPUT = """

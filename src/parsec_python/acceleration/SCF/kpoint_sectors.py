@@ -6,9 +6,12 @@ signed permutation ``R`` with a translation ``t`` of whole grid steps,
 :func:`..Symmetry.axis_reflection._space_group_operations`) permutes the grid points, ``(P_g f)(r) = f(g^-1 r)``,
 and commutes with ``H``.  It moves the phase, ``P_g e^{ik.r} P_g^-1 = e^{i (R k).(r - t)}``, so where ``R k = k``
 it commutes with ``H_k`` as well (the constant ``e^{-ik.t}`` drops out).  ``R k = k`` exactly, not modulo a
-reciprocal lattice vector: the finite-difference ``-nabla^2 - 2ik.grad + |k|^2`` of the u gauge (and the Bloch
-Laplacian of ``PARSEC_KPOINT_KINETIC=bloch``) is not invariant under the change of gauge ``u -> e^{-iG.r} u``
-that ``R k = k + G`` would need.  These operations form the little group ``G_k``.
+reciprocal lattice vector: where ``R k = k + G``, ``P_g`` carries ``H_k`` into ``H_{k+G} = e^{-iG.r} H_k e^{iG.r}``,
+so the operator that commutes with ``H_k`` is ``e^{iG.r} P_g``, a complex operator whose characters are not the
+real ``+-1`` of the sector bases below.  (The Bloch form of ``PARSEC_KPOINT_KINETIC=bloch``, ``e^{-ik.r} L e^{ik.r}``
+of the finite-difference Laplacian ``L``, obeys that identity exactly, since ``e^{iG.r}`` is periodic on the grid;
+the default ``-nabla^2 - 2ik.grad + |k|^2`` of the u gauge only to its discretization, about 1e-8 Ry on the even
+meshes of the tests.)  These operations form the little group ``G_k``.
 
 On the grid each term commutes with ``P_g``: the Laplacian and the first derivatives of a uniform periodic grid
 are invariant under its translations and turn as a scalar and a vector under ``R`` (the coefficients along the
@@ -39,7 +42,11 @@ A sector of ``n_s`` of the ``N`` rows solves ``M_s = ceil(c M n_s / N) + 6`` sta
 k-point, ``c`` = ``PARSEC_KPOINT_SECTOR_MARGIN``, 1.3 by default), at most ``n_s``; the k-point keeps the lowest
 ``M`` levels of the union.  After every solve, each sector with fewer states than rows must reach the ``M``-th
 level of the union (``max e_s >= e_M``): every level it did not compute then lies above the levels kept.  A
-sector that falls short gets 1.5 times its states and the step is solved again, from new starts.  A k-point
+sector that falls short gets 1.5 times its states and the step is solved again, from new starts.  The margin is
+needed only until the levels are known: after the first solve of a loop each sector keeps the ``h_s`` levels it
+holds among the ``M`` kept plus a tenth of them, at least six more (``PARSEC_KPOINT_SECTOR_REFIT=auto``, the
+default; :meth:`SectorKPointSolver._refit`), its Ritz states cut to their lowest pairs at its next solve, and a sector
+so cut that later falls short grows by its estimated deficit (the rule of the Gamma sectors).  A k-point
 whose sectors would not halve its work (``sum n_s M_s^2 <= N M^2 / 2``) stays one task, and so do the k-points
 of a basis of fewer than ``2^24`` entries (``N M``, 268 MB of complex vectors): their eigenproblems do not fill a
 device, and more of them would add the cost of the tasks (the 4631 k-points of an 8-atom cube with a 21^3 mesh).
@@ -47,9 +54,21 @@ device, and more of them would add the cost of the tasks (the 4631 k-points of a
 The density of a sector, ``|U v|^2``, is ``q_s / m_w`` on the rows of the orbit ``w`` of its column ``s``
 (``q = sum_n f_n |v_n|^2``, ``m_w`` the orbit size): expanded on the host and summed by the job of the driver.
 
-The scalar k-point SCF of a bulk orthorhombic cell takes it, without spin, hybrid, meta-GGA, LDA+U, forces or
-kept orbitals (the driver then gives the job its ``geometry``); ``PARSEC_KPOINT_SECTORS=off`` keeps one task per
-k-point, bit for bit as before.
+The k-point SCF of a bulk orthorhombic cell takes it, scalar or spin-polarized, with the exchange of a hybrid, forces
+and kept orbitals, without meta-GGA, LDA+U, the fixed occupations of ``occup.in`` or refined levels (the driver then
+gives the job its ``geometry``); ``PARSEC_KPOINT_SECTORS=off`` keeps one task per k-point, bit for bit as before.
+
+The sectors hold the potential invariant under the operations of ``H_k``, also where only the self-consistent
+solution is (a single Gamma point, a full mesh, the translations of a supercell: the operations the density is not
+symmetrized over, ``KPointSectors.assumed``).  A spin-polarized state that breaks that symmetry (an open shell, a
+Jahn-Teller or magnetic order) cannot be held, as on the sectors of a cluster (``Spin_Symmetry_Sectors``,
+:mod:`.spin_sectors`), and the same three tests guard a spin-polarized loop (``PARSEC_KPOINT_SECTOR_GUARD=auto``):
+no partly filled multiplet across the sectors of such a k-point in the start Hamiltonian, channel densities
+invariant under the operations assumed (:class:`SectorGuardGroup`) at the end, and with Fermi-Dirac occupations no
+fractional occupation of such a multiplet at the end, each weighted by its k-point (the electrons it adds to the
+density).  A loop that fails one runs again with one task per k-point
+(:func:`parsec_python.SCF.kpoints.run_scf_kpoints_spin_polarized`).  An unpolarized loop is not tested, as the
+unpolarized sectors of a cluster are not.
 """
 
 from __future__ import annotations
@@ -90,6 +109,9 @@ _CACHE_KEY = "kpoint_sector_plans"
 # states of a sector expanded to the whole grid at once for its extras (the forces)
 _FORCE_COLUMNS = 32
 _MARGIN_SWITCH = "PARSEC_KPOINT_SECTOR_MARGIN"
+_REFIT_SWITCH = "PARSEC_KPOINT_SECTOR_REFIT"
+# the buffer of a refitted sector over the levels it holds among those kept (at least _EXTRA_STATES states)
+_REFIT_BUFFER = 0.1
 _EXTRA_STATES = 6
 _GROWTH = 1.5
 _ATTEMPTS = 4
@@ -118,6 +140,114 @@ def sector_margin() -> float:
     if not value >= 1.0:
         raise ValueError(f"{_MARGIN_SWITCH} must be at least 1, not {raw!r}")
     return value
+
+
+def sector_guard_setting() -> str:
+    """``PARSEC_KPOINT_SECTOR_GUARD``: ``auto`` (default) tests a spin-polarized loop in the sectors of its k-points
+    for a state that breaks the symmetry the sectors assume and runs it again with one task per k-point where it
+    does (:func:`parsec_python.SCF.kpoints.run_scf_kpoints_spin_polarized`); ``off`` keeps the sectors without the
+    tests, as before."""
+
+    value = os.environ.get("PARSEC_KPOINT_SECTOR_GUARD", "auto").strip().lower() or "auto"
+    if value not in {"auto", "off"}:
+        raise ValueError(f"PARSEC_KPOINT_SECTOR_GUARD must be auto or off, not {value!r}")
+    return value
+
+
+def sector_refit_setting() -> str:
+    """``PARSEC_KPOINT_SECTOR_REFIT``: ``auto`` (default) cuts the states of every sector after the first solve of a
+    loop to the levels it holds among those its k-point keeps plus a buffer (:meth:`SectorKPointSolver._refit`);
+    ``off`` keeps the first counts (and their growth), bit for bit as before."""
+
+    value = os.environ.get(_REFIT_SWITCH, "auto").strip().lower() or "auto"
+    if value not in {"auto", "off"}:
+        raise ValueError(f"{_REFIT_SWITCH} must be auto or off, not {value!r}")
+    return value
+
+
+def refitted_count(held: int, size: int, count: int) -> int:
+    """The states of a sector that holds ``held`` of the levels its k-point keeps: ``held`` plus
+    :data:`_REFIT_BUFFER` of them, at least :data:`_EXTRA_STATES` more, at most its rows and its ``count`` so far."""
+
+    held = int(held)
+    return min(int(size), int(count), held + max(_EXTRA_STATES, math.ceil(_REFIT_BUFFER * held)))
+
+
+def _leading_columns(vectors, working: int):
+    """A copy of the first ``working`` columns of ``vectors`` (host or device) in its memory order."""
+
+    order = "F" if vectors.flags.f_contiguous and not vectors.flags.c_contiguous else "C"
+    return vectors[:, : int(working)].copy(order=order)
+
+
+def trimmed_state(state, requested: int, working: int, *, group=None, block_size: int | None = None):
+    """The Ritz state ``state`` of an eigensolver cut to its lowest ``working`` Ritz pairs, for a solve of
+    ``requested`` states that keeps it (``None`` where it cannot be cut: a state of ARPACK or DIAGLA).
+
+    The Ritz vectors of a state are in the order of their values, so the first ``working`` columns are the lowest
+    pairs.  The three kinds of states of the k-point solvers: that of the host eigensolver
+    (:class:`parsec_python.Eigensolvers.eigval.EigvalState`), that of one device
+    (:class:`..Eigensolvers.chebff_spinor.SpinorEigvalState`) and that of a basis the ranks of an MPI pool share by
+    columns (:class:`..Eigensolvers.chebff_columns.ColumnEigvalState`, ``group`` its ranks, collective: the columns
+    are laid out again over them, ``block_size`` that of the solves).  The lower bound of the next filter is the
+    largest value kept (the filter of a larger subspace began above it).  A state with no more than ``working``
+    columns comes back as it is.
+    """
+
+    from dataclasses import replace as _replace
+
+    if state is None or int(state.working_states) <= int(working):
+        return state
+    working, requested = int(working), int(requested)
+    subspace = getattr(state, "subspace", None)
+    if subspace is not None:  # the host eigensolver
+        if getattr(state, "window_vectors", None) is not None or getattr(state, "start_seed", None) is not None:
+            return None
+        values = np.asarray(subspace.eigenvalues, dtype=np.float64)[:working].copy()
+        cut = _replace(
+            subspace,
+            working_states=working,
+            eigenvalues=values,
+            vectors=_leading_columns(np.asarray(subspace.vectors), working),
+            filter_lower_bound=None if subspace.filter_lower_bound is None else float(np.max(values)),
+        )
+        return _replace(state, requested_states=requested, working_states=working, subspace=cut)
+    values = np.asarray(_host(state.eigenvalues), dtype=np.float64)[:working].copy()
+    bound = None if state.filter_lower_bound is None else float(np.max(values))
+    layout = getattr(state, "layout", None)
+    if layout is None:  # one device
+        return _replace(
+            state, vectors=_leading_columns(state.vectors, working), eigenvalues=values, working_states=working,
+            filter_lower_bound=bound,
+        )
+    from ..Eigensolvers.chebff_columns import ColumnLayout
+
+    fresh = ColumnLayout(working, layout.block_size if block_size is None else int(block_size), layout.size)
+    if layout.size == 1:
+        vectors = _leading_columns(state.vectors, working)
+    else:
+        dimension = int(state.operator_dimension)
+        rows = group.to_rows(state.vectors, layout, dimension)
+        vectors = group.to_columns(rows[:, :working], fresh, dimension)
+        del rows
+    return _replace(
+        state, vectors=vectors, eigenvalues=values, working_states=working, filter_lower_bound=bound, layout=fresh
+    )
+
+
+def carried_state(state, requested: int, settings, dimension: int, *, group=None):
+    """The Ritz state a k-point solver hands its next solve of ``requested`` states: ``state`` cut to the working
+    states of that solve (:func:`trimmed_state`) where it holds more (a task whose count the refit of the sectors
+    cut, ``trim_tasks``) and ``PARSEC_KPOINT_SECTOR_REFIT`` is ``auto``; else ``state`` as it is (a state the solve
+    cannot take starts afresh, as before)."""
+
+    if state is None or getattr(state, "operator_dimension", None) != int(dimension):
+        return state
+    working = min(int(requested) + int(settings.safety_buffer), int(dimension))
+    if int(state.working_states) <= working or sector_refit_setting() == "off":
+        return state
+    cut = trimmed_state(state, requested, working, group=group, block_size=int(settings.subspace.block_size))
+    return state if cut is None else cut
 
 
 def _host(value) -> np.ndarray:
@@ -263,13 +393,21 @@ def little_group_reduction(cell: CellGroup, elements: list[int], generators: lis
     """The orbits of the grid rows under ``elements`` (``None`` where one of them misses the grid)."""
 
     row_table = _RowOrderTable(cell.grid) if _fast_maps_requested() else None
-    mappings = []
+    # The smallest image of every row under the group, map by map, as detect_point_group_reduction keeps it: the
+    # maps are not held together (32 elements of a 20^3 diamond cell, 46.7 M points, are 12 GB); _orbit_labels of
+    # that one array is _orbit_labels of all the maps.
+    smallest = None
     for index in elements:
         mapping = cell.row_map(index, table=row_table)
         if mapping is None:
             return None
-        mappings.append(mapping)
-    representative_rows, full_to_wedge, multiplicities = _orbit_labels(mappings)
+        if smallest is None:
+            smallest = np.array(mapping, dtype=np.int64, copy=True)
+        else:
+            np.minimum(smallest, mapping, out=smallest)
+        del mapping
+    representative_rows, full_to_wedge, multiplicities = _orbit_labels([smallest])
+    del smallest
     order, rank = len(elements), len(generators)
     if order != 1 << rank:
         raise RuntimeError("the commuting involutions do not form a group of order 2^rank")
@@ -303,6 +441,7 @@ class PotentialInvariance:
         self.lattice = np.asarray(lattice, dtype=np.float64).reshape(3, 3)
         self.fractional = self.k_points @ self.lattice.T / (2.0 * np.pi)
         self._decided: dict[int, bool] = {}
+        self._in_group: dict[int, bool] = {}
         self._row_table = None
         self._sample = None
         self._sampled = None
@@ -322,7 +461,18 @@ class PotentialInvariance:
         matrix = self.cell.matrices[index]
         if np.array_equal(matrix, np.eye(3, dtype=np.int8)):
             return True  # a translation of the cell: every rho_k is invariant under it
-        return self._in_density_group(index) or self._maps_kpoints(matrix)
+        return self.in_density_group(index) or self._maps_kpoints(matrix)
+
+    def in_density_group(self, index: int) -> bool:
+        """Whether the density is symmetrized over operation ``index`` (``Symmetrize_Charge_Density``, the wedge of a
+        reduced mesh): then the loop without sectors makes the potential invariant under it as well."""
+
+        if index == 0:
+            return True
+        found = self._in_group.get(index)
+        if found is None:
+            found = self._in_group[index] = self._in_density_group(index)
+        return found
 
     def _in_density_group(self, index: int) -> bool:
         if self._sample is None:
@@ -358,6 +508,67 @@ class PotentialInvariance:
         return True
 
 
+class SectorGuardGroup:
+    """The operations of a cell against which the symmetry guard measures the densities of a loop in the sectors
+    (test 2 of :meth:`SectorKPointSolver.density_symmetry_report`).
+
+    Those the potential of the loop is taken to be invariant under (:class:`PotentialInvariance`), beyond those the
+    density is symmetrized over (whose invariance holds by construction): a generating set of the subgroup they
+    generate together, chosen in the order of the operations (the closure grows by right products, through the
+    group table).  ``rows`` of an operation are the grid rows of its images ``R r + t``.
+    """
+
+    def __init__(self, cell: CellGroup, invariance: PotentialInvariance) -> None:
+        self.cell = cell
+        self.invariance = invariance
+        self._images: list[tuple[int, np.ndarray]] | None = None
+
+    def _close(self, closure: set[int], generators: list[int]) -> None:
+        table = self.cell.table
+        frontier = list(closure)
+        while frontier:
+            fresh = []
+            for element in frontier:
+                for generator in generators:
+                    product_ = int(table[element, generator])
+                    if product_ not in closure:
+                        closure.add(product_)
+                        fresh.append(product_)
+            frontier = fresh
+
+    def images(self) -> list[tuple[int, np.ndarray]]:
+        """``(operation, rows)`` of the operations to test (built once)."""
+
+        if self._images is not None:
+            return self._images
+        admitted = [index for index in range(1, self.cell.order) if self.invariance(index)]
+        free = [index for index in admitted if self.invariance.in_density_group(index)]
+        closure = {0}
+        generators: list[int] = []
+        for index in free:
+            if index not in closure:
+                generators.append(index)
+                self._close(closure, generators)
+        tested: list[tuple[int, np.ndarray]] = []
+        table = _RowOrderTable(self.cell.grid) if _fast_maps_requested() else None
+        for index in admitted:
+            if index in closure:
+                continue
+            rows = self.cell.row_map(index, table=table)
+            if rows is None:
+                continue
+            generators.append(index)
+            self._close(closure, generators)
+            tested.append((index, np.asarray(rows, dtype=np.int64)))
+        self._images = tested
+        return tested
+
+    def operation_text(self, index: int) -> str:
+        matrix = np.asarray(self.cell.matrices[index], dtype=int).tolist()
+        shift = np.asarray(self.cell.shifts[index], dtype=int).tolist()
+        return f"{matrix} + {shift} grid steps"
+
+
 class SectorBlochHamiltonian(KPointKohnShamHamiltonian):
     """The Bloch Hamiltonian of one sector of a k-point: its complex matrices (the reduced kinetic term in the slot
     of the Bloch Laplacian, the reduced projectors) take the complex CSR kernel of the device
@@ -383,6 +594,10 @@ class KPointSectors:
         self._exchange: dict[int, tuple] = {}  # by sector: (exchange term of the whole grid, its reduction)
         self._gathers: dict[int, sp.csr_matrix] = {}  # by sector: U^H (shared by the tasks of the k-point)
         self._expanders: dict[tuple, tuple] = {}  # by (sector, device): the rows and factors of U on a device
+        # whether the sectors assume an invariance the density is not symmetrized over, and the operations of the
+        # symmetry guard (set by plan_sectors)
+        self.assumed = False
+        self.guard_group: SectorGuardGroup | None = None
 
     @property
     def order(self) -> int:
@@ -631,9 +846,17 @@ def plan_sectors(job: KPointJob) -> list[KPointSectors | None] | None:
         if sum(size * count * count for size, count in zip(sizes, counts)) > _WORK_FRACTION * rows * states * states:
             plans.append(None)
             continue
-        plans.append(KPointSectors(index, k_point, decomposition, counts))
+        plan = KPointSectors(index, k_point, decomposition, counts)
+        # the operations of the sectors that the density is not symmetrized over: the sectors assume the invariance
+        # of the potential under them (the symmetry guard, SectorKPointSolver.start_spectrum_report)
+        plan.assumed = any(not invariance.in_density_group(element) for element in elements[1:])
+        plans.append(plan)
     if not any(plan is not None for plan in plans):
         return None
+    guard = SectorGuardGroup(cell, invariance)
+    for plan in plans:
+        if plan is not None:
+            plan.guard_group = guard
     # the tasks of one k-point share its bases and static operators (KPointSectors.twin)
     by_task: list[KPointSectors | None] = []
     taken: set[int] = set()
@@ -685,6 +908,11 @@ class SectorKPointSolver:
         self._regrowths = 0
         self._regrown_tasks = 0  # sectors solved again alone (their solver kept the others)
         self._rebuilds = 0  # growths that made a new inner solver
+        # PARSEC_KPOINT_SECTOR_REFIT: the counts cut after the first solve (_refit), once per solver
+        self._refit_wanted = sector_refit_setting() == "auto"
+        self._refitted = False
+        self._trimmed: set[tuple[int, int]] = set()  # the sectors whose counts the refit cut
+        self._refit_states = 0  # the states the refit took off all sectors
         self._inner = None
         self._inner = self._new_inner()
 
@@ -793,18 +1021,87 @@ class SectorKPointSolver:
                     short.append((k_index, sector))
         return short
 
-    def _grow(self, short, potentials: dict, filter_degree: int, tolerance) -> list[np.ndarray]:
+    def _deficits(self, short, values) -> dict[tuple[int, int], int]:
+        """The estimated levels that each sector of ``short`` the refit cut lacks below the cut of its k-point
+        (:func:`..Eigensolvers.symmetry.bracket_deficits`, every sector counted once)."""
+
+        cut = [item for item in short if item in self._trimmed]
+        if not cut:
+            return {}
+        from ..Eigensolvers.symmetry import bracket_deficits
+
+        found: dict[tuple[int, int], int] = {}
+        for k_index in sorted({k for k, _ in cut}):
+            plan = self._plans[k_index]
+            levels = [np.asarray(values[self._position[(k_index, sector)]], dtype=float) for sector in range(plan.order)]
+            if any(part.size == 0 for part in levels):
+                continue
+            failing = [sector for k, sector in cut if k == k_index]
+            try:
+                estimate = bracket_deficits(levels, [1] * plan.order, int(self.job.number_of_states), failing)
+            except (ValueError, IndexError):
+                continue
+            found.update({(k_index, sector): int(value) for sector, value in estimate.items()})
+        return found
+
+    def _refit(self, values) -> None:
+        """Cut the states of every sector to the levels it holds among those its k-point keeps, plus a buffer.
+
+        The first counts carry the margin of :func:`sector_margin` over each sector's share of the rows, which a
+        sector needs before its levels are known; after the first solve of the loop they are (the bracket of
+        :meth:`_short_sectors` holds).  A sector that holds ``h`` of the ``M`` levels of its k-point keeps
+        :func:`refitted_count` states.  The inner solver cuts their Ritz states at their next solves
+        (``trim_tasks``: the lowest Ritz pairs are kept, nothing is solved again); a cut sector that later misses
+        levels grows by its estimated deficit (:meth:`_deficits`).  Once per solver, where the inner solver can.
+        """
+
+        self._refitted = True
+        trim = getattr(self._inner, "trim_tasks", None)
+        if trim is None:
+            return
+        states = int(self.job.number_of_states)
+        counts: dict[int, int] = {}
+        cut: list[tuple[int, int, int]] = []
+        for k_index, plan in enumerate(self._plans):
+            if plan is None:
+                continue
+            parts = [np.asarray(values[self._position[(k_index, sector)]], dtype=float) for sector in range(plan.order)]
+            levels = np.concatenate(parts)
+            if levels.size < states:
+                continue
+            owners = np.concatenate([np.full(part.size, sector, dtype=np.int64) for sector, part in enumerate(parts)])
+            held = np.bincount(owners[np.argsort(levels, kind="stable")[:states]], minlength=plan.order)
+            for sector in range(plan.order):
+                count = refitted_count(int(held[sector]), plan.sizes[sector], plan.counts[sector])
+                if count < plan.counts[sector]:
+                    cut.append((k_index, sector, count))
+                    counts[self._position[(k_index, sector)]] = count
+        if not counts or not trim(counts):
+            return
+        for k_index, sector, count in cut:
+            self._refit_states += self._plans[k_index].counts[sector] - count
+            self._plans[k_index].counts[sector] = count
+            self._trimmed.add((k_index, sector))
+
+    def _grow(self, short, potentials: dict, filter_degree: int, tolerance, values=None) -> list[np.ndarray]:
         """More states for the sectors ``short``, and the step solved again.
 
         Only those sectors are solved again where the inner solver can change the states of some tasks
         (``resize_tasks``: the others keep their Ritz states and levels); else a new inner solver solves every
-        sector from the start.
+        sector from the start.  ``values``: the levels of the solve that fell short (the deficits of the sectors the
+        refit cut).
         """
         counts = {}
+        deficits = self._deficits(short, values) if values is not None else {}
         for k_index, sector in short:
             plan = self._plans[k_index]
             count = plan.counts[sector]
-            plan.counts[sector] = min(plan.sizes[sector], max(math.ceil(_GROWTH * count), count + _EXTRA_STATES))
+            if (k_index, sector) in deficits:
+                # a sector the refit cut grows by its estimated deficit (the Gamma route's rule, bracket_deficits)
+                grown = count + _EXTRA_STATES + deficits[(k_index, sector)]
+            else:
+                grown = max(math.ceil(_GROWTH * count), count + _EXTRA_STATES)
+            plan.counts[sector] = min(plan.sizes[sector], grown)
             counts[self._position[(k_index, sector)]] = plan.counts[sector]
         self._regrowths += 1
         resize = getattr(self._inner, "resize_tasks", None)
@@ -824,8 +1121,11 @@ class SectorKPointSolver:
         for _ in range(_ATTEMPTS):
             short = self._short_sectors(values)
             if not short:
-                return self._union(values)
-            values = self._grow(short, potentials, filter_degree, tolerance)
+                union = self._union(values)
+                if self._refit_wanted and not self._refitted:
+                    self._refit(values)
+                return union
+            values = self._grow(short, potentials, filter_degree, tolerance, values)
         raise RuntimeError(
             f"the sectors of the k-points did not hold the lowest levels after {_ATTEMPTS} attempts; "
             f"{_SWITCH}=off solves each k-point whole"
@@ -943,6 +1243,182 @@ class SectorKPointSolver:
             total = np.zeros((len(self.job.geometry["atoms"]), 3), dtype=np.float64)
         return total
 
+    # ----------------------------------------------------------- the symmetry guard
+    def guarded_tasks(self) -> list[int]:
+        """The tasks whose sectors assume an invariance of the potential that the density is not symmetrized over
+        (a single Gamma point, a full mesh, the translations of a supercell): those the symmetry guard tests."""
+
+        return [task for task, plan in enumerate(self._plans) if plan is not None and getattr(plan, "assumed", False)]
+
+    def _task_weight(self, task: int) -> float:
+        geometry = self.job.geometry
+        k_of_task = np.asarray(geometry.get("k_of_task", np.arange(len(geometry["weights"]))), dtype=np.int64)
+        return float(np.asarray(geometry["weights"], dtype=np.float64)[int(k_of_task[task])])
+
+    def _guard_levels(self, task: int, levels, occupations, capacity: float):
+        owners, _ = self._kept[task]
+        values = np.asarray(levels[task], dtype=np.float64)
+        filled = np.asarray(occupations[task], dtype=np.float64) / float(capacity)
+        return values, filled, np.asarray(owners, dtype=np.int64)
+
+    def start_spectrum_report(self, levels, occupations, *, capacity: float = 1.0):
+        """Test 1 of the guard: the partly filled multiplets of the levels of the start Hamiltonian, ``None`` where
+        there are none.
+
+        ``levels`` and ``occupations`` are those of every task (the levels of :meth:`solve`), ``capacity`` the
+        occupation of a full level (1 for a spin channel).  As for the sectors of a cluster
+        (:func:`.spin_sectors.partly_filled_multiplets`): a multiplet of :func:`.spin_sectors.sector_multiplets`
+        (levels in two or more sectors of a guarded task) of ``d`` levels holding ``n`` electrons is partly filled
+        when ``w_k min(n, d - n)`` exceeds :data:`.spin_sectors.SPIN_SECTOR_OCCUPATION_TOLERANCE`, ``w_k`` the
+        weight of its k-point (the electrons it adds to the density; 1 at a single Gamma point).
+        """
+
+        from .spin_sectors import SPIN_SECTOR_OCCUPATION_TOLERANCE, FractionalOccupations
+
+        largest = 0.0
+        lines: list[str] = []
+        for part, line in self._start_multiplet_parts(levels, occupations, capacity):
+            if part <= SPIN_SECTOR_OCCUPATION_TOLERANCE:
+                continue
+            largest = max(largest, part)
+            lines.append(line())
+        if not lines:
+            return None
+        return FractionalOccupations(
+            largest=largest,
+            tolerance=float(SPIN_SECTOR_OCCUPATION_TOLERANCE),
+            lines=tuple(lines),
+            reason="a partly filled multiplet",
+            measure="largest w_k min(n, d - n) of d levels holding n electrons",
+        )
+
+    def _start_multiplet_parts(self, levels, occupations, capacity: float):
+        """``(w_k min(n, d - n), line)`` of every multiplet of :meth:`start_spectrum_report`, below its tolerance as
+        well; ``line()`` describes it."""
+
+        from .spin_sectors import START_MULTIPLET_WIDTH, sector_multiplets
+
+        for task in self.guarded_tasks():
+            values, filled, sectors = self._guard_levels(task, levels, occupations, capacity)
+            weight = self._task_weight(task)
+            for group in sector_multiplets(values, sectors):
+                electrons = float(np.sum(filled[group]))
+                part = weight * min(electrons, len(group) - electrons)
+
+                def line(task=task, weight=weight, group=group, electrons=electrons, values=values, sectors=sectors):
+                    text = " ".join(f"{values[member] * 13.605693122994:.4f}" for member in group)
+                    labels = " ".join(str(int(sectors[member])) for member in group)
+                    return (
+                        f"task {task} (k-point weight {weight:.4g}): {len(group)} levels within "
+                        f"{START_MULTIPLET_WIDTH:g} Ry at {text} eV hold {electrons:.4f} electrons (sectors {labels})"
+                    )
+
+                yield part, line
+
+    def start_spectrum_measure(self, levels, occupations, *, capacity: float = 1.0) -> float:
+        """The value test 1 compares with its tolerance: the largest ``w_k min(n, d - n)`` of the multiplets of
+        :meth:`start_spectrum_report`, 0 where there are none (for the report of the guard that passed)."""
+
+        return max((part for part, _ in self._start_multiplet_parts(levels, occupations, capacity)), default=0.0)
+
+    def density_symmetry_measure(self, densities, volume_element: float) -> float:
+        """Test 2 of the guard: the largest ``int |rho(g r) - rho(r)|`` (electrons) of the channel ``densities``
+        (whole grid) over the operations of :class:`SectorGuardGroup` (0 where there are none)."""
+
+        return max((value for _, value in self._asymmetries(densities, volume_element)), default=0.0)
+
+    def _asymmetries(self, densities, volume_element: float) -> list[tuple[str, float]]:
+        guarded = self.guarded_tasks()
+        if not guarded:
+            return []
+        group = self._plans[guarded[0]].guard_group
+        if group is None:
+            return []
+        found = []
+        for index, rows in group.images():
+            for channel, density in enumerate(densities):
+                values = np.asarray(density, dtype=np.float64)
+                deviation = float(volume_element * np.sum(np.abs(values[rows] - values)))
+                found.append((f"channel {channel + 1}, operation {group.operation_text(index)}", deviation))
+        return found
+
+    def density_symmetry_report(self, densities, volume_element: float, tolerance: float | None = None):
+        """Test 2 as a report (:class:`.spin_sectors.FractionalOccupations`), ``None`` below ``tolerance``
+        (:data:`.spin_sectors.DENSITY_SYMMETRY_TOLERANCE`)."""
+
+        from .spin_sectors import DENSITY_SYMMETRY_TOLERANCE, FractionalOccupations
+
+        tolerance = DENSITY_SYMMETRY_TOLERANCE if tolerance is None else float(tolerance)
+        found = self._asymmetries(densities, volume_element)
+        largest = max((value for _, value in found), default=0.0)
+        if largest < tolerance:
+            return None
+        return FractionalOccupations(
+            largest=largest,
+            tolerance=tolerance,
+            lines=tuple(
+                f"{label}: the density differs by {value:.4f} electrons from its image" for label, value in found
+                if value >= tolerance
+            ),
+            reason="a channel density that breaks the symmetry the k-point sectors assume",
+            measure="largest int |rho(g r) - rho(r)| (electrons)",
+        )
+
+    def fractional_report(self, levels, occupations, *, capacity: float = 1.0):
+        """Test 3 of the guard (Fermi-Dirac occupations, at the end of a loop): a level of a multiplet whose levels
+        lie in two or more sectors of a guarded task holds ``w_k min(f, 1 - f)`` of at least
+        :data:`.spin_sectors.SPIN_SECTOR_OCCUPATION_TOLERANCE` (:func:`.spin_sectors.fractional_occupations`), else
+        ``None``."""
+
+        from .spin_sectors import SPIN_SECTOR_OCCUPATION_TOLERANCE, FractionalOccupations
+
+        largest = 0.0
+        lines: list[str] = []
+        for part, line in self._fractional_parts(levels, occupations, capacity):
+            if part < SPIN_SECTOR_OCCUPATION_TOLERANCE:
+                continue
+            largest = max(largest, part)
+            lines.append(line())
+        if not lines:
+            return None
+        return FractionalOccupations(
+            largest=largest, tolerance=float(SPIN_SECTOR_OCCUPATION_TOLERANCE), lines=tuple(lines),
+            measure="largest w_k min(f, 1-f)",
+        )
+
+    def _fractional_parts(self, levels, occupations, capacity: float):
+        """``(w_k max min(f, 1 - f), line)`` of every multiplet of :meth:`fractional_report`, below its tolerance as
+        well; ``line()`` describes it."""
+
+        from .spin_sectors import MULTIPLET_WIDTH, _multiplets, sector_multiplets
+
+        for task in self.guarded_tasks():
+            values, filled, sectors = self._guard_levels(task, levels, occupations, capacity)
+            weight = self._task_weight(task)
+            fractional = weight * np.minimum(filled, 1.0 - filled)
+            groups = [group for group in _multiplets(values, MULTIPLET_WIDTH) if np.unique(sectors[group]).size >= 2]
+            exact = {tuple(group) for group in groups}
+            groups += [group for group in sector_multiplets(values, sectors) if tuple(group) not in exact]
+            for group in groups:
+                part = float(np.max(fractional[group]))
+
+                def line(task=task, weight=weight, group=group, values=values, filled=filled, sectors=sectors):
+                    text = " ".join(f"{values[member] * 13.605693122994:.4f}" for member in group)
+                    shares = " ".join(f"{filled[member]:.4f}" for member in group)
+                    labels = " ".join(str(int(sectors[member])) for member in group)
+                    return (
+                        f"task {task} (k-point weight {weight:.4g}): {len(group)} level(s) at {text} eV "
+                        f"(occupations {shares}; sectors {labels})"
+                    )
+
+                yield part, line
+
+    def fractional_measure(self, levels, occupations, *, capacity: float = 1.0) -> float:
+        """The value test 3 compares with its tolerance: the largest ``w_k min(f, 1 - f)`` of the multiplets of
+        :meth:`fractional_report`, 0 where there are none (for the report of the guard that passed)."""
+
+        return max((part for part, _ in self._fractional_parts(levels, occupations, capacity)), default=0.0)
+
     def _layout(self) -> list[tuple[int, int, int]]:
         return [(int(k), -1 if sector is None else int(sector), self._rows((k, sector))) for k, sector in self._items]
 
@@ -993,6 +1469,8 @@ class SectorKPointSolver:
                 "kpoint_sector_regrowths": float(self._regrowths),
                 "kpoint_sector_regrown_tasks": float(self._regrown_tasks),
                 "kpoint_sector_rebuilds": float(self._rebuilds),
+                "kpoint_sector_refit_states": float(self._refit_states),
+                "kpoint_sector_refit_sectors": float(len(self._trimmed)),
             }
         )
         return stats
@@ -1048,12 +1526,18 @@ __all__ = [
     "LittleGroupReduction",
     "PotentialInvariance",
     "SectorBlochHamiltonian",
+    "SectorGuardGroup",
     "SectorKPointSolver",
     "kpoint_sectors_setting",
     "generated_subgroup",
     "largest_commuting_involutions",
     "little_group_reduction",
     "plan_sectors",
+    "carried_state",
+    "refitted_count",
+    "sector_guard_setting",
     "sector_margin",
+    "sector_refit_setting",
     "sector_solver",
+    "trimmed_state",
 ]

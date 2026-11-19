@@ -110,6 +110,38 @@ class LittleGroupTests(unittest.TestCase):
                     self.assertEqual(int(table[index, other]), int(table[other, index]))
             self.assertEqual(sum(decomposition.sector_sizes), self.system.grid.size)
 
+    def test_the_orbits_take_one_map_at_a_time(self) -> None:
+        # little_group_reduction keeps the smallest image of every row, map by map (the 16 maps of the Gamma point of
+        # a 20^3 diamond cell held together were 6 GB): the orbits are those of all the maps at once, and no more
+        # than two maps are alive at any time (the running minimum and the map of the element at hand).
+        import gc
+        import weakref
+
+        from parsec_python.acceleration.Symmetry.axis_reflection import _orbit_labels
+
+        members = sectors.generated_subgroup(self.cell.table, self.cell.little_group(np.zeros(3), lambda index: True))
+        elements, generators = sectors.largest_commuting_involutions(self.cell.table, members)
+        self.assertEqual(len(elements), 16)
+        expected = _orbit_labels([self.cell.row_map(index) for index in elements])
+        alive, most = [], [0]
+        original = sectors.CellGroup.row_map
+
+        def counted(cell, index, rows=None, table=None):
+            gc.collect()
+            most[0] = max(most[0], sum(reference() is not None for reference in alive) + 1)
+            mapping = original(cell, index, rows, table)
+            alive.append(weakref.ref(mapping))
+            return mapping
+
+        with mock.patch.object(sectors.CellGroup, "row_map", counted):
+            reduction = sectors.little_group_reduction(self.cell, elements, generators)
+        self.assertEqual(len(alive), 16)
+        self.assertLessEqual(most[0], 2)
+        for got, want in zip(
+            (reduction.representative_rows, reduction.full_to_wedge, reduction.multiplicities), expected
+        ):
+            np.testing.assert_array_equal(got, want)
+
     def test_products_of_admitted_operations(self) -> None:
         # the subgroup that the operations about the origin (Td) and the translations generate holds their
         # products (the 96 operations of Td times the face-centring translations); one operation with a quarter

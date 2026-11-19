@@ -990,5 +990,27 @@ class FormerRouteSymmetryRowMapTests(SymmetryRowMapTests):
     fast_maps = "0"
 
 
+class MatchingTreeCacheTests(unittest.TestCase):
+    """The k-d trees kept across the operations of a detection (axis_reflection._matching_tree)."""
+
+    def test_a_kept_tree_does_not_follow_an_array_changed_after_it_was_built(self) -> None:
+        # a k-d tree refers to a contiguous float64 array unless it copies it: changing that array in place after the
+        # tree was kept would change the kept tree, found again under the key of the values it was built from
+        from parsec_python.acceleration.Symmetry import axis_reflection
+
+        points = np.random.default_rng(5).uniform(-4.0, 4.0, size=(321, 3))
+        original = points.copy()
+        for period in (None, np.array([8.0, 8.0, 8.0])):
+            with self.subTest(periodic=period is not None):
+                axis_reflection._MATCHING_TREES.clear()
+                axis_reflection._matching_tree(points, period)
+                points += 1.0e-3  # the caller reuses its array
+                tree = axis_reflection._matching_tree(original.copy(), period)
+                expected = original if period is None else axis_reflection._folded(original, period)
+                np.testing.assert_array_equal(np.asarray(tree.data), expected)
+                points[:] = original
+        axis_reflection._MATCHING_TREES.clear()
+
+
 if __name__ == "__main__":
     unittest.main()

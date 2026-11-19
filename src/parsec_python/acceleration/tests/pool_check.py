@@ -3,6 +3,7 @@
     python -m parsec_python.acceleration.tests.pool_check eigensolver METHOD SIZES STEPS [EXCHANGE_BYTES]
     python -m parsec_python.acceleration.tests.pool_check scf DRIVER RANKS POOLS
     python -m parsec_python.acceleration.tests.pool_check sectors RANKS POOLS
+    python -m parsec_python.acceleration.tests.pool_check guard RANKS SECTOR_POOLS PLAIN_POOLS
 
 Run it with ``OPENBLAS_NUM_THREADS=1`` (test_kpoint_pools.py does): the package imports NumPy before
 this module, so the settings below come too late for the BLAS of a ``-m`` run (:mod:`.thread_mpi`).  The
@@ -11,7 +12,8 @@ ranks of ``SIZES`` (``1,2,3``) with the one-device solver over ``STEPS`` solves;
 driver ``DRIVER`` of ``test_kpoint_parallel.DRIVERS`` on ``RANKS`` ranks in ``POOLS`` pools and in one
 process, with one task per k-point (``PARSEC_KPOINT_SECTORS=off``); ``sectors`` the scalar SCF of the silicon cube
 with the eight time-reversal invariant k-points split into the sectors of their little groups
-(:mod:`..SCF.kpoint_sectors`), the same on the pools and in one process.
+(:mod:`..SCF.kpoint_sectors`), the same on the pools and in one process; ``guard`` the spin-polarized loop that
+leaves the sectors of its k-points (the symmetry guard) and runs again on pools of another layout (:func:`check_guard`).
 """
 
 from __future__ import annotations
@@ -237,6 +239,91 @@ def check_forces(ranks: int, pools: int, sectors: str) -> dict:
     return {"serial": serial, "pooled": pooled}
 
 
+def check_guard(ranks: int, sector_pools: int, plain_pools: int) -> dict:
+    """The retry of the symmetry guard of the spin k-point sectors on pools of another layout, against one process.
+
+    Two O atoms of a periodic cube (the origin and the centre, spin-polarized, 3000 K) at the Gamma point and at X:
+    the loop in the sectors fails the guard after the start Hamiltonian and runs again with one task per k-point.
+    The sectors are solved on ``sector_pools`` pools of one rank, pool ``j`` holding the sectors of the k-points
+    ``k`` with ``k % sector_pools == j`` (each rank then caches the Bloch projectors of its own k-points, as the
+    pools of one rank of a 16-rank run that holds one sector each); the retry runs on ``plain_pools`` pools, whose
+    ranks build the projectors of a k-point together (the atoms dealt over them) where one of them lacks them.
+    """
+    import shutil
+    import warnings
+
+    from parsec_python.acceleration.SCF import kpoint_pools, kpoint_sectors
+    from parsec_python.acceleration.SCF.kpoint_pools import PoolPlan
+    from parsec_python.acceleration.SCF.kpoint_sectors import sector_solver
+    from parsec_python.acceleration.tests import thread_mpi
+    from parsec_python.acceleration.tests.test_kpoint_sector_guard import _oxygen
+    from parsec_python.models import SpinSectorFallbackRecord
+    from parsec_python.SCF.kpoints import run_scf_kpoints_spin_polarized
+    from parsec_python.SCF.pbc import prepare_periodic_single_point
+
+    os.environ["PARSEC_KPOINT_SECTORS"] = "auto"
+    os.environ["PARSEC_KPOINT_SECTOR_GUARD"] = "auto"
+    kpoint_sectors._MINIMUM_ENTRIES = 0
+    thread_mpi._TIMEOUT = 120.0  # ranks that disagree about a collective fail in minutes, not ten
+    directory, problem = _oxygen("3000", body_centre=True, criterion="1.0e-5", max_iter=60)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            system = prepare_periodic_single_point(problem)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    side = float(np.asarray(problem.periodic_cell.lattice_vectors)[0, 0])
+    k_points = np.array([np.zeros(3), np.pi / side * np.array([1.0, 0.0, 0.0])])
+    weights = np.array([0.5, 0.5])
+
+    def summary(found, records) -> dict:
+        notes = [record for record in records if isinstance(record, SpinSectorFallbackRecord)]
+        return dict(
+            _summary(found),
+            notes=[(note.stage, note.route) for note in notes],
+            abandoned=float(found.timings.detail.get("kpoint_sector_abandoned", 0.0)),
+        )
+
+    serial_records: list = []
+    serial = summary(
+        run_scf_kpoints_spin_polarized(system, k_points, weights, callback=serial_records.append), serial_records
+    )
+
+    def by_kpoint(sizes, n_ranks, *arguments, **keywords):
+        # the sectors of the k-points dealt by k-point over pools of one rank (planned on the root)
+        items = _LOCAL.sectors._items
+        assignment = tuple(
+            tuple(position for position, (task, _) in enumerate(items) if task % len(k_points) % sector_pools == pool)
+            for pool in range(sector_pools)
+        )
+        return PoolPlan(
+            pools=sector_pools, sizes=(1,) * sector_pools, tasks=len(items), bytes_per_rank=0, balance=1.0,
+            assignment=assignment,
+        )
+
+    def inner(job, **options):
+        return MPIPoolKPointSolver(job, context=_LOCAL.context, pools=sector_pools, **options)
+
+    def solver(job, **options):
+        made = sector_solver(job, inner, **options)
+        if made is None:
+            return MPIPoolKPointSolver(job, context=_LOCAL.context, pools=plain_pools, **options)
+        _LOCAL.sectors = made
+        return made
+
+    def rank(context):
+        _LOCAL.context = context
+        records: list = []
+        found = run_scf_kpoints_spin_polarized(system, k_points, weights, callback=records.append)
+        return summary(found, records)
+
+    with mock.patch("parsec_python.SCF.kpoints.make_kpoint_solver", solver), mock.patch.object(
+        kpoint_pools, "plan_pools_by_size", by_kpoint
+    ):
+        pooled = run_ranks(ranks, rank)
+    return {"serial": serial, "pooled": pooled}
+
+
 def check_projectors(ranks: int) -> dict:
     """The Bloch projectors built with the atoms dealt over a pool of ``ranks`` ranks against one build."""
     import scipy.sparse as sp
@@ -263,6 +350,8 @@ def check_projectors(ranks: int) -> dict:
             "error": float(difference.max()) if difference.nnz else 0.0,
             "labels": list(built.labels) == list(whole.labels),
             "signs": bool(np.array_equal(built.signs, whole.signs)),
+            # the decision of the pool to build: where the last rank lacks a k-point's projectors, and where none does
+            "any": [solver.pool_any(context.rank == ranks - 1), solver.pool_any(False)],
         }
 
     return {"ranks": run_ranks(ranks, rank)}
@@ -293,6 +382,8 @@ def main() -> None:
         payload = check_sectors(int(sys.argv[2]), int(sys.argv[3]))
     elif mode == "forces":
         payload = check_forces(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
+    elif mode == "guard":
+        payload = check_guard(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))
     elif mode == "projectors":
         payload = check_projectors(int(sys.argv[2]))
     else:

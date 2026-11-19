@@ -754,6 +754,7 @@ class MPIPoolKPointSolver:
             state = self.states.pop(task, None)
             self._release_cached()
             self._resident(state)
+            state = self._carried(state, requested, settings, operator)
             start = time.perf_counter()
             result = solve_column_eigval(
                 operator,
@@ -815,6 +816,31 @@ class MPIPoolKPointSolver:
             if getattr(self, "_kept", None) == task:
                 self._kept = None
         return True
+
+    def trim_tasks(self, counts: dict) -> bool:
+        """Fewer states for the tasks of ``counts`` (task -> states, each at most its present count), collective.
+
+        The pools keep the Ritz states: the next solve of such a task starts from its lowest Ritz pairs, laid out
+        again over the ranks of its pool (:func:`.kpoint_sectors.carried_state`).  Fewer states always fit the plan.
+        """
+        counts = {int(task): int(count) for task, count in counts.items()}
+        self.job = resized_job(self.job, counts)
+        return True
+
+    def _carried(self, state, requested: int, settings, operator):
+        """The state of a task for its solve of ``requested`` states: cut where the refit of the k-point sectors
+        gave it fewer (collective over the ranks of the pool, which solve the task together)."""
+        if state is None:
+            return None
+        from .kpoint_sectors import carried_state
+
+        dimension = int(operator.shape[0])
+        working = min(int(requested) + int(settings.safety_buffer), dimension)
+        if int(state.working_states) <= working:
+            return state
+        if self.group.size > 1 and isinstance(state.vectors, np.ndarray) and self.xp is not np:
+            state.vectors = self._device_vectors(state)  # the columns are laid out again on the devices
+        return carried_state(state, requested, settings, dimension, group=self.group)
 
     def _plan_holds(self, job) -> bool:
         """Whether the pools of :attr:`plan` hold the tasks of ``job`` (their new numbers of states)."""
@@ -1027,6 +1053,20 @@ class MPIPoolKPointSolver:
         result = np.asarray(_host(symmetric), dtype=np.float64)
         self._tick("symmetrize", start)
         return result, report
+
+    def pool_any(self, flag: bool) -> bool:
+        """Whether ``flag`` holds on some rank of this rank's pool (collective over the pool; the flag itself in a
+        pool of one rank and before the pools are formed).
+
+        The drivers decide with it whether a pool builds the Bloch projectors of a k-point (:meth:`projector_builder`
+        is collective over the pool): a projector cache that outlived an earlier plan of pools (the loop of the
+        symmetry guard's retry, a new inner solver of the sectors, the next loop of a hybrid) holds different
+        k-points on the ranks of one pool.
+        """
+        group = self.group
+        if group is None or group.size == 1 or self._pool_comm is None:
+            return bool(flag)
+        return any(bool(value) for value in self._pool_comm.allgather(bool(flag)))
 
     def projector_builder(self, grid, atoms, potentials, specifications, lattice_vectors=None, **keywords):
         """:func:`parsec_python.V_ion.build_nonlocal_projectors` with the atoms dealt over the ranks of the pool.

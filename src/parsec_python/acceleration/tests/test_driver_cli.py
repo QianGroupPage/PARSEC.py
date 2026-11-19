@@ -267,6 +267,37 @@ class PeriodicDriverTests(unittest.TestCase):
         for name in [name for name in os.environ if name.startswith("PARSEC_")]:
             del os.environ[name]
 
+    def test_a_deferred_periodic_laplacian_is_built_for_host_backends_and_kept_by_the_resident_cache(self) -> None:
+        # PARSEC_PERIODIC_DEFER_LAPLACIAN: the periodic preparation defers the matrix of a box; a host backend gets
+        # the matrix, and the view of a cached reference (the resident worker) keeps the periodic descriptor
+        from parsec_python.acceleration.Laplacian import (
+            DeferredPeriodicNegativeLaplacian,
+            periodic_negative_laplacian,
+        )
+        from parsec_python.Laplacian import build_negative_laplacian
+
+        for backend in ("scipy", "native"):
+            with self.subTest(backend=backend):
+                try:
+                    system = prepare_single_point(self.problem, backend=backend)
+                except driver_module.BackendUnavailableError:
+                    continue
+                matrix = system.reference.negative_laplacian
+                self.assertNotIsInstance(matrix, DeferredPeriodicNegativeLaplacian)
+                expected = build_negative_laplacian(system.reference.grid)
+                np.testing.assert_array_equal(matrix.toarray(), expected.toarray())
+        reference = driver_module.prepare_reference_periodic_single_point(
+            self.problem, negative_laplacian_builder=periodic_negative_laplacian
+        )
+        self.assertIsInstance(reference.negative_laplacian, DeferredPeriodicNegativeLaplacian)
+        view = driver_module._cached_reference_view(reference, cache_directory=None, lookup_seconds=0.25)
+        self.assertIsInstance(view.negative_laplacian, DeferredPeriodicNegativeLaplacian)
+        self.assertEqual(view.negative_laplacian.reference_static_cache_status, "hit")
+        self.assertFalse(view.negative_laplacian.materialized)
+        # the two descriptors share one matrix, whichever builds it
+        built = view.negative_laplacian.materialize()
+        self.assertIs(reference.negative_laplacian.materialize(), built)
+
     def test_periodic_cell_takes_the_reference_construction_and_its_own_hartree_solve(self) -> None:
         with (
             patch.object(
@@ -484,9 +515,13 @@ class PeriodicDriverTests(unittest.TestCase):
         other = (record[0], record[1], float(0.5).hex(), *record[3:])
         with self.assertRaisesRegex(ValueError, "periodic cell or the settings of its grid differ"):
             mpi_full_scf._require_same_domain([record, other])
-        moving = replace(translation, compute_forces=True)
-        with self.assertRaisesRegex(ValueError, "forces, relaxation and molecular dynamics of a periodic cell"):
-            mpi_full_scf._refuse_unsupported_periodic(moving)
+        # The forces and the moves of a cell on the default routines run there (test_mpi_periodic_sector_forces;
+        # molecular dynamics on one sector of the identity); a band structure of a cell does not.
+        mpi_full_scf._refuse_unsupported_periodic(replace(translation, compute_forces=True))
+        mpi_full_scf._refuse_unsupported_periodic(replace(translation, compute_forces=True, molecular_dynamics=object()))
+        bands = replace(translation, problem=replace(translation.problem, bands=object()))
+        with self.assertRaisesRegex(ValueError, "band structure .* of a periodic cell"):
+            mpi_full_scf._refuse_unsupported_periodic(bands)
         # The prepared grid of every rank is compared before the SCF.
         system = SimpleNamespace(grid=prepare_periodic_single_point(self.problem).grid)
         prepared = mpi_full_scf._prepared_cell_grid(system)

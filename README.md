@@ -1003,6 +1003,16 @@ density). Hybrids (their exchange sums over the full mesh), spinors and moving a
 weights, as before 8 November 2026, when every input with `.false.` did. Without `Use_Fortran_Routines` a shifted
 mesh still selects the Fortran-derived routines (above).
 
+A `Monkhorst_Pack_Grid` without a `Monkhorst_Pack_Shift` block (more than one point) is, since 18 November 2026,
+PARSEC 1.5's mesh: PARSEC reads `mpshift` from the block only, so without it the shift is zero, and it reduces
+every Monkhorst-Pack grid with `irrbz` (`init_var.F90:281-289`; the PARSEC 1.5 binary prints `shift = 0.0000 0.0000
+0.0000` and the same table as with a zero block). On either set of routines the input now runs exactly as with a
+zero `Monkhorst_Pack_Shift` block, the Gamma-centred mesh `(i-1)/n` reduced to its irreducible wedge with the
+density symmetrized (diamond and Si cubes: 4, 4 and 10 points for 2x2x2, 3x3x3 and 4x4x4), except that the missing
+block does not select the Fortran-derived routines. Before, such an input ran this port's own unreduced mesh
+`(2i-n-1)/(2n)` (points at +-1/4 and +-3/4 of a step for even `n`, no time reversal, no symmetrization), which
+`PARSEC_MP_UNSHIFTED_MESH=port` keeps; a mesh of one point is the Gamma point under both.
+
 A `Kpoint_List` of unequal weights of a bulk single point runs on the default routines with `.false.` (before 8
 November 2026 it went to the Fortran-derived routines by itself): every level is weighted by its point in the Fermi
 level, the density and the band energy, and the density is that of the listed points, as in PARSEC, whose

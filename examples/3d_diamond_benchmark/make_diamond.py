@@ -42,9 +42,14 @@ def main():
     parser.add_argument("--kmesh", type=int, nargs=3)
     parser.add_argument("--extra-states", type=int)
     parser.add_argument("--set", action="append", default=[], metavar="'KEYWORD: VALUE'")
+    parser.add_argument("--displace", type=float, nargs=3, metavar=("DX", "DY", "DZ"),
+                        help="move the atom at the origin by this vector (bohr): along (1, 1, 1) the structure keeps "
+                             "the six operations of C3v about it and has forces")
     args = parser.parse_args()
     n1, n2, n3 = args.n
     coords = atoms(n1, n2, n3)
+    if args.displace:
+        coords[0] = tuple(value + shift for value, shift in zip(coords[0], args.displace))
     occupied = 2 * len(coords)  # 4 valence electrons per carbon
     extra = args.extra_states if args.extra_states is not None else 6  # as the nanodiamond inputs
     lengths = [n * A_BOHR for n in (n1, n2, n3)]

@@ -609,7 +609,15 @@ class DevicePeriodicHartree:
             elif self.method == "fft":
                 # The eigenvalues of the circulant operator on the half spectrum of a real FFT: the transform of
                 # its first row, real for a symmetric stencil (Hartree.pbc.finite_difference_symbol).
-                row = np.asarray(sp.csr_matrix(negative_laplacian).getrow(0).toarray(), dtype=np.float64)
+                from ..Laplacian import DeferredNativeNegativeLaplacian, DeferredPeriodicNegativeLaplacian
+
+                if isinstance(negative_laplacian, DeferredPeriodicNegativeLaplacian):
+                    first = negative_laplacian.getrow(0)  # from the stencil: the matrix stays unbuilt
+                elif isinstance(negative_laplacian, DeferredNativeNegativeLaplacian):
+                    first = negative_laplacian.materialize().getrow(0)
+                else:
+                    first = sp.csr_matrix(negative_laplacian).getrow(0)
+                row = np.asarray(first.toarray(), dtype=np.float64)
                 symbol = cp.fft.rfftn(cp.asarray(row.reshape(self.shape))).real
                 magnitude = cp.abs(symbol)
                 largest = float(magnitude.max())
@@ -625,6 +633,10 @@ class DevicePeriodicHartree:
                 self.symbol = symbol
                 self.cg = None
             else:
+                from ..Laplacian import DeferredNativeNegativeLaplacian
+
+                if isinstance(negative_laplacian, DeferredNativeNegativeLaplacian):
+                    negative_laplacian = negative_laplacian.materialize()  # the CG applies the matrix
                 self.factor = None
                 self.cg = FusedConjugateGradient(cp, negative_laplacian, self.device_id, self.size)
 
@@ -804,8 +816,10 @@ def periodic_device_solver(grid, negative_laplacian, settings):
     if device_id is None:
         return None
     method = "g_space" if g_space else periodic_hartree_method()
+    # A deferred descriptor is keyed by the matrix cell that its views share (a resident process gives every
+    # calculation a view of its own), a matrix by itself.
     return _CACHE.get(
-        (grid, negative_laplacian),
+        (grid, getattr(negative_laplacian, "_memo", negative_laplacian)),
         (method, device_id),
         lambda: DevicePeriodicHartree(grid, negative_laplacian, device_id, g_space=g_space, method=method),
     )

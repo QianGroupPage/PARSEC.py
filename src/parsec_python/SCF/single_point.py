@@ -2413,6 +2413,8 @@ def run_scf(
     occupations = np.empty(0)
     representations = np.empty(0, dtype=np.int32)
     wavefunctions = np.empty((system.grid.size, 0))
+    # The lists of the record of the last iteration (_public_states).
+    public = None
     fermi_level = np.nan
     energies = None
     last_input_potential = input_potential.copy()
@@ -2501,6 +2503,18 @@ def run_scf(
         )
         if callable(release_previous_orbitals):
             release_previous_orbitals()
+        # The orbitals of the record of that iteration are a copy of them
+        # where the states have weights (_public_states), with the same
+        # sector views: released alike.  Kept, they held the basis of a
+        # sector that grows from a new start in this solve beside the new
+        # one (a 22^3 diamond cell on 16 A100 ran out of memory there).
+        release_public_orbitals = (
+            None
+            if public is None or public[3] is wavefunctions
+            else getattr(public[3], "release_intermediate_storage", None)
+        )
+        if callable(release_public_orbitals):
+            release_public_orbitals()
         if refining:
             # The loop converged at the iteration before: the same H[V_in]
             # until no level moves by more than level_tolerance.

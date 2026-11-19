@@ -107,8 +107,12 @@ class SelectionTests(unittest.TestCase):
         )
         for functional in ("pw92", "pw91", "lb94", "casida_salahub"):
             self.assertEqual([selected(functional, mode=mode) for mode in ("auto", "on", "off")], [True, True, False])
-        for mode in ("auto", "on", "off"):
-            self.assertFalse(selected("ca", mode=mode))
+        # CA-LSD kept the host up to 2026-11-18 (this test asserted it); PARSEC_PERIODIC_CA_XC=host is the way back
+        with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_CA_XC": "auto"}):
+            self.assertEqual([selected("ca", mode=mode) for mode in ("auto", "on", "off")], [True, True, False])
+        with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_CA_XC": "host"}):
+            for mode in ("auto", "on", "off"):
+                self.assertFalse(selected("ca", mode=mode))
         with mock.patch.dict(os.environ, {"PARSEC_CUPY_XC": ""}):
             self.assertFalse(selected("pbe"))
             self.assertTrue(device_xc.device_xc_selected("pbe", spin_polarized=True))
@@ -512,8 +516,11 @@ class DeviceSCFTests(unittest.TestCase):
                     self.assertEqual(operator.resident_device_bytes, resident)
 
     def test_ca_keeps_its_evaluator(self) -> None:
+        # A cluster never takes the device CA-LDA, whatever PARSEC_CUPY_XC says.  Its native C++ evaluator needs the
+        # native Hartree backend, which ``backend="cupy"`` does not select: the host functional on the full grid (the
+        # label named the C++ evaluator for this adapter up to 2026-11-18).
         _, label, _ = _solve(_xc_case("h2o_ca"), "on")
-        self.assertEqual(label, "cached C++/OpenMP float64 CA/PZ-LDA")
+        self.assertEqual(label, "vectorized NumPy CA/PZ-LDA")
 
     def test_spin_polarized_functionals(self) -> None:
         for name, mode, label in (

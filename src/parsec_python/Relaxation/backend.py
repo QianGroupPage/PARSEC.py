@@ -477,7 +477,9 @@ def periodic_backend(
     :func:`parsec_python.SCF.kpoints.run_scf_kpoints`, which keeps no eigenvectors, so its SCF step also accumulates
     the nonlocal force from them; without them the Gamma-point loop runs and the forces are built from its orbitals.
     The forces are those of :func:`parsec_python.Forces.compute_periodic_forces`: no symmetrization (the structure is
-    not reduced by space-group operations) and the net force removed, which is what Fortran does for a crystal.  The
+    not reduced by space-group operations) and the net force removed, which is what Fortran does for a crystal; on
+    the irreducible wedge of a mesh (``PARSEC_KPOINT_FORCE_WEDGE``) they are completed and averaged over its group,
+    which keeps the structure in it.  The
     k-point loops start their eigenproblems cold after a move; the Gamma loop carries its eigensubspace over.
     """
 

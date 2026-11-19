@@ -9,9 +9,10 @@ Start it on every rank (``srun -n R ... python run_mpi_kpoints.py ...``, one ran
 Usage (from the repository root, src on the python path):
     python examples/3d_diamond_benchmark/run_mpi_kpoints.py <n1> <n2> <n3> <work dir> [--kmesh K1 K2 K3]
         [--kpoints 'f1 f2 f3 w; ...'] [--set 'Keyword: value' ...] [--serial] [--pools P1,P2,...] [--sizes n,n,...]
-        [-- <further arguments of parsec_python.main>]
+        [--displace DX DY DZ] [-- <further arguments of parsec_python.main>]
 
-``--kpoints`` writes a Kpoint_List in reciprocal-lattice coordinates with weights (Kpoint_Method: manual),
+``--displace`` moves the atom at the origin by that vector in bohr (make_diamond.py): along (1, 1, 1) the structure
+keeps the six operations about it and has forces.  ``--kpoints`` writes a Kpoint_List in reciprocal-lattice coordinates with weights (Kpoint_Method: manual),
 e.g. the irreducible points of a Gamma-centred 2x2x2 mesh of a cubic cell: '0 0 0 1; 0.5 0 0 3; 0.5 0.5 0 3;
 0.5 0.5 0.5 1'.  ``--serial`` runs the same input in one process without MPI on one GPU (``--gpus 1``):
 the one-node k-point solver, the reference of the pools.  ``--pools 4,1`` runs the input once for each
@@ -73,6 +74,8 @@ def _write_input(args, work: Path) -> None:
         make += ["--kmesh", *map(str, args.kmesh)]
     for setting in args.set:
         make += ["--set", setting]
+    if args.displace:
+        make += ["--displace", *map(str, args.displace)]
     subprocess.run(make, check=True)
     if args.kpoints:
         rows = [row.split() for row in args.kpoints.split(";") if row.strip()]
@@ -97,6 +100,7 @@ def main() -> int:
     parser.add_argument("--serial", action="store_true")
     parser.add_argument("--pools")
     parser.add_argument("--sizes")
+    parser.add_argument("--displace", type=float, nargs=3)
     args = parser.parse_args(argv)
     rank, size = _rank_of_launch()
     root = Path(args.work).resolve()

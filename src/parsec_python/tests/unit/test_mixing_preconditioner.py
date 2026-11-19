@@ -224,8 +224,47 @@ class WrappedMixerTests(unittest.TestCase):
         mixed = mixer.mix(adapter.from_full(given), adapter.from_full(output), iteration=1)
         expected = given + 0.3 * KerkerPreconditioner(CUBIC, (6, 6, 6), 1.0).apply(output - given)
         np.testing.assert_allclose(adapter.to_full(mixed), expected, atol=1.0e-13)
-        with self.assertRaises(NotImplementedError):
-            preconditioned_mixer(AndersonMixer(settings), _System(grid, settings), adapter=adapter, channels=2)
+
+    def test_spin_channels_in_symmetry_sectors_filter_as_on_the_full_grid(self) -> None:
+        # The adapter of the spin sectors (SpinSectorReducer) on the orbits of the mirror x -> -x of a cubic cell:
+        # the joined orbit values of both channels mix to those of the full-grid mixer of two channels (before
+        # 2026-11-18 this combination was refused with NotImplementedError).
+        from types import SimpleNamespace
+
+        from parsec_python.acceleration.SCF.spin_sectors import SpinSectorReducer
+        from parsec_python.acceleration.SCF.symmetry_fields import SymmetrySCFReducer
+
+        shape = (6, 6, 6)
+        index = np.arange(216).reshape(shape)
+        mirrored = index[(-np.arange(6)) % 6, :, :]
+        representative = np.minimum(index, mirrored).reshape(-1)
+        wedge_points, full_to_wedge = np.unique(representative, return_inverse=True)
+        reduction = SimpleNamespace(full_size=216, wedge_size=wedge_points.size, full_to_wedge=full_to_wedge,
+                                    multiplicities=np.bincount(full_to_wedge).astype(np.int64))
+        adapter = SpinSectorReducer(SymmetrySCFReducer(reduction), hybrid=False)
+        settings = MixingSettings(preconditioner="kerker")
+        grid = _Grid(CUBIC, shape)
+        rng = np.random.default_rng(7)
+
+        def invariant():
+            values = rng.standard_normal(shape)
+            return (0.5 * (values + values[(-np.arange(6)) % 6, :, :])).reshape(-1)
+
+        given, output = [invariant(), invariant()], [invariant(), invariant()]
+        sectors = preconditioned_mixer(AndersonMixer(settings), _System(grid, settings), adapter=adapter, channels=2)
+        self.assertIsInstance(sectors, PreconditionedMixer)
+        mixed = sectors.mix(adapter.join_channels([adapter.from_full(field) for field in given]),
+                            adapter.join_channels([adapter.from_full(field) for field in output]), iteration=1)
+        full = preconditioned_mixer(AndersonMixer(settings), _System(grid, settings), channels=2)
+        expected = full.mix(np.concatenate(given), np.concatenate(output), iteration=1)
+        self.assertEqual(np.asarray(mixed).shape, (2 * reduction.wedge_size,))
+        np.testing.assert_allclose(np.concatenate([adapter.to_full(field) for field in adapter.split_channels(mixed)]),
+                                   expected, atol=1.0e-13)
+        # The charge part only: the magnetization residual passes unfiltered (times the mixing parameter).
+        up, down = adapter.split_channels(mixed)
+        magnetization = adapter.to_full(up) - adapter.to_full(down)
+        np.testing.assert_allclose(magnetization, (given[0] - given[1]) + 0.3 * ((output[0] - given[0])
+                                                                                - (output[1] - given[1])), atol=1.0e-13)
 
 
 class SettingsTests(unittest.TestCase):

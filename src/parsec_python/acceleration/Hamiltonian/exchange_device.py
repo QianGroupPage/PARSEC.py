@@ -369,6 +369,15 @@ def channel_orbitals(
                 "the exchange operator of a hybrid functional needs the orbitals of every "
                 "symmetry sector in this process (no MPI ranks)"
             )
+        if wavefunctions.point_group is not None:
+            # The sectors of a subgroup with weights (Symmetry.PointGroupReduction) hold one partner of a degenerate
+            # level; the pair densities need every partner of every occupied state.  A hybrid run keeps the abelian
+            # group (driver._orbital_group_refusal), so only orbitals of another run arrive here.
+            raise NotImplementedError(
+                "the exchange operator of a hybrid functional needs every partner of every occupied "
+                "level, which the weighted sectors of a point group do not hold (a hybrid run keeps "
+                "the abelian group of its structure)"
+            )
         for record in wavefunctions.sector_handovers or ():
             if record is not None and not getattr(record, "rotated", True):
                 raise NotImplementedError(

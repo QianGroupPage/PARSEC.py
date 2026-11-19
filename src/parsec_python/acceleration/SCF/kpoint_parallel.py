@@ -49,6 +49,7 @@ from parsec_python.SCF.kpoint_solver import (
 )
 
 from ..Eigensolvers.chebff_spinor import SpinorEigvalState, solve_spinor_eigval
+from .kpoint_sectors import carried_state
 from ..Parallel import WORKERS_ENV, make_pool, mpi
 
 SOLVER_ENV = "PARSEC_KPOINT_SOLVER"  # device (default) | host
@@ -176,6 +177,8 @@ class _SolveWorker:
         solve_start = time.perf_counter()
         state = self.states.pop(task, None)
         self.vectors.pop(task, None)  # release the previous basis before the next one is made
+        # a task whose states the refit of the k-point sectors cut keeps its lowest Ritz pairs (kpoint_sectors)
+        state = carried_state(state, requested, settings, int(operator.shape[0]))
         if state is not None and isinstance(state.vectors, np.ndarray) and backend.xp is not np:
             state.vectors = backend.asarray(state.vectors)  # a spilled subspace comes back
         elif (
@@ -263,7 +266,7 @@ class _SolveWorker:
                 operator,
                 task_states(self.job, task),
                 settings=settings,
-                state=self.states.get(task),
+                state=carried_state(self.states.get(task), task_states(self.job, task), settings, operator.shape[0]),
             )
             self._tick("solve", start)
             self.states[task] = solution.state
@@ -309,6 +312,12 @@ class _SolveWorker:
             if task in self.tasks:
                 self.states.pop(task, None)
                 self.vectors.pop(task, None)
+        yield None, None
+
+    def trim_tasks(self, counts: dict):
+        """Fewer states for some tasks (:meth:`PooledKPointSolver.trim_tasks`): their Ritz states are kept, and
+        their next solves take the lowest of them (:func:`.kpoint_sectors.carried_state`)."""
+        self.job = resized_job(self.job, counts)
         yield None, None
 
     def keep_device_states(self):
@@ -421,6 +430,15 @@ class PooledKPointSolver:
         counts = {int(task): int(count) for task, count in counts.items()}
         self.job = resized_job(self.job, counts)
         self.pool.results("resize_tasks", counts)
+        return True
+
+    def trim_tasks(self, counts: dict) -> bool:
+        """Fewer states for the tasks of ``counts`` (task -> states, each at most its present count): the workers
+        keep their Ritz states, and the next solve of each such task starts from its lowest Ritz pairs (the refit of
+        the k-point sectors).  ``True``: done."""
+        counts = {int(task): int(count) for task, count in counts.items()}
+        self.job = resized_job(self.job, counts)
+        self.pool.results("trim_tasks", counts)
         return True
 
     def accumulate(self, occupations: list[np.ndarray]) -> dict[str, np.ndarray]:

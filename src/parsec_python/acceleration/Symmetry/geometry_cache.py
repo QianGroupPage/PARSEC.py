@@ -279,6 +279,11 @@ def load_or_detect_reflection_reduction(
     # metadata is inspected.
     if not atoms:
         raise ValueError("axis-reflection detection requires at least one atom")
+    # A periodic grid the detector refuses is refused before a cache entry is read (a cell whose steps differ, cached
+    # under PARSEC_PERIODIC_UNEQUAL_STEPS=auto and run again with off).
+    from .axis_reflection import _lattice_period
+
+    _lattice_period(grid)
     # Hashing both full-grid coordinate arrays is needed only to address a
     # cache entry.
     key = None

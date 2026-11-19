@@ -616,7 +616,8 @@ class MPIShardGroup:
 
     owner = 0
 
-    def __init__(self, comm, operator, *, transport: str | None = None, ritz_route: str = "rows") -> None:
+    def __init__(self, comm, operator, *, transport: str | None = None, ritz_route: str = "rows",
+                 round_buffers: dict | None = None) -> None:
         self.comm = comm
         # The Ritz step where PARSEC_MPI_SHARED_RITZ is auto (shared_ritz_route).
         shared_ritz_route(ritz_route)
@@ -644,8 +645,9 @@ class MPIShardGroup:
         self.exchanged_bytes = 0
         # Ritz steps of the block route whose columns had no room for their row block (see _ritz_one_block).
         self.separate_row_blocks = 0
-        # The round buffers of the block route, kept from step to step (see _round_buffer).
-        self._buffers: dict = {}
+        # The round buffers of the block route, kept from step to step (see _round_buffer); the groups of the
+        # sectors that one rank solves one after another on its device may hand in one dict for all of them.
+        self._buffers: dict = {} if round_buffers is None else round_buffers
 
     # ----- the interface of SectorDeviceGroup ---------------------------
 
@@ -1665,14 +1667,17 @@ class MPIShardGroup:
         return target
 
 
-def attach_shared_group(operator, comm, *, ritz_route: str = "rows") -> MPIShardGroup:
+def attach_shared_group(operator, comm, *, ritz_route: str = "rows", round_buffers: dict | None = None) -> MPIShardGroup:
     """Give ``operator`` (this rank's replica of the shared sector) its group of ranks.
 
     ``ritz_route`` is the Ritz step of the group where ``PARSEC_MPI_SHARED_RITZ``
-    names none (:func:`shared_ritz_route`).
+    names none (:func:`shared_ritz_route`).  ``round_buffers``: a dict that the
+    groups of several sectors solved one after another on this rank's device
+    share for their round buffers (one set instead of one per sector); ``None``
+    gives the group its own.
     """
 
-    group = MPIShardGroup(comm, operator, ritz_route=ritz_route)
+    group = MPIShardGroup(comm, operator, ritz_route=ritz_route, round_buffers=round_buffers)
     operator._mpi_shared_group = group
     return group
 

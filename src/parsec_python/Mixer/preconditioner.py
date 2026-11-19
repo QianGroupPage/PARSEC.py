@@ -255,7 +255,16 @@ class PreconditionedMixer:
     (module docstring).  ``adapter`` is the SCF loop's scalar-field adapter
     of a symmetry-reduced loop (``to_full``/``from_full``, e.g. the identity
     sector of a periodic cell): the residual is filtered on the full grid and
-    the shifted output handed back in the loop's own representation.
+    the shifted output handed back in the loop's own representation.  With
+    two spin channels the adapter is that of the spin sectors
+    (:class:`parsec_python.acceleration.SCF.spin_sectors.SpinSectorReducer`):
+    the mixer is given both channels' orbit values end to end, which
+    ``split_channels`` parts, each channel goes to the full grid by
+    ``to_full``, the charge part is filtered there, and each channel comes
+    back by ``from_full`` and ``join_channels``.  The filter is a function
+    of ``|G|`` and so maps a field invariant under the point group to an
+    invariant one: the orbit average of ``from_full`` changes it by
+    rounding only.
     Everything else (``reset``, the safeguard counters, ``settings``) is the
     inner mixer's.
     """
@@ -273,6 +282,20 @@ class PreconditionedMixer:
             given = xp.asarray(input_potential, dtype=xp.float64)
             residual = xp.asarray(output_potential, dtype=xp.float64) - given
             return given + self.preconditioner.apply(residual, self.channels)
+        if self.channels == 2:
+            given = np.concatenate([
+                np.asarray(self.adapter.to_full(values), dtype=np.float64)
+                for values in self.adapter.split_channels(input_potential)
+            ])
+            residual = np.concatenate([
+                np.asarray(self.adapter.to_full(values), dtype=np.float64)
+                for values in self.adapter.split_channels(output_potential)
+            ]) - given
+            shifted = given + self.preconditioner.apply(residual, 2)
+            size = self.preconditioner.size
+            return self.adapter.join_channels(
+                [self.adapter.from_full(shifted[:size]), self.adapter.from_full(shifted[size:])]
+            )
         given = np.asarray(self.adapter.to_full(input_potential), dtype=np.float64)
         residual = np.asarray(self.adapter.to_full(output_potential), dtype=np.float64) - given
         return self.adapter.from_full(given + self.preconditioner.apply(residual, self.channels))
@@ -300,18 +323,15 @@ def preconditioned_mixer(mixer, system, *, adapter=None, channels: int = 1):
 
     ``system`` supplies the mixing settings (``system.input.mixing``) and the
     grid; ``adapter`` is the loop's scalar-field adapter (``None`` for full-grid
-    fields), ``channels`` 1, or 2 for the joined spin channels of a full-grid
-    loop.  A loop without the preconditioner keeps its mixer object, so its
-    arithmetic is unchanged.
+    fields), ``channels`` 1, or 2 for the joined spin channels of a loop (on
+    the full grid, or in the symmetry sectors through an adapter that also
+    splits and joins the channels).  A loop without the preconditioner keeps
+    its mixer object, so its arithmetic is unchanged.
     """
 
     settings = system.input.mixing
     if getattr(settings, "preconditioner", "none") == "none":
         return mixer
-    if channels == 2 and adapter is not None:
-        raise NotImplementedError(
-            "Mixing_Preconditioner: kerker is not implemented for spin channels in symmetry sectors"
-        )
     preconditioner = KerkerPreconditioner.for_grid(
         system.grid, settings.kerker_wavevector, settings.kerker_dielectric_constant
     )

@@ -112,5 +112,59 @@ class PeriodicPointGroupSCFTests(unittest.TestCase):
         self.assertEqual(details["detected_symmetry_group_order"], "1")
 
 
+def displaced_silicon(distance: float = 0.04):
+    """:func:`silicon` with the four neighbours of the atom at the origin moved ``distance`` bohr outward along their
+    bonds: Td about the origin stays, the face-centring translations go, and the atoms have forces."""
+
+    problem = silicon("pbe")
+    lattice = np.asarray(problem.periodic_cell.lattice_vectors, dtype=np.float64)
+    side = np.diag(lattice)
+    atoms = []
+    for atom in problem.atoms:
+        position = np.asarray(atom.position, dtype=np.float64)
+        bond = position - side * np.round(position / side)  # from the atom at the origin, nearest image
+        if 0.0 < np.linalg.norm(bond) < 0.5 * side[0] * np.sqrt(3.0) / 2.0 + 1.0e-6 and np.allclose(
+            np.abs(bond), np.abs(bond[0])
+        ):
+            position = position + distance * bond / np.linalg.norm(bond)
+        atoms.append(Atom(atom.symbol, tuple(position)))
+    return replace(problem, atoms=tuple(atoms))
+
+
+@unittest.skipUnless(cupy_available() and native_available(), "CUDA runtime or native extension is unavailable")
+class PeriodicSectorForceTests(unittest.TestCase):
+    """Forces of a cell solved in the sectors of its point group (weighted representations) against the full grid."""
+
+    def test_forces_in_the_sectors_of_a_cell_equal_those_of_the_full_grid(self) -> None:
+        from parsec_python.acceleration.Forces.sector_symmetry import sector_force_operations, sector_reduction
+        from parsec_python.Forces.symmetry import symmetrize_forces
+
+        problem = displaced_silicon()
+        moved = sum(
+            1 for a, b in zip(silicon("pbe").atoms, problem.atoms) if not np.array_equal(a.position, b.position)
+        )
+        self.assertEqual(moved, 4)
+        tables, groups = {}, {}
+        for setting in ("auto", "off"):
+            with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_SYMMETRY": setting}), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                system = driver.prepare_single_point(problem, backend="cupy")
+                system.materialize_final_wavefunctions = False
+                reduction = sector_reduction(system)
+                if setting == "auto":
+                    self.assertIsNotNone(reduction, "the cell was not solved in the sectors of a point group")
+                    self.assertTrue(np.any(np.asarray(reduction.sector_weights) > 1))
+                    groups[setting] = sector_force_operations(system)
+                result = driver.run_scf(system)
+                self.assertTrue(result.converged)
+                tables[setting] = driver.compute_forces(system, result, symmetrize=False)
+        sectors, full = tables["auto"], tables["off"]
+        self.assertEqual(len(groups["auto"]), 24)  # Td about the origin
+        self.assertGreater(float(np.abs(full.total).max()), 1.0e-3)
+        np.testing.assert_allclose(sectors.nonlocal_pseudopotential, full.nonlocal_pseudopotential, rtol=0, atol=2e-6)
+        np.testing.assert_allclose(sectors.total, full.total, rtol=0, atol=2e-6)
+        np.testing.assert_allclose(symmetrize_forces(sectors.total, groups["auto"]), sectors.total, rtol=0, atol=1e-12)
+
+
 if __name__ == "__main__":
     unittest.main()

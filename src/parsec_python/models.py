@@ -2551,6 +2551,10 @@ class SpinSectorFallbackRecord:
     # atoms``) and the quantity ``largest_fractional_occupation`` holds.
     reason: str = "fractional occupations"
     measure: str = "largest min(f, 1-f)"
+    # ``spin``: the sectors of a cluster (Spin_Symmetry_Sectors), the run starts again on the full grid;
+    # ``kpoint``: the sectors of the k-points of a periodic loop (PARSEC_KPOINT_SECTOR_GUARD), the loop starts
+    # again with one task per k-point.
+    route: str = "spin"
 
 
 @dataclass(frozen=True)

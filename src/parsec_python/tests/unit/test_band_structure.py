@@ -230,6 +230,10 @@ class BandInputTests(unittest.TestCase):
             self._parse(_PATH, periodic=False)
 
 
+# The former unreduced Monkhorst-Pack mesh of an input without Monkhorst_Pack_Shift (points at +-1/4 for even n),
+# which these checks were written on: PARSEC_MP_UNSHIFTED_MESH=port (the default is PARSEC 1.5's zero shift since
+# 2026-11-18, tests/unit/test_mp_unshifted_mesh.py).
+@mock.patch.dict(os.environ, {"PARSEC_MP_UNSHIFTED_MESH": "port"})
 class BandStructureRunTests(unittest.TestCase):
     def _run(self, *, so_psp: str, extra: str = "", states: int = 20, bands: str = _PATH):
         with tempfile.TemporaryDirectory() as tmp:

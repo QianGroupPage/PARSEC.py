@@ -261,6 +261,7 @@ def build_double_grid_projector_gradients(
     specifications: Mapping[str, SpeciesPotential],
     *,
     order: int | None = None,
+    atom_indices: Sequence[int] | None = None,
 ):
     """Projector gradients averaged over the double grid.
 
@@ -270,17 +271,30 @@ def build_double_grid_projector_gradients(
     adds its weight times ``w(|d|) grad Y + w'(|d|) Y d/|d|`` with ``|d|``
     clamped below to the first radial sample.  Columns, rows and labels are
     those of :func:`build_double_grid_projectors` before the cut of zero
-    values, as in the readable builder.
+    values, as in the readable builder.  ``atom_indices`` builds the columns
+    of those atoms only, in the order given and labelled with their index in
+    ``atoms`` (the columns of the whole build, bit for bit); ``None`` builds
+    every atom.
     """
 
     from parsec_python.Forces import NonlocalProjectorGradients
-    from parsec_python.Forces.nonlocal_force import real_harmonics_with_gradients
+    from parsec_python.Forces.nonlocal_force import (
+        _selected_atoms,
+        real_harmonics_with_gradients,
+    )
     from parsec_python.Pseudopotential.radial_derivatives import spline_derivative
 
     order = double_grid_order(grid) if order is None else int(order)
     displacements, fine_weights = double_grid_points(order, float(grid.spacing))
     sqrt_dv = np.sqrt(grid.volume_element)
-    tables = _channel_tables(atoms, potentials, specifications, grid, slopes=True)
+    selected = _selected_atoms(atoms, atom_indices)
+    tables = _channel_tables(
+        atoms if atom_indices is None else [atoms[index] for index in selected],
+        potentials,
+        specifications,
+        grid,
+        slopes=True,
+    )
 
     def atom_columns(atom_index: int) -> list:
         """``(rows, (points, 3) gradients, sign, label)`` of every column of one atom."""
@@ -326,7 +340,11 @@ def build_double_grid_projector_gradients(
                 )
         return columns
 
-    columns = [column for block in _map_atoms(atom_columns, len(atoms)) for column in block]
+    columns = [
+        column
+        for block in _map_atoms(lambda position: atom_columns(selected[position]), len(selected))
+        for column in block
+    ]
     indptr = np.zeros(len(columns) + 1, dtype=np.int64)
     rows = np.empty(0, dtype=np.int64)
     if columns:
@@ -357,21 +375,27 @@ def build_projector_gradients(
     atoms: Sequence[Atom],
     potentials: Mapping[str, ParsecPseudopotential],
     specifications: Mapping[str, SpeciesPotential],
+    *,
+    atom_indices: Sequence[int] | None = None,
 ):
     """Projector gradients of an isolated system on its grid.
 
     The double-grid gradients of :func:`build_double_grid_projector_gradients`
     for ``Double_Grid_Order > 1``; otherwise the readable
     :func:`parsec_python.Forces.build_nonlocal_projector_gradients`, unchanged.
+    ``atom_indices`` builds those atoms only (the representatives of the
+    orbits of symmetry sectors); ``None`` every atom.
     """
 
     if double_grid_order(grid) > 1:
         return build_double_grid_projector_gradients(
-            grid, atoms, potentials, specifications
+            grid, atoms, potentials, specifications, atom_indices=atom_indices
         )
     from parsec_python.Forces import build_nonlocal_projector_gradients
 
-    return build_nonlocal_projector_gradients(grid, atoms, potentials, specifications)
+    return build_nonlocal_projector_gradients(
+        grid, atoms, potentials, specifications, atom_indices=atom_indices
+    )
 
 
 __all__ = [

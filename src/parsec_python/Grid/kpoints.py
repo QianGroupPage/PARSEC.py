@@ -2,24 +2,29 @@
 
 Three sources are supported:
 
-* this port's uniform, unreduced Monkhorst-Pack grid
-  (:func:`monkhorst_pack_grid`, fractions ``(2i-n-1)/(2n)``, equal weights),
-  used by a ``Kpoint_Method: mp`` input without a ``Monkhorst_Pack_Shift``
-  block;
 * Fortran PARSEC's grid ``k = ((i-1) + s_i)/n_i`` reduced to the irreducible
   wedge by the space group and time reversal
-  (:func:`irreducible_monkhorst_pack`, ``irrbz.f90``), used by an input that
-  gives ``Monkhorst_Pack_Shift``: unequal weights ``count/N``;
+  (:func:`irreducible_monkhorst_pack`, ``irrbz.f90``): unequal weights
+  ``count/N``.  An input that gives ``Monkhorst_Pack_Shift`` takes its
+  shift; one without the block takes ``s = 0`` (the Gamma-centred mesh), as
+  PARSEC 1.5 does: ``usrinputfile.F90:976-994`` then leaves ``mpshift`` at
+  its static zero and ``init_var.F90:281-289`` calls ``irrbz`` for every
+  Monkhorst-Pack input (:func:`unshifted_mesh_setting`, since 2026-11-18;
+  a mesh of one point stays the Gamma point of the input);
+* this port's former uniform, unreduced Monkhorst-Pack grid
+  (:func:`monkhorst_pack_grid`, fractions ``(2i-n-1)/(2n)``, equal weights),
+  which an input without a ``Monkhorst_Pack_Shift`` block takes with
+  ``PARSEC_MP_UNSHIFTED_MESH=port`` (every such input before 2026-11-18);
 * a user-supplied explicit list (:func:`explicit_kpoints`,
   :func:`read_kpoint_file`, Fortran's ``Kpoint_Method: manual``), whose
   weights are normalized to one as ``init_var.F90`` does.
 
-For odd ``n`` the first grid equals Fortran's with ``s = 0`` modulo
-reciprocal lattice vectors, for even ``n`` Fortran's with ``s = 0.5``; Fortran
-without a shift block uses ``s = 0`` (Gamma-centred) for every ``n``.  The
+For odd ``n`` the former grid equals Fortran's with ``s = 0`` modulo
+reciprocal lattice vectors, for even ``n`` Fortran's with ``s = 0.5``.  The
 finite-difference Bloch Hamiltonian is not exactly periodic in ``k``, so
 equivalent points give slightly different eigenvalues; the Fortran path keeps
-Fortran's representatives.
+Fortran's representatives (folded into ``(-1/2, 1/2]``,
+:func:`fold_to_centered_zone`).
 
 Equal weights keep the scalar-``degeneracy`` Fermi-level pooling of the SCF
 drivers (``degeneracy = 2*weight``); unequal weights use the per-state
@@ -587,7 +592,8 @@ def kpoint_sampling_details(problem) -> MonkhorstPackSampling | None:
     """The Fortran-path sampling of a ``SinglePointInput``, or ``None``.
 
     Only an input with ``monkhorst_pack_shift`` (PARSEC's
-    ``Monkhorst_Pack_Shift`` block) takes it: the grid of
+    ``Monkhorst_Pack_Shift`` block, or zero for a ``Monkhorst_Pack_Grid``
+    without it, :func:`unshifted_mesh_setting`) takes it: the grid of
     ``monkhorst_pack_dimensions`` with that shift, reduced by the input's
     ``space_group`` (the identity where it is ``None``, e.g. with
     ``Ignore_Symmetry``) and by time reversal unless the calculation is
@@ -664,6 +670,46 @@ def kpoint_time_reversal_setting() -> str:
     return value
 
 
+MP_UNSHIFTED_MESH_ENV = "PARSEC_MP_UNSHIFTED_MESH"
+
+
+def unshifted_mesh_setting() -> str:
+    """``PARSEC_MP_UNSHIFTED_MESH``: the mesh of a ``Monkhorst_Pack_Grid`` without a ``Monkhorst_Pack_Shift`` block.
+
+    ``fortran`` (default, since 2026-11-18): PARSEC 1.5's, the Gamma-centred grid ``k = (i-1)/n`` reduced to its
+    irreducible wedge exactly as a zero ``Monkhorst_Pack_Shift`` is, on either set of routines (the space group
+    and time reversal of ``irrbz``, the density symmetrized, ``Symmetrize_Charge_Density`` true by default), without
+    choosing the Fortran-derived routines as the block does; ``port``: this port's former unreduced grid
+    ``(2i-n-1)/(2n)`` of equal weights (:func:`monkhorst_pack_grid`), bit for bit.  A mesh of one point
+    (``1 1 1``) is the Gamma point under both."""
+
+    import os
+
+    value = os.environ.get(MP_UNSHIFTED_MESH_ENV, "fortran").strip().lower() or "fortran"
+    if value not in ("fortran", "port"):
+        raise ValueError(f"{MP_UNSHIFTED_MESH_ENV} must be fortran or port, got {value!r}")
+    return value
+
+
+KPOINT_FORCE_WEDGE_ENV = "PARSEC_KPOINT_FORCE_WEDGE"
+
+
+def kpoint_force_wedge_setting() -> str:
+    """``PARSEC_KPOINT_FORCE_WEDGE``: ``auto`` (default, since 2026-11-18) lets the forces and the relaxation of a
+    bulk cell on the default routines run the irreducible wedge of a Monkhorst-Pack mesh, as Fortran's routines and a
+    single point do: the space group that maps the grid onto itself reduces the mesh and symmetrizes the density, the
+    nonlocal forces of the wedge are completed over it and the forces averaged over it (``symm_forces.f90``), so the
+    structure keeps the group; ``off`` keeps the whole mesh (its time-reversal pairs), as before.  Molecular dynamics
+    and ``manual`` movements keep the whole mesh either way (PARSEC uses no symmetry for them)."""
+
+    import os
+
+    value = os.environ.get(KPOINT_FORCE_WEDGE_ENV, "auto").strip().lower() or "auto"
+    if value not in ("auto", "off"):
+        raise ValueError(f"{KPOINT_FORCE_WEDGE_ENV} must be auto or off, got {value!r}")
+    return value
+
+
 def time_reversal_reduced(k_points, weights, lattice_vectors) -> tuple[np.ndarray, np.ndarray]:
     """The representatives of a uniform mesh of equal weights under time reversal (``k ~ -k``).
 
@@ -696,9 +742,11 @@ def kpoint_sampling(problem) -> tuple[np.ndarray, np.ndarray] | None:
     """``(k_points, weights)`` requested by a ``SinglePointInput``, or ``None``.
 
     An explicit list (``problem.kpoints``), Fortran's reduced grid
-    (``problem.monkhorst_pack_shift`` given, :func:`kpoint_sampling_details`)
-    or this port's unreduced Monkhorst-Pack grid
-    (``problem.monkhorst_pack_dimensions``); ``None`` means Gamma only.  For a
+    (``problem.monkhorst_pack_shift`` given, :func:`kpoint_sampling_details`;
+    also the zero shift of a mesh without a ``Monkhorst_Pack_Shift`` block)
+    or this port's former unreduced Monkhorst-Pack grid
+    (``problem.monkhorst_pack_dimensions`` alone: a mesh of one point, or
+    ``PARSEC_MP_UNSHIFTED_MESH=port``); ``None`` means Gamma only.  For a
     hybrid functional the port's grid and a list of equal weights are reduced
     by time reversal (:func:`time_reversal_reduced`) and Fortran's grid by
     time reversal only; the exchange checks that the set is a uniform mesh
@@ -735,6 +783,7 @@ __all__ = [
     "fold_to_centered_zone",
     "irreducible_monkhorst_pack",
     "kpoint_sampling",
+    "kpoint_force_wedge_setting",
     "kpoint_sampling_details",
     "kpoint_time_reversal_setting",
     "mesh_preserving_operations",
@@ -742,4 +791,5 @@ __all__ = [
     "read_kpoint_file",
     "time_reversal_reduced",
     "translate01",
+    "unshifted_mesh_setting",
 ]

@@ -403,9 +403,12 @@ class AcceleratedRunTests(unittest.TestCase):
                 float(accelerated["energy_total_ry"]), float(reference["energy_total_ry"]), delta=1.0e-7
             )
             occupied = np.asarray(reference["occupations"]) > 1.0e-6
+            # The weighted sectors of a point group (the D4h of H2 on the z axis, since 2026-11-18 by default) list
+            # every partner of their last multiplet, past States_Num: its lowest levels are those of the full grid.
+            levels = np.sort(accelerated["eigenvalues_ry"])
+            self.assertGreaterEqual(levels.size, occupied.size)
             self.assertLess(
-                np.max(np.abs(np.sort(accelerated["eigenvalues_ry"])[occupied]
-                              - np.sort(reference["eigenvalues_ry"])[occupied])),
+                np.max(np.abs(levels[: occupied.size][occupied] - np.sort(reference["eigenvalues_ry"])[occupied])),
                 1.0e-6,
             )
             if forces:

@@ -15,11 +15,12 @@ functionals on the device instead:
                                 correction of the density gradient
 ``pbe``, ``pw91``               GGA energy and the potential of the
                                 discrete energy (``pbe.py``)
+``ca`` (periodic cells only)    pointwise, one value per symmetry orbit
 ==============================  =======================================
 
 and the spin-polarized forms of ``pw92``, ``lb94``, ``casida_salahub``,
-``pbe`` and ``pw91`` that :func:`parsec_python.SCF.run_spin_scf` evaluates
-(``evaluate_spin_xc``).
+``pbe``, ``pw91`` and (periodic cells) ``ca`` that
+:func:`parsec_python.SCF.run_spin_scf` evaluates (``evaluate_spin_xc``).
 
 The discretization is that of the readable functionals, not a new one.  The
 density gradient is ``D n`` of :func:`parsec_python.V_xc.pbe.density_gradient`
@@ -52,7 +53,20 @@ onto the other.  No full-grid field is formed, on the device or the host.
 * ``off``: the host for every functional, as before this module (PBE as up
   to 2026-10-30).
 
-CA-LDA keeps its own path in every case.
+CA-LDA, the default functional, keeps its own path in a cluster (the native
+C++ evaluator on the wedge, :mod:`.native_ca_lda`, whatever ``PARSEC_CUPY_XC``
+says).  A periodic cell has no native evaluator (its Hartree backend is never
+``native``) and evaluated CA-LDA with NumPy on the host over the full grid at
+every SCF step, on every periodic route, until 2026-11-18 (about 3.4 s per
+step for the 46.7 M points of a diamond cell of 20^3 cubes).  Since then the
+device evaluates it (:func:`periodic_device_xc_selected`): on the orbits of
+the sectors of a Gamma cell (one value per orbit, as the other LDAs), on the
+full grid of the k-point drivers (:mod:`.periodic_xc`), the unpolarized form
+``ca_lda`` and both spin forms (``ca_lda_spin`` of ``evaluate_spin_xc``,
+``ca_lda_spin_polarized`` of ``evaluate_xc_spin_polarized``), each a
+line-by-line translation of the NumPy one, the host's numbers to round-off.
+``PARSEC_PERIODIC_CA_XC=host`` (or ``PARSEC_CUPY_XC=off``) keeps the host
+functional, as before.
 
 Memory: an evaluator keeps a value map and stencil signs per box point and
 a position and multiplicity per value on its device, and takes about a
@@ -86,12 +100,17 @@ DEVICE_XC_FUNCTIONALS = frozenset(
         "casida_salahub",
         "pbe",
         "pw91",
+        "ca",
     }
 )
 #: Functionals this module evaluates with spin polarization.
 DEVICE_SPIN_XC_FUNCTIONALS = frozenset(
-    {"pw92", "lb94", "casida_salahub", "pbe", "pw91"}
+    {"pw92", "lb94", "casida_salahub", "pbe", "pw91", "ca"}
 )
+#: Functionals this module evaluates for periodic cells only
+#: (:func:`periodic_device_xc_selected`): CA-LDA, whose clusters keep the
+#: native C++ evaluator (:func:`device_xc_selected` never selects it).
+PERIODIC_ONLY_XC_FUNCTIONALS = frozenset({"ca"})
 #: Functionals on the device unless ``PARSEC_CUPY_XC=off``: those added for
 #: parity with Fortran PARSEC, which had no accelerated path before, and PBE
 #: (since 2026-10-30; the host before).
@@ -114,7 +133,9 @@ _LDA_KERNELS = {
     "xalpha": "lda_xalpha",
     "wigner": "lda_wigner",
     "hedin_lundqvist": "lda_hedin_lundqvist",
+    "ca": "lda_ca",
 }
+_SPIN_LDA_KERNELS = {"pw92": "lda_spin_pw92", "ca": "lda_spin_ca"}
 _KERNEL_NAMES = (
     "xc_gradient",
     "xc_adjoint",
@@ -127,6 +148,8 @@ _KERNEL_NAMES = (
     "lda_wigner",
     "lda_hedin_lundqvist",
     "lda_spin_pw92",
+    "lda_ca",
+    "lda_spin_ca",
     "lb_unpolarized",
     "lb_spin",
 )
@@ -152,13 +175,50 @@ def device_xc_mode() -> str:
 def device_xc_selected(
     functional: str, *, spin_polarized: bool = False, mode: str | None = None
 ) -> bool:
-    """Whether ``functional`` runs on the device under ``mode``."""
+    """Whether ``functional`` runs on the device under ``mode``.
+
+    The rule of every grid; CA-LDA (:data:`PERIODIC_ONLY_XC_FUNCTIONALS`) is
+    never selected here: a cluster keeps its native evaluator, and a periodic
+    cell asks :func:`periodic_device_xc_selected`.
+    """
 
     mode = device_xc_mode() if mode is None else mode
     available = DEVICE_SPIN_XC_FUNCTIONALS if spin_polarized else DEVICE_XC_FUNCTIONALS
-    if mode == "off" or functional not in available:
+    if mode == "off" or functional not in available or functional in PERIODIC_ONLY_XC_FUNCTIONALS:
         return False
     return mode == "on" or functional in DEFAULT_DEVICE_XC_FUNCTIONALS
+
+
+def periodic_ca_xc_mode() -> str:
+    """``PARSEC_PERIODIC_CA_XC``: ``auto`` (unset or empty) or ``host``.
+
+    ``auto``: CA-LDA of a periodic cell on the device wherever the other
+    functionals of its route are (:func:`periodic_device_xc_selected`);
+    ``host``: the NumPy functional on the full grid, as up to 2026-11-18.
+    """
+
+    raw = os.environ.get("PARSEC_PERIODIC_CA_XC", "auto").strip().lower()
+    if raw in {"", "auto", "on", "device"}:
+        return "auto"
+    if raw in {"host", "off", "0", "false", "no"}:
+        return "host"
+    raise ValueError("PARSEC_PERIODIC_CA_XC must be auto or host")
+
+
+def periodic_device_xc_selected(
+    functional: str, *, spin_polarized: bool = False, mode: str | None = None
+) -> bool:
+    """Whether a periodic cell evaluates ``functional`` on the device under ``mode`` (``PARSEC_CUPY_XC``).
+
+    :func:`device_xc_selected`, and CA-LDA (both spin forms too) unless
+    ``PARSEC_PERIODIC_CA_XC=host`` or ``PARSEC_CUPY_XC=off``.  The grid and
+    the device are the caller's to check (:func:`device_grid_supported`).
+    """
+
+    mode = device_xc_mode() if mode is None else mode
+    if functional in PERIODIC_ONLY_XC_FUNCTIONALS:
+        return mode != "off" and periodic_ca_xc_mode() == "auto"
+    return device_xc_selected(functional, spin_polarized=spin_polarized, mode=mode)
 
 
 def device_grid_supported(grid) -> bool:
@@ -172,9 +232,10 @@ def device_grid_supported(grid) -> bool:
         grid, "is_confined_periodic", False
     ):
         return False
-    if _is_periodic(grid) and not getattr(grid, "is_orthorhombic", True):
-        # A grid of Andrew Grieder's routines with oblique or unequal steps, or his slab: the gradients carry the
-        # metric of the cell (V_xc.pbe._oblique_mix), which these kernels do not.
+    if _is_periodic(grid) and not getattr(grid, "is_orthorhombic", True) and not _unequal_steps(grid):
+        # A grid of Andrew Grieder's routines with oblique steps, or his slab: the gradients carry the metric of the
+        # cell (V_xc.pbe._oblique_mix), which these kernels do not.  A cell with its sides along the axes whose steps
+        # differ takes a row of weights per axis (_StencilGeometry; PARSEC_PERIODIC_UNEQUAL_STEPS=off: the host).
         return False
     shape = tuple(int(value) for value in getattr(grid, "shape", ()))
     if len(shape) != 3 or int(np.prod(shape)) >= 2**31:
@@ -188,6 +249,18 @@ def device_grid_supported(grid) -> bool:
 def _is_periodic(grid) -> bool:
     # As parsec_python.V_xc.pbe._is_periodic.
     return hasattr(grid, "cell") and hasattr(grid, "points_per_axis")
+
+
+def _unequal_steps(grid) -> bool:
+    """A bulk cell with its sides along the axes whose steps differ, under ``PARSEC_PERIODIC_UNEQUAL_STEPS=auto``
+    (:func:`parsec_python.acceleration.Symmetry.axis_reflection.unequal_step_grid`): the kernels take its gradient
+    with a step per axis (``V_xc.pbe`` differentiates it with the metric of its diagonal lattice)."""
+
+    if not _is_periodic(grid):
+        return False
+    from ..Symmetry.axis_reflection import periodic_unequal_steps_setting, unequal_step_grid
+
+    return unequal_step_grid(grid) and periodic_unequal_steps_setting() == "auto"
 
 
 def _display_name(functional: str) -> str:
@@ -289,7 +362,7 @@ def kernel_names(functional: str, *, spin_polarized: bool) -> tuple[str, ...]:
         return ("xc_gradient", "xc_adjoint", prefix + functional)
     if functional in _GRADIENT_FUNCTIONALS:
         return ("xc_gradient", "lb_spin" if spin_polarized else "lb_unpolarized")
-    return ("lda_spin_pw92",) if spin_polarized else (_LDA_KERNELS[functional],)
+    return (_SPIN_LDA_KERNELS[functional],) if spin_polarized else (_LDA_KERNELS[functional],)
 
 
 def _kernels(cp, device_id: int, names: tuple[str, ...] = _KERNEL_NAMES) -> dict[str, object]:
@@ -456,8 +529,18 @@ class _StencilGeometry:
         self.width = int(grid.settings.expansion_order) // 2
         weights = first_derivative_coefficients(grid.settings.expansion_order)
         # pbe.py _derivative_stencil: the weights in 1/bohr; the transpose
-        # correlates with their negatives.
-        weights = weights / grid.spacing
+        # correlates with their negatives.  A periodic cell whose steps differ
+        # between the axes (unequal_step_grid): a row per axis, weights / h_a
+        # (V_xc.pbe._oblique_mix of a diagonal lattice, the steps applied to
+        # every weight instead of the sum), the kernels reading row a at
+        # a * axis_stride.
+        self.axis_stride = 0
+        if _unequal_steps(grid):
+            steps = np.diag(np.asarray(grid.step_vectors, dtype=np.float64))
+            weights = np.ascontiguousarray(weights[None, :] / steps[:, None])
+            self.axis_stride = int(weights.shape[1])
+        else:
+            weights = weights / grid.spacing
         self.weights = cp.asarray(weights)
         self.negated_weights = cp.asarray(-weights)
         self.flips = None
@@ -533,6 +616,7 @@ class _StencilGeometry:
             np.int32(n2),
             np.int32(1 if self.periodic else 0),
             np.int32(self.width),
+            np.int32(self.axis_stride),
         )
 
     def gradient(self, cp, kernels, values):
@@ -596,6 +680,11 @@ class _DeviceEvaluatorBase:
         )
         if functional not in available:
             raise ValueError(f"no device evaluator for the {functional} functional")
+        if functional in PERIODIC_ONLY_XC_FUNCTIONALS and not _is_periodic(grid):
+            raise ValueError(
+                f"the device evaluates the {functional} functional of periodic cells only "
+                "(a cluster has the native evaluator)"
+            )
         if not device_grid_supported(grid):
             raise ValueError("the device XC evaluators need a cluster or orthorhombic grid")
         cp, _ = require_cupy()
@@ -807,6 +896,9 @@ class DeviceSpinXCEvaluator(_DeviceEvaluatorBase):
     #: (``evaluate_spin_xc``), or ``"ab"``, :func:`parsec_python.V_xc.pbe.pbe_spin_polarized` in the variables
     #: ``s_ab = D n_a . D n_b`` (``evaluate_xc_spin_polarized`` of the periodic spin drivers): its formula on the
     #: device with forward derivatives in place of the complex step (:mod:`.dual`), the same partials to round-off.
+    #: The form of CA-LDA: :func:`parsec_python.V_xc.ca_lda_spin.ca_lda_spin` (``evaluate_spin_xc``) unless
+    #: ``"spin_polarized"``, :func:`parsec_python.V_xc.ca_lda.ca_lda_spin_polarized` (``evaluate_xc_spin_polarized``
+    #: of the periodic spin drivers: the same formula in other operations, and no refusal of a negative channel).
     form = "pbe_spin"
     #: points of one pass of the ``"ab"`` form (its temporaries are a few dozen fields of this length)
     ab_chunk = 1 << 20
@@ -826,9 +918,12 @@ class DeviceSpinXCEvaluator(_DeviceEvaluatorBase):
                 half = 0.5 * core
                 up = up + half
                 down = down + half
-            message = f"{name} requires nonnegative spin densities"
-            self._check(up, message)
-            self._check(down, message)
+            polarized_ca = functional == "ca" and self.form == "spin_polarized"
+            if not polarized_ca:
+                # (ca_lda_spin_polarized refuses no density: it takes a channel below zero as empty.)
+                message = f"{name} requires nonnegative spin densities"
+                self._check(up, message)
+                self._check(down, message)
             up = cp.maximum(up, 0.0)
             down = cp.maximum(down, 0.0)
             count = self.size
@@ -836,7 +931,18 @@ class DeviceSpinXCEvaluator(_DeviceEvaluatorBase):
             potential_down = cp.empty(count, dtype=np.float64)
             energy_density = cp.empty(count, dtype=np.float64)
             kernels = self._kernels
-            if functional == "pw92":
+            if functional == "ca":
+                _launch(
+                    kernels["lda_spin_ca"],
+                    count,
+                    up,
+                    down,
+                    np.int32(1 if polarized_ca else 0),
+                    potential_up,
+                    potential_down,
+                    energy_density,
+                )
+            elif functional == "pw92":
                 _launch(
                     kernels["lda_spin_pw92"],
                     count,
@@ -995,9 +1101,11 @@ def accelerated_xc_evaluators(
     """The device evaluators the accelerated driver uses, ``(unpolarized, spin)``.
 
     Each is ``None`` where the host keeps the functional: another backend
-    than CuPy, CA-LDA, a functional ``PARSEC_CUPY_XC`` leaves on the host, or
-    a grid this module does not handle.  ``core_density`` returns the frozen
-    core density of the present structure (default: that of ``reference``).
+    than CuPy, CA-LDA of a cluster (the driver's native evaluator), a
+    functional ``PARSEC_CUPY_XC`` (or, for CA-LDA of a periodic cell,
+    ``PARSEC_PERIODIC_CA_XC``) leaves on the host, or a grid this module does
+    not handle.  ``core_density`` returns the frozen core density of the
+    present structure (default: that of ``reference``).
     """
 
     scf = getattr(getattr(reference, "input", None), "scf", None)
@@ -1041,14 +1149,16 @@ def accelerated_xc_evaluators(
             unpolarized = None if unpolarized is None else ZeroAverageXC(unpolarized)
             spin_evaluator = None if spin_evaluator is None else ZeroAverageXC(spin_evaluator)
         return unpolarized, spin_evaluator
+    # A periodic cell takes CA-LDA too (it has no native evaluator).
+    selected = periodic_device_xc_selected if _is_periodic(grid) else device_xc_selected
     if spin:
         # The loop of two channels evaluates the spin functional only; on the
         # orbits where the channels are solved in the symmetry sectors.
-        if not device_xc_selected(functional, spin_polarized=True):
+        if not selected(functional, spin_polarized=True):
             return None, None
         evaluator = DeviceSpinXCEvaluator(functional, grid, reducer=reducer, **keywords)
         return None, (ZeroAverageXC(evaluator) if zero_average else evaluator)
-    if not device_xc_selected(functional):
+    if not selected(functional):
         return None, None
     evaluator = DeviceXCEvaluator(functional, grid, reducer=reducer, **keywords)
     return (ZeroAverageXC(evaluator) if zero_average else evaluator), None
@@ -1110,4 +1220,7 @@ __all__ = [
     "device_xc_selected",
     "evaluation_fields",
     "kernel_source",
+    "PERIODIC_ONLY_XC_FUNCTIONALS",
+    "periodic_ca_xc_mode",
+    "periodic_device_xc_selected",
 ]

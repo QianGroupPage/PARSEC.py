@@ -613,8 +613,10 @@ class PeriodicSpinXCTests(unittest.TestCase):
     def test_ca_pbe_and_spinors_keep_the_host(self) -> None:
         from parsec_python.acceleration.V_xc import periodic_xc
 
-        with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "auto"}):
+        # CA-LSD took the device on 2026-11-18 (test_periodic_ca_device); PARSEC_PERIODIC_CA_XC=host keeps the host
+        with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "auto", "PARSEC_PERIODIC_CA_XC": "host"}):
             self.assertIsNone(periodic_xc.device_spin_evaluator(self.system("ca")))
+        with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "auto"}):
             pbe = self.system("pb")
             self.assertIsNone(periodic_xc.device_spin_evaluator(pbe))
         with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "on"}):

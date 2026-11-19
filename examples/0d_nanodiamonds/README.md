@@ -25,9 +25,15 @@ All inputs share the following settings:
 - **Occupations:** Fermi-Dirac at 500 K.
 - **SCF:** converged to a residual of 2e-4 Ry.
 
-Every cluster has the twofold rotations about the x, y and z axes (the group
-D2), so the code splits the eigenproblem into four independent symmetry
-sectors. Geometries:
+Every cluster has the point group Td about its central carbon (24 signed
+permutations of the axes). PARSEC splits the eigenproblem into the four
+sectors of its abelian subgroup D2 (the twofold rotations about the x, y and
+z axes), and so did this code when the reference outputs of both folders
+were made. Since 15 November 2026 this code solves by default the four
+weighted one-dimensional sectors of D2d instead, about a quarter of the basis
+of D2 (`PARSEC_ORBITAL_GROUP=abelian` keeps the D2 route; "Weighted sectors of
+a larger subgroup" in `src/parsec_python/acceleration/README.md`). The total
+energies of the two routes differ within the SCF criterion. Geometries:
 
 - k00 to k07 are GFN2-xTB optimized;
 - k08 to k14 are cut from the ideal diamond lattice, terminated with hydrogen
@@ -87,12 +93,29 @@ It checks these at the start, and `--check` prints the commands without
 running them; `--help` lists every option. Each line of the table looks like:
 
 ```text
-  k06 C795H300: ok, 10 steps (reference 10), E = -9437.81996163 Ry (difference 0.0e+00), 9.0 s (A100 9.0), peak 4.2 GiB (A100 4.2)
+  k06 C795H300: ok, 10 steps (reference 10), E = -9437.81996163 Ry (difference 0.0e+00, ok within 1e-05), 9.0 s (A100 9.0), peak 4.2 GiB (A100 4.2)
 ```
 
-A run whose total energy is within 1e-5 Ry of the reference is reported as
-`ok`. The A100 columns hold the reference for the same total number of GPUs,
-blank where the case did not fit on that many 80 GB GPUs.
+The references were made on the D2 route of the code of their date, and the
+default route of the code is now the weighted D2d sectors (above), whose
+total energies differ from those of D2 by up to 1.3e-4 Ry at the SCF
+criterion of 2e-4 Ry of these inputs. A run on the default route is therefore
+reported as `ok` when its total energy lies within the
+`Convergence_Criterion` of its input (2e-4 Ry) of the reference; its times
+and memory peaks are lower than the A100 columns (k14 on 16 A100: 63.6
+against 207.5 s and 20.5 against 59.7 GiB, measured on 15 November 2026), and
+the number of SCF steps can differ. `--abelian` runs the route of the
+references (`PARSEC_ORBITAL_GROUP=abelian`) and reports `ok` within 1e-5 Ry;
+its times compare with the A100 columns (the line above is a run of that
+route, on the code of 5 November 2026). With the code of 19 November 2026,
+k06 of `gpu_benchmark/` on the four A100 of one node (`--launcher main`) gave
+the reference energy to the printed digits with `--abelian` and 5.3e-6 Ry
+below it on the default route, both in 10 steps; on a laptop GPU (RTX 5070)
+k01 and k02 of the Fortran set gave the reference energies with `--abelian`,
+and k01 on the default route 7.1e-7 Ry above its reference in 10 steps
+instead of 16. The
+A100 columns hold the reference for the same total number of GPUs, blank
+where the case did not fit on that many 80 GB GPUs.
 
 Before the table, the smallest case of the set runs once on the same GPUs.
 That run compiles the CUDA kernels into CuPy's cache, as the warm-up runs
@@ -112,8 +135,9 @@ python src/parsec_python/main.py \
     --pp-dir examples/0d_nanodiamonds --device gpu --gpus 1 --no-archive
 ```
 
-One process places the four symmetry sectors on up to four GPUs (`--gpus 2`
-or `--gpus 4`) with the code's default settings. The times in the tables
+One process places the four symmetry sectors (of D2d by default, of D2 on the
+route of the references) on up to four GPUs (`--gpus 2` or `--gpus 4`) with
+the code's default settings. The times in the tables
 below were measured with `scripts/run_multi_gpu_scf.sh`, which applies the
 measured launch settings and runs one MPI rank per node. On 8 and 16 GPUs the
 GPUs of a node share the basis of a sector. Runner options such as `--pp-dir`
@@ -229,17 +253,21 @@ Notes:
   of k05 did not converge within 70 steps. The Fortran references of k05 and
   k06 therefore use Anderson mixing 0.20, a restart every 5 steps and up to 100
   steps.
-- **What to expect on other hardware.** A correct run should reproduce the
-  total energy to about 1e-6 Ry. The number of SCF steps can differ by one or
-  two, and by more for the slowly converging k05 and k06 of the Fortran
-  comparison. Times are of a first calculation of each structure (no symmetry
+- **What to expect on other hardware.** A correct run on the route of the
+  references (`PARSEC_ORBITAL_GROUP=abelian`, `run_benchmark.sh --abelian`)
+  should reproduce the total energy to about 1e-6 Ry; on the default route of
+  weighted D2d sectors, to within the SCF criterion of 2e-4 Ry (up to 1.3e-4
+  Ry). The number of SCF steps can differ by one or two, and by more for the
+  slowly converging k05 and k06 of the Fortran comparison and on the default
+  route. Times are of a first calculation of each structure (no symmetry
   cache) in double precision. Program time runs from the end of input parsing
   to the final report and includes CUDA initialization.
 - **Version of the benchmark references.** The times and memory peaks of the
   two GPU tables, the references of `run_benchmark.sh`, the total energies in
   the table and the `gpu_benchmark/` outputs (the runs on 16 GPUs) come from
   the series of 5 November 2026: inputs with `FF_MaxIter: 3` and
-  `Chebyshev_Degree_Decrease_After` at its default 4. A case takes the same
+  `Chebyshev_Degree_Decrease_After` at its default 4, the orbitals in the four
+  sectors of D2 (the default of that date). A case takes the same
   number of SCF steps at every GPU count, with total energies within 1e-10 Ry
   of each other. Against the series of 23 October 2026 (`FF_MaxIter: 4`,
   `Chebyshev_Degree_Decrease_After` 5) the first eigensolve is 24 to 36 %

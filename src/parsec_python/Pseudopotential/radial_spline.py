@@ -23,7 +23,37 @@ from dataclasses import dataclass
 import numpy as np
 
 
+#: The second derivatives of tables already solved, by the bytes of the table and the end slopes.  The recurrence below
+#: is a Python loop over the ~1,650 radial points (2.3 ms); a cell asks for the same few tables once per atom (992
+#: splines of 5 tables for the projector gradients of 192 atoms of LLZO, 2.3 s of the 4.6 s they took), and the answer is
+#: a function of the table alone.
+_SECOND_DERIVATIVES: dict[tuple[bytes, bytes, float, float], np.ndarray] = {}
+_SECOND_DERIVATIVES_LIMIT = 4096
+
+
 def _clamped_second_derivatives(
+    knots: np.ndarray,
+    values: np.ndarray,
+    left_slope: float = 0.0,
+    right_slope: float = 0.0,
+) -> np.ndarray:
+    """Return Numerical Recipes spline second derivatives (a copy of the stored result for a table seen before)."""
+    key = (
+        np.ascontiguousarray(knots, dtype=float).tobytes(),
+        np.ascontiguousarray(values, dtype=float).tobytes(),
+        float(left_slope),
+        float(right_slope),
+    )
+    found = _SECOND_DERIVATIVES.get(key)
+    if found is None:
+        found = _solve_second_derivatives(knots, values, left_slope, right_slope)
+        if len(_SECOND_DERIVATIVES) >= _SECOND_DERIVATIVES_LIMIT:
+            _SECOND_DERIVATIVES.clear()
+        _SECOND_DERIVATIVES[key] = found
+    return found.copy()
+
+
+def _solve_second_derivatives(
     knots: np.ndarray,
     values: np.ndarray,
     left_slope: float = 0.0,

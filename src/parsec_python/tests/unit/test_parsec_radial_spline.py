@@ -188,5 +188,40 @@ class ParsecRadialSplineTests(unittest.TestCase):
         self.assertGreater(abs(actual - unclamped), 5.0e-15)
 
 
+class SecondDerivativeCacheTests(unittest.TestCase):
+    """The second derivatives of a table seen before come from the store, equal to a fresh solve, and not shared."""
+
+    def _table(self, seed: int):
+        rng = np.random.default_rng(seed)
+        radii = np.cumsum(rng.uniform(0.01, 0.2, size=60)) + 0.01
+        return radii, rng.normal(size=60)
+
+    def test_the_stored_answer_equals_a_fresh_solve(self) -> None:
+        from parsec_python.Pseudopotential import radial_spline as module
+
+        radii, values = self._table(0)
+        first = ParsecRadialSpline.from_positive_grid(radii, values, 4)
+        again = ParsecRadialSpline.from_positive_grid(radii, values, 4)
+        fresh = module._solve_second_derivatives(first.knots, first.values)
+        np.testing.assert_array_equal(first.second_derivatives, fresh)
+        np.testing.assert_array_equal(again.second_derivatives, fresh)
+
+    def test_changing_one_spline_does_not_change_the_next(self) -> None:
+        radii, values = self._table(1)
+        first = ParsecRadialSpline.from_positive_grid(radii, values, 4)
+        expected = first.second_derivatives.copy()
+        first.second_derivatives[:] = 0.0
+        again = ParsecRadialSpline.from_positive_grid(radii, values, 4)
+        np.testing.assert_array_equal(again.second_derivatives, expected)
+
+    def test_another_table_or_padding_gets_its_own_answer(self) -> None:
+        radii, values = self._table(2)
+        one = ParsecRadialSpline.from_positive_grid(radii, values, 4)
+        shifted = ParsecRadialSpline.from_positive_grid(radii, values + 1.0e-3, 4)
+        wider = ParsecRadialSpline.from_positive_grid(radii, values, 6)
+        self.assertFalse(np.array_equal(one.second_derivatives, shifted.second_derivatives))
+        self.assertNotEqual(one.second_derivatives.size, wider.second_derivatives.size)
+
+
 if __name__ == "__main__":
     unittest.main()

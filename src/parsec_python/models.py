@@ -2288,6 +2288,11 @@ class SinglePointInput:
     """Sampling weights for ``kpoints`` (non-negative, normalized to sum 1 as
     PARSEC's ``init_var`` does; equal if omitted).  Unequal weights use the
     per-state weights of the Fermi level (Fortran ``flevel``)."""
+    kpoint_time_reversal: bool = False
+    """Whether the SCF runs the pairs ``k``, ``-k`` of the equal-weight mesh ``kpoints`` (one point of each with
+    twice the weight, :func:`~parsec_python.Grid.kpoints.time_reversal_reduced`): set by the input reader for the
+    whole mesh that forces and moving atoms of scalar or collinear-spin orbitals keep
+    (``PARSEC_KPOINT_TIME_REVERSAL``)."""
     bands: BandStructureSettings | None = None
     """Non-self-consistent band structure to compute after the SCF (periodic
     systems only); see :class:`BandStructureSettings`."""
@@ -2556,6 +2561,10 @@ class SpinSectorFallbackRecord:
     # atoms``) and the quantity ``largest_fractional_occupation`` holds.
     reason: str = "fractional occupations"
     measure: str = "largest min(f, 1-f)"
+    # ``spin``: the sectors of a cluster (Spin_Symmetry_Sectors), the run starts again on the full grid;
+    # ``kpoint``: the sectors of the k-points of a periodic loop (PARSEC_KPOINT_SECTOR_GUARD), the loop starts
+    # again with one task per k-point.
+    route: str = "spin"
 
 
 @dataclass(frozen=True)
@@ -2906,6 +2915,11 @@ class SinglePointResult:
     """A hybrid functional: the :class:`parsec_python.SCF.hybrid.FockLoopSummary` of the Fock
     loop (its outer iterations and what an ionic step needs to start the next structure);
     ``None`` otherwise.  ``xc_potential`` is then the semilocal part only."""
+    sector_states: tuple | None = None
+    """Symmetry sectors of a subgroup of the point group with weights (acceleration/Symmetry/orbital_groups.py):
+    ``(representations, occupations, weights)`` of the states that the sectors solved, one per state, the
+    occupations times the weights.  ``eigenvalues``, ``occupations``, ``representations`` and the columns of
+    ``wavefunctions`` list every partner of a weighted state as the full grid does.  ``None`` otherwise."""
     meta_gga: object | None = None
     """A meta-GGA: the :class:`parsec_python.SCF.meta_gga.MetaGGARecord` of the loop (``vtau`` of the
     last eigenproblem, the mixed ``vtau`` a next structure starts from, ``tau``); ``None`` otherwise.

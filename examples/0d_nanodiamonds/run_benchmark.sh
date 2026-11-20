@@ -26,6 +26,9 @@
 #                       the set runs once first, on the same GPUs, outside the
 #                       table: it compiles the CUDA kernels into CuPy's cache,
 #                       as the warm-up runs before the reference times did
+#   --abelian           run the route of the references, the four sectors of
+#                       D2 (PARSEC_ORBITAL_GROUP=abelian), and report ok within
+#                       1e-5 Ry of them (see "The verdict" below)
 #   --check             check the environment, print the commands, run nothing
 #
 # Examples:
@@ -55,9 +58,21 @@
 # many 80 GB GPUs. For fortran_comparison/ the reference is the
 # run of parsec_reference.out (main.py, one A100). Program time is the line
 # "Total accelerated Python wall time" of parsec.out: from the end of input
-# parsing to the final report, CUDA initialization included. A total energy
-# within 1e-5 Ry of the reference is reported as ok; a correct run is usually
-# within 1e-6 Ry.
+# parsing to the final report, CUDA initialization included.
+#
+# The verdict. The references were made on the abelian route: the orbitals in
+# the four sectors of D2 (gpu_benchmark/ on 5 November, fortran_comparison/ on
+# 14 October 2026). Since 15 November 2026 the code solves these Td clusters by
+# default in the weighted one-dimensional sectors of D2d, about a quarter of
+# the basis of D2, and its total energies differ from those of the D2 route
+# within the SCF criterion (up to 1.3e-4 Ry at the 2e-4 Ry of these inputs).
+# A run on the default route is therefore reported as ok when its total energy
+# lies within the Convergence_Criterion of its input of the reference; its
+# times and memory peaks are lower than the A100 columns (k14 on 16 A100:
+# 207.5 -> 63.6 s and 59.7 -> 20.5 GiB at the fullest GPU, 15 November 2026).
+# --abelian runs the route of the references and reports ok within 1e-5 Ry;
+# such a run is usually within 1e-6 Ry of them, and its times compare with the
+# A100 columns.
 set -euo pipefail
 
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed -e '$d' -e 's/^# \{0,1\}//'; }
@@ -75,6 +90,7 @@ set_dir=gpu_benchmark
 out=
 check=0
 warmup=1
+abelian=0
 cases=()
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -91,6 +107,7 @@ while [[ $# -gt 0 ]]; do
             shift 2;;
         --fortran-set) set_dir=fortran_comparison; shift;;
         --no-warmup) warmup=0; shift;;
+        --abelian) abelian=1; shift;;
         --check) check=1; shift;;
         -h|--help) usage; exit 0;;
         -*) fail "unknown option $1 (see --help)";;
@@ -124,6 +141,7 @@ done
 
 # The environment.
 export PYTHONPATH="$repo/src${PYTHONPATH:+:$PYTHONPATH}"
+if [[ $abelian == 1 ]]; then export PARSEC_ORBITAL_GROUP=abelian; fi
 "$python" - "$launcher" <<'EOF' || fail 'the Python environment is not complete (see above and the repository README)'
 import sys
 missing = []
@@ -163,14 +181,20 @@ else
     out=$(CDPATH= cd -- "$out" && pwd)
 fi
 summary=$out/summary.csv
-[[ $check == 1 || -f $summary ]] || echo 'case,formula,launcher,gpus,status,scf_steps,reference_steps,total_energy_ry,energy_difference_ry,program_s,a100_program_s,peak_gpu_gib,a100_peak_gpu_gib' > "$summary"
+[[ $check == 1 || -f $summary ]] || echo 'case,formula,launcher,gpus,status,scf_steps,reference_steps,total_energy_ry,energy_difference_ry,energy_tolerance_ry,program_s,a100_program_s,peak_gpu_gib,a100_peak_gpu_gib' > "$summary"
 echo "Runs: $out ($launcher, $nodes node(s) x $gpus GPU(s), cases: $(for folder in "${folders[@]}"; do basename "$folder"; done | tr '\n' ' '))"
+if [[ $abelian == 1 ]]; then
+    echo "Route: the four sectors of D2 of the references (PARSEC_ORBITAL_GROUP=abelian); ok within 1e-5 Ry"
+else
+    echo "Route: the code's default (weighted sectors of D2d); ok within the Convergence_Criterion of the input"
+fi
 
 compare() {  # compare <case folder> <run folder> <exit status>
-    "$python" - "$1" "$2" "$3" "$launcher" "$total" "$summary" <<'EOF'
+    "$python" - "$1" "$2" "$3" "$launcher" "$total" "$summary" "$abelian" <<'EOF'
 import csv, json, re, sys
 from pathlib import Path
 case_folder, run, status, launcher, total, summary = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4], int(sys.argv[5]), sys.argv[6]
+abelian = sys.argv[7] == '1'
 # A100-SXM4-80GB, code of 5 November 2026 (FF_MaxIter 3): "GPUs:program seconds:peak GiB of the fullest GPU"
 A100 = {
     'k06': '1:18.8:11.2 2:12.2:6.5 4:9.0:4.2 8:5.9:2.6 16:4.9:1.7',
@@ -188,8 +212,16 @@ def energies(path):
 def seconds(path):
     found = re.findall(r'Total accelerated Python wall time \[sec\] :\s+([0-9.]+)', path.read_text(errors='replace')) if path.exists() else []
     return float(found[-1]) if found else None
+def criterion(path):
+    # Convergence_Criterion of the input in Ry (PARSEC's unit where none is given); 1e-5 Ry where it is missing
+    found = re.search(r'^\s*Convergence_Criterion\s*[:=]?\s*([-+0-9.eEdD]+)\s*([A-Za-z]*)', path.read_text(errors='replace'), re.M | re.I)
+    if not found:
+        return 1e-5
+    value = float(found.group(1).replace('d', 'e').replace('D', 'e'))
+    return value * {'ev': 1 / 13.605693122994, 'hartree': 2.0, 'ha': 2.0}.get(found.group(2).lower(), 1.0)
 case, formula = case_folder.name.split('_', 1)
 reference = case_folder / 'parsec_reference.out'
+tolerance = 1e-5 if abelian else criterion(case_folder / 'parsec.in')
 ours = run / 'parsec.out'
 reference_energies, our_energies = energies(reference), energies(ours)
 peak = None
@@ -213,17 +245,17 @@ energy = our_energies[-1] if our_energies else None
 difference = energy - reference_energies[-1] if energy is not None and reference_energies else None
 if status != 0 or energy is None:
     verdict = 'FAILED'
-elif abs(difference) <= 1e-5:
+elif abs(difference) <= tolerance:
     verdict = 'ok'
 else:
     verdict = 'DIFFERS'
 row = [case, formula, launcher, total, verdict, len(our_energies) or '', len(reference_energies), '' if energy is None else f'{energy:.8f}',
-       '' if difference is None else f'{difference:.1e}', '' if seconds(ours) is None else f'{seconds(ours):.1f}',
+       '' if difference is None else f'{difference:.1e}', f'{tolerance:.0e}', '' if seconds(ours) is None else f'{seconds(ours):.1f}',
        '' if a100_seconds is None else f'{a100_seconds:.1f}', '' if peak is None else f'{peak:.1f}', '' if a100_peak is None else f'{a100_peak:.1f}']
 with open(summary, 'a', newline='') as handle:
     csv.writer(handle).writerow(row)
-print(f'  {case} {formula}: {verdict}, {row[5] or "?"} steps (reference {row[6]}), E = {row[7] or "?"} Ry (difference {row[8] or "?"}), '
-      f'{row[9] or "?"} s (A100 {row[10] or "n/a"}), peak {row[11] or "?"} GiB (A100 {row[12] or "n/a"})')
+print(f'  {case} {formula}: {verdict}, {row[5] or "?"} steps (reference {row[6]}), E = {row[7] or "?"} Ry (difference {row[8] or "?"}, '
+      f'ok within {row[9]}), {row[10] or "?"} s (A100 {row[11] or "n/a"}), peak {row[12] or "?"} GiB (A100 {row[13] or "n/a"})')
 EOF
 }
 

@@ -195,6 +195,8 @@ def build_negative_laplacian(grid: RealSpaceGrid) -> sp.csr_matrix:
         return build_general_negative_laplacian(grid)
     if _is_oblique(grid):
         return _build_oblique_negative_laplacian(grid)
+    if _wrapped_box(grid):
+        return _build_wrapped_negative_laplacian(grid)
     coeff = second_derivative_coefficients(grid.settings.expansion_order)
     width = grid.settings.stencil_half_width
     inv_h2 = 1.0 / grid.spacing**2
@@ -228,6 +230,257 @@ def build_negative_laplacian(grid: RealSpaceGrid) -> sp.csr_matrix:
         shape=(n, n),
     ).tocsr()
     matrix.sum_duplicates()
+    return matrix
+
+
+def _wrapped_box(grid) -> bool:
+    """Whether ``grid`` is an orthorhombic bulk cell whose rows are its whole box in row-major order (every
+    neighbour wraps around and none is missing): the case of :func:`_build_wrapped_negative_laplacian`."""
+
+    from ..Grid.pbc import PeriodicRealSpaceGrid
+
+    if type(grid) is not PeriodicRealSpaceGrid or not grid.is_orthorhombic:
+        return False
+    if tuple(getattr(grid, "boundary_modes", ())) != ("wrap", "wrap", "wrap"):
+        return False
+    shape = tuple(int(value) for value in grid.points_per_axis)
+    lookup = np.asarray(grid.lookup)
+    width = grid.settings.stencil_half_width
+    return (
+        lookup.shape == shape
+        and int(grid.size) == int(np.prod(shape))
+        and min(shape) > 2 * width
+        and int(lookup.reshape(-1)[0]) == 0
+        and int(lookup.reshape(-1)[-1]) == int(grid.size) - 1
+    )
+
+
+_KINETIC_SWITCH = "PARSEC_KPOINT_KINETIC"
+
+
+def kpoint_kinetic_setting() -> str:
+    """``PARSEC_KPOINT_KINETIC``: the kinetic term of a k-point.  ``gradient`` (default): ``-nabla^2 - 2ik.nabla +
+    k^2`` with the gradient discretized on its own; ``bloch``: the Bloch block of the finite-difference Laplacian
+    (:func:`build_bloch_negative_laplacian`), whose mesh of ``m`` points along an axis gives the Gamma point of the
+    supercell of ``m`` cells exactly; ``auto``: ``bloch`` where it applies, ``gradient`` elsewhere.
+
+    Both forms converge to the same energies.  Neither is closer at every spacing: on silicon (2 x 2 x 2 and
+    3 x 3 x 3 meshes, 12 to 28 points per cubic edge) the total energy of ``bloch`` is as close or closer to the
+    converged one, but on a gold cell at 0.6 bohr its lowest band dips below Gamma at k = 1/4 (-1.2 mRy, +5.3
+    with ``gradient``; +3.7 and +4.4 at 0.45 bohr, +10.4 and +10.9 at 0.35): the form of before stays the default.
+    """
+
+    import os
+
+    value = os.environ.get(_KINETIC_SWITCH, "gradient").strip().lower() or "gradient"
+    if value not in {"auto", "gradient", "bloch"}:
+        raise ValueError(f"{_KINETIC_SWITCH} must be gradient, bloch or auto, not {value!r}")
+    return value
+
+
+def bloch_laplacian_or_none(grid, k_point, cache: dict | None = None, key=None, *, meta_gga: bool = False):
+    """The u-gauge Bloch Laplacian of ``k_point`` (kept in ``cache`` by ``key``), or ``None`` for the gradient form.
+
+    It applies to a scalar (not spinor) Hamiltonian without a meta-GGA on a bulk orthorhombic cell of the default
+    routines (:func:`_wrapped_box`): ``auto`` takes it there and the gradient form elsewhere, ``bloch`` refuses
+    the others, ``gradient`` never takes it.
+    """
+
+    setting = kpoint_kinetic_setting()
+    if setting == "gradient":
+        return None
+    applies = _wrapped_box(grid) and not meta_gga
+    if not applies:
+        if setting == "auto":
+            return None
+        raise ValueError(
+            "PARSEC_KPOINT_KINETIC=bloch needs a bulk orthorhombic cell of the default routines (an orthorhombic "
+            "periodic box whose rows are its points) and a functional without a kinetic-energy density"
+        )
+    if cache is not None and key in cache:
+        return cache[key]
+    matrix = build_bloch_negative_laplacian(grid, k_point, "u")
+    if cache is not None:
+        cache[key] = matrix
+    return matrix
+
+
+def build_bloch_negative_laplacian(grid, k_point, gauge: str = "u") -> sp.csr_matrix:
+    """The Bloch block of the finite-difference ``-nabla^2`` of a periodic box at ``k_point`` (Cartesian, 1/bohr).
+
+    A supercell of ``m`` copies of the box along an axis has the finite-difference Laplacian of the box in each
+    copy, and its eigenfunctions of the translation by the box are ``psi(r + L) = e^{ik.L} psi(r)``: on the box
+    they solve the box's stencil with every wrapped neighbour taken times ``e^{ik.L}`` (``gauge="psi"``: the
+    twisted Laplacian, real, ``+-1`` on the wrapped entries, at a time-reversal invariant ``k``).  The periodic
+    factor ``u = e^{-ik.r} psi`` solves the stencil whose weight of the neighbour ``delta`` away is multiplied by
+    ``e^{ik.delta}`` (``gauge="u"``, the default, complex): ``sum_delta c_delta e^{ik.delta} u(r + delta)``.
+    Both are the exact Bloch block of the supercell's matrix, so a mesh of ``m`` points along an axis gives the
+    eigenvalues of the supercell of ``m`` boxes at the Gamma point.  (``-nabla^2 - 2ik.nabla + k^2`` with the
+    gradient discretized on its own, :class:`~parsec_python.Hamiltonian.KPointKohnShamHamiltonian` without
+    ``bloch_laplacian``, is another discretization of the same operator.)  An orthorhombic box of the default
+    routines (:func:`_wrapped_box`) only.
+    """
+
+    if not _wrapped_box(grid):
+        raise ValueError("the Bloch Laplacian needs an orthorhombic periodic box whose rows are its points")
+    if gauge not in {"u", "psi"}:
+        raise ValueError(f"gauge must be 'u' or 'psi', not {gauge!r}")
+    return _build_wrapped_negative_laplacian(grid, k_point=np.asarray(k_point, dtype=np.float64), gauge=gauge)
+
+
+# entries of a wrapped matrix from which its slabs are filled on threads
+_THREADED_ENTRIES = 1 << 22
+
+
+def _build_threads() -> int:
+    """Threads of the wrapped builder: ``PARSEC_PERIODIC_SETUP_THREADS``, else ``OMP_NUM_THREADS``, else the CPUs
+    up to 8 (the rule of the periodic setup's image sums).  The matrix does not depend on it."""
+    import os
+
+    for name in ("PARSEC_PERIODIC_SETUP_THREADS", "OMP_NUM_THREADS"):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError as error:
+                raise ValueError(f"{name} must be a positive integer, got {raw!r}") from error
+            if value < 1:
+                raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+            return value
+    return max(1, min(8, os.cpu_count() or 1))
+
+
+def _build_wrapped_negative_laplacian(grid, *, k_point=None, gauge: str = "u") -> sp.csr_matrix:
+    """The matrix of :func:`build_negative_laplacian` for a periodic box, written directly in CSR.
+
+    Every row holds its point and the ``2 M`` neighbours along each axis, all of them (they wrap), so the rows
+    are of equal length and the matrix of the COO route is known entry by entry: the columns of a row in
+    ascending order, the value of each its stencil weight.  Away from the faces the order is the same for every
+    row (axis 0 backwards, axis 1 backwards, axis 2 backwards, the point, then forwards); only rows within ``M``
+    of a face, whose wrapped neighbours change it, are sorted.  The same arrays as the COO route's (``tocsr``,
+    ``sum_duplicates``: sorted columns, no duplicates since every axis holds more than ``2 M`` points) without
+    its sort of all the entries.
+    """
+
+    coeff = second_derivative_coefficients(grid.settings.expansion_order)
+    width = grid.settings.stencil_half_width
+    inv_h2 = 1.0 / grid.spacing**2
+    shape = tuple(int(value) for value in grid.points_per_axis)
+    n = int(np.prod(shape))
+    strides = (shape[1] * shape[2], shape[2], 1)
+    # (axis, signed shift) in ascending column order for a row away from the faces
+    order = (
+        [(0, -s) for s in range(width, 0, -1)]
+        + [(1, -s) for s in range(width, 0, -1)]
+        + [(2, -s) for s in range(width, 0, -1)]
+        + [(None, 0)]
+        + [(2, s) for s in range(1, width + 1)]
+        + [(1, s) for s in range(1, width + 1)]
+        + [(0, s) for s in range(1, width + 1)]
+    )
+    count = len(order)
+    index_type = np.int32 if n * count < 2**31 else np.int64
+    weights = np.array(
+        [-3.0 * coeff[width] * inv_h2 if axis is None else -coeff[width + abs(shift)] * inv_h2 for axis, shift in order]
+    )
+    coordinates = [np.arange(extent, dtype=index_type) for extent in shape]
+    columns = np.empty((n, count), dtype=index_type)
+    sides = steps = slot_values = None
+    if k_point is None:
+        data = np.empty((n, count), dtype=np.float64)
+        slot_values = weights
+    else:
+        # the Bloch block (build_bloch_negative_laplacian): a phase per slot (u gauge) or per wrapped entry (psi)
+        sides = np.diag(np.asarray(grid.cell.lattice_vectors, dtype=np.float64))
+        steps = sides / np.asarray(shape, dtype=np.float64)
+        data = np.empty((n, count), dtype=np.complex128)
+        if gauge == "u":
+            phases = np.array(
+                [1.0 if axis is None else np.exp(1j * k_point[axis] * shift * steps[axis]) for axis, shift in order]
+            )
+            slot_values = weights * phases
+
+    psi = k_point is not None and gauge != "u"
+
+    def slab(first: int, last: int):
+        local_shape = (last - first,) + shape[1:]
+        lo, hi = first * strides[0], last * strides[0]
+        return local_shape, lo, hi, (coordinates[0][first:last], coordinates[1], coordinates[2])
+
+    def sort_near(first: int, last: int) -> None:
+        # rows within M of a face: their wrapped neighbours change the column order
+        local_shape, lo, hi, local = slab(first, last)
+        block, values = columns[lo:hi], data[lo:hi]
+        near = np.zeros(local_shape, dtype=bool)
+        for axis, extent in enumerate(shape):
+            edge = (local[axis] < width) | (local[axis] >= extent - width)
+            view = [1, 1, 1]
+            view[axis] = local_shape[axis]
+            near |= edge.reshape(view)
+        near = np.flatnonzero(near.reshape(-1))
+        if near.size:
+            permutation = np.argsort(block[near], axis=1, kind="stable")
+            block[near] = np.take_along_axis(block[near], permutation, axis=1)
+            values[near] = np.take_along_axis(values[near], permutation, axis=1)
+
+    def fill(first: int, last: int) -> None:
+        # the rows of the planes first <= i < last of axis 0 (every value as the whole-matrix expressions)
+        local_shape, lo, hi, local = slab(first, last)
+        rows = np.arange(lo, hi, dtype=index_type).reshape(local_shape)
+        block = columns[lo:hi]
+        for slot, (axis, shift) in enumerate(order):
+            if axis is None:
+                block[:, slot] = rows.reshape(-1)
+                continue
+            # column of the neighbour (i + shift) mod n along the axis: the row plus the change of that index
+            change = ((local[axis] + shift) % shape[axis] - local[axis]) * strides[axis]
+            view = [1, 1, 1]
+            view[axis] = local_shape[axis]
+            block[:, slot] = (rows + change.reshape(view)).reshape(-1)
+        values = data[lo:hi]
+        if slot_values is not None:
+            values[:] = slot_values[None, :]
+        else:
+            for slot, (axis, shift) in enumerate(order):
+                if axis is None:
+                    values[:, slot] = weights[slot]
+                    continue
+                wraps = (local[axis] + shift) // shape[axis]
+                phase = np.exp(1j * k_point[axis] * sides[axis] * wraps.astype(np.float64))
+                view = [1, 1, 1]
+                view[axis] = local_shape[axis]
+                values[:, slot] = np.broadcast_to(weights[slot] * phase.reshape(view), local_shape).reshape(-1)
+        if not psi:
+            sort_near(first, last)
+
+    # slabs of planes of axis 0 on threads (the entries do not depend on them)
+    threads = _build_threads()
+    slabs = np.linspace(0, shape[0], min(shape[0], 4 * threads) + 1).astype(int)
+    pairs = [(int(a), int(b)) for a, b in zip(slabs[:-1], slabs[1:]) if b > a]
+
+    def run(function) -> None:
+        if threads > 1 and len(pairs) > 1 and n * count >= _THREADED_ENTRIES:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="parsec-laplacian") as pool:
+                list(pool.map(lambda pair: function(*pair), pairs))
+        else:
+            function(0, shape[0])
+
+    run(fill)
+    if psi:
+        if np.max(np.abs(data.imag)) <= 1.0e-12 * np.max(np.abs(data.real)):
+            # a time-reversal invariant k: the twisted Laplacian is real (the columns still in slot order here)
+            data = np.ascontiguousarray(np.rint(data.real / weights[None, :]) * weights[None, :])
+        run(sort_near)
+    indptr = np.arange(0, n * count + 1, count, dtype=index_type)
+    matrix = sp.csr_matrix((data.reshape(-1), columns.reshape(-1), indptr), shape=(n, n))
+    matrix.has_sorted_indices = True
+    if k_point is None:
+        # What the matrix is, for a reader that can build what it needs from the grid instead of reading the
+        # matrix (the sector stencils of a point-group reduction, acceleration/Symmetry/operator_cache.py); a copy
+        # or any change of the matrix drops it.
+        matrix.parsec_wrapped_stencil_of = grid
     return matrix
 
 

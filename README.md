@@ -771,9 +771,13 @@ waiting for halo rows and summing over the ranks.
 `acceleration/tests/test_kpoint_mpi.py` runs the distributed operator, the drivers and the command line
 on 2 and 3 ranks (the device code on the host) against the single-process solver; it has not been run on
 GPUs or on more than one node. Because no rank holds whole orbitals, `--mpi` refuses (input error) LDA+U,
-`Eigensolver: arpack`/`diagla`, forces, relaxation and molecular dynamics of periodic or non-collinear runs,
-the Ylm-projected DOS and `Output_GW`; a non-collinear cluster's `parsec.dat` is written without
-wavefunction records.
+`Eigensolver: arpack`/`diagla`, forces, relaxation and molecular dynamics of periodic runs at the Gamma point
+alone, with spin, with spinors or with a hybrid functional, the Ylm-projected DOS and `Output_GW`; a
+non-collinear cluster's `parsec.dat` is written without wavefunction records. The forces of the scalar k-point
+SCF (a cell sampled beyond the Gamma point) run with `--mpi` since 2026-11-17: the nonlocal force is a sum over
+the states, so every rank of a k-point pool adds the terms of its columns (of the sectors of its k-points, made
+whole on its GPU 32 states at a time) and the parts are summed over the ranks; relaxations and molecular dynamics
+take them, rank 0 writes their files.
 
 ## Band structures (periodic systems)
 
@@ -998,6 +1002,16 @@ wedge with the averaged density is the full mesh: the 8-atom cube at 18 points p
 density). Hybrids (their exchange sums over the full mesh), spinors and moving atoms keep the full mesh of equal
 weights, as before 8 November 2026, when every input with `.false.` did. Without `Use_Fortran_Routines` a shifted
 mesh still selects the Fortran-derived routines (above).
+
+A `Monkhorst_Pack_Grid` without a `Monkhorst_Pack_Shift` block (more than one point) is, since 18 November 2026,
+PARSEC 1.5's mesh: PARSEC reads `mpshift` from the block only, so without it the shift is zero, and it reduces
+every Monkhorst-Pack grid with `irrbz` (`init_var.F90:281-289`; the PARSEC 1.5 binary prints `shift = 0.0000 0.0000
+0.0000` and the same table as with a zero block). On either set of routines the input now runs exactly as with a
+zero `Monkhorst_Pack_Shift` block, the Gamma-centred mesh `(i-1)/n` reduced to its irreducible wedge with the
+density symmetrized (diamond and Si cubes: 4, 4 and 10 points for 2x2x2, 3x3x3 and 4x4x4), except that the missing
+block does not select the Fortran-derived routines. Before, such an input ran this port's own unreduced mesh
+`(2i-n-1)/(2n)` (points at +-1/4 and +-3/4 of a step for even `n`, no time reversal, no symmetrization), which
+`PARSEC_MP_UNSHIFTED_MESH=port` keeps; a mesh of one point is the Gamma point under both.
 
 A `Kpoint_List` of unequal weights of a bulk single point runs on the default routines with `.false.` (before 8
 November 2026 it went to the Fortran-derived routines by itself): every level is weighted by its point in the Fermi

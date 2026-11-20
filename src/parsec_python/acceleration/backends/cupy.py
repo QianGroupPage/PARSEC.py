@@ -88,6 +88,10 @@ def require_cupy() -> tuple[Any, Any]:
             ) from exc
         _CUPY = cp
         _CUPYX_SPARSE = cpsparse
+        if os.environ.get("PARSEC_MEMORY_CENSUS"):
+            from ..benchmarks import memory_census
+
+            memory_census.install()
 
     # Import/device discovery is a process-level prerequisite, not a
     # Hamiltonian-operation check.  Calling cudaGetDeviceCount inside every
@@ -224,6 +228,31 @@ def device_stage(operator: Any, name: str):
     synchronization and launch schedule.
     """
 
+    census = _census_module()
+    if census is not None:
+        before = census.current_stage()
+        census.mark(name)
+        try:
+            with _device_stage_events(operator, name):
+                yield
+        finally:
+            census.mark(before)
+        return
+    with _device_stage_events(operator, name):
+        yield
+
+
+def _census_module():
+    """The memory census module where ``PARSEC_MEMORY_CENSUS`` is set (a diagnostic), else ``None``."""
+    if not os.environ.get("PARSEC_MEMORY_CENSUS"):
+        return None
+    from ..benchmarks import memory_census
+
+    return memory_census
+
+
+@contextmanager
+def _device_stage_events(operator: Any, name: str):
     stats = getattr(operator, "timing_stats", None)
     if stats is None or not _stage_timing_requested():
         yield

@@ -897,7 +897,8 @@ class ExchangePlanTests(unittest.TestCase):
             self.assertEqual([helper(devices, 1) for devices in ((0, 1), (0, 1, 2), (1,))], [1, 2, None])
             # Every layout of a rank that the runner plans (experimental.mpi_scf.sector_device_groups) with
             # the device that the driver gives the Hartree objects (driver._select_hartree_device): sectors,
-            # ranks and devices of a rank.  With ``any`` every shared sector has a helper, which is never its
+            # ranks and devices of a rank, for bases that the first solve divides over the devices of a group
+            # (``divided``, CHEBFF: the layouts with shared sectors).  With ``any`` every shared sector has a helper, which is never its
             # owner; by default, as with ``auto``, the sectors of two devices whose second one holds those
             # objects have none, one sector of the root rank wherever its sectors have two devices each.
             from parsec_python.acceleration import driver
@@ -905,7 +906,7 @@ class ExchangePlanTests(unittest.TestCase):
             without = {}
             for sectors, ranks, count in ((4, 4, 4), (4, 2, 4), (4, 1, 8), (4, 4, 2), (4, 2, 3), (8, 4, 4), (8, 2, 8),
                                           (2, 1, 4), (2, 2, 2), (2, 2, 3), (4, 1, 4), (8, 1, 4), (1, 1, 4)):
-                groups = sector_device_groups(sectors, ranks, 0, tuple(range(count)))
+                groups = sector_device_groups(sectors, ranks, 0, tuple(range(count)), divided=True)
                 busy = driver._select_hartree_device('auto', tuple(range(count)), groups)
                 shared = [devices for devices in groups.values() if len(devices) > 1]
                 found = {}
@@ -924,9 +925,25 @@ class ExchangePlanTests(unittest.TestCase):
                                                   if device is None]
                 self.assertEqual(without[sectors, ranks, count],
                                  [devices for devices in shared if devices[1:] == (busy,)])
+            # (4, 2, 3): the two sectors of a rank on three devices spread over all three
+            # (PARSEC_SECTOR_DEVICE_POOL=auto, the default), so a helper is free; disjoint groups (off) give the
+            # first sector two devices whose second holds the Hartree objects, without a helper
             self.assertEqual({layout: sectors for layout, sectors in without.items() if sectors},
-                             {(4, 2, 4): [(2, 3)], (4, 1, 8): [(6, 7)], (4, 4, 2): [(0, 1)], (4, 2, 3): [(0, 1)],
+                             {(4, 2, 4): [(2, 3)], (4, 1, 8): [(6, 7)], (4, 4, 2): [(0, 1)],
                               (8, 4, 4): [(2, 3)], (8, 2, 8): [(6, 7)], (2, 1, 4): [(2, 3)], (2, 2, 2): [(0, 1)]})
+            self.assertEqual(sector_device_groups(4, 2, 0, (0, 1, 2), divided=True), {0: (0, 1, 2), 2: (0, 1, 2)})
+            # Bases that are not divided (a CHEBDAV first solve, or sectors below the generalized Ritz step) lie
+            # whole on the first device of their group: placed by size, they keep disjoint groups rather than
+            # all on the pool's first device; the cyclic placement keeps the former pool.
+            self.assertEqual(sector_device_groups(4, 2, 0, (0, 1, 2)), {0: (0, 1), 2: (2,)})
+            with patch.dict(os.environ, {'PARSEC_SECTOR_PLACEMENT': 'cyclic'}):
+                self.assertEqual(sector_device_groups(4, 2, 0, (0, 1, 2)), {0: (0, 1, 2), 2: (0, 1, 2)})
+            os.environ.pop('PARSEC_CUPY_RITZ_CONDITION_HELPER', None)
+            with patch.dict(os.environ, {'PARSEC_SECTOR_DEVICE_POOL': 'off'}):
+                groups = sector_device_groups(4, 2, 0, (0, 1, 2))
+                self.assertEqual(groups, {0: (0, 1), 2: (2,)})
+                busy = driver._select_hartree_device('auto', (0, 1, 2), groups)
+                self.assertEqual([helper(devices, busy) for devices in groups.values() if len(devices) > 1], [None])
             os.environ['PARSEC_CUPY_RITZ_CONDITION_HELPER'] = 'any'
             # The Ritz step on real devices (test_ritz_dense) expects these devices, of a group of two, three
             # and four: a node gives it as many as it has, up to four.
@@ -3529,7 +3546,7 @@ class RitzStandInTests(unittest.TestCase):
             run.solution = solve(raw_overlap, raw_projection)
             return run.solution
 
-        def device_solve(raw_overlap, raw_projection, condition=None):
+        def device_solve(raw_overlap, raw_projection, condition=None, overwrite_grams=False):
             # Stands for the small solve on the device: the host solve of the pair that the current device
             # holds once its stream has done the work queued before, and the results as arrays of that device.
             # A ``condition`` is given the mirrored overlap as an array of the device, complete, before that

@@ -2413,6 +2413,8 @@ def run_scf(
     occupations = np.empty(0)
     representations = np.empty(0, dtype=np.int32)
     wavefunctions = np.empty((system.grid.size, 0))
+    # The lists of the record of the last iteration (_public_states).
+    public = None
     fermi_level = np.nan
     energies = None
     last_input_potential = input_potential.copy()
@@ -2501,6 +2503,18 @@ def run_scf(
         )
         if callable(release_previous_orbitals):
             release_previous_orbitals()
+        # The orbitals of the record of that iteration are a copy of them
+        # where the states have weights (_public_states), with the same
+        # sector views: released alike.  Kept, they held the basis of a
+        # sector that grows from a new start in this solve beside the new
+        # one (a 22^3 diamond cell on 16 A100 ran out of memory there).
+        release_public_orbitals = (
+            None
+            if public is None or public[3] is wavefunctions
+            else getattr(public[3], "release_intermediate_storage", None)
+        )
+        if callable(release_public_orbitals):
+            release_public_orbitals()
         if refining:
             # The loop converged at the iteration before: the same H[V_in]
             # until no level moves by more than level_tolerance.
@@ -2559,11 +2573,19 @@ def run_scf(
         occupations_density_start = time.perf_counter()
         # With the occupations of occup.in (a negative Fermi_Temp) the
         # n-th lowest state takes the n-th of them and no level is searched.
+        # Sectors of a subgroup of the point group with weights (acceleration/Symmetry/orbital_groups.py)
+        # return one partner of some degenerate levels: each state counts for its weight's worth of states,
+        # in the Fermi level and in everything the occupations weigh (density, band energy, forces).
+        state_weights = getattr(eigensolution, "state_weights", None)
+        if state_weights is not None and settings.fixed_occupations is not None:
+            raise ValueError("occupations from occup.in name every state: they need the orbitals of the full grid "
+                             "or of the abelian group (PARSEC_ORBITAL_GROUP=abelian)")
         occupation_result = (
             fermi_occupations(
                 eigenvalues,
                 system.electron_count,
                 settings.fermi_temperature_kelvin,
+                **({} if state_weights is None else {"weights": state_weights}),
             )
             if settings.fixed_occupations is None
             else fixed_occupations(
@@ -2573,6 +2595,8 @@ def run_scf(
             )
         )
         occupations = occupation_result.occupations
+        if state_weights is not None:
+            occupations = occupations * np.asarray(state_weights, dtype=np.float64)
         fermi_level = occupation_result.fermi_level
         density = build_orbital_density(
             wavefunctions, occupations, system.grid.volume_element
@@ -2751,11 +2775,12 @@ def run_scf(
         # Capture a self-contained record after mixing so its timing contains
         # both energy/convergence work and the PARSEC-mandated mixer call.  The
         # callback still receives exactly one completed record per iteration.
-        eigenvalue_history = tuple(float(value) for value in eigenvalues)
-        occupation_history = tuple(float(value) for value in occupations)
-        representation_history = tuple(
-            int(value) for value in representations
-        )
+        # The record lists every partner of a weighted state, each with its own occupation in [0, 1], as
+        # the full grid lists them (the same lists without weights).
+        public = _public_states(eigenvalues, occupations, representations, wavefunctions, state_weights)
+        eigenvalue_history = tuple(float(value) for value in public[0])
+        occupation_history = tuple(float(value) for value in public[1])
+        representation_history = tuple(int(value) for value in public[2])
         density_minimum = (
             float(np.min(density))
             if scalar_field_adapter is None
@@ -2804,10 +2829,10 @@ def run_scf(
             iteration_state_callback(
                 SCFIterationFields(
                     iteration=iteration,
-                    eigenvalues=eigenvalues,
-                    occupations=occupations,
-                    representations=representations,
-                    wavefunctions=wavefunctions,
+                    eigenvalues=public[0],
+                    occupations=public[1],
+                    representations=public[2],
+                    wavefunctions=public[3],
                     density=to_public_scalar(density),
                     next_effective_potential=to_public_scalar(mixed_potential),
                 )
@@ -2869,18 +2894,48 @@ def run_scf(
         ),
         next_effective_potential=to_public_scalar(mixed_potential),
         nonlocal_operator=system.nonlocal_operator,
-        eigenvalues=eigenvalues,
-        occupations=occupations,
-        wavefunctions=wavefunctions,
+        eigenvalues=public[0],
+        occupations=public[1],
+        wavefunctions=public[3],
         fermi_level=fermi_level,
         energies=energies,
         history=history,
         timings=run_timings,
-        representations=representations,
+        representations=public[2],
+        sector_states=(
+            None
+            if state_weights is None
+            else (np.asarray(representations), np.asarray(occupations), np.asarray(state_weights, dtype=np.int64))
+        ),
         atomic_reference_correction=system.atomic_reference_correction,
         eigensolver_state=eigval_state,
         hubbard=hubbard_state,
         dispersion=dispersion,
         embedding=None if embedding is None else nonadditive,
         **({} if meta is None else {"meta_gga": meta.record()}),
+    )
+
+
+def _public_states(eigenvalues, occupations, representations, wavefunctions, state_weights):
+    """The lists of a result: every partner of a weighted state, as the full grid lists them.
+
+    ``occupations`` are those of the SCF loop (times the weights where there are weights); the returned ones
+    are per partner, in [0, 1].  The orbitals carry the weights so that their full-grid form holds every
+    partner (``CuPySymmetryOrbitals.to_full_host``).  Without weights the lists are returned as they are.
+    """
+
+    if state_weights is None:
+        return eigenvalues, occupations, representations, wavefunctions
+    repeats = np.asarray(state_weights, dtype=np.int64)
+    weights = repeats.astype(np.float64)
+    orbitals = (
+        replace(wavefunctions, state_weights=repeats)
+        if is_dataclass(wavefunctions) and hasattr(wavefunctions, "state_weights")
+        else wavefunctions
+    )
+    return (
+        np.repeat(np.asarray(eigenvalues, dtype=np.float64), repeats),
+        np.repeat(np.asarray(occupations, dtype=np.float64) / weights, repeats),
+        np.repeat(np.asarray(representations), repeats),
+        orbitals,
     )

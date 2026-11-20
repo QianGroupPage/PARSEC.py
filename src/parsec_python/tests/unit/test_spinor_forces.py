@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import os
 import unittest
+from unittest import mock
 from dataclasses import replace
 from pathlib import Path
 
@@ -750,6 +752,13 @@ class SpinorIonicCliTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(energies)))
         self.assertEqual(log.count("Converged magnetic moment vector"), archive["dynamics_positions"].shape[0])
 
+    # The former mesh 2x1x1 of points at +-1/4 (PARSEC_MP_UNSHIFTED_MESH=port), which converges in 11 iterations.
+    # With PARSEC 1.5's zero shift (k = 0 and 1/2 along x, the default since 2026-11-18) the SCF of this odd-electron
+    # non-collinear Au2+ cell, sampled at time-reversal invariant points only, sits on a plateau of the residual just
+    # above its criterion of 1e-4 Ry from about iteration 12 (energy steady to 1e-4 Ry): it stops unconverged
+    # after its 80 iterations on GPUs (exit 3 on an A100 node and on a laptop GPU) and converges in about 58 on a
+    # laptop CPU.  The forces are the subject here; the default mesh is the twin below.
+    @mock.patch.dict(os.environ, {"PARSEC_MP_UNSHIFTED_MESH": "port"})
     def test_a_periodic_cell_with_k_points_has_forces(self) -> None:
         code, log = self._run(
             "Skip_Force: .false.\n",
@@ -757,6 +766,27 @@ class SpinorIonicCliTests(unittest.TestCase):
             periodic=True,
         )
         self.assertEqual(code, 0, log[-2000:])
+        archive = read_archive(self.directory / "parsec_python_results.npz")
+        self.assertEqual(archive["forces_total"].shape, (2, 3))
+        self.assertGreater(float(np.max(np.abs(archive["forces_total"]))), 0.1)
+
+    @mock.patch.dict(os.environ, {"PARSEC_MP_UNSHIFTED_MESH": "fortran"})
+    def test_a_periodic_cell_on_the_default_mesh_converges_with_more_iterations(self) -> None:
+        # The twin of the test above on the default mesh (k = 0 and 1/2): with Max_Iter 200 instead of 80 it converges,
+        # in 106 iterations on an A100 node and 86 to 110 on a laptop GPU (58 on its CPU), and has forces.
+        path = self._write(
+            "Skip_Force: .false.\n",
+            "Kpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n2 1 1\nend Monkhorst_Pack_Grid\n",
+            periodic=True,
+        )
+        path.write_text(path.read_text(encoding="utf-8").replace("Max_Iter: 80", "Max_Iter: 200"), encoding="utf-8")
+        code = cli_main([str(path), "--quiet"])
+        log = (self.directory / "parsec.out").read_text(encoding="utf-8")
+        self.assertEqual(code, 0, log[-2000:])
+        points = [line for line in log.splitlines() if line.lstrip().startswith("k-point") and "frac = (" in line]
+        self.assertEqual(len(points), 2, points)
+        self.assertIn("frac = ( 0.00000  0.00000  0.00000)", points[0])
+        self.assertIn("frac = ( 0.50000  0.00000  0.00000)", points[1])
         archive = read_archive(self.directory / "parsec_python_results.npz")
         self.assertEqual(archive["forces_total"].shape, (2, 3))
         self.assertGreater(float(np.max(np.abs(archive["forces_total"]))), 0.1)

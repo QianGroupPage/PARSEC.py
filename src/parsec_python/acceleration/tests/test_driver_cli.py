@@ -267,6 +267,37 @@ class PeriodicDriverTests(unittest.TestCase):
         for name in [name for name in os.environ if name.startswith("PARSEC_")]:
             del os.environ[name]
 
+    def test_a_deferred_periodic_laplacian_is_built_for_host_backends_and_kept_by_the_resident_cache(self) -> None:
+        # PARSEC_PERIODIC_DEFER_LAPLACIAN: the periodic preparation defers the matrix of a box; a host backend gets
+        # the matrix, and the view of a cached reference (the resident worker) keeps the periodic descriptor
+        from parsec_python.acceleration.Laplacian import (
+            DeferredPeriodicNegativeLaplacian,
+            periodic_negative_laplacian,
+        )
+        from parsec_python.Laplacian import build_negative_laplacian
+
+        for backend in ("scipy", "native"):
+            with self.subTest(backend=backend):
+                try:
+                    system = prepare_single_point(self.problem, backend=backend)
+                except driver_module.BackendUnavailableError:
+                    continue
+                matrix = system.reference.negative_laplacian
+                self.assertNotIsInstance(matrix, DeferredPeriodicNegativeLaplacian)
+                expected = build_negative_laplacian(system.reference.grid)
+                np.testing.assert_array_equal(matrix.toarray(), expected.toarray())
+        reference = driver_module.prepare_reference_periodic_single_point(
+            self.problem, negative_laplacian_builder=periodic_negative_laplacian
+        )
+        self.assertIsInstance(reference.negative_laplacian, DeferredPeriodicNegativeLaplacian)
+        view = driver_module._cached_reference_view(reference, cache_directory=None, lookup_seconds=0.25)
+        self.assertIsInstance(view.negative_laplacian, DeferredPeriodicNegativeLaplacian)
+        self.assertEqual(view.negative_laplacian.reference_static_cache_status, "hit")
+        self.assertFalse(view.negative_laplacian.materialized)
+        # the two descriptors share one matrix, whichever builds it
+        built = view.negative_laplacian.materialize()
+        self.assertIs(reference.negative_laplacian.materialize(), built)
+
     def test_periodic_cell_takes_the_reference_construction_and_its_own_hartree_solve(self) -> None:
         with (
             patch.object(
@@ -296,15 +327,16 @@ class PeriodicDriverTests(unittest.TestCase):
         )
         self.assertEqual(details["detected_symmetry_group_order"], "1")
         self.assertIn("periodic-wraparound", details["finite_difference_builder"])
-        # The readable periodic CG, on the host or (since 2026-10-30 by default) through the device
-        # hook where the k-point plan has a GPU; up to then this test asserted the host text alone.
+        # The readable periodic CG on the host, or (since 2026-10-30 by default) the device hook where the
+        # k-point plan has a GPU: since 2026-11-16 the FFT of the stencil symbol there
+        # (PARSEC_PERIODIC_HARTREE_METHOD=cg: the CG). Up to 2026-10-30 this test asserted the host text alone.
         from parsec_python.acceleration.Hartree.periodic_device import hartree_device_id
 
         self.assertTrue(
             details["hartree_implementation"].startswith(
                 "periodic Ewald-consistent"
                 if hartree_device_id() is None
-                else "periodic conjugate-gradient solve, CuPy float64 on the device"
+                else "periodic finite-difference solve by the FFT of its stencil symbol, CuPy float64 on the device"
             ),
             details["hartree_implementation"],
         )
@@ -350,9 +382,8 @@ class PeriodicDriverTests(unittest.TestCase):
         self.assertIs(driver_module._selection_for_problem(hybrid, cluster), hybrid)
 
     def test_what_a_periodic_cell_cannot_have_is_refused_by_name(self) -> None:
-        with self.assertRaisesRegex(
-            ValueError, "symmetry='on' is not supported for periodic problems"
-        ):
+        # The point group of a cell is a route of the CuPy backend (PARSEC_PERIODIC_SYMMETRY).
+        with self.assertRaisesRegex(ValueError, "symmetry='on' needs"):
             prepare_single_point(self.problem, backend="scipy", symmetry="on")
         # A periodic cell that one sector of the identity does not take is refused
         # in an MPI run before a rank prepares anything, by name.
@@ -408,6 +439,9 @@ class PeriodicDriverTests(unittest.TestCase):
 
     @unittest.skipUnless(cupy_available(), "CuPy and a CUDA device are required")
     def test_a_cell_as_one_sector_of_the_identity_gives_the_energy_of_the_full_grid(self) -> None:
+        # This cell has Oh about its origin: the identity is the route of PARSEC_PERIODIC_SYMMETRY=off
+        # (test_periodic_point_group.py runs its point group).
+        os.environ["PARSEC_PERIODIC_SYMMETRY"] = "off"
         full = run_scf(prepare_single_point(self.problem, backend="cupy"))
         os.environ["PARSEC_CUPY_SINGLE_SECTOR"] = "on"
         system = prepare_single_point(self.problem, backend="cupy")
@@ -481,9 +515,13 @@ class PeriodicDriverTests(unittest.TestCase):
         other = (record[0], record[1], float(0.5).hex(), *record[3:])
         with self.assertRaisesRegex(ValueError, "periodic cell or the settings of its grid differ"):
             mpi_full_scf._require_same_domain([record, other])
-        moving = replace(translation, compute_forces=True)
-        with self.assertRaisesRegex(ValueError, "forces, relaxation and molecular dynamics of a periodic cell"):
-            mpi_full_scf._refuse_unsupported_periodic(moving)
+        # The forces and the moves of a cell on the default routines run there (test_mpi_periodic_sector_forces;
+        # molecular dynamics on one sector of the identity); a band structure of a cell does not.
+        mpi_full_scf._refuse_unsupported_periodic(replace(translation, compute_forces=True))
+        mpi_full_scf._refuse_unsupported_periodic(replace(translation, compute_forces=True, molecular_dynamics=object()))
+        bands = replace(translation, problem=replace(translation.problem, bands=object()))
+        with self.assertRaisesRegex(ValueError, "band structure .* of a periodic cell"):
+            mpi_full_scf._refuse_unsupported_periodic(bands)
         # The prepared grid of every rank is compared before the SCF.
         system = SimpleNamespace(grid=prepare_periodic_single_point(self.problem).grid)
         prepared = mpi_full_scf._prepared_cell_grid(system)
@@ -551,6 +589,9 @@ class PeriodicDriverTests(unittest.TestCase):
         self.assertEqual(raised.input.hartree.multipole_order, 20)
 
     def test_periodic_scf_through_the_driver_agrees_with_the_reference_solver(self) -> None:
+        # The full grid of every backend, step for step as the reference solver; the sectors of the point
+        # group of this cell (Oh) are compared with that grid in test_periodic_point_group.py.
+        os.environ["PARSEC_PERIODIC_SYMMETRY"] = "off"
         reference_system = prepare_periodic_single_point(self.problem)
         reference = run_reference_scf(reference_system)
         # Every execution backend applies the Hamiltonian of the periodic

@@ -19,7 +19,9 @@ Memory.  The filter runs on chunks of columns, so its temporaries are a few
 chunks, not a few copies of the basis; the Rayleigh-Ritz projection is
 accumulated chunk by chunk and the rotation overwrites the basis in place.  The
 peak is the filtered block plus its QR factor.  A chunk is
-``PARSEC_SPINOR_FILTER_COLUMNS`` columns (default 64).
+``PARSEC_SPINOR_FILTER_COLUMNS`` columns (default 64 here, 32 in the k-point pools of
+:mod:`.chebff_columns`).  The random start basis is drawn :data:`START_COLUMNS` columns at a
+time whatever the chunk is.
 
 Everything uses only operations NumPy and CuPy share, so the tests run the
 exact code of the GPU with NumPy and compare it with the reference.
@@ -44,11 +46,16 @@ from ..backends.cupy import require_cupy
 _BREAKDOWN_TOLERANCE = 2.5e-16
 FILTER_COLUMNS_ENV = "PARSEC_SPINOR_FILTER_COLUMNS"
 _ROW_CHUNK = 1 << 16
+# Columns per draw of the random start basis: the stream of the former default chunk, whatever the chunk is
+# (it was drawn chunk by chunk, so that a chunk of another width started from another basis).
+START_COLUMNS = 64
 
 
-def _filter_columns() -> int:
+def _filter_columns(default: int = 64) -> int:
+    """``PARSEC_SPINOR_FILTER_COLUMNS``, else ``default`` (64 on one device, :data:`.chebff_columns.POOL_FILTER_COLUMNS`
+    in the k-point pools)."""
     value = os.environ.get(FILTER_COLUMNS_ENV, "").strip()
-    return max(1, int(value)) if value.isdigit() else 64
+    return max(1, int(value)) if value.isdigit() else int(default)
 
 
 @dataclass
@@ -509,8 +516,8 @@ def _first_solve(
     # each rank draws its own rows: the start of a distributed basis depends on the number of ranks
     rng = xp.random.default_rng(settings.random_seed + (0 if context is None else 7919 * context.rank))
     vectors = xp.empty((rows, working), dtype=xp.complex128)
-    for c0 in range(0, working, chunk):
-        c1 = min(c0 + chunk, working)
+    for c0 in range(0, working, START_COLUMNS):
+        c1 = min(c0 + START_COLUMNS, working)
         vectors[:, c0:c1] = rng.uniform(-1.0, 1.0, (rows, c1 - c0)) + 1j * rng.uniform(
             -1.0, 1.0, (rows, c1 - c0)
         )

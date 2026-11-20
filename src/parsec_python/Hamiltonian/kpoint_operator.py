@@ -82,7 +82,11 @@ class KPointKohnShamHamiltonian:
     kinetic_potential: np.ndarray | None = None
     gradient_flux: tuple | None = None
     k_gradient_cache: dict | None = field(default=None, repr=False, compare=False)
-    # V_eff + |k|^2, built once.
+    # The Bloch block of the finite-difference Laplacian at this k (u gauge,
+    # parsec_python.Laplacian.build_bloch_negative_laplacian): the kinetic term in place of
+    # -nabla^2 - 2ik.grad + |k|^2, the discretization of the Gamma point of the supercell.
+    bloch_laplacian: sp.csr_matrix | None = field(default=None, repr=False, compare=False)
+    # V_eff + |k|^2, built once (V_eff alone with bloch_laplacian).
     _diagonal: np.ndarray = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -102,9 +106,16 @@ class KPointKohnShamHamiltonian:
         object.__setattr__(self, "effective_potential", potential)
         object.__setattr__(self, "gradient", tuple(self.gradient))
         object.__setattr__(self, "k_point", k_point)
-        object.__setattr__(
-            self, "_diagonal", potential + float(np.dot(k_point, k_point))
-        )
+        if self.bloch_laplacian is not None:
+            if self.bloch_laplacian.shape != (size, size):
+                raise ValueError("the Bloch Laplacian does not match the kinetic operator")
+            if self.kinetic_potential is not None:
+                raise ValueError("a meta-GGA keeps the gradient form of the k-point kinetic term")
+            object.__setattr__(self, "_diagonal", potential)
+        else:
+            object.__setattr__(
+                self, "_diagonal", potential + float(np.dot(k_point, k_point))
+            )
         if self.kinetic_potential is not None:
             kinetic = np.ascontiguousarray(self.kinetic_potential, dtype=np.float64)
             if kinetic.shape != (size,):
@@ -172,9 +183,12 @@ class KPointKohnShamHamiltonian:
         # (n, 2*n_vectors) of the complex block halves the sparse-product work
         # and avoids upcasting the matrices.
         real_view = block.view(np.float64)
-        result = (self.negative_laplacian @ real_view).view(np.complex128)
-        if self._k_gradient is not None:
-            result -= 2j * (self._k_gradient @ real_view).view(np.complex128)
+        if self.bloch_laplacian is not None:
+            result = np.asarray(self.bloch_laplacian @ block, dtype=np.complex128)
+        else:
+            result = (self.negative_laplacian @ real_view).view(np.complex128)
+            if self._k_gradient is not None:
+                result -= 2j * (self._k_gradient @ real_view).view(np.complex128)
         result += self._diagonal[:, None] * block
         result += self.nonlocal_operator.apply(block)
         if self.kinetic_potential is not None:

@@ -78,6 +78,10 @@ def _geometry_key(
     _update_array(digest, "integer_coordinates", grid.integer_coordinates)
     _update_array(digest, "physical_coordinates", grid.coordinates)
     _update_array(digest, "grid_shift", np.asarray(grid.settings.shift, dtype=np.float64))
+    cell = getattr(grid, "cell", None)
+    if cell is not None:
+        # A periodic cell matches the atoms modulo its lattice.
+        _update_array(digest, "lattice_vectors", np.asarray(cell.lattice_vectors, dtype=np.float64))
     for index, atom in enumerate(atoms):
         digest.update(f"atom:{index}:".encode())
         digest.update(str(atom.symbol).encode("utf-8"))
@@ -103,6 +107,10 @@ def _representation_key(
     if isinstance(reduction, SignedPermutationReduction):
         _update_array(digest, "operations", reduction.operations)
         _update_array(digest, "generator_bits", reduction.generator_bits)
+    translations = getattr(reduction, "translations", None)
+    if translations is not None:
+        # the half-cell translations of a cell that repeats a smaller one (absent: the key of before)
+        _update_array(digest, "translations", translations)
     _update_array(digest, "representative_rows", reduction.representative_rows)
     _update_array(digest, "full_to_wedge", reduction.full_to_wedge)
     _update_array(digest, "multiplicities", reduction.multiplicities)
@@ -271,6 +279,11 @@ def load_or_detect_reflection_reduction(
     # metadata is inspected.
     if not atoms:
         raise ValueError("axis-reflection detection requires at least one atom")
+    # A periodic grid the detector refuses is refused before a cache entry is read (a cell whose steps differ, cached
+    # under PARSEC_PERIODIC_UNEQUAL_STEPS=auto and run again with off).
+    from .axis_reflection import _lattice_period
+
+    _lattice_period(grid)
     # Hashing both full-grid coordinate arrays is needed only to address a
     # cache entry.
     key = None
@@ -364,6 +377,12 @@ def load_or_build_reflection_decomposition(
 
     key = None
     hash_seconds = 0.0
+    from .axis_reflection import PointGroupReduction
+
+    if isinstance(reduction, PointGroupReduction):
+        # The weighted sectors of a subgroup are built where they are used: the cache format holds the
+        # complete character tables of the groups of before.
+        cache_directory = None
     if cache_directory is not None:
         if reduction_key is None:
             raise ValueError(

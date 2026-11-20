@@ -239,6 +239,49 @@ class FortranReferenceTests(unittest.TestCase):
         self._run("ag2h2_tiny")
 
 
+@unittest.skipUnless(_hybrid_available(), "CUDA runtime and native extension are unavailable")
+class TetrahedralSectorForceTests(unittest.TestCase):
+    """Forces of a Td molecule in the sectors of its point group (projectors of one atom per orbit)."""
+
+    def test_forces_in_compressed_sectors_equal_the_full_grid(self) -> None:
+        from parsec_python.acceleration.Symmetry.axis_reflection import PointGroupReduction
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        problem = _translation("ge2h2_nlcc_tiny", Path(directory.name)).problem
+        # Five Ge, four of them an orbit of the group of the sectors with projectors (one atom of it in the sector
+        # operators, compress_projectors_for_sectors), the bonds stretched beyond 4.6 bohr: forces along them.
+        bond = 4.9 / np.sqrt(3.0)
+        atoms = (Atom("Ge", (0.0, 0.0, 0.0)),) + tuple(
+            Atom("Ge", (bond * x, bond * y, bond * z))
+            for x, y, z in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1))
+        )
+        problem = replace(
+            problem,
+            atoms=atoms,
+            recenter_geometry=False,
+            grid=replace(problem.grid, radius=9.0),
+            scf=replace(problem.scf, number_of_states=16),  # 20 valence electrons
+        )
+        tables = {}
+        for symmetry in ("on", "off"):
+            system = driver.prepare_single_point(problem, symmetry=symmetry)
+            system.materialize_final_wavefunctions = False
+            result = driver.run_scf(system)
+            tables[symmetry] = driver.compute_forces(system, result, symmetrize=False)
+            if symmetry == "on":
+                sectors = system.backend.symmetry_eigensolver
+                self.assertIsInstance(sectors.decomposition.reduction, PointGroupReduction)
+                self.assertGreater(int(np.max(sectors.decomposition.reduction.atom_orbit_sizes)), 1)
+                # the terms were those of the projectors of one atom per orbit
+                self.assertLess(len(sectors.projector_force_labels), len(system.nonlocal_operator.labels))
+        self.assertGreater(float(np.abs(tables["off"].total).max()), 1.0e-3)
+        np.testing.assert_allclose(
+            tables["on"].nonlocal_pseudopotential, tables["off"].nonlocal_pseudopotential, rtol=0, atol=2e-6
+        )
+        np.testing.assert_allclose(tables["on"].total, tables["off"].total, rtol=0, atol=2e-6)
+
+
 @unittest.skipUnless(_hybrid_available(), "CUDA runtime or native extension is unavailable")
 class MovedAtomTests(unittest.TestCase):
     """In-place geometry update and continued SCF, with and without sectors."""

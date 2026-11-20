@@ -445,9 +445,15 @@ The following behaviors were translated directly:
 
 ### Full grid instead of symmetry wedge
 
-Python keeps every active point and applies identity symmetry. This is
-physically the same unreduced Hamiltonian but can be much larger than PARSEC's
-default wedge. For the H2O reference:
+The readable (reference) solver keeps every active point and applies identity
+symmetry. This is physically the same unreduced Hamiltonian but can be much
+larger than PARSEC's default wedge. The accelerated driver, the default on a
+GPU, solves the orbitals in symmetry sectors instead: the abelian groups of
+signed permutations (PARSEC's wedge), the weighted one-dimensional sectors of
+a larger point group (Td and Oh clusters since 2026-11-15; D4h, D2d, C4v and
+D4 molecules since 2026-11-18), and the sectors of the point and space groups of periodic cells
+at the Gamma point and of the little groups of k-points
+(`acceleration/README.md`). For the H2O reference:
 
 - half-shifted full grid: 179,944 points
 - PARSEC symmetry wedge: 44,986 points
@@ -484,21 +490,22 @@ reached. Its 12-column Davidson work window is distinct from the six safety
 states returned to later filtering. Subsequent SCF iterations use the same
 one-pass `subspace.f90z` translation as CHEBFF.
 
-`arpack` remains an explicit but unported selection and is rejected rather
-than substituted.
+`arpack` (and `diagla`) run as well: the readable solver and, on the CuPy
+eigensolvers, a device thick-restart Lanczos in ARPACK's role
+(`acceleration/README.md`, "ARPACK, Dynamic_Diag_Tol, Fix_Number_Eigenvalues
+and the TEST mode").
 
-### Currently unsupported
+### Scope
 
-- slab and wire boundary conditions on the accelerated path (the reference
-  solver runs them, `SCF/wire_slab.py`)
-- point-group reduction and MPI distribution
-- ellipsoid and cylinder masks in the Python builder
-- spin-orbit channels and non-collinear magnetism
-- spin polarization of periodic cells
-- meta-GGA and self-consistent hybrid functionals
-- forces, stress, geometry optimization, and molecular dynamics
-- DFT+U, external fields, k-points, and complex orbitals
-- PARSEC binary restart/checkpoint compatibility
+When this document was first written, the single-point port did not support
+slab and wire boundary conditions, point-group reduction and MPI
+distribution, spin-orbit channels and non-collinear magnetism, spin
+polarization of periodic cells, meta-GGA and hybrid functionals, forces,
+geometry optimization and molecular dynamics, LDA+U, external fields,
+k-points and complex orbitals, or PARSEC's `parsec.dat` restarts. All of these
+have been implemented since; `README.md` ("Physical scope", with the list of
+what is not supported as production physics, stress among it) and
+`acceleration/README.md` describe the present scope and its limits.
 
 Sphere and box domains are implemented. POTRE files with spin-orbit channels
 or an XC label inconsistent with the selected CA/PZ-LDA or PBE family are

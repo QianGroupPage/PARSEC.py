@@ -39,6 +39,29 @@ extern "C" __global__ void matvec(int n, int width, const int* neighbors,
     if (threadIdx.x == 0) partial[blockIdx.x] = sum;
 }
 
+// The rows [offset, offset + n) of the operator, for a device that holds them
+// (CuPyMultiDeviceConjugateGradientBackend): neighbors and codes of those rows,
+// global column indices into the whole vector x, products and block partials
+// of those rows. The arithmetic of matvec, row by row and block by block.
+extern "C" __global__ void matvec_rows(int n, int offset, int width, const int* neighbors,
+    const code_t* codes, const double* palette, const double* x, double* ax,
+    double* partial, const double* state, int force) {
+    if (!force && state[4] != 0.0) return;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    double value = 0.0, dot = 0.0;
+    if (i < n) {
+        for (int slot = 0; slot < width; ++slot) {
+            long long at = (long long)slot * n + i;
+            int j = neighbors[at];
+            if (j >= 0) value += palette[codes[at]] * x[j];
+        }
+        ax[i] = value;
+        dot = x[offset + i] * value;
+    }
+    double sum = block_sum(dot);
+    if (threadIdx.x == 0) partial[blockIdx.x] = sum;
+}
+
 extern "C" __global__ void residual(int n, const double* b, const double* ax,
     double* r, double* p, double* partial) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

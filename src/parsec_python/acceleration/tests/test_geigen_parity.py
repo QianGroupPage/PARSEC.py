@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -308,23 +309,32 @@ class AcceleratedCalculationTests(unittest.TestCase):
         reference_directory.mkdir()
         code, error = _run(_write(reference_directory, solver="arpack"), reference=True)
         self.assertEqual(code, 0, error)
-        path = _write(self.directory, solver="arpack")
-        code, error = _run(path)
-        self.assertEqual(code, 0, error)
-        self.assertNotIn("reference parsec_python.cli solver", error)
-        accelerated, reference = _archive(self.directory), _archive(reference_directory)
-        self.assertEqual(str(accelerated["backend_selected"]), "cupy")
-        self.assertLess(
-            abs(float(accelerated["energy_total_ry"]) - float(reference["energy_total_ry"])), 1.0e-7
-        )
-        np.testing.assert_allclose(
-            accelerated["eigenvalues_ry"], reference["eigenvalues_ry"], atol=1.0e-6
-        )
-        log = (path.parent / "parsec.out").read_text()
-        # H2 on the z axis: the eight sectors of D_2h, each counted.
-        counts = [line for line in log.splitlines() if "converged eigen-pairs" in line]
-        self.assertTrue(counts)
-        self.assertEqual(len(counts[0].split(":")[1].split()), 8)
+        reference = _archive(reference_directory)
+        # H2 on the z axis has D_4h on the grid.  Its weighted sectors (PARSEC_ORBITAL_GROUP_MAX_COST, 0.75 by
+        # default since 2026-11-18) are six: the two partners of the E levels of D_4h merged into one sector of
+        # weight 2, for g and u.  At 0.5 the orbitals keep the eight sectors of D_2h, as before.  Every sector is
+        # counted; States_Num 4 holds the pi_u pair whole, so both lists are those of the full grid.
+        for cost, sectors in (("", 6), ("0.5", 8)):
+            with self.subTest(cost=cost), patch.dict(os.environ, {"PARSEC_ORBITAL_GROUP_MAX_COST": cost}):
+                directory = self.directory / f"cost{cost or 'default'}"
+                directory.mkdir()
+                path = _write(directory, solver="arpack")
+                code, error = _run(path)
+                self.assertEqual(code, 0, error)
+                self.assertNotIn("reference parsec_python.cli solver", error)
+                accelerated = _archive(directory)
+                self.assertEqual(str(accelerated["backend_selected"]), "cupy")
+                self.assertLess(
+                    abs(float(accelerated["energy_total_ry"]) - float(reference["energy_total_ry"])), 1.0e-7
+                )
+                np.testing.assert_allclose(
+                    accelerated["eigenvalues_ry"], reference["eigenvalues_ry"], atol=1.0e-6
+                )
+                log = (path.parent / "parsec.out").read_text()
+                self.assertEqual("weights 1, 1, 2, 1, 1, 2" in log, sectors == 6)
+                counts = [line for line in log.splitlines() if "converged eigen-pairs" in line]
+                self.assertTrue(counts)
+                self.assertEqual(len(counts[0].split(":")[1].split()), sectors)
 
     def test_dynamic_tolerance_reaches_the_device_chebdav(self) -> None:
         from parsec_python.acceleration import driver

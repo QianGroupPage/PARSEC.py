@@ -29,6 +29,7 @@ from parsec_python.Forces import (
     nonlocal_forces,
     point_charge_forces,
 )
+from parsec_python.Forces.symmetry import symmetrize_forces
 from parsec_python.Forces.total import embedding_force_fields
 
 
@@ -68,17 +69,22 @@ def _nonlocal_forces(system, result, clock: dict) -> np.ndarray:
     if channels is not None:
         return _spin_nonlocal_forces(system, channels, operator, atom_count)
 
-    sectors = getattr(system.backend, "symmetry_eigensolver", None)
+    sectors = getattr(getattr(system, "backend", None), "symmetry_eigensolver", None)
     if sectors is not None:
         # Sector labels of the reference result are PARSEC's, from one.
         representations = np.asarray(result.representations, dtype=np.int32) - 1
+        solved = getattr(result, "sector_states", None)
+        if solved is not None:
+            # Weighted sectors: the states they solved, each with its occupation times its weight.
+            representations = np.asarray(solved[0], dtype=np.int32) - 1
+            occupations = np.asarray(solved[1], dtype=np.float64)
         terms = sectors.projector_force_terms(
             representations, sector_columns(representations), occupations
         )
         # What this process spent inside its own part of the command.
         for name, seconds in (getattr(sectors, "force_phase_seconds", None) or {}).items():
             clock[f"nonlocal_{name}"] = seconds
-        return _atom_sums(terms, operator.labels, atom_count)
+        return _sector_atom_forces(system, sectors, terms, operator, atom_count)
 
     gradients = system.projector_gradients()
     device_solver = getattr(system.eigenproblem_solver, "solver", None)
@@ -101,6 +107,30 @@ def _nonlocal_forces(system, result, clock: dict) -> np.ndarray:
     return nonlocal_forces(
         operator, gradients, result.wavefunctions, occupations, atom_count
     )
+
+
+def _sector_atom_forces(system, sectors, terms: np.ndarray, operator, atom_count: int) -> np.ndarray:
+    """The nonlocal force terms of the projectors of the sector operators, summed per atom.
+
+    The sector operators may hold the projectors of one atom per orbit of the group of the sectors
+    (:func:`..Symmetry.axis_reflection.compress_projectors_for_sectors`): the terms then belong to the labels of their
+    gradients (``projector_force_labels``), each ``n_a`` times the term of one atom of its orbit, and the average over
+    the full group of a :class:`..Symmetry.axis_reflection.PointGroupReduction` gives every atom its term and the
+    partners of the weighted levels theirs (:mod:`.sector_symmetry`), whatever the symmetrization asked for; the
+    average over the group of Abelian sectors with such projectors gives every atom of an orbit its term
+    (:func:`.sector_symmetry.abelian_orbit_operations`).
+    """
+
+    from .sector_symmetry import abelian_orbit_operations, sector_force_operations
+
+    labels = getattr(sectors, "projector_force_labels", None)
+    forces = _atom_sums(terms, operator.labels if not labels else labels, atom_count)
+    operations = sector_force_operations(system)
+    if operations is None:
+        operations = abelian_orbit_operations(system)
+    if operations is not None:
+        forces = symmetrize_forces(forces, operations)
+    return forces
 
 
 def _spin_nonlocal_forces(system, channels, operator, atom_count: int) -> np.ndarray:
@@ -126,7 +156,9 @@ def _spin_nonlocal_forces(system, channels, operator, atom_count: int) -> np.nda
                     0.5 * np.asarray(channel.occupations, dtype=np.float64),
                 )
             )
-        return _atom_sums(sectors.spin_projector_force_terms(selections), operator.labels, atom_count)
+        return _sector_atom_forces(
+            system, sectors, sectors.spin_projector_force_terms(selections), operator, atom_count
+        )
     gradients = system.projector_gradients()
     for_channel = getattr(system.eigenproblem_solver, "for_spin_channel", None)
     device_operator = getattr(system.backend, "device_operator", None)
@@ -214,14 +246,32 @@ def compute_periodic_forces(
     the host.  The local ionic and core-correction forces are the ball sums and the one FFT of
     :func:`.periodic_local.fast_periodic_local_forces`, on the GPU when the calculation ran on one.  The nonlocal term is
     contracted where the orbitals are, as for an isolated structure, with the gradients of the periodic projectors.
-    A crystal has no symmetrization here, no torque, and its net force is removed.
+    A crystal has no torque, and its net force is removed.  A cell solved in the sectors of a point group with
+    weighted representations (:class:`..Symmetry.axis_reflection.PointGroupReduction`, one partner of each degenerate
+    level solved) has its nonlocal term completed by the average over the full group ``G`` of the reduction, its
+    translations included (:mod:`.sector_symmetry`), and the total averaged over ``G`` (or over ``operations``);
+    otherwise a crystal has no symmetrization here.  The density and exchange-correlation potential of such a run are
+    averaged over ``G``, so its local terms are those of one atom per orbit of ``G`` turned onto the others
+    (:func:`.periodic_local.orbit_periodic_local_forces`, ``PARSEC_PERIODIC_SECTOR_LOCAL_FORCES``), and
+    ``phase_seconds["local_ewald_asymmetry"]`` (Ry/bohr) reports how much the average over the group changed the
+    Ewald and local terms.
     """
 
-    if symmetrize or operations:
+    from .sector_symmetry import abelian_cell_operations, sector_force_operations
+
+    completion = sector_force_operations(system)
+    # A cell in the sectors of an Abelian group solves every level: its forces need no completion, but a relaxation
+    # averages them (and its moved positions) over that group, so that atoms the group fixes stay on it.
+    abelian = abelian_cell_operations(system) if completion is None and (symmetrize or operations) else None
+    if (symmetrize or operations) and completion is None and abelian is None:
         raise ValueError(
             "a periodic cell has no symmetrized forces: its structure is not reduced by space-group operations"
         )
-    from .periodic_local import fast_periodic_local_forces
+    from .periodic_local import (
+        fast_periodic_local_forces,
+        orbit_periodic_local_forces,
+        periodic_sector_local_forces_setting,
+    )
 
     started = perf_counter()
     clock: dict[str, float] = {}
@@ -242,18 +292,46 @@ def compute_periodic_forces(
         result.density,
         result.xc_potential,
     )
+    # In sectors the density and the exchange-correlation potential are averaged over G (PARSEC_PERIODIC_SECTOR_
+    # LOCAL_FORCES=orbits): the local terms of one atom per orbit of G, turned onto the others.
+    orbits = completion is not None and periodic_sector_local_forces_setting() == "orbits"
+    site_asymmetry = 0.0
+
+    def local_terms():
+        if orbits:
+            return orbit_periodic_local_forces(*arguments, completion, xp=xp, erf=erf)
+        if device is None:
+            return fast_periodic_local_forces(*arguments), None
+        return fast_periodic_local_forces(*arguments, xp=xp, erf=erf), None
+
     if device is None:
-        local = fast_periodic_local_forces(*arguments)
+        local, details = local_terms()
     else:
         with xp.cuda.Device(device):
-            local = fast_periodic_local_forces(*arguments, xp=xp, erf=erf)
+            local, details = local_terms()
+    if details is not None:
+        site_asymmetry = details["site_asymmetry"]
     clock["local"] = perf_counter() - mark
     mark = perf_counter()
     separable = _nonlocal_forces(system, result, clock)
+    averaged_over = None
+    if completion is not None:
+        # The nonlocal term is complete over G already (_sector_atom_forces); the total is averaged over G too.
+        averaged_over = tuple(operations) if operations else completion
+    elif abelian is not None:
+        averaged_over = tuple(operations) if operations else abelian
     clock["nonlocal"] = perf_counter() - mark
     forces = assemble_forces(
-        positions, repulsion, local, separable, None, phase_seconds=clock, periodic=True
+        positions, repulsion, local, separable, averaged_over, phase_seconds=clock, periodic=True
     )
+    if completion is not None:
+        # What the average over the group changed (Ry/bohr, not seconds): the asymmetry of the Ewald and local terms
+        # (the nonlocal term is averaged already), with that of the local forces of the orbits (the representatives in
+        # their site groups, a few other atoms against their turned values); round-off where the density is invariant,
+        # as it is in sectors.
+        clock["local_ewald_asymmetry"] = max(
+            site_asymmetry, float(np.max(np.abs(forces.unsymmetrized - forces.symmetrized), initial=0.0))
+        )
     return replace(forces, seconds=perf_counter() - started)
 
 
@@ -274,6 +352,18 @@ def compute_forces(
     """
 
     if getattr(system.input, "periodic_cell", None) is not None:
+        sectors = getattr(getattr(system, "backend", None), "symmetry_eigensolver", None)
+        decomposition = getattr(sectors, "decomposition", None)
+        if (
+            decomposition is not None
+            and int(decomposition.reduction.group_order) > 1
+            and uses_fortran_routines(system.grid)
+        ):
+            # The Fortran-derived routines read the orbitals and density of a cell on the full grid.
+            raise NotImplementedError(
+                "the forces of a periodic cell of the Fortran-derived routines solved in the sectors of its point "
+                "group are not implemented: prepare it with symmetry='off' or PARSEC_PERIODIC_SYMMETRY=off"
+            )
         if uses_fortran_routines(system.grid):
             # The Fortran-derived routines (Use_Fortran_Routines): the device builders of
             # their Ewald terms and projectors with their lattice images.
@@ -338,6 +428,14 @@ def compute_forces(
     clock["local"] = perf_counter() - mark
     mark = perf_counter()
     separable = _nonlocal_forces(system, result, clock)
+    sectors = getattr(getattr(system, "backend", None), "symmetry_eigensolver", None)
+    if symmetrize and hasattr(getattr(getattr(sectors, "decomposition", None), "reduction", None), "coset_images"):
+        # The one-dimensional sectors of a subgroup of the point group solve one partner of some degenerate
+        # levels (weighted in the occupations): the nonlocal term of all partners is its average over the
+        # full point group, which the total gets below in any case and its report gets here.
+        if operations is None:
+            operations = atom_symmetry_operations(atoms)
+        separable = symmetrize_forces(separable, operations)
     clock["nonlocal"] = perf_counter() - mark
     mark = perf_counter()
     corrections = correction_forces(system, result)

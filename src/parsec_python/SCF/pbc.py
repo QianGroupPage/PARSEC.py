@@ -48,7 +48,7 @@ from ..V_ion import (
     normalize_density,
     superpose_atomic_density,
 )
-from ..V_ion.gspace_local import periodic_alpha_energy, periodic_local_ionic_potential
+from ..V_ion.gspace_local import fortran_first_step, periodic_alpha_energy, periodic_local_ionic_potential
 from ..V_xc import (
     NoncollinearXCResult,
     SpinPolarizedXCResult,
@@ -600,6 +600,26 @@ def atom_outside_cell(lattice_vectors: np.ndarray, atoms) -> Atom | None:
     return None
 
 
+def atoms_for_cell_builders(lattice_vectors: np.ndarray, atoms) -> tuple:
+    """The atoms the builders of a 3-D cell on the default routines take: those given, folded into the cell.
+
+    An atom inside the cell (the test of :func:`atom_outside_cell`) is taken as it is: where all are, the atoms are
+    returned unchanged, bit for bit as before.  Where one lies outside, the builders get the atoms folded into the
+    cell by lattice vectors (:func:`fold_atoms_into_cell`), which changes no periodic sum, as they do after every
+    move of a relaxation or a dynamics step (:attr:`PeriodicPreparedSinglePointSystem.cell_atoms`); the prepared
+    system keeps the coordinates as given.  Such coordinates come from a ``relax_restart.dat`` or an ``mdinit.dat``
+    of a run that moved an atom across a face of the cell (the run itself kept them, so that the optimizer and the
+    integrator see continuous coordinates; their state in those files refers to them), or from a caller.  Up to
+    2026-11-18 any atom outside was refused, up to 2026-11-19 one more than 1e-6 bohr outside a face; the
+    Fortran-derived routines take such coordinates as they are (translated into the cell, ``wrap_into_cell``).
+    """
+
+    atoms = tuple(atoms)
+    if atom_outside_cell(lattice_vectors, atoms) is None:
+        return atoms
+    return fold_atoms_into_cell(atoms, np.asarray(lattice_vectors, dtype=np.float64))
+
+
 def _prepare_fortran_periodic_single_point(
     problem: SinglePointInput,
 ) -> PeriodicPreparedSinglePointSystem:
@@ -652,15 +672,10 @@ def _prepare_fortran_periodic_single_point(
     grid = build_periodic_grid(problem.periodic_cell, problem.grid)
     grid_seconds = time.perf_counter() - stage_start
     # Alpha_Filter/Core_Filter: inipbc.f90 filters the radial tables with the
-    # final grid spacing grid%step(1) (fourier_f.f90); a general grid has one
-    # step per lattice direction.
-    filter_spacing = (
-        float(grid.spacings[0])
-        if getattr(grid, "is_general_periodic", False)
-        else grid.spacing
-    )
+    # final grid spacing grid%step(1) (fourier_f.f90): the step along the first
+    # lattice direction, which need not be the shortest one.
     pseudopotentials = apply_fourier_filters(
-        pseudopotentials, problem.pseudopotentials, filter_spacing
+        pseudopotentials, problem.pseudopotentials, fortran_first_step(grid)
     )
     # Every periodic sum runs over lattice images, so an atom outside the
     # cell is translated into it by lattice vectors (Fortran PARSEC takes
@@ -1183,6 +1198,12 @@ def update_periodic_geometry(system: PeriodicPreparedSinglePointSystem, atoms) -
     coordinates); the builders get them folded into the cell (:attr:`PeriodicPreparedSinglePointSystem.cell_atoms`).
 
     A system of the Fortran-derived routines goes to :func:`fortran_update_periodic_geometry`.
+
+    A system without a local ionic potential (``ionic_potential is None``: the orbital operators alone, which an MPI
+    rank that shares the basis of a sector prepares, ``acceleration.driver._prepare_periodic_orbital_operators``) gets
+    the projectors of the moved atoms alone: ``nonloc`` of ``parsec.F90`` after ``domove`` with the atoms folded into
+    the cell as :attr:`PeriodicPreparedSinglePointSystem.cell_atoms` folds them, on the same grid and with the same
+    arguments as that preparation.  Its other fields stay as they were (``None``, and NaN for the energies).
     """
 
     if uses_fortran_routines(system.grid):
@@ -1192,6 +1213,23 @@ def update_periodic_geometry(system: PeriodicPreparedSinglePointSystem, atoms) -
     if len(atoms) != len(system.atoms) or any(new.symbol != old.symbol for new, old in zip(atoms, system.atoms)):
         raise ValueError("moved atoms must keep their number, order and species")
     problem = replace(system.input, atoms=atoms)
+    if system.ionic_potential is None:
+        # The orbital operators of a sector rank: the projectors alone (the fields of the SCF loop are the root's).
+        moved = replace(system, input=problem, atoms=atoms)
+        nonlocal_operator = build_nonlocal_projectors(
+            system.grid,
+            moved.cell_atoms,
+            system.pseudopotentials,
+            problem.pseudopotentials,
+            problem.periodic_cell.lattice_vectors,
+            periodic_dimensions=problem.periodic_cell.dimensions,
+        )
+        seconds = time.perf_counter() - started
+        return replace(
+            moved,
+            nonlocal_operator=nonlocal_operator,
+            timings=PreparationTimings(nonlocal_ionic_seconds=seconds, total_seconds=seconds),
+        )
     folded = fold_atoms_into_cell(atoms, problem.periodic_cell.lattice_vectors)
     terms = _geometry_terms(
         problem,
@@ -1212,6 +1250,8 @@ def update_periodic_geometry(system: PeriodicPreparedSinglePointSystem, atoms) -
 
 def prepare_periodic_single_point(
     problem: SinglePointInput,
+    *,
+    negative_laplacian_builder=None,
 ) -> PeriodicPreparedSinglePointSystem:
     """Build every static periodic component, but do not enter the SCF loop.
 
@@ -1222,10 +1262,17 @@ def prepare_periodic_single_point(
     bohr with each component in ``[0, side_length)`` -- since this path does
     not recenter geometry the way the isolated path does (that convention
     is specific to a sphere/box centered on the origin, and would be wrong
-    here).
+    here).  An atom of a 3-D cell outside it (a ``relax_restart.dat`` or an
+    ``mdinit.dat`` of an atom that crossed a face) is folded into the cell
+    for the builders, and ``system.atoms`` keeps it as given, as after a move
+    (:func:`atoms_for_cell_builders`).  The parser still sends an input file
+    whose atoms lie outside the cell to the Fortran-derived routines; a
+    restart file does not change the routines of its input.
 
     These are Andrew Grieder's routines, the default; ``problem.grid.fortran_routines``
     (``Use_Fortran_Routines``) selects :func:`_prepare_fortran_periodic_single_point`.
+    ``negative_laplacian_builder(grid)`` replaces :func:`~..Laplacian.build_negative_laplacian` (the accelerated
+    driver's deferred descriptor of the same matrix).
     """
     if problem.periodic_cell is None:
         raise ValueError("prepare_periodic_single_point requires problem.periodic_cell")
@@ -1254,33 +1301,29 @@ def prepare_periodic_single_point(
     grid_seconds = time.perf_counter() - stage_start
     lattice_vectors = problem.periodic_cell.lattice_vectors
     dimensions = problem.periodic_cell.dimensions
-    orthorhombic = np.allclose(lattice_vectors, np.diag(np.diag(lattice_vectors)), atol=1.0e-10)
-    side_lengths = np.diag(lattice_vectors)
-    inverse_lattice = None if orthorhombic else np.linalg.inv(lattice_vectors)
-    for atom in atoms:
-        position = np.asarray(atom.position, dtype=float)
-        if dimensions == 2:
+    # The atoms of the builders: those of the problem, folded into a 3-D cell where one lies outside (a
+    # relax_restart.dat or mdinit.dat of an atom that crossed a face; atoms_for_cell_builders); the system keeps the
+    # problem's.  A slab's atoms must lie inside its cell.
+    builder_atoms = atoms
+    if dimensions == 2:
+        for atom in atoms:
+            position = np.asarray(atom.position, dtype=float)
             # in-plane fractional coordinates in [0, 1); along z the atom must sit inside the box
             fraction = position[:2] @ np.linalg.inv(lattice_vectors[:2, :2])
             outside = np.any(fraction < -1.0e-12) or np.any(fraction >= 1.0 + 1.0e-12)
-            outside = outside or abs(position[2]) >= 0.5 * lattice_vectors[2, 2]
-            where = "the slab cell (in-plane fractional coordinates in [0, 1), |z| < R)"
-        elif orthorhombic:
-            outside = np.any(position < 0.0) or np.any(position >= side_lengths)
-            where = f"cell [0, {side_lengths.tolist()})"
-        else:
-            fraction = position @ inverse_lattice
-            outside = np.any(fraction < -1.0e-12) or np.any(fraction >= 1.0 + 1.0e-12)
-            where = "the cell (fractional coordinates in [0, 1))"
-        if outside:
-            raise ValueError(
-                f"atom {atom.symbol} at {position} lies outside the periodic "
-                f"{where}; this path does not "
-                "recenter geometry the way the isolated path does"
-            )
+            if outside or abs(position[2]) >= 0.5 * lattice_vectors[2, 2]:
+                raise ValueError(
+                    f"atom {atom.symbol} at {position} lies outside the periodic slab cell (in-plane fractional "
+                    "coordinates in [0, 1), |z| < R); this path does not recenter geometry the way the isolated "
+                    "path does"
+                )
+    else:
+        builder_atoms = atoms_for_cell_builders(lattice_vectors, atoms)
 
     stage_start = time.perf_counter()
-    negative_laplacian = build_negative_laplacian(grid)
+    negative_laplacian = (
+        build_negative_laplacian if negative_laplacian_builder is None else negative_laplacian_builder
+    )(grid)
     # Only needed for k-point sampling's -2i*k.grad kinetic term
     # (Hamiltonian.kpoint_operator), bands and meta-GGAs: built when one
     # reads it, so that a Gamma-point run does not hold it.
@@ -1290,7 +1333,7 @@ def prepare_periodic_single_point(
     # 3. The terms that depend on the positions: local and Kleinman--Bylander nonlocal ionic terms, the starting and
     # core densities, the ion--ion energy.
     terms = _geometry_terms(
-        problem, grid, atoms, pseudopotentials, electron_count, negative_laplacian=negative_laplacian
+        problem, grid, builder_atoms, pseudopotentials, electron_count, negative_laplacian=negative_laplacian
     )
     atomic_reference_correction = float(
         sum(
@@ -1335,6 +1378,7 @@ __all__ = [
     "LazyGradient",
     "PeriodicPreparedSinglePointSystem",
     "atom_outside_cell",
+    "atoms_for_cell_builders",
     "fold_atoms_into_cell",
     "zero_average_local_potential",
     "fortran_update_periodic_geometry",

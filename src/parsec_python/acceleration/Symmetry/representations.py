@@ -37,6 +37,7 @@ from parsec_python.V_ion import NonlocalProjectorOperator
 
 from .axis_reflection import (
     AxisReflectionReduction,
+    PointGroupReduction,
     SignedPermutationReduction,
     _RowOrderTable,
     _fast_maps_requested,
@@ -120,18 +121,21 @@ def _representative_images(
         # Nothing to read off: a whole-grid map would be gathered through the
         # coordinates of every point instead of the representatives.
         table = None
+    translations = getattr(reduction, "translations", None)
     for index, operation in enumerate(operations):
         mapping = None
+        # r -> R r + t in a cell that repeats a smaller one (PointGroupReduction.translations)
+        translation = None if translations is None else translations[index]
         # The identity is its own shortcut: the representatives themselves.
         if table is not None and not np.array_equal(operation, np.eye(3)):
             whole = _grid_row_mapping_operation(
-                grid, operation, 1.0e-10, table=table
+                grid, operation, 1.0e-10, table=table, translation=translation
             )
             if whole is not None:
                 mapping = whole[reduction.representative_rows]
         if mapping is None:
             mapping = _grid_row_mapping_operation(
-                grid, operation, 1.0e-10, reduction.representative_rows
+                grid, operation, 1.0e-10, reduction.representative_rows, translation=translation
             )
         if mapping is None:
             raise RuntimeError("accepted symmetry operation no longer maps the grid")
@@ -159,6 +163,20 @@ class ReflectionRepresentationDecomposition:
     @property
     def full_size(self) -> int:
         return self.reduction.full_size
+
+    @property
+    def sector_weights(self) -> np.ndarray:
+        """How many states each state of every sector counts for: 1 for the groups of before.
+
+        A :class:`.axis_reflection.PointGroupReduction` solves the one-dimensional sectors of a subgroup of
+        the full point group only; a state of one counts for the partners of its level that no solved
+        sector holds (:mod:`.orbital_groups`).
+        """
+
+        weights = getattr(self.reduction, "sector_weights", None)
+        if weights is None:
+            return np.ones(self.representation_count, dtype=np.int64)
+        return np.asarray(weights, dtype=np.int64)
 
     @property
     def wedge_size(self) -> int:
@@ -221,7 +239,11 @@ class ReflectionRepresentationDecomposition:
         # (AxisReflectionReduction.identity, PARSEC_CUPY_SINGLE_SECTOR).
         character_rows: list[np.ndarray] = []
         seen: set[bytes] = set()
-        if isinstance(reduction, SignedPermutationReduction):
+        if isinstance(reduction, PointGroupReduction):
+            # The real one-dimensional characters of the chosen subgroup that are solved
+            # (orbital_groups.orbital_group_plan): fewer than its order where it is not abelian.
+            character_rows = list(np.asarray(reduction.sector_characters, dtype=np.int8))
+        elif isinstance(reduction, SignedPermutationReduction):
             # For C2^k, chi_p(g_b)=(-1)^(p dot b).  These are all |G|
             # mutually orthogonal real one-dimensional characters.
             rank = int(reduction.generator_bits.shape[1])
@@ -247,10 +269,11 @@ class ReflectionRepresentationDecomposition:
                     seen.add(key)
                     character_rows.append(character)
         characters = np.ascontiguousarray(np.vstack(character_rows), dtype=np.int8)
-        if characters.shape != (order, order):
+        rows = order if not isinstance(reduction, PointGroupReduction) else characters.shape[0]
+        if characters.shape != (rows, order):
             raise RuntimeError("failed to construct the reflection character table")
         gram = characters.astype(np.int64) @ characters.astype(np.int64).T
-        if not np.array_equal(gram, order * np.eye(order, dtype=np.int64)):
+        if not np.array_equal(gram, order * np.eye(rows, dtype=np.int64)):
             raise RuntimeError("reflection characters are not orthogonal")
 
         representatives = reduction.representative_rows
@@ -471,6 +494,49 @@ class ReflectionRepresentationDecomposition:
                 assembled[index] = reduced
         return tuple(assembled)
 
+    def reduce_hermitian_operators(
+        self,
+        operator: sp.spmatrix,
+        representations: Sequence[int] | None = None,
+    ) -> tuple[sp.csr_matrix | None, ...]:
+        """``U_Gamma.T A U_Gamma`` of a complex Hermitian ``A`` that commutes with the operations.
+
+        The basis ``U_Gamma`` of a sector is real (the characters are +-1), so the projection of a complex operator
+        is that of :meth:`reduce_operators` on its complex entries: the same rows, phases and normalization, a
+        Hermitian sector matrix (checked).  The operators of a k-point (:mod:`..SCF.kpoint_sectors`).
+        """
+
+        wanted = self._selected_representations(representations)
+        matrix = sp.csr_matrix(operator, dtype=np.complex128)
+        if matrix.shape != (self.full_size, self.full_size):
+            raise ValueError("operator does not match the representation grid")
+        matrix.sum_duplicates()
+        matrix.sort_indices()
+        selected = matrix[self.reduction.representative_rows, :].tocoo(copy=False)
+        sectors: list[sp.csr_matrix | None] = [None] * self.representation_count
+        for index in wanted:
+            row_orbits = selected.row
+            sector_rows = self.orbit_to_sector[index, row_orbits]
+            column_orbits = self.reduction.full_to_wedge[selected.col]
+            sector_columns = self.orbit_to_sector[index, column_orbits]
+            keep = (sector_rows >= 0) & (sector_columns >= 0)
+            normalization = np.sqrt(
+                self.reduction.multiplicities[row_orbits[keep]] / self.reduction.multiplicities[column_orbits[keep]]
+            )
+            data = selected.data[keep] * self.phases[index, selected.col[keep]] * normalization
+            size = self.sector_size(index)
+            reduced = sp.coo_matrix((data, (sector_rows[keep], sector_columns[keep])), shape=(size, size)).tocsr()
+            reduced.sum_duplicates()
+            reduced.eliminate_zeros()
+            reduced.sort_indices()
+            difference = reduced - reduced.conj().T
+            maximum = float(np.max(np.abs(difference.data))) if difference.nnz else 0.0
+            scale = float(np.max(np.abs(reduced.data), initial=1.0))
+            if maximum > 5.0e-13 * scale:
+                raise ValueError(f"representation operator is not Hermitian: maximum asymmetry {maximum:.3e}")
+            sectors[index] = reduced
+        return tuple(sectors)
+
     def _assemble_reduced_operator(
         self,
         selected: sp.coo_matrix,
@@ -553,7 +619,10 @@ class ReflectionRepresentationDecomposition:
         """
 
         wanted = self._selected_representations(representations)
-        projectors = sp.coo_matrix(operator.projectors, dtype=np.float64)
+        # (complex where the projectors are those of a k-point: the real basis of a sector keeps their phases)
+        projectors = sp.coo_matrix(
+            operator.projectors, dtype=np.result_type(operator.projectors.dtype, np.float64)
+        )
         projectors.sum_duplicates()
         workers = operator_build_workers(len(wanted))
 

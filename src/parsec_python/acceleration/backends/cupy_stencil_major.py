@@ -45,6 +45,19 @@ from .stencil_pipeline import (
 )
 
 
+# The kernels read every coefficient through a one-byte code (``unsigned char`` here and in cupy_compact,
+# implicit_stencil and stencil_pipeline): a packed stencil holds at most this many distinct values.
+PALETTE_CAPACITY = 256
+
+
+class PaletteOverflow(ValueError):
+    """A stencil has more distinct coefficients than its palette holds (:data:`PALETTE_CAPACITY`).
+
+    A ``ValueError``, as before; not a ``SectorStencilUnavailable`` of the direct sector builder, whose CSR route packs
+    the same values into the same palette.
+    """
+
+
 _CUDA_SOURCE = r"""
 extern "C" __global__
 void stencil_major_spmm6(
@@ -309,7 +322,7 @@ def _stencil_major_metadata(
         raise ValueError("stencil-major CUDA storage requires int32 grid rows")
     encoded = _coefficient_palette(host.data)
     if encoded is None:
-        raise ValueError("finite-difference operator has more than 256 coefficients")
+        raise PaletteOverflow(f"finite-difference operator has more than {PALETTE_CAPACITY} coefficients")
     palette, csr_codes = encoded
 
     row_count = int(host.shape[0])
@@ -803,7 +816,9 @@ class CuPyStencilMajorFiniteDifference:
         return output[:, 0] if was_vector else output
 
 __all__ = [
+    "PALETTE_CAPACITY",
     "CuPyStencilMajorFiniteDifference",
+    "PaletteOverflow",
     "StencilMajorHostMetadata",
     "build_stencil_major_metadata",
 ]

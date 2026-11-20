@@ -141,11 +141,20 @@ class ModeTests(unittest.TestCase):
         if cupy_available():
             for mode in ("auto", "device"):
                 with mock.patch.dict(os.environ, {periodic_device.MODE_ENV: mode, "PARSEC_KPOINT_BACKEND": "cupy"}):
+                    # the FFT of the stencil symbol by default since 2026-11-16, the CG with ``cg``
                     self.assertEqual(
                         periodic_device.describe_periodic_hartree(system, "old text"),
-                        "periodic conjugate-gradient solve, CuPy float64 on the device "
-                        f"({periodic_device.MODE_ENV}={mode}; SCF.pbc.solve_periodic_hartree)",
+                        "periodic finite-difference solve by the FFT of its stencil symbol, CuPy float64 on the "
+                        f"device ({periodic_device.MODE_ENV}={mode}, {periodic_device.METHOD_ENV}=fft; "
+                        "SCF.pbc.solve_periodic_hartree)",
                     )
+                    with mock.patch.dict(os.environ, {periodic_device.METHOD_ENV: "cg"}):
+                        self.assertEqual(
+                            periodic_device.describe_periodic_hartree(system, "old text"),
+                            "periodic conjugate-gradient solve, CuPy float64 on the device "
+                            f"({periodic_device.MODE_ENV}={mode}, {periodic_device.METHOD_ENV}=cg; "
+                            "SCF.pbc.solve_periodic_hartree)",
+                        )
         general = SimpleNamespace(
             grid=SimpleNamespace(is_general_periodic=True),
             input=SimpleNamespace(hartree=HartreeSettings()),
@@ -268,11 +277,46 @@ class DeviceSolveTests(unittest.TestCase):
         settings = HartreeSettings(relative_tolerance=1.0e-12)
         with mock.patch.dict(os.environ, {periodic_device.MODE_ENV: "host"}):
             host = solve_periodic_hartree(density, grid, laplacian, settings, None)
-        with mock.patch.dict(os.environ, {**_DEVICE, periodic_device.MODE_ENV: "device"}):
-            self.assertIsNotNone(periodic_device.periodic_device_solver(grid, laplacian, settings))
-            device = solve_periodic_hartree(density, grid, laplacian, settings, 0.3 * density)
-        np.testing.assert_allclose(device.potential, host.potential, rtol=0, atol=1.0e-10 * np.max(np.abs(host.potential)))
-        self.assertAlmostEqual(float(np.mean(device.potential)), 0.0, places=12)
+        for method in ("fft", "cg"):
+            periodic_device.clear_cache()
+            with self.subTest(method=method), mock.patch.dict(
+                os.environ, {**_DEVICE, periodic_device.MODE_ENV: "device", periodic_device.METHOD_ENV: method}
+            ):
+                solver = periodic_device.periodic_device_solver(grid, laplacian, settings)
+                self.assertEqual(solver.method, method)
+                device = solve_periodic_hartree(density, grid, laplacian, settings, 0.3 * density)
+                np.testing.assert_allclose(
+                    device.potential, host.potential, rtol=0, atol=1.0e-10 * np.max(np.abs(host.potential))
+                )
+                self.assertAlmostEqual(float(np.mean(device.potential)), 0.0, places=12)
+                self.assertTrue(device.converged)
+                self.assertEqual(device.iterations == 0, method == "fft")
+
+    def test_the_stencil_symbol_solves_the_finite_difference_equation(self) -> None:
+        """The FFT of the stencil symbol: the exact solution of the CG's linear system, to round-off."""
+
+        from parsec_python.Hartree.pbc import _solve_by_fourier_transform
+
+        for sides, order in (((5.0, 6.0, 7.0), 4), ((7.5, 7.5, 9.5), 12)):
+            grid = build_periodic_grid(PeriodicCell(np.diag(sides)), PeriodicGridSettings(spacing=0.5, expansion_order=order))
+            laplacian = build_negative_laplacian(grid)
+            density = _gaussian(grid, grid.coordinates[grid.size // 5]) + 0.01
+            settings = HartreeSettings()
+            exact = _solve_by_fourier_transform(density, grid, laplacian, settings, None, raise_on_nonconvergence=True)
+            periodic_device.clear_cache()
+            with self.subTest(shape=tuple(grid.points_per_axis)), mock.patch.dict(os.environ, _DEVICE):
+                device = solve_periodic_hartree(density, grid, laplacian, settings, 0.2 * density)
+                np.testing.assert_allclose(
+                    device.potential, exact.potential, rtol=0, atol=1.0e-12 * np.max(np.abs(exact.potential))
+                )
+                rhs = 8.0 * np.pi * (density - np.mean(density))
+                residual = np.linalg.norm(rhs - laplacian @ device.potential)
+                self.assertLess(residual, 1.0e-11 * np.linalg.norm(rhs))
+                self.assertAlmostEqual(device.residual_norm, residual, delta=1.0e-11 * np.linalg.norm(rhs))
+                self.assertEqual((device.iterations, device.matrix_vector_products), (0, 0))
+        with mock.patch.dict(os.environ, {periodic_device.METHOD_ENV: "jacobi"}):
+            with self.assertRaises(ValueError):
+                periodic_device.periodic_hartree_method()
 
 
 def _write_input(folder: Path, text: str) -> Path:
@@ -569,8 +613,10 @@ class PeriodicSpinXCTests(unittest.TestCase):
     def test_ca_pbe_and_spinors_keep_the_host(self) -> None:
         from parsec_python.acceleration.V_xc import periodic_xc
 
-        with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "auto"}):
+        # CA-LSD took the device on 2026-11-18 (test_periodic_ca_device); PARSEC_PERIODIC_CA_XC=host keeps the host
+        with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "auto", "PARSEC_PERIODIC_CA_XC": "host"}):
             self.assertIsNone(periodic_xc.device_spin_evaluator(self.system("ca")))
+        with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "auto"}):
             pbe = self.system("pb")
             self.assertIsNone(periodic_xc.device_spin_evaluator(pbe))
         with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "on"}):
@@ -585,6 +631,28 @@ class PeriodicSpinXCTests(unittest.TestCase):
         spinor = replace(system, input=replace(system.input, scf=replace(system.input.scf, noncollinear=True)))
         with mock.patch.dict(os.environ, _DEVICE):
             self.assertIsNone(periodic_xc.device_spin_evaluator(spinor))
+
+    def test_pbe_of_the_spin_drivers_on_the_device(self) -> None:
+        # evaluate_xc_spin_polarized (the k-point and Gamma spin drivers): pbe_spin_polarized on the device by
+        # default, its numbers to round-off, also where a channel is empty (its limit, on the host)
+        from parsec_python.acceleration.V_xc import periodic_xc
+
+        periodic_xc.clear_cache()
+        pbe = self.system("pb")
+        density = np.asarray(pbe.initial_density)
+        with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "auto"}):
+            self.assertIsNotNone(periodic_xc.device_spin_evaluator(pbe, "spin_polarized"))
+            self.assertIsNone(periodic_xc.device_spin_evaluator(pbe, "spin"))
+        for up, down in ((0.6 * density, 0.4 * density), (density, 0.0 * density)):
+            with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "auto"}):
+                device = pbe.evaluate_xc_spin_polarized(up, down)
+            with mock.patch.dict(os.environ, {**_DEVICE, "PARSEC_CUPY_XC": "off"}):
+                self.assertIsNone(periodic_xc.device_spin_evaluator(pbe, "spin_polarized"))
+                host = pbe.evaluate_xc_spin_polarized(up, down)
+            for left, right in ((device.potential_up, host.potential_up), (device.potential_down, host.potential_down)):
+                np.testing.assert_allclose(left, right, rtol=0, atol=1.0e-12 * max(1.0, float(np.max(np.abs(right)))))
+            np.testing.assert_allclose(device.energy_density, host.energy_density, rtol=0, atol=1.0e-13)
+            self.assertAlmostEqual(device.total_energy, host.total_energy, delta=1.0e-11 * abs(host.total_energy))
 
     def test_the_hook_is_installed(self) -> None:
         import parsec_python.acceleration  # noqa: F401
@@ -616,3 +684,41 @@ class GammaSpinRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(cupy_available(), "CUDA runtime is unavailable")
+class IonicScopeDensityTests(unittest.TestCase):
+    def test_the_ionic_scope_keeps_the_installed_density_of_a_bulk_grid(self) -> None:
+        # the scope of forces and moving atoms (device_periodic_preparation) hands a grid its device sums do not
+        # take to the builder installed before it (the index boxes and bins of the default routines' bulk grid),
+        # not to the readable sum: the density of the single point, bit for bit
+        from parsec_python.acceleration.tests.test_periodic_point_group import silicon
+        from parsec_python.acceleration.V_ion import periodic_device as fields
+        from parsec_python.SCF import pbc
+        from parsec_python.V_ion import ionic_potential
+
+        problem = silicon("ca", spacing=0.64)
+        grid = pbc.build_periodic_grid(problem.periodic_cell, problem.grid)
+        lattice = np.asarray(problem.periodic_cell.lattice_vectors, dtype=float)
+        if fields.handles(grid, lattice):
+            self.skipTest("the device sums take this grid themselves")
+        potentials = pbc.load_pseudopotentials(problem.pseudopotentials, xc_functional=problem.scf.xc_functional)
+        atoms = tuple(problem.atoms)
+        outside = ionic_potential.superpose_atomic_density(grid, atoms, potentials, problem.pseudopotentials, lattice)
+        installed = ionic_potential._atomic_density_provider
+        self.assertIsNotNone(installed)
+        calls = []
+
+        def counted(*arguments):
+            calls.append(1)
+            return installed(*arguments)
+
+        with mock.patch.object(ionic_potential, "_atomic_density_provider", counted):
+            with fields.device_periodic_preparation() as active:
+                inside = ionic_potential.superpose_atomic_density(
+                    grid, atoms, potentials, problem.pseudopotentials, lattice
+                )
+        self.assertTrue(active)
+        self.assertEqual(len(calls), 1)
+        np.testing.assert_array_equal(inside, outside)
+        self.assertIs(ionic_potential._atomic_density_provider, installed)

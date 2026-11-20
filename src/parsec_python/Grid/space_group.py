@@ -942,41 +942,54 @@ def space_group_atom_images(
     ``tolerance`` of each other).
     """
 
+    from scipy.spatial import cKDTree
+
     vectors = np.asarray(lattice_vectors, dtype=np.float64)
     columns = vectors.T
     inverse = np.linalg.inv(columns)
-    positions = np.array([np.asarray(atom.position, dtype=np.float64) for atom in atoms])
+    positions = np.array([np.asarray(atom.position, dtype=np.float64) for atom in atoms]).reshape(-1, 3)
     symbols = [atom.symbol for atom in atoms]
     count = len(symbols)
     images = np.empty((group.order, count), dtype=np.int64)
     rotations = np.asarray(group.cartesian_rotations, dtype=np.float64).reshape(-1, 3, 3)
+    # The atoms of each species in a periodic k-d tree of their lattice coordinates (the box of one cell): the
+    # distance of the tree is the norm of the difference with nint removed from each component, Fortran's test,
+    # for all atoms at once instead of a loop over pairs (1,728 atoms and 24 operations: 100 s in that loop).
+    species: dict[str, np.ndarray] = {}
+    for index, symbol in enumerate(symbols):
+        species.setdefault(symbol, []).append(index)
+    trees = {}
+    for symbol, members in species.items():
+        members = np.asarray(members, dtype=np.int64)
+        species[symbol] = members
+        trees[symbol] = cKDTree(_unit_box(positions[members] @ inverse.T), boxsize=1.0)
     for number, (rotation, translation) in enumerate(
         zip(rotations, group.translation_vectors)
     ):
         shift = columns @ translation
-        for index in range(count):
-            mapped = rotation @ (positions[index] - shift)
-            found = -1
-            for other in range(count):
-                if symbols[other] != symbols[index]:
-                    continue
-                difference = inverse @ (mapped - positions[other])
-                difference -= np.rint(difference)
-                if np.sqrt(difference @ difference) <= tolerance:
-                    found = other
-                    break
-            if found < 0:
-                raise ValueError(
-                    f"symmetry operation {number + 1} maps atom {index + 1} at "
-                    f"{positions[index].tolist()} onto no atom (PARSEC error 411: "
-                    "unable to find equivalent of atom)"
-                )
-            images[number, index] = found
+        mapped = _unit_box((positions - shift) @ rotation.T @ inverse.T)
+        for symbol, members in species.items():
+            for index, near in zip(members, trees[symbol].query_ball_point(mapped[members], r=tolerance)):
+                if not near:
+                    raise ValueError(
+                        f"symmetry operation {number + 1} maps atom {index + 1} at "
+                        f"{positions[index].tolist()} onto no atom (PARSEC error 411: "
+                        "unable to find equivalent of atom)"
+                    )
+                images[number, index] = members[min(near)]  # the first atom of the species, as the loop takes it
         if np.unique(images[number]).size != count:
             raise ValueError(
                 f"symmetry operation {number + 1} does not permute the atoms"
             )
     return images
+
+
+def _unit_box(fractions: np.ndarray) -> np.ndarray:
+    """Lattice coordinates in ``[0, 1)`` for a periodic k-d tree of box 1 (``mod`` can round up to 1)."""
+
+    wrapped = np.mod(fractions, 1.0)
+    wrapped[wrapped >= 1.0] = 0.0
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -1149,14 +1162,52 @@ def affine_grid_images(matrix, constant, counts, index_type=np.int64, *, xp=np):
         xp.arange(n[axis], dtype=xp.int64).reshape([n[axis] if other == axis else 1 for other in range(3)])
         for axis in range(3)
     ]
-    flat = xp.zeros((1, 1, 1), dtype=xp.int64)
+    terms = []
     for row in range(3):
         component = xp.full((1, 1, 1), int(constant[row]), dtype=xp.int64)
         for column in range(3):
             if matrix[row][column]:
                 component = component + int(matrix[row][column]) * axes[column]
-        flat = flat + (component % n[row]) * strides[row]
-    return xp.broadcast_to(flat, tuple(n)).reshape(-1).astype(index_type)
+        terms.append((component % n[row]) * strides[row])
+    size = n[0] * n[1] * n[2]
+    if xp is not np or size < _THREADED_IMAGES:
+        flat = terms[0] + terms[1] + terms[2]
+        return xp.broadcast_to(flat, tuple(n)).reshape(-1).astype(index_type)
+    # A large grid: the sum of the three broadcast terms written once into the result, by slabs of the first axis on
+    # threads (NumPy leaves the lock in these sums); the same integers.
+    result = np.empty(tuple(n), dtype=index_type)
+
+    def part(term, first, last):
+        return term[first:last] if term.shape[0] > 1 else term
+
+    def fill(first: int, last: int) -> None:
+        slab = result[first:last]
+        np.add(part(terms[0], first, last), part(terms[1], first, last), out=slab, casting="unsafe")
+        np.add(slab, part(terms[2], first, last), out=slab, casting="unsafe")
+
+    _run_by_slabs(fill, n[0])
+    return result.reshape(-1)
+
+
+_THREADED_IMAGES = 1 << 22
+"""Points of a grid from which :func:`affine_grid_images` fills its result by slabs on threads."""
+
+
+def _run_by_slabs(work, count: int) -> None:
+    """``work(first, last)`` over slabs of ``range(count)`` on the threads of the periodic setup."""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    from ..Laplacian.finite_difference import _build_threads
+
+    threads = max(1, min(_build_threads(), count))
+    if threads == 1:
+        work(0, count)
+        return
+    bounds = np.linspace(0, count, threads + 1).astype(int)
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        for future in [pool.submit(work, int(a), int(b)) for a, b in zip(bounds[:-1], bounds[1:]) if b > a]:
+            future.result()
 
 
 def _row_major_points(grid, points, counts) -> bool:

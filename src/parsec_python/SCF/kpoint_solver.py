@@ -45,6 +45,45 @@ class KPointJob:
     make_hamiltonian: Callable[[int, dict], Any]
     accumulate: Callable[[int, np.ndarray, np.ndarray], dict[str, np.ndarray]]
     extras: Callable[[int, np.ndarray], Any] | None = None
+    # The number of states of every task where they differ (the sectors of the k-points,
+    # parsec_python.acceleration.SCF.kpoint_sectors); None: number_of_states for every task.
+    states_per_task: tuple[int, ...] | None = None
+    # The grid rows of every task where they differ (the sectors again); None: the whole grid for every task.
+    rows_per_task: tuple[int, ...] | None = None
+    # The points of the whole grid where the tasks have fewer rows (the fields of the SCF step live on it).
+    grid_points: int | None = None
+    # Whether ``extras`` is a sum over the states that takes any subset of them: ``extras(task, vectors, xp=...,
+    # columns=...)`` with ``columns`` the indices of the columns of ``vectors`` among the states of the task (the
+    # nonlocal forces of the scalar k-point SCF), so that the ranks of the MPI k-point pools each sum their columns.
+    extras_by_columns: bool = False
+    # What a solver that splits the k-points into the sectors of their little groups needs: a dict with the grid,
+    # the atoms of the cell, the Cartesian k-points and whether the density is the only part of ``accumulate``
+    # (set by the scalar k-point SCF); None: no such splitting.
+    geometry: Any = None
+
+
+def task_states(job: "KPointJob", task: int) -> int:
+    """The number of states of ``task``: ``states_per_task[task]`` where given, else ``number_of_states``."""
+    if job.states_per_task is not None:
+        return int(job.states_per_task[task])
+    return int(job.number_of_states)
+
+
+def resized_job(job: "KPointJob", counts: dict) -> "KPointJob":
+    """``job`` with the numbers of states of the tasks in ``counts`` (task -> states) replaced."""
+    from dataclasses import replace
+
+    states = [task_states(job, task) for task in range(job.n_tasks)]
+    for task, count in counts.items():
+        states[int(task)] = int(count)
+    return replace(job, states_per_task=tuple(states), number_of_states=max(states))
+
+
+def task_rows(job: "KPointJob", task: int, default: int) -> int:
+    """The grid rows of ``task``: ``rows_per_task[task]`` where given, else ``default`` (the whole grid)."""
+    if job.rows_per_task is not None:
+        return int(job.rows_per_task[task])
+    return int(default)
 
 
 class SerialKPointSolver:
@@ -58,31 +97,41 @@ class SerialKPointSolver:
         self.states: dict[int, Any] = {}
         self._vectors: dict[int, np.ndarray] = {}
         self._residuals: dict[int, float] = {}
+        self._values: dict[int, np.ndarray] = {}
 
     def solve(
-        self, potentials: dict, filter_degree: int, tolerance: float | None = None
+        self, potentials: dict, filter_degree: int, tolerance: float | None = None, tasks=None
     ) -> list[np.ndarray]:
         """One eigenvalue array per task (task order), vectors kept in the solver.
 
         ``tolerance`` replaces ``Diag_Tolerance`` for this call
         (``Dynamic_Diag_Tol``); the job's ``eigval_settings`` then takes it as
-        a second argument.
+        a second argument.  ``tasks`` solves those only, the others keep the
+        eigenvalues of their last solve.
         """
         settings = job_eigval_settings(self.job, filter_degree, tolerance)
-        eigenvalues = []
-        for task in range(self.job.n_tasks):
+        wanted = range(self.job.n_tasks) if tasks is None else sorted(int(task) for task in tasks)
+        for task in wanted:
             operator = self.job.make_hamiltonian(task, potentials).as_linear_operator()
             solution = solve_eigval(
                 operator,
-                self.job.number_of_states,
+                task_states(self.job, task),
                 settings=settings,
                 state=self.states.get(task),
             )
             self.states[task] = solution.state
             self._vectors[task] = np.asarray(solution.vectors)
             self._residuals[task] = residual_max(solution.residual_norms)
-            eigenvalues.append(np.asarray(solution.eigenvalues, dtype=float))
-        return eigenvalues
+            self._values[task] = np.asarray(solution.eigenvalues, dtype=float)
+        return [self._values[task] for task in range(self.job.n_tasks)]
+
+    def resize_tasks(self, counts: dict) -> bool:
+        """New numbers of states for the tasks of ``counts`` (task -> states); their Ritz states are dropped, those
+        of the other tasks kept.  ``True``: the next :meth:`solve` of those tasks takes them."""
+        self.job = resized_job(self.job, counts)
+        for task in counts:
+            self.states.pop(int(task), None)
+        return True
 
     def residuals(self) -> list[float]:
         """Largest eigenpair residual of each task's last solve (NaN where none was measured)."""
@@ -280,6 +329,7 @@ def map_tasks(
 
 
 __all__ = [
+    "task_states",
     "DEVICE_FIRST_SOLVERS",
     "KPointJob",
     "SerialKPointSolver",

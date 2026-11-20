@@ -223,8 +223,13 @@ class OrbitVectorFields:
         full_to_wedge = np.asarray(reduction.full_to_wedge, dtype=np.int64)
         operation_of_row = np.full(full_to_wedge.size, -1, dtype=np.int16)
         order = sorted(range(len(operations)), key=lambda index: (not np.allclose(operations[index], np.eye(3)), index))
+        # r -> R r + t in a cell that repeats a smaller one: t moves the row, R alone turns the vector
+        translations = getattr(reduction, "translations", None)
         for index in order:
-            images = _grid_row_mapping_operation(grid, np.rint(operations[index]).astype(np.int8), 1.0e-10, selected_rows=rows)
+            images = _grid_row_mapping_operation(
+                grid, np.rint(operations[index]).astype(np.int8), 1.0e-10, selected_rows=rows,
+                translation=None if translations is None else translations[index],
+            )
             if images is None or not np.array_equal(full_to_wedge[images], np.arange(rows.size)):
                 raise RuntimeError("the symmetry operations do not map the orbit representatives onto their orbits")
             images = np.asarray(images, dtype=np.int64)

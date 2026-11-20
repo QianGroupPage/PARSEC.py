@@ -228,7 +228,12 @@ Currently supported:
     symmetric one; Andrew Grieder's routines fold their shifted grid alike), and the density is
     symmetrized over the space group (`Symmetrize_Charge_Density`, then true by
     default); weighted `Kpoint_List` rows; reference solver only.  Without the
-    shift block the unreduced grid of earlier versions is kept.  On Andrew
+    shift block the shift is zero, as in PARSEC 1.5 (its `mpshift` keeps its
+    static zero and `irrbz` reduces every Monkhorst-Pack grid): the input runs
+    as with a zero block on either set of routines, without selecting the
+    Fortran-derived ones (since 2026-11-18; `PARSEC_MP_UNSHIFTED_MESH=port`
+    keeps the unreduced grid `(2i-n-1)/(2n)` of earlier versions, and a grid
+    of one point stays the Gamma point).  On Andrew
     Grieder's routines (`Use_Fortran_Routines: .false.`) the shifted grid of a
     bulk single point is reduced by the operations that map their grid (that of
     `Grid_Spacing`) and the mesh onto themselves, with time reversal, and the

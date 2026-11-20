@@ -43,6 +43,18 @@ def _conjugate_transpose(matrix) -> sp.csr_matrix:
     return sp.csr_matrix(transposed, dtype=np.complex128)
 
 
+def prepare_device_nonlocal(xp, operator, gradients: NonlocalProjectorGradients, *, sparse=None):
+    """The device matrices of :func:`device_nonlocal_forces` (``P^H`` and the three ``(dP)^H``), made once for the
+    calls of one force pass on blocks of the same k-point's orbitals."""
+
+    sparse = _sparse_module(xp) if sparse is None else sparse
+    columns = gradient_columns_for(operator.labels, gradients.labels)
+    return (
+        sparse.csr_matrix(_conjugate_transpose(operator.projectors)),
+        [sparse.csr_matrix(_conjugate_transpose(sp.csc_matrix(component)[:, columns])) for component in gradients.components],
+    )
+
+
 def device_nonlocal_forces(
     xp,
     operator,
@@ -53,6 +65,7 @@ def device_nonlocal_forces(
     *,
     sparse=None,
     block_bytes: int = _BLOCK_BYTES,
+    prepared=None,
 ) -> np.ndarray:
     """``(atoms, 3)`` nonlocal forces in Ry/bohr of the orbitals ``wavefunctions`` (an ``xp`` array).
 
@@ -64,16 +77,13 @@ def device_nonlocal_forces(
     occupations = np.asarray(occupations, dtype=np.float64)
     if operator.projectors.shape[1] == 0 or occupations.size == 0:
         return np.zeros((atom_count, 3), dtype=np.float64)
-    sparse = _sparse_module(xp) if sparse is None else sparse
-    columns = gradient_columns_for(operator.labels, gradients.labels)
     occupied = np.flatnonzero(occupations != 0.0)
     if not occupied.size:
         return np.zeros((atom_count, 3), dtype=np.float64)
 
-    overlap_matrix = sparse.csr_matrix(_conjugate_transpose(operator.projectors))
-    gradient_matrices = [
-        sparse.csr_matrix(_conjugate_transpose(sp.csc_matrix(component)[:, columns])) for component in gradients.components
-    ]
+    overlap_matrix, gradient_matrices = (
+        prepare_device_nonlocal(xp, operator, gradients, sparse=sparse) if prepared is None else prepared
+    )
     projector_count = int(operator.projectors.shape[1])
     grid_size = int(wavefunctions.shape[0])
     # a block holds the orbitals and four sets of overlaps, all complex
@@ -98,4 +108,4 @@ def device_nonlocal_forces(
     return forces
 
 
-__all__ = ["device_nonlocal_forces"]
+__all__ = ["device_nonlocal_forces", "prepare_device_nonlocal"]

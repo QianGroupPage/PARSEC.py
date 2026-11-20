@@ -43,10 +43,13 @@ from parsec_python.SCF.kpoint_solver import (
     device_solver_supports,
     job_eigval_settings,
     residual_max,
+    resized_job,
     set_parallel_backend,
+    task_states,
 )
 
 from ..Eigensolvers.chebff_spinor import SpinorEigvalState, solve_spinor_eigval
+from .kpoint_sectors import carried_state
 from ..Parallel import WORKERS_ENV, make_pool, mpi
 
 SOLVER_ENV = "PARSEC_KPOINT_SOLVER"  # device (default) | host
@@ -170,10 +173,12 @@ class _SolveWorker:
         start = time.perf_counter()
         operator = self.converter.operator(hamiltonian)
         self._tick("upload", start)
-        requested = self.job.number_of_states
+        requested = task_states(self.job, task)
         solve_start = time.perf_counter()
         state = self.states.pop(task, None)
         self.vectors.pop(task, None)  # release the previous basis before the next one is made
+        # a task whose states the refit of the k-point sectors cut keeps its lowest Ritz pairs (kpoint_sectors)
+        state = carried_state(state, requested, settings, int(operator.shape[0]))
         if state is not None and isinstance(state.vectors, np.ndarray) and backend.xp is not np:
             state.vectors = backend.asarray(state.vectors)  # a spilled subspace comes back
         elif (
@@ -238,14 +243,15 @@ class _SolveWorker:
         return np.asarray(self._to_host(self.vectors[task]))
 
     # ------------------------------------------------------------- SCF steps
-    def solve(self, potentials: dict, filter_degree: int, tolerance: float | None = None):
+    def solve(self, potentials: dict, filter_degree: int, tolerance: float | None = None, only=None):
         # ``tolerance``: the eigensolver tolerance of this SCF iteration
-        # (Dynamic_Diag_Tol); None keeps the job's Diag_Tolerance.
+        # (Dynamic_Diag_Tol); None keeps the job's Diag_Tolerance.  ``only``: the tasks to solve (all of
+        # this worker's where None).
         settings = job_eigval_settings(self.job, filter_degree, tolerance)
         # ARPACK and DIAGLA are host eigensolvers: the host route below, with the
         # device Hamiltonian as their operator.
         on_device = self.device_solver and device_solver_supports(settings)
-        for task in self.tasks:
+        for task in self.tasks if only is None else [task for task in self.tasks if task in only]:
             start = time.perf_counter()
             hamiltonian = self.job.make_hamiltonian(task, potentials)
             self._tick("hamiltonian", start)  # builds the Bloch projectors of a k-point on first use
@@ -258,9 +264,9 @@ class _SolveWorker:
             start = time.perf_counter()
             solution = solve_eigval(
                 operator,
-                self.job.number_of_states,
+                task_states(self.job, task),
                 settings=settings,
-                state=self.states.get(task),
+                state=carried_state(self.states.get(task), task_states(self.job, task), settings, operator.shape[0]),
             )
             self._tick("solve", start)
             self.states[task] = solution.state
@@ -297,6 +303,22 @@ class _SolveWorker:
                 else:
                     total[name] = np.array(value, copy=True)
         yield None, total
+
+    def resize_tasks(self, counts: dict):
+        """New numbers of states of some tasks (:meth:`PooledKPointSolver.resize_tasks`): their Ritz states and
+        orbitals are dropped here."""
+        self.job = resized_job(self.job, counts)
+        for task in counts:
+            if task in self.tasks:
+                self.states.pop(task, None)
+                self.vectors.pop(task, None)
+        yield None, None
+
+    def trim_tasks(self, counts: dict):
+        """Fewer states for some tasks (:meth:`PooledKPointSolver.trim_tasks`): their Ritz states are kept, and
+        their next solves take the lowest of them (:func:`.kpoint_sectors.carried_state`)."""
+        self.job = resized_job(self.job, counts)
+        yield None, None
 
     def keep_device_states(self):
         """Hand the device subspaces as they are from now on (no host copy in :meth:`export_states`)."""
@@ -371,6 +393,7 @@ class PooledKPointSolver:
         if plan is not None:
             workers = device_worker_count(plan, job.n_tasks)
         self.backend = plan.name if plan is not None else "cpu"
+        self._values: dict[int, np.ndarray] = {}
         self.pool = make_pool(
             range(job.n_tasks),
             lambda tasks, index: _SolveWorker(job, tasks, index, plan),
@@ -383,19 +406,40 @@ class PooledKPointSolver:
         return self.pool.n_workers
 
     def solve(
-        self, potentials: dict, filter_degree: int, tolerance: float | None = None
+        self, potentials: dict, filter_degree: int, tolerance: float | None = None, tasks=None
     ) -> list[np.ndarray]:
         """One eigenvalue array per task (task order), vectors kept in the workers.
 
         ``tolerance`` replaces ``Diag_Tolerance`` for this call
         (``Dynamic_Diag_Tol``); the job's ``eigval_settings`` then takes it
-        as a second argument.
+        as a second argument.  ``tasks`` solves those only, the others keep the
+        eigenvalues of their last solve.
         """
-        if tolerance is None:
+        if tasks is not None:
+            by_task = self.pool.by_task("solve", potentials, filter_degree, tolerance, frozenset(int(t) for t in tasks))
+        elif tolerance is None:
             by_task = self.pool.by_task("solve", potentials, filter_degree)
         else:
             by_task = self.pool.by_task("solve", potentials, filter_degree, tolerance)
-        return [by_task[task] for task in range(self.job.n_tasks)]
+        self._values.update(by_task)
+        return [self._values[task] for task in range(self.job.n_tasks)]
+
+    def resize_tasks(self, counts: dict) -> bool:
+        """New numbers of states for the tasks of ``counts`` (task -> states); the workers drop their Ritz states and
+        keep those of the other tasks.  ``True``: the next :meth:`solve` of those tasks takes them."""
+        counts = {int(task): int(count) for task, count in counts.items()}
+        self.job = resized_job(self.job, counts)
+        self.pool.results("resize_tasks", counts)
+        return True
+
+    def trim_tasks(self, counts: dict) -> bool:
+        """Fewer states for the tasks of ``counts`` (task -> states, each at most its present count): the workers
+        keep their Ritz states, and the next solve of each such task starts from its lowest Ritz pairs (the refit of
+        the k-point sectors).  ``True``: done."""
+        counts = {int(task): int(count) for task, count in counts.items()}
+        self.job = resized_job(self.job, counts)
+        self.pool.results("trim_tasks", counts)
+        return True
 
     def accumulate(self, occupations: list[np.ndarray]) -> dict[str, np.ndarray]:
         """Sum of every task's density contribution for the given occupations."""
@@ -519,9 +563,19 @@ def make_solver(job: KPointJob, **options):
     """The solver of a k-point job: in an MPI run (``PARSEC_MPI=1``) the pools of ranks
     (:class:`.kpoint_pools.MPIPoolKPointSolver`), or for a job with per-task extras (the spin-orbit and
     non-collinear drivers, forces) the basis split by rows over the ranks (:class:`.kpoint_mpi.MPIKPointSolver`);
-    else the pool of threads and devices of this process."""
+    else the pool of threads and devices of this process.  A job whose k-points split into the sectors of their
+    little groups (``PARSEC_KPOINT_SECTORS``, :mod:`.kpoint_sectors`) gets that solver of its sectors."""
+    from .kpoint_sectors import sector_solver
+
+    solver = sector_solver(job, _plain_solver, **options)
+    return _plain_solver(job, **options) if solver is None else solver
+
+
+def _plain_solver(job: KPointJob, **options):
+    """The solver of :func:`make_solver` with one task per k-point (or per task of the job)."""
     if mpi.context() is not None:
-        if job.extras is None and options.get("problem_size") is not None:
+        # the pools also take extras that sum over any subset of the states (the forces of the scalar SCF)
+        if (job.extras is None or job.extras_by_columns) and options.get("problem_size") is not None:
             from .kpoint_pools import MPIPoolKPointSolver
 
             return MPIPoolKPointSolver(job, **options)

@@ -2173,6 +2173,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Input error: {error}", file=sys.stderr)
             return 2
 
+    # PARSEC_SUPERCELL_KPOINTS=auto: a Gamma-point cell that repeats a smaller one, solved as that cell with the
+    # Gamma-centred k-point mesh of the repeats (SCF/kpoint_supercell.py; the same energies, the Bloch kinetic term)
+    import dataclasses as _dataclasses
+
+    from .SCF.kpoint_supercell import describe as _describe_bloch_cells, kpoints_of_supercell as _bloch_cells
+
+    _found_cells = _bloch_cells(translation.problem)
+    if _found_cells is not None:
+        translation = _dataclasses.replace(translation, problem=_found_cells[0])
+        # the mesh reproduces the supercell with the Bloch kinetic term
+        import os as _os
+
+        _os.environ["PARSEC_KPOINT_KINETIC"] = "bloch"
+        print(_describe_bloch_cells("cell", _found_cells[1]))
+
     is_periodic = translation.problem.periodic_cell is not None
     if (
         getattr(translation, "polarizability_field", None) is not None
@@ -2738,7 +2753,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ionic_backend_of(translation.potential_extrapolation),
                     ionic_reporter,
                     log.write,
-                    directory=input_directory,
+                    # the ranks other than 0 of an MPI run write no files (--no-data-files), and read manual.dat
+                    directory=None if arguments.no_data_files else input_directory,
+                    input_directory=input_directory,
                     restart=relax_restart,
                     symmetrize=use_symmetry,
                 )
@@ -2751,7 +2768,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ionic_backend_of(translation.potential_extrapolation),
                     ionic_reporter,
                     log.write,
-                    directory=input_directory,
+                    directory=None if arguments.no_data_files else input_directory,
                     restart=dynamics_restart,
                 )
                 result, forces = dynamics.result, dynamics.forces
@@ -2829,9 +2846,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             scan_lines_after_run(translation, outcome, log.write, input_directory)
             # The SCF archive is written first so a long band calculation cannot lose it.
-            _run_band_structure(system, translation, result, reporter, input_directory)
-            # Create_DOS (parsec.F90 l.2181-2189), of the last structure.
-            _run_dos(system, translation, result, reporter, input_directory)
+            # The bands of the last structure where the atoms moved (calc_bands after
+            # the movement loop of parsec.F90): its projectors with its potential.
+            last_system = (
+                outcome.system if outcome is not None else dynamics.system if dynamics is not None else system
+            )
+            _run_band_structure(last_system, translation, result, reporter, input_directory)
+            # Create_DOS (parsec.F90 l.2181-2189), of the last structure: the Ylm projections of its orbitals about
+            # its atoms.
+            _run_dos(last_system, translation, result, reporter, input_directory)
             total_elapsed = time.perf_counter() - start
             log.write(f" Total Python wall time [sec] : {total_elapsed:11.2f}")
             log.write(f"Text log: {log_path}")
@@ -2853,9 +2876,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.debug:
             raise
         message = f"Calculation failed: {type(error).__name__}: {error}"
-        if not getattr(run_log, "failure_reported", False):
+        rank = _mpi_rank()
+        if rank is not None:
+            # an MPI run (the k-point pools): the ranks other than 0 write no log, and a rank that fails alone
+            # ends the others: every failed rank tells why, with its traceback, on the standard error
+            import traceback
+
+            text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            print(f"MPI rank {rank}: calculation failed:\n{text}", file=sys.stderr, end="", flush=True)
+        elif not getattr(run_log, "failure_reported", False):
             print(message, file=sys.stderr)
         return 1
+
+
+def _mpi_rank() -> int | None:
+    """The rank of this process in an MPI run of several ranks (``PARSEC_MPI``), else ``None``."""
+    if os.environ.get("PARSEC_MPI", "").strip() != "1":
+        return None
+    try:
+        from parsec_python.acceleration.Parallel import mpi
+
+        context = mpi.context()
+    except Exception:  # noqa: BLE001 - no mpi4py: not an MPI run
+        return None
+    return None if context is None or context.size == 1 else int(context.rank)
 
 
 __all__ = ["main", "refinement_progress", "save_result_archive"]

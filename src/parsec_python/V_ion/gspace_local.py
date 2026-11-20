@@ -158,13 +158,22 @@ def fortran_qtable_size(spacing: float) -> int:
     return int(2.0 * np.pi / float(spacing) / DELTA_Q) + 4
 
 
-def _first_spacing(grid) -> float:
-    """``grid%step(1)``: the step along the first lattice direction."""
+def fortran_first_step(grid) -> float:
+    """``grid%step(1)`` of Fortran PARSEC: the length of one grid step along the first lattice direction.
+
+    What ``fourier_f.f90`` takes for the end of its q table (``pbc%nq``) and for the Fourier filters
+    (``Alpha_Filter``, ``Core_Filter``) of a periodic grid: ``spacings[0]`` of a grid with one step per lattice
+    direction (:class:`~..Grid.pbc.GeneralPeriodicGrid`, the confined grids), the one ``spacing`` of an orthorhombic
+    grid of one step, and ``|a_1|/n_1`` of a :class:`~..Grid.pbc.PeriodicRealSpaceGrid` whose steps differ, whose
+    ``spacing`` is the shortest step instead (to 2026-11-19 taken here, where Fortran takes the first).
+    """
 
     spacings = getattr(grid, "spacings", None)
     if spacings is not None:
         return float(np.asarray(spacings)[0])
-    return float(grid.spacing)
+    if getattr(grid, "is_orthorhombic", True) or getattr(grid, "step_vectors", None) is None:
+        return float(grid.spacing)
+    return float(np.linalg.norm(np.asarray(grid.step_vectors, dtype=np.float64)[0]))
 
 
 @dataclass(frozen=True)
@@ -208,7 +217,7 @@ def gspace_vectors(grid, lattice_vectors: np.ndarray) -> GSpaceVectors:
     norms = np.sqrt(np.einsum("ij,ij->i", vectors, vectors))
     # v_first.f90: n = int(q/delq + 2 + 1/2) must stay below nq.
     table_index = np.floor(norms / DELTA_Q + 2.0 + 0.5)
-    keep = (norms > 0.0) & (table_index < fortran_qtable_size(_first_spacing(grid)))
+    keep = (norms > 0.0) & (table_index < fortran_qtable_size(fortran_first_step(grid)))
     integers = integers[keep]
     vectors = vectors[keep]
     norms = norms[keep]
@@ -394,7 +403,7 @@ def _dense_set(grid, lattice_vectors: np.ndarray) -> _DenseSet:
     if len(shape) != 3:
         raise ValueError("the G-space local potential needs a 3-D periodic grid")
     shift = np.asarray(getattr(grid, "shift", np.zeros(3)), dtype=np.float64)
-    spacing = _first_spacing(grid)
+    spacing = fortran_first_step(grid)
     key = (shape, lattice_vectors.tobytes(), shift.tobytes(), spacing)
     found = _DENSE_CACHE.get(key)
     if found is not None:
@@ -470,7 +479,7 @@ def _cache_key(grid, lattice_vectors) -> tuple:
         tuple(int(value) for value in grid.points_per_axis),
         np.asarray(lattice_vectors, dtype=np.float64).tobytes(),
         shift.tobytes(),
-        _first_spacing(grid),
+        fortran_first_step(grid),
     )
 
 
@@ -680,6 +689,7 @@ __all__ = [
     "GSpaceVectors",
     "LOCAL_POTENTIAL_METHODS",
     "alpha_coefficient",
+    "fortran_first_step",
     "fortran_qtable_size",
     "gspace_alpha_energy",
     "gspace_local_forces",

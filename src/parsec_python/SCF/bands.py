@@ -40,6 +40,7 @@ import numpy as np
 
 from ..Eigensolvers import solve_eigval
 from ..Grid import band_path_kpoints, explicit_kpoints
+from ..Laplacian.finite_difference import bloch_laplacian_or_none
 from ..Hamiltonian.kpoint_operator import KPointKohnShamHamiltonian
 from ..models import BandStructureResult, BandStructureSettings
 from .kpoint_solver import device_solver_supports, map_tasks
@@ -368,6 +369,8 @@ def solve_kpoint_bands(
                         potentials["effective_potential"],
                         nonlocal_k,
                         k_point,
+                        # the kinetic term of the SCF (PARSEC_KPOINT_KINETIC)
+                        bloch_laplacian=bloch_laplacian_or_none(system.grid, k_point),
                     )
                 ],
                 k_point,
@@ -381,6 +384,7 @@ def solve_kpoint_bands(
                         potentials[name],
                         nonlocal_k,
                         k_point,
+                        bloch_laplacian=bloch_laplacian_or_none(system.grid, k_point),
                     )
                     for name in ("potential_up", "potential_down")
                 ],

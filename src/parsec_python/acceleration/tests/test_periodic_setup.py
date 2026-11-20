@@ -9,7 +9,9 @@ the images it leaves out are still of order 1e-6 Ry).
 from __future__ import annotations
 
 import functools
+import os
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +39,19 @@ _EXAMPLES = Path(__file__).resolve().parents[4] / "examples" / "0d_AuH"
 _SIDES = (6.0, 7.2, 8.4)  # spacing 0.6 on all three axes
 _FCC = 5.4 * (np.ones((3, 3)) - np.eye(3))  # oblique: 60 degrees between the lattice vectors, 12 points per axis
 _FRACTIONAL = np.array([[0.1, 0.2, 0.3], [0.55, 0.4, 0.8], [0.3, 0.9, 0.5]])
+
+
+# The comparisons of the device density with the host's bit for bit take the kernel of every atom: the bins of
+# PARSEC_PERIODIC_DENSITY_BINS=auto sum the same terms in another order (test_periodic_local_device compares them).
+_DENSITY_BINS = mock.patch.dict(os.environ, {"PARSEC_PERIODIC_DENSITY_BINS": "off"})
+
+
+def setUpModule() -> None:
+    _DENSITY_BINS.start()
+
+
+def tearDownModule() -> None:
+    _DENSITY_BINS.stop()
 
 
 def _lattice(oblique: bool) -> np.ndarray:

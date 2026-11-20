@@ -24,6 +24,8 @@ Settings of every input: grid spacing 0.16 bohr, sphere = largest atom distance 
 
 With the adaptive inner criterion the PBE start of a spin-unpolarized hybrid stops at a residual of 1e-4 Ry. The energy its log prints for the start (the last `Total Energy` before `Fock loop`, with the note that it is the energy of a start) is therefore not a converged PBE energy: here it lies 4.0e-08 to 1.4e-05 Ry above the energy of the `pbe` input (benzene the most). E_PBE in the tables below is always the energy of the `pbe` input. The O2 start (spin-polarized) runs to `Convergence_Criterion`: its printed energy equals E_PBE to the printed digits.
 
+The logs of the `pbe` inputs of H2, N2, CO and CH4 are of 19 November 2026. These molecules have the point groups D4h, C4v and Td on the grid, and since 15 November (Td) and 18 November 2026 (D4h, C4v; `PARSEC_ORBITAL_GROUP_MAX_COST` 0.75) a semilocal run solves the weighted one-dimensional sectors of a larger subgroup instead of the abelian group (`src/parsec_python/acceleration/README.md`, "Weighted sectors of a larger subgroup"). Their total energies are those of the abelian route to the printed digits, so E_PBE and every dE below are unchanged; the CO HOMO moved by 0.02 meV (the last printed digit). The PBE runs took 5 to 6 s (Timings; 6 to 11 s in the logs of 7 November); H2 needed 36 SCF iterations instead of 20 and took 4.7 to 5.3 s against 3.9 s with `PARSEC_ORBITAL_GROUP=abelian` on the same node, CO 36 instead of 32. The hybrids keep the abelian group: their logs are those of 7 November 2026.
+
 ## PBE level
 
 | molecule | E_PBE this code (Ry) | E_PBE QE (Ry) | difference (Ry) | KB offset (Ry) | HOMO this code (eV) | HOMO QE (eV) |
@@ -31,7 +33,7 @@ With the adaptive inner criterion the PBE start of a spin-unpolarized hybrid sto
 | H2 | -2.32971479 | -2.32974716 | +3.24e-05 | 0 | -10.3764 | -10.3762 |
 | H2O | -34.34610983 | -34.34601311 | -9.67e-05 | +1.75e-4 | -7.2386 | -7.2384 |
 | CH4 | -16.15718582 | -16.15717314 | -1.27e-05 | -1.8e-5 | -9.4647 | -9.4647 |
-| CO | -43.31671520 | -43.31651838 | -1.97e-04 | +8.7e-5 | -9.0614 | -9.0617 |
+| CO | -43.31671520 | -43.31651838 | -1.97e-04 | +8.7e-5 | -9.0615 | -9.0617 |
 | N2 | -39.83042717 | -39.83021536 | -2.12e-04 | -4.9e-5 | -10.2959 | -10.2961 |
 | C6H6 | -75.47051533 | -75.47016414 | -3.51e-04 |  | -6.3305 | -6.3306 |
 | O2 (triplet) | -63.71093108 | -63.71080847 | -1.23e-04 | +2.73e-4 | -6.8729 / -11.6050 | -6.8736 / -11.6064 |
@@ -186,13 +188,13 @@ Wall time of `main.py` (program wall, PBE start included) on one A100 of a share
 |---|---|---|---|---|---|
 | H2 | 1,252,368 | 6 | 9-17 | 11 | 53-158 |
 | H2O | 1,568,208 | 12 | 14-23 | 22 | 86-294 |
-| CH4 | 1,788,656 | 11 | 15-27 | 24 | 95-283 |
-| CO | 1,387,496 | 10 | 15-22 | 18 | 114-299 |
-| N2 | 1,376,312 | 8 | 12-21 | 14 | 99-258 |
+| CH4 | 1,788,656 | 6 | 15-27 | 24 | 95-283 |
+| CO | 1,387,496 | 6 | 15-22 | 18 | 114-299 |
+| N2 | 1,376,312 | 5 | 12-21 | 14 | 99-258 |
 | C6H6 | 3,241,288 | 13 | 33-52 | 38 | 404-744 |
 | O2 (triplet) | 1,413,968 | 14 | 25-31 | 29 | 257-654 |
 
-Outer Fock iterations to an estimated exchange error below 1e-8 Ry: 3-4 for PBE0, HSE and B3*, 6-7 for HF (QE, whose loop runs to 1e-10 Ry and starts the libxc hybrids from the functional without its exact exchange and HF from Slater exchange: 4-6 and 10-16). The table gives outer iterations / inner SCF iterations of the Fock loop (summed over its outer iterations); the PBE start takes 13-29 SCF iterations before them, the `pbe` input 20-44. The exact exchange itself (pair solves and ACE builds) is 0.3-21.8 s of a run.
+Outer Fock iterations to an estimated exchange error below 1e-8 Ry: 3-4 for PBE0, HSE and B3*, 6-7 for HF (QE, whose loop runs to 1e-10 Ry and starts the libxc hybrids from the functional without its exact exchange and HF from Slater exchange: 4-6 and 10-16). The table gives outer iterations / inner SCF iterations of the Fock loop (summed over its outer iterations); the PBE start takes 13-29 SCF iterations before them, the `pbe` input 24-44. The exact exchange itself (pair solves and ACE builds) is 0.3-21.8 s of a run.
 
 | molecule | pbe0 | hse06 | hse03 | b3lyp | b3lyp5 | b3pw91 | hf |
 |---|---|---|---|---|---|---|---|

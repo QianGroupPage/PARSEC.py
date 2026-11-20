@@ -4,6 +4,9 @@ The carbon skeleton is cut from an ASE bulk-diamond supercell about a carbon
 site.  Candidate radii are integer multiples of the ideal nearest-neighbour
 C--C distance.  Every bond from a retained carbon to a removed diamond-lattice
 neighbour is terminated by one hydrogen along the missing-bond direction.
+The reference supercell grows where the surface completion reaches its edge,
+and every cluster is checked to be mapped onto itself by the 24 operations of
+its point group Td.
 
 This script generates geometries, PARSEC input files, and geometry audits.  It
 does not run a DFT calculation or relax the ideal structures.
@@ -23,6 +26,7 @@ from ase import Atoms
 from ase.build import bulk
 from ase.io import write
 from ase.neighborlist import neighbor_list
+from scipy.spatial import cKDTree
 
 
 DEFAULT_LATTICE_CONSTANT_ANGSTROM = 3.567
@@ -30,6 +34,10 @@ DEFAULT_CH_BOND_ANGSTROM = 1.09
 DEFAULT_GRID_SPACING_ANGSTROM = 0.20
 DEFAULT_VACUUM_PADDING_ANGSTROM = 5.0
 VALENCE_ELECTRONS = {"C": 4, "H": 1}
+
+
+class ReferenceLatticeTooSmall(RuntimeError):
+    """The surface completion reached sites at the edge of the reference supercell."""
 
 
 @dataclass(frozen=True)
@@ -145,6 +153,12 @@ def _build_cluster(
             break
         retained_set.update(additions)
         surface_completion_passes += 1
+    if any(len(lattice.adjacency[index]) != 4 for index in retained_set):
+        # The completion reached the edge of the supercell, where sites lack
+        # neighbours: the caller builds a larger one.
+        raise ReferenceLatticeTooSmall(
+            f"k={multiplier}: the surface completion reached the edge of the reference lattice"
+        )
     ordered = sorted(
         retained_set,
         key=lambda index: (
@@ -199,12 +213,50 @@ def _build_cluster(
     )
 
 
+def _td_operations() -> list[np.ndarray]:
+    """The 24 signed permutation matrices of Td about the central carbon.
+
+    Every permutation of the axes with an even number of sign changes: they
+    map the four bond directions of a diamond site onto themselves.
+    """
+
+    operations = []
+    for permutation in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)):
+        matrix = np.zeros((3, 3))
+        for row, column in enumerate(permutation):
+            matrix[row, column] = 1.0
+        for signs in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)):
+            operations.append(np.diag(signs) @ matrix)
+    return operations
+
+
+def _is_td_symmetric(cluster: "Cluster", tolerance: float = 1.0e-6) -> bool:
+    """Whether every operation of Td maps the carbons and the hydrogens onto themselves."""
+
+    for positions in (cluster.carbon_positions, cluster.hydrogen_positions):
+        if len(positions) == 0:
+            continue
+        tree = cKDTree(positions)
+        for operation in _td_operations():
+            distance, index = tree.query(positions @ operation.T)
+            if float(np.max(distance)) > tolerance or len(set(index.tolist())) != len(positions):
+                return False
+    return True
+
+
 def _minimum_pair_distance(positions: np.ndarray) -> float | None:
     if len(positions) < 2:
         return None
-    displacements = positions[:, None, :] - positions[None, :, :]
-    distances = np.linalg.norm(displacements, axis=2)
-    distances[np.diag_indices_from(distances)] = np.inf
+    # The nearest neighbours of every atom from a tree (a full distance
+    # matrix of the largest clusters would take tens of GB), their distances
+    # with the arithmetic of that matrix.
+    count = min(len(positions), 5)
+    _, index = cKDTree(positions).query(positions, k=count)
+    first = np.repeat(np.arange(len(positions)), count)
+    second = np.asarray(index).reshape(-1)
+    keep = first != second
+    displacements = positions[first[keep]] - positions[second[keep]]
+    distances = np.linalg.norm(displacements, axis=1)
     return float(np.min(distances))
 
 
@@ -304,6 +356,8 @@ def _audit_cluster(
     hh_min = audit["hydrogen_hydrogen_min_distance_angstrom"]
     if hh_min is not None and float(hh_min) < 1.2:
         raise ValueError(f"{cluster.formula}: unphysical H--H contact ({hh_min:.6f} A)")
+    if not _is_td_symmetric(cluster):
+        raise ValueError(f"{cluster.formula}: not mapped onto itself by the operations of Td")
     return audit
 
 
@@ -481,13 +535,22 @@ def generate(
         raise ValueError("maximum_carbon_atoms must be greater than one")
     if maximum_multiplier < 1:
         raise ValueError("maximum_multiplier must be positive")
-    lattice = _reference_lattice(lattice_constant_angstrom, maximum_multiplier)
+    lattice_multiplier = maximum_multiplier
+    lattice = _reference_lattice(lattice_constant_angstrom, lattice_multiplier)
     output_root.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, object]] = []
     first_excluded: dict[str, object] | None = None
 
     for multiplier in range(maximum_multiplier + 1):
-        cluster = _build_cluster(lattice, multiplier, ch_bond_angstrom)
+        while True:
+            try:
+                cluster = _build_cluster(lattice, multiplier, ch_bond_angstrom)
+                break
+            except ReferenceLatticeTooSmall:
+                # A larger supercell gives the same sites; only where the
+                # completion reached the edge is it needed.
+                lattice_multiplier += max(4, lattice_multiplier // 2)
+                lattice = _reference_lattice(lattice_constant_angstrom, lattice_multiplier)
         if cluster.n_carbon >= maximum_carbon_atoms:
             first_excluded = {
                 "radius_multiplier": multiplier,

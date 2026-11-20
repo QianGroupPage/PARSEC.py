@@ -836,6 +836,27 @@ def _reference_only_features(
     return features
 
 
+def _forces_on_kpoint_pools(problem) -> bool:
+    """Whether an MPI run sums its forces on the ranks of the k-point pools.
+
+    That is the scalar k-point SCF (:func:`parsec_python.SCF.kpoints.run_scf_kpoints`,
+    whose nonlocal force is a sum over the states: ``KPointJob.extras_by_columns``) of a
+    cell sampled beyond the Gamma point, without spin, spinors or a hybrid functional,
+    whose forces read the orbitals of one process.
+    """
+
+    scf = problem.scf
+    return bool(
+        problem.periodic_cell is not None
+        and problem.has_kpoint_sampling
+        and not getattr(scf, "noncollinear", False)
+        and not getattr(scf, "self_consistent_spin_orbit", False)
+        and not getattr(scf, "spin_polarized", False)
+        and not getattr(scf, "is_hybrid", False)
+        and not _gamma_point_only(problem)
+    )
+
+
 def _mpi_unsupported_features(translation) -> list[str]:
     """Features of the reference drivers that an MPI run (``--mpi``) cannot carry.
 
@@ -865,14 +886,22 @@ def _mpi_unsupported_features(translation) -> list[str]:
         or problem.has_kpoint_sampling
         or problem.scf.noncollinear
     )
-    if uses_kpoint_solver and (
-        getattr(translation, "compute_forces", False)
-        or getattr(translation, "relaxation", None) is not None
-        or getattr(translation, "molecular_dynamics", None) is not None
+    if (
+        uses_kpoint_solver
+        and (
+            getattr(translation, "compute_forces", False)
+            or getattr(translation, "relaxation", None) is not None
+            or getattr(translation, "molecular_dynamics", None) is not None
+        )
+        and not _forces_on_kpoint_pools(problem)
     ):
         features.append(
-            "forces, relaxation or molecular dynamics of a periodic or non-collinear "
-            "run (they read the orbitals, which the distributed solver does not gather)"
+            "forces, relaxation or molecular dynamics of a periodic run at the Gamma point alone, "
+            "with spin, a hybrid functional or spinors (they read the orbitals, which the distributed "
+            "solver does not gather; those of the scalar k-point SCF are summed on the ranks of its "
+            "k-point pools; the forces and relaxations of a bulk cell at the Gamma point run on "
+            "several GPUs and nodes in the sectors of its point group with "
+            "scripts/run_multi_gpu_scf.sh [--rank-per-gpu])"
         )
     dos = getattr(translation, "dos", None)
     if dos is not None and getattr(dos, "ylm_l", -1) >= 0:
@@ -971,6 +1000,143 @@ def _gamma_point_only(problem: SinglePointInput) -> bool:
     return sampling is not None and len(sampling[0]) == 1 and not np.any(sampling[0])
 
 
+_PERIODIC_SECTOR_FORCES_SWITCH = "PARSEC_PERIODIC_SECTOR_FORCES"
+
+
+def periodic_sector_forces_setting() -> str:
+    """``PARSEC_PERIODIC_SECTOR_FORCES``: ``auto`` (the default) or ``off``.
+
+    ``auto`` lets the forces and the relaxation of a bulk cell at the Gamma point keep the sectors of its point group
+    (:func:`periodic_sector_forces_refusal` names what does not); ``off`` solves every forces, relaxation and
+    molecular-dynamics run of a cell on the full grid, as before the forces in sectors existed.
+    """
+
+    value = os.environ.get(_PERIODIC_SECTOR_FORCES_SWITCH, "auto").strip().lower() or "auto"
+    if value not in {"auto", "off"}:
+        raise ValueError(f"{_PERIODIC_SECTOR_FORCES_SWITCH} must be auto or off, not {value!r}")
+    return value
+
+
+_PERIODIC_SECTOR_BANDS_SWITCH = "PARSEC_PERIODIC_SECTOR_BANDS"
+
+
+def periodic_sector_bands_setting() -> str:
+    """``PARSEC_PERIODIC_SECTOR_BANDS``: ``auto`` (the default) or ``off``.
+
+    ``auto`` lets the SCF of a bulk cell at the Gamma point that asks for a band structure (``bandstruc``) keep the
+    sectors of its point group.  ``calc_bands`` reads only what the SCF leaves on the full grid: the converged
+    effective potential (the result of the sectors holds it expanded from the orbits of the grid), the Fermi level
+    and the number of states (:func:`.Output.post_scf.band_hand_over`); the bands of every k-point of the path are
+    solved on the full grid afresh, as before.  ``off`` solves the whole SCF of such a cell on the full grid, as
+    before the hand-over existed.
+    """
+
+    value = os.environ.get(_PERIODIC_SECTOR_BANDS_SWITCH, "auto").strip().lower() or "auto"
+    if value not in {"auto", "off"}:
+        raise ValueError(f"{_PERIODIC_SECTOR_BANDS_SWITCH} must be auto or off, not {value!r}")
+    return value
+
+
+def periodic_sector_forces_refusal(translation, *, supercell: bool = False) -> str | None:
+    """Why the forces or the moved atoms of a periodic cell keep the full grid, or ``None`` where sectors take them.
+
+    The sectors of the point group of a bulk cell at the Gamma point (``PARSEC_PERIODIC_SYMMETRY``, the driver's
+    route) give the forces of the density the SCF used once their nonlocal term and the total are averaged over the
+    full group ``G`` of the reduction (:mod:`.Forces.sector_symmetry`).  That holds for a single point with forces and
+    for a relaxation by an optimizer (``bfgs``, ``simple``), whose ionic loop finds ``G`` once and averages the forces
+    and the moved positions over it (``parsec.F90`` keeps the structure of a relaxation in its group in the same way).
+    The rest stays on the full grid: molecular dynamics and manual movements (``parsec.F90`` uses no symmetry there),
+    ``Move_Flag`` fixing atoms (a fixed atom that ``G`` exchanges with a movable one leaves the group), the
+    Fortran-derived routines (``Use_Fortran_Routines``, whose forces read the full grid), point charges, a band
+    structure under ``PARSEC_PERIODIC_SECTOR_BANDS=off`` (under ``auto`` the bands take the expanded potential of the
+    sectors), a non-self-consistent run, a restart from ``wfn.dat`` (full-grid states), an electric field
+    (``Polarizability``), k-point sampling beyond the Gamma point (its own routes, e.g. the force wedge of the mesh)
+    and the supercell that stands for a mesh of the time-reversal invariant points (``supercell``: it repeats the
+    atoms of the input).  ``PARSEC_PERIODIC_SECTOR_FORCES=off`` keeps every one on the full grid, as before.
+    """
+
+    problem = translation.problem
+    if problem.periodic_cell is None:
+        return "not a periodic cell"
+    if periodic_sector_forces_setting() == "off":
+        return f"{_PERIODIC_SECTOR_FORCES_SWITCH}=off"
+    if getattr(translation, "molecular_dynamics", None) is not None:
+        return "molecular dynamics uses no symmetry"
+    relaxation = getattr(translation, "relaxation", None)
+    if relaxation is not None and relaxation.method not in ("bfgs", "simple"):
+        return "manual movements use no symmetry"
+    if relaxation is None and not getattr(translation, "compute_forces", False):
+        return "no forces are computed"
+    if getattr(getattr(translation, "routines", None), "fortran", False) or getattr(
+        problem.grid, "fortran_routines", False
+    ):
+        return "the forces of the Fortran-derived routines (Use_Fortran_Routines) read the full grid"
+    movable = getattr(translation, "movable", None)
+    if movable is not None and not all(bool(flag) for flag in movable):
+        return "Move_Flag fixes atoms"
+    if getattr(problem, "point_charges", ()):
+        return "point charges (Add_Point_Charges)"
+    if getattr(translation, "polarizability_field", None) is not None:
+        return "an electric field (Polarizability)"
+    if problem.bands is not None and periodic_sector_bands_setting() == "off":
+        # Under PARSEC_PERIODIC_SECTOR_BANDS=auto the bands take the expanded potential of the sectors.
+        return "a band structure"
+    if getattr(translation, "nscf", None) is not None:
+        # nscf_kpoints runs no SCF (Restart_Run is required; the reference CLI runs it): never reached from main.
+        return "a non-self-consistent run"
+    if getattr(translation, "restart_run", False) and getattr(translation, "restart_from_wfndat", False):
+        return "Restart_From_Wfndat (the stored orbitals seed the eigensolver of the full grid)"
+    if supercell:
+        return "the supercell of a k-point mesh, which repeats the atoms of the input"
+    if problem.has_kpoint_sampling and not _gamma_point_only(problem):
+        return "k-point sampling beyond the Gamma point"
+    return None
+
+
+def _periodic_sector_forces_line(system, operations) -> str | None:
+    """The parsec.out line of the forces of a cell in sectors, or ``None`` where the cell is on the full grid.
+
+    With the full group ``G`` of a point-group reduction (``operations``): ``|G|``, the atoms whose projectors the
+    sectors keep (one per orbit of the group of the sectors:
+    :func:`.Symmetry.axis_reflection.compress_projectors_for_sectors`, ``PARSEC_SECTOR_PROJECTOR_ORBITS``; the
+    nonlocal forces contract the gradients of the same columns) and their columns.  The sectors of an Abelian group
+    solve every level; they keep the projectors of one atom per orbit where the reduction knows the orbits of its atoms
+    (their nonlocal term completed by the average over the group), of every atom otherwise.
+    """
+
+    from .Forces.sector_symmetry import sector_reduction
+    from .Symmetry.axis_reflection import projector_orbit_counts
+
+    sectors = getattr(getattr(system, "backend", None), "symmetry_eigensolver", None)
+    solved = getattr(getattr(sectors, "decomposition", None), "reduction", None)
+    if solved is None or int(getattr(solved, "group_order", 1)) <= 1:
+        return None
+    atom_count = len(system.atoms)
+    operator = getattr(system, "nonlocal_operator", None)
+    labels = () if operator is None else tuple(getattr(operator, "labels", ()))
+    if operations is None:
+        # Abelian sectors: the projectors of one atom per orbit where the reduction was given the orbits
+        # (Symmetry/axis_reflection.attach_abelian_atom_orbits), every atom otherwise.
+        kept_atoms, kept_columns = projector_orbit_counts(solved, labels, atom_count)
+        return (
+            f" Forces of the periodic cell in the sectors of its point group: an Abelian group of "
+            f"{int(solved.group_order)} operations, every level solved, "
+            + (
+                "the projectors of every atom "
+                if kept_columns == len(labels)
+                else f"projectors of {kept_atoms} of {atom_count} atoms ({kept_columns} of {len(labels)} columns) "
+            )
+            + f"({_PERIODIC_SECTOR_FORCES_SWITCH}=auto)"
+        )
+    reduction = sector_reduction(system)
+    kept_atoms, kept_columns = projector_orbit_counts(reduction, labels, atom_count)
+    return (
+        f" Forces of the periodic cell in the sectors of its point group: averaged over {len(operations)} "
+        f"operations; projectors of {kept_atoms} of {atom_count} atoms ({kept_columns} of {len(labels)} columns) "
+        f"({_PERIODIC_SECTOR_FORCES_SWITCH}=auto)"
+    )
+
+
 def _reference_argv(arguments: argparse.Namespace) -> list[str]:
     """Forward the options the reference CLI shares with this one."""
 
@@ -1059,10 +1225,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     with resources.applied(), ExitStack() as scope:
         try:
             status = _run(arguments, resources, scope)
-        except BaseException:
-            _abort_mpi(1)
+        except BaseException as error:
+            _abort_mpi(1, error)
             raise
-    if status not in (0, 3):
+    if status not in (0, 3, 4):
+        # 3 (an SCF loop did not converge) and 4 (a relaxation not relaxed: Movement_Num used up) are outcomes of
+        # the run that every rank reaches together (relaxation_exit_code of the reference CLI): no abort for them
         _abort_mpi(status)
     return status
 
@@ -1099,13 +1267,22 @@ def shared_vector_seed(translation, context=None):
     )
 
 
-def _abort_mpi(status: int) -> None:
+def _abort_mpi(status: int, error: BaseException | None = None) -> None:
     """A rank that failed must not leave the others waiting in a collective (the interpreter's exit
-    would wait for them in MPI_Finalize): end the whole MPI job."""
+    would wait for them in MPI_Finalize): end the whole MPI job.
+
+    The traceback of ``error`` goes to the standard error first, with the rank: the abort ends the
+    process before the interpreter would print it, and the ranks other than 0 write no log.
+    """
     from .Parallel import mpi
 
     context = mpi.context()
     if context is not None and context.size > 1:
+        if error is not None and not isinstance(error, SystemExit):
+            import traceback
+
+            text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            print(f"MPI rank {context.rank} failed:\n{text}", file=sys.stderr, end="")
         sys.stdout.flush()
         sys.stderr.flush()
         context.comm.Abort(int(status))
@@ -1144,6 +1321,24 @@ def _run(
         except ValueError as error:
             print(f"Input error: {error}", file=sys.stderr)
             return 2
+    # A k-point mesh of the time-reversal invariant points as the Gamma point of the supercell
+    # (PARSEC_KPOINT_SUPERCELL=auto), and a repeating Gamma-point cell as its smaller cell with a mesh
+    # (PARSEC_SUPERCELL_KPOINTS=auto, a k-point run of the reference CLI, which makes the same cell):
+    # parsec_python/SCF/kpoint_supercell.py, the same energies with the Bloch kinetic term.
+    from parsec_python.SCF.kpoint_supercell import (
+        describe as _describe_kpoint_cells,
+        kpoints_of_supercell as _bloch_cells,
+        supercell_of_trim_mesh as _trim_supercell,
+    )
+
+    from .driver import periodic_sector_refusal as _sector_refusal
+
+    _found_supercell = _trim_supercell(translation.problem, refusal=_sector_refusal)
+    if _found_supercell is not None:
+        translation = replace(translation, problem=_found_supercell[0])
+        print(_describe_kpoint_cells("supercell", _found_supercell[1]))
+    elif _bloch_cells(translation.problem) is not None:
+        return reference_main(_reference_argv(arguments))
 
     from parsec_python.MLFF import MLFFError, relax_initial_structure
 
@@ -1184,7 +1379,11 @@ def _run(
     except (OSError, ValueError) as error:
         print(f"Input error: {error}", file=sys.stderr)
         return 2
-    if arguments.symmetry == "on" and not keeps_group:
+    # A cell keeps no group in the parser (its forces are not symmetrized):
+    # whether its SCF may take the point group of the cell is decided below
+    # and by the driver.
+    periodic_cell = translation.problem.periodic_cell is not None
+    if arguments.symmetry == "on" and not keeps_group and not periodic_cell:
         print(
             "Input error: --symmetry on cannot be used here: "
             + (
@@ -1372,6 +1571,94 @@ def _run(
             "NOTE: Restart_Run of a spin-polarized calculation: both channels on the full grid "
             "(Spin_Symmetry_Sectors: off for the restart)",
         ]
+    # PARSEC_PERIODIC_SECTOR_FORCES and PARSEC_PERIODIC_SECTOR_BANDS, read in
+    # every run so that a value they do not know is refused.
+    try:
+        periodic_sector_forces_setting()
+        periodic_sector_bands_setting()
+    except ValueError as error:
+        print(f"Input error: {error}", file=sys.stderr)
+        return 2
+    # Whether the forces or the relaxation of a periodic cell keep the sectors
+    # of its point group (periodic_sector_forces_refusal).
+    periodic_sector_forces = False
+    if translation.problem.periodic_cell is not None:
+        # The parser keeps no point group for a cell on the default routines
+        # (use_symmetry: its forces are not symmetrized).  The SCF of a bulk
+        # cell at the Gamma point may still solve in the sectors of its point
+        # group about the origin of the cell, which the driver looks for
+        # (PARSEC_PERIODIC_SYMMETRY).  Its single-point forces and its
+        # relaxations by an optimizer keep those sectors too, their forces and
+        # moved positions averaged over the full group of the sectors
+        # (PARSEC_PERIODIC_SECTOR_FORCES=auto); molecular dynamics, manual
+        # movements, Move_Flag with fixed atoms and the Fortran-derived routines
+        # read the full grid (periodic_sector_forces_refusal).  A band structure
+        # keeps the sectors of the SCF under PARSEC_PERIODIC_SECTOR_BANDS=auto:
+        # the bands read the potential the result holds on the full grid
+        # (Output/post_scf.band_hand_over); under off the whole run reads the
+        # full grid, as before.  nscf_kpoints runs no SCF here (Restart_Run is
+        # required and the reference CLI runs it).
+        moving_or_forces = (
+            translation.relaxation is not None
+            or translation.molecular_dynamics is not None
+            or translation.compute_forces
+        )
+        sector_forces_refusal = (
+            periodic_sector_forces_refusal(translation, supercell=_found_supercell is not None)
+            if moving_or_forces
+            else None
+        )
+        periodic_sector_forces = moving_or_forces and sector_forces_refusal is None
+        periodic_full_grid = None if periodic_sector_forces else (
+            "a relaxation or molecular dynamics"
+            if translation.relaxation is not None or translation.molecular_dynamics is not None
+            else "forces"
+            if translation.compute_forces
+            else "a band structure"
+            if translation.problem.bands is not None and periodic_sector_bands_setting() == "off"
+            else "a non-self-consistent run"
+            if getattr(translation, "nscf", None) is not None
+            else None
+        )
+        wfndat_restart = translation.restart_run and getattr(translation, "restart_from_wfndat", False)
+        # Under PARSEC_PERIODIC_SECTOR_FORCES=auto a refusal names what keeps
+        # the full grid; under off the message of before.
+        named_refusal = (
+            moving_or_forces
+            and periodic_full_grid is not None
+            and sector_forces_refusal is not None
+            and periodic_sector_forces_setting() == "auto"
+        )
+        if arguments.symmetry == "on" and (
+            periodic_full_grid is not None or wfndat_restart or translation.problem.point_charges
+        ):
+            print(
+                "Input error: --symmetry on cannot be used with "
+                + (
+                    (
+                        "molecular dynamics"
+                        if translation.molecular_dynamics is not None
+                        else "a relaxation"
+                        if translation.relaxation is not None
+                        else "forces"
+                    )
+                    + f" of a periodic cell here, which keeps the full grid: {sector_forces_refusal}"
+                    if named_refusal
+                    else f"{periodic_full_grid} of a periodic cell, which the point-group sectors of a cell do not compute"
+                    if periodic_full_grid is not None
+                    else "Restart_From_Wfndat"
+                    if wfndat_restart
+                    else "point charges (Add_Point_Charges): the calculation uses no point group"
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        if periodic_full_grid is not None:
+            solver_symmetry_mode = "off"
+        elif not wfndat_restart and not translation.problem.point_charges and (
+            arguments.symmetry == "on" or (arguments.symmetry is None and not translation.ignore_symmetry)
+        ):
+            solver_symmetry_mode = arguments.symmetry or "auto"
 
     summary = summarize_translation(translation)
     if arguments.dry_run:
@@ -1555,6 +1842,12 @@ def _run(
                 symmetry=solver_symmetry_mode,
                 symmetry_cache_directory=symmetry_cache_directory,
             )
+            if _context is None or _context.is_root:
+                # What of a cluster with a point group runs on the full grid for want of the native extension
+                # (also a NOTE line of parsec.out).
+                for key, value in getattr(getattr(system, "backend_info", None), "details", ()):
+                    if key == "symmetry_full_grid_note":
+                        print(f"NOTE: {value}", file=sys.stderr)
             # Wavefunctions are much larger than all scalar observables and
             # are absent from the default archive.  Keep symmetry-sector
             # orbitals resident/lazy unless the user explicitly requests
@@ -1573,6 +1866,24 @@ def _run(
                 or translation.molecular_dynamics is not None
             )
             reporter.setup(system)
+            # The forces of a cell solved in the sectors of a point group with
+            # weighted representations: averaged over the full group G of the
+            # sectors (Forces/sector_symmetry.py), which the ionic loop of a
+            # relaxation finds once and keeps the moved positions in
+            # (PARSEC_PERIODIC_SECTOR_FORCES=auto).
+            sector_operations = None
+            if periodic_sector_forces:
+                from .Forces.sector_symmetry import sector_force_operations, sector_symmetry_operations
+
+                sector_operations = sector_force_operations(system)
+                # G of a point group, or H of Abelian sectors: the forces and
+                # moved positions of a relaxation stay on the group the moved
+                # atoms must keep (check_sector_atoms)
+                if sector_symmetry_operations(system) is not None:
+                    symmetrize_forces = True
+                line = _periodic_sector_forces_line(system, sector_operations)
+                if line is not None:
+                    log.write(line)
             # FDET (PARSEC 1.5): the frozen field and the tip sphere.
             from parsec_python.Output.correction_output import embedding_setup_lines
 
@@ -1686,6 +1997,9 @@ def _run(
                 if translation.problem.periodic_cell is not None:
                     from .Forces.periodic_device import with_periodic_operations
 
+                    # A cell in the sectors of a point group takes the full
+                    # group G of the sectors with its translations, what its
+                    # forces are averaged over and its moved atoms keep.
                     backend = with_periodic_operations(backend)
                 if restart is not None:
                     from parsec_python.SCF.restart import with_first_warm_start
@@ -1843,8 +2157,17 @@ def _run(
             from parsec_python.Output.afm_scan import scan_lines_after_run
 
             scan_lines_after_run(translation, outcome, log.write, input_directory)
-            # bandstruc of a Gamma-point cell, Create_DOS of a cluster.
-            run_post_scf_outputs(system, translation, result, reporter, log.write, input_directory)
+            # bandstruc of a Gamma-point cell, Create_DOS of a cluster: of the
+            # last structure where the atoms moved (parsec.F90 calls calc_bands
+            # after the movement loop, with the projectors of the last positions).
+            last_system = (
+                outcome.system
+                if outcome is not None
+                else dynamics.system
+                if dynamics is not None
+                else system
+            )
+            run_post_scf_outputs(last_system, translation, result, reporter, log.write, input_directory)
             log.write(f"Text log: {log_path}")
             if dynamics is not None:
                 return 3 if dynamics.scf_failed else 0
@@ -1863,7 +2186,15 @@ def _run(
     except Exception as error:
         if arguments.debug:
             raise
-        if not getattr(run_log, "failure_reported", False):
+        rank = getattr(arguments, "mpi_rank", None)
+        if rank is not None:
+            # an MPI run: the ranks other than 0 write no log, and a rank that fails alone ends the others
+            # (the abort of main): every failed rank tells why, with its traceback, on the standard error
+            import traceback
+
+            text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            print(f"MPI rank {rank}: calculation failed:\n{text}", file=sys.stderr, end="", flush=True)
+        elif not getattr(run_log, "failure_reported", False):
             print(
                 f"Calculation failed: {type(error).__name__}: {error}",
                 file=sys.stderr,

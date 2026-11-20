@@ -1,9 +1,10 @@
 # Bulk diamond on many GPUs
 
-Supercells of bulk diamond from 8 to 5,832 atoms, at the Gamma point and with Gamma-centred Monkhorst-Pack meshes,
+Supercells of bulk diamond from 8 to 64,000 atoms, at the Gamma point and with Gamma-centred Monkhorst-Pack meshes,
 computed on 16 NVIDIA A100 80 GB GPUs (four Perlmutter nodes). The series measures how large a periodic cell this
-code can treat: the orbitals of one cell are shared by all ranks (one rank per GPU, any number of nodes), and with
-k-points the ranks form pools of k-points.
+code can treat: the orbitals of one cell are shared by all ranks (one rank per GPU, any number of nodes), or, where
+the cell has a point group (about its origin or, since 2026-11-18, a symmetric site off it, with the translations by
+half the cell), divided into its symmetry sectors; with k-points the ranks form pools of k-points.
 
 ## Settings
 
@@ -72,6 +73,110 @@ k3 n = 7; the two differ in no code path these runs take).
 9 x 9 x 10 (6,480 atoms, 12,966 states) does not fit: the root GPU, which also holds the m x m matrices of the
 Rayleigh-Ritz step, runs out at 75.6 GB plus a 5.4 GB request; the run stops with `FULL_SCF_FAILED` after 69 s.
 The other GPUs of n = 9 held 51-52 GiB of arrays (the root 61 GiB).
+(These rows are the one sector of the identity; the memory round of 2026-11-15 brought n = 10, 8,000 atoms, to
+651.5 s and 68.1 GB.)
+
+### Gamma point in the sectors of the point group (2026-11-16)
+
+With an atom at the origin and 18 points per cubic edge, the cell keeps Td about that atom, and the orbitals take
+the weighted sectors of D2d (`PARSEC_PERIODIC_SYMMETRY=auto`, the default; `src/parsec_python/acceleration/README.md`,
+"Point groups of periodic cells"): 1/16 of the grid times the states of the one sector of the identity. Four nodes,
+one process per node on its four GPUs (`scripts/run_multi_gpu_scf.sh --nodes 4 parsec.in out`, the launch of the
+nanodiamond series), first runs; GPU memory as reported by the runner for the fullest GPU. The times are those of
+the code with the periodic Hartree solve by the FFT of the stencil symbol and the local ionic potential on the GPU
+(below); "before" is the program time of the same runs on code 51b2e6b0, which had neither:
+
+| n | atoms | electrons | grid points | states | SCF iterations | program (s) | SCF (s) | setup (s) | later step (s) | GPU (GiB) | before (s) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 6 | 1,728 | 6,912 | 1,259,712 | 3,462 | 9 | 5.7 | 1.9 | 3.7 | 0.12 | 1.0 | 18.4 |
+| 8 | 4,096 | 16,384 | 2,985,984 | 8,198 | 9 | 12.4 | 5.4 | 6.8 | 0.37 | 2.5 | 29.7 |
+| 10 | 8,000 | 32,000 | 5,832,000 | 16,006 | 9 | 36.2 | 19.5 | 16.6 | 1.25 | 6.5 | 71.2 |
+| 12 | 13,824 | 55,296 | 10,077,696 | 27,654 | 10 | 106.8 | 78.1 | 28.5 | 5.40 | 14.8 | 173.8 |
+| 14 | 21,952 | 87,808 | 16,003,008 | 43,910 | 10 | 193.0 | 152.9 | 39.9 | 10.85 | 32.1 | 347.8 |
+| 15 | 27,000 | 108,000 | 19,683,000 | 54,006 | 9 | 280.5 | 229.9 | 50.5 | 17.87 | 46.4 | 479.4 |
+| 16 | 32,768 | 131,072 | 23,887,872 | 65,542 | 9 | 424.8 | 361.7 | 62.9 | 28.35 | 66.3 | 690.7 |
+
+n = 16 was the largest cube that fits with the point group alone (n = 17 would need about 1.4 times the memory;
+with the translations below n = 20 fits). The energy per atom is
+-11.4039349 Ry from n = 10 on; the energies of the two codes agree within 3e-10 Ry. SCF to 1e-7 Ry, the sectors
+give the energy of the one sector of the identity within 4e-14 Ry (n = 1), 5e-13 Ry (n = 2) and 9e-13 Ry (n = 3).
+
+Of the 690.7 s of n = 16 on code 51b2e6b0, the setup took 239.6 s (153 s the local ionic potential of the root,
+on the host; 30 s the finite differences) and the periodic Hartree solves 84 s (CG on the GPU, about 9 s a step).
+Three changes, each exact or with a switch that restores the former bits (`src/parsec_python/acceleration/README.md`):
+
+- The Hartree solve divides by the eigenvalues of the wrapped finite-difference Laplacian, the FFT of its stencil
+  (`PARSEC_PERIODIC_HARTREE_METHOD=fft`, the default; `cg` the former solve): 0.26 s a step at n = 16, 2.5 s for
+  the whole SCF, and the GPU of the solve no longer holds the matrix.
+- The local ionic potential (the structure-factor series and the short-ranged terms of every image) is summed on
+  the GPU (`PARSEC_PERIODIC_SETUP_DEVICE=auto`, the default; `off` the host): 1.0 s at n = 16.
+- The finite-difference matrix of the wrapped box is written directly in its final order (the same arrays): 5.3 s.
+
+The setup of n = 16 is now 62.9 s, of which 23 s are the projectors and 11 s the initial density; of its SCF,
+355 s are eigensolves (133 s the first). The host memory of the root fell from 34.1 to 14.6 GiB. With one rank
+per GPU (`--rank-per-gpu`, sector groups of four ranks) n = 10 took 33.8 s and 10.2 GiB.
+
+### Gamma point with the translations by half the cell (2026-11-16)
+
+A supercell of n cubes repeats a smaller cell, and its grid of 18 n points per edge maps onto itself under the
+translations by half the cell: for an even n all seven (the cell is 2 x 2 x 2 cells of n/2 cubes), for an odd n the
+three face-centring ones `(0, a/2, a/2) n` of the fcc lattice. With Td about the origin they give a group of 192 or 96
+operations, whose real characters are the time-reversal invariant k-points of the smaller cell, and the orbitals take
+10 or 5 weighted sectors of a subgroup of 32 or 16 (`PARSEC_PERIODIC_TRANSLATIONS=auto`, the default;
+`src/parsec_python/acceleration/README.md`, "Translations by half the cell"): about 1/102 of the rows times states
+of the one sector of the identity, against 1/16 with Td alone. The projectors of a cell are also built for all atoms
+at once (`acceleration/V_ion/periodic_projectors.py`; the same arrays, 23.0 s -> 1.5 s at n = 16). The same launch
+and settings as above, first runs; "before" is the program time of the table above (code d50bf3d0):
+
+| n | atoms | electrons | grid points | states | SCF iterations | program (s) | SCF (s) | setup (s) | later step (s) | GPU (GiB) | before (s) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 6 | 1,728 | 6,912 | 1,259,712 | 3,462 | 7 | 4.4 | 1.3 | 3.0 | 0.08 | 0.7 | 5.7 |
+| 8 | 4,096 | 16,384 | 2,985,984 | 8,198 | 8 | 9.2 | 4.0 | 5.0 | 0.30 | 1.2 | 12.4 |
+| 10 | 8,000 | 32,000 | 5,832,000 | 16,006 | 7 | 19.8 | 10.6 | 9.2 | 0.90 | 2.4 | 36.2 |
+| 12 | 13,824 | 55,296 | 10,077,696 | 27,654 | 7 | 43.7 | 27.2 | 16.4 | 2.29 | 4.4 | 106.8 |
+| 14 | 21,952 | 87,808 | 16,003,008 | 43,910 | 7 | 92.5 | 64.6 | 27.7 | 5.33 | 8.0 | 193.0 |
+| 15 | 27,000 | 108,000 | 19,683,000 | 54,006 | 8 | 170.7 | 135.6 | 35.0 | 10.73 | 23.9 | 280.5 |
+| 16 | 32,768 | 131,072 | 23,887,872 | 65,542 | 7 | 187.8 | 142.9 | 44.7 | 11.81 | 16.1 | 424.8 |
+| 18 | 46,656 | 186,624 | 34,012,224 | 93,318 | 7 | 362.1 | 292.3 | 69.7 | 24.25 | 30.1 | - |
+| 20 | 64,000 | 256,000 | 46,656,000 | 128,006 | 7 | 668.1 | 561.7 | 106.3 | 46.66 | 53.8 | - |
+
+n = 20 is the largest cube that fits (n = 22 would need about 1.8 times the memory; an odd n has the three
+translations only, so n = 15 takes more time and memory than n = 16). The energy per atom is -11.4039349 Ry from
+n = 10 on, as above. SCF to 1e-7 Ry, the translations give the energy of the point group alone within 1e-14 Ry
+(n = 1, 96 operations), 2e-13 Ry (n = 2), 2e-12 Ry (n = 3) and 2e-12 Ry (n = 4); at the 2e-4 Ry of the series the
+two SCFs take different paths (7 to 8 steps instead of 9 to 10) and their energies differ by up to 5e-4 Ry for
+32,768 atoms (1.5e-8 Ry per atom). The ten sectors of n = 16 hold 2,054 states each, on 16 GPUs six of them on two
+GPUs and four on one (the placement by count of these runs, `PARSEC_SECTOR_PLACEMENT=cyclic` since 2026-11-18; the
+default placement by the cost of the sectors groups them otherwise, `src/parsec_python/acceleration/MULTI_GPU.md`);
+its first eigensolve takes 71 s and a later SCF step 12 s.
+
+### Gamma point: projectors of one atom per orbit, binned densities (2026-11-16)
+
+The sectors of a group take the projectors of one atom per orbit of the group, scaled by the square root of the
+orbit size (`PARSEC_SECTOR_PROJECTOR_ORBITS=auto`: the same sector operators to round-off, a 32nd of the columns
+for the subgroup of 32 of these cells), and the superposed atomic density of the first SCF step is summed on the GPU
+from bins of the atom images (`PARSEC_PERIODIC_DENSITY_BINS=auto`: the same terms in another order). The same launch
+and settings as above, first runs on one allocation from small to large; "before" is the program time of the table
+above (code 6275754b):
+
+| n | atoms | SCF iterations | program (s) | SCF (s) | setup (s) | later step (s) | GPU (GiB) | before (s) |
+|---|---|---|---|---|---|---|---|---|
+| 6 | 1,728 | 7 | 22.6 (*) | 14.8 | 7.8 | 0.06 | 0.8 | 4.4 |
+| 8 | 4,096 | 8 | 7.0 | 2.1 | 4.8 | 0.16 | 1.1 | 9.2 |
+| 10 | 8,000 | 7 | 12.2 | 3.7 | 8.4 | 0.34 | 2.1 | 19.8 |
+| 12 | 13,824 | 7 | 22.5 | 7.5 | 14.8 | 0.69 | 3.9 | 43.7 |
+| 14 | 21,952 | 7 | 37.0 | 14.5 | 22.4 | 1.32 | 7.5 | 92.5 |
+| 15 | 27,000 | 8 | 77.8 | 50.2 | 27.4 | 4.22 | 23.2 | 170.7 |
+| 16 | 32,768 | 7 | 64.3 | 30.2 | 33.9 | 2.84 | 15.2 | 187.8 |
+| 18 | 46,656 | 7 | 112.9 | 63.4 | 49.3 | 6.03 | 29.0 | 362.1 |
+| 20 | 64,000 | 7 | 195.5 | 125.2 | 70.2 | 11.90 | 52.2 | 668.1 |
+
+(*) the first item of the allocation: its first eigensolve (13.4 s) compiles the GPU kernels of the code; the same
+cell took 4.1 s after another one. The energies are those of the table above within 2e-9 Ry; SCF to 1e-7 Ry the
+projectors of one atom per orbit give those of every atom within 1e-14 (8 and 64 atoms), 5e-11 (216) and 1.2e-10 Ry
+(512). At n = 16 the SCF is 30.2 s instead of 142.9 s (the first eigensolve 11.7 s instead of 70.7, a later step
+2.8 s instead of 11.8): the projectors of every atom in each of the ten sectors had cost more than the stencil. The
+setup is now the larger part (n = 20: 70.2 s of 195.5, of it 8.2 s the density instead of 36.4).
 
 ### k-points (irreducible wedge of a Gamma-centred mesh)
 
@@ -90,6 +195,131 @@ At n = 7 the four bases do not fit the GPUs together: every rank keeps two of it
 others in host memory (51 GB per rank at the peak), and all 16 ranks share every k-point (P = 1). GPU memory at
 n = 6 (P = 4): 74.6 GB by nvidia-smi, the estimate of the code 69 GB per GPU. The first k-point run of an allocation
 compiles the device kernels of the Bloch operator (2x2x2 n = 2: 38 s the first time, 2.3 s warm).
+
+### k-points in the sectors of their little groups (2026-11-17)
+
+Each k-point of the wedge is split into the sectors of the commuting involutions of its little group: the
+translations by half the cell (all seven for an even n, the three face-centring ones for an odd n), the twofold
+axes and mirrors of Td that fix k (`PARSEC_KPOINT_SECTORS=auto`, the default; `src/parsec_python/acceleration/README.md`,
+"The sectors of a k-point"). The sectors of all k-points are the tasks of the k-point pools, which are planned by
+the size of each task (`PARSEC_KPOINT_POOL_ASSIGN=auto`); their complex matrices run in a CSR kernel of their own on
+the device. The same inputs and launch as the table above (the default routines, 18 points per cubic edge, the mesh
+reduced by Td and time reversal, the density symmetrized), first runs; "before" is the code before the sectors (the
+path of `PARSEC_KPOINT_SECTORS=off`):
+
+| n | atoms | mesh (k) | sectors | pools | SCF iterations | program (s) | first step (s) | later step (s) | GPU (GiB) | before (s) | before, GPU (GiB) | E/atom (Ry) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 6 | 1,728 | 3x3x3 (4) | 64 | 16 x 1 | 8 | 18.3 | 7.9 | 1.1 | 6.0 | 195.7 | 26.5 | -11.4039207 |
+| 7 | 2,744 | 2x2x2 (4) | 32 | 8 x 2 | 8 | 87.7 | 37.1 | 6.8 | 33.6 | 586.1 | 54.1 | -11.4039172 |
+| 8 | 4,096 | 2x2x2 (4) | 64 | 16 x 1 | 8 | 85.9 | 37.6 | 6.2 | 25.9 | - | - | -11.4039214 |
+| 9 | 5,832 | 2x2x2 (4) | 32 | 8 x 2 | 8 | 477.1 | 172.8 | 42.8 | 58.1 | - | - | -11.4039242 |
+| 10 | 8,000 | 2x2x2 (4) | 64 | 16 x 1 | 8 | 374.1 | 143.3 | 31.0 | 49.5 | - | - | -11.4039262 |
+
+"pools" is the number of k-point pools times their ranks; "later step" the median of the steps after the first.
+The energies of the first two rows are those without sectors within 8e-6 Ry in total (the convergence criterion of
+these inputs is 2e-4 Ry). An even n is faster than the odd n below it: its seven translations give each k-point twice
+the sectors. An odd n has the three face-centring translations only, so two of the four k-points of n = 9 have four
+sectors each, of 1.06 million rows and 3,805 states (65 GB a basis), besides 8 of half and 16 of a quarter of that
+size. Planned by their sizes, each of the eight largest sectors gets a pool of two ranks with one medium and two small
+ones (every subspace on the GPUs, about 60 GB of estimate per GPU). Planned as before (`PARSEC_KPOINT_POOL_ASSIGN=cyclic`:
+every task as large as the largest, dealt round-robin), n = 9 did not run: with one rank per pool the large bases went to
+host memory beside small tasks, four of them on one node, more than its 256 GB; with four ranks per pool
+(`--kpoint-pools 4`) a pool stopped after five to seven steps. The plan by sizes changed n = 7 from 119.6 s
+(20.3 GiB) to 87.7 s, n = 8 from 105.6 s (14.8 GiB) to 85.9 s and n = 10 from 404.7 s (51.0 GiB, two subspaces of each
+rank in host memory, 37 GiB per rank) to 374.1 s with every subspace on the GPU; it keeps the same total energies to
+the last digit. n = 6 has the same plan either way.
+
+These are the runs of 2026-11-17. Since 2026-11-18 each sector keeps after the first solve only the levels it holds
+among those of its k-point plus a buffer (`PARSEC_KPOINT_SECTOR_REFIT=auto`), which cuts the later steps by 15 to
+21 % (n = 7: 86.6 -> 81.8 s on one allocation) and moves the energies within the SCF criterion (about 1e-6 Ry);
+times also vary between allocations by about as much (n = 6 took about 21 s with the code of 2026-11-18 on another
+allocation).
+
+The other drivers of k-points take the sectors too (2026-11-17; the same inputs with one keyword changed, first runs):
+
+| run | GPUs | with sectors | without | GPU, with/without (GiB) | total energy apart (Ry) |
+|---|---|---|---|---|---|
+| n = 6, 3x3x3, `Spin_Polarization: true` | 16 (MPI pools) | 50.9 s (89.4 s with the spin PBE on the host) | 392.2 s | 8.9 / 41.8 | 2.9e-6 |
+| n = 3, 2x2x2, one relaxation step (`Minimization: bfgs`, `Movement_Num: 1`) | 4 (one process) | 83.1 s | 97.9 s | 1.7 / 6.2 | 2.3e-7 |
+| n = 3, 1x1x2, `Correlation_Type: pbe0` | 4 (one process) | 53.5 s | 69.4 s | 14.6 / 15.7 | 1.3e-6 |
+
+The two channels of a spin-polarized k-point share its sectors; the forces of a relaxation come from the orbitals of
+the sectors expanded to the whole grid (in one process, or on the ranks of the MPI pools, each over its columns, since
+the evening of the same day); the exchange of PBE0 is
+reduced to the sectors, which keep their plans and Ritz states from one loop of the Fock loop to the next (the inner
+SCF steps 0.7 instead of 2.1 s). The spin-polarized PBE of these drivers ran on the host of every rank, 37 of the 81 s
+of SCF; on the GPU (the formula of the host with forward derivatives, `src/parsec_python/acceleration/V_xc/dual.py`)
+it takes 0.5 s and the run 50.9 s (later steps 2.1 instead of 6.8 s), the same total energy to the digits printed.
+
+Relaxations with k-points on the MPI pools (`--mpi`, 16 A100, `Minimization: bfgs`, `Movement_Num: 1`; no space
+group: the mesh of a relaxation is reduced by time reversal alone, `PARSEC_KPOINT_TIME_REVERSAL`, since 2026-11-18):
+n = 3 with the 2x2x2 mesh (8 points, each its own partner) 15.9 s, against 83.1 s in one process on four GPUs, the same
+total energy (-2463.22850177 Ry) and forces to the digits printed; n = 6 with the 3x3x3 mesh (14 of its 27 points)
+135.6 s, of which 118.2 s SCF, within 9e-8 Ry and 6e-6 Ry/bohr of the whole mesh (largest force 4.4e-5 Ry/bohr).
+Before the same day these took 31.1 s and 381.0 s: the whole mesh (205.4 s of SCF at n = 6) and a starting density
+from the readable sum (20.9 s and 159.3 s: the scope of the forces on the GPU had replaced the builder of the bulk
+grid, which the single points kept, 0.24 s at n = 6).
+
+Since the night after, forces and relaxations take the irreducible wedge of the mesh as a single point does
+(`PARSEC_KPOINT_FORCE_WEDGE`, as Fortran's routines with `symm_forces.f90`: the forces completed and averaged over the
+operations that map the grid onto itself, so the structure keeps them): n = 6 with the 3x3x3 mesh runs 4 of the 27
+points, 54.6 s instead of 135.6 s (SCF 39.3 s), 5.8 GiB on the fullest GPU instead of 12.7, the total energy within
+2.4e-6 Ry (the SCF criterion is 2e-4 Ry). The structures with an atom moved (`make_diamond.py --displace 0.05 0.05
+0.05`, the six operations about it left): n = 3 with the 2x2x2 mesh, SCF to 1e-6 Ry, 4 of 8 points, the same total
+energy to the digits printed and forces within 1e-6 Ry/bohr of the whole mesh; two BFGS moves with the 3x3x3 mesh 6
+of 27 points, SCF 33.4 instead of 52.0 s, the last energy within 2.4e-6 Ry. Such a structure leaves the k-points little
+groups of order 2 at most: n = 6 then takes 265 s per SCF loop with the wedge (6 points, 11 tasks), and the 14 pairs
+(25 tasks) ran out of GPU memory in the second structure.
+
+The setup of large Gamma cells (2026-11-17): the Ewald ion-ion sums on the GPU (`acceleration/V_ion/ewald_device.py`:
+the images of the host in cells of the cutoff for the real-space pairs, CuPy for the structure factors;
+`PARSEC_DEVICE_EWALD=off` keeps the host sums bit for bit), the finite-difference matrix filled by slabs on threads
+and the image centres of the atomic density for all atoms of a species at once (both the same bits). n = 20 on 16
+A100, each run second in its allocation: 151.2 s instead of 176.2 s, the setup before the SCF 44.9 s instead of 70.0
+(ion-ion 0.7 instead of 16.8 s, finite differences 5.8 instead of 10.1, atomic density 3.5 instead of 8.1), the SCF
+106.3 s either way, the same total and ion-ion energies to the digits printed. With the sector stencils of the cell
+built from its grid (2026-11-18: the reduction of its full matrix checked every row and column once per sector) and the
+atom-matching trees of the symmetry detection kept: 141.9 s, the setup 35.4 s, the same energies. With the
+finite-difference matrix of the cell never built (`PARSEC_PERIODIC_DEFER_LAPLACIAN`: the sector stencils and the FFT
+Hartree symbol come from the grid), the row maps of the point group filled on threads and the orbits of its 32
+operations taken map by map: 132.7 s, the setup 26.9 s, the same energies (the matrix built at once: 139.6 s); the
+host memory of a rank peaks at 8.1-10.7 GiB instead of 30.6-31.4 (21.2-24.0 with the matrix).
+
+n = 22 (85,184 atoms, 340,736 electrons, 62.1 M grid points) converges in 8 SCF steps on 16 A100 in 261.7 s
+(-11.40393 Ry/atom, as from n = 8 on) with `PARSEC_CUPY_SECTOR_MARGIN=fixed` (the full margin of states of the weighted
+sectors from the start), 78.8 GiB on the fullest GPU; `PARSEC_CUPY_SECTOR_MARGIN_BUDGET=0.95` also fits (261.6 s, 79.1
+GiB). By default the margin is cut for memory, a sector then misses states and grows from a new start in the second
+step, and that growth runs out of memory: the GPUs of a rank hold three sector bases of 19.3 GiB each. One rank per GPU
+(sector groups of ranks) does not fit either: the ranks are dealt to the sectors in equal numbers, not by their sizes.
+Since 2026-11-18 the default margin converges there (the SCF loop no longer holds the basis of a regrowing sector: 1044 s, 18 steps), and with the sectors placed by their cost (`PARSEC_SECTOR_PLACEMENT=size`) one rank per GPU (`--rank-per-gpu`, `Eigensolver: chebff`) runs n = 22 with the default settings in 322.9 s, 8 steps, without a margin cut, 66.4 GiB on the fullest GPU.
+
+### Gamma point: forces and relaxations in the sectors (2026-11-18)
+
+The forces and the `bfgs` relaxations of a cell keep the sectors of its point group (`PARSEC_PERIODIC_SECTOR_FORCES`,
+README of `acceleration`): the projector gradients of one atom per orbit, the local terms of one atom per orbit of the
+full group, the total averaged over that group. The inputs of `make_diamond.py` name `Cubic_Spline`, which puts the
+forces of a Gamma cell on the Fortran-derived routines by default; a forces run adds
+
+```bash
+--set 'Skip_Force: false' --set 'Use_Fortran_Routines: .false.'   # and for a relaxation: --set 'Minimization: bfgs'
+```
+
+One relaxation step (the SCF and the forces of the perfect cubes, whose forces vanish by symmetry: the largest is
+1.5-3.7e-4 Ry/bohr at the SCF criterion of 2e-4 Ry) on 16 A100, one rank per node:
+
+| n | atoms | whole run | SCF | forces | fullest GPU |
+|---|---:|---:|---:|---:|---:|
+| 6 | 1,728 | 9.6 s | 1.5 s | 2.2 s | 1.6 GiB |
+| 10 | 8,000 | 14.6 s | 4.0 s | 3.0 s | 2.4 GiB |
+| 20 | 64,000 | 164.7 s | 118.5 s | 14.8 s | 50.6 GiB |
+| 22 | 85,184 | 304.1 s | 237.3 s | 20.0 s | 79.1 GiB |
+
+n = 22 with `PARSEC_CUPY_SECTOR_MARGIN=fixed` and `PARSEC_CUPY_FORCE_PREFETCH=off` (the gradients built beside the SCF
+take the last GiB otherwise); its energy is that of the SCF alone above. Before the local terms of the orbits and the
+gradients of the representatives, the local forces of n = 20 took about 520 s on one A100 and the gradients of every
+atom 188 s on the host. With the bonds of 6^3 cubes displaced by 0.04 bohr (G of 192, SCF to 1e-8 Ry), the forces in
+the sectors agree with one sector of the identity (`PARSEC_PERIODIC_SYMMETRY=off`) within 1.4e-8 Ry/bohr: 10.7 s in all
+(forces 1.0 s) against 424.3 s (forces 36.4 s) on 16 A100.
 
 ### Scaling on one size
 

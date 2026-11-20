@@ -16,10 +16,12 @@ small end-to-end runs of the reference command line on the orthorhombic grid
 from __future__ import annotations
 
 import math
+import os
 import re
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -496,8 +498,11 @@ class InputTests(unittest.TestCase):
         gw = translation.gw
         self.assertIsNotNone(gw)
         self.assertEqual(gw.kgrid, (2, 2, 2))
-        # This port's 2x2x2 grid is (+-1/4): k = (i + 1/2)/2 in BerkeleyGW's convention.
-        self.assertEqual(gw.kshift, (0.5, 0.5, 0.5))
+        # PARSEC 1.5's grid without a shift block: k = i/2, a zero shift (since 2026-11-18)
+        self.assertEqual(gw.kshift, (0.0, 0.0, 0.0))
+        with mock.patch.dict(os.environ, {"PARSEC_MP_UNSHIFTED_MESH": "port"}):
+            # this port's former 2x2x2 grid is (+-1/4): k = (i + 1/2)/2 in BerkeleyGW's convention
+            self.assertEqual(_parse(PERIODIC, MP_SCF).gw.kshift, (0.5, 0.5, 0.5))
         self.assertIsNone(gw.fermi_level)
         self.assertEqual(gw.space_group.order, 16)  # H2 along z in a cube: D4h
         self.assertTrue(any("PARSEC writes 0 0 0" in w for w in translation.warnings))
@@ -608,7 +613,9 @@ class RunTests(unittest.TestCase):
         return rho, vxc, wfn
 
     def test_scf_with_kpoints_on_the_orthorhombic_grid(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
+        # the former unreduced 2x2x2 grid of points at +-1/4 (PARSEC_MP_UNSHIFTED_MESH=port): eight k-points of the
+        # WFN file with their own levels
+        with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"PARSEC_MP_UNSHIFTED_MESH": "port"}):
             directory = Path(folder)
             path = _write(directory, PERIODIC, MP_SCF)
             code, error = _run_cli(path)

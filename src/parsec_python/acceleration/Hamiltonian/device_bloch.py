@@ -289,6 +289,17 @@ class DeviceBlochOperator:
         if self.stencil is not None and pending is None:
             # -nabla^2 - 2i k.grad + V + |k|^2 in one kernel (orthorhombic periodic grid)
             result = self.stencil.apply(block, self.stencil_diagonal)
+        elif self.laplacian.dtype == xp.complex128:
+            # the Bloch block of the finite-difference Laplacian (PARSEC_KPOINT_KINETIC=bloch): one complex
+            # product, no k.grad term, V without |k|^2 (rows of the whole grid: the row-distributed solver refuses it);
+            # a sector of a k-point: its reduced kinetic term with |k|^2 (.complex_csr_device, the diagonal in the
+            # same pass)
+            product = getattr(self.laplacian, "product", None)
+            if product is not None:
+                result = product(block, diagonal=self.diagonal)
+            else:
+                result = xp.ascontiguousarray(self.laplacian @ block)
+                result += self.diagonal[:, None] * block
         else:
             real = block.view(xp.float64)
             # cuSPARSE returns a column-major product; the complex view below needs
@@ -306,15 +317,23 @@ class DeviceBlochOperator:
         if self.kinetic is not None:
             result += self._kinetic_term(block)
         if self.projector_forward is not None:
+            adjoint_product = getattr(self.projector_adjoint, "product", None)
             if self.projector_real:
                 coefficients = self._real_product(self.projector_adjoint, block)
+            elif adjoint_product is not None:
+                coefficients = adjoint_product(block)
             else:
                 coefficients = self.projector_adjoint @ block
             if self.allsum is not None:
                 coefficients = self.allsum(coefficients)
             coefficients *= self.projector_signs[:, None]
+            forward_product = getattr(self.projector_forward, "product", None)
             if self.projector_real:
                 result += self._real_product(self.projector_forward, coefficients)
+            elif forward_product is not None:
+                if not result.flags.c_contiguous:
+                    result = xp.ascontiguousarray(result)
+                forward_product(coefficients, result, accumulate=True)
             else:
                 result += self.projector_forward @ coefficients
         if self.hubbard is not None:
@@ -721,8 +740,24 @@ class DeviceBlochConverter:
         return np.asarray(host_array)
 
     def _derivative_parts(self, hamiltonian):
-        """Device ``(laplacian, k_gradient)``: the stencil matrices, ``k_gradient`` None without Bloch term."""
+        """Device ``(laplacian, k_gradient)``: the stencil matrices, ``k_gradient`` None without Bloch term.
+
+        A Hamiltonian with ``bloch_laplacian`` (``PARSEC_KPOINT_KINETIC=bloch``) gives that complex matrix and no
+        ``k_gradient``; the row-distributed converter does not take it.
+        """
         backend = self.backend
+        bloch = getattr(hamiltonian, "bloch_laplacian", None)
+        if bloch is not None:
+            if self._rows(bloch) is not bloch:
+                raise NotImplementedError(
+                    "PARSEC_KPOINT_KINETIC=bloch is not implemented for the row-distributed MPI k-point solver "
+                    "(the forces of a k-point run); PARSEC_KPOINT_KINETIC=gradient takes it"
+                )
+            if self._complex_csr(hamiltonian):
+                from .complex_csr_device import DeviceComplexCSR
+
+                return self._cached(bloch, lambda: DeviceComplexCSR(backend.cp, bloch)), None
+            return self._cached(bloch, lambda: backend.matrix(bloch, dtype=np.complex128)), None
         laplacian = self._cached(
             hamiltonian.negative_laplacian,
             lambda: backend.matrix(hamiltonian.negative_laplacian, dtype=np.float64),
@@ -737,7 +772,13 @@ class DeviceBlochConverter:
             )
         return laplacian, k_gradient
 
-    def _projector_parts(self, nonlocal_operator):
+    def _complex_csr(self, hamiltonian) -> bool:
+        """Whether the complex matrices of ``hamiltonian`` take :class:`.complex_csr_device.DeviceComplexCSR`: the
+        operators of the sectors of a k-point (``device_csr``) on CuPy; every other operator keeps the CuPy
+        products of before."""
+        return bool(getattr(hamiltonian, "device_csr", False)) and self.backend.name == "cupy"
+
+    def _projector_parts(self, nonlocal_operator, complex_csr: bool = False):
         """Device ``(forward, adjoint, signs, real)`` of the Kleinman-Bylander projectors."""
         backend = self.backend
         if nonlocal_operator.projectors.shape[1] == 0:
@@ -751,6 +792,14 @@ class DeviceBlochConverter:
 
         def build():
             rows = self._rows(nonlocal_operator.projectors)
+            if complex_csr and not projector_real:
+                from .complex_csr_device import DeviceComplexCSR
+
+                return (
+                    DeviceComplexCSR(backend.cp, rows),
+                    DeviceComplexCSR(backend.cp, sp.csr_matrix(rows).conj().T),
+                    backend.asarray(np.asarray(nonlocal_operator.signs, dtype=np.float64)),
+                )
             return (
                 backend.matrix(rows, dtype=matrix_dtype),
                 backend.matrix(rows.conj().T, dtype=matrix_dtype),
@@ -771,6 +820,7 @@ class DeviceBlochConverter:
             return None
         from .bloch_stencil import AxialStencils, BlochStencil, grid_shape_of
 
+        bloch = getattr(hamiltonian, "bloch_laplacian", None)
         anchors = (laplacian, *tuple(gradient))
         key = ("stencils",) + tuple(id(item) for item in anchors)
         entry = self._stencils.get(key)
@@ -785,6 +835,15 @@ class DeviceBlochConverter:
         k_point = tuple(
             float(value) for value in np.asarray(getattr(hamiltonian, "k_point", np.zeros(3)), dtype=float).reshape(3)
         )
+        if bloch is not None:
+            # the phase-weighted stencil of the Bloch Laplacian, read off its row 0 (BlochStencil.from_bloch)
+            found = by_k.get(("bloch", k_point))
+            if found is None:
+                found = BlochStencil.from_bloch(self.backend.cp, stencils, bloch)
+                if found is None:
+                    return None
+                by_k[("bloch", k_point)] = found
+            return found
         found = by_k.get(k_point)
         if found is None:
             found = by_k[k_point] = BlochStencil(self.backend.cp, stencils, k_point)
@@ -798,7 +857,9 @@ class DeviceBlochConverter:
         if host_diagonal is None:
             host_diagonal = hamiltonian.effective_potential
         diagonal = backend.asarray(np.asarray(self._local(np.asarray(host_diagonal, dtype=np.float64))))
-        forward, adjoint, signs, projector_real = self._projector_parts(hamiltonian.nonlocal_operator)
+        forward, adjoint, signs, projector_real = self._projector_parts(
+            hamiltonian.nonlocal_operator, self._complex_csr(hamiltonian)
+        )
         return laplacian, k_gradient, diagonal, forward, adjoint, signs, projector_real
 
     def _soc_parts(self, soc_projectors, grid_size: int) -> "_BatchedSOC | None":

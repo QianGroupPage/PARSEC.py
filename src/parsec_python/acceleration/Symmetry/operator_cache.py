@@ -117,6 +117,53 @@ def _canonical_kinetic(negative_laplacian: object) -> sp.csr_matrix:
     return kinetic
 
 
+def _wrapped_stencil_grid(negative_laplacian: object):
+    """The grid of a matrix that :func:`parsec_python.Laplacian.finite_difference.build_negative_laplacian` made as
+    the wrapped stencil of a periodic box, or ``None``.
+
+    The builder names the grid on the matrix; the shape, the entry count and a few rows are checked against the
+    stencil of that grid (a matrix changed in place keeps the name and goes through the matrix).
+    """
+
+    from ..Laplacian import DeferredPeriodicNegativeLaplacian
+
+    if isinstance(negative_laplacian, DeferredPeriodicNegativeLaplacian):
+        # the descriptor of that matrix, not built: the grid is what it stands for
+        return negative_laplacian.grid
+    grid = getattr(negative_laplacian, "parsec_wrapped_stencil_of", None)
+    if grid is None or not sp.isspmatrix_csr(negative_laplacian):
+        return None
+    from parsec_python.Laplacian.finite_difference import second_derivative_coefficients
+
+    shape = tuple(int(value) for value in grid.points_per_axis)
+    n = int(np.prod(shape))
+    width = int(grid.settings.stencil_half_width)
+    count = 6 * width + 1
+    matrix = negative_laplacian
+    if matrix.shape != (n, n) or int(matrix.nnz) != n * count:
+        return None
+    coeff = second_derivative_coefficients(grid.settings.expansion_order)
+    inv_h2 = 1.0 / float(grid.spacing) ** 2
+    strides = (shape[1] * shape[2], shape[2], 1)
+    for row in sorted({0, 1, n // 3, n // 2, n - 2, n - 1}):
+        point = (row // strides[0], (row // strides[1]) % shape[1], row % shape[2])
+        expected = {row: -3.0 * coeff[width] * inv_h2}
+        for axis in range(3):
+            for shift in range(-width, width + 1):
+                if shift:
+                    moved = list(point)
+                    moved[axis] = (moved[axis] + shift) % shape[axis]
+                    column = moved[0] * strides[0] + moved[1] * strides[1] + moved[2]
+                    expected[column] = expected.get(column, 0.0) - coeff[width + abs(shift)] * inv_h2
+        start, stop = int(matrix.indptr[row]), int(matrix.indptr[row + 1])
+        columns = np.asarray(matrix.indices[start:stop], dtype=np.int64)
+        if not np.array_equal(columns, np.array(sorted(expected), dtype=np.int64)):
+            return None
+        if not np.array_equal(matrix.data[start:stop], np.array([expected[c] for c in sorted(expected)])):
+            return None
+    return grid
+
+
 def _direct_sector_stencils(
     decomposition: ReflectionRepresentationDecomposition,
     negative_laplacian: object,
@@ -131,16 +178,47 @@ def _direct_sector_stencils(
     caller through the full-grid matrix: on ``PARSEC_SECTOR_STENCIL=csr``,
     for an operator handed over as a matrix, and for an input the direct
     builder does not cover.
+
+    A stencil with more coefficients than its palette holds stops the run with :class:`PaletteOverflow` from either
+    builder (the native kernel's ValueError is turned into one), not through the CSR route, whose packing would refuse
+    the same values after forming the full-grid matrix; the driver checks the stencils of a periodic cell before
+    (``_sector_palette_check``), so that only a cluster can reach it here (none measured: at most 227 values, Td at
+    order 20 on an unshifted grid).
     """
 
     from ..Laplacian import DeferredNativeNegativeLaplacian
     from .sector_stencil import (
+        PALETTE_CAPACITY,
+        PaletteOverflow,
         SectorStencilUnavailable,
         build_sector_stencils,
         native_kernel_available,
         sector_stencil_route,
     )
 
+    def overflow(error: Exception) -> PaletteOverflow:
+        return PaletteOverflow(
+            f"{error}: the sector stencils of this calculation need more coefficients than the {PALETTE_CAPACITY} of "
+            "their palette; a lower Expansion_Order or PARSEC_ORBITAL_GROUP=abelian (PARSEC_PERIODIC_SYMMETRY=off for "
+            "a periodic cell) avoids it"
+        )
+
+    wrapped = _wrapped_stencil_grid(negative_laplacian)
+    if wrapped is not None:
+        # The matrix of a periodic box (Laplacian/finite_difference.py, the stencil wrapped on every axis): its
+        # sector stencils from the grid with a wrapped lookup, the sector rows alone (the reduction of the matrix
+        # checks every row and column of it for every sector: 5.5 s of the 64,000 atoms of a 20^3 diamond cell)
+        if sector_stencil_route() == "csr":
+            return None, "csr"
+        try:
+            metadata = build_sector_stencils(
+                wrapped, decomposition, representations, implementation="numpy", wrap=True
+            )
+        except SectorStencilUnavailable:
+            return None, "csr"
+        except PaletteOverflow as error:
+            raise overflow(error) from error
+        return metadata, "direct-numpy-wrapped"
     if not isinstance(negative_laplacian, DeferredNativeNegativeLaplacian):
         return None, "csr"
     route = sector_stencil_route()
@@ -158,6 +236,11 @@ def _direct_sector_stencils(
         )
     except SectorStencilUnavailable:
         return None, "csr"
+    except ValueError as error:
+        # PaletteOverflow of NumPy's builder, std::invalid_argument of the native kernel
+        if isinstance(error, PaletteOverflow) or f"more than {PALETTE_CAPACITY} coefficients" in str(error):
+            raise overflow(error) from error
+        raise
     return metadata, f"direct-{implementation}"
 
 
@@ -387,6 +470,11 @@ def load_or_build_reduced_operators(
     both caches off it is not computed and is reported as ``None``.
     """
 
+    from .axis_reflection import PointGroupReduction
+
+    if isinstance(decomposition.reduction, PointGroupReduction):
+        # The weighted sectors of a subgroup keep no disk entry (geometry_cache does not keep them either).
+        cache_directory = None
     partial = None
     if representations is not None and cache_directory is None:
         partial = tuple(sorted({int(index) for index in representations}))

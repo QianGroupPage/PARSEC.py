@@ -101,10 +101,18 @@ class SelectionTests(unittest.TestCase):
         selected = periodic_xc.periodic_spin_device_selected
         self.assertEqual(periodic_xc.HOST_UNLESS_ASKED, frozenset({"pbe"}))
         self.assertEqual([selected("pbe", mode=mode) for mode in ("auto", "on", "off")], [False, True, False])
+        # since 2026-11-17 PBE of evaluate_xc_spin_polarized has its own form on the device (its formula)
+        self.assertEqual(
+            [selected("pbe", mode=mode, kind="spin_polarized") for mode in ("auto", "on", "off")], [True, True, False]
+        )
         for functional in ("pw92", "pw91", "lb94", "casida_salahub"):
             self.assertEqual([selected(functional, mode=mode) for mode in ("auto", "on", "off")], [True, True, False])
-        for mode in ("auto", "on", "off"):
-            self.assertFalse(selected("ca", mode=mode))
+        # CA-LSD kept the host up to 2026-11-18 (this test asserted it); PARSEC_PERIODIC_CA_XC=host is the way back
+        with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_CA_XC": "auto"}):
+            self.assertEqual([selected("ca", mode=mode) for mode in ("auto", "on", "off")], [True, True, False])
+        with mock.patch.dict(os.environ, {"PARSEC_PERIODIC_CA_XC": "host"}):
+            for mode in ("auto", "on", "off"):
+                self.assertFalse(selected("ca", mode=mode))
         with mock.patch.dict(os.environ, {"PARSEC_CUPY_XC": ""}):
             self.assertFalse(selected("pbe"))
             self.assertTrue(device_xc.device_xc_selected("pbe", spin_polarized=True))
@@ -130,6 +138,31 @@ class SelectionTests(unittest.TestCase):
         source = device_xc.kernel_source()
         self.assertIn(f"#define PBE_GAMMA ({_GAMMA!r})", source)
         self.assertIn("#define PW_GAM (0.5198421)", source)
+
+
+class ForwardDerivativeTests(unittest.TestCase):
+    """acceleration/V_xc/dual.py: the formula of spin-polarized PBE with forward derivatives gives the partials of
+    its complex step (pbe_spin_polarized_partials) to round-off, and its energy bit for bit."""
+
+    def test_the_partials_of_spin_polarized_pbe(self) -> None:
+        from parsec_python.V_xc.pbe import _pbe_spin_energy_density, pbe_spin_polarized_partials
+        from parsec_python.acceleration.V_xc.dual import partials
+
+        rng = np.random.default_rng(3)
+        up, down = rng.uniform(1.0e-6, 0.5, 4000), rng.uniform(1.0e-6, 0.5, 4000)
+        gradient_up, gradient_down = rng.normal(size=(3, 4000)) * up, rng.normal(size=(3, 4000)) * down
+        arguments = (
+            up,
+            down,
+            np.sum(gradient_up * gradient_up, axis=0),
+            np.sum(gradient_up * gradient_down, axis=0),
+            np.sum(gradient_down * gradient_down, axis=0),
+        )
+        host = pbe_spin_polarized_partials(*arguments)
+        forward = partials(_pbe_spin_energy_density, arguments, np)
+        np.testing.assert_array_equal(forward[0], host[0])
+        for got, expected in zip(forward[1:], host[1:]):
+            np.testing.assert_allclose(got, expected, rtol=0, atol=1.0e-13 * float(np.max(np.abs(expected))))
 
 
 @unittest.skipUnless(cupy_available(), "CUDA runtime is unavailable")
@@ -260,6 +293,50 @@ class DeviceGridTests(unittest.TestCase):
             )
             value = device_xc.DeviceSpinXCEvaluator(functional, grid)(0.7 * density, 0.3 * density)
             self.assert_same(reference, value, f"periodic spin {functional}")
+
+    def test_periodic_cell_on_the_orbits_of_its_point_group(self) -> None:
+        """The orbits of the point group of a cell about its origin: the stencils wrap, the flux turns with them."""
+
+        from parsec_python.Grid.pbc import build_periodic_grid
+        from parsec_python.acceleration.SCF.symmetry_fields import SymmetrySCFReducer
+        from parsec_python.acceleration.Symmetry import SignedPermutationReduction, detect_point_group_reduction
+        from parsec_python.models import PeriodicCell, PeriodicGridSettings
+
+        side = 6.0
+        fcc = [(0.0, 0.0, 0.0), (0.0, 0.5, 0.5), (0.5, 0.0, 0.5), (0.5, 0.5, 0.0)]
+        structures = {
+            # diamond about an atom (Td, the orbitals in D2d), rocksalt about Na (Oh, in D4h)
+            "diamond": [Atom("C", tuple(side * (np.array(b) + s))) for s in (0.0, 0.25) for b in fcc],
+            "rocksalt": [Atom("Na", tuple(side * np.array(b))) for b in fcc]
+            + [Atom("Cl", tuple(side * (np.array(b) + np.array((0.5, 0.0, 0.0))))) for b in fcc],
+        }
+        for shift in (0.5, 0.0):
+            grid = build_periodic_grid(
+                PeriodicCell(np.eye(3) * side),
+                PeriodicGridSettings(spacing=side / 16, expansion_order=12, shift=(shift,) * 3),
+            )
+            for name, atoms in structures.items():
+                reduction = detect_point_group_reduction(grid, atoms, SignedPermutationReduction.detect(grid, atoms))
+                self.assertGreater(reduction.group_order, 4, name)
+                for sub in (reduction, SignedPermutationReduction.detect(grid, atoms)):
+                    reducer = SymmetrySCFReducer(sub)
+                    density = np.full(grid.size, 1.0e-3)
+                    for atom in atoms:
+                        difference = grid.coordinates - np.asarray(atom.position)
+                        difference -= np.round(difference / side) * side
+                        density += np.exp(-np.sum(difference * difference, axis=1) / 1.1)
+                    wedge = reducer.from_full(density)
+                    for functional in ("pbe", "pw91", "pw92"):
+                        label = f"{functional} {name} order {sub.group_order} shift {shift}"
+                        reference = evaluate_unpolarized_xc(functional, reducer.to_full(wedge), grid, None)
+                        value = device_xc.DeviceXCEvaluator(functional, grid, reducer=reducer)(wedge)
+                        self.assertLess(
+                            _relative(reducer.wedge_values(reference.potential), value.potential), FIELD_TOLERANCE, label
+                        )
+                        self.assertAlmostEqual(
+                            value.total_energy, reference.total_energy,
+                            delta=FIELD_TOLERANCE * abs(reference.total_energy), msg=label,
+                        )
 
     def test_core_density_of_the_present_structure(self) -> None:
         present = [self.core]
@@ -439,8 +516,11 @@ class DeviceSCFTests(unittest.TestCase):
                     self.assertEqual(operator.resident_device_bytes, resident)
 
     def test_ca_keeps_its_evaluator(self) -> None:
+        # A cluster never takes the device CA-LDA, whatever PARSEC_CUPY_XC says.  Its native C++ evaluator needs the
+        # native Hartree backend, which ``backend="cupy"`` does not select: the host functional on the full grid (the
+        # label named the C++ evaluator for this adapter up to 2026-11-18).
         _, label, _ = _solve(_xc_case("h2o_ca"), "on")
-        self.assertEqual(label, "cached C++/OpenMP float64 CA/PZ-LDA")
+        self.assertEqual(label, "vectorized NumPy CA/PZ-LDA")
 
     def test_spin_polarized_functionals(self) -> None:
         for name, mode, label in (
@@ -484,7 +564,8 @@ class DeviceSCFTests(unittest.TestCase):
         base = periodic_hydrogen()
         for functional in ("pw92", "pw91", "lb94"):
             problem = replace(base, scf=replace(base.scf, xc_functional=functional))
-            with warnings.catch_warnings():
+            # The full grid, step for step as the reference (the point group of the cell: test_periodic_point_group.py).
+            with warnings.catch_warnings(), mock.patch.dict(os.environ, {"PARSEC_PERIODIC_SYMMETRY": "off"}):
                 warnings.simplefilter("ignore")
                 reference = run_reference(prepare_periodic_single_point(problem))
                 result = driver.run_scf(driver.prepare_single_point(problem, backend="cupy"))

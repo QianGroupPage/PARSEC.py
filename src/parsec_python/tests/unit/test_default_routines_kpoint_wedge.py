@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import itertools
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -260,7 +262,13 @@ class ParserTests(unittest.TestCase):
         self.assertFalse(unsymmetrized.scf.symmetrize_density)
         # every point of a Gamma-centred 2^3 mesh is its own time-reversal partner
         self.assertEqual(len(kpoint_sampling(unsymmetrized)[0]), 8)
+        # forces take the wedge of the single point (PARSEC_KPOINT_FORCE_WEDGE), or the full mesh with off
         moving = self.parse(2, "Use_Fortran_Routines: .false.\nSkip_Force: .false.").problem
+        self.assertEqual(tuple(moving.monkhorst_pack_dimensions), (2, 2, 2))
+        self.assertEqual(moving.space_group.order, 24)
+        self.assertEqual(len(kpoint_sampling(moving)[0]), 4)
+        with mock.patch.dict(os.environ, {"PARSEC_KPOINT_FORCE_WEDGE": "off"}):
+            moving = self.parse(2, "Use_Fortran_Routines: .false.\nSkip_Force: .false.").problem
         self.assertIsNone(moving.monkhorst_pack_dimensions)
         self.assertEqual(len(moving.kpoints), 8)
 

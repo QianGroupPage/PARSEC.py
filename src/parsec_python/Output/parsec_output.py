@@ -192,6 +192,17 @@ def density_symmetrization_lines(reports) -> list[str]:
 def spin_sector_fallback_lines(record) -> list[str]:
     """``parsec.out`` lines of a :class:`parsec_python.models.SpinSectorFallbackRecord`."""
 
+    if getattr(record, "route", "spin") == "kpoint":
+        return [
+            "",
+            f" NOTE: k-point sectors: {record.reason} after {record.stage}",
+            f"       ({record.measure} = {record.largest_fractional_occupation:.3E}, "
+            f"kept only below {record.tolerance:.0E}).",
+            "       The sectors of the k-points cannot hold a state that breaks the symmetry they assume;",
+            "       the loop starts again with one task per k-point (PARSEC_KPOINT_SECTOR_GUARD=off keeps the sectors).",
+            *(f"       {line}" for line in record.multiplets),
+            "",
+        ]
     return [
         "",
         f" NOTE: Spin_Symmetry_Sectors: {getattr(record, 'reason', 'fractional occupations')} after {record.stage}",
@@ -3006,7 +3017,15 @@ class ParsecTextReporter:
         A leaner counterpart to :meth:`iteration`: the spin-polarized driver
         does not yet carry per-stage timing instrumentation (see its module
         docstring), so this omits the timing breakdown ``iteration`` prints.
+        The note that a spin-polarized k-point loop leaves the sectors of its
+        k-points (``SpinSectorFallbackRecord``, the symmetry guard) has no
+        levels of its own: its lines, as :meth:`iteration` writes them.
         """
+        from ..models import SpinSectorFallbackRecord
+
+        if isinstance(step, SpinSectorFallbackRecord):
+            self.write("\n".join(spin_sector_fallback_lines(step)))
+            return
         energies = step.energies
         atom_count = len(self.problem.atoms)
         energy_per_atom_ev = energies.total * RYDBERG_TO_EV / max(atom_count, 1)
@@ -3191,7 +3210,8 @@ class ParsecTextReporter:
         if "pools" in detail:
             lines.append(
                 f" {'MPI k-point pools':30s} : {int(detail['pools']):12d}"
-                f"   ({int(detail.get('pool_ranks', 0))} rank(s), {int(detail.get('pool_tasks', 0))} task(s) on rank 0)"
+                f"   ({int(detail.get('pool_ranks', 0))} rank(s), {int(detail.get('pool_tasks', 0))} task(s) on rank 0"
+                + ("; tasks dealt by their sizes)" if detail.get("pool_assignment_by_size") else ")")
             )
             lines.append(
                 f" {'Estimate per GPU [GB]':30s} : {detail.get('pool_estimate_bytes', 0.0) / 1e9:12.3f}"
@@ -3212,6 +3232,11 @@ class ParsecTextReporter:
                     f" {'Host memory (rank 0) [GB]':30s} : {detail['pool_host_peak_bytes'] / 1e9:12.3f}"
                     f"   (peak; {detail.get('pool_host_setup_bytes', 0.0) / 1e9:.3f} GB after the preparation)"
                 )
+            if detail.get("pool_host_node_estimate_bytes"):
+                lines.append(
+                    f" {'Host estimate per node [GB]':30s} : {detail['pool_host_node_estimate_bytes'] / 1e9:12.3f}"
+                    "   (subspaces kept on the host by the ranks of the fullest node)"
+                )
         counters = (
             ("first_solves", "First solves"),
             ("subspace_steps", "Subspace steps"),
@@ -3224,7 +3249,53 @@ class ParsecTextReporter:
             lines.append(" Eigensolver counters")
             for key, label in present:
                 lines.append(f"   {label:28s} : {int(detail[key]):12d}")
+        # the k-points in the sectors of their little groups (acceleration/SCF/kpoint_sectors.py)
+        if "kpoint_sector_tasks" in detail:
+            lines.append(
+                f" {'K-point sectors':30s} : {int(detail['kpoint_sector_tasks']):12d}"
+                f"   tasks ({int(detail.get('kpoint_sector_kpoints', 0))} k-point(s) split, largest group"
+                f" {int(detail.get('kpoint_sector_largest_group', 0))})"
+            )
+            lines.append(
+                f" {'Rows x states^2 of the whole':30s} : {detail.get('kpoint_sector_work_fraction', 0.0):12.4f}"
+                f"   (states added and solved again {int(detail.get('kpoint_sector_regrowths', 0))} time(s))"
+            )
+        lines.extend(ParsecTextReporter._kpoint_guard_lines(detail))
         lines.append(" --------------------------------------------------")
+        return lines
+
+    @staticmethod
+    def _kpoint_guard_lines(detail) -> list[str]:
+        """What the tests of the symmetry guard of the k-point sectors measured (``PARSEC_KPOINT_SECTOR_GUARD``,
+        ``SCF/kpoints.py``), also where they passed, beside their tolerances; none without the guard."""
+
+        if not any(key.startswith("kpoint_guard_") for key in detail):
+            return []
+        from ..acceleration.SCF.spin_sectors import DENSITY_SYMMETRY_TOLERANCE, SPIN_SECTOR_OCCUPATION_TOLERANCE
+
+        lines = [
+            " K-point sector guard (measured, tolerance"
+            + ("; in the sectors the loop left)" if detail.get("kpoint_sector_abandoned") else ")")
+        ]
+        if "kpoint_guard_start_share" in detail:
+            lines.append(
+                f"   {'Test 1, start multiplets':28s} : {detail['kpoint_guard_start_share']:12.4E}"
+                f"   (largest w_k min(n, d-n); {SPIN_SECTOR_OCCUPATION_TOLERANCE:.0E};"
+                f" {int(detail.get('kpoint_guard_start_passes', 0))} further solve(s))"
+            )
+        if "kpoint_guard_density_asymmetry" in detail:
+            first = detail.get("kpoint_guard_density_asymmetry_first")
+            lines.append(
+                f"   {'Test 2, density asymmetry':28s} : {detail['kpoint_guard_density_asymmetry']:12.4E}"
+                f"   (largest int |rho(g r) - rho(r)| [e]; {DENSITY_SYMMETRY_TOLERANCE:.0E};"
+                + ("" if first is None else f" {first:.4E} where the criterion was first met,")
+                + f" {int(detail.get('kpoint_guard_tightenings', 0))} tightening(s))"
+            )
+        if "kpoint_guard_fractional_share" in detail:
+            lines.append(
+                f"   {'Test 3, fractional levels':28s} : {detail['kpoint_guard_fractional_share']:12.4E}"
+                f"   (largest w_k min(f, 1-f); {SPIN_SECTOR_OCCUPATION_TOLERANCE:.0E})"
+            )
         return lines
 
     def finish_spin_polarized(

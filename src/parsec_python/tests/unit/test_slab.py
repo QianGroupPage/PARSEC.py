@@ -248,7 +248,13 @@ class SlabInputTests(unittest.TestCase):
         cell = problem.periodic_cell
         self.assertEqual(cell.dimensions, 2)
         np.testing.assert_allclose(cell.lattice_vectors, [[7, 0, 0], [3, 6, 0], [0, 0, 16]])
-        self.assertEqual(problem.monkhorst_pack_dimensions, (3, 3, 1))
+        # the 3 x 3 mesh of the plane: PARSEC 1.5's zero shift (an explicit list on these routines, since 2026-11-18)
+        from parsec_python.Grid.kpoints import kpoint_sampling
+
+        k_points, weights = kpoint_sampling(problem)
+        self.assertEqual(k_points.shape, (9, 3))
+        np.testing.assert_allclose(weights, np.full(9, 1.0 / 9.0))
+        np.testing.assert_allclose(k_points[:, 2], 0.0)
         positions = np.array([atom.position for atom in problem.atoms])
         # the slab is centred along z (mean of the extremes was 4.0) and in-plane positions are folded into the cell
         np.testing.assert_allclose(positions[:, 2], [-0.5, 0.5])

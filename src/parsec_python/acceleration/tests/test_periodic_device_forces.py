@@ -56,6 +56,19 @@ from ..V_ion import periodic_device as device_fields
 from ..V_ion import periodic_setup_fortran as periodic_setup
 from ..backends.cupy import cupy_available
 
+# The comparisons of the device density with the host's bit for bit take the kernel of every atom: the bins of
+# PARSEC_PERIODIC_DENSITY_BINS=auto sum the same terms in another order (test_periodic_local_device compares them).
+_DENSITY_BINS = mock.patch.dict(os.environ, {"PARSEC_PERIODIC_DENSITY_BINS": "off"})
+
+
+def setUpModule() -> None:
+    _DENSITY_BINS.start()
+
+
+def tearDownModule() -> None:
+    _DENSITY_BINS.stop()
+
+
 DATA = Path(__file__).resolve().parents[2] / "tests" / "data"
 STEP = 1.0e-6
 
@@ -616,7 +629,9 @@ class ScopeTests(unittest.TestCase):
         )
         self.assertIsInstance(device_forces.periodic_ionic_scope(cluster), nullcontext)
 
-    def test_mpi_still_refuses_periodic_forces(self) -> None:
+    def test_mpi_refuses_gamma_forces_and_takes_kpoint_forces(self) -> None:
+        # the forces of a Gamma-point cell read whole orbitals: refused under --mpi; those of the scalar k-point SCF
+        # are summed on the ranks of the k-point pools (since 2026-11-17): the input check lets them through
         from .. import cli as accelerated_cli
         from ..Parallel import mpi
 
@@ -628,15 +643,48 @@ class ScopeTests(unittest.TestCase):
                     path = directory / "parsec.in"
                     path.write_text(_CLI_INPUT + extra, encoding="utf-8")
                     errors = StringIO()
+                    # (the reference solver the k-points go to is not run here: the check is the subject)
+                    reference = mock.Mock(return_value=0)
                     with mock.patch.object(accelerated_cli, "_join_mpi", return_value=None), mock.patch.object(
                         accelerated_cli, "_abort_mpi"
                     ), mock.patch.object(
                         mpi, "requested", return_value=True
+                    ), mock.patch.object(mpi, "context", return_value=None), mock.patch.object(
+                        accelerated_cli, "reference_main", reference
                     ), redirect_stderr(errors), redirect_stdout(StringIO()):
                         code = accelerated_cli.main([str(path), "--quiet", "--no-archive"])
+                if extra.startswith("Kpoint"):
+                    self.assertNotIn("forces, relaxation or molecular dynamics of a periodic", errors.getvalue())
+                    self.assertEqual(code, 0)
+                    reference.assert_called_once()
+                    continue
                 self.assertEqual(code, 2)
                 self.assertIn("forces, relaxation or molecular dynamics of a periodic", errors.getvalue())
                 self.assertIn("--mpi", errors.getvalue())
+
+    def test_mpi_ends_a_relaxation_without_abort_when_its_movements_are_used(self) -> None:
+        # exit status 4 (Movement_Num used up) and 3 (an SCF loop not converged) are reached by every rank: the
+        # MPI job ends normally; another status (an input error) ends it with MPI_Abort
+        from .. import cli as accelerated_cli
+        from ..Parallel import mpi
+
+        for status, aborts in ((4, False), (3, False), (0, False), (5, True)):
+            with self.subTest(status=status):
+                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as name:
+                    directory = Path(name)
+                    shutil.copy(DATA / "H_POTRE.DAT", directory / "H_POTRE.DAT")
+                    path = directory / "parsec.in"
+                    path.write_text(_CLI_INPUT + _TWO_K + "Minimization: bfgs\n", encoding="utf-8")
+                    with mock.patch.object(accelerated_cli, "_join_mpi", return_value=None), mock.patch.object(
+                        accelerated_cli, "_abort_mpi"
+                    ) as abort, mock.patch.object(mpi, "requested", return_value=True), mock.patch.object(
+                        mpi, "context", return_value=None
+                    ), mock.patch.object(
+                        accelerated_cli, "reference_main", mock.Mock(return_value=status)
+                    ), redirect_stderr(StringIO()), redirect_stdout(StringIO()):
+                        code = accelerated_cli.main([str(path), "--quiet", "--no-archive"])
+                self.assertEqual(code, status)
+                self.assertEqual(abort.called, aborts)
 
 
 @unittest.skipUnless(cupy_available(), "CUDA runtime is unavailable")

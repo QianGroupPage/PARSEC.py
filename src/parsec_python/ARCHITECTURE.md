@@ -118,9 +118,10 @@ boundary values of `hartset_wire`/`hartset_slab` and the CG) and `Hartree.pbc.so
 (`SCF.pbc`, `set_periodic_spin_xc_provider`) a faster evaluator; `acceleration/Hartree/periodic_device.py` and
 `acceleration/V_xc/periodic_xc.py` supply the CUDA ones where the k-point plan puts the eigenproblems on a device
 (`PARSEC_PERIODIC_HARTREE`, `PARSEC_CUPY_XC`), the plain FD-CG of an orthorhombic 3-D cell among them by default
-since 2026-10-30 (`PARSEC_PERIODIC_HARTREE=host` keeps the host CG); the CA and PBE spin functionals of a periodic
-cell stay on the host by default. `acceleration/tests/test_periodic_device_fields.py` checks them against the
-definitions.
+since 2026-10-30 (`PARSEC_PERIODIC_HARTREE=host` keeps the host CG). The spin PBE of the periodic spin drivers
+runs there too since 2026-11-17 (`evaluate_xc_spin_polarized`; `PARSEC_CUPY_XC=off` keeps the host), and CA-LDA and
+CA-LSD of a periodic cell since 2026-11-18 (`PARSEC_PERIODIC_CA_XC=auto`; `host` keeps the host formula over the
+full grid). `acceleration/tests/test_periodic_device_fields.py` checks them against the definitions.
 
 Where a performance path cannot carry a feature of the readable drivers it hands the
 combination back by name (`acceleration/tests/test_parity_device_routes.py`): ARPACK and

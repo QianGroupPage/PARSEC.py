@@ -26,7 +26,9 @@ from dataclasses import replace
 from pathlib import Path
 import shutil
 import tempfile
+import os
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -616,6 +618,9 @@ Correlation_Type: pbe0
         self.assertEqual(len(k_points), 2)
         np.testing.assert_allclose(sorted(weights), [1.0 / 3.0, 2.0 / 3.0])
 
+    # the former mesh 2x1x1 of points at +-1/4, one time-reversal pair (PARSEC_MP_UNSHIFTED_MESH=port; PARSEC 1.5's
+    # zero shift gives 0 and 1/2, each its own partner)
+    @mock.patch.dict(os.environ, {"PARSEC_MP_UNSHIFTED_MESH": "port"})
     def test_reference_command_line_runs_k_points_and_reports_band_edges(self) -> None:
         from parsec_python.cli import main
 

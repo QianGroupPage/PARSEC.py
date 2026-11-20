@@ -357,8 +357,23 @@ class AcceleratedTextReporter:
                 f"{details['ionic_setup_seconds']}, wait at its join [sec] = "
                 f"{details['ionic_setup_wait_seconds']}.\n",
             )
+        # Weighted sectors of a larger subgroup (Symmetry/orbital_groups.py): the symmetry block of the
+        # reference above lists PARSEC's Abelian subgroup, the orbitals use the group this line names.
+        weighted = str(details.get("symmetry_detection", "")).startswith("exact point group")
+        if weighted:
+            lines.insert(
+                0,
+                " The symmetry block above lists PARSEC's Abelian subgroup; the "
+                "orbitals use the weighted sectors that symmetry_detection "
+                "names below.\n",
+            )
         for key, value in info.details:
-            if detailed or key in _SUMMARY_DETAIL_KEYS:
+            if key == "symmetry_full_grid_note":
+                # What of a cluster with a point group runs on the full grid for want of the native extension
+                # (driver._cluster_full_grid_notes): at every output level.
+                lines.append(f" NOTE: {value}")
+                continue
+            if detailed or key in _SUMMARY_DETAIL_KEYS or (weighted and key == "symmetry_detection"):
                 lines.append(f" {key} = {value}")
         if not detailed:
             lines.append(" Detailed backend settings: set Output_Level: 2")

@@ -130,3 +130,28 @@ class SolvePeriodicHartreeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WrappedLaplacianTests(unittest.TestCase):
+    """The CSR of a periodic box written directly: the arrays of the COO route, entry for entry."""
+
+    def test_the_direct_csr_is_the_coo_route(self) -> None:
+        from unittest import mock
+
+        from parsec_python.Laplacian import finite_difference
+
+        for counts, order, shift in (((10, 10, 10), 4, 0.5), ((11, 13, 17), 8, 0.0), ((26, 26, 30), 12, 0.5), ((9, 9, 9), 8, 0.5)):
+            with self.subTest(counts=counts, order=order, shift=shift):
+                spacing = 0.37
+                grid = build_periodic_grid(
+                    PeriodicCell(lattice_vectors=np.diag(np.array(counts) * spacing)),
+                    PeriodicGridSettings(spacing=spacing, expansion_order=order, shift=(shift,) * 3),
+                )
+                self.assertTrue(finite_difference._wrapped_box(grid))
+                direct = build_negative_laplacian(grid)
+                with mock.patch.object(finite_difference, "_wrapped_box", lambda grid: False):
+                    coo = build_negative_laplacian(grid)
+                for name in ("indptr", "indices", "data"):
+                    np.testing.assert_array_equal(getattr(direct, name), getattr(coo, name))
+                    self.assertEqual(getattr(direct, name).dtype, getattr(coo, name).dtype)
+                self.assertTrue(direct.has_canonical_format)

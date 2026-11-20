@@ -151,6 +151,19 @@ def _support_box_rows(grid: RealSpaceGrid, position: np.ndarray, radius: float) 
     return np.sort(rows[rows >= 0])
 
 
+def _selected_atoms(atoms: Sequence[Atom], atom_indices: Sequence[int] | None) -> Sequence[int]:
+    """The atom indices a gradient builder loops over: every atom, or ``atom_indices`` checked against ``atoms``."""
+
+    if atom_indices is None:
+        return range(len(atoms))
+    selected = [int(index) for index in np.asarray(atom_indices, dtype=np.int64).reshape(-1)]
+    if any(index < 0 or index >= len(atoms) for index in selected):
+        raise ValueError(f"atom indices must lie in [0, {len(atoms)})")
+    if len(set(selected)) != len(selected):
+        raise ValueError("atom indices must not repeat")
+    return selected
+
+
 @dataclass(frozen=True)
 class NonlocalProjectorGradients:
     """``grad beta_q`` for every column of a nonlocal projector operator.
@@ -173,6 +186,8 @@ def build_nonlocal_projector_gradients(
     atoms: Sequence[Atom],
     potentials: Mapping[str, ParsecPseudopotential],
     specifications: Mapping[str, SpeciesPotential],
+    *,
+    atom_indices: Sequence[int] | None = None,
 ) -> NonlocalProjectorGradients:
     """Sample the gradients of all KB projectors on the active grid.
 
@@ -182,12 +197,18 @@ def build_nonlocal_projector_gradients(
     sample is replaced by that sample, also in the direction ``d/|d|``.
     With ``Double_Grid_Order > 1`` the gradients are averaged over the double
     grid as the projectors are (:func:`double_grid_projector_gradients`).
+
+    ``atom_indices`` builds the columns of those atoms only, in the order
+    given, each labelled with its index in ``atoms``: the columns of the
+    whole build with these labels, bit for bit (the projector gradients of
+    the representative atoms of symmetry sectors).  ``None`` builds every
+    atom.
     """
 
     order = int(getattr(grid.settings, "double_grid_order", 1))
     if order > 1:
         return double_grid_projector_gradients(
-            grid, atoms, potentials, specifications, order=order
+            grid, atoms, potentials, specifications, order=order, atom_indices=atom_indices
         )
     rows: list[np.ndarray] = []
     columns: list[np.ndarray] = []
@@ -198,7 +219,8 @@ def build_nonlocal_projector_gradients(
     sqrt_dv = np.sqrt(grid.volume_element)
     tables: dict[tuple[str, int, int], tuple] = {}
 
-    for atom_index, atom in enumerate(atoms):
+    for atom_index in _selected_atoms(atoms, atom_indices):
+        atom = atoms[atom_index]
         potential = potentials[atom.symbol]
         specification = specifications[atom.symbol]
         local_l = specification.local_angular_momentum
@@ -279,6 +301,7 @@ def double_grid_projector_gradients(
     specifications: Mapping[str, SpeciesPotential],
     *,
     order: int,
+    atom_indices: Sequence[int] | None = None,
 ) -> NonlocalProjectorGradients:
     """Projector gradients averaged over the Ono-Hirose double grid.
 
@@ -287,7 +310,8 @@ def double_grid_projector_gradients(
     ``w(|d|)*grad Y + w'(|d|)*Y*d/|d|``, with ``|d|`` clamped below to the
     first radial sample.  The coarse points and the column order are those of
     :func:`parsec_python.V_ion.double_grid.build_double_grid_projectors`;
-    ``order = 1`` gives :func:`build_nonlocal_projector_gradients` exactly.
+    ``order = 1`` gives :func:`build_nonlocal_projector_gradients` exactly;
+    ``atom_indices`` selects atoms as there.
     """
 
     from ..V_ion.double_grid import double_grid_support
@@ -301,7 +325,8 @@ def double_grid_projector_gradients(
     sqrt_dv = np.sqrt(grid.volume_element)
     tables: dict[tuple[str, int, int], tuple] = {}
 
-    for atom_index, atom in enumerate(atoms):
+    for atom_index in _selected_atoms(atoms, atom_indices):
+        atom = atoms[atom_index]
         potential = potentials[atom.symbol]
         specification = specifications[atom.symbol]
         local_l = specification.local_angular_momentum
@@ -391,6 +416,8 @@ def build_periodic_projector_gradients(
     specifications: Mapping[str, SpeciesPotential],
     lattice_vectors: np.ndarray,
     k_point: np.ndarray | None = None,
+    *,
+    atom_indices: Sequence[int] | None = None,
 ) -> NonlocalProjectorGradients:
     """Gradients of the periodic projectors of :func:`parsec_python.V_ion.build_nonlocal_projectors`.
 
@@ -404,6 +431,9 @@ def build_periodic_projector_gradients(
     The images, support radius, radial interpolation (spline or PARSEC's table) and column order are those of the
     projector builder; with ``k_point=None`` the columns are real (the Gamma point).  Within
     ``_PROJECTOR_GRADIENT_FLOOR`` of an atom the gradient is evaluated at that distance (see there).
+    ``atom_indices`` builds the columns of those atoms only, in the order given and labelled with their index in
+    ``atoms``: the columns of the whole build with these labels, bit for bit (the representative atoms of the
+    symmetry sectors of a cell).  ``None`` builds every atom.
 
     Known limitation: the projector of an atom that sits exactly on a grid point has no defined value at that point
     (the direction of a zero displacement; the harmonics of ``l >= 2`` evaluate to nonzero constants there), so the
@@ -424,7 +454,8 @@ def build_periodic_projector_gradients(
     sqrt_dv = np.sqrt(grid.volume_element)
     tables: dict[tuple[str, int, int], tuple] = {}
 
-    for atom_index, atom in enumerate(atoms):
+    for atom_index in _selected_atoms(atoms, atom_indices):
+        atom = atoms[atom_index]
         potential = potentials[atom.symbol]
         specification = specifications[atom.symbol]
         local_l = specification.local_angular_momentum

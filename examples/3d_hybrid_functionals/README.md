@@ -39,7 +39,7 @@ python src\parsec_python\main.py examples\3d_hybrid_functionals\Si_k222\pbe0\par
 ```
 
 `parsec.out` is written beside the input; compare it with `parsec_python.out`. Every input of this example, one after
-another on one node (about 1 h 26 min of program time on one A100, 38 min of it the two O2 hybrids), and the tables:
+another on one node (about 1 h 28 min of program time on one A100, 38 min of it the two O2 hybrids), and the tables:
 
 ```powershell
 python examples\3d_hybrid_functionals\run_examples.py            # or: run_examples.py Si_k222 hBN_k661/pbe0
@@ -67,11 +67,14 @@ order 12, `Convergence_Criterion 1e-6 Ry`, `Cubic_Spline: .true.` for every spec
 `Fermi_Temp 1 K` (O2: `-1 K` with `occup.in`), `States_Num` = occupied + 4 (O2: 11 per channel; Si64: 140). The
 k-points are QE's `K_POINTS automatic n n n 0 0 0` written out as a `Kpoint_List` of every point of the mesh with
 equal weights; a hybrid reduces the list by time reversal only (Si 2x2x2: 8 points, 4x4x4: 36, 3x3x3: 14, h-BN
-6x6x1: 20), and its exchange sums over the whole mesh, as QE's with `nqx = n`. (`Monkhorst_Pack_Grid n n n` with a
-`Monkhorst_Pack_Shift` block of zeros gives the same points, but such a block also turns on the space group of
+6x6x1: 20), and its exchange sums over the whole mesh, as QE's with `nqx = n`. (`Monkhorst_Pack_Grid n n n`, with
+or without a `Monkhorst_Pack_Shift` block of zeros, gives the same points, but it also turns on the space group of
 PARSEC's k-point machinery, which the displaced Si cell does not admit on its grid; the lists keep every input
-alike.) The Si64 cells are timing cases: `Si64_k222` takes this code's own `Monkhorst_Pack_Grid 2 2 2` (points at
-+-1/4 of the reciprocal vectors). Everything else is the default: PBE start of the Fock loop, ACE of the
+alike.) The Si64 cells are timing cases: `Si64_k222` takes `Monkhorst_Pack_Grid 2 2 2` without a shift block,
+which is PARSEC 1.5's Gamma-centred mesh since 18 November 2026 (0 and 1/2: the irreducible wedge of 4 points for
+PBE, all 8 points for PBE0, each its own time-reversal partner; its logs are of 19 November 2026).
+`PARSEC_MP_UNSHIFTED_MESH=port` keeps this code's former mesh of such an input (points at +-1/4 of the reciprocal
+vectors: 8 points for PBE, 4 time-reversal pairs for PBE0). Everything else is the default: PBE start of the Fock loop, ACE of the
 `States_Num` states of every k-point, the adaptive inner criterion, outer DIIS, HSE06 with omega = 0.11 1/bohr in
 both parts. The Fock-loop keywords that differ from input to input are those of the Coulomb singularity:
 
@@ -271,13 +274,14 @@ energy of this cell give the analytic force to 1.3e-6 Ry/bohr (PBE 2.6e-6).
 | O2_box/pbe | 1 | 78.1 | 73.5 |  |  |  |  | 1.9 |
 | O2_box/pbe0 | 1 | 1123.0 | 1120.0 | 7.61 | 1.83 | 548 | 5 | 0.7 |
 | O2_box/hse06 | 1 | 1150.6 | 1146.0 | 6.30 | 1.53 | 447 | 4 | 0.7 |
-| Si64_gamma/pbe | 1 | 8.6 | 6.5 |  |  |  |  | 4.3 |
+| Si64_gamma/pbe | 1 | 15.0 | 9.3 |  |  |  |  | 0.5 |
 | Si64_gamma/pbe0 | 1 | 39.5 | 37.1 | 7.63 | 4.16 | 67008 | 6 | 8.3 |
-| Si64_k222/pbe | 4 | 129.3 | 125.2 |  |  |  |  | 5.6 |
-| Si64_k222/pbe0 | 4 | 168.0 | 163.5 | 37.61 | 25.40 | 2396160 | 6 | 15.3 |
+| Si64_k222/pbe | 4 | 49.8 | 46.8 |  |  |  |  | 0.9 |
+| Si64_k222/pbe0 | 4 | 374.6 | 372.1 | 75.59 | 48.13 | 4788224 | 6 | 25.7 |
 
 Program wall time of `main.py` (first runs of each input on an A100 node that other jobs shared: indicative; the h-BN
-rows are those of the earlier runs, whose slab inputs this code's defaults for bulk cells leave unchanged), the
+rows are those of the earlier runs, whose slab inputs this code's defaults for bulk cells leave unchanged, and the
+rows of `Si64_gamma/pbe` and `Si64_k222` those of 19 November 2026), the
 seconds of its SCF (PBE start and Fock loop), of the exchange builds (pair solves on the GPU and ACE; in the cuFFT
 solver alone), the pair solves, the outer iterations and the peak device memory (`acceleration/benchmarks/
-periodic_hybrid_run.py`). The exchange builds take 3 % (h-BN, MgO) to 11 % (Si 4x4x4) of the SCF, and 21 % and 23 % for Si64 at the Gamma point and on the 2x2x2 mesh; the rest is mostly the eigensolver of the k-points. The two O2 hybrids run the Fock loop on the host (the third route above): 1,120 to 1,150 s, against 78 s for the PBE input of the same cell on the GPU. Si64: at the Gamma point (68^3 points, 128 occupied states, 67,008 pair solves) PBE0 takes 40 s on one GPU and PBE 9 s; on the 2x2x2 mesh (4 time-reversal representatives, 64^3 points, 2.4 million pair solves) PBE0 takes 168 s on four GPUs, 38 s of it in the exchange, and PBE 129 s (the PBE input solves all 8 points of the mesh). The same `Grid_Spacing` gives 68 points per side on the Gamma-point route and 64 on the k-point route.
+periodic_hybrid_run.py`). The exchange builds take 3 % (h-BN, MgO) to 11 % (Si 4x4x4) of the SCF, and 21 % and 20 % for Si64 at the Gamma point and on the 2x2x2 mesh; the rest is mostly the eigensolver of the k-points. The two O2 hybrids run the Fock loop on the host (the third route above): 1,120 to 1,150 s, against 78 s for the PBE input of the same cell on the GPU. Si64: at the Gamma point (68^3 points, 128 occupied states, 67,008 pair solves) PBE0 takes 40 s on one GPU on the full grid, which a hybrid keeps, and PBE 15 s in the 10 weighted sectors of a subgroup of 32 of the 96 operations of the cell (README of the accelerated driver, "Translations by half the cell"). That PBE run was the first of the sectors on its node and compiled their CUDA kernels (about 5 s of its first eigensolve): a second run took 6.0 s, against 8.0 s for a second run on the full grid (`PARSEC_PERIODIC_SYMMETRY=off`, the route of the log of 8 November 2026: 8.6 s, 4.3 GiB) on the same node, with the same energy to 1e-8 Ry. On the 2x2x2 mesh (64^3 points) PBE0 solves all 8 points of PARSEC 1.5's Gamma-centred mesh, each its own time-reversal partner (4.8 million pair solves), in 375 s on four GPUs, 76 s of it in the exchange; PBE solves its irreducible wedge of 4 points (Gamma, X, M and R, the density symmetrized), each split into the sectors of its little group (64 tasks), in 50 s. With the former mesh of this input (`PARSEC_MP_UNSHIFTED_MESH=port`, points at +-1/4) the code of 8 November 2026 took 168 s for PBE0 (4 time-reversal pairs, 2.4 million pair solves) and 129 s for PBE (all 8 points, without sectors). The same `Grid_Spacing` gives 68 points per side on the Gamma-point route and 64 on the k-point route.

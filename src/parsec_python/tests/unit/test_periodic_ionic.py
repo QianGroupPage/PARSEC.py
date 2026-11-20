@@ -16,6 +16,7 @@ from pathlib import Path
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -280,6 +281,37 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("after setting net force to zero", (folder / "parsec.out").read_text())
 
+    def test_forces_of_a_mesh_take_its_time_reversal_pairs(self) -> None:
+        # the whole Gamma-centred 3x2x1 mesh of the default routines that forces keep: its pairs k, -k (4 points of 6)
+        # give the energy and the forces of the 6 (PARSEC_KPOINT_TIME_REVERSAL=off)
+        from parsec_python.Input import parse_parsec_input
+
+        extra = (
+            "Skip_Force: .false.\nUse_Fortran_Routines: .false.\nIgnore_Symmetry: .true.\nKpoint_Method: mp\n"
+            "begin Monkhorst_Pack_Grid\n3 2 1\nend Monkhorst_Pack_Grid\n"
+            "begin Monkhorst_Pack_Shift\n0.0 0.0 0.0\nend Monkhorst_Pack_Shift"
+        )
+        found = {}
+        for setting in ("auto", "off"):
+            with mock.patch.dict(os.environ, {"PARSEC_KPOINT_TIME_REVERSAL": setting}):
+                code, _, folder = self._run(extra)
+                self.assertEqual(code, 0)
+                translation = parse_parsec_input(folder / "parsec.in")
+            text = (folder / "parsec.out").read_text()
+            energy = float(re.findall(r"Total Energy =\s+(-?\d+\.\d+)", text)[-1])
+            from parsec_python.Grid.kpoints import kpoint_sampling
+
+            points, weights = kpoint_sampling(translation.problem)
+            self.assertEqual(len(translation.problem.kpoints), 6)  # the mesh of these routines stays whole
+            self.assertFalse(translation.routines.fortran)
+            found[setting] = (len(points), np.asarray(weights), energy, self._final_forces(folder))
+        self.assertEqual(found["auto"][0], 4)
+        self.assertEqual(found["off"][0], 6)
+        self.assertAlmostEqual(float(found["auto"][1].sum()), 1.0, places=14)
+        self.assertAlmostEqual(found["auto"][2], found["off"][2], delta=1.0e-7)
+        self.assertGreater(float(np.abs(found["off"][3]).max()), 1.0e-3)
+        np.testing.assert_allclose(found["auto"][3], found["off"][3], atol=2.0e-6)
+
     @staticmethod
     def _final_forces(folder: Path) -> np.ndarray:
         """The last table of forces after the net force is removed, from ``parsec.out`` (six decimals)."""
@@ -352,6 +384,20 @@ class CommandLineTests(unittest.TestCase):
         frames = (folder / "relaxation.xyz").read_text().count("energy_Ry=")  # one frame per structure
         self.assertGreaterEqual(frames, 3)
 
+    def test_the_ionic_loops_write_no_files_without_data_files(self) -> None:
+        # --no-data-files (the ranks other than 0 of an MPI run share the folder of rank 0): no atom.cor,
+        # trajectory or restart of a relaxation, no md_*.dat of dynamics
+        code, _, folder = self._run("Minimization: bfgs\nMovement_Num: 1\nForce_Min: 1e-3 Ry/bohr", reference_main, "--no-data-files")
+        self.assertIn(code, (0, 4))
+        code, _, other = self._run(
+            "Molecular_Dynamics: .true.\nTinit: 300\nT_Final: 200\nT_Step: 10\nTime_Step: 20\nStep_Num: 1\nRng_Seed: 7",
+            reference_main,
+            "--no-data-files",
+        )
+        self.assertEqual(code, 0)
+        for place in (folder, other):
+            self.assertEqual(sorted(path.name for path in place.iterdir() if path.name != "parsec.out"), ["H_POTRE.DAT", "parsec.in"])
+
     def test_molecular_dynamics(self) -> None:
         code, _, folder = self._run("Molecular_Dynamics: .true.\nTinit: 300\nT_Final: 200\nT_Step: 10\nTime_Step: 20\nStep_Num: 3\nRng_Seed: 7")
         self.assertEqual(code, 0)
@@ -405,6 +451,89 @@ class CommandLineTests(unittest.TestCase):
         self.assertTrue(routines.fortran)
         self.assertFalse(routines.requested)
         self.assertIn("spin-polarized cell with k-points", "; ".join(routines.reasons))
+
+
+# H2 along z about the centre of the cube: the 16 operations of D4h map the atoms and the grid onto themselves, and the
+# compressed bond gives forces along z.
+_WEDGE_INPUT = _INPUT.replace(" 2.9 3.1 3.0\n 4.35 3.0 3.2\n", " 3.0 3.0 2.4\n 3.0 3.0 3.6\n")
+_WEDGE_MESH = (
+    "Use_Fortran_Routines: .false.\nKpoint_Method: mp\nbegin Monkhorst_Pack_Grid\n3 3 1\nend Monkhorst_Pack_Grid\n"
+    "begin Monkhorst_Pack_Shift\n0.0 0.0 0.0\nend Monkhorst_Pack_Shift\n"
+)
+
+
+class ForceWedgeTests(unittest.TestCase):
+    """Forces and relaxations of the default routines on the irreducible wedge of a mesh (PARSEC_KPOINT_FORCE_WEDGE)."""
+
+    def _folder(self, extra: str, *, flag: str = "") -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        folder = Path(directory.name)
+        text = _WEDGE_INPUT.format(extra=extra, mixing="0.1")
+        if flag:
+            text = text.replace("Local_Component: s\n", f"Local_Component: s\n{flag}\n")
+        (folder / "parsec.in").write_text(text)
+        (folder / "H_POTRE.DAT").write_bytes(_H.read_bytes())
+        return folder
+
+    def _parse(self, extra: str, *, flag: str = "", setting: str = "auto"):
+        from parsec_python.Input import parse_parsec_input
+
+        with mock.patch.dict(os.environ, {"PARSEC_KPOINT_FORCE_WEDGE": setting}):
+            return parse_parsec_input(self._folder(_WEDGE_MESH + extra, flag=flag) / "parsec.in")
+
+    def _run(self, extra: str, setting: str):
+        folder = self._folder(_WEDGE_MESH + extra)
+        output, error = StringIO(), StringIO()
+        previous = os.getcwd()
+        os.chdir(folder)
+        try:
+            with mock.patch.dict(os.environ, {"PARSEC_KPOINT_FORCE_WEDGE": setting}):
+                with redirect_stdout(output), redirect_stderr(error):
+                    code = reference_main([str(folder / "parsec.in"), "--no-archive"])
+        finally:
+            os.chdir(previous)
+        self.assertEqual(code, 0, error.getvalue()[-2000:])
+        return folder
+
+    def test_forces_and_relaxations_take_the_wedge_and_dynamics_the_whole_mesh(self) -> None:
+        from parsec_python.Grid.kpoints import kpoint_sampling
+
+        for extra in ("Skip_Force: .false.\n", "Minimization: bfgs\n"):
+            problem = self._parse(extra).problem
+            self.assertIsNotNone(problem.space_group)
+            self.assertGreater(problem.space_group.order, 1)
+            self.assertIsNone(problem.kpoints)
+            self.assertFalse(problem.kpoint_time_reversal)
+            self.assertEqual(len(kpoint_sampling(problem)[0]), 3)  # 9 points; their pairs would be 5
+            off = self._parse(extra, setting="off").problem
+            self.assertTrue(off.kpoint_time_reversal)
+            self.assertEqual(len(kpoint_sampling(off)[0]), 5)
+        # the mirror z -> -z exchanges the atoms, the second of which Move_Flag 1 fixes: the pairs of the whole mesh
+        fixed = self._parse("Minimization: bfgs\n", flag="Move_Flag: 1").problem
+        self.assertTrue(fixed.kpoint_time_reversal)
+        self.assertIsNone(fixed.space_group)
+        dynamics = self._parse(
+            "Molecular_Dynamics: .true.\nTinit: 300\nT_Final: 300\nT_Step: 10\nTime_Step: 20\nStep_Num: 2\n"
+        ).problem
+        self.assertTrue(dynamics.kpoint_time_reversal)
+        self.assertIsNone(dynamics.space_group)
+
+    def test_the_forces_of_the_wedge_are_those_of_the_whole_mesh(self) -> None:
+        found = {}
+        for setting in ("auto", "off"):
+            folder = self._run("Skip_Force: .false.\n", setting)
+            text = (folder / "parsec.out").read_text()
+            found[setting] = (
+                float(re.findall(r"Total Energy =\s+(-?\d+\.\d+)", text)[-1]),
+                CommandLineTests._final_forces(folder),
+            )
+        self.assertAlmostEqual(found["auto"][0], found["off"][0], delta=1.0e-7)
+        forces = found["off"][1]
+        self.assertGreater(float(np.abs(forces[:, 2]).max()), 1.0e-2)
+        np.testing.assert_allclose(found["auto"][1], forces, atol=2.0e-6)
+        np.testing.assert_allclose(found["auto"][1][:, :2], 0.0, atol=1.0e-6)  # the group keeps them along z
+        np.testing.assert_allclose(found["auto"][1][0], -found["auto"][1][1], atol=1.0e-6)
 
 
 if __name__ == "__main__":

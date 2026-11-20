@@ -16,7 +16,10 @@
 // own box, and its stencil wraps around.  ``flips`` (bit a set where the
 // reflection that carries the representative onto the box point reverses
 // axis a) carries the components of a vector field, the GGA flux, from the
-// representative to the other points of its orbit.
+// representative to the other points of its orbit.  With ``use_flips`` 2 the byte of a box point is
+// instead the index of the operation (a signed permutation) that carries the representative onto it, and
+// ``table`` holds per operation the source axis and the sign of each component (6 bytes): component a of
+// the image is sign[a] * component perm[a] of the vector at the representative.
 //
 // A module holds the kernels named by -DKERNEL_<name> options only (each
 // functional compiles what it launches).
@@ -123,23 +126,29 @@ static __device__ __forceinline__ double scalar_sample(const double* values, con
     return value < 0 ? 0.0 : values[value];
 }
 
-// Component ``axis`` of a vector field stored at the representatives.
-static __device__ __forceinline__ double vector_sample(const double* component, const int* value_of_box,
-                                                const unsigned char* flips, int use_flips, index_t box,
-                                                int axis) {
+// Component ``axis`` of a vector field stored at the representatives (``flux``: 3 x count).
+static __device__ __forceinline__ double vector_sample(const double* flux, index_t count, const int* value_of_box,
+                                                const unsigned char* flips, int use_flips,
+                                                const signed char* table, index_t box, int axis) {
     if (box < 0) return 0.0;
     int value = value_of_box[box];
     if (value < 0) return 0.0;
-    double sample = component[value];
+    if (use_flips == 2) {
+        const signed char* operation = table + 6 * (int)flips[box];
+        return (double)operation[3 + axis] * flux[(index_t)operation[axis] * count + value];
+    }
+    double sample = flux[(index_t)axis * count + value];
     if (use_flips && ((flips[box] >> axis) & 1)) sample = -sample;
     return sample;
 }
 
-// pbe.py density_gradient / discrete_gga: (D f)_a at every value, 3 x count.
+// pbe.py density_gradient / discrete_gga: (D f)_a at every value, 3 x count.  The weights of axis a start at
+// weights + a * axis_stride: 0 for a grid of one spacing (one row of 2M+1 weights), 2M+1 for a periodic cell whose
+// steps differ between the axes (a row of weights / h_a per axis).
 #ifdef KERNEL_xc_gradient
 extern "C" __global__ void xc_gradient(
     index_t count, const double* values, const int* value_of_box, const int* positions,
-    int n0, int n1, int n2, int periodic, int width, const double* weights, double* gradient) {
+    int n0, int n1, int n2, int periodic, int width, int axis_stride, const double* weights, double* gradient) {
     index_t w = (index_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (w >= count) return;
     const int lengths[3] = {n0, n1, n2};
@@ -147,13 +156,14 @@ extern "C" __global__ void xc_gradient(
     BoxPoint point = box_point((index_t)positions[w], n1, n2);
     double center = values[w];
     for (int axis = 0; axis < 3; ++axis) {
-        double sum = center * weights[width];
+        const double* axis_weights = weights + axis * axis_stride;
+        double sum = center * axis_weights[width];
         for (int j = -width; j < 0; ++j) {
             double left = scalar_sample(values, value_of_box,
                                         box_neighbor(point, axis, j, lengths, strides, periodic));
             double right = scalar_sample(values, value_of_box,
                                          box_neighbor(point, axis, -j, lengths, strides, periodic));
-            sum += (left - right) * weights[width + j];
+            sum += (left - right) * axis_weights[width + j];
         }
         gradient[axis * count + w] = sum;
     }
@@ -165,8 +175,8 @@ extern "C" __global__ void xc_gradient(
 #ifdef KERNEL_xc_adjoint
 extern "C" __global__ void xc_adjoint(
     index_t count, const double* flux, const int* value_of_box, const unsigned char* flips,
-    int use_flips, const int* positions, int n0, int n1, int n2, int periodic, int width,
-    const double* negated_weights, const double* base, double scale, double* out) {
+    int use_flips, const signed char* table, const int* positions, int n0, int n1, int n2, int periodic, int width,
+    int axis_stride, const double* negated_weights, const double* base, double scale, double* out) {
     index_t w = (index_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (w >= count) return;
     const int lengths[3] = {n0, n1, n2};
@@ -175,13 +185,14 @@ extern "C" __global__ void xc_adjoint(
     double total = base[w];
     for (int axis = 0; axis < 3; ++axis) {
         const double* component = flux + axis * count;
-        double sum = component[w] * negated_weights[width];
+        const double* axis_weights = negated_weights + axis * axis_stride;
+        double sum = component[w] * axis_weights[width];
         for (int j = -width; j < 0; ++j) {
-            double left = vector_sample(component, value_of_box, flips, use_flips,
+            double left = vector_sample(flux, count, value_of_box, flips, use_flips, table,
                                         box_neighbor(point, axis, j, lengths, strides, periodic), axis);
-            double right = vector_sample(component, value_of_box, flips, use_flips,
+            double right = vector_sample(flux, count, value_of_box, flips, use_flips, table,
                                          box_neighbor(point, axis, -j, lengths, strides, periodic), axis);
-            sum += (left - right) * negated_weights[width + j];
+            sum += (left - right) * axis_weights[width + j];
         }
         total += sum;
     }
@@ -777,6 +788,83 @@ static __device__ void ca_lsda_point(double rho_up, double rho_down, double* pot
     *potential_down = 2.0 * (4.0 / 3.0) * exchange_down + correlation_down;
     *energy = 2.0 * (rho_up * exchange_up + rho_down * exchange_down) + correlation * rho;
 }
+
+// ca_lda.py ca_lda_spin_polarized (exc_spn.f90 as the periodic spin drivers evaluate it) for one point with a
+// positive total density: the same formula as ca_lsda_point in its own operations (powers instead of cube roots,
+// no clamp of 1 +- zeta, the coefficients of the potential grouped as there).
+static __device__ void ca_lsda_polarized_point(double rh1, double rh2, double* potential_up,
+                                               double* potential_down, double* energy) {
+    const double c1 = 0.0622, c2 = 0.0960, c3 = 0.0040, c4 = 0.0232;
+    const double g = -0.2846, b1 = 1.0529, b2 = 0.3334;
+    const double as_ = 0.0311, bs = -0.0538, cs = 0.0014, ds = -0.0096;
+    const double gs = -0.1686, b1s = 1.3981, b2s = 0.2611;
+    double total = rh1 + rh2;
+    double ex1 = PW_AX * pow(2.0 * rh1, 1.0 / 3.0);
+    double vx1 = (4.0 / 3.0) * ex1;
+    double ex2 = PW_AX * pow(2.0 * rh2, 1.0 / 3.0);
+    double vx2 = (4.0 / 3.0) * ex2;
+    double rs = pow(0.75 / PI / total, 1.0 / 3.0);
+    double zeta = (rh1 - rh2) / total;
+    double f = (pow(1.0 + zeta, 4.0 / 3.0) + pow(1.0 - zeta, 4.0 / 3.0) - 2.0) / CA_GAMMA;
+    double fz = (4.0 / 3.0) * (pow(1.0 + zeta, 1.0 / 3.0) - pow(1.0 - zeta, 1.0 / 3.0)) / CA_GAMMA;
+    double eu, vc_u, es, vc_s;
+    if (rs < 1.0) {
+        double lrs = log(rs);
+        eu = c1 * lrs - c2 + (c3 * lrs - c4) * rs;
+        vc_u = eu - (c1 + (c3 * lrs + c3 - c4) * rs) / 3.0;
+        es = as_ * lrs + bs + (cs * lrs + ds) * rs;
+        vc_s = es - (as_ + (cs * lrs + cs + ds) * rs) / 3.0;
+    } else {
+        double srs = sqrt(rs);
+        eu = g / (1.0 + b1 * srs + b2 * rs);
+        vc_u = eu * eu * (1.0 + (7.0 / 6.0) * b1 * srs + (4.0 / 3.0) * b2 * rs) / g;
+        es = gs / (1.0 + b1s * srs + b2s * rs);
+        vc_s = es * es * (1.0 + (7.0 / 6.0) * b1s * srs + (4.0 / 3.0) * b2s * rs) / gs;
+    }
+    double vc_down = vc_u + f * (vc_s - vc_u) - (es - eu) * (1.0 + zeta) * fz;
+    double vc_up = vc_u + f * (vc_s - vc_u) + (es - eu) * (1.0 - zeta) * fz;
+    double ec = eu + f * (es - eu);
+    *potential_up = 2.0 * vx1 + vc_up;
+    *potential_down = 2.0 * vx2 + vc_down;
+    *energy = 2.0 * (rh1 * ex1 + rh2 * ex2) + ec * total;
+}
+
+// ca_lda.py ca_lda on every value: zero where the density is not positive, the energy density rho * epsilon.
+#ifdef KERNEL_lda_ca
+extern "C" __global__ void lda_ca(index_t count, const double* density, double* potential,
+                                  double* energy_density, double* epsilon) {
+    index_t w = (index_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= count) return;
+    double rho = density[w];
+    double v = 0.0, eps = 0.0;
+    if (rho > 0.0) ca_lda_point(rho, &v, &eps);
+    potential[w] = v;
+    energy_density[w] = rho * eps;
+    epsilon[w] = eps;
+}
+#endif
+
+// ca_lda_spin.py ca_lda_spin (``polarized`` 0) or ca_lda.py ca_lda_spin_polarized (``polarized`` 1); ``up`` and
+// ``down`` hold their halves of the core and are not negative.
+#ifdef KERNEL_lda_spin_ca
+extern "C" __global__ void lda_spin_ca(index_t count, const double* up, const double* down, int polarized,
+                                       double* potential_up, double* potential_down, double* energy_density) {
+    index_t w = (index_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= count) return;
+    double rho_up = up[w], rho_down = down[w];
+    double vu = 0.0, vd = 0.0, e = 0.0;
+    if (rho_up + rho_down > 0.0) {
+        if (polarized) {
+            ca_lsda_polarized_point(rho_up, rho_down, &vu, &vd, &e);
+        } else {
+            ca_lsda_point(rho_up, rho_down, &vu, &vd, &e);
+        }
+    }
+    potential_up[w] = vu;
+    potential_down[w] = vd;
+    energy_density[w] = e;
+}
+#endif
 
 // asymptotic_correction.py _channel_correction at one point.
 static __device__ double lb_correction(double rho, double g0, double g1, double g2, double spin_scale,

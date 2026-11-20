@@ -668,6 +668,9 @@ class SectorGroupTests(unittest.TestCase):
         self.assertEqual(sector_device_groups(4, 4, 3, (0, 1, 2, 3)), {3: (0, 1, 2, 3)})
 
     def test_exchange_context_plans_what_it_configures_and_shares_no_basis(self) -> None:
+        import os
+        from unittest.mock import patch
+
         from parsec_python.acceleration.experimental.mpi_scf import MPISectorContext
 
         world = _World(1)
@@ -679,7 +682,11 @@ class SectorGroupTests(unittest.TestCase):
         self.assertFalse(context._shared(1))
         semilocal = MPISectorContext(comm)
         self.assertTrue(semilocal._shared(1))
-        self.assertEqual(semilocal.planned_groups(4, (0, 1, 2, 3)), {1: (0, 1, 2, 3)})
+        # Four sectors on three ranks: by count rank 1 owns sector 1; by size (the default) the root takes the
+        # lightest share (one sector) and rank 1 the two of rank 0 of before (experimental/mpi_scf.sector_rank_plan).
+        with patch.dict(os.environ, {"PARSEC_SECTOR_PLACEMENT": "cyclic"}):
+            self.assertEqual(semilocal.planned_groups(4, (0, 1, 2, 3)), {1: (0, 1, 2, 3)})
+        self.assertEqual(semilocal.planned_groups(4, (0, 1, 2, 3)), {0: (0, 1), 3: (2, 3)})
         # Configuration agrees with the plan on every rank (one rank here).
         single = MPISectorContext(_Comm(world, 0), exchange=True)
         self.assertEqual(single.configure(4, (0, 1)), single.planned_groups(4, (0, 1)))

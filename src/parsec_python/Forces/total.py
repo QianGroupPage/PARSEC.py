@@ -419,7 +419,9 @@ def compute_periodic_forces(
     local ionic and core-correction forces (there is no term for the SCF residual in the periodic path) and the
     nonlocal force with the periodic projectors; then the net force is removed.  ``operations`` are optional
     symmetry operations of the atoms to average over (none by default: the Gamma-only periodic path does not
-    reduce the grid by symmetry).
+    reduce the grid by symmetry).  A k-point run on the irreducible wedge of a Monkhorst-Pack mesh (the problem
+    carries the group of :func:`parsec_python.Forces.periodic.reduced_kpoint_operations`, ``PARSEC_KPOINT_FORCE_WEDGE``)
+    has its nonlocal force completed over that group and, unless ``operations`` are given, the total averaged over it.
     """
 
     from time import perf_counter
@@ -441,6 +443,16 @@ def compute_periodic_forces(
                 "a k-point result needs its nonlocal forces from the SCF step: run it with compute_forces=True"
             )
         separable = np.asarray(result.nonlocal_forces, dtype=np.float64)
+        from .periodic import reduced_kpoint_operations
+
+        completion = reduced_kpoint_operations(system, result)
+        if completion is not None:
+            # An irreducible wedge (PARSEC_KPOINT_FORCE_WEDGE): its points stand for their stars, so the nonlocal
+            # force of the wedge is averaged over its group, and the total over the same operations, which keeps the
+            # structure in the group, as symm_forces.f90 does on Fortran's routines.
+            separable = symmetrize_forces(separable, completion)
+            if operations is None:
+                operations = completion
     else:
         gradients = build_periodic_projector_gradients(
             system.grid, atoms, system.pseudopotentials, specifications, lattice

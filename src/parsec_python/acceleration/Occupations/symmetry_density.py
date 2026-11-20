@@ -305,6 +305,11 @@ class CuPySymmetryDensityBuilder:
             self.pool_release["sector_density_seconds"] += (
                 perf_counter() - sectors_started
             )
+        point_group = getattr(wavefunctions, "point_group", None)
+        if point_group is not None:
+            # The one-dimensional sectors of a subgroup hold one partner of some degenerate levels, counted
+            # with their weights in the occupations: the average over the full group is the density of all.
+            wedge_density = point_group.symmetrize_values(wedge_density)
         if self.reducer is not None:
             return self.reducer.field(wedge_density)
         expansion_started = perf_counter()

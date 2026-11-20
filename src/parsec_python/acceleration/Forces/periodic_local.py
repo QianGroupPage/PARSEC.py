@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -623,11 +624,35 @@ def local_force_provider(
         return fast_periodic_local_forces(*arguments, xp=xp, erf=erf, tolerance=tolerance)
 
 
+_GRID_BOUNDS: tuple | None = None
+
+
+def _grid_bounds(grid) -> tuple[np.ndarray, np.ndarray]:
+    """``(low, high)``, the bounding box of the coordinates of ``grid``, kept for the last grid it was asked for.
+
+    The two reductions over the ``(points, 3)`` coordinates of a 192-atom cell (1.9 million points) take 30 ms each: done
+    once per atom in the ball sums of a force evaluation they were 9 of the 16 s of the core-correction term.  The box is
+    a property of the grid, which does not change while the atoms move; the cache is keyed by the identity of the
+    coordinate array (weakly held), so another grid, or the same grid rebuilt, computes its own.
+    """
+
+    global _GRID_BOUNDS
+    coordinates = grid.coordinates
+    if _GRID_BOUNDS is not None and _GRID_BOUNDS[0]() is coordinates:
+        return _GRID_BOUNDS[1], _GRID_BOUNDS[2]
+    low, high = coordinates.min(axis=0), coordinates.max(axis=0)
+    try:
+        reference = weakref.ref(coordinates)
+    except TypeError:  # not an ndarray that can be weakly referenced: no cache
+        return low, high
+    _GRID_BOUNDS = (reference, low, high)
+    return low, high
+
+
 def _images_reaching_the_grid(grid, centre: np.ndarray, translations: np.ndarray, radius: float) -> np.ndarray:
     """The translations whose image ball of ``radius`` around ``centre + T`` can hold a grid point (the bounding box of the grid)."""
 
-    coordinates = grid.coordinates
-    low, high = coordinates.min(axis=0), coordinates.max(axis=0)
+    low, high = _grid_bounds(grid)
     points = centre + translations
     gap = np.maximum(np.maximum(low - points, points - high), 0.0)
     return translations[np.sqrt(np.einsum("ij,ij->i", gap, gap)) <= radius]

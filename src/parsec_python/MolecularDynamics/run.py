@@ -27,6 +27,7 @@ from ..Relaxation.backend import IonicBackend, moved_atoms, release_orbitals
 from ..SCF.filter_restart import FilterRestart
 from .atomic_masses import atomic_masses
 from .md_files import (
+    MD_MECH_HEADER,
     MD_NRG_HEADER,
     MoldynRecords,
     format_md_nrg_line,
@@ -35,6 +36,7 @@ from .md_files import (
     parse_md_restart,
     restart_molecular_dynamics,
     step_records,
+    trim_output_files,
 )
 from .moldyn import (
     MolecularDynamicsState,
@@ -137,11 +139,25 @@ def restart_structure(translation, input_directory: Path):
 
 
 class _Files:
-    """The four output files of a run, appended to as the run proceeds."""
+    """The four output files of a run, appended to as the run proceeds.
 
-    def __init__(self, directory: Path | None) -> None:
+    With ``append`` (``MD_Append_Output`` in a restart) the files of the run that is continued are kept:
+    :meth:`trim` cuts what that run wrote beyond the restart step, and the headers are not written again.
+    """
+
+    _HEADERS = {MD_NRG: MD_NRG_HEADER, MD_MECH: MD_MECH_HEADER}
+
+    def __init__(self, directory: Path | None, append: bool = False) -> None:
         self.directory = None if directory is None else Path(directory)
+        self.append_mode = bool(append)
         self.started: list[Path] = []
+
+    def trim(self, frame: int) -> dict[str, int]:
+        """Remove the records numbered ``frame`` or later from the files of the run that is continued."""
+
+        if self.directory is None or not self.append_mode:
+            return {}
+        return trim_output_files(self.directory, frame)
 
     def append(self, records: MoldynRecords, *, structure: bool = True) -> None:
         """Add the records of one step; with ``structure`` false only the line of ``md_nrg.dat`` (MD_Output_Interval)."""
@@ -156,7 +172,12 @@ class _Files:
         ):
             path = self.directory / name
             if path not in self.started:
-                path.write_text("", encoding="utf-8", newline="\n")
+                if self.append_mode and path.is_file() and path.stat().st_size > 0:
+                    header = self._HEADERS.get(name, "")
+                    if header and text.startswith(header):
+                        text = text[len(header):]
+                else:
+                    path.write_text("", encoding="utf-8", newline="\n")
                 self.started.append(path)
             if text:
                 with path.open("a", encoding="utf-8", newline="\n") as handle:
@@ -258,7 +279,19 @@ def run_recorded_molecular_dynamics(
     if extrapolation != "none":
         # Not a line of PARSEC, which always starts from the last potential.
         write(f" Potential extrapolation after a move: {extrapolation}")
-    files = _Files(directory)
+    files = _Files(directory, append=bool(settings.append_output) and state.restarted)
+    trimmed = files.trim(state.frame)
+    if files.append_mode:
+        write(
+            f" MD_Append_Output: the files of the run go on from step {state.frame}"
+            + (f" ({sum(trimmed.values())} bytes of records from {state.frame} on removed)" if sum(trimmed.values()) else "")
+        )
+    if settings.rng_seed > 0 and not settings.use_test_rng and settings.friction_coefficient >= 1.0e-6:
+        write(
+            " WARNING: Rng_Seed > 0 with a Langevin friction: PARSEC starts the random number generator again from the seed every"
+            " 10000 numbers, the thermostat noise repeats every ~4000 Gaussian numbers (7 steps of 192 atoms) and has a net"
+            " force on the centre of mass; Rng_Seed 0 takes fresh numbers"
+        )
     files.append(initial_records(state, species, positions))
     outcome = MolecularDynamicsOutcome(state=state, positions=positions)
     carried = None

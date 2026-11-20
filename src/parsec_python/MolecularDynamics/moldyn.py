@@ -343,6 +343,41 @@ def _center_of_mass_velocity(
     )
 
 
+def _without_net_force(
+    masses: np.ndarray, amove1: np.ndarray, acceleration: np.ndarray
+) -> np.ndarray:
+    """``acceleration`` less its mass-weighted mean over the movable atoms: what is left exerts no net force."""
+    weight = (np.asarray(masses, dtype=float) * amove1)[:, None]
+    return acceleration - (weight * acceleration).sum(axis=0) / weight.sum()
+
+
+def remove_center_of_mass_motion(
+    state: MolecularDynamicsState, time_step: float
+) -> MolecularDynamicsState:
+    """``state`` with the motion of the centre of mass of the movable atoms taken out (``Remove_COM_Motion``).
+
+    The integrator takes the velocity of the structure from the difference of the positions
+    ``(current - previous)/dt`` and the friction from ``velocities`` (the estimate for the next step), and the
+    two have their own centre-of-mass velocities.  Each is cleaned of its own: the previous positions move by
+    ``v dt`` (``dt`` is ``time_step`` in atomic units), ``velocities`` lose theirs, and ``accelerations`` lose
+    their mass-weighted mean (the net force and net random force of the last step).  Fixed atoms stay where
+    they are.
+    """
+    amove1 = state.movable.astype(float)
+    amove = amove1[:, None]
+    masses = np.asarray(state.masses, dtype=float)
+    moved = _center_of_mass_velocity(
+        masses, amove1, (state.current_positions - state.previous_positions) / time_step
+    )
+    estimate = _center_of_mass_velocity(masses, amove1, state.velocities)
+    return replace(
+        state,
+        velocities=state.velocities - estimate * amove,
+        previous_positions=state.previous_positions + moved * amove * time_step,
+        accelerations=_without_net_force(masses, amove1, state.accelerations) * amove,
+    )
+
+
 def _gaussian_deviates(count: int, random: UniformSource | None) -> np.ndarray:
     """``gdev`` for x, y and z of the first atom, then of the second, ..."""
     if random is None:
@@ -466,11 +501,10 @@ def moldyn_step(
             vold = vold + accold * deltat
         else:
             sigm = np.sqrt(2.0 * beta * tempeh / (deltat * amass))
-            accold = (
-                0.5 * forces / amass
-                - beta * vold
-                + sigm * _gaussian_deviates(count, random)
-            ) * amove
+            noise = sigm * _gaussian_deviates(count, random)
+            if settings.remove_center_of_mass and not keep_center_of_mass:
+                noise = _without_net_force(state.masses, amove1, noise)
+            accold = (0.5 * forces / amass - beta * vold + noise) * amove
             xcur = xold + deltat * (vold + 0.5 * deltat * accold)
             vold = vold + deltat * accold
     elif beta < MICROCANONICAL_FRICTION:
@@ -497,11 +531,11 @@ def moldyn_step(
         xold = xcur
         accolder = state.accelerations
         # the previous velocity estimate enters the friction force
-        accold = amove * (
-            0.5 * forces / amass
-            - beta * state.velocities
-            + sigm * _gaussian_deviates(count, random)
-        )
+        noise = sigm * _gaussian_deviates(count, random)
+        if settings.remove_center_of_mass and not keep_center_of_mass:
+            # Remove_COM_Motion: the random force has no net part, the momentum of the cell stays what it was
+            noise = _without_net_force(state.masses, amove1, noise)
+        accold = amove * (0.5 * forces / amass - beta * state.velocities + noise)
         voldr = (xold - xolder) / deltat + deltat * (2.0 * accold + accolder) / 6.0
         xcur = xold + deltat * (voldr + deltat * (4.0 * accold - accolder) / 6.0)
         tke = _kinetic_energy(state.masses, voldr)

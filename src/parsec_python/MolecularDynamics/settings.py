@@ -24,7 +24,25 @@ Step_num              250        integer     number of time steps
 rng_seed              0          integer     seed, 0 means "from the clock"
 Mol_RNG_Seed          0          integer     PARSEC 1.5's name of ``rng_seed``
 test_rng              .false.    logical     use PARSEC's own simple generator
+Remove_COM_Motion     .false.    logical     PARSEC.py extension: a Langevin run keeps
+                                             the centre of mass at rest (see below)
+MD_Append_Output      .false.    logical     PARSEC.py extension: a restart appends to
+                                             the files of the run it continues
 ====================  =========  ==========  =====================================
+
+``Remove_COM_Motion``: the Langevin force of every atom is independent noise, whose sum over the atoms is a
+random force on the centre of mass, and nothing removes the momentum it gives (PARSEC's microcanonical branch
+subtracts the centre-of-mass velocity, the Langevin branch does not).  A restarted Langevin run that starts from
+the same ``rng_seed`` repeats the same noise in every segment, and the push adds up instead of averaging out.
+With this keyword the mass-weighted mean of the random acceleration is subtracted, so that the random force has
+no net part (the friction then only acts on a momentum that stays zero), and a restart takes the centre-of-mass
+velocity out of ``mdinit.dat`` (positions, velocities and accelerations), so that a trajectory that has drifted
+stops drifting.  Fixed atoms stay fixed; a net force that the forces keep (FDET) is never removed.
+
+``MD_Append_Output``: a restart (``Restart_mode``) does not start ``md_nrg.dat``, ``md_mech.dat``, ``atom.cor`` and
+``movie.xyz`` anew: it cuts every record numbered at or after the step of ``mdinit.dat`` (what a killed run left
+beyond its last restart block) and goes on, without the headers.  The step counter continues, so a trajectory
+of any number of restarts is one set of files.
 
 PARSEC 1.5 renamed ``rng_seed`` to ``Mol_RNG_Seed`` (``usrinputfile.F90:4741``)
 with the same meaning: a positive value is put as the seed of the compiler's
@@ -229,6 +247,8 @@ class MolecularDynamicsSettings:
     step_num: int = 250  # Step_num -> mol_dynamic%step_num
     rng_seed: int = 0  # rng_seed -> mol_dynamic%rng_seed
     use_test_rng: bool = False  # test_rng -> mol_dynamic%use_test_rng
+    remove_center_of_mass: bool = False  # Remove_COM_Motion (PARSEC.py extension)
+    append_output: bool = False  # MD_Append_Output (PARSEC.py extension)
 
     def __post_init__(self) -> None:
         method = esdf_reduce(str(self.cooling_method))
@@ -246,6 +266,8 @@ class MolecularDynamicsSettings:
         object.__setattr__(self, "enabled", bool(self.enabled))
         object.__setattr__(self, "restart", bool(self.restart))
         object.__setattr__(self, "use_test_rng", bool(self.use_test_rng))
+        object.__setattr__(self, "remove_center_of_mass", bool(self.remove_center_of_mass))
+        object.__setattr__(self, "append_output", bool(self.append_output))
         reals = (
             "initial_temperature",
             "final_temperature",
@@ -362,6 +384,12 @@ class MolecularDynamicsSettings:
         raw = given("test_rng")
         if raw is not None:
             values["use_test_rng"] = _esdf_boolean("test_rng", raw)
+        raw = given("Remove_COM_Motion")
+        if raw is not None:
+            values["remove_center_of_mass"] = _esdf_boolean("remove_com_motion", raw)
+        raw = given("MD_Append_Output")
+        if raw is not None:
+            values["append_output"] = _esdf_boolean("md_append_output", raw)
         raw = given("Restart_mode")
         if raw is not None and values.get("enabled", False):
             values["restart"] = _esdf_boolean("restart_mode", raw)

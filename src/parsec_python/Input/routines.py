@@ -152,6 +152,8 @@ DEFAULT_GLOBAL_KEYS = frozenset(
         "step_num",
         "rng_seed",
         "test_rng",
+        "remove_com_motion",
+        "md_append_output",
         "dynamic_diag_tol",
         "potential_extrapolation",
         "md_output_interval",

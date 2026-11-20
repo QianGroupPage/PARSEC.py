@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -57,6 +58,7 @@ from .moldyn import (
     BOHR_ANGSTROM,
     MolecularDynamicsState,
     MoldynStep,
+    remove_center_of_mass_motion,
 )
 from .settings import RESCALE_FRICTION, MolecularDynamicsSettings
 
@@ -295,7 +297,7 @@ def restart_molecular_dynamics(
     the positions the integrator continues from; the structure returned by
     the first step is therefore not recentred.
     """
-    return MolecularDynamicsState(
+    state = MolecularDynamicsState(
         masses=masses,
         movable=restart.movable.astype(np.int64),
         current_positions=restart.current_positions,
@@ -307,6 +309,10 @@ def restart_molecular_dynamics(
         move_count=0,
         restarted=True,
     )
+    if settings.remove_center_of_mass:
+        # Remove_COM_Motion (PARSEC.py extension): a trajectory that drifted stops drifting at the restart
+        state = remove_center_of_mass_motion(state, settings.time_step)
+    return state
 
 
 # ----------------------------------------------------------------------
@@ -451,6 +457,53 @@ def format_parsec_out_summary(settings: MolecularDynamicsSettings) -> str:
     lines.append(" Number of MD iterations = " + fortran_i(settings.step_num, 5))
     lines.append("  ")
     return "\n".join(lines) + "\n"
+
+
+# ----------------------------------------------------------------------
+# MD_Append_Output: continue the files of the run that is restarted
+# ----------------------------------------------------------------------
+#: first line of a record of each file: ``(regular expression, label group or None)``.  A record is dropped when
+#: its step number is at or after the step a restart continues with, a record without number (the closing block
+#: of ``atom.cor``) always.
+_RECORD_STARTS = {
+    "md_nrg.dat": (re.compile(rb"^[ \t]*(\d+)[ \t]+[-+0-9.]", re.MULTILINE), True),
+    "md_mech.dat": (re.compile(rb"^[ \t]*Step[ \t]*#[ \t]*(\d+)", re.MULTILINE), True),
+    "atom.cor": (
+        re.compile(rb"^[ \t]*Coordinates for (?:step #[ \t]*(\d+)|next Run)", re.MULTILINE),
+        True,
+    ),
+    # the line of the atom count before the title
+    "movie.xyz": (re.compile(rb"^[ \t]*\d+[ \t]*\n[ \t]*Step[ \t]*#[ \t]*(\d+)", re.MULTILINE), True),
+    "md_frames.extxyz": (re.compile(rb"^\d+[ \t]*\n[^\n]*\bstep=(\d+)", re.MULTILINE), True),
+}
+
+
+def trim_output_file(path: Path, frame: int) -> int:
+    """Cut ``path`` before its first record numbered ``frame`` or later; returns the number of bytes removed.
+
+    ``path`` is one of ``md_nrg.dat``, ``md_mech.dat``, ``atom.cor``, ``movie.xyz`` and ``md_frames.extxyz`` (by
+    name).  A run that a time limit killed has records beyond its last restart block, and a run that ended has
+    the closing block of ``atom.cor``: a restart that appends to the files first removes both.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return 0
+    pattern, _ = _RECORD_STARTS[path.name]
+    data = path.read_bytes()
+    for match in pattern.finditer(data):
+        label = match.group(1)
+        if label is None or int(label) >= frame:
+            if match.start() < len(data):
+                with path.open("r+b") as handle:
+                    handle.truncate(match.start())
+                return len(data) - match.start()
+            break
+    return 0
+
+
+def trim_output_files(directory: Path, frame: int) -> dict[str, int]:
+    """:func:`trim_output_file` for every file of a molecular dynamics run in ``directory``."""
+    return {name: trim_output_file(Path(directory) / name, frame) for name in _RECORD_STARTS}
 
 
 # ----------------------------------------------------------------------

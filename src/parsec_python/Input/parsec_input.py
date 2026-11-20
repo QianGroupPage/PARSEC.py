@@ -294,6 +294,8 @@ _MOLECULAR_DYNAMICS_KEYS = (
     "step_num",
     "rng_seed",
     "test_rng",
+    "remove_com_motion",
+    "md_append_output",
 )
 
 # ---------------------------------------------------------------------------

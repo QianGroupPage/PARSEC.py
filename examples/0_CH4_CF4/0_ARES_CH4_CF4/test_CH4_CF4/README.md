@@ -9,6 +9,8 @@ shift ΔBE = BE(CF₄) − BE(CH₄) with experiment.
 ## Running
 
 ```bash
+export ARES_DSCF_DATA=/path/to/DSCF_DATA/C   # the JCTC 2022 runs (see Gotchas)
+export ARES_PP_DIR=/path/to/PPs_copy         # their pseudopotentials
 python3 setup.py            # build inputs (idempotent)
 sbatch run8.qsub            # all 8 runs, one per node, debug queue
 sbatch run_b3lyp_cf4.qsub   # b3lyp/CF4 only, if run8 times out on it
@@ -81,9 +83,11 @@ MAE of 0.20 eV, and ~70% below the PP-PBE error of −0.48 eV. Gas-phase XPS res
 
 ## Gotchas
 
-Inputs come from our own production runs at
-`/global/cfs/cdirs/m3974/4Liping/DSCF_DATA/C/{2,15}/{I,F}` (2 = CH₄, 15 = CF₄) —
-`setup.py` copies those `POSCAR`s verbatim. Four things that cost time to work out:
+Inputs come from our own production runs in
+`$ARES_DSCF_DATA/{2,15}/{I,F}` (the `DSCF_DATA/C` folder of the JCTC 2022 runs; 2 = CH₄, 15 = CF₄) —
+`setup.py` copies those `POSCAR`s verbatim, and `analyze.py` reads their `ares.log`s. Both stop
+with a message when `ARES_DSCF_DATA` (or, for `setup.py`, `ARES_PP_DIR`) is not set. Four things
+that cost time to work out:
 
 - **The grid is per molecule, not global.** CH₄ uses `GRIDSPACING=0.12` / `ISOrmax=5.0`,
   CF₄ `0.07` / `5.5`. CF₄'s `ares.in` is unreadable (mode 600); recover its settings from

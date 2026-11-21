@@ -11,7 +11,7 @@ same physical system in Fortran PARSEC's own input, used to generate
 `fortran_reference.out`:
 
 ```
-mpiexec -n 2 /home/a2d2/Programs/Research/PARSEC/src/parsec-ubuntu_gnu-mpifort-gfortran-16.2.1.linux_ubuntu.mpi
+mpiexec -n 2 <PARSEC_FORTRAN_ROOT>/src/parsec-ubuntu_gnu-mpifort-gfortran-16.2.1.linux_ubuntu.mpi
 ```
 
 (git commit `f432777`, config `ubuntu_gnu`; PARSEC_ACCELERATED environment

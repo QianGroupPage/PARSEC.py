@@ -2,9 +2,10 @@
 """Build a clean pbe/ + b3lyp/ tree reproducing the CH4 / CF4 rows of Table S1.
 
 Reference: Xu, Prendergast, Qian, J. Chem. Theory Comput. 2022, 18, 5471-5478.
-The paper's own production runs survive on CFS at
+The paper's own production runs survive on CFS; set ARES_DSCF_DATA to their
+DSCF_DATA/C folder and ARES_PP_DIR to their PPs_copy pseudopotentials:
 
-    /global/cfs/cdirs/m3974/4Liping/DSCF_DATA/C/{2,15}/{I,F}
+    $ARES_DSCF_DATA/{2,15}/{I,F}
 
 (2 = CH4, 15 = CF4; I = initial state, F = 1s final state).  Everything below
 -- geometry, pseudopotentials, grid spacing, cutoff radius -- is taken from
@@ -34,10 +35,22 @@ Two details worth flagging, both differing from our earlier archived attempt:
 """
 import os
 import shutil
+import sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-REF = "/global/cfs/cdirs/m3974/4Liping/DSCF_DATA/C"
-PPDIR = "/global/cfs/cdirs/m3974/PPs_copy"
+REF = os.environ.get("ARES_DSCF_DATA", "")    # DSCF_DATA/C of the JCTC 2022 runs
+PPDIR = os.environ.get("ARES_PP_DIR", "")     # their PPs_copy pseudopotentials
+
+
+def require_inputs():
+    """Stop with a message unless both reference folders are named and exist."""
+    for name, value, what in (
+            ("ARES_DSCF_DATA", REF, "the DSCF_DATA/C folder of the JCTC 2022 runs (2/I, 2/F, 15/I, 15/F)"),
+            ("ARES_PP_DIR", PPDIR, "the PPs_copy pseudopotentials of those runs (C.pbe-mt-cpi.UPF, ...)")):
+        if not value:
+            sys.exit(f"setup.py: set {name} to {what}")
+        if not os.path.isdir(value):
+            sys.exit(f"setup.py: {name}={value} is not a folder; it must be {what}")
 
 # molecule -> (reference index, ligand, GRIDSPACING, ISOrmax)
 MOL = {
@@ -162,5 +175,6 @@ def build(level, lrefine):
 
 
 if __name__ == "__main__":
+    require_inputs()
     for level, lrefine in (("pbe", "F"), ("b3lyp", "T")):
         build(level, lrefine)

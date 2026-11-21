@@ -19,15 +19,15 @@ BE, is the number to compare against experiment.
 
 Reference columns are read live from the production runs behind Xu, Prendergast,
 Qian, J. Chem. Theory Comput. 2022, 18, 5471 -- our own JCTC paper -- which still
-live on CFS.  So 'JCTC 2022' below is that paper's actual ARES output, not a
-transcription of its Table S1.
+live on CFS (set ARES_DSCF_DATA to their DSCF_DATA/C folder).  So 'JCTC 2022'
+below is that paper's actual ARES output, not a transcription of its Table S1.
 """
 import os
 import re
 import sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-REF = "/global/cfs/cdirs/m3974/4Liping/DSCF_DATA/C"
+REF = os.environ.get("ARES_DSCF_DATA", "")    # DSCF_DATA/C of the JCTC 2022 runs
 REF_IDX = {"CH4": 2, "CF4": 15}
 MOLS = ("CH4", "CF4")
 
@@ -96,6 +96,11 @@ def jctc2022():
 
 
 def main():
+    if not REF:
+        sys.exit("analyze.py: set ARES_DSCF_DATA to the DSCF_DATA/C folder of the JCTC 2022 runs "
+                 "(2/I, 2/F, 15/I, 15/F)")
+    if not os.path.isdir(REF):
+        sys.exit(f"analyze.py: ARES_DSCF_DATA={REF} is not a folder")
     src = {"pbe (Lrefine=F)": ours("pbe"),
            "b3lyp (Lrefine=T)": ours("b3lyp"),
            "JCTC 2022 (published)": jctc2022()}

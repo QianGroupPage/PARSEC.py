@@ -27,12 +27,18 @@ except ImportError:  # package unit tests can run without the host DFT tree
     read_parsec_pseudopotential = None
 
 
-PARSEC_ROOT = Path(os.environ.get("PARSEC_FORTRAN_ROOT", "/home/zeyizhang/PARSEC"))
-FHI = PARSEC_ROOT / "fhi98pp" / "adka_v1_0" / "Dfhipp"
-ATOM_SRC = PARSEC_ROOT / "pseudopotential" / "Src"
+# The Fortran PARSEC checkout with FHI98PP and ATOM comes from PARSEC_FORTRAN_ROOT; without it the tests that
+# need it are skipped. The POTRE converter is this repository's own unless PARSEC_POTRE_CONVERTER names another.
+PARSEC_ROOT = Path(os.environ["PARSEC_FORTRAN_ROOT"]) if os.environ.get("PARSEC_FORTRAN_ROOT") else None
+FHI = PARSEC_ROOT / "fhi98pp" / "adka_v1_0" / "Dfhipp" if PARSEC_ROOT else None
+ATOM_SRC = PARSEC_ROOT / "pseudopotential" / "Src" if PARSEC_ROOT else None
+POTRE_CONVERTER = Path(
+    os.environ.get("PARSEC_POTRE_CONVERTER", Path(__file__).resolve().parents[2] / "tools" / "upf_to_parsec.py")
+)
+NO_FHI = "FHI98PP reference checkout is unavailable (set PARSEC_FORTRAN_ROOT)"
 
 
-@unittest.skipUnless(FHI.is_dir(), "FHI98PP reference checkout is unavailable")
+@unittest.skipUnless(FHI is not None and FHI.is_dir(), NO_FHI)
 class InputAndParserTests(unittest.TestCase):
     def test_core_hole_changes_ionic_charge(self) -> None:
         template = (FHI / "bin/Elements/TM/14-Si:tm.ini").read_text()
@@ -83,7 +89,7 @@ class InputAndParserTests(unittest.TestCase):
             choose_local_channel([failed, safe], requested=0, reject_ghosts=True)
 
 
-@unittest.skipUnless(FHI.is_dir(), "FHI98PP reference checkout is unavailable")
+@unittest.skipUnless(FHI is not None and FHI.is_dir(), NO_FHI)
 class FhiIntegrationTests(unittest.TestCase):
     def test_si_2p_core_hole_is_byte_identical(self) -> None:
         reference = FHI / "tests/si_2p_core_hole/generated/si_2p_ch_pbe_rc250"
@@ -103,12 +109,7 @@ class FhiIntegrationTests(unittest.TestCase):
 
     def test_p_1s_all_formats_are_byte_identical(self) -> None:
         qe = FHI / "tools/fhi2upf_qe.x"
-        converter = Path(
-            os.environ.get(
-                "PARSEC_POTRE_CONVERTER",
-                "/mnt/c/Users/zigze/Desktop/parsec_python/src/tools/upf_to_parsec.py",
-            )
-        )
+        converter = POTRE_CONVERTER
         if not qe.is_file() or not converter.is_file():
             self.skipTest("QE or POTRE converter is unavailable")
         reference = FHI / "tests/p_1s_core_hole"
@@ -155,12 +156,7 @@ class FhiIntegrationTests(unittest.TestCase):
 
     def test_local_only_and_nlcc_potre_conversion(self) -> None:
         qe = FHI / "tools/fhi2upf_qe.x"
-        converter = Path(
-            os.environ.get(
-                "PARSEC_POTRE_CONVERTER",
-                "/mnt/c/Users/zigze/Desktop/parsec_python/src/tools/upf_to_parsec.py",
-            )
-        )
+        converter = POTRE_CONVERTER
         if not qe.is_file() or not converter.is_file():
             self.skipTest("QE or POTRE converter is unavailable")
         if read_parsec_pseudopotential is None:
@@ -191,9 +187,10 @@ class FhiIntegrationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    (ATOM_SRC / "atom_all_gfortran.exe").is_file()
+    ATOM_SRC is not None
+    and (ATOM_SRC / "atom_all_gfortran.exe").is_file()
     and (ATOM_SRC / "kb_conv_gfortran.exe").is_file(),
-    "ATOM executables are unavailable",
+    "ATOM executables are unavailable (set PARSEC_FORTRAN_ROOT)",
 )
 class AtomIntegrationTests(unittest.TestCase):
     def test_si_ca_all_formats_and_local_scan(self) -> None:
